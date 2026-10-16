@@ -273,17 +273,27 @@ def test_story_task_post_landing_latches_round_trip_and_default_off():
     """The shared-store post-landing latches survive a save, and a legacy state
     file (no keys) reads them unset — never as a mark owed."""
     task = StoryTask(story_key="2.1", epic=0)
-    assert (task.ticket_done_pending, task.ticket_park_pending) == (False, "")
+    assert (task.ticket_done_pending, task.ticket_park_pending, task.ticket_commit_pending) == (
+        False,
+        "",
+        False,
+    )
     task.ticket_done_pending = True
     task.ticket_park_pending = "awaiting operator: rotate the key"
+    task.ticket_commit_pending = True
     state = _state(source="tickets", tasks={"2.1": task})
     back = RunState.from_dict(json.loads(json.dumps(state.to_dict()))).tasks["2.1"]
     assert back.ticket_done_pending is True
     assert back.ticket_park_pending == "awaiting operator: rotate the key"
+    assert back.ticket_commit_pending is True
     d = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del d["ticket_done_pending"], d["ticket_park_pending"]
+    del d["ticket_done_pending"], d["ticket_park_pending"], d["ticket_commit_pending"]
     legacy = StoryTask.from_dict(d)
-    assert (legacy.ticket_done_pending, legacy.ticket_park_pending) == (False, "")
+    assert (
+        legacy.ticket_done_pending,
+        legacy.ticket_park_pending,
+        legacy.ticket_commit_pending,
+    ) == (False, "", False)
 
 
 def test_story_task_refuses_a_corrupt_ticket_binding():

@@ -5943,8 +5943,12 @@ def _blob_oid_for_bytes(repo: Path, rel: str, data: bytes) -> str:
         return _blob_oid_for_file(repo, rel, shadow)
 
 
-def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes) -> bool:
+def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes | None) -> bool:
     """Whether the INDEX entry for ``rel`` is safe to overwrite with ``data``.
+
+    ``data=None`` asks the same question of a write that DELETES ``rel`` (the file
+    is absent, so `git add` stages its removal): an absent index entry is that
+    deletion itself, and an entry is safe only when it holds HEAD's own content.
 
     Git holds a path in two places and `commit_paths` writes both: `git add` copies the
     WORKING TREE into the commit and overwrites the INDEX in place. A staged version
@@ -5990,13 +5994,16 @@ def index_holds_no_foreign_content(repo: Path, rel: str, data: bytes) -> bool:
     head_oid = head[2] if head is not None and head[1] == "blob" else None
     records = [r for r in proc.stdout.split(b"\0") if r]
     if not records:
-        return head_oid is None  # empty in both places; otherwise a staged deletion
+        # Empty in both places, or a staged deletion — which a deletion write keeps.
+        return head_oid is None or data is None
     if len(records) != 1:
         raise GitError(f"git ls-files -s returned unmerged stages for {rel!r} in {repo}")
     fields = records[0].split(b"\t", 1)[0].decode("ascii", "strict").split()
     if len(fields) != 3:
         raise GitError(f"git ls-files -s returned a malformed entry for {rel!r} in {repo}")
     staged = fields[1]
+    if data is None:
+        return staged == head_oid
     return staged in {head_oid, _blob_oid_for_bytes(repo, rel, data)}
 
 

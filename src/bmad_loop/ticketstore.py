@@ -591,7 +591,8 @@ class StoreCommitter:
         never interleave a stage and a commit.
 
         Before anything is staged, each path's index entry is checked with
-        ``verify.index_holds_no_foreign_content`` against the bytes on disk: a
+        ``verify.index_holds_no_foreign_content`` against the bytes on disk (or,
+        for a path absent from disk, the deletion its stage would record): a
         staged version distinct from both HEAD and the file (a human's ``git add``
         in progress) would be overwritten by the stage, so the commit is skipped
         and those paths are returned in :attr:`StoreCommit.foreign`. Raises
@@ -623,9 +624,9 @@ class StoreCommitter:
             except ValueError:
                 continue  # outside the store: `commit_paths` ignores it too
             try:
-                data = path.read_bytes()
+                data: bytes | None = path.read_bytes()
             except FileNotFoundError:
-                continue  # a deletion to stage, or a path git never saw
+                data = None  # a deletion to stage: a staged version would be lost too
             if not verify.index_holds_no_foreign_content(self.store_repo, rel, data):
                 foreign.append(rel)
         return tuple(foreign)

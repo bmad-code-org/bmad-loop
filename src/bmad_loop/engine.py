@@ -2111,6 +2111,7 @@ class Engine:
                 or publication_pending
                 or task.ticket_done_pending
                 or task.ticket_park_pending
+                or task.ticket_commit_pending
             ):
                 continue
             merged = merged_key in merged_units
@@ -4777,7 +4778,8 @@ class Engine:
         """Record on ``task``, before ``_commit``'s COMMITTING save, the work
         source's writes owed once the unit's code has landed on the target (tickets
         mode with a shared ticket store marks the plan then:
-        ``StoryTask.ticket_done_pending`` / ``ticket_park_pending``). Base: none."""
+        ``StoryTask.ticket_done_pending`` / ``ticket_park_pending``, or only commits
+        it: ``ticket_commit_pending``). Base: none."""
         del task
 
     def _land_post_landing_writes(self, task: StoryTask) -> None:

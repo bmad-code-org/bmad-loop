@@ -57,10 +57,11 @@ Where the ticket's terminal mark lands depends on the run's store topology. A
 store tracked in the code checkout (T1) is marked inside the commit window, so the
 plan rides the unit's commit. A shared store (T2–T4: ``ProjectPaths.shared_store``)
 cannot ride it, so the mark is latched on the task in the COMMITTING save
-(``ticket_done_pending`` / ``ticket_park_pending``) and made once the code has
-landed: after ``finalize_commit`` in place, after the merge-back under worktree
-isolation, or replayed on resume before any pick. A failed mark pauses at
-``ticket-tree``, latch kept.
+(``ticket_done_pending`` / ``ticket_park_pending``; ``ticket_commit_pending``
+when ``mark_done = "never"`` leaves only the ``built`` plan to commit in a store
+repository) and made once the code has landed: after ``finalize_commit`` in
+place, after the merge-back under worktree isolation, or replayed on resume
+before any pick. A failed mark pauses at ``ticket-tree``, latch kept.
 
 A session (or, under ``[operator] on_review_demotion = "park"``, a review) that
 parks the ticket at ``awaiting-operator`` keeps the base park verification; the
@@ -1589,14 +1590,21 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         unit's commit cannot), latch the ticket's terminal mark on ``task`` in the
         COMMITTING save — the same choice :meth:`_terminal_plan_write` makes for
         T1: a park's ``blocked`` reason (``ticket_park_pending``), else ``done``
-        under ``mark_done = "auto"`` (``ticket_done_pending``), else nothing. Both
-        fields are assigned every time, so a re-armed unit never carries a stale
-        latch into its next commit. Journals ``ticket-mark-latched``."""
+        under ``mark_done = "auto"`` (``ticket_done_pending``), else no mark. Under
+        ``"never"`` a store with its own repository (T3/T4) still latches the
+        commit of the ``built`` plan the session wrote there
+        (``ticket_commit_pending``), which a T1 unit's own commit carries. All
+        three fields are assigned every time, so a re-armed unit never carries a
+        stale latch into its next commit. Journals ``ticket-mark-latched``."""
         if self.paths.shared_store is None or task.ticket is None:
             return
         parked = bool(task.operator_actions)
+        accept = not parked and self.policy.tickets.mark_done == "auto"
+        topology = self.store_topology
+        versioned = topology is not None and topology.store_repo is not None
         task.ticket_park_pending = operator_park_reason(task.operator_actions) if parked else ""
-        task.ticket_done_pending = not parked and self.policy.tickets.mark_done == "auto"
+        task.ticket_done_pending = accept
+        task.ticket_commit_pending = not parked and not accept and versioned
         self._journal_latch(task)
 
     def _journal_latch(self, task: StoryTask) -> None:
@@ -1608,15 +1616,18 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _post_landing_target(task: StoryTask) -> str:
         if task.ticket_park_pending:
             return "blocked"
-        return verify.PLAN_DONE if task.ticket_done_pending else ""
+        if task.ticket_done_pending:
+            return verify.PLAN_DONE
+        return verify.PLAN_BUILT if task.ticket_commit_pending else ""
 
     def _land_post_landing_writes(self, task: StoryTask) -> None:
         """Make the latched mark now that the unit's code is on the target: on the
         run's own tree (the main checkout's view of the shared store) and the plan
         ``find`` named at pick time — ``mark <ref> blocked --blocked <reason>``
-        (reason ``park``) or ``mark <ref> done`` (reason ``accept``) — then clear
-        the latch and save. A replay after a crash past the mark is the
-        chokepoint's no-op. A mark that fails is a repair write: it raises
+        (reason ``park``) or ``mark <ref> done`` (reason ``accept``), no mark for a
+        commit-only latch (``built``) — then commit the plan in the store's own
+        repository, clear the latch and save. A replay after a crash past the mark
+        is the chokepoint's no-op. A mark that fails is a repair write: it raises
         ``RunPaused`` at ``ticket-tree`` with the latch kept, so the resume marks
         again (:meth:`_replay_post_landing_writes`)."""
         target = self._post_landing_target(task)
@@ -1627,7 +1638,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             self._pause_post_landing_mark(task, target, "the unit has no ticket binding")
         plan = self._recorded_plan(ticket)
         try:
-            if task.ticket_park_pending:
+            if target == verify.PLAN_BUILT:
+                pass  # commit-only: the session's own `built` write is the change
+            elif task.ticket_park_pending:
                 self.ticket_tree.mark(
                     ticket.ref,
                     "blocked",
@@ -1646,6 +1659,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return  # latch kept: a resume marks (a no-op) and commits again
         task.ticket_done_pending = False
         task.ticket_park_pending = ""
+        task.ticket_commit_pending = False
         self._save()
 
     def _commit_marked_plan(self, task: StoryTask, target: str) -> bool:
@@ -1852,6 +1866,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return
         task.ticket_park_pending = ""
         task.ticket_done_pending = True
+        task.ticket_commit_pending = False
         self._journal_latch(task)
         self._save()
 

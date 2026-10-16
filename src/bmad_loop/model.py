@@ -800,9 +800,13 @@ class StoryTask:
     # `_commit` before the COMMITTING save, so every crash window past it replays
     # the mark on resume; cleared (and saved) only once the mark is made.
     # `ticket_done_pending`: accept (`mark <ref> done`); `ticket_park_pending`: the
-    # park's `blocked_reason` (`mark <ref> blocked --blocked <reason>`), "" for none.
+    # park's `blocked_reason` (`mark <ref> blocked --blocked <reason>`), "" for none;
+    # `ticket_commit_pending`: no mark (`mark_done = "never"`), but a store with its
+    # own repository (T3/T4) still owes the commit of the `built` plan the session
+    # wrote there, which a T1 unit's own commit would have carried.
     ticket_done_pending: bool = False
     ticket_park_pending: str = ""
+    ticket_commit_pending: bool = False
 
     @property
     def terminal(self) -> bool:
@@ -917,6 +921,7 @@ class StoryTask:
             "ticket": self.ticket.to_dict() if self.ticket is not None else None,
             "ticket_done_pending": self.ticket_done_pending,
             "ticket_park_pending": self.ticket_park_pending,
+            "ticket_commit_pending": self.ticket_commit_pending,
         }
 
     def _serialized_worktree_path(
@@ -1204,6 +1209,7 @@ class StoryTask:
             ticket=_ticket_binding_from(d.get("ticket")),
             ticket_done_pending=bool(d.get("ticket_done_pending", False)),
             ticket_park_pending=str(d.get("ticket_park_pending", "") or ""),
+            ticket_commit_pending=bool(d.get("ticket_commit_pending", False)),
         )
 
 

@@ -9,6 +9,7 @@ tests/test_engine_worktree.py). Real-spawn budget: none.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from test_tickets_engine import (
     _kinds,
     _marking_tree,
     _plan_status,
+    _policy,
     _resume,
     _retro_doc,
     _retro_policy,
@@ -31,6 +33,7 @@ from test_tickets_engine import (
 from bmad_loop import verify
 from bmad_loop.journal import load_state
 from bmad_loop.model import PAUSE_EPIC_BOUNDARY, Phase
+from bmad_loop.policy import TicketsPolicy
 from bmad_loop.ticketstore import StoreCommit, StoreCommitError, StoreCommitter
 
 PLAN = b"---\nstatus: built\n---\n"
@@ -104,6 +107,31 @@ def test_store_commit_refuses_foreign_staged_plan(store):
     assert result == StoreCommit(None, ("plan.md",))
     assert verify.rev_parse_head(store) == head
     assert git(store, "show", ":plan.md") == staged.decode("utf-8").rstrip("\n")
+
+
+def test_store_commit_refuses_foreign_staged_version_of_an_absent_path(store):
+    """A path the commit names is gone from disk while a human's staged version
+    of it sits in the index: staging the deletion would destroy that version, so
+    the path is reported foreign and nothing is committed. A plain deletion (the
+    index at HEAD's content) still commits. Ablation (performed): skip the foreign
+    check for an absent path and the deletion is committed over the staged
+    version — this FAILS."""
+    head = verify.rev_parse_head(store)
+    staged = b"---\nstatus: built\n---\n\nhand-edited\n"
+    (store / "plan.md").write_bytes(staged)
+    git(store, "add", "plan.md")
+    (store / "plan.md").unlink()
+    committer = StoreCommitter(store, store)
+
+    result = committer.commit("1.1", [store / "plan.md"], "chore")
+
+    assert result == StoreCommit(None, ("plan.md",))
+    assert verify.rev_parse_head(store) == head
+    assert git(store, "show", ":plan.md") == staged.decode("utf-8").rstrip("\n")
+
+    git(store, "reset", "-q", "--", "plan.md")
+    assert committer.commit("1.1", [store / "plan.md"], "chore").sha is not None
+    assert "plan.md" not in git(store, "ls-files").split()
 
 
 def test_store_commit_git_fault_raises_typed(store, monkeypatch):
@@ -222,6 +250,37 @@ def test_store_commit_failed_mid_run_is_retried_before_finishing(
     assert [e["story_key"] for e in _kinds(engine, "run-end-ticket-mark")] == ["1.1"]
     assert [e["story_key"] for e in _kinds(engine, "store-committed")] == ["1.1"]
     assert _subjects(store)[0] == "chore(tickets): 1.1 done [bmad-loop test-run]"
+
+
+def test_mark_done_never_still_commits_the_built_plan(project_v7_store_repo, monkeypatch):
+    """`mark_done = "never"` writes no mark, but the session's own `built` write
+    sits in the store repository, which no unit commit carries (T1's does): the
+    task latches a commit-only obligation, and once the code lands the plan is
+    committed at `built` and the latch cleared. Ablation (performed): latch
+    nothing under "never" and the run finishes with the plan uncommitted — this
+    FAILS."""
+    layout = project_v7_store_repo
+    store = layout.output_folder
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    pol = dataclasses.replace(_policy(), tickets=TicketsPolicy(mark_done="never"))
+    engine, _ = _shared_engine(
+        layout, tree, policy=pol, script=[_builds_shared(layout, tree, plan)], max_stories=1
+    )
+
+    result = engine.run()
+
+    assert not result.paused
+    state = load_state(engine.run_dir)
+    task = state.tasks["1.1"]
+    assert state.finished and task.phase == Phase.DONE and not task.ticket_commit_pending
+    assert not tree.marks
+    assert _plan_status(plan) == "built"
+    assert [e["target"] for e in _kinds(engine, "ticket-mark-latched")] == ["built"]
+    assert _subjects(store)[0] == "chore(tickets): 1.1 built [bmad-loop test-run]"
+    rel = plan.relative_to(store).as_posix()
+    assert rel in _head_files(store) and rel not in verify.dirty_paths(store)
 
 
 def test_retro_doc_committed_in_store_repo(project_v7_store_repo, monkeypatch):

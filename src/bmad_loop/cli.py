@@ -4012,6 +4012,12 @@ def _print_stories_status(state: RunState, project: Path) -> None:
         )
 
 
+def _owed_post_landing_label(task: StoryTask) -> str:
+    if task.ticket_park_pending:
+        return "blocked"
+    return "done" if task.ticket_done_pending else "built"
+
+
 def _print_tickets_status(state: RunState, project: Path) -> None:
     """``status``'s queue footer for a tickets run: the initiative the run is
     pinned to and its folder, read from run state alone — the per-run task rows
@@ -4022,9 +4028,9 @@ def _print_tickets_status(state: RunState, project: Path) -> None:
     folder = f"  ({state.initiative_folder})" if state.initiative_folder else ""
     print(f"tickets: initiative {state.initiative or '(none)'}{folder}")
     owed = [
-        f"{key} ({'blocked' if task.ticket_park_pending else 'done'})"
+        f"{key} ({_owed_post_landing_label(task)})"
         for key, task in state.tasks.items()
-        if task.ticket_park_pending or task.ticket_done_pending
+        if task.ticket_park_pending or task.ticket_done_pending or task.ticket_commit_pending
     ]
     if owed:
         print(
