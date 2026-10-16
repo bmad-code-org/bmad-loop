@@ -792,12 +792,18 @@ def _probe_unreadable(check: str, rel: str, fault: str) -> Finding:
     )
 
 
-def _tickets_layout_problem(paths: bmadconfig.ProjectPaths, folder: Path) -> str:
+def _tickets_layout_problem(
+    paths: bmadconfig.ProjectPaths, folder: Path, isolation: str = "none"
+) -> str:
     """Why the initiative folder is not a store tickets runs drive today — a
     folder tracked inside the code checkout (``repo_root``), so a plan marked
     ``done`` rides its unit's own commit — or "" when it is one. Outside the
     checkout, untracked or gitignored, or a nested repo (a gitlink, not a tree)
-    is a store layout a later release layer of bmad-loop supports."""
+    is a store layout a later release layer of bmad-loop supports. Under
+    ``isolation = "worktree"`` the folder must also lie inside the project: the
+    unit worktree's paths re-anchor only what the project holds, so a tracked
+    sibling (an ``output_folder`` of ``../tickets``) would be read and marked in
+    the main checkout, not the unit's own copy."""
     repo_root = paths.repo_root
     try:
         rel = folder.resolve().relative_to(repo_root.resolve()).as_posix()
@@ -814,6 +820,14 @@ def _tickets_layout_problem(paths: bmadconfig.ProjectPaths, folder: Path) -> str
             f"{rel} has no tracked files in {repo_root} (gitignored, or never "
             "committed) — commit the initiative folder"
         )
+    # `folder` resolved above; `paths.project` is canonical off `load_paths`
+    if isolation == "worktree" and not folder.resolve().is_relative_to(paths.project):
+        return (
+            f'isolation = "worktree" needs it inside the project {paths.project}, so '
+            "a unit worktree marks its own copy, not the main checkout's — move it "
+            'under the project, or set `isolation = "none"` under [scm] in '
+            ".bmad-loop/policy.toml"
+        )
     return ""
 
 
@@ -823,10 +837,12 @@ def tickets_preflight(
     *,
     probe_capability: bool,
     branch_per: str | None = None,
+    isolation: str = "none",
 ) -> list[Finding]:
     """Tickets mode's project checks, as :class:`Finding` s (``paths`` is the
     paths loaded for tickets mode, ``trees`` the dev skill trees, ``branch_per``
-    the policy's ``[scm] branch_per``; None skips its check).
+    the policy's ``[scm] branch_per``; None skips its check; ``isolation`` the
+    policy's ``[scm] isolation``).
 
     Static checks, in order: the script (``tickets.script-missing``), the BMad
     config reader it imports (``tickets.config-utils-missing``), ``uv`` on PATH
@@ -926,7 +942,7 @@ def tickets_preflight(
                         },
                     )
                 )
-            elif folder is not None and (why := _tickets_layout_problem(paths, folder)):
+            elif folder is not None and (why := _tickets_layout_problem(paths, folder, isolation)):
                 findings.append(
                     Finding(
                         "tickets.layout-unsupported",

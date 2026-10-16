@@ -12157,6 +12157,34 @@ def test_untracked_store_refused_until_topology_layer(project_v7, monkeypatch, t
     assert why[layout] in problem.message and "later release layer" in problem.message
 
 
+@pytest.mark.parametrize(("isolation", "refused"), [("worktree", True), ("none", False)])
+def test_tracked_sibling_store_refused_under_worktree_isolation(
+    project_v7, monkeypatch, isolation, refused
+):
+    """A nested project (`<repo>/app`) whose initiative folder is a tracked sibling
+    (`output_folder = ../tickets`): a unit worktree re-anchors only what the
+    project holds, so its session would read and mark the main checkout's plan.
+    Refused under worktree isolation, accepted in place. Ablation (performed):
+    drop the isolation clause in `_tickets_layout_problem` and the `worktree` row
+    FAILS."""
+    import dataclasses
+
+    paths = dataclasses.replace(
+        _tickets_paths(project_v7), project=project_v7.project.resolve() / "app"
+    )
+    monkeypatch.setattr(install_mod.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+
+    findings = install_mod.tickets_preflight(
+        paths, [".claude/skills"], probe_capability=False, isolation=isolation
+    )
+
+    layout = [f for f in findings if f.check == "tickets.layout-unsupported"]
+    assert [f.severity for f in layout] == (["problem"] if refused else [])
+    if refused:
+        assert 'isolation = "worktree"' in layout[0].message
+        assert str(paths.project) in layout[0].message
+
+
 @pytest.mark.parametrize(("branch_per", "warned"), [("run", True), ("story", False), (None, False)])
 def test_tickets_preflight_warns_branch_per_run(project_v7, monkeypatch, branch_per, warned):
     """`branch_per = "run"` builds every ticket on one branch, and build-auto's

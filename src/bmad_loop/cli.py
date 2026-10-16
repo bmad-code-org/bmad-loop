@@ -2771,6 +2771,7 @@ def _validate_tickets_mode_queue(
             dev_trees,
             probe_capability=probes,
             branch_per=pol.scm.branch_per if pol is not None else None,
+            isolation=pol.scm.isolation if pol is not None else "none",
         )
     )
     tickets_probs = install.missing_tickets_support(project, dev_trees)
@@ -3493,7 +3494,11 @@ def _check_tickets_preflight(paths: bmadconfig.ProjectPaths, pol) -> int | None:
     the run executes the script anyway). Warnings print; a problem refuses the
     run."""
     findings = install.tickets_preflight(
-        paths, [], probe_capability=True, branch_per=pol.scm.branch_per
+        paths,
+        [],
+        probe_capability=True,
+        branch_per=pol.scm.branch_per,
+        isolation=pol.scm.isolation,
     )
     for warning in (f for f in findings if f.severity == "warning"):
         print(f"warning: {warning.message}", file=sys.stderr)

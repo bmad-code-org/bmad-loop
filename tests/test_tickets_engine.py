@@ -645,39 +645,6 @@ def test_plan_produced_reads_the_active_workspace(project_v7, tmp_path):
     assert "Halt after planning." not in engine._dev_prompt(task, None)
 
 
-def test_bound_plan_rebases_a_repo_local_sibling_plan_into_the_mount(project_v7, tmp_path):
-    """A nested project (`<repo>/app`) whose initiative folder is a tracked
-    sibling (`output_folder = ../tickets`) passes the layout preflight, and under
-    worktree isolation the session's `tickets.py` writes the plan inside the unit
-    worktree. The bound plan is that worktree copy — so read-back and the mount
-    tree's `mark` agree — while a plan under the project still re-anchors on the
-    mount project and one outside the checkout is left as recorded. Ablation
-    (performed): drop the `repo_root` anchor in `_bound_plan` and the sibling plan
-    reads as the main checkout's copy — this FAILS."""
-    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
-    engine, _ = make_engine(project_v7, tree)
-    task = _bound(engine, tree)
-    repo = engine.paths.repo_root
-    engine.paths = dataclasses.replace(engine.paths, project=repo / "app")
-    engine.state.project = str(repo / "app")
-    mount = tmp_path / "mount"
-    engine.workspace = Workspace(root=mount, paths=engine.paths.rebased(mount))
-    assert engine.workspace.paths.project == mount.resolve() / "app"
-    assert task.ticket is not None
-
-    sibling = repo / "tickets" / "1-cart" / "plan-1.1.md"
-    task.ticket = dataclasses.replace(task.ticket, plan=str(sibling))
-    assert engine._bound_plan(task) == mount.resolve() / "tickets" / "1-cart" / "plan-1.1.md"
-
-    nested = repo / "app" / "tickets" / "plan-1.1.md"
-    task.ticket = dataclasses.replace(task.ticket, plan=str(nested))
-    assert engine._bound_plan(task) == mount.resolve() / "app" / "tickets" / "plan-1.1.md"
-
-    outside = tmp_path / "elsewhere" / "plan-1.1.md"
-    task.ticket = dataclasses.replace(task.ticket, plan=str(outside))
-    assert engine._bound_plan(task) == outside
-
-
 def test_unreadable_checkpoint_plan_stops_the_dispatch(project_v7):
     """A plan-checkpoint plan that is on disk but cannot be read is not an absent
     plan: the run launches no session and pauses naming the fault, instead of
