@@ -35,16 +35,17 @@ breaking changes may land in a minor release.
   epic with bmad-ticket. A `rejected` verdict blocks every later pick while the epic
   stays open. A retrospective refused for a dirty tree, a git fault or a stop request
   records no closure, so the resume runs it.
-- Park a ticket as `blocked` ("awaiting operator: …"), never `done`. `bmad-loop confirm
-  <ref>` and `resolve` re-arm it through `tickets.py mark`; a code rollback re-arms its
-  plan, and a timed-out review lands it at `built`.
+- Park a ticket as `blocked` ("awaiting operator: …"), never `done`.
+  `bmad-loop confirm <ref>` and `resolve` re-arm it through `tickets.py mark`; a code
+  rollback re-arms its plan, and a timed-out review lands it at `built`.
 - Drive every repo-store layout: a store tracked in the code checkout is marked inside
   the unit's commit; an ignored folder or a store in its own repository is marked after
   the code lands (latched and replayed on resume), and a store repository gets plan-only
   commits with `Bmad-Code-*` trailers. A failed store commit is retried before the run
   finishes and pauses at `ticket-tree` if still owed; a failed retrospective commit
   pauses at the epic boundary before its closure, and the resume commits it. A store
-  inside a renamed project moves with it.
+  inside a renamed project moves with it. `confirm` commits a store plan in the store's
+  own repository.
 - Add `Bmad-Ticket:` and `Bmad-Plan:` trailers to tickets unit commits, and name worktree
   unit branches `bmad-loop/<run>/<epic-slug>/<ref>`.
 - Add tickets mode to `run --dry-run` (build order, dispatches, the first pause) and the

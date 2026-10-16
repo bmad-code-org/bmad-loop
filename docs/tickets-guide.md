@@ -126,7 +126,7 @@ The run records the document's `verdict` (or `unknown` when there is none) and p
 
 ## Parking and resolve
 
-When a session parks a ticket for a person (an `awaiting-operator` result, or a review demotion under `[operator] on_review_demotion = "park"`), the unit commits and its plan is marked `blocked` with the reason `awaiting operator: <actions>`, never `done`. Do the actions, then run `bmad-loop confirm <ref>`: it marks the plan `done` (`built` under `mark_done = "never"`) and clears `blocked_*`.
+When a session parks a ticket for a person (an `awaiting-operator` result, or a review demotion under `[operator] on_review_demotion = "park"`), the unit commits and its plan is marked `blocked` with the reason `awaiting operator: <actions>`, never `done`. Do the actions, then run `bmad-loop confirm <ref>`: it marks the plan `done` (`built` under `mark_done = "never"`) and clears `blocked_*`. The plan is committed with the park record's deletion when the code checkout tracks the store, in the store's own repository when it has one, and not at all in an unversioned store.
 
 An escalated ticket is recovered with `bmad-loop resolve <run-id>`. The ticket's plan is the frozen spec, and its `<intent-contract>` block is the intent. The re-arm moves the plan through `tickets.py mark` (back to `ready-for-dev`, or `in-review` for a restore) and clears `blocked_*`; a refused move aborts the re-arm and puts the plan back byte for byte. See [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode).
 
