@@ -273,3 +273,27 @@ def test_redirect_mount_store_refuses_an_unredirectable_config(project_v7, tmp_p
     )
     with pytest.raises(ticketstore.TicketStoreError):
         ticketstore.redirect_mount_store(project_v7.project, tmp_path / "store")
+
+
+def test_redirect_mount_store_refuses_an_unreadable_user_layer(project_v7, tmp_path, monkeypatch):
+    """A personal layer that exists but cannot be read is refused, never rewritten
+    from empty: Python 3.14's `Path.is_file` reads a stat fault as False, which
+    would drop the user's other keys."""
+    path = project_v7.project / ticketstore.USER_CONFIG_REL
+    before = path.read_bytes()
+    real_is_file, real_read_bytes = Path.is_file, Path.read_bytes
+
+    def is_file(self, *args, **kwargs):
+        return False if self == path else real_is_file(self, *args, **kwargs)
+
+    def read_bytes(self):
+        if self == path:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    with pytest.raises(ticketstore.TicketStoreError, match="Permission denied"):
+        ticketstore.redirect_mount_store(project_v7.project, tmp_path / "store")
+    monkeypatch.undo()
+    assert path.read_bytes() == before

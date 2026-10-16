@@ -524,7 +524,10 @@ def redirect_mount_store(mount_project: Path, main_store: Path) -> None:
     rewritten or the merged value is not ``main_store``."""
     path = mount_project / USER_CONFIG_REL
     try:
-        text = path.read_bytes().decode("utf-8") if path.is_file() else ""
+        try:  # only absence reads as empty: Path.is_file folds any stat fault to False
+            text = path.read_bytes().decode("utf-8")
+        except (FileNotFoundError, NotADirectoryError):
+            text = ""
         data = redirected_user_config_text(text, main_store).encode("utf-8")
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_bytes(path, data)
