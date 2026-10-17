@@ -79,7 +79,8 @@ committed one gets its retrospective (``gates.retrospective = "auto"``:
 closure recorded in ``RunState.ticket_epic_closures`` and a pause at
 ``epic-boundary`` for a person to close it with bmad-ticket — bmad-loop never
 writes the epic file. A ``rejected`` verdict pauses every later pick while the
-epic stays open; any other pauses once.
+epic stays open; any other pauses once. A ``--story`` run admits no epic, so it
+finishes past the epic its ticket finished.
 """
 
 from __future__ import annotations
@@ -112,6 +113,7 @@ from .model import (
     PAUSE_SPEC_APPROVAL,
     PAUSE_TICKET_TREE,
     Phase,
+    RunState,
     StoryTask,
     TicketBinding,
     VerifyOutcome,
@@ -159,6 +161,12 @@ from .worksource import WorkRef, WorkSource
 
 TicketTreeFactory = Callable[[Path, str | None], TicketTreeLike]
 """Builds the run's tree from ``(project_root, pinned_initiative)``."""
+
+
+def _pick_scope(state: RunState) -> PickScope:
+    """The ``--epic``/``--story`` selector as ``run`` resolved it into state."""
+    return PickScope(state.ticket_epic_filter, state.story_filter or "")
+
 
 PLAN_WRITE_REASONS: Mapping[tuple[SpecWriteReason, str], PlanWriteReason] = {
     # a kept branch adopted as finished: the orchestrator's acceptance (built → done)
@@ -346,7 +354,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             lambda: self.ticket_tree,
             lambda: self.state.ticket_story_approvals,
             lambda: self.state.ticket_epic_closures,
-            lambda: PickScope(self.state.ticket_epic_filter, self.state.story_filter or ""),
+            lambda: _pick_scope(self.state),
             acked_get=lambda: self.state.ticket_epic_closure_acked,
         )
 
@@ -570,15 +578,15 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
           set by the resume prologue): the run stopped between recording the
           closure and pausing for it, so pause for it now.
 
-        bmad-loop never writes the epic's file: its status is read, never set."""
-        steps = epic_boundary(
-            status_view,
-            self.state.ticket_epic_closures,
-            frozenset(self.state.ticket_epic_closure_acked),
-            self._committed_epics(),
-            resumed=frozenset(self.state.ticket_epic_closure_resumed),
-        )
-        for step in steps:
+        Only the epics the run's selector admits (:meth:`PickScope.admits_epic`)
+        are checked: a ``--story`` run admits none, so the epic its ticket
+        finished is left to a later run (:meth:`_run_end_retrospective` journals
+        it). bmad-loop never writes the epic's file: its status is read, never
+        set."""
+        scope = _pick_scope(self.state)
+        for step in self._epic_boundary_steps(status_view):
+            if not scope.admits_epic(step.slug):
+                continue
             if step.action == BOUNDARY_ACK:
                 self._ack_epic_closure(step)
                 continue
@@ -601,6 +609,15 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                     )
                 )
 
+    def _epic_boundary_steps(self, status_view: StatusView) -> list[EpicBoundary]:
+        return epic_boundary(
+            status_view,
+            self.state.ticket_epic_closures,
+            frozenset(self.state.ticket_epic_closure_acked),
+            self._committed_epics(),
+            resumed=frozenset(self.state.ticket_epic_closure_resumed),
+        )
+
     def _ack_epic_closure(self, step: EpicBoundary) -> None:
         """The operator resumed past an epic's one closure pause without closing
         it: acknowledge it so it never pauses again, and say so once."""
@@ -621,8 +638,11 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         that cannot be read journals ``retro-run-end-skipped``
         (``board-unreadable``) and pauses at ``ticket-tree``, as the pick's own
         read fault does: the epics this run committed are known to this run only,
-        so finishing would lose the boundary for good. Store commits a landed
-        mark still owes are settled first (:meth:`_settle_owed_store_commits`)."""
+        so finishing would lose the boundary for good. An epic this run finished
+        outside its selector (a ``--story`` run's) journals
+        ``retro-run-end-skipped`` (``out-of-scope``) instead. Store commits a
+        landed mark still owes are settled first
+        (:meth:`_settle_owed_store_commits`)."""
         self._settle_owed_store_commits()
         try:
             status_view = self.ticket_tree.status()
@@ -631,6 +651,12 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 "retro-run-end-skipped", epic=0, reason="board-unreadable", error=str(e)
             )
             self._pause_ticket_pick(Halt("tree-fault", "", None, f"tickets.py {e.kind}: {e}"))
+        scope = _pick_scope(self.state)
+        for step in self._epic_boundary_steps(status_view):
+            if step.action == BOUNDARY_RETRO and not scope.admits_epic(step.slug):
+                self.journal.append(
+                    "retro-run-end-skipped", epic=0, epic_ref=step.slug, reason="out-of-scope"
+                )
         self._ticket_epic_boundary_check(status_view)
 
     def _retro_doc(self, slug: str) -> Path:

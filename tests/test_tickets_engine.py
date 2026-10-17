@@ -2522,6 +2522,42 @@ def test_ticket_epic_boundary_fires_at_pick_after_resume(project_v7):
     assert state.ticket_epic_closures == {"epic-cart": "accepted"}
 
 
+@pytest.mark.parametrize(
+    ("scope", "paused"),
+    [({"story_filter": "1.1"}, False), ({"ticket_epic_filter": "epic-cart"}, True)],
+    ids=["story", "epic"],
+)
+def test_story_scope_run_finishes_past_the_epic_its_ticket_finished(project_v7, scope, paused):
+    """A `--story` run admits no epic-level cause: the ticket finishing its epic
+    commits, no retro runs, `retro-run-end-skipped` names the epic
+    `out-of-scope` and the run finishes; an `--epic` run on that epic still
+    pauses for its closure. Ablation (performed): drop the `admits_epic` filter
+    in `_ticket_epic_boundary_check` and the `--story` run pauses at
+    `epic-boundary` — this FAILS."""
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy("never"),
+        script=[_builds_finishing(project_v7, tree, plan)],
+        **scope,
+    )
+
+    assert engine.run().paused is paused
+
+    state = load_state(engine.run_dir)
+    assert state.tasks["1.1"].phase == Phase.DONE
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    if paused:
+        assert (state.paused_stage, state.paused_story_key) == (PAUSE_EPIC_BOUNDARY, "epic-cart")
+        assert _kinds(engine, "retro-run-end-skipped") == []
+        return
+    assert state.finished and state.ticket_epic_closures == {}
+    [skipped] = _kinds(engine, "retro-run-end-skipped")
+    assert (skipped["epic_ref"], skipped["reason"]) == ("epic-cart", "out-of-scope")
+
+
 @pytest.mark.parametrize("mode", ["never", "notify"])
 def test_retro_never_still_pauses_for_closure(project_v7, mode):
     """`gates.retrospective` `never` or `notify` runs no retro session, but the
