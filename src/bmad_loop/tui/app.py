@@ -35,6 +35,7 @@ from .. import (
     policy,
     resolve,
     runs,
+    runsetup,
     stories,
     ticketstore,
     verify,
@@ -1363,13 +1364,16 @@ class BmadLoopApp(App[None]):
             # edit, and the refusal must be about the same mode the re-arm is told.
             conflict = bmadconfig.worktree_isolation_conflict(paths, isolation)
             if conflict is None:
-                # the ticket-store refusal `_prepare_resume_locked` makes next, with
-                # the topology the run recorded (tickets mode only)
+                # the sweep's initiative pin and the ticket-store refusal
+                # `_prepare_resume_locked` makes next, with the topology the run
+                # recorded (tickets mode only)
                 try:
                     recorded = load_state(run_dir)
                 except (OSError, KeyError, ValueError):
                     recorded = None  # the locked re-read below names an unreadable state
                 if recorded is not None:
+                    conflict = runsetup.sweep_initiative_conflict(recorded, paths)
+                if recorded is not None and conflict is None:
                     conflict = ticketstore.store_conflict(
                         self.project,
                         runs.judged_store_source(
@@ -1429,6 +1433,13 @@ class BmadLoopApp(App[None]):
                     )
                     return
                 if paths is not None:
+                    # the initiative pin, re-judged on the state the re-arm writes:
+                    # the lock-free judgment above skips a state it could not read
+                    if (
+                        pinned := runsetup.sweep_initiative_conflict(fresh_state, paths)
+                    ) is not None:
+                        self.notify(pinned, severity="error")
+                        return
                     if (moved := runs.restamp_code_root(run_dir, paths.repo_root)) is not None:
                         self.notify(moved, severity="warning")
                 outcome = runs.rearm_escalation(

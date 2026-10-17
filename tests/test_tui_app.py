@@ -8133,8 +8133,12 @@ def test_escalation_rearm_judges_a_v7_sweeps_store_as_a_tickets_run(project_v7, 
     from conftest import escalated_run
 
     from bmad_loop import runs, ticketstore
+    from bmad_loop.journal import load_state
 
     run_dir = escalated_run(project_v7.project, "r1", story_key="1", run_type="sweep").run_dir
+    state = load_state(run_dir)
+    state.initiative = project_v7.initiative  # pinned at launch, as `compose_sweep` does
+    save_state(run_dir, state)
 
     def conflict(_project, store_source, _isolation, *, recorded=None):
         return "the ticket store is not supported" if store_source == "tickets" else None
@@ -8150,6 +8154,63 @@ def test_escalation_rearm_judges_a_v7_sweeps_store_as_a_tickets_run(project_v7, 
     app._do_rearm(run_dir.name, run_dir, "1")
 
     assert "the ticket store is not supported" in notes
+
+
+def test_escalation_rearm_refuses_a_sweep_on_a_switched_initiative(project_v7, monkeypatch):
+    """`cli.cmd_resolve`'s re-arm parity for the sweep's initiative pin: a v7 sweep
+    started with no initiative active, re-armed while one is, is toasted with the
+    pin's fix text before the escalation is spent — the detached resume would refuse
+    it only after `runs.rearm_escalation` had consumed it. Ablation (performed):
+    delete both `sweep_initiative_conflict` checks in `_do_rearm` and the gesture
+    re-arms."""
+    from conftest import escalated_run
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir = escalated_run(project_v7.project, "r1", story_key="1", run_type="sweep").run_dir
+    before = load_state(run_dir)
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed"))
+    notes: list[str] = []
+    app = BmadLoopApp(project_v7.project)
+    monkeypatch.setattr(app, "notify", lambda msg, **_k: notes.append(str(msg)))
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: pytest.fail("resumed"))
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert any("started on no active initiative" in note for note in notes)
+    assert load_state(run_dir) == before
+
+
+def test_escalation_rearm_rejudges_a_sweeps_initiative_under_the_lock(project_v7, monkeypatch):
+    """The pin is judged again on the state re-read under the run lock, the state
+    the re-arm writes: the lock-free judgment skips a state it could not read.
+    Ablation (performed): delete the locked `sweep_initiative_conflict` check in
+    `_do_rearm` and the gesture re-arms."""
+    from conftest import escalated_run
+
+    from bmad_loop import runs, runsetup
+
+    run_dir = escalated_run(project_v7.project, "r1", story_key="1", run_type="sweep").run_dir
+    judged: list = []
+
+    def judge(state, paths):
+        judged.append(state)
+        return "initiative switched" if len(judged) > 1 else None
+
+    monkeypatch.setattr(runsetup, "sweep_initiative_conflict", judge)
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed"))
+    notes: list[str] = []
+    app = BmadLoopApp(project_v7.project)
+    monkeypatch.setattr(app, "notify", lambda msg, **_k: notes.append(str(msg)))
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: pytest.fail("resumed"))
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert len(judged) == 2
+    assert "initiative switched" in notes
 
 
 @pytest.mark.parametrize(
