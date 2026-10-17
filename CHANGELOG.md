@@ -49,8 +49,8 @@ breaking changes may land in a minor release.
   before its closure, and the resume commits it. A store
   inside a renamed project moves with it. `confirm` commits a store plan in the store's
   own repository.
-- Add `Bmad-Ticket:` and `Bmad-Plan:` trailers to tickets unit commits, and name worktree
-  unit branches `bmad-loop/<run>/<epic-slug>/<ref>`.
+- Add a `Bmad-Ticket:` trailer to tickets unit commits, plus `Bmad-Plan:` when the plan lies
+  inside the code checkout, and name worktree unit branches `bmad-loop/<run>/<epic-slug>/<ref>`.
 - Add tickets mode to `run --dry-run` (build order, dispatches, the first pause) and the
   `run --epic` / `--story` selectors (an epic id or slug, a ticket ref).
 - Harvest a ticket plan's `deferred:` findings into the initiative's `deferred-work.md`,

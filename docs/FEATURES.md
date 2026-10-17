@@ -25,7 +25,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Board writes never move a row backward. The only exception is done → awaiting-operator, and only when the caller explicitly opts in.
   - Board updates are serialized across processes, so two concurrent bmad-loop processes cannot interleave an advance.
   - A session completes only on a hook Stop event or on window death, never because of what the model writes in its reply.
-  - In tickets mode there is no board: bmad-loop is the only writer of a ticket plan's status during a run, through `tickets.py mark`, and the plan reaches `done` only after verify and review.
+  - In tickets mode there is no board: the build skill writes a plan's status during its own session, every other status write during a run is bmad-loop's, through `tickets.py mark`, and the plan reaches `done` only after verify and review.
 - **Config:** `bmad-loop run --epic N`, `bmad-loop run --story KEY`, `bmad-loop run --max-stories N`, `bmad-loop run --dry-run`; `[limits] max_dev_attempts`
 - **Tested by:** `tests/test_engine.py`, `tests/test_statemachine.py`, `tests/test_sprintstatus_advance.py`, `tests/test_tickets_engine.py`
 - **Docs:** [CLI reference: run](reference/cli.md#run), [Configuration: [limits]](reference/configuration.md#limits), [Run state reference](reference/run-state.md)

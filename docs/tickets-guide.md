@@ -70,7 +70,7 @@ Tickets this run already touched are routed by their task state, never re-dispat
 
 `bmad-loop run --epic <id|slug>` limits picks to one epic; the slug may omit its `epic-` prefix. `--story <ref>` runs one ticket, resolved through `tickets.py find`; it must be ready to start or refine. `bmad-loop run --dry-run` prints the build order, each `ticket <ref>` dispatch and the first pause a run would reach, and marks nothing.
 
-A unit's commit carries `Bmad-Ticket:` and `Bmad-Plan:` trailers. Under worktree isolation its branch is `bmad-loop/<run>/<epic-slug>/<ref>`.
+A unit's commit carries a `Bmad-Ticket:` trailer, and a `Bmad-Plan:` trailer when the plan lies inside the code checkout (an external store's plan has none). Under worktree isolation its branch is `bmad-loop/<run>/<epic-slug>/<ref>`.
 
 ## Pauses and how to clear them
 
