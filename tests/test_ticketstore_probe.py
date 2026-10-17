@@ -275,6 +275,30 @@ def test_store_conflict_refuses_a_store_that_changed_since_the_run_started(
     assert text is not None and "changed since this run started" in text
 
 
+def test_store_conflict_refuses_a_recorded_store_whose_initiative_is_gone(
+    project_v7_store_repo,
+):
+    """An initiative folder deleted under a paused run leaves nothing to classify:
+    with nothing recorded that is no refusal (the tickets preflight reports it), but
+    against the topology the run recorded the store it started on is gone — a
+    resumed sweep, which no tickets preflight covers, would read its ledger as
+    absent. Ablation (performed): return None for an unclassified store in
+    `store_topology_conflict` and the recorded row FAILS."""
+    layout = project_v7_store_repo
+    recorded = ticketstore.assess_store(
+        bmadconfig.load_paths(layout.project, want_tickets=True), "none"
+    )
+    assert isinstance(recorded, StoreTopology)
+    remove_tree(layout.initiative_folder)
+
+    assert ticketstore.store_conflict(layout.project, "tickets", "none") is None
+    text = ticketstore.store_conflict(
+        layout.project, "tickets", "none", recorded=recorded.to_dict()
+    )
+    assert text is not None and "no initiative folder to classify" in text
+    assert str(recorded.store_root) in text
+
+
 def test_redirect_mount_store_rewrites_the_user_layer(project_v7, tmp_path):
     """The mount's personal layer points `output_folder` at the main store, the
     other keys kept, and the merged config reads it back the way tickets.py does."""

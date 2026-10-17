@@ -277,20 +277,32 @@ def classify_store(facts: StoreFacts, isolation: str) -> StoreTopology | StoreRe
 
 
 def store_topology_conflict(
-    result: StoreTopology | StoreRefusal, *, recorded: Mapping[str, object] | None = None
+    result: StoreTopology | StoreRefusal | None, *, recorded: Mapping[str, object] | None = None
 ) -> str | None:
     """The refusal message for a store tickets runs cannot drive, or None.
 
     Refused: every :class:`StoreRefusal`, and a topology that differs from the one
     a run ``recorded`` at its start (resume re-validates — a store that moved under
-    a running ticket tree would mark plans the run never read). Every classified
-    layout runs: T1 is marked inside the commit window, the shared layouts after the
-    code lands.
+    a running ticket tree would mark plans the run never read). A ``result`` of
+    None (:func:`assess_store`: no initiative folder to classify) is refused only
+    against a recorded topology — the store the run started on is gone, and a
+    resumed sweep, which no tickets preflight covers, would read its ledger as
+    absent. Every classified layout runs: T1 is marked inside the commit window,
+    the shared layouts after the code lands.
 
     Sole producer of the text, shared by validate, the run/sweep/resume/resolve
     preflights, the dry-run banner, the auto-sweep factory and the TUI guards."""
     if isinstance(result, StoreRefusal):
         return _refusal_text(result)
+    if result is None:
+        if not recorded:
+            return None
+        return (
+            f"the ticket store changed since this run started: it was "
+            f"{recorded.get('layout')} ({recorded.get('store_root')}) and there is now "
+            "no initiative folder to classify — a run marks plans only in the store it "
+            "started on. Restore the initiative folder, or start a new run."
+        )
     if recorded is not None and result.to_dict() != dict(recorded):
         was = recorded.get("layout")
         return (
@@ -578,10 +590,7 @@ def store_conflict(
         paths = bmadconfig.load_paths(project, want_tickets=True)
     except bmadconfig.BmadConfigError as e:
         return f"cannot read the BMAD config to classify the ticket store: {e}"
-    result = assess_store(paths, isolation)
-    if result is None:
-        return None
-    return store_topology_conflict(result, recorded=recorded or None)
+    return store_topology_conflict(assess_store(paths, isolation), recorded=recorded or None)
 
 
 def with_shared_store(

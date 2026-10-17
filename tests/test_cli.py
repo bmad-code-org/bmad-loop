@@ -13409,6 +13409,51 @@ def test_resume_tickets_accepts_a_store_moved_with_the_project(project, capsys, 
     assert len(built) == 1
 
 
+def test_sweep_resume_refuses_a_recorded_store_whose_initiative_is_gone(
+    project, capsys, monkeypatch
+):
+    """A v7 sweep paused on its initiative, whose folder is then deleted, keeps the
+    same `active_initiative`, so the initiative pin passes, and no tickets preflight
+    covers a sweep — resume refuses on the store it recorded instead, before any
+    engine is built, rather than reading the ledger as absent. No real spawn.
+    Ablation (performed): return None for an unclassified store in
+    `ticketstore.store_topology_conflict` and this FAILS (the engine is built)."""
+    from conftest import remove_tree
+
+    from bmad_loop import bmadconfig, runs, ticketstore
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    paths = bmadconfig.load_paths(project.project, want_tickets=True)
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-5709",
+        run_type="sweep",
+        initiative=V7_DEFAULT_INITIATIVE,
+        store_topology=topology.to_dict(),
+        paused_reason="operator stop",
+        paused_stage="escalation",
+        policy_snapshot=LAUNCH_SNAPSHOT,
+    )
+    assert paths.initiative_folder is not None
+    remove_tree(paths.initiative_folder)
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    built: list[dict] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(cli, "SweepEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "no initiative folder to classify" in capsys.readouterr().err
+    assert built == []
+
+
 def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):
     """`run` refuses a store layout tickets runs cannot drive — here an initiative
     folder the code repository neither tracks nor ignores — through
