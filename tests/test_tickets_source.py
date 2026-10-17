@@ -664,6 +664,30 @@ def test_source_remaining_estimate(tmp_path: Path):
     assert _source(tree).remaining_estimate({"1.1": Phase.DEFERRED}) == 1
 
 
+def test_source_remaining_estimate_counts_only_the_scope(tmp_path: Path):
+    """A `--epic` or `--story` run estimates only the tickets its scope admits:
+    the rest of the initiative is never picked, so it is not left for a resume.
+
+    Ablation (performed): drop the `scope.admits` filter and both scoped
+    estimates count every open ticket — this FAILS."""
+    tree = FakeTicketTree.from_rows(
+        tmp_path,
+        ready_to_start=(
+            ticket_row("1.1"),
+            ticket_row("1.2"),
+            ticket_row("2.1", epic=CHECKOUT),
+        ),
+    )
+
+    def scoped(scope: ts.PickScope) -> ts.TicketsWorkSource:
+        return ts.TicketsWorkSource(lambda: tree, list, dict, lambda: scope)
+
+    assert scoped(ts.EVERYTHING).remaining_estimate({}) == 3
+    assert scoped(ts.PickScope(epic=CHECKOUT)).remaining_estimate({}) == 1
+    assert scoped(ts.PickScope(ref="1.2")).remaining_estimate({}) == 1
+    assert scoped(ts.PickScope(ref="1.2")).remaining_estimate({"1.2": Phase.DEFERRED}) == 0
+
+
 def _boundary(views, closures=None, acked=(), committed=(CART,), resumed=()):
     _, status_view = views
     return [

@@ -748,14 +748,18 @@ class TicketsWorkSource:
         return Pick()
 
     def remaining_estimate(self, phases: Mapping[str, Phase]) -> int:
-        """Open tickets this run has not touched and that are not already in
-        review. A read error raises; the engine reads that as no estimate."""
+        """Open tickets in the run's scope that it has not touched and that are
+        not already in review. A read error raises; the engine reads that as no
+        estimate."""
         status_view = self._tree_get().status()
         touched = {key for key, phase in phases.items() if phase != Phase.ESCALATED}
+        scope = self._scope_get()
         return sum(
             1
             for row in status_view.tickets
-            if row.state not in (*_TICKET_FINISHED, "review") and row_label(row) not in touched
+            if row.state not in (*_TICKET_FINISHED, "review")
+            and row_label(row) not in touched
+            and scope.admits(row)
         )
 
     # ----------------------------------------------- no epics: inert answers
