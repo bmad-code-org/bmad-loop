@@ -7186,7 +7186,7 @@ def test_a_claim_that_did_not_land_is_journaled(tmp_path, monkeypatch, capsys):
     from bmad_loop.tui import launch
 
     run_dir = _escalated_run(tmp_path, "r1")
-    monkeypatch.setattr(launch, "claim_ctl_window", lambda _p, _rid: "record not written")
+    monkeypatch.setattr(launch, "claim_ctl_window", lambda _p, _rid, **_k: "record not written")
     cli._claim_ctl_window(tmp_path, run_dir)
     assert "warning: record not written" in capsys.readouterr().err
     entries = [e for e in Journal(run_dir).entries() if e["kind"] == "ctl-window-claim-failed"]
@@ -7204,7 +7204,7 @@ def test_a_claim_that_raises_does_not_abort_the_resume(tmp_path, monkeypatch, ca
 
     run_dir = _escalated_run(tmp_path, "r1")
 
-    def boom(_project, _run_id):
+    def boom(_project, _run_id, **_kw):
         raise MultiplexerError("no such backend: gone")
 
     monkeypatch.setattr(launch, "claim_ctl_window", boom)
@@ -7219,6 +7219,238 @@ def test_a_claim_that_raises_does_not_abort_the_resume(tmp_path, monkeypatch, ca
     monkeypatch.setattr(Journal, "append", unwritable)
     cli._claim_ctl_window(tmp_path, run_dir)
     assert "could not journal it: disk full" in capsys.readouterr().err
+
+
+def _ctl_launch_entries(run_dir):
+    from bmad_loop.journal import Journal
+
+    return [e for e in Journal(run_dir).entries() if e["kind"] == "ctl-window-claim-failed"]
+
+
+@pytest.mark.parametrize("marked", [True, False])
+def test_a_launched_resume_refused_before_accepting_is_journaled(
+    tmp_path, monkeypatch, capsys, marked
+):
+    # #925: a TUI-launched resume refused before accepting the run prints into
+    # a window nobody watches and leaves the record with an older window, so
+    # the refusal goes to the run's journal. Unmarked (typed in a shell, which
+    # shows the refusal) nothing is journaled. Ablation: drop the
+    # `_drive_ctl_launch` dispatch and the marked row has no entry; drop its
+    # `args.ctl_launch` gate and the unmarked row has one.
+    run_dir = _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _run_dir: "alive")
+    marker = ["--ctl-launch"] if marked else []
+    assert cli.main([*marker, "resume", "--project", str(tmp_path), "r1"]) == 1
+    assert "still live" in capsys.readouterr().err
+    errors = [e["error"] for e in _ctl_launch_entries(run_dir)]
+    if marked:
+        assert len(errors) == 1 and "still live" in errors[0]
+    else:
+        assert errors == []
+
+
+def test_a_launched_refusal_journals_every_line_it_printed_not_only_the_hint(
+    tmp_path, monkeypatch, capsys
+):
+    # A skills gate prints its FAIL lines and then a generic hint; the entry
+    # keeps them all, so the cause survives the window. Ablation: keep only the
+    # last line and the FAIL lines are missing.
+    run_dir = _escalated_run(tmp_path, "r1")
+
+    def refuse(_args):
+        print("FAIL: .claude/skills/bmad-build-auto not found", file=sys.stderr)
+        print("run `bmad-loop validate` for details", file=sys.stderr)
+        return 1
+
+    monkeypatch.setattr(cli, "cmd_resume", refuse)
+    args = argparse.Namespace(
+        func=refuse, project=str(tmp_path), run_id="r1", command="resume", ctl_launch=True
+    )
+    assert cli._drive_ctl_launch(args) == 1
+    capsys.readouterr()
+    [error] = [e["error"] for e in _ctl_launch_entries(run_dir)]
+    assert "FAIL: .claude/skills/bmad-build-auto not found" in error
+    assert "bmad-loop validate" in error
+    assert "still names the window of the launch before it" in error
+
+
+def test_a_launched_resume_that_accepted_then_failed_journals_no_refusal(tmp_path, monkeypatch):
+    # Past acceptance the run is this child's, and its failure the run's own
+    # story; the claim also hears the launch marker. Ablation: drop the
+    # `accepted` mark in `_claim_ctl_window` and a refusal entry appears.
+    from bmad_loop.tui import launch
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    heard: list[bool] = []
+
+    def claim(_project, _run_id, *, launched=False):
+        heard.append(launched)
+
+    def accept_then_fail(args):
+        cli._claim_ctl_window(tmp_path, run_dir)
+        return 1
+
+    monkeypatch.setattr(launch, "claim_ctl_window", claim)
+    monkeypatch.setattr(cli, "cmd_resume", accept_then_fail)
+    assert cli.main(["--ctl-launch", "resume", "--project", str(tmp_path), "r1"]) == 1
+    assert heard == [True]
+    assert _ctl_launch_entries(run_dir) == []
+
+
+def test_a_launched_resolve_refused_at_entry_is_journaled(tmp_path, capsys):
+    # The same trace through resolve's entry refusals. Ablation: drop
+    # `cmd_resolve` from the marked dispatch and the entry is missing.
+    run_dir = _escalated_run(tmp_path, "r1")
+    argv = ["--ctl-launch", "resolve", "--project", str(tmp_path), "r1", "--story", "nope"]
+    assert cli.main(argv) == 1
+    assert "no escalated story" in capsys.readouterr().err
+    errors = [e["error"] for e in _ctl_launch_entries(run_dir)]
+    assert len(errors) == 1 and "no escalated story" in errors[0]
+
+
+def test_a_launched_resume_that_raised_before_accepting_journals_the_reason(tmp_path, monkeypatch):
+    # `main` prints a folded exception only after the wrapper returns, so the
+    # wrapper takes the reason from the exception itself. Ablation: drop its
+    # `except` arm and the entry reads "exit 1".
+    run_dir = _escalated_run(tmp_path, "r1")
+
+    def raises(_args):
+        raise policy_mod.PolicyError("policy.toml is broken")
+
+    monkeypatch.setattr(cli, "cmd_resume", raises)
+    assert cli.main(["--ctl-launch", "resume", "--project", str(tmp_path), "r1"]) == 1
+    errors = [e["error"] for e in _ctl_launch_entries(run_dir)]
+    assert len(errors) == 1 and "policy.toml is broken" in errors[0]
+
+
+def test_a_refusal_journal_that_cannot_resolve_the_run_keeps_the_childs_outcome(
+    tmp_path, monkeypatch, capsys
+):
+    # The journaler runs in the wrapper's `finally`; a fault resolving the run
+    # there must not replace the child's return code or exception. Ablation:
+    # move the resolve back out of the guard and both rows raise OSError.
+    _escalated_run(tmp_path, "r1")
+
+    def unreadable_cwd(_args):
+        raise OSError("cwd is gone")
+
+    monkeypatch.setattr(cli, "_project", unreadable_cwd)
+
+    def refuse(_args):
+        return 1
+
+    def raises(_args):
+        raise policy_mod.PolicyError("policy.toml is broken")
+
+    def args(func):
+        return argparse.Namespace(
+            func=func, project=str(tmp_path), run_id="r1", command="resume", ctl_launch=True
+        )
+
+    assert cli._drive_ctl_launch(args(refuse)) == 1
+    with pytest.raises(policy_mod.PolicyError, match="policy.toml is broken"):
+        cli._drive_ctl_launch(args(raises))
+    assert capsys.readouterr().err.count("could not journal this refused launch: cwd is gone") == 2
+
+
+def test_a_refusal_journal_says_a_run_listing_fault_rather_than_reading_it_as_absence(
+    tmp_path, monkeypatch, capsys
+):
+    # An unlistable runs dir makes `resolve_run_dir` raise RunRefError for a
+    # run that is still there; the journaler must say so, not take it for "no
+    # run". Ablation: return silently on RunRefError and nothing is printed.
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(cli.runs, "_scan_run_dirs", lambda _project: ([], [], "denied"))
+    cli._journal_unaccepted_launch(
+        argparse.Namespace(project=str(tmp_path), run_id="r1", command="resume"), "refused"
+    )
+    err = capsys.readouterr().err
+    assert "could not journal this refused launch" in err
+    assert "the run listing is incomplete — denied" in err
+
+
+def test_a_refusal_journal_never_recreates_a_run_cleanup_removed(tmp_path, monkeypatch, capsys):
+    # Cleanup removes the run under the state lock; one removed between the
+    # journaler's first look and its lock must not be recreated by the append,
+    # and the refusal it could not record is said. Ablation: drop the in-lock
+    # `is_run` check and the run dir comes back; fall through silently on it and
+    # no warning is printed.
+    import shutil
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    real_lock = cli.state_lock
+
+    def cleanup_wins(target):
+        shutil.rmtree(run_dir)
+        return real_lock(target)
+
+    monkeypatch.setattr(cli, "state_lock", cleanup_wins)
+    cli._journal_unaccepted_launch(
+        argparse.Namespace(project=str(tmp_path), run_id="r1", command="resume"), "refused"
+    )
+    assert not run_dir.exists()
+    err = capsys.readouterr().err
+    assert "could not journal this refused launch: run 'r1' was removed" in err
+
+
+def test_a_refusal_journal_never_lands_in_a_run_its_id_only_suffixes(tmp_path, capsys):
+    # The refused run is gone; a re-resolve of its id would fall back to a
+    # suffix match. Ablation: journal through `runs.resolve_run_dir` and the
+    # entry lands in `other-r1`; return silently on the partial match and no
+    # warning is printed.
+    other = _escalated_run(tmp_path, "other-r1")
+    cli._journal_unaccepted_launch(
+        argparse.Namespace(project=str(tmp_path), run_id="r1", command="resume"), "refused"
+    )
+    assert _ctl_launch_entries(other) == []
+    err = capsys.readouterr().err
+    assert "could not journal this refused launch: run 'r1' is gone" in err
+    assert "'other-r1'" in err
+
+
+@pytest.mark.parametrize("raised", [False, True])
+def test_a_launched_refusal_with_one_huge_line_is_cut_before_journaling(
+    tmp_path, monkeypatch, capsys, raised
+):
+    # The line trim bounds the count, not a line, and an exception's message
+    # skips it. Ablation: drop the cut in `_journal_unaccepted_launch` and the
+    # entry holds the whole scalar in both rows.
+    run_dir = _escalated_run(tmp_path, "r1")
+    huge = "x" * 100_000
+
+    def refuse(_args):
+        if raised:
+            raise policy_mod.PolicyError(f"bad scalar {huge}")
+        print(f"bad scalar {huge}", file=sys.stderr)
+        return 1
+
+    args = argparse.Namespace(
+        func=refuse, project=str(tmp_path), run_id="r1", command="resume", ctl_launch=True
+    )
+    if raised:
+        with pytest.raises(policy_mod.PolicyError):
+            cli._drive_ctl_launch(args)
+    else:
+        assert cli._drive_ctl_launch(args) == 1
+    capsys.readouterr()
+    [error] = [e["error"] for e in _ctl_launch_entries(run_dir)]
+    assert "bad scalar x" in error and "more chars cut]" in error
+    assert len(error) < cli._CTL_REFUSAL_MAX_CHARS + 500
+
+
+def test_a_refusal_journal_never_lands_outside_the_runs_dir(tmp_path):
+    # A command can refuse its ref before normalizing `args.run_id`, so the
+    # journaler must not recompose a raw ref into a path. Ablation: journal
+    # through `runs.run_dir_for` and the outside run gets an entry.
+    outside = _escalated_run(tmp_path / "elsewhere", "r9")
+    project = tmp_path / "project"
+    runs_dir = runs.run_dir_for(project, "x").parent
+    runs_dir.mkdir(parents=True)  # POSIX resolves `..` only through a real dir
+    ref = os.path.relpath(outside, runs_dir)
+    cli._journal_unaccepted_launch(
+        argparse.Namespace(project=str(project), run_id=ref, command="resume"), "refused"
+    )
+    assert _ctl_launch_entries(outside) == []
 
 
 def test_resolve_claims_nothing_before_its_entry_refusals(tmp_path, monkeypatch, capsys):

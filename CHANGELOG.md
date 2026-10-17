@@ -150,6 +150,9 @@ breaking changes may land in a minor release.
 - TUI: record a resume or resolve window as the run's control window only once its child
   accepts the run, so a resume refused as "still live" no longer sends attach and `x` to
   its own window while the engine runs in another (#920).
+- TUI: journal `ctl-window-claim-failed` when a TUI-launched resume or resolve cannot
+  prove it runs in a control session, or exits before accepting the run, instead of
+  keeping the previous launch's window record and leaving no trace (#925).
 - Report a pre-upgrade control session in this project's own registry at
   `cleanup --json` `sessions.superseded_ctl_sessions` and in its own TUI toast, not in
   `sessions.legacy_leftovers` or the `not migrated` line, which again name only what a

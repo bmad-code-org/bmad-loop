@@ -277,6 +277,9 @@ RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resolve_adopt"),
     ("cli.py", "_resolve_reverify"),
     ("cli.py", "_resolve_abandon"),
+    # #925: a refused TUI-launched child's journal row, under the hold cleanup
+    # removes the run in, so the append never recreates a removed run dir
+    ("cli.py", "_journal_unaccepted_launch"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
     ("runs.py", "rearm_for_reverify"),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
@@ -5299,6 +5300,42 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants
 
 
+class _CtlLaunch:
+    """A TUI-launched resume/resolve in flight (`--ctl-launch`, see
+    `_drive_ctl_launch`): whether it has accepted its run yet, and the lines it
+    wrote to stderr before that — the refusal, when it exits before accepting.
+    Every line, not the last: a gate prints its `FAIL:` lines and then a generic
+    hint. A pass-through for every other stream attribute."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self.accepted = False
+        self.lines: list[str] = []
+
+    def write(self, text: str) -> int:
+        if not self.accepted:
+            # ponytail: capped so a chatty refusal cannot bloat the journal entry;
+            # one huge line is bounded by `_CTL_REFUSAL_MAX_CHARS` instead.
+            self.lines.extend(line.strip() for line in text.splitlines() if line.strip())
+            del self.lines[:-20]
+        return self._stream.write(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+# ponytail: process-wide, which is what the flag is — one command per process.
+_ctl_launch: _CtlLaunch | None = None
+
+# The most of a refused launch's reason one journal entry keeps: the line trim
+# bounds the count, not a line (a validator echoing one huge policy scalar), and
+# an exception's message skips it.
+_CTL_REFUSAL_MAX_CHARS = 4000
+
+
 def _claim_ctl_window(project: Path, run_dir: Path) -> None:
     """Publish the control window this process runs in as the run's, once this
     process has accepted the run (`tui.launch.claim_ctl_window`). The caller holds
@@ -5315,8 +5352,11 @@ def _claim_ctl_window(project: Path, run_dir: Path) -> None:
     from .adapters.multiplexer import MultiplexerError
     from .tui import launch  # import-safe: launch.py has no textual imports
 
+    ctl = _ctl_launch
+    if ctl is not None:
+        ctl.accepted = True
     try:
-        warning = launch.claim_ctl_window(project, run_dir.name)
+        warning = launch.claim_ctl_window(project, run_dir.name, launched=ctl is not None)
     except (MultiplexerError, OSError) as exc:
         warning = f"could not record this window as run {run_dir.name}'s control window: {exc}"
     if warning is not None:
@@ -5325,6 +5365,82 @@ def _claim_ctl_window(project: Path, run_dir: Path) -> None:
             Journal(run_dir).append("ctl-window-claim-failed", error=warning)
         except OSError as exc:
             print(f"warning: could not journal it: {exc}", file=sys.stderr)
+
+
+def _drive_ctl_launch(args: argparse.Namespace) -> int:
+    """Run a TUI-launched resume/resolve, and journal it when it exits non-zero
+    before accepting the run (#925). Such a child refuses into a detached window
+    nobody is watching, and leaves the record with an older window, so without
+    this its refusal is on no durable record. Acceptance is `_claim_ctl_window`,
+    the point every drive path passes under the run's state lock; a child that
+    accepted and then failed is the run's own story, already journaled."""
+    global _ctl_launch
+    ctl = _ctl_launch = _CtlLaunch(sys.stderr)
+    rc: int = ExitCode.FAILURE
+    try:
+        with contextlib.redirect_stderr(ctl):
+            rc = args.func(args)
+    except BaseException as e:
+        ctl.lines.append(str(e) or type(e).__name__)
+        raise
+    finally:
+        _ctl_launch = None
+        if rc != ExitCode.OK and not ctl.accepted:
+            _journal_unaccepted_launch(args, "; ".join(ctl.lines) or f"exit {rc}")
+    return rc
+
+
+def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
+    """Journal why a TUI-launched child did not drive its run, under the run's
+    state lock and only into a run that still exists (cleanup removes one under
+    the same hold). Best-effort, and loudly so: the child is already exiting.
+
+    Re-resolved through `resolve_run_dir`, which never recomposes a ref that
+    could escape the runs dir (a command can refuse its ref before normalizing
+    `args.run_id`), and kept only on an exact-name hit: the command normalized
+    `args.run_id` to the run it resolved, and a removed run's id would otherwise
+    fall back to a suffix match and journal into another run.
+
+    The resolve sits inside the guard too: this runs in `_drive_ctl_launch`'s
+    `finally`, so a raise from it would replace the child's own exception or
+    return code. A `RunRefError` is said like any other fault, never read as
+    absence: an incomplete run listing raises one for a run that is still
+    there, and a silent return would strand the refusal again. A partial match is
+    said too: it is not journaled into, so the refusal is on no record. So is a run
+    cleanup removed between the resolve and the lock.
+
+    The reason is cut to `_CTL_REFUSAL_MAX_CHARS`, so a huge refusal cannot bloat
+    every failed resume's journal row."""
+    if len(reason) > _CTL_REFUSAL_MAX_CHARS:
+        cut = len(reason) - _CTL_REFUSAL_MAX_CHARS
+        reason = f"{reason[:_CTL_REFUSAL_MAX_CHARS]}… [{cut} more chars cut]"
+    try:
+        run_dir = runs.resolve_run_dir(_project(args), args.run_id)
+        if run_dir.name != args.run_id:
+            # a partial match, not the run this command resolved
+            print(
+                f"warning: could not journal this refused launch: run {args.run_id!r} "
+                f"is gone; its id only matches run {run_dir.name!r}",
+                file=sys.stderr,
+            )
+            return
+        with state_lock(run_dir):
+            if not runs.is_run(run_dir):
+                # cleanup removed it after the resolve: said, never recreated
+                print(
+                    f"warning: could not journal this refused launch: run {args.run_id!r} "
+                    "was removed before its journal could be written",
+                    file=sys.stderr,
+                )
+                return
+            Journal(run_dir).append(
+                "ctl-window-claim-failed",
+                error=f"a TUI-launched {args.command} exited before driving the run: "
+                f"{reason} — the run's control-window record still names the window "
+                "of the launch before it",
+            )
+    except Exception as e:
+        print(f"warning: could not journal this refused launch: {e}", file=sys.stderr)
 
 
 def _unresumable_source(state: RunState) -> str | None:
@@ -6715,6 +6831,10 @@ def _resolve_reverify_finished(
         f"minted replay run {replay_id} for {story_key} (replay of {args.run_id}) — "
         "verify replays on resume"
     )
+    # From here the command drives the replay run, so a TUI-launched child refused
+    # before accepting it journals there (`_journal_unaccepted_launch`), not into
+    # the finished run.
+    args.run_id = replay_id
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {replay_id}")
         return 0
@@ -8856,6 +8976,9 @@ def main(argv: list[str] | None = None) -> int:
     # deliver them (a stale multiplexer server, #731; `PSMUX_BARE_ENV`, #730).
     parser.add_argument("--state-root", help=argparse.SUPPRESS)
     parser.add_argument("--registry-root", help=argparse.SUPPRESS)
+    # Hidden, composed the same way: this process runs in a window the launcher
+    # minted (`_drive_ctl_launch`, `tui.launch.claim_ctl_window`, #925).
+    parser.add_argument("--ctl-launch", action="store_true", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name: str, func, help: str, *, aliases=()) -> argparse.ArgumentParser:
@@ -9383,6 +9506,8 @@ def main(argv: list[str] | None = None) -> int:
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux
         # without ever loading policy, so this is the one reliable seam.
         _configure_mux(_project(args))
+        if args.ctl_launch and args.func in (cmd_resume, cmd_resolve):
+            return _drive_ctl_launch(args)
         return args.func(args)
     except (
         bmadconfig.BmadConfigError,

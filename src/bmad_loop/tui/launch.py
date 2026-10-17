@@ -368,11 +368,19 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
         _forget_ctl_window(project, run_id)
 
 
-def claim_ctl_window(project: Path, run_id: str) -> str | None:
+def claim_ctl_window(project: Path, run_id: str, *, launched: bool = False) -> str | None:
     """Publish the control-session window this process runs in as the run's
     control window. Returns operator wording when the record did not land, None
     when it did or when this process is not in a control session at all (a
     resume typed in the operator's own shell owns no window to record).
+
+    `launched` is the process's own word that start_detached minted its window
+    (the hidden `--ctl-launch`). It is what tells an unanswered session probe
+    apart from an operator's shell: `current_session()` answers None for both,
+    so a launched child whose probe failed would otherwise keep the previous
+    launch's record and say nothing (#925). Launched but not provably in a
+    control session drops the record and warns, as a window that cannot name
+    itself does.
 
     Called by the child a launch started (start_detached), at the moment it
     accepts the run: under the run's state lock, after its liveness re-check
@@ -391,16 +399,23 @@ def claim_ctl_window(project: Path, run_id: str) -> str | None:
     The window's name is not checked: ctl_window_id re-proves the record against
     this run's tagged `<kind>-<run_id>` rows, so a record naming any other
     window (a shell window an operator typed the resume in) is ignored there."""
-    if not in_ctl_session():
-        return None
-    win_id = get_multiplexer().current_window_id()
+    try:
+        in_ctl = in_ctl_session()
+        if not in_ctl and not launched:
+            return None
+        win_id = get_multiplexer().current_window_id() if in_ctl else None
+    except MultiplexerError:
+        if not launched:
+            raise
+        win_id = None  # a launched child's probe that raised went unanswered too
     if win_id:
         _record_ctl_window(project, run_id, win_id)
         if _read_ctl_window(project, run_id) == win_id:
             return None
     else:
-        # In a control window that cannot name itself: the previous record names
-        # a window this run no longer drives from, so drop it.
+        # In a control window that cannot name itself, or a launched one whose
+        # session probe went unanswered: the previous record names a window this
+        # run no longer drives from, so drop it.
         _forget_ctl_window(project, run_id)
     return (
         f"this window could not be recorded as run {run_id}'s control window — "
@@ -1362,7 +1377,9 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     drift = _registry_drift(project, mux)
     if drift is not None:
         raise LaunchError(drift)
-    hidden = [f"--state-root={state_root}"]
+    # `--ctl-launch` tells the child its window was minted here, which its own
+    # session probe cannot be trusted to answer (claim_ctl_window, #925).
+    hidden = ["--ctl-launch", f"--state-root={state_root}"]
     try:
         namespaced = mux.has_registry_namespace()
         in_force = mux.registry_root() if namespaced else None
