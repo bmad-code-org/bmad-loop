@@ -91,6 +91,16 @@ def _split_frontmatter(text: str) -> tuple[str, str, str] | None:
     return None
 
 
+def is_frontmatter_only(text: str) -> bool:
+    """Whether ``text`` is a frontmatter block and nothing else (whitespace
+    aside) — the shape ``tickets.py mark`` gives a plan it creates, before any
+    build has written a body into it."""
+    split = _split_frontmatter(text)
+    if split is None:
+        return False
+    return "".join(split[2].splitlines(keepends=True)[1:]).strip() == ""
+
+
 def parse_frontmatter(text: str) -> dict[str, Any]:
     """The frontmatter mapping ``text`` carries, or ``{}`` when it carries none.
 
@@ -109,6 +119,23 @@ def parse_frontmatter(text: str) -> dict[str, Any]:
     except yaml.YAMLError:
         return {}
     return doc if isinstance(doc, dict) else {}
+
+
+def frontmatter_fault(text: str) -> str | None:
+    """Why ``text`` carries no frontmatter mapping, or None when it does: the
+    shapes `parse_frontmatter` folds into ``{}`` (no block, unparseable YAML, a
+    document that is not a mapping), named for a caller that must not read a
+    malformed block as an absent status."""
+    split = _split_frontmatter(text)
+    if split is None:
+        return "no frontmatter block"
+    try:
+        doc = yaml.safe_load(split[1])
+    except yaml.YAMLError as e:
+        return f"unparseable frontmatter YAML ({type(e).__name__})"
+    if not isinstance(doc, dict):
+        return "frontmatter is not a mapping"
+    return None
 
 
 def read_frontmatter(path: Path) -> dict[str, Any]:

@@ -31,14 +31,17 @@ REPO_URL = "https://github.com/bmad-code-org/bmad-loop"
         ("0.5.0", (0, 5, 0), ""),
         ("1.10.2", (1, 10, 2), ""),
         ("0.5.0-rc1", (0, 5, 0), "rc1"),
-        ("0.5.0.dev3", (0, 5, 0), "dev3"),
+        ("0.5.0-rc.2", (0, 5, 0), "rc.2"),
     ],
 )
 def test_parse_version(v, core, suffix):
     assert release.parse_version(v) == (core, suffix)
 
 
-@pytest.mark.parametrize("bad", ["", "1.2", "1.2.x", "v1.2.3", "x.y.z"])
+# `0.5.0.dev3` and `-dev` pre-releases are not SemVer `bmad setup` can order.
+@pytest.mark.parametrize(
+    "bad", ["", "1.2", "1.2.x", "v1.2.3", "x.y.z", "0.5.0.dev3", "0.5.0-dev3", "01.2.3"]
+)
 def test_parse_version_rejects_garbage(bad):
     with pytest.raises(ValueError):
         release.parse_version(bad)

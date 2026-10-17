@@ -49,6 +49,10 @@ Severity = Literal["ok", "warning", "problem"]
 VALIDATE_CHECKS: frozenset[str] = frozenset(
     {
         "bmad-config",
+        # BMAD v7 with no `[core] active_initiative`: artifacts fall back to output_folder
+        "bmad-config.initiative-unset",
+        # BMAD v7 resolved under tickets mode past leftover v6 artifact keys
+        "bmad-config.v6-keys-ignored",
         "policy",
         "policy.model-qualified",
         "policy.effort-unsupported",
@@ -123,6 +127,38 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.stories-dispatch",
         "skills.stories-dispatch-missing",
         "skills.stories-dispatch-stale",
+        # tickets mode: the dev primitive's step-01 routes a ticket from the v7 tree
+        "skills.tickets-dispatch",
+        "skills.tickets-dispatch-missing",
+        "skills.tickets-dispatch-stale",
+        # tickets mode preflight (install.tickets_preflight)
+        "tickets.era",
+        "tickets.script-missing",
+        "tickets.config-utils-missing",
+        "tickets.uv-missing",
+        "tickets.initiative-unset",
+        "tickets.initiative-missing",
+        # the ticket-store topology (ticketstore.classify_store): the classified
+        # layout, or a store tickets runs refuse (a T1 store outside the project
+        # under worktree isolation)
+        "tickets.store-topology",
+        # the initiative folder only partly tracked, or untracked but not gitignored
+        "tickets.tree-untracked",
+        # worktree isolation cannot redirect a shared store: config.user.toml is
+        # tracked or not gitignored
+        "tickets.own-repo-isolation",
+        # the project is not a git repository (a BMAD workspace): deferred
+        "tickets.workspace-unsupported",
+        # a shared store written outside the session cwd while a role sets extra_args
+        "tickets.store-sandbox",
+        # `[scm] branch_per = "run"`: build-auto's branch-fit check may HALT a ticket
+        "tickets.branch-per-run",
+        # a tracker store (or an unreadable store config): bmad-loop drives repo stores only
+        "tickets.store-not-repo",
+        # `validate --probes`: the script's `--help` offers every verb and mark status
+        "tickets.capability",
+        # tickets.py present but validate ran without --probes: nothing executed
+        "tickets.capability-not-run",
         "skills.sweep",
         "skills.sweep-missing",
         "skills.sweep-incomplete",

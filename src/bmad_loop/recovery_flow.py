@@ -21,7 +21,7 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, Callable, NamedTuple, NoReturn, Protocol
 
 from . import gates, verify
 from .model import Phase
@@ -177,6 +177,26 @@ class _OwnedSpecAuthorityError(RuntimeError):
         self.safe_restoration_unavailable = safe_restoration_unavailable
 
 
+class OwnedPlanRefused(Exception):
+    """An :class:`OwnedPlanWriter` could not restore or re-route the plan; nothing
+    the writer refused was written, and recovery pauses for the operator."""
+
+
+class OwnedPlanWriter(Protocol):
+    """The work source's own writer for an attempt-owned spec that is a work
+    item's plan: its byte restore and its lifecycle route replace the recovery
+    flow's anchored writers, so a plan is restored and re-routed through its own
+    chokepoint (tickets mode: ``TicketTree.restore_preimage`` and ``mark``).
+    Both raise :class:`OwnedPlanRefused` for a write they refuse or cannot
+    make."""
+
+    def owns(self, task: StoryTask, spec_path: Path) -> bool: ...
+
+    def restore(self, task: StoryTask, spec_path: Path, data: bytes) -> None: ...
+
+    def normalize(self, task: StoryTask, spec_path: Path, target_status: str) -> None: ...
+
+
 def _target_stat_version(observed: os.stat_result) -> tuple[int, int, int]:
     """Mutation-sensitive fields subordinate to an already-bound target inode."""
     return observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns
@@ -197,7 +217,13 @@ class RecoveryFlow:
     import cycle). ``workspace_get`` reads the engine's live (worktree-swappable)
     active workspace. ``dev_attempt_dispatched`` answers whether a dev session of
     the task's current attempt was dispatched — the provenance a rollback stamps
-    on the ref it parks (``StoryTask.preserve_from_attempt``)."""
+    on the ref it parks (``StoryTask.preserve_from_attempt``).
+
+    ``spec_confine_root`` answers the root an attempt-owned spec write for a task
+    is confined to (default: the active workspace's project, where a v6 spec
+    lives; a ticket plan's is its store root), and ``owned_plan`` is the work
+    source's own writer for a spec that is a work item's plan (default: none,
+    the anchored writers here restore every spec)."""
 
     def __init__(
         self,
@@ -213,6 +239,8 @@ class RecoveryFlow:
         escalate: Callable[[StoryTask, str], None],
         escalation_pause: Callable[..., NoReturn],
         dev_attempt_dispatched: Callable[[StoryTask], bool],
+        spec_confine_root: Callable[[StoryTask], Path] | None = None,
+        owned_plan: OwnedPlanWriter | None = None,
     ) -> None:
         self.paths = paths
         self.policy = policy
@@ -234,6 +262,14 @@ class RecoveryFlow:
         # the engine's `RunPaused` (DW-322).
         self._pauses_raised = 0
         self._dev_attempt_dispatched = dev_attempt_dispatched
+        self._spec_confine_root_for = spec_confine_root
+        self._owned_plan = owned_plan
+
+    def _spec_confine_root(self, task: StoryTask) -> Path:
+        """The root every attempt-owned spec write for ``task`` is confined to."""
+        if self._spec_confine_root_for is not None:
+            return self._spec_confine_root_for(task)
+        return self._workspace_get().paths.project
 
     def _pause(self, reason: str, story_key: str = "", **kwargs: object) -> NoReturn:
         """Raise the injected escalation pause, marking that this flow paused.
@@ -789,6 +825,8 @@ class RecoveryFlow:
         confine_root: Path | None = None,
         root_identity: os.stat_result | None = None,
     ) -> None:
+        if self._route_owned_plan(task, spec_path, data=snapshot, unsafe_context=unsafe_context):
+            return
         try:
             self._restore_attempt_owned_spec_bytes(
                 spec_path, snapshot, confine_root=confine_root, root_identity=root_identity
@@ -811,6 +849,14 @@ class RecoveryFlow:
         unsafe_context: str,
         root_identity: os.stat_result | None = None,
     ) -> None:
+        if self._route_owned_plan(
+            task,
+            spec_path,
+            data=snapshot,
+            target_status=target_status,
+            unsafe_context=unsafe_context,
+        ):
+            return
         try:
             self._restore_attempt_owned_spec(
                 spec_path,
@@ -830,9 +876,56 @@ class RecoveryFlow:
                 ),
             )
 
+    def _route_owned_plan(
+        self,
+        task: StoryTask,
+        spec_path: Path,
+        *,
+        data: bytes | None = None,
+        target_status: str | None = None,
+        unsafe_context: str,
+    ) -> bool:
+        """Restore ``data`` and/or route the plan to ``target_status`` through the
+        work source's own writer when it owns ``spec_path``; False when it does
+        not, and the caller's anchored writers run instead.
+
+        The plan must resolve inside :meth:`_spec_confine_root` (the store root):
+        one that does not is never handed to the writer, and recovery pauses as
+        for any unsafe owned spec — so is a write the writer refuses. The check is
+        made on the resolved path before the write; the writer's own lock covers
+        the write itself."""
+        writer = self._owned_plan
+        if writer is None or not writer.owns(task, spec_path):
+            return False
+        root = self._spec_confine_root(task)
+        try:
+            confined = spec_path.resolve().is_relative_to(root.resolve())
+        except (OSError, RuntimeError):
+            confined = False
+        if not confined:
+            self.pause_for_owned_spec_recovery(
+                task,
+                str(spec_path),
+                f"it lies outside the store root {root} {unsafe_context}",
+            )
+        try:
+            if data is not None:
+                writer.restore(task, spec_path, data)
+            if target_status is not None:
+                writer.normalize(task, spec_path, target_status)
+        except OwnedPlanRefused as exc:
+            self.pause_for_owned_spec_recovery(
+                task,
+                str(spec_path),
+                f"its plan could not be put back through its own chokepoint "
+                f"{unsafe_context} ({exc})",
+            )
+        return True
+
     def _mount_root_identity(self, task: StoryTask, workspace: Workspace) -> os.stat_result | None:
-        """The ``root_identity`` pinning ``workspace.paths.project`` — the
-        ``confine_root`` every attempt-owned normalization passes — for one write
+        """The ``root_identity`` pinning :meth:`_spec_confine_root` (the active
+        workspace's project for a v6 spec) — the ``confine_root`` every
+        attempt-owned normalization passes — for one write
         (DW-445). Take it at the call, beside that ``confine_root``.
 
         ``None`` when ``workspace`` is not a unit mount (``workspace.root ==
@@ -848,7 +941,7 @@ class RecoveryFlow:
         if workspace.root == self.paths.repo_root:
             return None
         return mount_root_identity(
-            workspace.paths.project, mount=workspace.root, recorded=task.worktree_identity
+            self._spec_confine_root(task), mount=workspace.root, recorded=task.worktree_identity
         )
 
     def _normalize_attempt_owned_spec_or_pause(
@@ -861,6 +954,10 @@ class RecoveryFlow:
         unsafe_context: str,
         root_identity: os.stat_result | None = None,
     ) -> None:
+        if self._route_owned_plan(
+            task, spec_path, target_status=target_status, unsafe_context=unsafe_context
+        ):
+            return
         try:
             self._normalize_attempt_owned_spec(
                 spec_path,
@@ -1367,7 +1464,7 @@ class RecoveryFlow:
                                 spec_path,
                                 task.dispatched_spec_snapshot,
                                 target_status,
-                                confine_root=workspace.paths.project,
+                                confine_root=self._spec_confine_root(task),
                                 root_identity=self._mount_root_identity(task, workspace),
                                 unsafe_context="while restoring the pre-attempt retry input",
                             )
@@ -1377,7 +1474,7 @@ class RecoveryFlow:
                                 task,
                                 spec_path,
                                 target_status,
-                                confine_root=workspace.paths.project,
+                                confine_root=self._spec_confine_root(task),
                                 root_identity=self._mount_root_identity(task, workspace),
                                 unsafe_context=(
                                     "while restoring the attempt-owned lifecycle status"
@@ -1446,7 +1543,7 @@ class RecoveryFlow:
                                     unsafe_context=(
                                         "while restoring the pre-launch operator input"
                                     ),
-                                    confine_root=workspace.paths.project,
+                                    confine_root=self._spec_confine_root(task),
                                     root_identity=self._mount_root_identity(task, workspace),
                                 )
                                 owned_snapshot_restored = True
@@ -1481,7 +1578,7 @@ class RecoveryFlow:
                         spec_path,
                         original_spec,
                         unsafe_context="while undoing a tentative lifecycle repair",
-                        confine_root=workspace.paths.project,
+                        confine_root=self._spec_confine_root(task),
                         root_identity=self._mount_root_identity(task, workspace),
                     )
                     normalized_status = None
@@ -1636,7 +1733,7 @@ class RecoveryFlow:
                             owned_spec[0],
                             task.dispatched_spec_snapshot,
                             target_status,
-                            confine_root=workspace.paths.project,
+                            confine_root=self._spec_confine_root(task),
                             root_identity=self._mount_root_identity(task, workspace),
                             unsafe_context="before the baseline reset",
                         )
@@ -1646,7 +1743,7 @@ class RecoveryFlow:
                             owned_spec[0],
                             task.dispatched_spec_snapshot,
                             unsafe_context="before the baseline reset",
-                            confine_root=workspace.paths.project,
+                            confine_root=self._spec_confine_root(task),
                             root_identity=self._mount_root_identity(task, workspace),
                         )
                     owned_snapshot_restored = True
@@ -1669,7 +1766,7 @@ class RecoveryFlow:
                         owned_spec[0],
                         task.dispatched_spec_snapshot,
                         unsafe_context="after the baseline reset",
-                        confine_root=workspace.paths.project,
+                        confine_root=self._spec_confine_root(task),
                         root_identity=self._mount_root_identity(task, workspace),
                     )
                     owned_snapshot_restored = True
@@ -1696,7 +1793,7 @@ class RecoveryFlow:
                             owned_spec[0],
                             task.dispatched_spec_snapshot,
                             target_status,
-                            confine_root=workspace.paths.project,
+                            confine_root=self._spec_confine_root(task),
                             root_identity=self._mount_root_identity(task, workspace),
                             unsafe_context="after the baseline reset",
                         )
@@ -1705,7 +1802,7 @@ class RecoveryFlow:
                             task,
                             owned_spec[0],
                             target_status,
-                            confine_root=workspace.paths.project,
+                            confine_root=self._spec_confine_root(task),
                             root_identity=self._mount_root_identity(task, workspace),
                             unsafe_context="after the baseline reset",
                         )
@@ -1788,7 +1885,7 @@ class RecoveryFlow:
                 owned_spec[0],
                 task.dispatched_spec_snapshot,
                 unsafe_context="before the ordinary manual-recovery pause",
-                confine_root=workspace.paths.project,
+                confine_root=self._spec_confine_root(task),
                 root_identity=self._mount_root_identity(task, workspace),
             )
             restored_before_pause = str(owned_spec[0])

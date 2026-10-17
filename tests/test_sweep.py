@@ -50,10 +50,10 @@ from conftest import (
 
 from bmad_loop import artifact_publication, deferredwork, platform_util, runs
 from bmad_loop import sweep as sweep_mod
-from bmad_loop import verify
+from bmad_loop import ticketstore, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
-from bmad_loop.bmadconfig import ProjectPaths
+from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.engine import RunPaused, _LedgerAnchor, _session_task_id
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
@@ -102,7 +102,7 @@ from bmad_loop.sweep import (
     validate_triage,
 )
 from bmad_loop.tui import launch
-from bmad_loop.verify import worktree_clean
+from bmad_loop.verify import rev_parse_head, worktree_clean
 
 QUIET = NotifyPolicy(desktop=False, file=True)
 
@@ -121,14 +121,27 @@ def triage_result(open_ids, **sections):
 
 
 def make_sweep(
-    project, script, policy=None, answers=(), prompting=False, run_id="sweep-run", **kwargs
+    project,
+    script,
+    policy=None,
+    answers=(),
+    prompting=False,
+    run_id="sweep-run",
+    store_topology=None,
+    **kwargs,
 ):
     # `run_id` names a DISTINCT run: its own run_dir, state.json and journal.
     # Overridden only where a test needs a second run rather than a resume of the
-    # first (run-scoped state, e.g. the DW-124 quarantine).
+    # first (run-scoped state, e.g. the DW-124 quarantine). `store_topology` is the
+    # v7 store record `runsetup.compose_sweep` stamps (`StoreTopology.to_dict`).
     run_dir = project.project / ".bmad-loop" / "runs" / run_id
     adapter = MockAdapter(script, usage_per_session=TokenUsage(input_tokens=10, output_tokens=5))
-    state = RunState(run_id=run_id, project=str(project.project), started_at="now")
+    state = RunState(
+        run_id=run_id,
+        project=str(project.project),
+        started_at="now",
+        store_topology=dict(store_topology or {}),
+    )
     journal = Journal(run_dir)
     # the run dir's mint-time identity, as `runsetup.compose_sweep` records it (DW-446)
     state.run_dir_identity = platform_util.root_identity_record(run_dir)
@@ -12099,7 +12112,7 @@ def test_an_inherited_commit_debt_survives_a_replay_that_closes_nothing(project,
 # a different path in a different tree under worktree isolation — so a publisher
 # added in that scope would have satisfied a text match while naming the wrong file.
 _LEDGER_PUBLISHED = frozenset({"self.workspace.paths.deferred_work"})
-_STORE_PUBLISHED = frozenset({"decisions_store.store_path(project)"})
+_STORE_PUBLISHED = frozenset({"decisions_store.store_path(project, scope)"})
 
 
 def test_every_sweep_ledger_commit_names_its_own_tree():
@@ -37842,3 +37855,489 @@ def test_escalated_restart_over_dirt_resets_then_restores_the_snapshot(project):
     assert (project.project / "notes.txt").read_text(encoding="utf-8") == "committed\n"
     assert git(project.project, "for-each-ref", "refs/attempt-preserve-dirty/") != ""
     assert load_state(resumed.run_dir).tasks[MIGRATE_KEY].phase == Phase.DONE
+
+
+# ------------------------------------------------------------- sweep on BMAD v7
+
+
+def _v7_paths(layout) -> ProjectPaths:
+    """A pure v7 install resolves as v7 with no `want_tickets`, as `cmd_sweep`
+    loads it."""
+    paths = load_paths(layout.project)
+    assert paths.era == "v7" and paths.implementation_artifacts == layout.initiative_folder
+    return paths
+
+
+def _v7_plan(paths: ProjectPaths, name: str) -> Path:
+    """Where build-auto writes a free-form bundle's plan: `plan-<slug>.md` in the
+    initiative folder, its slug led by the bundle key."""
+    return paths.implementation_artifacts / f"plan-dw-{name}.md"
+
+
+def _v7_bundle_dev_effect(paths: ProjectPaths, name: str, dw_ids, *, followup_review: bool):
+    """A v7 build-auto bundle session: it edits code and finishes its plan at
+    `built`, never `done` (the orchestrator owns `done`, and a bundle never gets
+    it). It leaves the ledger alone."""
+
+    def effect(spec):
+        baseline = rev_parse_head(paths.project)
+        source = paths.project / "src.txt"
+        source.write_text(source.read_text(encoding="utf-8") + f"change for dw-{name}\n", "utf-8")
+        plan = _v7_plan(paths, name)
+        write_spec(plan, "built", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(plan),
+                "baseline_commit": baseline,
+                "tasks_total": 1,
+                "tasks_done": 1,
+                "verification": [],
+                "escalations": [],
+                "followup_review_recommended": followup_review,
+            },
+        )
+
+    return effect
+
+
+def _v7_bundle_review_effect(paths: ProjectPaths, name: str):
+    """A follow-up review of a `built` plan: it converges and leaves the plan at
+    `built`."""
+
+    def effect(spec):
+        plan = _v7_plan(paths, name)
+        baseline = _spec_baseline(plan)
+        write_spec(plan, "built", baseline)
+        return SessionResult(
+            status="completed",
+            result_json={
+                "workflow": "auto-dev",
+                "story_key": f"dw-{name}",
+                "spec_file": str(plan),
+                "baseline_commit": baseline,
+                "status": "built",
+                "followup_review_recommended": False,
+                "escalations": [],
+            },
+        )
+
+    return effect
+
+
+def _plant_stray_board(paths: ProjectPaths) -> None:
+    """A sprint board at the path a v6 sweep would read, carrying an open retro
+    action item, committed: a v7 sweep must ignore it."""
+    paths.sprint_status.write_text(
+        "development_status:\n  epic-1: done\naction_items:\n"
+        "  - id: epic-1-retro-item-1-x\n    action: Add X\n    status: open\n",
+        encoding="utf-8",
+    )
+    git(paths.project, "add", "-A")
+    git(paths.project, "commit", "-q", "-m", "stray board")
+
+
+def _forbid_sprint_board(monkeypatch) -> list[str]:
+    """Make every public `sprintstatus` function raise, in that module and
+    wherever a `bmad_loop` module imported it by name, and fail every sprint
+    source read. Returns the names that were called. An `AssertionError` is no
+    exception any board reader catches, so a call also crashes the run."""
+    from bmad_loop import sprintstatus
+    from bmad_loop.sprint_source import SprintWorkSource
+
+    called: list[str] = []
+
+    def raiser(name):
+        def boom(*args, **kwargs):
+            called.append(name)
+            raise AssertionError(f"a v7 sweep read the sprint board: {name}")
+
+        return boom
+
+    targets = {
+        obj: name
+        for name, obj in vars(sprintstatus).items()
+        if callable(obj)
+        and getattr(obj, "__module__", None) == sprintstatus.__name__
+        and not isinstance(obj, type)
+        and not name.startswith("_")
+    }
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None or not mod_name.startswith("bmad_loop"):
+            continue
+        for attr, value in list(vars(mod).items()):
+            if not isinstance(value, type) and callable(value) and value in targets:
+                monkeypatch.setattr(mod, attr, raiser(targets[value]))
+    for method in ("pick", "remaining_estimate", "epic_progress", "retro_done", "retro_docs"):
+        monkeypatch.setattr(SprintWorkSource, method, raiser(f"SprintWorkSource.{method}"))
+    return called
+
+
+def _v7_review_policy(enabled: bool) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=enabled),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+
+
+def test_v7_sweep_never_reads_sprint_status(project_v7, monkeypatch, tmp_path):
+    """A sweep persists no source, so it inherits the sprint source (which has
+    epics) and every sprint-board seam keyed on it. On v7 there is no board: a
+    full sweep (triage, one bundle, its review) reads none, even with a stray
+    board on disk, and no seam would carry one into a worktree.
+
+    ABLATION (each reddens this test): drop the `_make_work_source` override
+    (the source is a sprint source with epics); drop the v7 arm of
+    `_ingest_retro_action_items` (the board read crashes the run); drop the
+    `_sprint_board_instruction` override (the review prompt names
+    sprint-status.yaml); drop the `_has_sprint_board` override (the worktree
+    seed carries the stray board); drop the `_review_converged_statuses`
+    override (a review ending at `built` never converges, and the run asks for
+    a second review)."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open"})
+    _plant_stray_board(paths)
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, adapter = make_sweep(
+        paths,
+        [
+            triage_effect(plan),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1"], followup_review=True),
+            _v7_bundle_review_effect(paths, "fix-things"),
+        ],
+        policy=_v7_review_policy(enabled=True),
+    )
+    called = _forbid_sprint_board(monkeypatch)
+
+    assert isinstance(engine.source, sweep_mod.NoBoardWorkSource)
+    assert not engine.source.has_epics
+    assert engine.source.pick({}, None).ref is None
+
+    summary = engine.run()
+
+    assert called == []
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DONE
+    assert len(adapter.sessions) == 3
+    review_prompt = adapter.sessions[2].prompt
+    assert "sprint-status" not in review_prompt
+    assert "dw-fix-things" in adapter.sessions[1].prompt
+    worktree = tmp_path / "unit"
+    worktree.mkdir()
+    assert engine._worktree_flow._board_seed(worktree) == ()
+    assert engine._worktree_flow._artifact_seed_drops(worktree) == []
+
+
+def test_v7_bundle_closes_on_built(project_v7):
+    """build-auto finishes a v7 bundle's plan at `built`. The dev gate accepts
+    it, the orchestrator closes the bundle's entries, and the plan stays
+    `built`: a bundle is not a ticket, so nothing marks it `done`.
+
+    ABLATION: drop the v7 arm of `_bundle_success_statuses` and the dev gate
+    expects `done`, so the attempt retries and the entries stay open."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open", "DW-2": "open"})
+    plan = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1", "DW-2"], "intent": "fix both"}],
+    )
+    engine, adapter = make_sweep(
+        paths,
+        [
+            triage_effect(plan),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1", "DW-2"], followup_review=False),
+        ],
+        policy=_v7_review_policy(enabled=False),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DONE
+    entries = ledger_entries(paths)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+    assert "resolved by sweep bundle dw-fix-things" in entries["DW-1"].body
+    assert verify.status_of(verify.read_frontmatter(_v7_plan(paths, "fix-things"))) == "built"
+    assert len(_records(engine, "sweep-bundle-closed")) == 1
+    # the free-form intent names the initiative folder and the slug hint
+    dev_prompt = adapter.sessions[1].prompt
+    assert "Lead the plan slug with `dw-fix-things`." in dev_prompt
+    folder = paths.initiative_folder.relative_to(paths.project).as_posix()
+    assert f"the initiative folder `{folder}`" in dev_prompt
+    assert "implementation_artifacts" not in dev_prompt
+
+
+@pytest.mark.parametrize(
+    ("fixture", "layout"),
+    [("project_v7_store_repo", "T3"), ("project_v7_external_store", "T4")],
+)
+def test_v7_bundle_plan_committed_in_store_repo(request, fixture, layout):
+    """When the initiative folder is in a ticket store with its own repository
+    (T3 nested, T4 external), the code commit cannot carry the bundle's plan.
+    Once the code has landed, the accepted plan gets its own commit in the store
+    repository, holding the plan alone, with the `Bmad-Code-*` trailers naming
+    the bundle's code commit and range.
+
+    ABLATION (performed): drop the `_publish_bundle_plan` call in
+    `SweepEngine._land_post_landing_writes` and the plan stays uncommitted in the
+    store (no `store-committed` row, no commit touching it)."""
+    v7 = request.getfixturevalue(fixture)
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)  # the store's, not the code's
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == layout
+    triage = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, _ = make_sweep(
+        paths,
+        [
+            triage_effect(triage),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1"], followup_review=False),
+        ],
+        policy=_v7_review_policy(enabled=False),
+        store_topology=topology.to_dict(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    task = engine.state.tasks["dw-fix-things"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    plan = _v7_plan(paths, "fix-things")
+    rel = plan.resolve().relative_to(store.resolve()).as_posix()
+    commits = git(store, "log", "--format=%H", "--", rel).split()
+    assert len(commits) == 1
+    assert [e["commit"] for e in _records(engine, "store-committed")] == commits
+    body = git(store, "log", "-1", "--format=%B", commits[0])
+    assert body.splitlines()[0] == "chore(sweep): dw-fix-things plan [bmad-loop sweep-run]"
+    assert f"Bmad-Code-Repo: {paths.repo_root.as_posix()}" in body
+    assert f"Bmad-Code-Commit: {task.commit_sha}" in body
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{task.commit_sha}" in body
+    assert git(store, "show", "--name-only", "--format=", commits[0]).split() == [rel]
+    assert git(store, "status", "--porcelain", "--", rel) == ""
+    assert verify.status_of(verify.read_frontmatter(plan)) == "built"
+
+
+def test_v7_bundle_plan_trailers_name_the_landed_squash_commit(project_v7_store_repo):
+    """Under worktree isolation a `squash` merge-back lands a different commit
+    than the bundle's, and the unit branch's teardown leaves the bundle's
+    unreachable: the store trailers name the target's head, which holds the
+    code. Driven at the seam: a T3 bundle that landed in place, then re-published
+    as a merged-back unit whose own commit the target does not hold.
+
+    ABLATION (performed): pass `task.commit_sha` in `_publish_bundle_plan` again
+    and the trailers name the unreachable unit commit — this FAILS."""
+    v7 = project_v7_store_repo
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology)
+    triage = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, _ = make_sweep(
+        paths,
+        [
+            triage_effect(triage),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1"], followup_review=False),
+        ],
+        policy=_v7_review_policy(enabled=False),
+        store_topology=topology.to_dict(),
+    )
+    assert not engine.run().crashed
+    repo = paths.repo_root
+    landed = rev_parse_head(repo)
+    unit = git(repo, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "squashed away").strip()
+    assert not verify.is_ancestor(repo, unit, landed)
+    plan = _v7_plan(paths, "fix-things")
+    plan.write_text(plan.read_text(encoding="utf-8") + "\nreviewed\n", encoding="utf-8")
+    task = replace(
+        engine.state.tasks["dw-fix-things"], worktree_path=str(repo / "unit"), commit_sha=unit
+    )
+
+    engine._publish_bundle_plan(task)
+
+    body = git(store, "log", "-1", "--format=%B")
+    assert f"Bmad-Code-Commit: {landed}" in body
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{landed}" in body
+
+
+def test_v7_bundle_plan_in_a_checkout_store_rides_the_code_commit(project_v7):
+    """T1 (the store is tracked inside the code checkout): the code commit
+    already carries the plan, so the sweep makes no store-repository commit and
+    journals no store row.
+
+    ABLATION (performed): drop the `per_worktree()` early return in
+    `_publish_bundle_plan` and the T1 run journals `store-unversioned` (its
+    topology has no store repository)."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open"})
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == "T1"
+    triage = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    engine, _ = make_sweep(
+        paths,
+        [
+            triage_effect(triage),
+            _v7_bundle_dev_effect(paths, "fix-things", ["DW-1"], followup_review=False),
+        ],
+        policy=_v7_review_policy(enabled=False),
+        store_topology=topology.to_dict(),
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    task = engine.state.tasks["dw-fix-things"]
+    rel = _v7_plan(paths, "fix-things").relative_to(paths.project).as_posix()
+    assert rel in git(paths.project, "show", "--name-only", "--format=", task.commit_sha).split()
+    for kind in ("store-committed", "store-commit-failed", "store-unversioned"):
+        assert _records(engine, kind) == []
+
+
+def test_v7_sweep_store_record_moves_with_a_renamed_project(project_v7_store_repo, tmp_path):
+    """A nested store (T3) a v7 sweep recorded under the launch-time project is
+    located on the live one: the sweep's shared store and the store repository it
+    publishes bundle plans in are the moved paths, not the recorded ones.
+    ABLATION (performed): read the raw `state.store_topology` in
+    `SweepEngine.__init__` / `store_topology` and both name the old path."""
+    import dataclasses
+
+    paths = _v7_paths(project_v7_store_repo)
+    live = ticketstore.assess_store(paths, "none")
+    assert isinstance(live, ticketstore.StoreTopology) and live.store_repo is not None
+    launched = tmp_path / "launched-here"
+    moved = dataclasses.replace(
+        live,
+        store_root=launched / live.store_root.relative_to(paths.project),
+        store_repo=launched / live.store_repo.relative_to(paths.project),
+    )
+    engine, adapter = make_sweep(paths, [], store_topology=moved.to_dict())
+    engine.state.project = str(launched)
+    resumed = SweepEngine(
+        paths=paths,
+        policy=engine.policy,
+        adapter=adapter,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=engine.state,
+    )
+
+    assert resumed.paths.shared_store == live.store_root
+    assert resumed.store_topology == live
+
+
+def test_v7_sweep_hands_the_shared_store_to_synthesizing_adapters(project_v7_store_repo, tmp_path):
+    """A bundle's first dev attempt has no recorded plan, so the synthesizing
+    adapter scans its own `paths` for it (`_artifact_dirs`). Under worktree
+    isolation with a shared store (T3 here) build-auto writes the plan to the main
+    checkout's store, so the scan must look there, not in the unit checkout.
+    ABLATION (performed): drop the adapter hand-off in `SweepEngine.__init__` and
+    the scan names `<worktree>/_bmad-output/...`."""
+    from bmad_loop.adapters.generic import _DevSynthesisMixin
+
+    paths = _v7_paths(project_v7_store_repo)
+    live = ticketstore.assess_store(paths, "none")
+    assert isinstance(live, ticketstore.StoreTopology) and live.store_repo is not None
+    engine, _ = make_sweep(paths, [], store_topology=live.to_dict())
+    dev = MockAdapter([])
+    dev.paths = paths  # what `make_adapters` loads: no shared store
+    triage = MockAdapter([])
+    SweepEngine(
+        paths=paths,
+        policy=engine.policy,
+        adapter=dev,
+        triage_adapter=triage,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=engine.state,
+    )
+
+    assert dev.paths.shared_store == live.store_root
+    assert _DevSynthesisMixin._artifact_dirs(dev, tmp_path / "unit") == [  # type: ignore[arg-type]
+        paths.implementation_artifacts
+    ]
+    assert not hasattr(triage, "paths")
+
+
+def test_v7_bundle_review_accepts_built(project_v7):
+    """A follow-up review of a `built` plan leaves it `built`. The review gate
+    accepts that, and its reclose finds the plan at a success status: a review
+    that rewrote the ledger gets its entries closed again.
+
+    ABLATION: drop the v7 arm of `_bundle_success_statuses` and the review gate
+    retries on a `built` plan ("expected 'done'"); the reclose skips it too."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open"})
+    plan = _v7_plan(paths, "fix-things")
+    write_spec(plan, "built", rev_parse_head(paths.project))
+    engine, _ = make_sweep(paths, [], policy=_v7_review_policy(enabled=True))
+    task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1"], spec_file=str(plan))
+
+    outcome = engine._verify_review(task)
+
+    assert outcome.ok, outcome.reason
+    assert ledger_entries(paths)["DW-1"].status.startswith("done")
+    assert len(_records(engine, "sweep-bundle-reclosed")) == 1
+    # still `built`: the review gate never asks for `done` on v7
+    assert verify.status_of(verify.read_frontmatter(plan)) == "built"
+
+
+def test_v7_bundle_verify_gates_keep_the_v6_rule_without_accept_statuses(project):
+    """`accept_statuses=None` keeps both bundle gates on today's v6 statuses and
+    wording, so a v6 sweep is unchanged."""
+    write_ledger(project, {"DW-1": "done 2026-06-01"})
+    spec = bundle_spec_path(project, "fix-things")
+    write_spec(spec, "built", rev_parse_head(project.project))
+    task = StoryTask(story_key="dw-fix-things", epic=0, dw_ids=["DW-1"], spec_file=str(spec))
+
+    review = verify.verify_review_bundle(task, project, Policy())
+    assert not review.ok and review.reason == "spec status is 'built', expected 'done'"
+    accepted = verify.verify_review_bundle(
+        task, project, Policy(), accept_statuses=frozenset({"built", "done"})
+    )
+    assert accepted.ok, accepted.reason
+
+
+def test_v7_retro_ingest_skipped_journaled(project_v7, monkeypatch):
+    """A v7 project has no sprint board, and its retro action items are prose in
+    the epic retrospective. A fresh v7 sweep files nothing, reads no board (a
+    stray one on disk included), and says so: one
+    `sweep-retro-ingest-unavailable` row with `ingest_cause="no-board"`.
+
+    ABLATION: drop the v7 arm and the stray board's open item is read (the
+    forbidden read crashes the run) instead of journaled as unavailable."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open"})
+    _plant_stray_board(paths)
+    before = paths.deferred_work.read_bytes()
+    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "later"}])
+    engine, adapter = make_sweep(paths, [triage_effect(plan)])
+    called = _forbid_sprint_board(monkeypatch)
+
+    summary = engine.run()
+
+    assert called == []
+    assert not summary.crashed and len(adapter.sessions) == 1
+    assert paths.deferred_work.read_bytes() == before
+    (row,) = _records(engine, "sweep-retro-ingest-unavailable")
+    assert row["ingest_cause"] == "no-board"
+    assert "error" not in row
+    assert _records(engine, "sweep-retro-items-ingested") == []

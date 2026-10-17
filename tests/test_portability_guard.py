@@ -292,6 +292,9 @@ RUN_STATE_TRANSACTIONS = {
     ("runsetup.py", "compose_run"),
     ("runsetup.py", "compose_sweep"),
     ("tui/app.py", "_do_rearm"),
+    # the tickets "Request replan": a locked re-check of the pause, then the plan's
+    # `mark(reason="replan")` to draft (the resume launches after the lock is released)
+    ("tui/app.py", "_ticket_replan_worker"),
     # DW-525: the locked re-check + worktree move under the FINISHED run's lock
     ("unitreplay.py", "mint_replay_run"),
     # DW-535: the re-check, snapshot, teardown and `finished` write of an abandon
@@ -314,6 +317,8 @@ REFUSAL_HELPER_DEFS = {
     ("artifact_publication.py", "_refuse_zero_inode_root"),
     ("cli.py", "_reject_bad_run_id"),
     ("cli.py", "_reject_isolation_conflict"),
+    # the ticket-store topology wrapper (tickets mode); test_cli.py
+    ("cli.py", "_reject_store_topology"),
     # #496/#497: the launch plugin-trust preflight; test_cli.py
     # test_run_refuses_an_enabled_ungranted_project_plugin and
     # test_resume_refuses_a_mismatched_plugin_before_any_side_effect
@@ -359,6 +364,65 @@ ISOLATION_CONFLICT_CALLERS = {
     ("cli.py", "factory"): 1,  # `_sweep_factory`'s closure: raises — no rc channel
     ("tui/app.py", "_guarded"): 1,  # the pre-launch toast guard
     ("tui/app.py", "_do_rearm"): 1,
+    ("tui/app.py", "_ticket_replan_worker"): 1,  # ahead of the replan's draft mark
+}
+
+# Every call site of the ticket-store topology refusal — the pure text producer
+# `ticketstore.store_topology_conflict`, the probe-level predicate
+# `ticketstore.store_conflict` that wraps it, and the rc-returning CLI wrapper
+# `_reject_store_topology` — as `(file, enclosing function) -> count`. The
+# `ISOLATION_CONFLICT_CALLERS` idiom and rows: the store refusal stands beside the
+# #414 one on every run-arming surface, so resume, resolve, the dry-run banner, the
+# auto-sweep factory and the TUI guards cannot skip it. `validate` reports it as
+# findings through `install._tickets_store_findings` (its tickets queue validator),
+# and `cmd_run` refuses through the wrapper ahead of that same preflight. A new
+# caller lands with a row and the test that it refuses.
+STORE_TOPOLOGY_CALLERS = {
+    ("ticketstore.py", "store_conflict"): 1,  # the predicate's own text call
+    ("install.py", "_tickets_store_findings"): 1,  # validate + run preflight findings
+    ("cli.py", "_reject_store_topology"): 1,  # the wrapper's own predicate call
+    ("cli.py", "cmd_run"): 1,
+    ("cli.py", "cmd_sweep"): 1,
+    # pre-session + post-confirm, as the #414 pair, + ahead of --reverify/--adopt-branch
+    ("cli.py", "cmd_resolve"): 3,
+    ("cli.py", "_resolve_reverify_finished"): 1,
+    ("cli.py", "_prepare_resume_locked"): 1,  # re-validates the recorded topology
+    ("cli.py", "_warn_preflight_would_abort"): 1,
+    ("cli.py", "factory"): 1,  # `_sweep_factory`'s closure: raises
+    ("tui/app.py", "_guarded"): 1,
+    ("tui/app.py", "_do_rearm"): 1,
+    ("tui/app.py", "_ticket_replan_worker"): 1,  # ahead of the replan's draft mark
+}
+
+# Every call to a spec frontmatter-status writer in src — `set_frontmatter_status`,
+# `set_frontmatter_status_anchored`, `devcontract.reset_spec_status` — as
+# `(file, enclosing function) -> count`, with who owns its tickets-mode answer. In
+# tickets mode `TicketTree.mark` is the only write path to a plan's `status`, so a
+# writer is either the engine seam (`Engine._spec_status_write`, which TicketsEngine
+# maps to `mark` or refuses) or a non-engine site whose tickets branch is named here.
+# A new caller fails `test_spec_status_writers_are_inventoried` until it is routed
+# through the seam or given a row and a tickets-mode decision.
+SPEC_STATUS_WRITERS = {
+    # the engine seam's base arms: adoption sets, the repair family resets. Routed
+    # sites: `_salvage_review_timeout`, `_reconcile_generic_terminal_frontmatter`,
+    # `_apply_adoption`, `_reset_spec_for_repair`.
+    ("engine.py", "_spec_status_write"): 2,
+    # the writer's own callee chain: `reset_spec_for_replan` re-opens a spec for the
+    # TUI's "Request replan". A ticket plan never reaches it: `tui/app.py`
+    # `_do_replan` hands a tickets run to `_ticket_replan_worker`, which marks the
+    # plan `mark(reason="replan")` to draft.
+    ("devcontract.py", "reset_spec_for_replan"): 1,
+    # `bmad-loop confirm`'s v6 spec flip. A ticket park never reaches it: its
+    # plan is marked `mark(reason="confirm")` in `_mark_ticket_confirmed`.
+    ("cli.py", "_apply_confirmation"): 1,
+    # the resolve re-arm transaction (tickets mode: `mark(reason="rearm")` with a
+    # `restore_preimage` rollback, the resolve session).
+    ("runs.py", "_rearm_escalation_locked"): 1,
+    # the attempt-owned spec route after a byte restore. A ticket plan never
+    # reaches it: `RecoveryFlow._route_owned_plan` hands it to the engine's
+    # `OwnedPlanWriter` (`restore_preimage`, then `mark` with reason `rollback` or
+    # `rearm`), and `TicketsEngine._after_code_rollback` re-arms it after a reset.
+    ("recovery_flow.py", "_normalize_attempt_owned_spec"): 1,
 }
 
 # What counts as consulting liveness, matched as a substring of the callee's name
@@ -416,9 +480,11 @@ JOURNAL_PATCH_KINDS = frozenset(
         # recovery_flow.py — the intent-gap restore pair.
         "attempt-restore-failed",
         "attempt-restored",
-        # runs.py — the operator-selected stale-restore pair.
+        # runs.py — the operator-selected stale-restore pair, and the tickets-mode
+        # re-arm's move of a plan's intent-gap patch to the run dir.
         "stale-restore-unparseable",
         "stale-restore-excluded",
+        "restore-patch-evacuated",
         # worktree_flow.py — the retained forensic patch of a closed unit.
         "unit-closed",
     }
@@ -479,10 +545,50 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # `accepted-with-open-items` / `rejected` / `unknown`) — never the doc's raw
     # text. Kind-scoped because `verdict` is generic.
     "retro-auto-finished": frozenset({"verdict"}),
+    # tickets_engine.py: the closure an epic boundary recorded (the same closed
+    # verdict token, or `unknown` when no retrospective verdict was read), and its
+    # acknowledgement when a resume passed an epic still open. `epic_ref` is
+    # aliased by name.
+    "ticket-epic-closure": frozenset({"verdict"}),
+    "epic-closure-not-recorded": frozenset({"verdict"}),
     # DW-527: the literal `post-proceed`, marking the row `_finish_inflight`'s
     # post-replay arm writes (a re-latched `--reverify` replay) apart from the
     # ordinary reverify arm's. Kind-scoped because `replay` is generic.
     "resume-reverify": frozenset({"replay"}),
+    # A git recovery ref NAME (`refs/...`), never a story key on its own — the
+    # `/` fails `_IDENTIFIER_RE`, so `scrub_json` redacts it. Declared per kind, not
+    # by name: on `ticket-mark` the same name carries an identifier-shaped ticket
+    # key and is aliased.
+    "attempt-commits-preserved": frozenset({"ref"}),
+    "attempt-worktree-preserved": frozenset({"ref"}),
+    "replay-abandon-snapshot": frozenset({"ref"}),
+    "replay-abandoned": frozenset({"ref"}),
+    "merge-target-preserved": frozenset({"ref"}),
+    "isolation-flip-orphan-preserved": frozenset({"ref"}),
+    # tickettree.py: plan `status` tokens (`before`/`after`; `?` when unreadable),
+    # a closed outcome slug, and the script's `created` boolean. `ref` (the ticket
+    # key) is aliased by `diagnostics._JOURNAL_KIND_ALIAS_FIELDS`; `plan` is dropped
+    # to presence in diagnostics; `reason` is the closed `PlanWriteReason`, dropped
+    # by name.
+    "ticket-mark": frozenset({"before", "after", "outcome", "created"}),
+    "ticket-plan-restored": frozenset({"before", "after", "outcome"}),
+    # runs.py: whether the re-arm moved its restore latch onto the evacuated copy.
+    # `patch` and `stashed_to` are dropped by name.
+    "restore-patch-evacuated": frozenset({"latched"}),
+    # tickets_engine.py: the pick's closed halt token (`tickets_source.HALT_*`);
+    # `ref` and `stage` ride the by-name benign row, `detail` is dropped by name.
+    "ticket-pick-halt": frozenset({"cause"}),
+    # tickets_engine.py `_spec_status_write`: the plan status a refused engine write
+    # targeted and the closed refusal token (`no-plan-reason` / `unbound` /
+    # `not-bound-plan`); `site` is the closed `SpecWriteReason` (by-name benign).
+    "ticket-status-write-refused": frozenset({"target", "cause"}),
+    # tickets_engine.py: the plan status a shared store's post-landing mark owes
+    # (`done` / `blocked`), latched and replayed.
+    "ticket-mark-latched": frozenset({"target"}),
+    "resume-ticket-mark": frozenset({"target"}),
+    "run-end-ticket-mark": frozenset({"target"}),
+    # tickets_engine.py: the unversioned store's closed layout token (`T2`/`T6`).
+    "store-unversioned": frozenset({"layout"}),
 }
 
 # Every OTHER field name journalled today: a declared inventory, not a per-name
@@ -660,10 +766,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # it collapses to `mcp`; any name outside the set ships as `other`.
         "in_tool",
         # `sweep-retro-ingest-unavailable`'s discriminator (DW-388): WHICH input the
-        # retro action-item ingest could not use, as a closed three-value enum
+        # retro action-item ingest could not use, as a closed four-value enum
         # (`sprint-status-unreadable` | `action-items-malformed` |
-        # `ledger-unavailable`) chosen by the except arm, never read from either
-        # file. A closed slug deliberately — `error`, the natural spelling, is in
+        # `ledger-unavailable` | `no-board`, a v7 project's sweep) chosen by the
+        # code arm, never read from either file. A closed slug deliberately — `error`, the natural spelling, is in
         # `diagnostics._JOURNAL_DROP_FIELDS` and ships as a presence marker, which
         # could not tell the operator whether to repair the board or the ledger.
         # Item ids and action text are operator free text and are never journaled.
@@ -793,7 +899,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "rearmed",
         "record",
         "redrive",
-        "ref",
         # DW-535: `replay-abandoned`'s flag that a retry's recovered `-abandon` ref
         # was pruned since the earlier attempt parked it (a bare boolean).
         "ref_pruned",
@@ -1213,6 +1318,12 @@ JOURNAL_KINDS = frozenset(
         # `in_tool`, a closed slug the adapter chose (declared benign).
         "session-active",
         "session-idle",
+        # checkpoints.py
+        "checkpoint-pause",
+        "checkpoint-resume",
+        "checkpoint-skip-last",
+        "stories-escalation-unresolved",
+        "stories-wedged",
         # cli.py
         # DW-410: a real launch whose resolved `[adapter] extra_args` drops the
         # profile's bypass tokens — one per affected launched role. `role`,
@@ -1222,6 +1333,10 @@ JOURNAL_KINDS = frozenset(
         # `error` is a drop field.
         "ctl-window-claim-failed",
         "run-resume",
+        # The resume of a tickets run paused for a refined ticket's story-file
+        # approval records that approval (`tickets_source.approve_paused_story_file`).
+        # Its one field, `ref`, rides the by-name benign row.
+        "ticket-story-approved",
         # cli.py + runs.py
         "rearm-code-root-restamped",
         # cli.py + runs.py (resume and re-arm, `runs.reconcile_root_identities`).
@@ -1519,12 +1634,17 @@ JOURNAL_KINDS = frozenset(
         "rearm-spec-flip-skipped",
         "rearm-spec-write-unreachable",
         "rearm-upstream-write-unreachable",
+        # tickets mode: a plan's intent-gap patch moved out of the tree at re-arm.
+        "restore-patch-evacuated",
         "run-stop-undelivered",
         "sentinel-cleared",
         "stale-restore-commits",
         "stale-restore-excluded",
         "stale-restore-unparseable",
         "story-escalation-resolved",
+        # resolve.py — a tickets-mode resolve context whose plan could not be read
+        # (the context carries nulls for what it could not read).
+        "resolve-ticket-context-unreadable",
         # runsetup.py
         "composition-unwind-failed",
         # A resume that could not clear its run's same-named session from a
@@ -1536,19 +1656,14 @@ JOURNAL_KINDS = frozenset(
         # `_JOURNAL_DROP_FIELDS`.
         "session-kill-refused",
         "run-start",
-        # stories_engine.py
-        "checkpoint-pause",
-        "checkpoint-resume",
-        "checkpoint-skip-last",
+        # stories_engine.py (`plan-halt` and its proof waiver: tickets_engine.py too)
         "deferred-close-declaration-unreadable",
         "plan-halt",
         "plan-halt-proof-of-work-skipped",
         "sentinel-detected",
-        "stories-escalation-unresolved",
         "stories-manifest-unreadable",
         "stories-selector-unknown",
         "stories-validated",
-        "stories-wedged",
         # sweep.py
         # DW-273. The bundle path's artifact-only receipt was ACCEPTED at the dev
         # proof-of-work gate: the ordinary probe positively found nothing, the
@@ -1924,9 +2039,10 @@ JOURNAL_KINDS = frozenset(
         # entries and is routed by name (`diagnostics._JOURNAL_KEYLIST_FIELDS`).
         "sweep-retro-items-ingested",
         # ...and its degrade: the board could not be read, its `action_items` is
-        # not a list, or the ledger append faulted before writing. The sweep
-        # carries on without ingesting. `ingest_cause` is the closed slug that
-        # tells the three apart; `error` is already a drop field.
+        # not a list, the ledger append faulted before writing, or the project is
+        # v7 and has no board. The sweep carries on without ingesting.
+        # `ingest_cause` is the closed slug that tells the four apart; `error` is
+        # already a drop field.
         "sweep-retro-ingest-unavailable",
         "sweep-return-no-client",
         "sweep-returned-after-decisions",
@@ -1954,6 +2070,41 @@ JOURNAL_KINDS = frozenset(
         "sweep-triage-reload-failed",
         "sweep-triage-result",
         "triage-decision",
+        # tickets_engine.py — the tickets-mode pick: rows the pick passed over
+        # (once per process each), and its pick-time pauses. A blocked plan pauses
+        # through the checkpoint mixin's `stories-wedged`. Plus an engine status
+        # write the plan chokepoint has no reason for, refused unwritten, and a
+        # registered task whose binding a resume re-resolved from the tree, and a
+        # review leg whose plan risk could not be read (reviewed as high risk). And
+        # the epic boundary: the closure it recorded, and a resume past an epic
+        # still open (its `retro-auto-*` rows reuse the base kinds with `epic_ref`).
+        # And a shared store's mark latched for after the code lands, and its
+        # replay on resume or retry at run end; its store-repository commit (made,
+        # failed, skipped over a foreign staged version, or still owed at run end)
+        # and an unversioned store, once a run.
+        "epic-closure-not-recorded",
+        "resume-ticket-mark",
+        "run-end-ticket-mark",
+        "store-commit-owed",
+        "store-commit-failed",
+        "store-commit-foreign-dirt",
+        "store-committed",
+        "store-unversioned",
+        "ticket-epic-closure",
+        "ticket-foreign-active",
+        "ticket-hitl-pause",
+        "ticket-mark-latched",
+        "ticket-pick-halt",
+        "ticket-plan-risk-unread",
+        "ticket-rebound",
+        "ticket-refine-pause",
+        "ticket-skipped",
+        "ticket-status-write-refused",
+        # tickettree.py — the ticket-plan chokepoint: one `ticket-mark` per
+        # mark/discard call (any outcome), one `ticket-plan-restored` per
+        # byte-exact restore.
+        "ticket-mark",
+        "ticket-plan-restored",
         # worktree_flow.py
         "accepted-spec-delivery-unreachable",
         "accepted-spec-write-unreachable",
@@ -2073,6 +2224,17 @@ POSIX_PATHS = ("/tmp", "/proc", "/dev/null")
 # string starting with "git " is routinely prose (an error message, a doc line)
 # while a sequence literal headed by "git" is not.
 SPAWN_CALL_NAMES = {"run", "Popen", "call", "check_call", "check_output"}
+
+# The one module that may spawn a v7 project's `tickets.py`: `TicketTree._call`
+# is the single spawn point, so every read and mark shares its launcher, UTF-8
+# decoding, timeout, pin check and error contract. A spawn elsewhere is a
+# `tickets` finding (see `_tickets_script_spawns`).
+TICKETS_SCRIPT_OWNERS = {"tickettree.py"}
+# What names the script in source: a string ending in "tickets.py", or the
+# bmadconfig marker constant that spells its installed path.
+TICKETS_SCRIPT_NAMES = {"V7_MARKER_REL"}
+# Spawn helpers beyond `subprocess`: the stop-aware runners in `childrun`.
+CHILDRUN_SPAWN_NAMES = {"run_argv", "run_child"}
 
 # Prefix that makes an environment variable this project's to register.
 ENV_PREFIX = "BMAD_LOOP_"
@@ -2652,7 +2814,7 @@ def _positional_kind_literal(node: ast.Call, index: int) -> str | None:
 
     Empty and occupied-but-unreadable are different answers and must not share one
     return value. ``sweep.py``'s own ``_close_bundle_ledger_when_spec_status(task,
-    str(spec_file), success_status)`` omits ``kind`` and relies on the default, so
+    str(spec_file), success_statuses)`` omits ``kind`` and relies on the default, so
     folding the empty slot into the sentinel reddens the clean tree.
 
     A non-literal in an occupied slot is FLAGGED, not skipped. Deferring it to the
@@ -3165,6 +3327,24 @@ def _names_isolation_refusal(
     ) or _names_guarded_verify_call(func, "_reject_isolation_conflict", wrapper_aliases)
 
 
+def _names_store_topology_refusal(
+    func: ast.expr, aliases: dict[str, frozenset[str]] | None = None
+) -> bool:
+    """True when ``func`` spells a ticket-store topology refusal entry point: the
+    pure ``ticketstore.store_topology_conflict``, the predicate
+    ``ticketstore.store_conflict``, or the CLI wrapper ``_reject_store_topology``,
+    each through its own alias set. Same reach and trade as
+    :func:`_names_isolation_refusal`."""
+    aliases = aliases or {}
+    return any(
+        _names_guarded_verify_call(func, name, aliases.get(name, frozenset()))
+        for name in STORE_TOPOLOGY_NAMES
+    )
+
+
+STORE_TOPOLOGY_NAMES = ("store_topology_conflict", "store_conflict", "_reject_store_topology")
+
+
 def _block_exits(body: list[ast.stmt]) -> bool:
     """Whether this simple guard body cannot fall through to the re-arm below it."""
     return bool(body) and isinstance(body[-1], (ast.Return, ast.Raise))
@@ -3320,6 +3500,80 @@ def _function_body_nodes(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast
     return [node for stmt in fn.body for node in ast.walk(stmt)]
 
 
+def _tickets_script_spawns(tree: ast.AST, docs: set[int]) -> list[int]:
+    """Line numbers of spawn calls whose arguments name the tickets script.
+
+    A spawn is ``subprocess.<SPAWN_CALL_NAMES>(...)`` (the module under any
+    ``import … as`` alias) or its bare from-import spelling, or ``run_argv``/``run_child`` by name or attribute. The script is
+    named by a string constant ending in ``tickets.py`` (docstrings excluded), by
+    :data:`TICKETS_SCRIPT_NAMES`, or by a module-level or local name whose
+    assignment mentions either (``script = root / V7_MARKER_REL`` then
+    ``Popen([py, str(script)])``) — taint follows plain assignments to a fixed
+    point, unscoped, which over-approximates and never under-reports a direct
+    rebinding. NOT COVERED: a path that arrives as a parameter or an attribute
+    (``self.script``), built in another module — the reason the owner module is
+    the only one that holds a script path at all."""
+
+    def names_script(node: ast.AST, tainted: set[str]) -> bool:
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Constant)
+                and isinstance(sub.value, str)
+                and id(sub) not in docs
+                and sub.value.endswith("tickets.py")
+            ):
+                return True
+            if isinstance(sub, ast.Name) and (sub.id in TICKETS_SCRIPT_NAMES or sub.id in tainted):
+                return True
+            if isinstance(sub, ast.Attribute) and sub.attr in TICKETS_SCRIPT_NAMES:
+                return True
+        return False
+
+    tainted: set[str] = set()
+    assigns = [n for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign))]
+    changed = True
+    while changed:
+        changed = False
+        for node in assigns:
+            if node.value is None or not names_script(node.value, tainted):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for sub in ast.walk(target):
+                    if isinstance(sub, ast.Name) and sub.id not in tainted:
+                        tainted.add(sub.id)
+                        changed = True
+
+    # `import subprocess as sp` spells the module `sp`.
+    subprocess_names = {"subprocess"} | {
+        alias.asname
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Import)
+        for alias in n.names
+        if alias.name == "subprocess" and alias.asname
+    }
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_spawn = (
+            isinstance(func, ast.Attribute)
+            and func.attr in SPAWN_CALL_NAMES
+            and isinstance(func.value, ast.Name)
+            and func.value.id in subprocess_names
+        ) or (isinstance(func, ast.Name) and func.id in SPAWN_CALL_NAMES | CHILDRUN_SPAWN_NAMES)
+        is_spawn = is_spawn or (
+            isinstance(func, ast.Attribute) and func.attr in CHILDRUN_SPAWN_NAMES
+        )
+        if not is_spawn:
+            continue
+        operands = [*node.args, *(kw.value for kw in node.keywords)]
+        if any(names_script(arg, tainted) for arg in operands):
+            hits.append(node.lineno)
+    return hits
+
+
 def _scan_source(src: str, rel: str):
     """The whole per-file scan, over one source string → the same
     ``(kind, rel, lineno, line_text)`` tuples ``_scan`` collects.
@@ -3340,6 +3594,7 @@ def _scan_source(src: str, rel: str):
     rearm_aliases = _call_aliases(tree, "rearm_escalation")
     isolation_aliases = _call_aliases(tree, "worktree_isolation_conflict")
     isolation_wrapper_aliases = _call_aliases(tree, "_reject_isolation_conflict")
+    store_aliases = {name: _call_aliases(tree, name) for name in STORE_TOPOLOGY_NAMES}
 
     # First positional args of `_run_git(...)` calls — the one position where a
     # git argv literal feeds the chokepoint instead of bypassing it. Collected up
@@ -4163,6 +4418,20 @@ def _scan_source(src: str, rel: str):
                     enclosing_names.get(id(node)),
                 )
             )
+        if isinstance(node, ast.Call) and _names_store_topology_refusal(node.func, store_aliases):
+            findings.append(
+                (
+                    "storetopologycall",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    enclosing_names.get(id(node)),
+                )
+            )
+
+    # tickets.py spawns outside the tickettree chokepoint — see
+    # `_tickets_script_spawns` for the shapes.
+    findings.extend(("tickets", rel, ln, line_at(ln)) for ln in _tickets_script_spawns(tree, docs))
 
     return findings
 
@@ -4188,6 +4457,94 @@ def test_no_tmux_invocation_outside_backend():
         "adapters/tmux_backend.py) — route it through get_multiplexer() instead:\n"
         + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
     )
+
+
+def test_tickets_script_spawned_only_in_tickettree():
+    """Only ``tickettree.py`` may spawn a v7 project's ``tickets.py``: every other
+    module reads the tree through ``TicketTree`` (or the ``TicketTreeLike`` seam),
+    so the launcher, UTF-8 decoding, timeout, initiative pin and error mapping
+    are never bypassed. Shapes and what stays uncovered: ``_tickets_script_spawns``;
+    the probe tables below keep this green for a reason."""
+    offenders = [
+        (rel, ln, txt) for _, rel, ln, txt in _of("tickets") if rel not in TICKETS_SCRIPT_OWNERS
+    ]
+    assert not offenders, (
+        "tickets.py spawned outside tickettree.py — read the tree through "
+        "tickettree.TicketTree instead:\n"
+        + "\n".join(f"  {rel}:{ln}: {txt.strip()}" for rel, ln, txt in offenders)
+    )
+
+
+def test_tickettree_has_a_single_spawn_point():
+    """The owner's own half of the invariant: ``tickettree.py`` spawns through
+    exactly one ``childrun.run_argv`` call, inside ``TicketTree._call``, and
+    nothing else in it spawns. Ablation: a second ``run_argv`` call (say, a
+    ``capability`` that spawns ``--help`` itself) turns this red."""
+    tree = ast.parse((SRC / "tickettree.py").read_text(encoding="utf-8"))
+    spawns: list[str] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in _function_body_nodes(fn):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name in SPAWN_CALL_NAMES | CHILDRUN_SPAWN_NAMES:
+                    spawns.append(f"{fn.name}:{name}")
+    assert spawns == ["_call:run_argv"], spawns
+
+
+TICKETS_SPAWN_PROBES = [
+    (
+        "literal-path",
+        'import subprocess, sys\nsubprocess.run([sys.executable, "_bmad/method/scripts/tickets.py"])\n',
+    ),
+    (
+        "marker-attribute",
+        "from bmad_loop import bmadconfig, childrun\n"
+        "childrun.run_argv([py, str(root / bmadconfig.V7_MARKER_REL), 'next'], cwd=None, timeout=5)\n",
+    ),
+    (
+        "tainted-name",
+        "import subprocess, sys\nscript = root / V7_MARKER_REL\nsubprocess.Popen([sys.executable, str(script)])\n",
+    ),
+    (
+        "tainted-argv",
+        "from bmad_loop.childrun import run_argv\n"
+        "argv = [py, str(p / 'tickets.py'), 'find', ref]\nrun_argv(argv, cwd=None, timeout=1)\n",
+    ),
+    (
+        "bare-check-output",
+        "from subprocess import check_output\ncheck_output(['uv', 'run', 'x/tickets.py'])\n",
+    ),
+    ("keyword-argv", "import subprocess\nsubprocess.run(args=['python', 'tickets.py', 'next'])\n"),
+    ("aliased-module", "import subprocess as sp\nsp.run([py, 'tickets.py', 'next'])\n"),
+]
+TICKETS_SPAWN_NON_PROBES = [
+    ("marker-existence", "marker = project / V7_MARKER_REL\nok = marker.is_file()\n"),
+    ("unrelated-spawn", "import subprocess\nsubprocess.run(['uv', '--version'])\n"),
+    (
+        "prose-beside-a-spawn",
+        '"""Drives tickets.py."""\nimport subprocess\nmsg = "see tickets.py."\nsubprocess.run(["true"])\n',
+    ),
+    ("tainted-name-not-spawned", "script = root / V7_MARKER_REL\nlog.info('using %s', script)\n"),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), TICKETS_SPAWN_PROBES, ids=[p[0] for p in TICKETS_SPAWN_PROBES]
+)
+def test_tickets_spawn_detector_flags_every_spawn_shape(label, source):
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "tickets"]
+    assert found, f"the {label!r} shape produced no `tickets` finding:\n{source}"
+
+
+@pytest.mark.parametrize(
+    ("label", "source"), TICKETS_SPAWN_NON_PROBES, ids=[p[0] for p in TICKETS_SPAWN_NON_PROBES]
+)
+def test_tickets_spawn_detector_stays_silent_on_lookalikes(label, source):
+    found = [f for f in _scan_source(source, "probe.py") if f[0] == "tickets"]
+    assert not found, f"the {label!r} shape was flagged; it spawns no tickets.py:\n{source}"
 
 
 def _git_offenders(findings) -> list[tuple[str, int, str]]:
@@ -4938,6 +5295,142 @@ def test_isolation_conflict_refusal_sites_are_enumerated():
         f"  scanned:  {sorted(sites.elements())}\n"
         f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
     )
+
+
+def test_store_topology_refusal_sites_are_enumerated():
+    """The ticket-store topology refusal is reached from exactly the declared call
+    sites, counted WITH multiplicity — `store_topology_conflict`, `store_conflict`
+    and `_reject_store_topology` alike — so a run-arming surface that skips it, or a
+    new one that reaches it, reddens a row.
+
+    Ablation: delete the `storetopologycall` emit and this reddens (every row
+    declared, none scanned); delete the `_reject_store_topology` call in
+    `_prepare_resume_locked` and the count comparison reddens naming the site."""
+    findings = _of("storetopologycall")
+    sites = Counter((rel, fn) for _, rel, _, _, fn in findings)
+    declared = Counter(STORE_TOPOLOGY_CALLERS)
+    changed = {key for key in set(sites) | set(declared) if sites[key] != declared[key]}
+    detail = [
+        f"  {rel}:{ln}: in {fn or '<module>'} — {txt.strip()}"
+        for _, rel, ln, txt, fn in findings
+        if (rel, fn) in changed
+    ]
+    assert sites == declared, (
+        "the ticket-store topology refusal call sites moved (store_topology_conflict / "
+        "store_conflict / _reject_store_topology). A new surface lands WITH its refusal "
+        "test; a removed one deletes its row — update STORE_TOPOLOGY_CALLERS only "
+        "alongside that decision:\n"
+        f"  scanned:  {sorted(sites.elements())}\n"
+        f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "source", "fn"),
+    [
+        (
+            "qualified-predicate-call",
+            "def f(args):\n    ticketstore.store_conflict(project, source, iso)\n",
+            "f",
+        ),
+        (
+            "bare-wrapper-call",
+            "def cmd_run(args):\n"
+            "    if (rc := _reject_store_topology(project, pol, source)) is not None:\n"
+            "        return rc\n",
+            "cmd_run",
+        ),
+        (
+            "renamed-text-import",
+            "from .ticketstore import store_topology_conflict as why\n"
+            "def g(result):\n    why(result)\n",
+            "g",
+        ),
+    ],
+    ids=["qualified-predicate-call", "bare-wrapper-call", "renamed-text-import"],
+)
+def test_store_topology_call_detector_reports_the_site(label, source, fn):
+    """Each spelling is found and attributed to its enclosing function.
+
+    Ablation: delete the `storetopologycall` emit and every row reddens."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "storetopologycall"]
+    assert len(found) == 1, f"the {label!r} shape produced {len(found)} findings:\n{source}"
+    assert found[0][4] == fn
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def store_conflict(project, source, isolation):\n    return None\n",
+        "def f():\n    store_conflicts(paths)\n",
+        "def f():\n    handler = ticketstore.store_conflict\n",
+    ],
+    ids=["definition", "similar-name", "reference-not-a-call"],
+)
+def test_store_topology_call_detector_stays_silent_on_non_calls(source):
+    """A definition, a similar name and a bare reference are not call sites.
+
+    Ablation: relax `_names_guarded_verify_call`'s name equality to a substring
+    match and the similar-name row reddens."""
+    found = [f for f in _scan_source(source, "cli.py") if f[0] == "storetopologycall"]
+    assert not found
+
+
+SPEC_STATUS_WRITER_NAMES = frozenset(
+    {"set_frontmatter_status", "set_frontmatter_status_anchored", "reset_spec_status"}
+)
+
+
+def _spec_status_writer_calls(rel: str, source: str) -> Counter[tuple[str, str | None]]:
+    """``(rel, innermost enclosing function) -> calls`` to a spec status writer in
+    ``source``, by bare name or attribute (``verify.set_frontmatter_status``)."""
+    tree = ast.parse(source)
+    enclosing = _enclosing_function_names(tree)
+    calls: Counter[tuple[str, str | None]] = Counter()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name in SPEC_STATUS_WRITER_NAMES:
+            calls[(rel, enclosing[id(node)])] += 1
+    return calls
+
+
+def _spec_status_writer_scan() -> Counter[tuple[str, str | None]]:
+    calls: Counter[tuple[str, str | None]] = Counter()
+    for path in _py_files():
+        rel = path.relative_to(SRC).as_posix()
+        calls += _spec_status_writer_calls(rel, path.read_text(encoding="utf-8"))
+    return calls
+
+
+def test_spec_status_writers_are_inventoried():
+    """Every spec frontmatter-status writer call in src sits at a declared
+    ``(file, function)`` with its declared count (`SPEC_STATUS_WRITERS`): in tickets
+    mode a plan's `status` moves only through `TicketTree.mark`, so a new writer
+    must route through `Engine._spec_status_write` or carry its own tickets-mode
+    decision in the table.
+
+    Ablation (in-test): one dummy caller added to engine.py's source reddens the
+    comparison; deleting a row (e.g. `_apply_confirmation`'s) reddens it too."""
+    scanned = _spec_status_writer_scan()
+    declared = Counter(SPEC_STATUS_WRITERS)
+    assert scanned == declared, (
+        "spec status writer call sites moved — route an engine write through "
+        "`Engine._spec_status_write`, or add a SPEC_STATUS_WRITERS row naming the "
+        "site's tickets-mode answer:\n"
+        f"  scanned:  {sorted(scanned.items(), key=str)}\n"
+        f"  declared: {sorted(declared.items(), key=str)}"
+    )
+    dummy = "def _sneaky(spec):\n    verify.set_frontmatter_status(spec, 'done')\n"
+    engine_source = (SRC / "engine.py").read_text(encoding="utf-8") + "\n\n" + dummy
+    with_dummy = scanned - _spec_status_writer_calls(
+        "engine.py", (SRC / "engine.py").read_text(encoding="utf-8")
+    )
+    with_dummy += _spec_status_writer_calls("engine.py", engine_source)
+    assert with_dummy != declared
+    assert with_dummy[("engine.py", "_sneaky")] == 1
 
 
 def _journal_measured_splats(findings) -> Counter[tuple[str, str | None]]:
@@ -9331,7 +9824,7 @@ def test_journal_kind_literal_positional_arm_stays_silent_on_lookalikes():
     a KEYWORD-ONLY `kind` (no positional slot exists, so a string in that argument
     position is some other parameter's), an EMPTY slot (the parameter default, which the
     definition arm reports instead — `sweep.py`'s own
-    `_close_bundle_ledger_when_spec_status(task, str(spec_file), success_status)` call
+    `_close_bundle_ledger_when_spec_status(task, str(spec_file), success_statuses)` call
     relies on it, so flagging an omitted `kind` would redden the clean tree), the same
     call in a file declaring no such position, and a declared FORWARDER whose positional
     kind the journal-write emit already reports — double-reporting one site would make a

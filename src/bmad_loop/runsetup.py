@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from . import bmadconfig
 from . import policy as policy_mod
-from . import runs
+from . import runs, ticketstore, worksource
 from .checks import Finding
 from .journal import Journal, save_state, state_lock
 from .model import RunState
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from .policy import Policy
     from .stories_engine import StoriesEngine
     from .sweep import SweepEngine
+    from .tickets_engine import TicketsEngine
 
     class MakeAdapters(Protocol):
         """Call shape of :func:`make_adapters`, which ``compose_*`` takes injected.
@@ -462,7 +463,9 @@ def make_adapters(
     # synthesizes the result from the spec, and so needs the project paths to
     # find that spec — rebasing onto the active worktree's implementation-
     # artifacts dir under isolation, not just the main checkout's.
-    paths = bmadconfig.load_paths(project)
+    paths = bmadconfig.load_paths(
+        project, want_tickets=policy.stories.source == worksource.SOURCE_TICKETS
+    )
     mux = None
     adapters: dict[str, CodingCLIAdapter] = {}
     by_cfg: dict = {}
@@ -822,16 +825,21 @@ def build_run_state(
     epic_filter: int | None,
     story_filter: str | None,
     max_stories: int | None,
-    stories_on: bool,
+    source: str,
     spec_folder: str,
     trusted_config_digest: str,
     run_dir_identity: tuple[int, int] | None,
+    initiative: str = "",
+    initiative_folder: str = "",
+    store_topology: dict[str, str | None] | None = None,
+    ticket_epic_filter: str = "",
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
     ``policy_snapshot`` freezes ``policy`` at launch so every later display reads
     the weights the run actually launched under; ``source`` / ``spec_folder``
-    record which queue the run dispatches (a stories manifest vs sprint-status).
+    record which queue the run dispatches (a stories manifest vs sprint-status);
+    ``spec_folder`` is dropped for a source without one.
 
     ``trusted_config_digest`` is carried here **as well as** stamped out of the
     tree by :func:`compose_run` (#498). The out-of-tree file is the one resume
@@ -846,7 +854,15 @@ def build_run_state(
 
     ``run_dir_identity`` is the run dir's mint-time identity
     (:func:`_claim_identity` of the composer's claim, DW-446) — what the verify
-    stream's pin compares the run dir it opens against."""
+    stream's pin compares the run dir it opens against.
+
+    ``initiative`` / ``initiative_folder`` are the v7 active initiative and its
+    folder (``ProjectPaths.active_initiative`` / ``initiative_folder``), pinned only
+    for a tickets run, whose tree reads refuse once the live initiative differs;
+    every other source records them empty. ``store_topology`` is the classified
+    ticket store (``ticketstore.StoreTopology.to_dict``), and ``ticket_epic_filter``
+    the ``--epic`` selector resolved to an epic slug, likewise tickets only."""
+    tickets = source == worksource.SOURCE_TICKETS
     return RunState(
         run_id=run_id,
         project=str(project),
@@ -857,10 +873,66 @@ def build_run_state(
         epic_filter=epic_filter,
         story_filter=story_filter,
         max_stories=max_stories,
-        source="stories" if stories_on else "sprint-status",
-        spec_folder=spec_folder if stories_on else "",
+        source=source,
+        spec_folder=spec_folder if worksource.traits_for(source).has_spec_folder else "",
+        initiative=initiative if tickets else "",
+        initiative_folder=initiative_folder if tickets else "",
+        store_topology=dict(store_topology or {}) if tickets else {},
+        ticket_epic_filter=ticket_epic_filter if tickets else "",
         trusted_config_digest=trusted_config_digest,
     )
+
+
+def _run_store_topology(
+    paths: bmadconfig.ProjectPaths, policy: Policy, source: str
+) -> dict[str, str | None]:
+    """The ticket-store topology a tickets run records at its start (``{}`` for any
+    other source, and when there is no initiative folder to classify — the
+    preflight's ``tickets.initiative-*`` checks own that refusal). The run preflight
+    refused every unrunnable store already, so a store refused here changed in
+    between; that raises :class:`ticketstore.TicketStoreError` rather than starting
+    unrecorded."""
+    if source != worksource.SOURCE_TICKETS:
+        return {}
+    result = ticketstore.assess_store(paths, policy.scm.isolation)
+    if result is None:
+        return {}
+    if isinstance(result, ticketstore.StoreRefusal):
+        raise ticketstore.TicketStoreError(
+            "the ticket store no longer classifies at run start (it changed after the "
+            "preflight) — run `bmad-loop validate` and start the run again"
+        )
+    return result.to_dict()
+
+
+def _engine_cls_for(
+    source: str,
+    spec_folder: str,
+    *,
+    engine_cls: type[Engine],
+    stories_engine_cls: type[StoriesEngine],
+    tickets_engine_cls: type[TicketsEngine] | None = None,
+) -> tuple[type[Engine], dict[str, str]]:
+    """The engine class a story run from ``source`` is built with, and the extra
+    constructor kwargs that class takes beyond the shared ones.
+
+    A source the registry does not carry (a run state persisted by a newer
+    version) raises :class:`worksource.UnknownSource`, and a registered source
+    that cannot run yet raises :class:`worksource.SourceNotRunnable` — neither is
+    rebuilt as a sprint run. The classes are injected so ``cli``'s module-level
+    names — and the tests' monkeypatches of them — stay the ones built.
+    ``tickets_engine_cls`` None is :class:`~bmad_loop.tickets_engine.TicketsEngine`."""
+    if not worksource.resumable_traits_for(source).runnable:
+        worksource.refuse_unrunnable(source)
+    if source == worksource.SOURCE_STORIES:
+        return stories_engine_cls, {"spec_folder": spec_folder}
+    if source == worksource.SOURCE_TICKETS:
+        if tickets_engine_cls is None:
+            from .tickets_engine import TicketsEngine
+
+            tickets_engine_cls = TicketsEngine
+        return tickets_engine_cls, {}
+    return engine_cls, {}
 
 
 @dataclass
@@ -882,6 +954,43 @@ class ComposedRun:
 
 class SweepOptionsError(ValueError):
     """Persisted selector-bearing sweep options are unsafe to resume."""
+
+
+class SweepPinError(ValueError):
+    """A sweep would resume under another BMAD v7 initiative than it started on."""
+
+
+def sweep_initiative_conflict(state: RunState, paths: bmadconfig.ProjectPaths) -> str | None:
+    """The refusal text when a sweep would resume on another initiative than the
+    one it pinned at launch (``RunState.initiative``), else None. Every story run
+    is None here: a tickets run checks its pin on each tree read instead.
+
+    On v7 the ledger and the pre-answer store both belong to one initiative
+    (``ProjectPaths.deferred_work``, ``decisions.store_scope``), and a sweep's
+    triage, bundles and run-local decisions name that ledger's DW ids, so a
+    resume under a switched initiative would apply them to a different ledger
+    whose ids mean other entries. The live side is ``paths.active_initiative``
+    (``""`` off v7). A sweep that started with no initiative active pins
+    ``""``; one written before the pin existed reads the same, which on a v7
+    project with an initiative active is refused rather than guessed."""
+    if state.run_type != "sweep":
+        return None
+    pinned = state.initiative
+    live = paths.active_initiative if paths.era == "v7" else ""
+    if pinned == live:
+        return None
+    started = f"initiative {pinned!r}" if pinned else "no active initiative"
+    now = repr(live) if live else "unset"
+    fix = (
+        f"set `[core] active_initiative` back to {pinned!r}"
+        if pinned
+        else "unset `[core] active_initiative`"
+    )
+    return (
+        f"sweep {state.run_id} started on {started}, but the active initiative is now "
+        f"{now}; its ledger and pre-answers belong to the initiative it started on. "
+        f"To resume it, {fix} (_bmad/custom/config.user.toml); otherwise start a new sweep"
+    )
 
 
 @dataclass(frozen=True)
@@ -1198,15 +1307,17 @@ def compose_run(
     epic_filter: int | None,
     story_filter: str | None,
     max_stories: int | None,
-    stories_on: bool,
+    source: str,
     spec_folder: str,
     sweep_factory: SweepFactory,
     make_adapters: MakeAdapters,
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
     trusted_config_digest: str,
+    tickets_engine_cls: type[TicketsEngine] | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     plugin_grants: GrantSet = GrantSet.empty(),
+    ticket_epic_filter: str = "",
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -1232,9 +1343,15 @@ def compose_run(
     once by the caller and handed to the engine's registry build. The default is
     no grants (fail closed), never "read the store" — this layer does not read it.
     A fatal plugin verdict raises out of the engine build and unwinds the run.
+
+    ``ticket_epic_filter`` is a tickets run's ``--epic`` selector, already resolved
+    to an epic slug by the caller (``epic_filter`` stays None for such a run, and
+    ``story_filter`` carries the resolved ticket ref).
     """
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
+    # Before the claim: a store that changed since the preflight leaves nothing behind.
+    store_topology = _run_store_topology(paths, policy, source)
     # Outside the try below, and it must stay there: a collision refusal that
     # reached `_unwind_composition` would delete the run it exists to protect.
     composer_claim = _claim_run_dir(run_dir)
@@ -1259,10 +1376,16 @@ def compose_run(
             epic_filter=epic_filter,
             story_filter=story_filter,
             max_stories=max_stories,
-            stories_on=stories_on,
+            source=source,
             spec_folder=spec_folder,
             trusted_config_digest=trusted_config_digest,
             run_dir_identity=_claim_identity(composer_claim),
+            initiative=paths.active_initiative,
+            initiative_folder=(
+                str(paths.initiative_folder) if paths.initiative_folder is not None else ""
+            ),
+            store_topology=store_topology,
+            ticket_epic_filter=ticket_epic_filter,
         )
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering
@@ -1298,12 +1421,15 @@ def compose_run(
             sweep_factory=sweep_factory,
             plugin_grants=plugin_grants,
         )
-        # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-        engine: Engine = (
-            stories_engine_cls(**common, spec_folder=spec_folder)
-            if stories_on
-            else engine_cls(**common)  # pyright: ignore[reportArgumentType]
+        cls, extra = _engine_cls_for(
+            source,
+            spec_folder,
+            engine_cls=engine_cls,
+            stories_engine_cls=stories_engine_cls,
+            tickets_engine_cls=tickets_engine_cls,
         )
+        # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
+        engine: Engine = cls(**common, **extra)  # pyright: ignore[reportArgumentType]
     except BaseException:
         _unwind_composition(project, run_dir, journal, composer_claim)
         raise
@@ -1400,6 +1526,7 @@ def compose_sweep(
     from .sweep import select_entries
 
     select_entries((), only_ids=only_ids, min_severity=min_severity)
+    v7 = paths.era == "v7"
     options = {
         "prompting": prompting,
         "decisions_only": decisions_only,
@@ -1418,6 +1545,11 @@ def compose_sweep(
 
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
+    # v7: the ledger and the bundle plans live in the ticket store, so a sweep
+    # records its topology as a tickets run does (before the claim, for the same
+    # reason): `SweepEngine` shares a store no checkout carries and publishes an
+    # accepted plan in a store's own repository, and a resume refuses a changed one.
+    store_topology = _run_store_topology(paths, policy, worksource.SOURCE_TICKETS) if v7 else {}
     # Same claim, same reason, same placement outside the try as in `compose_run`.
     composer_claim = _claim_run_dir(run_dir)
     # Atomic from the first published artifact onward, exactly as in `compose_run`
@@ -1437,6 +1569,13 @@ def compose_sweep(
             sweep_options_version=SWEEP_OPTIONS_VERSION,
             sweep_options_digest=options_digest,
             trusted_config_digest=trusted_config_digest,
+            # v7: the initiative whose ledger this sweep works, which a resume
+            # must find unchanged (`sweep_initiative_conflict`).
+            initiative=paths.active_initiative if v7 else "",
+            initiative_folder=(
+                str(paths.initiative_folder) if v7 and paths.initiative_folder is not None else ""
+            ),
+            store_topology=store_topology,
         )
         # Persist the sweep options atomically (tmp + os.replace), the way save_state
         # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
@@ -1495,6 +1634,7 @@ def compose_resume(
     engine_cls: type[Engine],
     stories_engine_cls: type[StoriesEngine],
     sweep_engine_cls: type[SweepEngine],
+    tickets_engine_cls: type[TicketsEngine] | None = None,
     profiles: dict[str, CLIProfile] | None = None,
     sweep_options: SweepResumeOptions | None = None,
     plugin_grants: GrantSet = GrantSet.empty(),
@@ -1522,9 +1662,27 @@ def compose_resume(
     ``plugin_grants`` is the resume's frozen grant set, as in :func:`compose_run`.
     Unlike the two launches this has no unwind, so the caller preflights the
     grants before its first side effect (``cli._prepare_resume_locked``); the
-    engine build stays the gate."""
+    engine build stays the gate.
+
+    A story run whose persisted ``source`` this version cannot drive — unknown to
+    the registry, or registered but not runnable yet — raises before any side
+    effect (:func:`_engine_cls_for`)."""
     if state.run_type == "sweep":
         validate_sweep_options_version(state.sweep_options_version)
+        if (conflict := sweep_initiative_conflict(state, paths)) is not None:
+            raise SweepPinError(conflict)
+        story_engine = None
+    else:
+        # stories mode is pinned in run state at launch, so resume rebuilds the
+        # same picker (StoriesEngine) without any flag. An unrecognised persisted
+        # source is refused here, ahead of the session kills below.
+        story_engine = _engine_cls_for(
+            state.source,
+            state.spec_folder,
+            engine_cls=engine_cls,
+            stories_engine_cls=stories_engine_cls,
+            tickets_engine_cls=tickets_engine_cls,
+        )
     resolved_sweep_options = (
         sweep_options
         if sweep_options is not None
@@ -1602,14 +1760,10 @@ def compose_resume(
             sweep_factory=sweep_factory,
             plugin_grants=plugin_grants,
         )
-        # stories mode is pinned in run state at launch, so resume rebuilds the
-        # same picker (StoriesEngine) without any flag.
+        assert story_engine is not None
+        cls, extra = story_engine
         # heterogeneous **kwargs: pyright unions the dict values; per-arg error is spurious
-        engine = (
-            stories_engine_cls(**story_common, spec_folder=state.spec_folder)
-            if state.source == "stories"
-            else engine_cls(**story_common)  # pyright: ignore[reportArgumentType]
-        )
+        engine = cls(**story_common, **extra)  # pyright: ignore[reportArgumentType]
     return ComposedRun(
         engine=engine, run_id=run_dir.name, run_dir=run_dir, state=state, journal=journal
     )

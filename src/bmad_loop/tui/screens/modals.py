@@ -13,6 +13,7 @@ from typing import Any
 
 from rich.cells import cell_len
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -20,15 +21,35 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
-from ... import stories
+from ... import stories, tickets_source, worksource
 from ...escalation import display_pause_reason
 from ...model import RunState
 from .. import data, widgets
 
 
+def source_options() -> list[tuple[str, str]]:
+    """The start-run modal's source picker: one (label, source) per registered
+    source that ``run`` can launch from, in registry order."""
+    return [(t.label, t.name) for t in worksource.TRAITS.values() if t.runnable]
+
+
 def _int_or_none(value: str) -> int | None:
     value = value.strip()
     return int(value) if value else None
+
+
+def epic_selector(source: object, value: str) -> int | str | None:
+    """The start-run modal's ``--epic`` value for ``source``: blank is None; a
+    tickets run takes an epic id or slug as text (``run`` resolves it against the
+    tree); every other source takes only a number, as ``run`` does.
+
+    Raises ValueError on a non-number outside tickets mode."""
+    value = value.strip()
+    if not value:
+        return None
+    if source == worksource.SOURCE_TICKETS:
+        return value
+    return int(value)
 
 
 class BaseDialog(ModalScreen):
@@ -162,11 +183,15 @@ class BaseDialog(ModalScreen):
 class StartRunModal(BaseDialog):
     """Options for `bmad-loop run`.
 
-    Dual-flow: a source select (prefilled from ``[stories]``) picks sprint mode
-    vs. stories mode; the spec-folder input feeds a live schedule preview that
-    validates ``stories.yaml`` (parses + rules pass, SPEC.md present) and lists
-    the linear schedule with independent spec/done checkpoint markers — the same
-    projection `run --dry-run` prints. Returns
+    A source select (prefilled from ``[stories]``) picks sprint, stories or
+    tickets mode. In stories mode the spec-folder input feeds a live schedule
+    preview that validates ``stories.yaml`` (parses + rules pass, SPEC.md
+    present) and lists the linear schedule with independent spec/done checkpoint
+    markers — the same projection `run --dry-run` prints. In tickets mode the
+    preview is the active initiative's board (:func:`data.project_tickets_overview`),
+    read on a worker thread because it runs the project's ``tickets.py``. The
+    epic input is a number, or in tickets mode an epic id or slug
+    (:func:`epic_selector`). Returns
     ``{source, spec_folder, epic, story, max_stories, dry_run}``."""
 
     DEFAULT_CSS = """
@@ -189,13 +214,16 @@ class StartRunModal(BaseDialog):
         self,
         project: Path,
         *,
-        default_source: str = "sprint-status",
+        default_source: str = worksource.SOURCE_SPRINT,
         default_spec_folder: str = "",
     ):
         super().__init__()
         self._project = project
         self._default_source = default_source
         self._default_spec_folder = default_spec_folder
+        # bumped by every preview refresh: a tickets read shows only while its
+        # request is still the latest, so a slow read cannot land over a newer one
+        self._preview_seq = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -204,10 +232,7 @@ class StartRunModal(BaseDialog):
             # in any terminal size (the modal is tall in stories mode).
             with VerticalScroll(id="fields"):
                 yield Select(
-                    [
-                        ("sprint mode — sprint-status.yaml", "sprint-status"),
-                        ("stories mode — folder+id dispatch", "stories"),
-                    ],
+                    source_options(),
                     value=self._default_source,
                     allow_blank=False,
                     id="source",
@@ -218,13 +243,11 @@ class StartRunModal(BaseDialog):
                     id="spec-folder",
                 )
                 yield Input(
-                    placeholder="epic — blank for all (sprint mode)",
-                    type="integer",
-                    valid_empty=True,
+                    placeholder="epic — blank for all; a number, or an epic id/slug (tickets)",
                     id="epic",
                 )
                 yield Input(
-                    placeholder="story — 3-1 / slug / full key (sprint), or story id (stories)",
+                    placeholder="story — 3-1 / slug / key (sprint), story id, or ticket ref",
                     id="story",
                 )
                 yield Input(
@@ -251,13 +274,19 @@ class StartRunModal(BaseDialog):
             self._refresh_preview()
 
     def _refresh_preview(self) -> None:
+        self._preview_seq += 1
         try:
             body = self.query_one("#preview-body", Static)
             source = self.query_one("#source", Select).value
             spec_folder = self.query_one("#spec-folder", Input).value.strip()
         except NoMatches:
             return  # a Changed message during mount, before the tree is built
-        if source != "stories":
+        traits = worksource.TRAITS.get(source) if isinstance(source, str) else None
+        if traits is not None and traits.name == worksource.SOURCE_TICKETS:
+            body.update(Text("tickets mode — reading the active initiative…", style="dim"))
+            self._load_tickets_preview(self._preview_seq)
+            return
+        if traits is None or not traits.has_spec_folder:
             body.update(Text("sprint mode — walks sprint-status.yaml", style="dim"))
             return
         if not spec_folder:
@@ -285,15 +314,62 @@ class StartRunModal(BaseDialog):
             text.append(f"  {r.title}", style="dim")
         body.update(text)
 
+    @work(thread=True, exclusive=True, group="tickets-preview")
+    def _load_tickets_preview(self, seq: int) -> None:
+        # tickets.py is project code and may take seconds: never on the UI thread.
+        board = data.project_tickets_overview(self._project)
+        self.app.call_from_thread(self._show_tickets_preview, board, seq)
+
+    def _show_tickets_preview(self, board: data.TicketsBoard, seq: int) -> None:
+        if seq != self._preview_seq:
+            return  # superseded: a later refresh owns the preview
+        try:
+            body = self.query_one("#preview-body", Static)
+            source = self.query_one("#source", Select).value
+        except NoMatches:
+            return  # dismissed while the read was in flight
+        if source != worksource.SOURCE_TICKETS:
+            return  # the picker moved on; that source's preview stands
+        if board.fault is not None:
+            body.update(Text(f"⚠ tickets board unavailable: {board.fault}", style="red"))
+            return
+        counts: dict[str, int] = {}
+        for row in board.rows:
+            counts[row.state] = counts.get(row.state, 0) + 1
+        text = Text()
+        text.append(f"initiative {board.initiative} · {len(board.rows)} tickets", style="bold")
+        if counts:
+            text.append("\n  " + " · ".join(f"{n} {state}" for state, n in counts.items()))
+        flagged = [r for r in board.rows if r.state not in ("done", "dropped")]
+        for label, pick in (
+            ("hitl", lambda r: r.hitl),
+            ("plan checkpoint", lambda r: r.plan_checkpoint),
+            ("done checkpoint", lambda r: r.done_checkpoint),
+        ):
+            refs = [tickets_source.row_label(r) for r in flagged if pick(r)]
+            if refs:
+                text.append(f"\n  {label}: {', '.join(refs)}", style="magenta")
+        text.append("\n  dry run prints the build order and the first pause", style="dim")
+        body.update(text)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id != "ok":
             self.dismiss(None)
             return
+        source = self.query_one("#source", Select).value
+        try:
+            epic = epic_selector(source, self.query_one("#epic", Input).value)
+        except ValueError:
+            self.notify(
+                "epic must be a number outside tickets mode (tickets mode takes an id or slug)",
+                severity="error",
+            )
+            return
         self.dismiss(
             {
-                "source": self.query_one("#source", Select).value,
+                "source": source,
                 "spec_folder": self.query_one("#spec-folder", Input).value.strip(),
-                "epic": _int_or_none(self.query_one("#epic", Input).value),
+                "epic": epic,
                 "story": self.query_one("#story", Input).value.strip() or None,
                 "max_stories": _int_or_none(self.query_one("#max-stories", Input).value),
                 "dry_run": self.query_one("#dry-run", Checkbox).value,

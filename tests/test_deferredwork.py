@@ -1009,6 +1009,50 @@ def test_flat_append_after_canonical_stays_visible_to_legacy_parser():
     assert legacy.title == "later flat finding"
 
 
+def test_flat_source_plan_append_after_canonical_stays_visible():
+    """The v7 attended `bmad-build` opens its flat block with `source_plan:`; the
+    block ends DW-1's span and reaches the legacy parser like a v6 one."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n"
+        "- source_plan: `epic-auth/story-login-plan.md`\n"
+        "  summary: later v7 finding\n"
+        "  evidence: must not be swallowed by DW-1\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+    (legacy,) = parse_legacy(text)
+
+    assert canonical.open
+    assert "later v7 finding" not in canonical.body
+    assert legacy.title == "later v7 finding"
+    assert has_legacy(text)
+
+
+def test_flat_source_plan_status_not_absorbed_into_previous_entry():
+    """A v7 flat block after a CLOSED entry must stay an open legacy finding, not
+    become dead text inside DW-1's done span, where no reader — the strict view,
+    the legacy parser, the sweep's migrate step — would ever see it again.
+    Ablation: revert `_FLAT_SOURCE_BODY` to `source_spec:[ \\t]` and this FAILS."""
+    text = (
+        "# Deferred Work\n\n"
+        "### DW-1: closed canonical\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: done\n\n"
+        "- source_plan: `epic-auth/story-login-plan.md`\n"
+        "  summary: open v7 finding\n"
+        "  evidence: filed after DW-1 was closed\n"
+    )
+
+    (canonical,) = parse_ledger(text)
+
+    assert canonical.status == "done"
+    assert "open v7 finding" not in canonical.body
+    assert has_legacy(text)
+    (legacy,) = parse_legacy(text)
+    assert legacy.title == "open v7 finding" and not legacy.done
+
+
 # The canonical-span boundary has to recognize every flat shape parse_legacy
 # does (#304): a boundary keyed on the full three-line block leaves the bug in
 # place for the partial ones — and those are not hypothetical, they are the
@@ -1028,18 +1072,21 @@ FLAT_TAIL_SHAPES = {
 }
 
 
+@pytest.mark.parametrize("key", ["source_spec", "source_plan"])
 @pytest.mark.parametrize("shape", sorted(FLAT_TAIL_SHAPES), ids=sorted(FLAT_TAIL_SHAPES))
-def test_flat_append_visible_for_every_shape_parse_legacy_accepts(shape):
+def test_flat_append_visible_for_every_shape_parse_legacy_accepts(shape, key):
+    """Both flat openers — v6 `source_spec:` and v7 `source_plan:` — in every shape."""
+    tail = FLAT_TAIL_SHAPES[shape].replace("source_spec", key).replace("SOURCE_SPEC", key.upper())
     text = (
         "# Deferred Work\n\n### DW-1: canonical\n\n"
-        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n" + FLAT_TAIL_SHAPES[shape]
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n\n" + tail
     )
 
     (canonical,) = parse_ledger(text)
     (legacy,) = parse_legacy(text)
 
     assert canonical.open, "the boundary must not cost DW-1 its status"
-    assert "source_spec" not in canonical.body
+    assert key not in canonical.body.lower()
     assert legacy.body.lstrip().startswith(("- ", "* ", "-\t"))
 
 
@@ -2689,6 +2736,171 @@ def test_a_tail_below_an_indented_heading_reaches_the_legacy_parser():
 )
 def test_gates_story_matches_on_key_boundaries(token, story_key, gated):
     assert deferredwork.gates_story(token, story_key) is gated
+
+
+def _ticket_gated(*lines: str):
+    """`_gated` under the ticket grammar."""
+    text = (
+        "# Deferred Work\n\n### DW-1: gated entry\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n"
+        + "".join(f"{x}\n" for x in lines)
+    )
+    (entry,) = parse_ledger(text)
+    return deferredwork.gates(entry, grammar="ticket")
+
+
+def test_ticket_gate_shapes_agree_with_the_vendored_tickets_py(monkeypatch):
+    """The four ticket-grammar shapes are copies of `tickets.py`'s own patterns
+    (`CROSS_RE`, `ID_RE`, `EPIC_RE`, `NAME_RE`), pinned to the vendored upstream
+    rather than to a comment: if upstream widens a ref shape, a gate written in it
+    would start reporting `malformed` and refuse nothing. Loaded from the fixture
+    file, never from `stories` or the installed project script, and never run —
+    and without bytecode, which would land a `__pycache__` beside the pinned
+    files and fail `test_vendored_bmad_v7_matches_pin`."""
+    import importlib.util
+
+    from conftest import V7_FIXTURE
+
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+
+    spec = importlib.util.spec_from_file_location("_vendored_tickets", V7_FIXTURE / "tickets.py")
+    assert spec is not None and spec.loader is not None
+    upstream = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(upstream)
+
+    assert deferredwork._TICKET_REF_RE.pattern == upstream.CROSS_RE.pattern
+    assert deferredwork._TICKET_ID_RE.pattern == upstream.ID_RE.pattern
+    assert deferredwork._EPIC_FOLDER_RE.pattern == upstream.EPIC_RE.pattern
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "1.2",  # E.M: an entry of a listed epic, the unit key
+        "2.6a",  # an id with a letter
+        "1",  # a bare epic id
+        "epic-cart",  # an epic folder
+        "epic-cart.v2",  # EPIC_RE admits any folder character a line can carry
+    ],
+)
+def test_ticket_grammar_accepts_refs(token):
+    """Every shape a dispatched ticket answers to is a token under the ticket grammar."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((token,), ())
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "3-2",  # a stories-mode id
+        "3-2-invite-link",  # a sprint key
+        "3-2a-split-half",
+        "1.2.3",  # one dot too many for E.M
+        "1.",  # a ref missing its entry id
+        "task-cart.md",  # not a leaf type
+        "epic-",  # an epic folder with no slug
+    ],
+)
+def test_ticket_grammar_rejects_story_keys(token):
+    """A v6 story key names no ticket, so under the ticket grammar it is
+    `malformed` rather than a token that gates nothing in silence. Ablation
+    (performed): read the story arms under `"ticket"` too and `3-2` lands in
+    `tokens`, turning this red."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+
+
+@pytest.mark.parametrize("token", ["story-login.md", "bug-crash-on-save.md", "spike-cache.md"])
+def test_ticket_grammar_rejects_backlog_file_names(token):
+    """A backlog leaf file name gates nothing: a tickets run never dispatches a
+    backlog row, and one moved into an epic is dispatched by its `E.M` ref. So it
+    is `malformed` (validate warns `deferred.hard-gate-unstructured`) rather than
+    a token that reads as a gate in force. Ablation (performed): accept the
+    leaf-name shape (`tickets.py` `NAME_RE`) under `"ticket"` and this FAILS."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+
+
+@pytest.mark.parametrize("token", ["true", "false", "true.1", "1.false"])
+def test_ticket_grammar_rejects_boolean_ids(token):
+    """`tickets.py` `_id` refuses `true` and `false` (frontmatter reads them as
+    booleans), so no epic or ticket carries either id and a gate naming one, bare
+    or as a ref half, is `malformed` rather than a gate that is always clear.
+    Ablation (performed): drop the boolean-id check and this FAILS."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+
+
+def test_ticket_grammar_keeps_capitalised_boolean_words():
+    """Only the lowercase spellings are booleans to `tickets.py`; `True` is a
+    legal id there, so it stays a token."""
+    g = _ticket_gated("gate: True, True.1")
+    assert (g.tokens, g.malformed) == (("True", "True.1"), ())
+
+
+@pytest.mark.parametrize("token", ["1.2", "2.6a"])
+def test_story_grammar_still_rejects_dotted_ref(token):
+    """The grammar is a parameter, not a union: a ticket ref on a sprint or stories
+    project is a token no story key can match, so it stays `malformed` there.
+    Ablation (performed): accept the ticket arms under `"story"` and this FAILS."""
+    g = _gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+    assert deferredwork._matchable_token(token, "ticket") is True
+
+
+def test_legacy_story_tokens_are_story_keys_the_ticket_grammar_cannot_read():
+    """`legacy_story_tokens` names exactly the story-shaped tokens the ticket
+    grammar drops: a bare word both grammars read is a ticket token, and a token
+    neither reads is only malformed."""
+    text = (
+        "# Deferred Work\n\n### DW-1: migrated\n\n"
+        "origin: test\nlocation: n/a\nreason: test\nstatus: open\n"
+        "gate: 3-2, 1.2, auth, 3-2-invite-link, x y\n"
+    )
+    (entry,) = parse_ledger(text)
+    assert deferredwork.legacy_story_tokens(entry) == ("3-2", "3-2-invite-link")
+
+
+@pytest.mark.parametrize(
+    ("token", "ref", "gated"),
+    [
+        ("1.2", "1.2", True),  # the ticket itself
+        ("1.06", "1.6", True),  # ids compare as tickets.py compares them
+        ("01.6", "1.6", True),
+        ("1.2", "1.3", False),
+        ("1", "1.3", True),  # the epic by its initiative id
+        ("01", "1.3", True),
+        ("2", "1.3", False),
+        ("epic-cart", "1.3", True),  # the epic by its folder
+        ("epic-carts", "1.3", False),
+    ],
+)
+def test_gates_ticket_epic_id_and_slug_arms(token, ref, gated):
+    assert deferredwork.gates_ticket(token, ref, epic_id="1", epic_slug="epic-cart") is gated
+
+
+def test_gates_ticket_epic_arms_need_a_known_epic():
+    """An unlisted epic (no initiative id) and a missing binding (no folder) leave
+    only the ref arm, rather than an empty id or slug matching every ticket."""
+    assert deferredwork.gates_ticket("1", "1.3", epic_id="", epic_slug="") is False
+    assert deferredwork.gates_ticket("epic-cart", "1.3", epic_id="1", epic_slug="") is False
+    assert deferredwork.gates_ticket("1.3", "1.3", epic_id="", epic_slug="") is True
+
+
+@pytest.mark.parametrize(
+    ("token", "ref"),
+    [
+        ("2.6", "2.6a"),  # `2.6a` is its own ticket, not a split of `2.6`
+        ("1.2", "1.20"),  # no numeric neighbour
+        ("1.2", "1.2a"),
+        ("2", "2a.1"),  # an epic id is opaque too
+    ],
+)
+def test_gates_ticket_no_split_arm(token, ref):
+    """Ticket ids are opaque letters and digits: no prefix or split arm, unlike
+    `gates_story`. Ablation (performed): give `gates_ticket` a `startswith` arm
+    and `2.6` gates `2.6a`, turning this red."""
+    assert deferredwork.gates_ticket(token, ref, epic_id="2", epic_slug="epic-x") is False
 
 
 @pytest.mark.parametrize(

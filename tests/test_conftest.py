@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import errno
 import functools
+import hashlib
 import json
 import os
 import re
@@ -191,9 +192,14 @@ def test_state_root_override_is_restored(tmp_path, operator):
 
 
 def _project_shape(paths: bmadconfig.ProjectPaths) -> dict[str, str]:
+    """Every path-valued member as a project-relative spelling (the v7 era fields
+    are strings, and `initiative_folder` is None on v6)."""
     root = paths.project.resolve()
+    members = {f.name: getattr(paths, f.name) for f in fields(paths)}
     return {
-        f.name: getattr(paths, f.name).resolve().relative_to(root).as_posix() for f in fields(paths)
+        name: value.resolve().relative_to(root).as_posix()
+        for name, value in members.items()
+        if isinstance(value, Path)
     }
 
 
@@ -1685,6 +1691,7 @@ _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
         # `test_reap_identity_*`, `test_recorded_*`.
         _OTHER_DEFS: 28,
     },
+    "test_tickets_e2e.py": {"test_e2e_tickets_": 13},
 }
 
 
@@ -2431,3 +2438,93 @@ def test_guard_cannot_see_a_gate_whose_reason_is_not_a_literal():
     Pinned as a row so the gap is a known boundary rather than a silent surprise — if
     it ever needs closing, this row is the one that changes."""
     assert _scan_source(_NON_LITERAL_REASON, "probe.py") == []
+
+
+# --- The v7 sandbox (`install_bmad_v7`, `project_v7`) ------------------------------
+# Real-spawn budget of the vendored tickets.py in this file: 1
+# (`test_project_v7_next_lists_build_order`). The Windows leg sits at its time budget,
+# so further premise rows read the tree from disk instead of spawning the script.
+
+
+def test_vendored_bmad_v7_matches_pin():
+    """Every vendored upstream file hashes to its `PIN.toml` sha256, and the pin
+    lists exactly the files the fixture folder holds, so a re-vendor that forgets to
+    re-pin, a line-ending conversion on checkout (the `-text` attribute), or a
+    formatter touching the bytes (the trunk and ruff excludes) all fail here."""
+    pin = tomllib.loads((conftest.V7_FIXTURE / "PIN.toml").read_text(encoding="utf-8"))
+    assert pin["source_repo"] == "https://github.com/bmad-code-org/BMAD-METHOD"
+    assert re.fullmatch(r"[0-9a-f]{40}", pin["commit"])
+    listed = {f["path"]: f for f in pin["files"]}
+    on_disk = {p.name for p in conftest.V7_FIXTURE.iterdir()} - {"PIN.toml"}
+    assert set(listed) == on_disk == {"tickets.py", "config_utils.py", "LICENSE-BMAD-METHOD"}
+    for name, entry in listed.items():
+        digest = hashlib.sha256((conftest.V7_FIXTURE / name).read_bytes()).hexdigest()
+        assert digest == entry["sha256"], f"{name} drifted from {entry['upstream_path']}"
+
+
+def _rows(doc: dict, group: str) -> list[dict]:
+    rows = doc[group]
+    assert isinstance(rows, list)
+    return rows
+
+
+def test_project_v7_next_lists_build_order(project_v7):
+    """The real vendored `next` accepts the fixture tree as a valid v7 initiative: 1.1
+    is the only ready ticket, 1.2 waits on it, epic 2 is gated on epic 1's closure,
+    and nothing is reported as a problem, drift or an order warning. Each DEFAULT_TREE
+    flag reaches the row it was written for, so the tree really carries one ticket of
+    each kind. One real spawn."""
+    doc = conftest.run_tickets(project_v7, "next")
+
+    assert doc["store"] == "repo" and doc["folder"] == project_v7.initiative
+    assert [r["ref"] for r in _rows(doc, "ready_to_start")] == ["1.1"]
+    blocked = {r["ref"]: r for r in _rows(doc, "blocked")}
+    assert list(blocked) == ["1.2", "2.1", "2.2"]
+    assert blocked["1.2"]["waiting_on"] == [1]
+    assert blocked["2.1"]["gated_by"] == blocked["2.2"]["gated_by"] == ["epic-cart"]
+    for group in ("ready_to_refine", "in_progress", "unpinned_after", "undeclared_after"):
+        assert doc[group] == [], group
+    assert doc["order_conflict"] == [] and "problems" not in doc
+    rows = {r["ref"]: r for group in ("ready_to_start", "blocked") for r in _rows(doc, group)}
+    assert not any("drift" in r for r in rows.values())
+    one_one, one_two, two_one, two_two = (rows[k] for k in ("1.1", "1.2", "2.1", "2.2"))
+    assert one_one["plan_checkpoint"] and one_one["done_checkpoint"] and not one_one["refined"]
+    assert one_two["hitl"] is True
+    assert two_one["plan_checkpoint"] and two_one["refined"] is True
+    assert two_two["type"] == "bug" and two_two["refine"] is True and two_two["refined"] is False
+
+
+def test_project_v7_template_is_clean_and_ignores_user_toml(project_v7):
+    """A `project_v7` copy is a committed, clean v7 install: the scripts sit at their
+    installed paths byte-identical to the vendored pin, the tree is tracked (layout
+    T1), and the personal config layer that names the active initiative is on disk but
+    gitignored, as `bmad setup` leaves it.
+
+    Ablation target: drop `_bmad/custom/*.user.toml` from `V7_GITIGNORE` and the
+    clean-status and ignored assertions both fail."""
+    root = project_v7.project
+    assert conftest.git(root, "status", "--porcelain") == ""
+    tracked = set(conftest.git(root, "ls-files").splitlines())
+    user = conftest.V7_USER_CONFIG_REL.as_posix()
+    assert user not in tracked
+    assert conftest.git(root, "check-ignore", user) == user
+    user_doc = tomllib.loads((root / user).read_text(encoding="utf-8"))
+    assert user_doc["core"]["active_initiative"] == project_v7.initiative
+    rel_tree = project_v7.initiative_folder.relative_to(root).as_posix()
+    for rel in (
+        conftest.V7_TICKETS_REL.as_posix(),
+        conftest.V7_CONFIG_UTILS_REL.as_posix(),
+        conftest.V7_STORE_CONFIG_REL.as_posix(),
+        "_bmad/config.toml",
+        ".claude/skills/bmod-method/bmod.toml",
+        f"{rel_tree}/tickets.toml",
+        f"{rel_tree}/epic-cart/tickets.toml",
+    ):
+        assert rel in tracked, rel
+    for installed, vendored in (
+        (conftest.V7_TICKETS_REL, "tickets.py"),
+        (conftest.V7_CONFIG_UTILS_REL, "config_utils.py"),
+    ):
+        assert (root / installed).read_bytes() == (conftest.V7_FIXTURE / vendored).read_bytes()
+    assert project_v7.tickets_script == root / conftest.V7_TICKETS_REL
+    assert ".bmad-loop/runs/" in (root / ".gitignore").read_text(encoding="utf-8").splitlines()
