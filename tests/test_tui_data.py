@@ -1411,6 +1411,28 @@ def test_tickets_overview_stat_gated(tmp_path, monkeypatch):
     assert len(tree.calls) == 3
 
 
+def test_tickets_overview_rereads_when_config_utils_changes(tmp_path, monkeypatch):
+    """`tickets.py` execs the project's `config_utils.py` to resolve the store and
+    initiative, so an upgraded helper re-reads a cached board.
+
+    Ablation (performed): drop `V7_CONFIG_UTILS_REL` from the signature sources
+    and the cached board is served — this FAILS."""
+    tree = _fake_board_tree(monkeypatch, tmp_path)
+    _write_plan(tmp_path / "_bmad-output" / "init-a" / "epic-cart" / "story-a-plan.md", "done")
+    helper = tmp_path / bmadconfig.V7_CONFIG_UTILS_REL
+    helper.parent.mkdir(parents=True)
+    helper.write_text("# v1\n", encoding="utf-8")
+    state = _tickets_state(tmp_path)
+
+    data.tickets_overview(tmp_path, state)
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 1
+
+    helper.write_text("# v2, repaired\n", encoding="utf-8")
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 2
+
+
 def test_tickets_overview_follows_a_moved_project(tmp_path, monkeypatch):
     """A run recorded under a project that has since moved watches the live
     initiative folder: a plan edit there re-reads the board.

@@ -1045,8 +1045,9 @@ def _tickets_tree_sig(project: Path, folder: Path) -> object:
     the ``(path, mtime_ns, size)`` of ``tickets.toml`` and every ``*.md`` in the
     initiative folder and its subfolders (two levels — epic folders hold their
     leaves and plans flat), plus the config layers ``active_initiative`` is read
-    from and the script itself. Read with ``scandir``; a folder that cannot be
-    listed or a file that cannot be stat'ed is part of the signature too."""
+    from, the script itself and the ``config_utils.py`` it execs. Read with
+    ``scandir``; a folder that cannot be listed or a file that cannot be stat'ed
+    is part of the signature too."""
     files: list[tuple[str, object, object]] = []
     pending: list[tuple[Path, int]] = [(folder, 1)]
     while pending:
@@ -1068,7 +1069,11 @@ def _tickets_tree_sig(project: Path, folder: Path) -> object:
                     files.append((entry.path, st.st_mtime_ns, st.st_size))
         except OSError as e:
             files.append((str(here), "unlistable", e.errno))
-    sources = (*bmadconfig.V7_CENTRAL_LAYERS_REL, bmadconfig.V7_MARKER_REL)
+    sources = (
+        *bmadconfig.V7_CENTRAL_LAYERS_REL,
+        bmadconfig.V7_MARKER_REL,
+        bmadconfig.V7_CONFIG_UTILS_REL,
+    )
     return (
         tuple(sorted(files, key=lambda f: f[0])),
         tuple(_config_source_sig(project / rel) for rel in sources),

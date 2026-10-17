@@ -335,6 +335,8 @@ V7_CENTRAL_LAYERS_REL: tuple[Path, ...] = (
 # The v7 era marker: the ticket-tree script v7 setup installs. A FILE — the folder
 # around it can exist empty on a v6 install.
 V7_MARKER_REL = Path("_bmad") / "method" / "scripts" / "tickets.py"
+# The helper `tickets.py` execs to merge the config layers.
+V7_CONFIG_UTILS_REL = Path("_bmad") / "scripts" / "config_utils.py"
 _REQUIRED_KEYS = ("implementation_artifacts", "planning_artifacts")
 _PATH_KEYS = (*_REQUIRED_KEYS, "repo_root", "output_folder")
 
