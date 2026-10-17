@@ -107,6 +107,17 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: psmux words it the same for tmux parity (``psmux: can't find window:
     #: @N``, the #545 client-side validator, source-read at v3.3.8).
     _WINDOW_GONE_STDERR: tuple[str, ...] = ("can't find window",)
+    #: Prefixes of a ``list-sessions`` row that cannot be a session name, on
+    #: top of the empty row :meth:`_is_session_row` always refuses: the
+    #: client's own words printed where a server's answer belongs (#919). A
+    #: leaf whose client prints such rows at exit 0 declares them; tmux prints
+    #: none, so the tuple is empty here.
+    _NON_SESSION_ROW_PREFIXES: tuple[str, ...] = ()
+    #: Prefix of the stderr line a leaf's ``list-sessions`` prints for each
+    #: server it could not read, when it then exits non-zero after printing
+    #: the rows that did answer (see :meth:`_is_partial_listing`). tmux has one
+    #: server, so its listing is never partial and the prefix is empty here.
+    _PARTIAL_LISTING_STDERR_PREFIX = ""
     #: ``-n`` name of every session's window 0, so no window bmad-loop creates is
     #: left for the multiplexer to name (psmux auto-renames unnamed windows to
     #: their foreground process). One literal for both ``new_session`` argvs.
@@ -269,7 +280,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
     def _warn_unproven_listing(
         self,
         verb: str,
-        proc: subprocess.CompletedProcess[str] | BaseException,
+        proc: subprocess.CompletedProcess[str] | BaseException | list[str],
         on_fault: Callable[[str], None] | None = None,
     ) -> None:
         """Say out loud that a METADATA listing failed for a reason other than the
@@ -287,7 +298,10 @@ class BaseTmuxBackend(TerminalMultiplexer):
         Takes the completed process OR the transport exception that replaced one:
         a timeout and a spawn that died prove no more about the session than an
         unrecognized non-zero exit does, and the caller's sentinel is the same,
-        so the signal must be too.
+        so the signal must be too. Or takes the rows a listing that exited 0
+        printed where session names belong (see :meth:`_is_session_row`): each
+        stands for a session the listing could not read, so it is the same
+        fault, reported while the names that did answer are kept (#919).
 
         The one failure left deliberately silent is a multiplexer that is not
         installed at all: a box without one has no sessions to report on, so the
@@ -313,8 +327,21 @@ class BaseTmuxBackend(TerminalMultiplexer):
         """
         if not shutil.which(self._BINARY):
             return
+        consequence = "reading it as empty"
         if isinstance(proc, BaseException):
             outcome, detail = "failed", f"{type(proc).__name__}: {proc}"
+        elif isinstance(proc, list):
+            outcome = "printed a row that cannot be a session name"
+            detail = ", ".join(repr(row) for row in proc)
+            # The names that did answer are kept (#919), so the listing is not
+            # read as empty: only the sessions behind these rows are unknown.
+            consequence = "keeping the names that answered"
+        elif self._is_partial_listing(proc):
+            # Every stderr line names a server that did not answer; the rows
+            # of the ones that did are kept, as for the exit-0 rows above.
+            outcome = f"exited {proc.returncode}"
+            detail = proc.stderr.strip()
+            consequence = "keeping the names that answered"
         else:
             if self._session_proved_gone(proc):
                 return
@@ -325,7 +352,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return
         print(
             f"warning: {self._BINARY} {verb} {outcome} without proving "
-            f"the session gone; reading it as empty: {detail}",
+            f"the session gone; {consequence}: {detail}",
             file=sys.stderr,
         )
 
@@ -431,8 +458,11 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return []
         if proc.returncode != 0:
             self._warn_unproven_listing("list-sessions", proc, on_fault)
-            return []
-        return [line for line in proc.stdout.splitlines() if line]
+            if not self._is_partial_listing(proc):
+                return []
+        rows = proc.stdout.splitlines()
+        self._warn_non_session_rows(rows, on_fault)
+        return [row for row in rows if self._is_session_row(row)]
 
     def session_options(self, option: str) -> dict[str, str]:
         # Map session name -> value of ``option`` ("" when unset). Same missing
@@ -452,13 +482,37 @@ class BaseTmuxBackend(TerminalMultiplexer):
             return {}
         if proc.returncode != 0:  # no server / no sessions
             self._warn_unproven_listing("list-sessions", proc)
-            return {}
-        options: dict[str, str] = {}
-        for line in proc.stdout.splitlines():
-            name, _, value = line.partition("\t")
-            if name:
-                options[name] = value
-        return options
+            if not self._is_partial_listing(proc):
+                return {}
+        rows = [line.partition("\t") for line in proc.stdout.splitlines()]
+        self._warn_non_session_rows([name for name, _, _ in rows])
+        return {name: value for name, _, value in rows if self._is_session_row(name)}
+
+    def _is_partial_listing(self, proc: subprocess.CompletedProcess[str]) -> bool:
+        # A non-zero list-sessions whose stdout still holds the servers that
+        # answered: every non-empty stderr line names one that did not, in the
+        # leaf's declared shape. Anything else on stderr (no server running, a
+        # transport error) or none at all is not proof of that, so the caller
+        # keeps its empty sentinel.
+        lines = [line for line in proc.stderr.splitlines() if line.strip()]
+        prefix = self._PARTIAL_LISTING_STDERR_PREFIX
+        return bool(prefix and lines) and all(line.startswith(prefix) for line in lines)
+
+    def _is_session_row(self, name: str) -> bool:
+        # A session name is never empty, so an empty row is the listing's own
+        # fault rather than a session; psmux prints one, at exit 0, for a server
+        # that did not answer its 500 ms read (#919).
+        return bool(name) and not name.startswith(self._NON_SESSION_ROW_PREFIXES)
+
+    def _warn_non_session_rows(
+        self, names: list[str], on_fault: Callable[[str], None] | None = None
+    ) -> None:
+        # A row the two session listings drop is a listing fault, not an
+        # absence: report it through the one fault channel, keeping the names
+        # that did answer.
+        faulty = [name for name in names if not self._is_session_row(name)]
+        if faulty:
+            self._warn_unproven_listing("list-sessions", faulty, on_fault)
 
     # ------------------------------------------------- shell dialect seam
 

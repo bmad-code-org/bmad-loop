@@ -561,6 +561,7 @@ def run_argv(
     cwd: str | Path | None,
     timeout: float | None,
     env: dict[str, str] | None = None,
+    encoding: str | None = None,
 ) -> ChildRun:
     """Run ``argv`` with no shell, under exactly :func:`run_child`'s supervision.
 
@@ -586,6 +587,11 @@ def run_argv(
     warning). ``argv`` must therefore not carry untrusted text for such a target;
     the probe callers pass a resolved binary path and a fixed flag.
 
+    ``encoding`` names the codec both streams are decoded with. The default
+    (``None``) keeps ``Popen``'s locale codec; a caller whose child always writes
+    one codec (a script run under ``-X utf8``) passes it, so a Windows cp1252
+    locale does not turn the child's UTF-8 into mojibake.
+
     Spawn faults (``OSError``, ``ValueError`` from ``Popen``) propagate untouched,
     as in :func:`run_child`; each caller owns its translation."""
     args = list(argv)
@@ -599,6 +605,7 @@ def run_argv(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding=encoding,
             errors="replace",
         ),
         timeout,

@@ -13,9 +13,12 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    FakeTicketTree,
     install_bmad_central_config,
     install_bmad_config,
+    install_bmad_v7,
     refuse_to_resolve,
+    ticket_row,
     write_sprint,
 )
 
@@ -23,6 +26,7 @@ from bmad_loop import bmadconfig, deferredwork, platform_util, policy
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import RunState
 from bmad_loop.runs import RUNS_DIR
+from bmad_loop.tickettree import TicketsTimeout
 from bmad_loop.tui import data
 
 
@@ -1330,6 +1334,213 @@ def test_stories_overview_none_when_unavailable(tmp_path):
     assert data.stories_overview(tmp_path, "bad") is None  # invalid manifest, no raise
 
 
+# ------------------------------------------------------------- tickets board
+# Every tickets-board test reads a FakeTicketTree through `_board_ticket_tree`:
+# real-spawn budget 0 (the Windows leg's budget).
+
+
+def _tickets_state(root: Path, initiative: str = "init-a") -> RunState:
+    return RunState(
+        run_id="r1",
+        project=str(root),
+        started_at="2026-06-11T10:00:00",
+        source="tickets",
+        initiative=initiative,
+        initiative_folder=str(root / "_bmad-output" / initiative) if initiative else "",
+    )
+
+
+def _fake_board_tree(monkeypatch, root: Path) -> FakeTicketTree:
+    tree = FakeTicketTree.from_rows(
+        root,
+        initiative="init-a",
+        ready_to_start=(ticket_row("1.2", plan_checkpoint=True),),
+        others=(ticket_row("1.1", status="done"),),
+        pinned_initiative="init-a",
+    )
+    seen: list[tuple[Path, str]] = []
+
+    def board_tree(project: Path, initiative: str) -> FakeTicketTree:
+        seen.append((project, initiative))
+        return tree
+
+    monkeypatch.setattr(data, "_board_ticket_tree", board_tree)
+    monkeypatch.setattr(data, "_tickets_cache", {})
+    tree.seen = seen  # type: ignore[attr-defined]
+    return tree
+
+
+def _write_plan(path: Path, status: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\nstatus: {status}\n---\n", encoding="utf-8")
+
+
+def test_tickets_overview_stat_gated(tmp_path, monkeypatch):
+    """The board spawns `tickets.py status` once while the initiative's files
+    are unchanged, and again when a plan (two levels down) or a `tickets.toml`
+    changes; a file the script does not read changes nothing.
+
+    Ablation (performed): drop the signature check in `initiative_board` and the
+    second call spawns again — this FAILS."""
+    tree = _fake_board_tree(monkeypatch, tmp_path)
+    folder = tmp_path / "_bmad-output" / "init-a"
+    plan = folder / "epic-cart" / "story-cart-model-plan.md"
+    _write_plan(plan, "ready-for-dev")
+    (folder / "tickets.toml").write_text("[[epic]]\n", encoding="utf-8")
+    state = _tickets_state(tmp_path)
+
+    first = data.tickets_overview(tmp_path, state)
+    assert first.fault is None
+    assert first.initiative == "init-a"
+    assert [r.ref for r in first.rows] == ["1.2", "1.1"]
+    assert data.tickets_overview(tmp_path, state) is first
+    assert tree.calls == [("status",)]
+    assert tree.seen == [(tmp_path, "init-a")]  # pinned to the run's initiative
+
+    (folder / "notes.txt").write_text("not read by tickets.py\n", encoding="utf-8")
+    assert data.tickets_overview(tmp_path, state) is first
+    assert len(tree.calls) == 1
+
+    _write_plan(plan, "in-progress")
+    later = plan.stat().st_mtime_ns + 1_000_000_000
+    os.utime(plan, ns=(later, later))
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 2
+
+    (folder / "tickets.toml").write_text("[[epic]]\n# edited\n", encoding="utf-8")
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 3
+
+
+def test_tickets_overview_rereads_when_config_utils_changes(tmp_path, monkeypatch):
+    """`tickets.py` execs the project's `config_utils.py` to resolve the store and
+    initiative, so an upgraded helper re-reads a cached board.
+
+    Ablation (performed): drop `V7_CONFIG_UTILS_REL` from the signature sources
+    and the cached board is served — this FAILS."""
+    tree = _fake_board_tree(monkeypatch, tmp_path)
+    _write_plan(tmp_path / "_bmad-output" / "init-a" / "epic-cart" / "story-a-plan.md", "done")
+    helper = tmp_path / bmadconfig.V7_CONFIG_UTILS_REL
+    helper.parent.mkdir(parents=True)
+    helper.write_text("# v1\n", encoding="utf-8")
+    state = _tickets_state(tmp_path)
+
+    data.tickets_overview(tmp_path, state)
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 1
+
+    helper.write_text("# v2, repaired\n", encoding="utf-8")
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 2
+
+
+def test_tickets_overview_follows_a_moved_project(tmp_path, monkeypatch):
+    """A run recorded under a project that has since moved watches the live
+    initiative folder: a plan edit there re-reads the board.
+
+    Ablation (performed): drop the rebase in `tickets_overview` and the signature
+    stats the vanished folder, so the edit never re-reads — this FAILS."""
+    old, live = tmp_path / "old", tmp_path / "live"
+    tree = _fake_board_tree(monkeypatch, live)
+    plan = live / "_bmad-output" / "init-a" / "epic-cart" / "story-cart-model-plan.md"
+    _write_plan(plan, "ready-for-dev")
+    state = _tickets_state(old)
+
+    data.tickets_overview(live, state)
+    assert data.tickets_overview(live, state).fault is None
+    assert len(tree.calls) == 1
+
+    _write_plan(plan, "in-progress")
+    later = plan.stat().st_mtime_ns + 1_000_000_000
+    os.utime(plan, ns=(later, later))
+    data.tickets_overview(live, state)
+    assert len(tree.calls) == 2
+
+
+def test_tickets_overview_carries_fault(tmp_path, monkeypatch):
+    """A tree that cannot be read is a board with `fault` set and no rows —
+    never None and never an empty board. The fault is cached like an answer,
+    but retried once `TICKETS_FAULT_RETRY_S` has passed with no file changed.
+
+    Ablation (performed): return `TicketsBoard(rows=(), fault=None, ...)` on the
+    error and the fault assertion FAILS; drop the retry window and the
+    recovered read never happens — the last assertion FAILS."""
+    tree = _fake_board_tree(monkeypatch, tmp_path)
+    (tmp_path / "_bmad-output" / "init-a").mkdir(parents=True)
+    tree.faults["status"] = TicketsTimeout("tickets.py status took longer than 60s")
+    state = _tickets_state(tmp_path)
+
+    board = data.tickets_overview(tmp_path, state)
+    assert board is not None
+    assert board.rows == ()
+    assert board.fault == "tickets.py timeout: tickets.py status took longer than 60s"
+    assert data.tickets_overview(tmp_path, state) is board  # within the window
+    assert len(tree.calls) == 1
+
+    del tree.faults["status"]
+    monkeypatch.setattr(data, "TICKETS_FAULT_RETRY_S", 0.0)
+    recovered = data.tickets_overview(tmp_path, state)
+    assert recovered.fault is None
+    assert len(recovered.rows) == 2
+
+
+def test_tickets_overview_unavailable_without_initiative(tmp_path, monkeypatch):
+    """A run that pinned no initiative has no tree to read: the board says so in
+    `fault` and spawns nothing. A project with no v7 active initiative gives the
+    start-run preview a fault the same way.
+
+    Ablation (performed): drop the initiative check in `tickets_overview` and
+    the tree is read for initiative "" — this FAILS."""
+
+    def no_tree(project: Path, initiative: str):
+        raise AssertionError(f"read the tree for {initiative!r}")
+
+    monkeypatch.setattr(data, "_board_ticket_tree", no_tree)
+    monkeypatch.setattr(data, "_tickets_cache", {})
+    board = data.tickets_overview(tmp_path, _tickets_state(tmp_path, initiative=""))
+    assert board.rows == ()
+    assert board.fault == "this run pinned no initiative"
+
+    preview = data.project_tickets_overview(tmp_path)  # no BMAD config at all
+    assert preview.rows == ()
+    assert preview.fault is not None and preview.fault.startswith("BMAD config unreadable")
+
+
+def test_project_tickets_overview_resolves_a_mixed_install_as_tickets_mode(tmp_path, monkeypatch):
+    """A v7 install with the v6 keys left behind resolves v6 for an auto-detecting
+    read but v7 for a tickets run (`load_paths(want_tickets=True)`). The start-run
+    preview shows the board that run would start from, so it reads the v7 active
+    initiative rather than answering "no v7 active initiative".
+
+    Ablation (performed): resolve the preview with `_project_paths(project)` (no
+    `want_tickets`) and this FAILS on the fault."""
+    root = tmp_path / "mixed"
+    root.mkdir()
+    layout = install_bmad_v7(root)
+    (root / "_bmad" / "custom" / "config.toml").write_text(
+        "[modules.bmm]\n"
+        'planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"\n'
+        'implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(data, "_paths_cache", {})
+    monkeypatch.setattr(data, "_tickets_paths_cache", {})
+    read: list[tuple[str, Path]] = []
+
+    def board(project: Path, initiative: str, folder: Path) -> data.TicketsBoard:
+        read.append((initiative, folder))
+        return data.TicketsBoard((), None, initiative)
+
+    monkeypatch.setattr(data, "initiative_board", board)
+    sprint_paths = data._project_paths(root)
+    assert sprint_paths is not None and sprint_paths.era == "v6"  # the auto-detect stays v6
+
+    preview = data.project_tickets_overview(root)
+    assert preview.fault is None
+    assert read == [(layout.initiative, layout.initiative_folder.resolve())]
+    assert data._project_paths(root) is sprint_paths  # its own cache entry, untouched
+
+
 # ------------------------------------------------------------- deferred work
 
 
@@ -1874,7 +2085,7 @@ def test_pending_missed_decisions_read_fault_is_named_and_not_cached(project, mo
 
     with monkeypatch.context() as m:
 
-        def boom(_project):
+        def boom(_project, _paths=None):
             raise PermissionError(13, "stubbed: permission denied")
 
         m.setattr(decisions, "pending_missed_decisions", boom)
@@ -1949,4 +2160,6 @@ def test_pending_missed_decisions_none_pending_is_an_answer(project):
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "done 2026-06-01"})
     missed = data.pending_missed_decisions(project.project)
-    assert missed == data.MissedDecisions([])
+    # `ledger` names what the (empty) listing was read from, for the answer's
+    # `listed_ledger` guard.
+    assert missed == data.MissedDecisions([], ledger=project.deferred_work)

@@ -12,12 +12,16 @@ from bmad_loop.model import (
     ENV_FAULT_SITE_DISPATCH_PREFIX,
     ENV_FAULT_SITES,
     PAUSE_ENVIRONMENT,
+    PAUSE_TICKET_HITL,
+    PAUSE_TICKET_REFINE,
+    PAUSE_TICKET_TREE,
     SWEEP_REFUSED_DIRTY,
     SWEEP_REFUSED_NOT_STARTED,
     Phase,
     RunState,
     SessionRecord,
     StoryTask,
+    TicketBinding,
     TokenUsage,
     VerifyOutcome,
     env_fault_site_reverifiable,
@@ -154,6 +158,157 @@ def test_run_state_stories_fields_default_when_absent_from_dict():
     del d["spec_folder"]
     back = RunState.from_dict(d)
     assert back.source == "sprint-status" and back.spec_folder == ""
+
+
+def test_run_state_round_trips_initiative_pin():
+    default = _state()
+    assert default.initiative == "" and default.initiative_folder == ""
+    pinned = _state(initiative="initiative-checkout", initiative_folder="/p/_bmad-output/i")
+    d = pinned.to_dict()
+    assert d["initiative"] == "initiative-checkout"
+    assert d["initiative_folder"] == "/p/_bmad-output/i"
+    back = RunState.from_dict(d)
+    assert back.initiative == "initiative-checkout"
+    assert back.initiative_folder == "/p/_bmad-output/i"
+
+
+def test_old_state_json_defaults_initiative_empty():
+    # a state.json written before the v7 pin existed reads as "no initiative pinned"
+    d = _state().to_dict()
+    del d["initiative"]
+    del d["initiative_folder"]
+    back = RunState.from_dict(d)
+    assert back.initiative == "" and back.initiative_folder == ""
+
+
+def _binding(**kw) -> TicketBinding:
+    base = dict(
+        ref="2.1",
+        id="1",
+        epic_slug="epic-checkout",
+        epic_id="2",
+        title="Checkout form",
+        plan="/p/_bmad-output/i/epic-checkout/story-checkout-form-plan.md",
+        risk="high",
+        refined=True,
+        plan_checkpoint=True,
+        done_checkpoint=False,
+        hitl=False,
+    )
+    base.update(kw)
+    return TicketBinding(**base)
+
+
+def test_run_state_ticket_fields_default_and_round_trip():
+    default = _state()
+    assert (default.ticket_epic_filter, default.ticket_story_approvals) == ("", [])
+    assert default.ticket_epic_closures == {}
+    state = _state(
+        ticket_epic_filter="epic-cart",
+        ticket_story_approvals=["2.1"],
+        ticket_epic_closures={"epic-cart": "rejected"},
+    )
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict())))
+    assert back.ticket_epic_filter == "epic-cart"
+    assert back.ticket_story_approvals == ["2.1"]
+    assert back.ticket_epic_closures == {"epic-cart": "rejected"}
+
+
+def test_old_state_json_defaults_ticket_fields_empty():
+    d = _state().to_dict()
+    for key in ("ticket_epic_filter", "ticket_story_approvals", "ticket_epic_closures"):
+        del d[key]
+    back = RunState.from_dict(d)
+    assert (back.ticket_epic_filter, back.ticket_story_approvals) == ("", [])
+    assert back.ticket_epic_closures == {}
+
+
+def test_run_state_store_topology_round_trips_exactly():
+    topology = {
+        "layout": "T3",
+        "placement": "shared-in-project",
+        "versioning": "store-repo",
+        "store_root": "/p/_bmad-output",
+        "store_repo": "/p/_bmad-output",
+    }
+    assert _state().store_topology == {}
+    back = RunState.from_dict(json.loads(json.dumps(_state(store_topology=topology).to_dict())))
+    assert back.store_topology == topology
+    old = _state().to_dict()
+    del old["store_topology"]
+    assert RunState.from_dict(old).store_topology == {}
+
+
+@pytest.mark.parametrize("mangled", [["T1"], {"layout": 1}, "T1", {"layout": ["T1"]}])
+def test_run_state_mangled_store_topology_reads_as_unreadable(mangled):
+    """A hand-mangled topology never raises out of `from_dict` and never reads as
+    "nothing recorded" (which would skip resume's comparison): it becomes a
+    marker no classified topology equals. Ablation (performed): return `{}` for a
+    mangled shape and this FAILS."""
+    d = _state().to_dict()
+    d["store_topology"] = mangled
+    back = RunState.from_dict(d)
+    assert back.store_topology and "unreadable" in back.store_topology
+
+
+def test_story_task_ticket_binding_round_trips():
+    task = StoryTask(story_key="2.1", epic=0)
+    task.ticket = _binding()
+    state = _state(source="tickets", tasks={"2.1": task})
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict()))).tasks["2.1"]
+    assert back.ticket == _binding()
+    assert back.ticket is not None and back.ticket.to_dict() == _binding().to_dict()
+
+
+def test_story_task_ticket_defaults_none_and_reads_legacy_state():
+    task = StoryTask(story_key="1-1-a", epic=1)
+    assert task.ticket is None
+    d = task.to_dict()
+    assert d["ticket"] is None
+    del d["ticket"]
+    assert StoryTask.from_dict(d).ticket is None
+
+
+def test_story_task_post_landing_latches_round_trip_and_default_off():
+    """The shared-store post-landing latches survive a save, and a legacy state
+    file (no keys) reads them unset — never as a mark owed."""
+    task = StoryTask(story_key="2.1", epic=0)
+    assert (task.ticket_done_pending, task.ticket_park_pending, task.ticket_commit_pending) == (
+        False,
+        "",
+        False,
+    )
+    task.ticket_done_pending = True
+    task.ticket_park_pending = "awaiting operator: rotate the key"
+    task.ticket_commit_pending = True
+    state = _state(source="tickets", tasks={"2.1": task})
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict()))).tasks["2.1"]
+    assert back.ticket_done_pending is True
+    assert back.ticket_park_pending == "awaiting operator: rotate the key"
+    assert back.ticket_commit_pending is True
+    d = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del d["ticket_done_pending"], d["ticket_park_pending"], d["ticket_commit_pending"]
+    legacy = StoryTask.from_dict(d)
+    assert (
+        legacy.ticket_done_pending,
+        legacy.ticket_park_pending,
+        legacy.ticket_commit_pending,
+    ) == (False, "", False)
+
+
+def test_story_task_refuses_a_corrupt_ticket_binding():
+    """A binding that is not an object is a corrupt state file: loading refuses it
+    rather than dropping the ticket a resume needs. Ablation (performed): read a
+    non-mapping as None and this FAILS."""
+    d = StoryTask(story_key="2.1", epic=0).to_dict()
+    d["ticket"] = "2.1"
+    with pytest.raises(ValueError, match="ticket binding"):
+        StoryTask.from_dict(d)
+
+
+def test_ticket_pause_stages_are_distinct():
+    stages = (PAUSE_TICKET_HITL, PAUSE_TICKET_REFINE, PAUSE_TICKET_TREE)
+    assert stages == ("ticket-hitl", "ticket-refine", "ticket-tree")
 
 
 def test_sweeps_refused_round_trips():

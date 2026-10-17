@@ -89,9 +89,14 @@ class UnitWorkspace:
     baseline: str  # commit the worktree was cut from (for failed-diff capture)
 
 
-def unit_branch_name(run_id: str, unit_key: str, branch_per: str) -> str:
+def unit_branch_name(
+    run_id: str, unit_key: str, branch_per: str, *, epic_segment: str | None = None
+) -> str:
     """branch_per=run shares one branch across the whole run; branch_per=story
-    gives each unit its own branch.
+    gives each unit its own branch — ``bmad-loop/<run>/<unit>``, or
+    ``bmad-loop/<run>/<epic>/<unit>`` when the work source names the unit's epic
+    (``epic_segment``: tickets mode passes the epic slug; None keeps the
+    two-segment name every other mode uses).
 
     Both segments are ref-sanitized: `--run-id` is user-suppliable and a unit key is
     a sprint-board / ledger id, so either can carry ref-illegal sequences (`:`, `..`,
@@ -103,6 +108,11 @@ def unit_branch_name(run_id: str, unit_key: str, branch_per: str) -> str:
     """
     if branch_per == "run":
         return f"bmad-loop/{safe_ref_segment(run_id)}"
+    if epic_segment:
+        return (
+            f"bmad-loop/{safe_ref_segment(run_id)}/{safe_ref_segment(epic_segment)}/"
+            f"{safe_ref_segment(unit_key)}"
+        )
     return f"bmad-loop/{safe_ref_segment(run_id)}/{safe_ref_segment(unit_key)}"
 
 
@@ -419,6 +429,7 @@ def open_unit_workspace(
     *,
     spec_file: str | None = None,
     on_orphan_preserved: Callable[[str, str], None] | None = None,
+    epic_segment: str | None = None,
 ) -> UnitWorkspace:
     """Mount a fresh worktree for `unit_key` and return its rebased workspace.
 
@@ -465,7 +476,7 @@ def open_unit_workspace(
     the compare-and-swap would move the ref under a live checkout and the mount
     would then fail on the held branch anyway. See `_refuse_foreign_checkout`.
     """
-    branch = unit_branch_name(run_id, unit_key, branch_per)
+    branch = unit_branch_name(run_id, unit_key, branch_per, epic_segment=epic_segment)
     unresolved_wt = unit_worktrees_dir(run_dir) / safe_segment(unit_key)
     try:
         wt = unresolved_wt.resolve()

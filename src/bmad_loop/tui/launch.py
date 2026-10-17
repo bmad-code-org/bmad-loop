@@ -269,11 +269,11 @@ def _run_dir_is_confined(project: Path, run_dir: Path) -> bool:
 
 
 def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
-    """Record the window a launch just minted, so ctl_window_id can prefer it
-    over an older window sharing the run id.
+    """Record the window that accepted the run, so ctl_window_id can prefer it
+    over an older window sharing the run id. Its one writer is claim_ctl_window.
 
     Best-effort on purpose. The window is already running by the time this
-    writes, so a failed write must not fail the launch — the lookup degrades to
+    writes, so a failed write must not fail the run — the lookup degrades to
     the name scan, i.e. to the behaviour before this record existed. A failure
     forgets the previous record rather than leaving it: degrading to the scan is
     the intended fallback, answering a superseded window is not.
@@ -366,6 +366,61 @@ def _record_ctl_window(project: Path, run_id: str, win_id: str) -> None:
             atomic_write_text(run_dir / _CTL_WINDOW_FILE, win_id, follow_symlinks=False)
     except Exception:
         _forget_ctl_window(project, run_id)
+
+
+def claim_ctl_window(project: Path, run_id: str, *, launched: bool = False) -> str | None:
+    """Publish the control-session window this process runs in as the run's
+    control window. Returns operator wording when the record did not land, None
+    when it did or when this process is not in a control session at all (a
+    resume typed in the operator's own shell owns no window to record).
+
+    `launched` is the process's own word that start_detached minted its window
+    (the hidden `--ctl-launch`). It is what tells an unanswered session probe
+    apart from an operator's shell: `current_session()` answers None for both,
+    so a launched child whose probe failed would otherwise keep the previous
+    launch's record and say nothing (#925). Launched but not provably in a
+    control session drops the record and warns, as a window that cannot name
+    itself does.
+
+    Called by the child a launch started (start_detached), at the moment it
+    accepts the run: under the run's state lock, after its liveness re-check
+    answered not alive. A rival that drives the run publishes its engine pid
+    under that same lock before releasing it, so publication follows acceptance
+    in lock order. A refused child never gets here, and a child that accepts
+    after an earlier claim overwrites it — it is now the one driving. Recording
+    from the launcher instead fails both ways (#920): it writes before the child
+    has decided, and it can write after a rival child accepted.
+
+    Ceiling: from launch until the child accepts (seconds, the child's
+    start-up) the record still names the previous launch's window, so `a` and
+    `x` in that gap answer it. Before #920 they answered the minted window at
+    once, including a window about to refuse.
+
+    The window's name is not checked: ctl_window_id re-proves the record against
+    this run's tagged `<kind>-<run_id>` rows, so a record naming any other
+    window (a shell window an operator typed the resume in) is ignored there."""
+    try:
+        in_ctl = in_ctl_session()
+        if not in_ctl and not launched:
+            return None
+        win_id = get_multiplexer().current_window_id() if in_ctl else None
+    except MultiplexerError:
+        if not launched:
+            raise
+        win_id = None  # a launched child's probe that raised went unanswered too
+    if win_id:
+        _record_ctl_window(project, run_id, win_id)
+        if _read_ctl_window(project, run_id) == win_id:
+            return None
+    else:
+        # In a control window that cannot name itself, or a launched one whose
+        # session probe went unanswered: the previous record names a window this
+        # run no longer drives from, so drop it.
+        _forget_ctl_window(project, run_id)
+    return (
+        f"this window could not be recorded as run {run_id}'s control window — "
+        "attach and stop from the TUI may target an older window for this run"
+    )
 
 
 def ctl_window_id(project: Path, run_id: str) -> str | None:
@@ -481,9 +536,26 @@ def ctl_window_lookup(project: Path, run_id: str) -> tuple[str | None, int]:
     _list_ctl_windows), and when the backend is unavailable at all: neither is
     "no window", and every caller surfaces it — the TUI's attach warns and
     carries on to the agent session, the stop worker warns the window may still
-    be running, the CLI attach warns on stderr, ctl_window_recorded says it
+    be running, the CLI attach warns on stderr, ctl_window_reachable says it
     could not confirm. Availability is re-read here, not trusted from a
     caller's gate: it can change while a confirm modal is open."""
+    tagged, unproven, recorded = _scan_ctl_windows(project, run_id)
+    if not tagged:
+        return None, unproven
+    # Membership in `tagged`, not mere presence in the listing: it re-checks the
+    # name and the project-scoping predicates, so a record whose id is absent from
+    # the scoped matches — killed, pruned, renamed onto another run, or naming a
+    # row this project cannot claim — is not replayed. A tie-break among rows the
+    # tag already proved, never a proof on its own: it is what turns a stale id
+    # from a replayed target into a fallthrough.
+    return (recorded if recorded in tagged else tagged[0]), unproven
+
+
+def _scan_ctl_windows(project: Path, run_id: str) -> tuple[list[str], int, str | None]:
+    """ctl_window_lookup's listing pass: the ids of this run's windows proven
+    this project's by tag, in listing order; how many it refused for an empty
+    tag; and the record, read after the listing. Raises as ctl_window_lookup
+    does."""
     if not mux_available():
         raise MultiplexerError(
             "multiplexer backend unavailable: the run's control window could not be looked up"
@@ -538,15 +610,7 @@ def ctl_window_lookup(project: Path, run_id: str) -> tuple[str | None, int]:
             tagged.append(win_id)
         elif not tag:
             unproven += 1
-    if not tagged:
-        return None, unproven
-    # Membership in `tagged`, not mere presence in the listing: it re-checks the
-    # name and the project-scoping predicates, so a record whose id is absent from
-    # the scoped matches — killed, pruned, renamed onto another run, or naming a
-    # row this project cannot claim — is not replayed. A tie-break among rows the
-    # tag already proved, never a proof on its own: it is what turns a stale id
-    # from a replayed target into a fallthrough.
-    return (recorded if recorded in tagged else tagged[0]), unproven
+    return tagged, unproven, recorded
 
 
 def unproven_ctl_window_notice(project: Path, run_id: str, count: int) -> str:
@@ -569,35 +633,32 @@ def unproven_ctl_window_notice(project: Path, run_id: str, count: int) -> str:
     )
 
 
-def ctl_window_recorded(project: Path, run_id: str, win_id: str) -> bool:
-    """Whether `ctl_window_id` now answers `win_id` for this run — i.e. whether
-    the launch's disambiguation actually took.
+def ctl_window_reachable(project: Path, run_id: str, win_id: str) -> bool:
+    """Whether the lookup can reach `win_id` for this run: listed under this
+    run's name and proven this project's by its tag — the launch-time check
+    every launcher's caller turns into a warning.
 
-    False means the launch itself succeeded but the lookup will not answer
-    the window it minted: either it is back on the ambiguous first-match scan,
-    which is exactly #482's symptom, or — since #750 — the window's
-    best-effort tag write did not land, so the lookup refuses it outright and
-    `a`/`x` cannot reach it at all. Both are operator-visible: every launcher
-    should report it rather than let an unqualified success toast imply the
-    targeting is sound (start_run_detached and start_sweep_detached included,
-    which mint the only window under a fresh run id but still depend on its
-    tag). Split out of resume_detached's return so the resolve
-    path can warn while still keeping the captured id it attaches with.
+    False means the launch itself succeeded but `a`/`x` cannot reach the window
+    it minted: since #750 an untagged window is refused outright, and
+    start_detached stamps the tag best-effort. Every launcher should report it
+    rather than let an unqualified success toast imply the targeting is sound.
 
-    Asks `ctl_window_id` rather than comparing the record to `win_id`, because
-    a round-tripped record is not the same claim. A backend whose
+    Reachable, not preferred: a resume or resolve window is preferred over an
+    older one only once its child accepts the run and records it
+    (claim_ctl_window), which a check at launch cannot wait for. A child whose
+    record does not land says so in its own window.
+
+    Membership in the lookup's own listing rather than a comparison with the
+    minted id alone, because the seam tolerates a backend whose
     `new_parked_window` id is shaped differently from its `list_windows`
-    `window_id` column — a divergence the seam explicitly tolerates — writes and
-    reads the record back intact while `ctl_window_id` rejects it against the
-    listing and falls through to the first match. File equality would report
-    that as sound; it is the precise case the warning exists for.
+    `window_id` column, and such an id is no target the lookup can answer.
 
-    An unanswerable listing counts as not recorded. The probe is observation, so
+    An unanswerable listing counts as unreachable. The probe is observation, so
     it degrades rather than raising into the launchers (neither has a handler
     for it), and "could not confirm" is closer to the warning's own hedge —
-    attach/stop *may* target an older window — than silence would be."""
+    attach/stop *may* miss the window — than silence would be."""
     try:
-        return ctl_window_id(project, run_id) == win_id
+        return win_id in _scan_ctl_windows(project, run_id)[0]
     except MultiplexerError:
         return False
 
@@ -1259,13 +1320,16 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
 
     Returns the new window's stable backend id (bare `@N` on tmux,
     session-qualified on psmux) so callers can target it unambiguously (window
-    names collide when several kinds share a run_id). The same id is recorded in
-    the run dir so ctl_window_id answers this window rather than an older one
-    under the same run id — see _record_ctl_window.
+    names collide when several kinds share a run_id).
+
+    Does not record the id in the run dir: the window's child does that, and
+    only once it has accepted the run (claim_ctl_window). This launch cannot
+    know whether its child will drive or refuse as "still live", and a refused
+    child's window recorded here would take the record from the window whose
+    engine keeps running (#920).
 
     Refuses a run id that aliases a control session, FIRST — this is the one
-    place every drive path converges on the mutation (the window mint and the
-    ctl-window record overwrite): run/sweep launches with freshly validated
+    place every drive path converges on the mutation (the window mint): run/sweep launches with freshly validated
     ids, and resume/resolve replaying ids an older release persisted. Gating
     each button separately kept finding the path nobody gated (resolve was
     the fourth); gating the mutation cannot. Ahead of the mux probes so the
@@ -1313,7 +1377,9 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     drift = _registry_drift(project, mux)
     if drift is not None:
         raise LaunchError(drift)
-    hidden = [f"--state-root={state_root}"]
+    # `--ctl-launch` tells the child its window was minted here, which its own
+    # session probe cannot be trusted to answer (claim_ctl_window, #925).
+    hidden = ["--ctl-launch", f"--state-root={state_root}"]
     try:
         namespaced = mux.has_registry_namespace()
         in_force = mux.registry_root() if namespaced else None
@@ -1341,33 +1407,17 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer new-window failed: {e}") from e
     if win_id:
-        # Record before tagging: a window minted but unrecorded puts the lookup
-        # back on the ambiguous scan, while an *untagged* window already has a
-        # documented fallback in _ctl_window_candidates — so even a
-        # non-conforming backend raising from the (contractually best-effort)
-        # set_window_option must not cost the record.
-        _record_ctl_window(project, run_id, win_id)
         # Tag the window with its project so a cleanup in another project never
-        # closes it (the ctl session is shared across projects).
+        # closes it (the ctl session is shared across projects). No record here:
+        # the child publishes it once it accepts the run (claim_ctl_window, #920).
         mux.set_window_option(win_id, runs.PROJECT_OPTION, runs.project_tag(project))
-    else:
-        # No id to record: the backend did not capture one. Whatever the previous
-        # launch recorded now names a superseded window, so drop it.
-        _forget_ctl_window(project, run_id)
     return win_id
 
 
 def _reachable_window(project: Path, run_id: str, win_id: str | None) -> str | None:
-    """`win_id` when ctl_window_id will answer it for this run, else None — the
-    launch-time check every launcher's caller turns into a warning.
-
-    A fresh run or sweep mints the only window under its run id and writes no
-    record, so the one thing that can still go wrong is the tag: start_detached
-    stamps it best-effort, and since #750 an untagged window is refused by the
-    lookup, so `a`/`x` would silently miss it. Re-reading through the lookup
-    (ctl_window_recorded) asks the consumers' own question, and also catches an
-    uncaptured id or a listing that could not be read."""
-    if win_id and not ctl_window_recorded(project, run_id, win_id):
+    """`win_id` when the lookup can reach it for this run, else None — see
+    ctl_window_reachable. An uncaptured id is None already."""
+    if win_id and not ctl_window_reachable(project, run_id, win_id):
         return None
     return win_id
 
@@ -1377,7 +1427,7 @@ def start_run_detached(
     run_id: str,
     *,
     spec: str | None = None,
-    epic: int | None = None,
+    epic: int | str | None = None,  # str: a tickets-mode epic id or slug
     story: str | None = None,
     max_stories: int | None = None,
 ) -> str | None:
@@ -1417,24 +1467,12 @@ def start_sweep_detached(
 
 def resume_detached(project: Path, run_id: str) -> str | None:
     """Resume in a ctl-session window; returns the window id, or None when the
-    lookup cannot name that window afterwards — the caller should warn, because
-    resume is the launch that mints a *second* window under the run id, so this
-    is exactly when the ambiguous scan starts answering the superseded one while
-    the launch itself succeeded.
+    lookup cannot reach it afterwards (see _reachable_window) — the caller
+    should warn, because resume mints a *second* window under the run id.
 
-    Two ways to land there, one signal: the backend captured no id, or it did but
-    the record did not survive (refused, unwritable, run dir pruned mid-launch).
-    Both leave `ctl_window_id` on the scan, so reporting only the first would let
-    the rest degrade behind an unqualified success toast.
-
-    Verified by re-reading rather than by threading the write's outcome up: it
-    asks the question the consumers actually ask — will `ctl_window_id` prefer
-    this window — of the same file they will read, instead of a proxy for it.
-
-    Folded into the return here, rather than reported alongside the id as the
-    resolve path does, because resume has no immediate use for a window it
-    cannot record: it launches and leaves, where resolve attaches to the window
-    it just minted and still needs that id to do so."""
+    The window becomes the run's recorded control window only once its child
+    accepts the run (claim_ctl_window), so a resume refused as "still live"
+    leaves the record with the window that drives (#920)."""
     win_id = start_detached(
         project, ["resume", "--project", str(project), run_id], run_id, "resume"
     )

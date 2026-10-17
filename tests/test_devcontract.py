@@ -1002,6 +1002,36 @@ def test_every_dev_primitive_has_a_fallback_result_prefix():
     assert not missing, f"dev primitives whose completion marker cannot be read back: {missing}"
 
 
+def test_find_result_artifact_ignores_ledger_in_initiative_folder(tmp_path):
+    """On v7 the scan root is the initiative folder, which also holds the
+    deferred-work ledger, the initiative file and the ticket breakdown. Each of
+    those is rewritten during a session, so each is fresher than the launch
+    floor, yet none carries a result marker: qualification stays marker-based
+    and the plan the bundle wrote is the only hit. With the plan gone nothing
+    qualifies, and the scan never falls back to the newest ``*.md``."""
+    import os
+
+    folder = tmp_path / "_bmad-output" / "initiative-checkout"
+    folder.mkdir(parents=True)
+    plan = _spec(folder / "plan-dw-bundle-1-retry-guard.md", status="built", auto_run="done")
+    os.utime(plan, ns=(2_000_000_000, 2_000_000_000))
+    for name, text in (
+        (
+            "deferred-work.md",
+            "# Deferred Work\n\n## DW-1: retry guard\n\n- status: done 2026-10-15\n"
+            "- source_spec: epic-auth/story-login-plan.md\n- summary: guard the retry\n",
+        ),
+        ("initiative-checkout.md", "---\nstatus: active\n---\n\n# Checkout\n"),
+    ):
+        (folder / name).write_text(text, encoding="utf-8")
+        os.utime(folder / name, ns=(3_000_000_000, 3_000_000_000))
+    (folder / "tickets.toml").write_text("[[epics]]\n", encoding="utf-8")
+
+    assert devcontract.find_result_artifact(folder, since_ns=1_000_000_000) == plan
+    plan.unlink()
+    assert devcontract.find_result_artifact(folder, since_ns=1_000_000_000) is None
+
+
 def test_find_artifact_ignores_fence_quoted_heading(tmp_path):
     """A spec whose only `## Auto Run Result` is a fenced example must not
     qualify as a terminal artifact, even with a fresh mtime — otherwise the
@@ -3046,3 +3076,174 @@ def test_env_fault_claim_reads_only_the_last_real_marker(tmp_path):
 
     assert rj is not None
     assert "env_fault_claim" not in rj
+
+
+# ------------------------------------- BMAD v7 ticket terminals (built / dropped)
+#
+# A ticket session passes `success_statuses`: ("built",) for dev, ("built",
+# "done") for review. Every v6 caller passes nothing and must keep today's
+# answers byte for byte.
+
+_TICKET_DEV = (devcontract.BUILT,)
+_TICKET_REVIEW = (devcontract.BUILT, devcontract.DONE)
+
+
+def test_terminal_statuses_default_is_the_v6_set():
+    assert devcontract.terminal_statuses() == devcontract.DEFAULT_TERMINAL
+    assert devcontract.DEFAULT_TERMINAL == {"done", "blocked", "awaiting-operator"}
+    assert devcontract.terminal_statuses(plan_halt=True) == {
+        "done",
+        "blocked",
+        "awaiting-operator",
+        "ready-for-dev",
+    }
+
+
+def test_terminal_statuses_ticket_contract_adds_dropped():
+    assert devcontract.terminal_statuses(_TICKET_DEV) == {
+        "built",
+        "blocked",
+        "awaiting-operator",
+        "dropped",
+    }
+    assert devcontract.terminal_statuses(_TICKET_REVIEW) == {
+        "built",
+        "done",
+        "blocked",
+        "awaiting-operator",
+        "dropped",
+    }
+
+
+@pytest.mark.parametrize("success", [_TICKET_DEV, _TICKET_REVIEW])
+def test_synthesize_built_is_terminal_only_when_in_success_statuses(tmp_path, success):
+    sp = _spec(tmp_path / "plan.md", status="built", auto_run=None)
+
+    assert devcontract.synthesize_result(sp, story_key="1.1").result_json is None
+    out = devcontract.synthesize_result(sp, story_key="1.1", success_statuses=success)
+    rj = out.result_json
+    assert rj is not None and rj["status"] == "built"
+    assert rj["escalations"] == []
+    assert out.status_consistent
+
+
+def test_built_carries_followup_review_recommended(tmp_path):
+    sp = _spec(tmp_path / "plan.md", status="built", auto_run="built", followup=True)
+    rj = devcontract.synthesize_result(
+        sp, story_key="1.1", success_statuses=_TICKET_DEV
+    ).result_json
+    assert rj is not None and rj["followup_review_recommended"] is True
+
+
+def test_ticket_contract_done_from_dev_is_not_a_success(tmp_path):
+    """A dev leg's only success is `built`. A marker-carrying `done` still
+    synthesizes (the marker is terminal) so verify can refuse it, but without the
+    followup flag a successful exit carries; a marker-less `done` is no terminal."""
+    marked = _spec(tmp_path / "a.md", status="done", auto_run="done", followup=True)
+    rj = devcontract.synthesize_result(
+        marked, story_key="1.1", success_statuses=_TICKET_DEV
+    ).result_json
+    assert rj is not None and rj["status"] == "done"
+    assert "followup_review_recommended" not in rj
+
+    bare = _spec(tmp_path / "b.md", status="done", auto_run=None)
+    out = devcontract.synthesize_result(bare, story_key="1.1", success_statuses=_TICKET_DEV)
+    assert out.result_json is None
+
+
+@pytest.mark.parametrize("auto_run", [None, "dropped"])
+def test_dropped_synthesizes_critical_in_tickets_mode(tmp_path, auto_run):
+    """Ablation: deleting the DROPPED arm in `synthesize_result` leaves the
+    escalation list empty, and this fails."""
+    sp = _spec(tmp_path / "plan.md", status="dropped", auto_run=auto_run)
+    rj = devcontract.synthesize_result(
+        sp, story_key="1.1", success_statuses=_TICKET_DEV
+    ).result_json
+    assert rj is not None and rj["status"] == "dropped"
+    (esc,) = rj["escalations"]
+    assert esc["type"] == "dropped" and esc["severity"] == "CRITICAL"
+    assert esc["spec_file"] == str(sp)
+    assert "followup_review_recommended" not in rj
+
+
+def test_dropped_prose_only_escalates_in_tickets_mode(tmp_path):
+    sp = _spec(tmp_path / "plan.md", status="in-progress", auto_run="dropped")
+    rj = devcontract.synthesize_result(
+        sp, story_key="1.1", success_statuses=_TICKET_DEV
+    ).result_json
+    assert rj is not None
+    assert [e["type"] for e in rj["escalations"]] == ["dropped"]
+
+
+@pytest.mark.parametrize("status", ["built", "dropped"])
+def test_sprint_defaults_unchanged_for_built_status(tmp_path, status):
+    """The v6 contract has no `built` or `dropped`: under the default arguments a
+    marker-less spec at either is still not terminal, and a marker-carrying one
+    synthesizes exactly as before — no escalation, no followup flag.
+
+    Ablation: making the default `success_statuses` include `built` (or adding
+    DROPPED to the terminal set unconditionally) turns the first assertion into
+    a result and fails this test."""
+    bare = _spec(tmp_path / "a.md", status=status, auto_run=None)
+    assert devcontract.synthesize_result(bare, story_key="1-1-a").result_json is None
+    assert not devcontract.is_frontmatter_candidate(bare, since_ns=0)
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
+
+    marked = _spec(tmp_path / "b.md", status=status, auto_run=status, followup=True)
+    rj = devcontract.synthesize_result(marked, story_key="1-1-a").result_json
+    assert rj is not None and rj["status"] == status
+    assert rj["escalations"] == []
+    assert "followup_review_recommended" not in rj
+
+
+def test_sprint_synthesis_is_identical_with_explicit_default(tmp_path):
+    """Passing the default explicitly is the same call: the v6 synthesis of every
+    v6 terminal is unchanged by the new parameter."""
+    for status in ("done", "blocked", "awaiting-operator"):
+        sp = _spec(
+            tmp_path / f"{status}.md",
+            status=status,
+            auto_run=status,
+            followup=True,
+            actions="['call the bank']",
+        )
+        implicit = devcontract.synthesize_result(sp, story_key="1-1-a")
+        explicit = devcontract.synthesize_result(sp, story_key="1-1-a", success_statuses=("done",))
+        assert implicit == explicit
+
+
+def test_frontmatter_candidate_terminal_param(tmp_path):
+    built = _write(tmp_path, "plan-a.md", "---\nstatus: built\n---\n\nbody\n", 2_000)
+    dropped = _write(tmp_path, "plan-b.md", "---\nstatus: dropped\n---\n\nbody\n", 3_000)
+    terminal = devcontract.terminal_statuses(_TICKET_DEV)
+
+    assert devcontract.is_frontmatter_candidate(built, since_ns=0, terminal=terminal)
+    assert devcontract.is_frontmatter_candidate(dropped, since_ns=0, terminal=terminal)
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0, terminal=terminal) == [
+        dropped,
+        built,
+    ]
+    assert devcontract.find_frontmatter_candidates(tmp_path, since_ns=0) == []
+
+
+def test_find_fallback_result_artifact_matches_prefixed_names_only(tmp_path):
+    """Only the skill's no-spec fallback qualifies: a marker-carrying spec in the
+    same folder belongs to someone else (#261) and is never returned, nor is a
+    fallback older than the launch floor."""
+    _write(
+        tmp_path,
+        "spec-other.md",
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n",
+        5_000,
+    )
+    assert devcontract.find_fallback_result_artifact(tmp_path, since_ns=1_000) is None
+
+    _write(tmp_path, "bmad-dev-auto-result-old.md", "---\nstatus: blocked\n---\n", 500)
+    assert devcontract.find_fallback_result_artifact(tmp_path, since_ns=1_000) is None
+
+    a = _write(tmp_path, "bmad-dev-auto-result-a.md", "---\nstatus: blocked\n---\n", 2_000)
+    b = _write(tmp_path, "bmad-build-auto-result-b.md", "---\nstatus: blocked\n---\n", 3_000)
+    assert devcontract.find_fallback_result_artifact(tmp_path, since_ns=1_000) == b
+    b.unlink()
+    assert devcontract.find_fallback_result_artifact(tmp_path, since_ns=1_000) == a
+    assert devcontract.find_fallback_result_artifact(tmp_path / "ghost", since_ns=0) is None

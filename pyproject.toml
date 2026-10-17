@@ -93,8 +93,14 @@ filterwarnings = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-# skill assets contain template placeholders that are not valid Python
-extend-exclude = [".agents", ".claude", "src/bmad_loop/data/skills"]
+# skill assets contain template placeholders that are not valid Python; the
+# vendored upstream BMAD-METHOD fixture is pinned byte-for-byte (PIN.toml)
+extend-exclude = [
+  ".agents",
+  ".claude",
+  "src/bmad_loop/data/skills",
+  "tests/fixtures/bmad_v7",
+]
 
 [tool.ruff.lint]
 # CI lints with trunk's ruff (pinned 0.15.17), whose plugin injects no `--select`
@@ -139,6 +145,9 @@ strict = [
   "src/bmad_loop/sanitize.py",
   "src/bmad_loop/plugins/digest.py",
   "src/bmad_loop/plugins/grants.py",
+  "src/bmad_loop/worksource.py",
+  "src/bmad_loop/ticketmodel.py",
+  "src/bmad_loop/ticketstore.py",
 ]
 # Check against the floor of requires-python so we never lean on 3.12+ typing.
 pythonVersion = "3.11"
