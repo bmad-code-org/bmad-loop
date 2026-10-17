@@ -166,9 +166,9 @@ and the title. The state is the plan's status when the ticket has a plan, else
 
 `tickets.py` is the project's own code, so the board reads it on the poll worker,
 never the UI thread. It runs again only when `tickets.toml`, a `.md` file in the
-initiative or one of its epic folders, the config, or the script changes. A tree
-that cannot be read shows `tickets board unavailable:` and the reason, and is
-retried after 30 seconds.
+initiative or one of its epic folders, the config, the script, or the
+`config_utils.py` it loads changes. A tree that cannot be read shows
+`tickets board unavailable:` and the reason, and is retried after 30 seconds.
 
 | Glyph | State                       | Color    |
 | ----- | --------------------------- | -------- |
@@ -379,7 +379,9 @@ To return to the default proportions, delete the `[tui]` size keys from
   (folder-and-id dispatch) or `tickets mode` (the BMAD v7 ticket tree),
   prefilled from `[stories]`. Tickets mode previews the active initiative: its
   ticket counts and the refs that pause on hitl or a checkpoint. A tickets pick
-  launches only while `[stories] source = "tickets"`.
+  launches only while `[stories] source = "tickets"`. Under that policy a
+  stories pick still launches (its `--spec` overrides the policy source); a
+  sprint pick does not.
 - **spec folder**: stories mode only. The epic spec folder holding
   `stories.yaml` and `SPEC.md`; it drives a live schedule preview that validates
   the manifest and lists the schedule with `[spec/done]` checkpoint markers and
