@@ -2821,6 +2821,23 @@ def test_ticket_grammar_rejects_backlog_file_names(token):
     assert (g.tokens, g.malformed) == ((), (token,))
 
 
+@pytest.mark.parametrize("token", ["true", "false", "true.1", "1.false"])
+def test_ticket_grammar_rejects_boolean_ids(token):
+    """`tickets.py` `_id` refuses `true` and `false` (frontmatter reads them as
+    booleans), so no epic or ticket carries either id and a gate naming one, bare
+    or as a ref half, is `malformed` rather than a gate that is always clear.
+    Ablation (performed): drop the boolean-id check and this FAILS."""
+    g = _ticket_gated(f"gate: {token}")
+    assert (g.tokens, g.malformed) == ((), (token,))
+
+
+def test_ticket_grammar_keeps_capitalised_boolean_words():
+    """Only the lowercase spellings are booleans to `tickets.py`; `True` is a
+    legal id there, so it stays a token."""
+    g = _ticket_gated("gate: True, True.1")
+    assert (g.tokens, g.malformed) == (("True", "True.1"), ())
+
+
 @pytest.mark.parametrize("token", ["1.2", "2.6a"])
 def test_story_grammar_still_rejects_dotted_ref(token):
     """The grammar is a parameter, not a union: a ticket ref on a sprint or stories

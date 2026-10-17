@@ -560,6 +560,9 @@ _TICKET_REF_RE = re.compile(r"^([0-9A-Za-z]+)\.([0-9A-Za-z]+)$")
 _TICKET_ID_RE = re.compile(r"^[0-9A-Za-z]+$")
 # An epic folder (`EPIC_RE`), `epic-<slug>`: that whole epic.
 _EPIC_FOLDER_RE = re.compile(r"^epic-[^/]+$")
+# Ids `ID_RE` admits but `tickets.py` `_id` refuses: frontmatter reads a bare
+# `true` / `false` as a boolean, so no epic or ticket can carry either id.
+_TICKET_BOOLEAN_IDS = frozenset({"true", "false"})
 # The prose convention `gate:` replaces, matched anywhere on a line rather than
 # at its start: real ledgers hard-wrap their `reason:` prose, so the declaration
 # routinely lands mid-line and a line-anchored pattern misses exactly the entries
@@ -956,16 +959,18 @@ def _matchable_token(token: str, grammar: GateGrammar = "story") -> bool:
     (``3-2``, ``3-2-invite-link``) is ``malformed`` there — no ticket carries one.
     So is a backlog leaf file name (``story-login.md``): a tickets run never
     dispatches a backlog row, and one moved into an epic is dispatched by its new
-    ``E.M`` ref, so the file name would gate nothing in silence.
+    ``E.M`` ref, so the file name would gate nothing in silence. So is an id of
+    ``true`` or ``false``, bare or as either half of a ref: ``tickets.py`` reads
+    neither as an id.
     """
     if not GATE_TOKEN_RE.match(token):
         return False
     if grammar == "ticket":
-        return bool(
-            _TICKET_REF_RE.match(token)
-            or _TICKET_ID_RE.match(token)
-            or _EPIC_FOLDER_RE.match(token)
-        )
+        if _EPIC_FOLDER_RE.match(token):
+            return True
+        pair = _TICKET_REF_RE.match(token)
+        ids = pair.groups() if pair else (token,) if _TICKET_ID_RE.match(token) else ()
+        return bool(ids) and not _TICKET_BOOLEAN_IDS.intersection(ids)
     return bool(_STORIES_ID_RE.match(token) or sprintstatus.STORY_RE.match(token))
 
 
