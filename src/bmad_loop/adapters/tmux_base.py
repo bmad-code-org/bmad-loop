@@ -594,7 +594,10 @@ class BaseTmuxBackend(TerminalMultiplexer):
     def new_window(
         self, session: str, name: str, cwd: Path, env: dict[str, str], command: str
     ) -> str:
-        return self._tmux(
+        # The launched pane's id comes back in the same create, so pane_target
+        # pins exactly the pane this window started with, whatever splits or
+        # swaps an operator or a hook makes before it is read (#948).
+        window_id, _, pane_id = self._tmux(
             "new-window",
             "-t",
             f"={session}:",
@@ -604,9 +607,16 @@ class BaseTmuxBackend(TerminalMultiplexer):
             str(cwd),
             "-P",
             "-F",
-            "#{window_id}",
+            "#{window_id} #{pane_id}",
             *self._window_launch(env, command),
-        )
+        ).partition(" ")
+        panes = self._launched_panes()
+        if pane_id.startswith("%"):
+            panes[window_id] = pane_id
+        else:
+            # A restarted server can reuse the id: no stale pane may answer for it.
+            panes.pop(window_id, None)
+        return window_id
 
     def new_parked_window(
         self, session: str, name: str, cwd: Path, argv: list[str], return_opt: str
@@ -691,7 +701,42 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # caller reads as "no match" (DW-350).
         return self._tmux("capture-pane", "-p", "-t", window_id)
 
+    def _launched_panes(self) -> dict[str, str]:
+        # Launched pane per window id, as new_window read it at create time;
+        # per instance, created on first use (subclasses need not call
+        # an __init__ for it).
+        return vars(self).setdefault("_launched_pane_ids", {})
+
+    def pane_target(self, window_id: str) -> str:
+        # `<window>.%N` rather than a bare `%N`: psmux runs one server per session
+        # and only reaches the right one through the session the window id
+        # carries, and both backends resolve a `%N` pane slot by id (psmux 3.4.0
+        # and tmux 3.4 measured). A pane index would drift with swap-pane, so
+        # the id is what is kept. The launched pane is the window's FIRST pane, not its active one: an
+        # operator who splits the window before this runs makes the split active
+        # (display-message would answer it), while a split never takes the
+        # lowest index (psmux 3.4.0 and tmux 3.4 list panes by index). A dead
+        # window lists nothing, so no pane id is a failure too.
+        if launched := self._launched_panes().get(window_id):
+            return f"{window_id}.{launched}"
+        rows = self._tmux("list-panes", "-t", window_id, "-F", "#{pane_index} #{pane_id}")
+        panes = []
+        for row in rows.splitlines():
+            index, _, pane = row.partition(" ")
+            if index.isdigit() and pane.startswith("%"):
+                panes.append((int(index), pane))
+        if not panes:
+            raise TmuxError(f"no pane id for {window_id}: {rows!r}")
+        return f"{window_id}.{min(panes)[1]}"
+
     def send_text(self, window_id: str, text: str) -> None:
+        # A pane in copy or clock mode eats the keys: tmux swallows the text, and
+        # psmux takes it as mode keys and leaves only the Enter (#949). Refuse
+        # rather than leave the mode — that would yank an operator reading
+        # scrollback. On psmux the flag is server-wide (psmux/psmux#828), which
+        # still matches what it swallows.
+        if self._tmux("display-message", "-p", "-t", window_id, "#{pane_in_mode}") == "1":
+            raise TmuxError(f"{window_id} is in a pane mode; not typing into it")
         self._tmux("send-keys", "-t", window_id, "-l", text)
         time.sleep(0.3)  # let the TUI ingest the paste before submitting
         self._tmux("send-keys", "-t", window_id, "Enter")

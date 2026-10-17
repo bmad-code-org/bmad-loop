@@ -1638,7 +1638,7 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
         str(tmp_path),
         "-P",
         "-F",
-        "#{window_id}",
+        "#{window_id} #{pane_id}",
         "-e",
         "A=1",
         "-e",
@@ -1678,7 +1678,7 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
         str(tmp_path),
         "-P",
         "-F",
-        "#{window_id}",
+        "#{window_id} #{pane_id}",
     ]
     assert rec.argv[-5:] == ["/bin/sh", "-c", tmux_base.LAUNCH_PRELUDE, "sh", command]
     assert len(rec.argv) == 17
@@ -1853,7 +1853,7 @@ def test_dialect_leaf_new_window_routes_launch_through_hook(monkeypatch, tmp_pat
         str(tmp_path),
         "-P",
         "-F",
-        "#{window_id}",
+        "#{window_id} #{pane_id}",
         "wrapped:cmd",
     ]
     assert "-e" not in rec.argv  # env strategy fully delegated to the hook
