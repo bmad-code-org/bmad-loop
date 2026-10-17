@@ -5406,7 +5406,8 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
     return code. A `RunRefError` is said like any other fault, never read as
     absence: an incomplete run listing raises one for a run that is still
     there, and a silent return would strand the refusal again. A partial match is
-    said too: it is not journaled into, so the refusal is on no record.
+    said too: it is not journaled into, so the refusal is on no record. So is a run
+    cleanup removed between the resolve and the lock.
 
     The reason is cut to `_CTL_REFUSAL_MAX_CHARS`, so a huge refusal cannot bloat
     every failed resume's journal row."""
@@ -5424,13 +5425,20 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
             )
             return
         with state_lock(run_dir):
-            if runs.is_run(run_dir):
-                Journal(run_dir).append(
-                    "ctl-window-claim-failed",
-                    error=f"a TUI-launched {args.command} exited before driving the run: "
-                    f"{reason} — the run's control-window record still names the window "
-                    "of the launch before it",
+            if not runs.is_run(run_dir):
+                # cleanup removed it after the resolve: said, never recreated
+                print(
+                    f"warning: could not journal this refused launch: run {args.run_id!r} "
+                    "was removed before its journal could be written",
+                    file=sys.stderr,
                 )
+                return
+            Journal(run_dir).append(
+                "ctl-window-claim-failed",
+                error=f"a TUI-launched {args.command} exited before driving the run: "
+                f"{reason} — the run's control-window record still names the window "
+                "of the launch before it",
+            )
     except Exception as e:
         print(f"warning: could not journal this refused launch: {e}", file=sys.stderr)
 

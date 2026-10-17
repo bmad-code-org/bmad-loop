@@ -7369,10 +7369,12 @@ def test_a_refusal_journal_says_a_run_listing_fault_rather_than_reading_it_as_ab
     assert "the run listing is incomplete — denied" in err
 
 
-def test_a_refusal_journal_never_recreates_a_run_cleanup_removed(tmp_path, monkeypatch):
+def test_a_refusal_journal_never_recreates_a_run_cleanup_removed(tmp_path, monkeypatch, capsys):
     # Cleanup removes the run under the state lock; one removed between the
-    # journaler's first look and its lock must not be recreated by the append.
-    # Ablation: drop the in-lock `is_run` check and the run dir comes back.
+    # journaler's first look and its lock must not be recreated by the append,
+    # and the refusal it could not record is said. Ablation: drop the in-lock
+    # `is_run` check and the run dir comes back; fall through silently on it and
+    # no warning is printed.
     import shutil
 
     run_dir = _escalated_run(tmp_path, "r1")
@@ -7387,6 +7389,8 @@ def test_a_refusal_journal_never_recreates_a_run_cleanup_removed(tmp_path, monke
         argparse.Namespace(project=str(tmp_path), run_id="r1", command="resume"), "refused"
     )
     assert not run_dir.exists()
+    err = capsys.readouterr().err
+    assert "could not journal this refused launch: run 'r1' was removed" in err
 
 
 def test_a_refusal_journal_never_lands_in_a_run_its_id_only_suffixes(tmp_path, capsys):
