@@ -5305,6 +5305,7 @@ async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatc
         return tree
 
     monkeypatch.setattr(app_mod, "_replan_ticket_tree", factory)
+    _no_store_conflict(monkeypatch)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
@@ -5339,6 +5340,7 @@ async def test_replan_in_tickets_mode_refused_mark_does_not_resume(project_tree,
     tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
     tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
     monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    _no_store_conflict(monkeypatch)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
@@ -5347,6 +5349,103 @@ async def test_replan_in_tickets_mode_refused_mark_does_not_resume(project_tree,
             pilot,
             lambda: any("not resuming" in m for m in notifications(app)),
         )
+    assert calls == []
+
+
+def _no_store_conflict(monkeypatch) -> None:
+    """`project_tree` installs no BMAD config, so the replan's ticket-store
+    refusal would name the missing config; these rows are about what follows it."""
+    from bmad_loop import ticketstore
+
+    monkeypatch.setattr(ticketstore, "store_conflict", lambda *_a, **_k: None)
+
+
+def _replan_tree(plan: Path):
+    from conftest import FakeTicketTree, fake_find, ticket_row
+
+    row = ticket_row("1.1", status="ready-for-dev")
+    tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    return tree
+
+
+async def test_replan_in_tickets_mode_refuses_a_changed_store(project_tree, monkeypatch):
+    """The detached resume refuses a ticket store whose topology changed while the
+    run was paused, so the replan takes that refusal BEFORE it re-opens the plan,
+    judged against the topology the run recorded, rebased onto the live project.
+    Ablation (performed): drop the `store_conflict` check in `_ticket_replan_worker`
+    and the plan is marked to draft (FAILS)."""
+    from bmad_loop import ticketstore
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir, plan = _tickets_paused_run(
+        project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
+    )
+    recorded = {"layout": "checkout", "store_root": str(project_tree.project / "_bmad-output")}
+    state = load_state(run_dir)
+    state.store_topology = dict(recorded)
+    save_state(run_dir, state)
+    seen: list[tuple[str, object]] = []
+
+    def conflict(_project, source, _isolation, *, recorded=None):
+        seen.append((source, recorded))
+        return "the ticket store changed since this run started"
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    tree = _replan_tree(plan)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any("ticket store changed" in m for m in notifications(app)),
+        )
+    assert seen == [("tickets", recorded)]
+    assert tree.marks == []
+    assert calls == []
+
+
+async def test_replan_in_tickets_mode_refuses_a_newer_checkpoint(project_tree, monkeypatch):
+    """Another controller can resume the run while the modal is open, and the run
+    can pause at a newer plan checkpoint before the replan takes the lock. The stage
+    alone still reads `plan-checkpoint`, so the re-read pause must be the ticket the
+    modal showed, with the binding it showed. Ablation (performed): drop the
+    paused-key/binding check in `_ticket_replan_worker` and the stale ticket is
+    marked to draft (FAILS)."""
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _no_store_conflict(monkeypatch)
+    run_dir, plan = _tickets_paused_run(
+        project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
+    )
+    tree = _replan_tree(plan)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        # the run moved on to ticket 1.2's plan checkpoint behind the open modal
+        state = load_state(run_dir)
+        newer = StoryTask(story_key="1.2", epic=0, phase=Phase.DEV_VERIFY, spec_file=str(plan))
+        newer.ticket = _ticket_binding(plan, "1.2")
+        state.tasks["1.2"] = newer
+        state.paused_story_key = "1.2"
+        save_state(run_dir, state)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any("no longer paused at ticket 1.1" in m for m in notifications(app)),
+        )
+    assert tree.marks == []
     assert calls == []
 
 

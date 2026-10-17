@@ -59,6 +59,7 @@ from ..model import (
     Phase,
     RunState,
     StoryTask,
+    TicketBinding,
     env_fault_site_reverifiable,
 )
 from ..platform_util import LockUnavailableError, resolve_or_lexical
@@ -987,7 +988,7 @@ class BmadLoopApp(App[None]):
                 if spec_path is None:
                     self.notify("no spec file to reset for replan", severity="error")
                     return
-                ticket: tuple[str, str | None] | None = None
+                ticket: tuple[str, TicketBinding, str | None] | None = None
                 if state.source == worksource.SOURCE_TICKETS:
                     # R13: a ticket's plan is re-opened only through the chokepoint,
                     # so a paused task with no recorded binding has no ref to mark.
@@ -998,7 +999,7 @@ class BmadLoopApp(App[None]):
                             severity="error",
                         )
                         return
-                    ticket = (task.ticket.ref, state.initiative or None)
+                    ticket = (task.story_key, task.ticket, state.initiative or None)
                 self._do_replan(
                     run_id,
                     spec_path,
@@ -1254,13 +1255,14 @@ class BmadLoopApp(App[None]):
         confine_root: Path,
         *,
         root_identity: os.stat_result | None = None,
-        ticket: tuple[str, str | None] | None = None,
+        ticket: tuple[str, TicketBinding, str | None] | None = None,
     ) -> None:
         """Request-replan: reset the planned spec to draft + strip its Auto Run
         Result, then resume — the next dispatch re-enters step-02 planning. Uses
         the same devcontract primitives the engine's repair path uses.
 
-        `ticket` is `(ref, pinned initiative)` for a tickets-mode run. The plan is
+        `ticket` is `(paused key, its recorded binding, pinned initiative)` for a
+        tickets-mode run. The plan is
         then re-opened to `draft` only through `TicketTree.mark(reason="replan")`,
         on a worker thread (`_ticket_replan_worker`), never by a raw frontmatter
         write; the Auto Run Result is left alone.
@@ -1298,8 +1300,10 @@ class BmadLoopApp(App[None]):
             self.notify(f"replan: no spec at {spec_path} — not resuming", severity="error")
             return
         if ticket is not None:
-            ref, initiative = ticket
-            self._ticket_replan_worker(run_id, run_dir, spec_path, confine_root, ref, initiative)
+            key, binding, initiative = ticket
+            self._ticket_replan_worker(
+                run_id, run_dir, spec_path, confine_root, key, binding, initiative
+            )
             return
         try:
             reset = devcontract.reset_spec_for_replan(
@@ -1340,17 +1344,43 @@ class BmadLoopApp(App[None]):
         run_dir: Path,
         plan: Path,
         tree_root: Path,
-        ref: str,
+        key: str,
+        binding: TicketBinding,
         initiative: str | None,
     ) -> None:
         """Re-open a ticket's plan to `draft` through the chokepoint, then resume.
 
         A worker because `mark` spawns `tickets.py` (bounded by its timeout), which
-        must not run on the message loop. The state lock is taken without waiting,
-        as `_do_rearm` takes it, and the pause and liveness are re-read under it: a
-        resume that won the race owns the run. `tree_root` is the plan's live root
-        (`_paused_spec_root`), the tree a re-arm marks through too. Every UI update
-        marshals through `call_from_thread`."""
+        must not run on the message loop. The ticket-store refusal the detached
+        resume makes is taken first, lock-free as `_do_rearm` takes it, with the
+        topology the run recorded: a store whose topology changed while the run was
+        paused would refuse the resume only after the plan was re-opened. The state
+        lock is then taken without waiting, as `_do_rearm` takes it, and the pause and
+        liveness are re-read under it: a resume that won the race owns the run. The
+        re-read pause must still be `key`'s with the `binding` the modal showed, or
+        another controller has moved the run to a newer checkpoint the operator never
+        reviewed. `tree_root` is the plan's live root (`_paused_spec_root`), the tree a
+        re-arm marks through too. Every UI update marshals through `call_from_thread`."""
+        ref = binding.ref
+        try:
+            isolation = policy.load(self.project / POLICY_FILE).scm.isolation
+            recorded = load_state(run_dir)
+        except (policy.PolicyError, OSError, KeyError, ValueError) as e:
+            self.call_from_thread(
+                self.notify,
+                f"replan: cannot judge the ticket store ({e}) — not replanning",
+                severity="error",
+            )
+            return
+        conflict = ticketstore.store_conflict(
+            self.project,
+            worksource.SOURCE_TICKETS,
+            isolation,
+            recorded=runs.live_store_topology(recorded, self.project) or None,
+        )
+        if conflict is not None:
+            self.call_from_thread(self.notify, conflict, severity="error")
+            return
         try:
             with state_lock(run_dir, blocking=False):
                 if _engine_possibly_live(run_dir):
@@ -1365,6 +1395,19 @@ class BmadLoopApp(App[None]):
                     self.call_from_thread(
                         self.notify,
                         f"run {run_id} is no longer paused at a plan checkpoint — not replanning",
+                        severity="warning",
+                    )
+                    return
+                fresh_task = fresh.tasks.get(key)
+                if (
+                    fresh.paused_story_key != key
+                    or fresh_task is None
+                    or fresh_task.ticket != binding
+                ):
+                    self.call_from_thread(
+                        self.notify,
+                        f"run {run_id} is no longer paused at ticket {ref}'s plan checkpoint "
+                        "— not replanning",
                         severity="warning",
                     )
                     return

@@ -386,6 +386,7 @@ STORE_TOPOLOGY_CALLERS = {
     ("cli.py", "factory"): 1,  # `_sweep_factory`'s closure: raises
     ("tui/app.py", "_guarded"): 1,
     ("tui/app.py", "_do_rearm"): 1,
+    ("tui/app.py", "_ticket_replan_worker"): 1,  # ahead of the replan's draft mark
 }
 
 # Every call to a spec frontmatter-status writer in src — `set_frontmatter_status`,
