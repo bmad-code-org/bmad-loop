@@ -1325,6 +1325,9 @@ JOURNAL_KINDS = frozenset(
         # profile's bypass tokens — one per affected launched role. `role`,
         # `profile` and `missing` are config names/flags from the resolved profile.
         "bypass-dropped",
+        # #920: the accepting process could not publish its control window;
+        # `error` is a drop field.
+        "ctl-window-claim-failed",
         "run-resume",
         # The resume of a tickets run paused for a refined ticket's story-file
         # approval records that approval (`tickets_source.approve_paused_story_file`).

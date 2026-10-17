@@ -68,7 +68,7 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 ├── failed/<unit>/changes.patch diff of a dropped unit
 ├── resolve/<story>/            escalation context.json and the resolve agent's resolution.json
 ├── restore/<story>.patch       tickets mode: a plan's intent-gap patch, moved out of the tree at re-arm
-├── ctl-window                  TUI: the control window last opened for this run
+├── ctl-window                  TUI: the control window that last accepted this run
 ├── decisions.json              sweep runs: run-scoped triage decisions
 └── bundles/<name>/intent.md    sweep runs: per-bundle intent
 ```

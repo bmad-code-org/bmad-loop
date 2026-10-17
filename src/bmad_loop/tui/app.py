@@ -914,15 +914,14 @@ class BmadLoopApp(App[None]):
         if not win_id:
             self.notify(f"{what} launched but its window id was not captured", severity="error")
             return
-        if not launch.ctl_window_recorded(self.project, run_id, win_id):
+        if not launch.ctl_window_reachable(self.project, run_id, win_id):
             # Not an error and not a reason to abort: this attach targets the id
             # in hand, so the resolve session itself is reached correctly. What
-            # is lost is the record *later* verbs read, so `a`/`x` after this
-            # window is minted may answer an older one (#482's symptom).
+            # is lost is reach for *later* verbs: `a`/`x` refuse an untagged
+            # window (#750), so they may miss this one.
             self.notify(
-                f"{what} launched but its window id was not recorded or its tag did "
-                "not land — later attach/stop may miss it or target an older window "
-                "for this run",
+                f"{what} launched but its window tag did not land or could not be "
+                "confirmed — later attach/stop may miss it",
                 severity="warning",
             )
         launch.select_ctl_window_id(win_id)
@@ -1236,16 +1235,14 @@ class BmadLoopApp(App[None]):
             self.notify(str(e), severity="error")
             return
         if not win_id:
-            # The resume itself is running; only the disambiguation record is
-            # lost, so `a`/`x` may target an older same-run_id window (#482's
-            # symptom). Warn instead of masking it behind the success toast.
-            # "not recorded", not "not captured": resume_detached reports the
-            # uncaptured id and the unwritten record through this one signal
-            # because they leave the operator in the same place.
+            # The resume itself is running; only reach is lost, so `a`/`x` may
+            # miss its window. Warn instead of masking it behind the success
+            # toast. resume_detached reports an uncaptured id and an unproven
+            # tag through this one signal: both leave the operator in the same
+            # place.
             self.notify(
-                "resume launched but its window id was not recorded or its tag did "
-                "not land — attach/stop may miss it or target an older window for "
-                "this run",
+                "resume launched but its window id was not captured or its tag did "
+                "not land — attach/stop may miss it",
                 severity="warning",
             )
         self.notify(
