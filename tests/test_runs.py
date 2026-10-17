@@ -8386,7 +8386,7 @@ def test_plugin_snapshots_dir_can_never_collide_with_a_run(tmp_path):
 def _healthy_leftovers(project, **kw):
     """`legacy_registry_leftovers` where every registry answered: the grouped
     remainder, with the fault list asserted empty (a healthy registry is silent)."""
-    grouped, faults = runs.legacy_registry_leftovers(project, **kw)
+    grouped, faults, _superseded = runs.legacy_registry_leftovers(project, **kw)
     assert faults == []
     return grouped
 
@@ -9140,13 +9140,15 @@ def test_superseded_ctl_sessions_reports_a_name_it_could_not_derive(tmp_path, mo
     assert faults == [f"could not derive the pre-upgrade control-session name: {detail}"]
 
 
-def test_legacy_leftovers_name_a_pre_rename_control_session_in_our_own_registry(
+def test_legacy_leftovers_name_a_pre_rename_control_session_in_our_own_registry_apart(
     tmp_path, monkeypatch
 ):
-    """#733: `cleanup` said "nothing to clean up" and `legacy_leftovers: []`
-    while the pre-rename control session held a parked run window, because the
-    reader walked the legacy registries only. Ablate the primary pass in
-    `legacy_registry_leftovers` and this fails."""
+    """#733: `cleanup` said "nothing to clean up" while the pre-rename control
+    session held a parked run window, because the reader walked the legacy
+    registries only. #917: it is named in the third element, never in the
+    legacy grouping, since this registry is no legacy one. Ablate the primary
+    pass in `legacy_registry_leftovers`, or merge its result back into
+    `grouped`, and this fails."""
     own = str(runs.mux_registry_root(tmp_path))
     old = runs.superseded_ctl_name(tmp_path)
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
@@ -9155,7 +9157,7 @@ def test_legacy_leftovers_name_a_pre_rename_control_session_in_our_own_registry(
         "get_multiplexer",
         lambda: _RegistryMux([runs.CTL_SESSION, old, _DIGEST_CTL], {}, root=own),
     )
-    assert _healthy_leftovers(tmp_path) == {own: [old]}
+    assert runs.legacy_registry_leftovers(tmp_path) == ({}, [], [old])
 
 
 def test_legacy_leftovers_report_an_unreadable_own_registry(tmp_path, monkeypatch):
@@ -9172,7 +9174,7 @@ def test_legacy_leftovers_report_an_unreadable_own_registry(tmp_path, monkeypatc
     own = str(runs.mux_registry_root(tmp_path))
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _Faulting([], {}, root=own))
-    assert runs.legacy_registry_leftovers(tmp_path) == ({}, [f"{own}: list-sessions failed"])
+    assert runs.legacy_registry_leftovers(tmp_path) == ({}, [f"{own}: list-sessions failed"], [])
 
 
 def test_legacy_leftovers_names_a_case_variant_ctl_where_the_transport_folds(tmp_path, monkeypatch):
@@ -9223,7 +9225,7 @@ def test_legacy_registry_leftovers_degrades_on_a_transport_fault(tmp_path, monke
     monkeypatch.setattr(
         runs, "_legacy_registries", lambda: [_Broken([], {}, root="/reg/broken"), healthy]
     )
-    grouped, faults = runs.legacy_registry_leftovers(tmp_path)
+    grouped, faults, _superseded = runs.legacy_registry_leftovers(tmp_path)
     assert grouped == {"/reg/displaced": ["bmad-loop-old-1"]}
     assert len(faults) == 1
     assert "/reg/broken" in faults[0] and "no server" in faults[0]
@@ -9238,9 +9240,11 @@ def test_legacy_registry_leftovers_reports_a_backend_that_cannot_be_selected(tmp
         raise MultiplexerError("no backend")
 
     monkeypatch.setattr(runs, "get_multiplexer", boom)
-    grouped, faults = runs.legacy_registry_leftovers(tmp_path)
-    assert grouped == {}
-    assert len(faults) == 1 and "no backend" in faults[0]
+    assert runs.legacy_registry_leftovers(tmp_path) == (
+        {},
+        ["no legacy registry could be checked: backend selection failed: no backend"],
+        [],
+    )
 
 
 def test_legacy_registry_leftovers_still_scans_our_own_registry_when_discovery_fails(
@@ -9259,8 +9263,9 @@ def test_legacy_registry_leftovers_still_scans_our_own_registry_when_discovery_f
     monkeypatch.setattr(runs, "_legacy_registries", boom)
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _RegistryMux([old], {}, root=own))
     assert runs.legacy_registry_leftovers(tmp_path) == (
-        {own: [old]},
+        {},
         ["no legacy registry could be checked: legacy discovery failed"],
+        [old],
     )
 
 
@@ -9278,11 +9283,16 @@ def test_legacy_registry_leftovers_routes_own_registry_faults_apart(tmp_path, mo
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
     monkeypatch.setattr(runs, "get_multiplexer", lambda: _Unlistable([], {}, root=own))
     routed: list[str] = []
-    assert runs.legacy_registry_leftovers(tmp_path, on_primary_fault=routed.append) == ({}, [])
+    assert runs.legacy_registry_leftovers(tmp_path, on_primary_fault=routed.append) == (
+        {},
+        [],
+        [],
+    )
     assert routed == [f"{own}: could not be listed: no server"]
     assert runs.legacy_registry_leftovers(tmp_path) == (
         {},
         [f"{own}: could not be listed: no server"],
+        [],
     )
 
 
