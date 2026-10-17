@@ -5397,12 +5397,11 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
 
     The resolve sits inside the guard too: this runs in `_drive_ctl_launch`'s
     `finally`, so a raise from it would replace the child's own exception or
-    return code."""
+    return code. A `RunRefError` is said like any other fault, never read as
+    absence: an incomplete run listing raises one for a run that is still
+    there, and a silent return would strand the refusal again."""
     try:
-        try:
-            run_dir = runs.resolve_run_dir(_project(args), args.run_id)
-        except runs.RunRefError:
-            return  # no run to record against
+        run_dir = runs.resolve_run_dir(_project(args), args.run_id)
         if run_dir.name != args.run_id:
             return  # a partial match, not the run this command resolved
         with state_lock(run_dir):

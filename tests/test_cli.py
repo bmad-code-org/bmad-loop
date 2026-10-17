@@ -7353,6 +7353,22 @@ def test_a_refusal_journal_that_cannot_resolve_the_run_keeps_the_childs_outcome(
     assert capsys.readouterr().err.count("could not journal this refused launch: cwd is gone") == 2
 
 
+def test_a_refusal_journal_says_a_run_listing_fault_rather_than_reading_it_as_absence(
+    tmp_path, monkeypatch, capsys
+):
+    # An unlistable runs dir makes `resolve_run_dir` raise RunRefError for a
+    # run that is still there; the journaler must say so, not take it for "no
+    # run". Ablation: return silently on RunRefError and nothing is printed.
+    _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(cli.runs, "_scan_run_dirs", lambda _project: ([], [], "denied"))
+    cli._journal_unaccepted_launch(
+        argparse.Namespace(project=str(tmp_path), run_id="r1", command="resume"), "refused"
+    )
+    err = capsys.readouterr().err
+    assert "could not journal this refused launch" in err
+    assert "the run listing is incomplete — denied" in err
+
+
 def test_a_refusal_journal_never_recreates_a_run_cleanup_removed(tmp_path, monkeypatch):
     # Cleanup removes the run under the state lock; one removed between the
     # journaler's first look and its lock must not be recreated by the append.
