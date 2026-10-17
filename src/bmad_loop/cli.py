@@ -5360,11 +5360,17 @@ def _claim_ctl_window(project: Path, run_dir: Path) -> None:
     except (MultiplexerError, OSError) as exc:
         warning = f"could not record this window as run {run_dir.name}'s control window: {exc}"
     if warning is not None:
-        print(f"warning: {warning}", file=sys.stderr)
-        try:
-            Journal(run_dir).append("ctl-window-claim-failed", error=warning)
-        except OSError as exc:
-            print(f"warning: could not journal it: {exc}", file=sys.stderr)
+        _report_ctl_window_fault(run_dir, warning)
+
+
+def _report_ctl_window_fault(run_dir: Path, warning: str) -> None:
+    """Print a control-window record fault and journal it as
+    `ctl-window-claim-failed`. Never raises."""
+    print(f"warning: {warning}", file=sys.stderr)
+    try:
+        Journal(run_dir).append("ctl-window-claim-failed", error=warning)
+    except OSError as exc:
+        print(f"warning: could not journal it: {exc}", file=sys.stderr)
 
 
 def _drive_ctl_launch(args: argparse.Namespace) -> int:
@@ -5411,15 +5417,19 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
 
     The reason is cut to `_CTL_REFUSAL_MAX_CHARS`, so a huge refusal cannot bloat
     every failed resume's journal row."""
+    # A finished-run reverify switches this process to the replay run it
+    # minted (`_resolve_reverify_finished`); a refusal after that is the replay
+    # run's, not the finished run's.
+    run_id = getattr(args, "ctl_launch_run_id", None) or args.run_id
     if len(reason) > _CTL_REFUSAL_MAX_CHARS:
         cut = len(reason) - _CTL_REFUSAL_MAX_CHARS
         reason = f"{reason[:_CTL_REFUSAL_MAX_CHARS]}… [{cut} more chars cut]"
     try:
-        run_dir = runs.resolve_run_dir(_project(args), args.run_id)
-        if run_dir.name != args.run_id:
+        run_dir = runs.resolve_run_dir(_project(args), run_id)
+        if run_dir.name != run_id:
             # a partial match, not the run this command resolved
             print(
-                f"warning: could not journal this refused launch: run {args.run_id!r} "
+                f"warning: could not journal this refused launch: run {run_id!r} "
                 f"is gone; its id only matches run {run_dir.name!r}",
                 file=sys.stderr,
             )
@@ -5428,7 +5438,7 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
             if not runs.is_run(run_dir):
                 # cleanup removed it after the resolve: said, never recreated
                 print(
-                    f"warning: could not journal this refused launch: run {args.run_id!r} "
+                    f"warning: could not journal this refused launch: run {run_id!r} "
                     "was removed before its journal could be written",
                     file=sys.stderr,
                 )
@@ -5758,6 +5768,20 @@ def _echo_rearm_notices(notices: tuple[runs.RearmNotice, ...]) -> None:
         print(f"{notice.severity}: {notice.message}{tail}", file=sys.stderr)
 
 
+def _hand_back_ctl_window(
+    project: Path, run_dir: Path, predecessor: str | None, claimed: str | None
+) -> None:
+    """This window is about to exit without a usable session, so the window the
+    record named before its claim is the run's again (#937)."""
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if claimed is not None and claimed != predecessor:
+        with state_lock(run_dir):
+            fault = launch.restore_ctl_window(project, run_dir.name, predecessor, claimed)
+            if fault is not None:
+                _report_ctl_window_fault(run_dir, fault)
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     from .model import PAUSE_ESCALATION, Phase
 
@@ -6029,6 +6053,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # resume publishes its pid in, and the liveness gate above is re-taken
         # there: a resume that accepted after it keeps the record. The other paths
         # claim when they resume (`_resume_paused_run`), or drive nothing.
+        from .tui import launch  # import-safe: launch.py has no textual imports
+
         with state_lock(run_dir):
             live = runs.engine_liveness(run_dir)
             if live == "alive":
@@ -6041,48 +6067,64 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            # Captured around the claim, so a session that cannot start can hand
+            # the record back (#937).
+            predecessor = launch.recorded_ctl_window(project, run_dir.name)
             _claim_ctl_window(project, run_dir)
-        adapters = _make_adapters(project, run_dir, pol)
-        dev_cfg = pol.adapter.resolved("dev")
-        model = dev_cfg.model
-        effort = dev_cfg.effort
-        _ctx_path, withheld, unreadable = resolve.build_context(
-            state,
-            run_dir,
-            story_key,
-            isolation=pol.scm.isolation,
-            project_root=project,
-            code_root=pre_session_code_root,
-        )
-        if pre_session_code_root != project:
-            print(
-                f"warning: resolve session stays project-rooted at {project.as_posix()!r}; "
-                "code fixes and commits belong in the run's code root at "
-                f"{pre_session_code_root.as_posix()!r}",
-                file=sys.stderr,
-            )
-        print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
+            claimed = launch.recorded_ctl_window(project, run_dir.name)
+        # From the claim on, any exit without a usable session hands the record
+        # back: adapter and context setup can fail too, not just the session.
         try:
-            produced = resolve.run_session(
-                adapters["dev"],
-                project,
+            adapters = _make_adapters(project, run_dir, pol)
+            dev_cfg = pol.adapter.resolved("dev")
+            model = dev_cfg.model
+            effort = dev_cfg.effort
+            _ctx_path, withheld, unreadable = resolve.build_context(
+                state,
                 run_dir,
                 story_key,
-                # This CALL precedes the re-arm below, so the generation it passes is
-                # the one still on disk — the pre-bump value. Not an ordering of the
-                # read: `rearm_escalation` reloads state and bumps its own copy, so
-                # this `task` object reads the same either way.
-                generation=task.generation,
-                model=model,
-                effort=effort,
+                isolation=pol.scm.isolation,
+                project_root=project,
+                code_root=pre_session_code_root,
             )
-        except NotImplementedError:
-            print(
-                "the dev adapter has no interactive session mode — fix the spec by hand, "
-                f"then: bmad-loop resolve {args.run_id} --no-interactive",
-                file=sys.stderr,
-            )
-            return 1
+            if pre_session_code_root != project:
+                print(
+                    f"warning: resolve session stays project-rooted at {project.as_posix()!r}; "
+                    "code fixes and commits belong in the run's code root at "
+                    f"{pre_session_code_root.as_posix()!r}",
+                    file=sys.stderr,
+                )
+            print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
+            # Only the session call answers "no interactive mode": a
+            # NotImplementedError out of adapter or context setup is a setup
+            # failure, and propagates through the hand-back below.
+            try:
+                produced = resolve.run_session(
+                    adapters["dev"],
+                    project,
+                    run_dir,
+                    story_key,
+                    # This CALL precedes the re-arm below, so the generation it passes is
+                    # the one still on disk — the pre-bump value. Not an ordering of the
+                    # read: `rearm_escalation` reloads state and bumps its own copy, so
+                    # this `task` object reads the same either way.
+                    generation=task.generation,
+                    model=model,
+                    effort=effort,
+                )
+            except NotImplementedError:
+                print(
+                    "the dev adapter has no interactive session mode — fix the spec by hand, "
+                    f"then: bmad-loop resolve {args.run_id} --no-interactive",
+                    file=sys.stderr,
+                )
+                _hand_back_ctl_window(project, run_dir, predecessor, claimed)
+                return 1
+        except BaseException:
+            # Setup failed, the dev CLI could not be spawned, or the session
+            # died: the window exits all the same, so hand the record back first.
+            _hand_back_ctl_window(project, run_dir, predecessor, claimed)
+            raise
         # DW-11, second half. `produced` alone is not enough to record coverage,
         # because the watermark `rearm_escalation` stamps is `len(task.sessions)` — it
         # covers every recorded session, INCLUDING the ones whose artifacts this walk
@@ -6827,6 +6869,8 @@ def _resolve_reverify_finished(
         print(f"error: {e}", file=sys.stderr)
         return 1
     replay_id = replay_dir.name
+    # From here a refused launch is the replay run's (`_journal_unaccepted_launch`).
+    args.ctl_launch_run_id = replay_id
     print(
         f"minted replay run {replay_id} for {story_key} (replay of {args.run_id}) — "
         "verify replays on resume"

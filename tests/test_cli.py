@@ -6740,6 +6740,109 @@ def test_resolve_interactive_unsupported_adapter(tmp_path, monkeypatch, capsys):
     assert "were not shown" not in captured.out
 
 
+@pytest.mark.parametrize("restore_fails", [False, True])
+def test_a_resolve_whose_session_cannot_start_hands_the_record_back(
+    tmp_path, monkeypatch, capsys, restore_fails
+):
+    # #937: the resolve claimed its window, then the adapter has no interactive
+    # session, so the window exits without hosting one. The record goes back
+    # to the window it named before the claim, under the lock every claim is
+    # made in; a hand-back that did not land is printed and journaled.
+    # Ablation: drop the restore from the NotImplementedError arm and the
+    # record keeps naming @7; drop its lock and the held-lock assert fires;
+    # drop the report and the journal has no entry.
+    from bmad_loop import resolve
+    from bmad_loop.tui import launch
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+
+    def claim(project, run_id, **_kw):
+        launch._record_ctl_window(project, run_id, "@7")
+
+    real_restore = launch.restore_ctl_window
+
+    def restore(*args):
+        assert_run_state_lock_held(run_dir)
+        fault = real_restore(*args)
+        return "hand-back failed" if restore_fails else fault
+
+    monkeypatch.setattr(launch, "restore_ctl_window", restore)
+    monkeypatch.setattr(launch, "claim_ctl_window", claim)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+
+    def unsupported(*a, **k):
+        assert launch.recorded_ctl_window(tmp_path, "r1") == "@7"  # the claim landed
+        raise NotImplementedError
+
+    monkeypatch.setattr(resolve, "run_session", unsupported)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
+    assert launch.recorded_ctl_window(tmp_path, "r1") == "@2"
+    errors = [e["error"] for e in _ctl_launch_entries(run_dir)]
+    assert errors == (["hand-back failed"] if restore_fails else [])
+    assert ("warning: hand-back failed" in capsys.readouterr().err) is restore_fails
+
+
+@pytest.mark.parametrize("failing", ["_make_adapters", "build_context", "run_session"])
+def test_resolve_hands_the_record_back_when_it_fails_past_the_claim(tmp_path, monkeypatch, failing):
+    # Past the claim, an adapter profile that does not load, a context.json
+    # that cannot be written, or a dev CLI that was removed each end the
+    # command without a session. The window exits all the same, so the record
+    # goes back to the window it named before, and the error still
+    # propagates. Ablation: start the try at run_session and the setup rows
+    # keep naming @7.
+    from bmad_loop import resolve
+    from bmad_loop.tui import launch
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    monkeypatch.setattr(
+        launch,
+        "claim_ctl_window",
+        lambda project, run_id, **_kw: launch._record_ctl_window(project, run_id, "@7"),
+    )
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+
+    def fail(*a, **k):
+        raise OSError(failing)
+
+    monkeypatch.setattr(cli if failing == "_make_adapters" else resolve, failing, fail)
+    try:
+        rc = cli.main(["resolve", "--project", str(tmp_path), "r1"])
+    except OSError:
+        rc = None
+    assert rc != 0
+    assert launch.recorded_ctl_window(tmp_path, "r1") == "@2"
+
+
+def test_resolve_reports_a_setup_not_implemented_as_a_setup_failure(tmp_path, monkeypatch, capsys):
+    # A NotImplementedError out of adapter setup is not "the dev adapter has
+    # no interactive session mode": it propagates as the setup error, and the
+    # record still goes back to the window it named before the claim.
+    # Ablation: widen the NotImplementedError arm to cover _make_adapters and
+    # the session-mode wording replaces the setup error.
+    from bmad_loop.tui import launch
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    monkeypatch.setattr(
+        launch,
+        "claim_ctl_window",
+        lambda project, run_id, **_kw: launch._record_ctl_window(project, run_id, "@7"),
+    )
+
+    def fail(*a, **k):
+        raise NotImplementedError("adapter builder")
+
+    monkeypatch.setattr(cli, "_make_adapters", fail)
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1"])
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert "adapter builder" in err
+    assert "no interactive session mode" not in err
+    assert launch.recorded_ctl_window(tmp_path, "r1") == "@2"
+
+
 def _withheld_line(out: str) -> str:
     (line,) = [ln for ln in out.splitlines() if "were not shown" in ln]
     return line
@@ -7272,6 +7375,20 @@ def test_a_launched_refusal_journals_every_line_it_printed_not_only_the_hint(
     assert "FAIL: .claude/skills/bmad-build-auto not found" in error
     assert "bmad-loop validate" in error
     assert "still names the window of the launch before it" in error
+
+
+def test_a_refused_launch_after_a_replay_mint_journals_into_the_replay_run(tmp_path):
+    # A finished-run reverify mints a replay run and drives it in this process;
+    # a refusal after the mint is the replay run's. Ablation: ignore the
+    # switched run id and the entry lands in the finished run instead.
+    finished = _escalated_run(tmp_path, "r1")
+    replay = _escalated_run(tmp_path, "r2")
+    args = argparse.Namespace(
+        project=str(tmp_path), run_id="r1", command="resolve", ctl_launch_run_id="r2"
+    )
+    cli._journal_unaccepted_launch(args, "refused")
+    assert _ctl_launch_entries(finished) == []
+    assert len(_ctl_launch_entries(replay)) == 1
 
 
 def test_a_launched_resume_that_accepted_then_failed_journals_no_refusal(tmp_path, monkeypatch):

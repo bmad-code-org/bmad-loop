@@ -396,9 +396,11 @@ def claim_ctl_window(project: Path, run_id: str, *, launched: bool = False) -> s
     `x` in that gap answer it. Before #920 they answered the minted window at
     once, including a window about to refuse.
 
-    The window's name is not checked: ctl_window_id re-proves the record against
-    this run's tagged `<kind>-<run_id>` rows, so a record naming any other
-    window (a shell window an operator typed the resume in) is ignored there."""
+    ctl_window_id re-proves the record against this run's tagged
+    `<kind>-<run_id>` rows, so a record naming a window called anything else is
+    ignored there. A landed record is therefore checked by name as well, and a
+    window the lookup cannot reach is reported rather than passed off as
+    recorded (_unnamed_ctl_window, #937)."""
     try:
         in_ctl = in_ctl_session()
         if not in_ctl and not launched:
@@ -411,7 +413,7 @@ def claim_ctl_window(project: Path, run_id: str, *, launched: bool = False) -> s
     if win_id:
         _record_ctl_window(project, run_id, win_id)
         if _read_ctl_window(project, run_id) == win_id:
-            return None
+            return _unnamed_ctl_window(project, run_id, win_id)
     else:
         # In a control window that cannot name itself, or a launched one whose
         # session probe went unanswered: the previous record names a window this
@@ -420,6 +422,78 @@ def claim_ctl_window(project: Path, run_id: str, *, launched: bool = False) -> s
     return (
         f"this window could not be recorded as run {run_id}'s control window — "
         "attach and stop from the TUI may target an older window for this run"
+    )
+
+
+def recorded_ctl_window(project: Path, run_id: str) -> str | None:
+    """The window id the run's record names, or None (see _read_ctl_window)."""
+    return _read_ctl_window(project, run_id)
+
+
+def restore_ctl_window(
+    project: Path, run_id: str, previous: str | None, claimed: str
+) -> str | None:
+    """Hand the record back from `claimed`, a window that claimed the run and
+    then never drove it (an interactive resolve whose session could not start,
+    #937), to `previous`, the record before that claim. The caller holds the
+    run's state lock, the lock every claim is made under.
+
+    Only while the record still names `claimed`: a claim accepted since then
+    drives the run, and keeps its own. No predecessor means the record goes,
+    which is exactly the state before the claim.
+
+    Returns operator wording when the record could not be handed back (both
+    writers swallow their faults), None otherwise."""
+    if _read_ctl_window(project, run_id) != claimed:
+        return None
+    if previous:
+        _record_ctl_window(project, run_id, previous)
+        if _read_ctl_window(project, run_id) == previous:
+            return None
+    else:
+        _forget_ctl_window(project, run_id)
+        # Absence proven, not read: _read_ctl_window answers None for a record
+        # it cannot read as well, which here would pass off a kept one as gone.
+        try:
+            os.lstat(runs.run_dir_for(project, run_id) / _CTL_WINDOW_FILE)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            pass
+    return (
+        f"run {run_id}'s control-window record could not be handed back from this "
+        "exiting window — attach and stop from the TUI may target it"
+    )
+
+
+def _unnamed_ctl_window(project: Path, run_id: str, win_id: str) -> str | None:
+    """Operator wording when the claimed window is not named for the run, so
+    the lookup's name scan never reaches it; None when it is.
+
+    A window named for another run is a real shape: `resolve <finished-run>
+    --reverify` runs in `resolve-<finished-run>` and resumes a new replay run
+    there (#937), so the record lands while `a` and `x` cannot find it.
+
+    The name only, not the tag ctl_window_reachable also checks: start_detached
+    stamps the tag after the child is already running, so a tag check here
+    races the launcher, which reports a failed tag write itself."""
+    try:
+        rows = _list_ctl_windows(
+            get_multiplexer(), ctl_session(project), ["window_id", "window_name"]
+        )
+    except MultiplexerError as e:
+        return (
+            f"could not confirm this window is reachable as run {run_id}'s control "
+            f"window ({e}) — attach and stop from the TUI may not find it"
+        )
+    for row_id, name, *_ in rows:
+        if row_id == win_id:
+            m = _CTL_WINDOW_RE.match(name)
+            if m is not None and m.group(1) == run_id:
+                return None
+    return (
+        f"this window is not named for run {run_id}, so attach and stop from the TUI "
+        f"cannot find it as the run's control window — stop it with: bmad-loop stop {run_id}"
     )
 
 
@@ -1115,7 +1189,14 @@ def _ensure_ctl_session(project: Path) -> str:
     # catch — otherwise the raw MultiplexerError slips past them and crashes the app.
     try:
         if not mux.has_session(name):
-            mux.new_session(name, project)
+            try:
+                mux.new_session(name, project)
+            except MultiplexerError:
+                # Two launches that both saw no session race on the create, and
+                # the loser is refused ("duplicate session" on tmux, "failed to
+                # create session" on psmux) by a session that now exists (#952).
+                if not mux.has_session(name):
+                    raise
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer ctl-session setup failed: {e}") from e
     # After both arms: a session created just now on a stale server inherits
