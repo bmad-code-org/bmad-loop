@@ -103,7 +103,7 @@ Every resume also checks that this bmad-loop knows the run's work source, that t
 - `"auto"` (default): after the ticket passes verify and review, bmad-loop runs `tickets.py mark <ref> done`. That unblocks the ticket's dependents in `next`.
 - `"never"`: the plan stays at `built` for a person to mark.
 
-bmad-loop is the only writer of a plan's `status` and `blocked_*` fields during a run. Every write goes through `tickets.py mark` under a lock, is read back from the plan's frontmatter, and must be a move the plan transition table allows. A plan never moves backward without an explicit reason (park, repair, rearm, rollback, replan or salvage), and `done` and `dropped` are final. bmad-loop never writes `dropped` and never edits epic or initiative files.
+The build skill writes a plan's `status` during its own session; every other write of `status` and `blocked_*` during a run is bmad-loop's, and none lands while a session for that ticket is live. Each bmad-loop write goes through `tickets.py mark` under a lock, is read back from the plan's frontmatter, and must be a move the plan transition table allows. A plan never moves backward without an explicit reason (park, repair, rearm, rollback, replan or salvage), and `done` and `dropped` are final. bmad-loop never writes `dropped` and never edits epic or initiative files.
 
 `[tickets] thorough_review` asks build-auto for a thorough pass: `"never"`, `"high-risk"` (default) or `"always"`. Under `"high-risk"` a dev leg reads the ticket's risk from `tickets.py find` and a review leg reads the plan's `risk`. See the [configuration reference](reference/configuration.md) for both keys.
 

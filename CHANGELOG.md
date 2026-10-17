@@ -31,13 +31,14 @@ breaking changes may land in a minor release.
   before dispatch, an unrefined one runs a `Halt after planning.` leg and pauses for plan
   review, and `done_checkpoint` pauses after the ticket commits.
 - Run the epic retrospective (`/bmad-retrospective -H <epic-slug>`) when a run finishes
-  an epic, record its verdict, and pause at `epic-boundary` until a person closes the
-  epic with bmad-ticket. A `rejected` verdict blocks every later pick while the epic
-  stays open. A retrospective refused for a dirty tree, a git fault or a stop request
+  an epic, record its verdict, and pause at `epic-boundary` for a person to close the
+  epic with bmad-ticket. A `rejected` verdict pauses every later pick while the epic
+  stays open; any other pauses once. A retrospective refused for a dirty tree, a git fault or a stop request
   records no closure, so the resume runs it.
 - Park a ticket as `blocked` ("awaiting operator: …"), never `done`.
-  `bmad-loop confirm <ref>` and `resolve` re-arm it through `tickets.py mark`; a code
-  rollback re-arms its plan, and a timed-out review lands it at `built`.
+  `bmad-loop confirm <ref>` marks it `done` through `tickets.py mark` once the actions
+  are done; `bmad-loop resolve <run-id>` re-arms an escalated ticket. A code rollback
+  re-arms its plan, and a timed-out review lands it at `built`.
 - Drive every repo-store layout: a store tracked in the code checkout is marked inside
   the unit's commit; an ignored folder or a store in its own repository is marked after
   the code lands (latched and replayed on resume), and a store repository gets plan-only
