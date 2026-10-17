@@ -6095,27 +6095,31 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             print(f"launching resolve agent for {story_key} — converse, fix the spec, then exit…")
-            produced = resolve.run_session(
-                adapters["dev"],
-                project,
-                run_dir,
-                story_key,
-                # This CALL precedes the re-arm below, so the generation it passes is
-                # the one still on disk — the pre-bump value. Not an ordering of the
-                # read: `rearm_escalation` reloads state and bumps its own copy, so
-                # this `task` object reads the same either way.
-                generation=task.generation,
-                model=model,
-                effort=effort,
-            )
-        except NotImplementedError:
-            print(
-                "the dev adapter has no interactive session mode — fix the spec by hand, "
-                f"then: bmad-loop resolve {args.run_id} --no-interactive",
-                file=sys.stderr,
-            )
-            _hand_back_ctl_window(project, run_dir, predecessor, claimed)
-            return 1
+            # Only the session call answers "no interactive mode": a
+            # NotImplementedError out of adapter or context setup is a setup
+            # failure, and propagates through the hand-back below.
+            try:
+                produced = resolve.run_session(
+                    adapters["dev"],
+                    project,
+                    run_dir,
+                    story_key,
+                    # This CALL precedes the re-arm below, so the generation it passes is
+                    # the one still on disk — the pre-bump value. Not an ordering of the
+                    # read: `rearm_escalation` reloads state and bumps its own copy, so
+                    # this `task` object reads the same either way.
+                    generation=task.generation,
+                    model=model,
+                    effort=effort,
+                )
+            except NotImplementedError:
+                print(
+                    "the dev adapter has no interactive session mode — fix the spec by hand, "
+                    f"then: bmad-loop resolve {args.run_id} --no-interactive",
+                    file=sys.stderr,
+                )
+                _hand_back_ctl_window(project, run_dir, predecessor, claimed)
+                return 1
         except BaseException:
             # Setup failed, the dev CLI could not be spawned, or the session
             # died: the window exits all the same, so hand the record back first.

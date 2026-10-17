@@ -6815,6 +6815,34 @@ def test_resolve_hands_the_record_back_when_it_fails_past_the_claim(tmp_path, mo
     assert launch.recorded_ctl_window(tmp_path, "r1") == "@2"
 
 
+def test_resolve_reports_a_setup_not_implemented_as_a_setup_failure(tmp_path, monkeypatch, capsys):
+    # A NotImplementedError out of adapter setup is not "the dev adapter has
+    # no interactive session mode": it propagates as the setup error, and the
+    # record still goes back to the window it named before the claim.
+    # Ablation: widen the NotImplementedError arm to cover _make_adapters and
+    # the session-mode wording replaces the setup error.
+    from bmad_loop.tui import launch
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+    monkeypatch.setattr(
+        launch,
+        "claim_ctl_window",
+        lambda project, run_id, **_kw: launch._record_ctl_window(project, run_id, "@7"),
+    )
+
+    def fail(*a, **k):
+        raise NotImplementedError("adapter builder")
+
+    monkeypatch.setattr(cli, "_make_adapters", fail)
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1"])
+    err = capsys.readouterr().err
+    assert rc != 0
+    assert "adapter builder" in err
+    assert "no interactive session mode" not in err
+    assert launch.recorded_ctl_window(tmp_path, "r1") == "@2"
+
+
 def _withheld_line(out: str) -> str:
     (line,) = [ln for ln in out.splitlines() if "were not shown" in ln]
     return line
