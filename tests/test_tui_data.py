@@ -1411,6 +1411,29 @@ def test_tickets_overview_stat_gated(tmp_path, monkeypatch):
     assert len(tree.calls) == 3
 
 
+def test_tickets_overview_follows_a_moved_project(tmp_path, monkeypatch):
+    """A run recorded under a project that has since moved watches the live
+    initiative folder: a plan edit there re-reads the board.
+
+    Ablation (performed): drop the rebase in `tickets_overview` and the signature
+    stats the vanished folder, so the edit never re-reads — this FAILS."""
+    old, live = tmp_path / "old", tmp_path / "live"
+    tree = _fake_board_tree(monkeypatch, live)
+    plan = live / "_bmad-output" / "init-a" / "epic-cart" / "story-cart-model-plan.md"
+    _write_plan(plan, "ready-for-dev")
+    state = _tickets_state(old)
+
+    data.tickets_overview(live, state)
+    assert data.tickets_overview(live, state).fault is None
+    assert len(tree.calls) == 1
+
+    _write_plan(plan, "in-progress")
+    later = plan.stat().st_mtime_ns + 1_000_000_000
+    os.utime(plan, ns=(later, later))
+    data.tickets_overview(live, state)
+    assert len(tree.calls) == 2
+
+
 def test_tickets_overview_carries_fault(tmp_path, monkeypatch):
     """A tree that cannot be read is a board with `fault` set and no rows —
     never None and never an empty board. The fault is cached like an answer,

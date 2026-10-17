@@ -72,6 +72,7 @@ from ..runs import (
     _StatSig,
     list_run_dirs,
     liveness,
+    rebase_recorded_project_path,
 )
 
 # ------------------------------------------------------------- run watching
@@ -1107,13 +1108,16 @@ def initiative_board(project: Path, initiative: str, folder: Path) -> TicketsBoa
 def tickets_overview(project: Path, state: RunState) -> TicketsBoard:
     """The tickets-mode board for a run: the tree of the initiative it pinned
     (``RunState.initiative`` and ``initiative_folder``), read as
-    :func:`initiative_board` reads it — off the UI thread. A run with no pinned
+    :func:`initiative_board` reads it — off the UI thread. The recorded folder
+    moves with a renamed project (:func:`~bmad_loop.runs.rebase_recorded_project_path`),
+    so the signature watches the tree the script reads. A run with no pinned
     initiative has no tree to read and says so in ``fault``."""
     if not state.initiative or not state.initiative_folder:
         return TicketsBoard((), "this run pinned no initiative", state.initiative)
     folder = Path(state.initiative_folder)
     if not folder.is_absolute():
         folder = project / folder
+    folder = rebase_recorded_project_path(folder, state, project)
     return initiative_board(project, state.initiative, folder)
 
 
