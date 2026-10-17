@@ -1071,12 +1071,13 @@ class BmadLoopApp(App[None]):
         state.tasks: there is no plan to show, and the reason is the payload."""
         return state.source == worksource.SOURCE_TICKETS and self._paused_task(state) is None
 
-    @staticmethod
-    def _epic_closure_summary(state: RunState) -> str:
+    def _epic_closure_summary(self, state: RunState) -> str:
         """The epic-closure viewer's head: the retrospective verdict the engine
         recorded for the paused epic (`RunState.ticket_epic_closures`) and the path
         the retrospective lives at (`<initiative folder>/<slug>/<slug>-retrospective.md`,
-        as `TicketsEngine._retro_doc` spells it). No file or tree is read."""
+        as `TicketsEngine._retro_doc` spells it). The recorded folder is rebased onto
+        the live project (`runs.rebase_recorded_project_path`), so a moved project
+        names the retrospective the run will read. No file or tree is read."""
         slug = state.paused_story_key or ""
         verdict = state.ticket_epic_closures.get(slug) if slug else None
         lines = [
@@ -1087,7 +1088,10 @@ class BmadLoopApp(App[None]):
             )
         ]
         if slug and state.initiative_folder:
-            retro = Path(state.initiative_folder) / slug / f"{slug}-retrospective.md"
+            folder = runs.rebase_recorded_project_path(
+                Path(state.initiative_folder), state, self.project
+            )
+            retro = folder / slug / f"{slug}-retrospective.md"
             lines.append(f"retrospective: {retro}")
         return "\n".join(lines)
 

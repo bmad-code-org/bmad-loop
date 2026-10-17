@@ -5248,6 +5248,29 @@ async def test_epic_closure_viewer_shows_verdict(project_tree, monkeypatch):
         assert "close epic-cart with bmad-ticket" in body
 
 
+def test_epic_closure_summary_follows_a_moved_project(project_tree):
+    """A run keeps its launch-time project and initiative folder; after the project
+    moves, the closure viewer names the retrospective under the LIVE project, where
+    the run reads it. Ablation (performed): name `state.initiative_folder` as
+    recorded and the old path is shown (FAILS)."""
+    run_dir, _plan = _tickets_paused_run(
+        project_tree.project, stage="epic-boundary", key="epic-cart"
+    )
+    state = load_state(run_dir)
+    old = project_tree.project.parent / "moved-away"
+    state.project = str(old)
+    state.initiative_folder = str(old / "_bmad-output" / "init-a")
+    app = BmadLoopApp(project_tree.project)
+    retro = (
+        project_tree.project
+        / "_bmad-output"
+        / "init-a"
+        / "epic-cart"
+        / "epic-cart-retrospective.md"
+    )
+    assert f"retrospective: {retro}" in app._epic_closure_summary(state)
+
+
 async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatch):
     """R13: "Request replan" on a tickets run re-opens the plan to `draft` only
     through `TicketTree.mark(reason="replan")` — pinned to the run's initiative, on
