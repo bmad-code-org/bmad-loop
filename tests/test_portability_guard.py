@@ -360,6 +360,7 @@ ISOLATION_CONFLICT_CALLERS = {
     ("cli.py", "factory"): 1,  # `_sweep_factory`'s closure: raises — no rc channel
     ("tui/app.py", "_guarded"): 1,  # the pre-launch toast guard
     ("tui/app.py", "_do_rearm"): 1,
+    ("tui/app.py", "_ticket_replan_worker"): 1,  # ahead of the replan's draft mark
 }
 
 # Every call site of the ticket-store topology refusal — the pure text producer

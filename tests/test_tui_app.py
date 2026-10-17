@@ -5101,14 +5101,19 @@ def _tickets_paused_run(
     initiative: str = "init-a",
     closures: dict[str, str] | None = None,
     run_id: str = "20260611-100000-aaaa",
+    worktree_path: Path | None = None,
 ) -> tuple[Path, Path]:
     """A tickets-mode run paused at `stage` with key `key`, pinned to `initiative`.
     With `plan_status`, ticket `key` is a recorded task bound to its plan (written
     with that frontmatter status), as `TicketsEngine` records a planned ticket.
+    With `worktree_path`, the task is that unit mount's, its plan written at the
+    same relative path under the mount, with the mount's mint-time identity.
     Canned state only: nothing here (or in the app under test) runs `tickets.py`.
     Returns (run_dir, plan path)."""
     folder = root / "_bmad-output" / initiative
     plan = folder / "epic-cart" / "story-cart-model-plan.md"
+    if worktree_path is not None:
+        plan = worktree_path / plan.relative_to(root)
     tasks: dict[str, StoryTask] = {}
     if plan_status is not None and key is not None:
         plan.parent.mkdir(parents=True, exist_ok=True)
@@ -5118,6 +5123,9 @@ def _tickets_paused_run(
         )
         task = StoryTask(story_key=key, epic=0, phase=Phase.DEV_VERIFY, spec_file=str(plan))
         task.ticket = _ticket_binding(plan, key)
+        if worktree_path is not None:
+            task.worktree_path = str(worktree_path)
+            task.worktree_identity = platform_util.root_identity_record(worktree_path)
         tasks[key] = task
     run_dir = make_run(
         root,
@@ -5450,6 +5458,88 @@ async def test_replan_in_tickets_mode_refuses_a_changed_store(project_tree, monk
             lambda: any("ticket store changed" in m for m in notifications(app)),
         )
     assert seen == [("tickets", recorded)]
+    assert tree.marks == []
+    assert calls == []
+
+
+async def test_replan_in_tickets_mode_refuses_a_worktree_isolation_conflict(
+    project_tree, monkeypatch
+):
+    """The detached resume refuses worktree isolation under a disjoint `repo_root`
+    (`worktree_isolation_conflict`), so a layout edited while the run was paused is
+    refused BEFORE the plan is re-opened, as `_do_rearm` refuses it. Ablation
+    (performed): drop the isolation check in `_ticket_replan_worker` and the plan is
+    marked to draft (FAILS)."""
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _no_store_conflict(monkeypatch)
+    _split_root_tui_project(project_tree)
+    expected = bmadconfig.worktree_isolation_conflict(
+        bmadconfig.load_paths(project_tree.project), "worktree"
+    )
+    assert expected is not None, "the fixture really does carry the conflicting pair"
+    _run_dir, plan = _tickets_paused_run(
+        project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
+    )
+    tree = _replan_tree(plan)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: expected in notifications(app))
+    assert tree.marks == []
+    assert calls == []
+
+
+async def test_replan_in_tickets_mode_refuses_a_worktree_mount_swapped_for_a_link(
+    project_tree, monkeypatch
+):
+    """DW-423 for tickets mode: the isolated run's mount is replaced by a link to an
+    outside tree carrying the same plan subpath while the review modal is open. The
+    replan refuses before it builds the tree, so the outside tree's `tickets.py`
+    never marks: error notice, no resume. Ablation (performed): drop the
+    `require_root_pinned` check in `_ticket_replan_worker` and the plan is marked to
+    draft and the run resumes (FAILS)."""
+    import shutil
+
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _no_store_conflict(monkeypatch)
+    wt = _unit_worktree(project_tree.project)
+    _run_dir, plan = _tickets_paused_run(
+        project_tree.project,
+        stage="plan-checkpoint",
+        plan_status="ready-for-dev",
+        worktree_path=wt,
+    )
+    roots: list[Path] = []
+    tree = _replan_tree(plan)
+
+    def make_tree(root, _pin):
+        roots.append(root)
+        return tree
+
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", make_tree)
+    outside = project_tree.project.parent / "outside-mount"
+    monkeypatch.chdir(project_tree.project)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        shutil.copytree(wt, outside)
+        wt.rename(wt.with_name(wt.name + "-aside"))
+        wt.symlink_to(outside, target_is_directory=True)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: any("replan failed" in m for m in notifications(app)))
+    assert roots == []
     assert tree.marks == []
     assert calls == []
 

@@ -62,7 +62,7 @@ from ..model import (
     TicketBinding,
     env_fault_site_reverifiable,
 )
-from ..platform_util import LockUnavailableError, resolve_or_lexical
+from ..platform_util import LockUnavailableError, require_root_pinned, resolve_or_lexical
 from ..policy import POLICY_FILE
 from ..process_host import ProcessHostError
 from ..runs import RUNS_DIR, RearmError, StopRunError
@@ -1306,7 +1306,7 @@ class BmadLoopApp(App[None]):
         if ticket is not None:
             key, binding, initiative = ticket
             self._ticket_replan_worker(
-                run_id, run_dir, spec_path, confine_root, key, binding, initiative
+                run_id, run_dir, spec_path, confine_root, key, binding, initiative, root_identity
             )
             return
         try:
@@ -1351,20 +1351,24 @@ class BmadLoopApp(App[None]):
         key: str,
         binding: TicketBinding,
         initiative: str | None,
+        root_identity: os.stat_result | None,
     ) -> None:
         """Re-open a ticket's plan to `draft` through the chokepoint, then resume.
 
         A worker because `mark` spawns `tickets.py` (bounded by its timeout), which
-        must not run on the message loop. The ticket-store refusal the detached
-        resume makes is taken first, lock-free as `_do_rearm` takes it, with the
-        topology the run recorded: a store whose topology changed while the run was
-        paused would refuse the resume only after the plan was re-opened. The state
+        must not run on the message loop. The worktree-isolation and ticket-store
+        refusals the detached resume makes are taken first, lock-free as `_do_rearm`
+        takes them, the store one with the topology the run recorded: a layout or a
+        store that changed while the run was paused would refuse the resume only
+        after the plan was re-opened. The state
         lock is then taken without waiting, as `_do_rearm` takes it, and the pause and
         liveness are re-read under it: a resume that won the race owns the run. The
         re-read pause must still be `key`'s with the `binding` the modal showed, or
         another controller has moved the run to a newer checkpoint the operator never
         reviewed. `tree_root` is the plan's live root (`_paused_spec_root`), the tree a
-        re-arm marks through too. Every UI update marshals through `call_from_thread`."""
+        re-arm marks through too. `root_identity` pins it as it pins the stories-mode
+        reset (DW-423): a worktree mount swapped for a link refuses before the tree's
+        `tickets.py` is run. Every UI update marshals through `call_from_thread`."""
         ref = binding.ref
         try:
             isolation = policy.load(self.project / POLICY_FILE).scm.isolation
@@ -1376,12 +1380,26 @@ class BmadLoopApp(App[None]):
                 severity="error",
             )
             return
-        conflict = ticketstore.store_conflict(
-            self.project,
-            worksource.SOURCE_TICKETS,
-            isolation,
-            recorded=runs.live_store_topology(recorded, self.project) or None,
-        )
+        try:
+            paths = bmadconfig.load_paths(self.project, want_tickets=True)
+        except bmadconfig.BmadConfigError:
+            conflict = None  # `store_conflict` loads the same config and names the fault
+        except OSError as e:
+            self.call_from_thread(
+                self.notify,
+                f"replan: cannot read the project config ({e}) — not replanning",
+                severity="error",
+            )
+            return
+        else:
+            conflict = bmadconfig.worktree_isolation_conflict(paths, isolation)
+        if conflict is None:
+            conflict = ticketstore.store_conflict(
+                self.project,
+                worksource.SOURCE_TICKETS,
+                isolation,
+                recorded=runs.live_store_topology(recorded, self.project) or None,
+            )
         if conflict is not None:
             self.call_from_thread(self.notify, conflict, severity="error")
             return
@@ -1415,6 +1433,7 @@ class BmadLoopApp(App[None]):
                         severity="warning",
                     )
                     return
+                require_root_pinned(tree_root, root_identity)
                 mark = _replan_ticket_tree(tree_root, initiative).mark(
                     ref, "draft", reason="replan", expected_plan=plan, journal=Journal(run_dir)
                 )
