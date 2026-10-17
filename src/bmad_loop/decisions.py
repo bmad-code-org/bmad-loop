@@ -339,7 +339,9 @@ def drop_pre_answer(project: Path, dw_id: str, *, answer: object, scope: str | N
 # ------------------------------------------------------- discovery + apply
 
 
-def pending_missed_decisions(project: Path) -> list[Decision]:
+def pending_missed_decisions(
+    project: Path, paths: bmadconfig.ProjectPaths | None = None
+) -> list[Decision]:
     """Decisions earlier sweeps surfaced but no one answered: reconstructed from
     every run's persisted triage*.json, kept only when the DW id is still open
     and not already usably answered in the store — the value has to be one a sweep
@@ -351,8 +353,13 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     only that initiative's sweeps are read: DW ids are numbered per initiative
     ledger, so another initiative's triage names different entries under the
     same ids. With no initiative active only runs that recorded none are read,
-    since the ``output_folder`` ledger numbers its ids independently too."""
-    paths = bmadconfig.load_paths(project)
+    since the ``output_folder`` ledger numbers its ids independently too.
+
+    ``paths`` is the caller's own load of the config, when it has one: the ledger
+    it names is then the one these decisions were listed from, which a caller
+    hands back to :func:`apply_pre_answer` as ``listed_ledger``."""
+    if paths is None:
+        paths = bmadconfig.load_paths(project)
     scope = store_scope(paths)
     # The initiative a run must have recorded for its triage to be read: v7
     # filters every run, including the no-initiative case (""); v6 reads all.
@@ -572,7 +579,13 @@ class PreAnswerResult:
 
 
 def apply_pre_answer(
-    project: Path, decision: Decision, option: DecisionOption, *, date: str, commit: bool = True
+    project: Path,
+    decision: Decision,
+    option: DecisionOption,
+    *,
+    date: str,
+    commit: bool = True,
+    listed_ledger: Path | None = None,
 ) -> PreAnswerResult:
     """Record a human's out-of-band answer durably, answering whether a ledger
     `decision:` audit line actually landed. `close` also flips the entry to done
@@ -692,8 +705,20 @@ def apply_pre_answer(
     no such precondition — it is sanitized, never refused.
 
     The store written is the one for the ledger written (:func:`store_scope` of
-    the same ``paths``): on BMAD v7 that is the active initiative's."""
+    the same ``paths``): on BMAD v7 that is the active initiative's.
+
+    ``listed_ledger`` is the ledger the decision was listed from
+    (:func:`pending_missed_decisions`' ``paths``). The caller blocks on a human
+    between listing and this call, so a config edit in between — another
+    initiative made active — would land the answer on an unrelated entry of the
+    same DW id in another ledger. A ledger other than ``listed_ledger`` raises
+    :class:`~bmad_loop.bmadconfig.BmadConfigError` before anything is written."""
     paths = bmadconfig.load_paths(project)
+    if listed_ledger is not None and paths.deferred_work != listed_ledger:
+        raise bmadconfig.BmadConfigError(
+            f"the deferred-work ledger is now {paths.deferred_work}, not the "
+            f"{listed_ledger} {decision.id} was listed from — list the decisions again"
+        )
     scope = store_scope(paths)
     ledger = paths.deferred_work
     detail = option.resolution or option.intent

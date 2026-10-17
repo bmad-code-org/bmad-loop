@@ -96,9 +96,10 @@ mark` (reason `rearm`), clearing its `blocked_*` fields, and an aborted re-arm r
   at `built` (or `done`), and retro action-item ingest journals
   `sweep-retro-ingest-unavailable` with `ingest_cause="no-board"`.
 - Pin a v7 sweep to its initiative: a resume refuses a switched `active_initiative`, and
-  pre-answers are kept per initiative in `.bmad-loop/decisions-<initiative>.json`. A
-  bundle plan in a ticket store with its own repository is committed there once the
-  code lands.
+  pre-answers are kept per initiative in `.bmad-loop/decisions-<initiative>.json`.
+  `decisions` and the TUI refuse an answer once another initiative is active than the
+  one its decision was listed from. A bundle plan in a ticket store with its own
+  repository is committed there once the code lands.
 - Add `initiative` and `era` to `validate --json`. `mode` is now an open enum (it gains
   `tickets`); `schema_version` stays 1.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,

@@ -2384,6 +2384,60 @@ def test_pending_with_no_initiative_skips_initiative_runs(project_v7):
     assert [(d.id, d.question) for d in pending] == [("DW-1", "unscoped q")]
 
 
+def test_pre_answer_refuses_a_ledger_switched_since_listing(project_v7):
+    """A decision is listed from one initiative's ledger, then the human answers
+    after another initiative was made active. Both ledgers hold a `DW-1`, so the
+    answer would land on unrelated work: the write is refused before either the
+    ledger or a store is touched. Answered against the ledger it was listed from,
+    it records as before.
+
+    ABLATION (performed): drop the `listed_ledger` check in `apply_pre_answer`
+    and `beta`'s ledger and store take `alpha`'s answer."""
+    layout = project_v7
+    project = layout.project
+    alpha = _activate(layout, "alpha")
+    _open_ledger(alpha.deferred_work, "DW-1")
+    _make_run(
+        layout,
+        "20260601-000000-aaaa",
+        _triage(["DW-1"], [_decision("DW-1", question="alpha q")]),
+        initiative="alpha",
+    )
+    beta = _activate(layout, "beta")
+    _open_ledger(beta.deferred_work, "DW-1")
+    alpha = _activate(layout, "alpha")
+    pending = decisions.pending_missed_decisions(project, alpha)
+    assert [d.question for d in pending] == ["alpha q"]
+    decision, option = _build_decision("DW-1")
+    beta = _activate(layout, "beta")
+    beta_ledger = beta.deferred_work.read_bytes()
+
+    with pytest.raises(bmadconfig.BmadConfigError, match="list the decisions again"):
+        decisions.apply_pre_answer(
+            project,
+            decision,
+            option,
+            date="2026-06-13",
+            commit=False,
+            listed_ledger=alpha.deferred_work,
+        )
+
+    assert beta.deferred_work.read_bytes() == beta_ledger
+    assert not decisions.store_path(project, "beta").exists()
+
+    _activate(layout, "alpha")
+    result = decisions.apply_pre_answer(
+        project,
+        decision,
+        option,
+        date="2026-06-13",
+        commit=False,
+        listed_ledger=alpha.deferred_work,
+    )
+    assert result.recorded
+    assert set(decisions.load_pre_answers(project, "alpha")) == {"DW-1"}
+
+
 @pytest.mark.parametrize("state", [b"{not json", b"[]"], ids=["unreadable", "non-object"])
 def test_pending_with_no_initiative_skips_unreadable_runs(project_v7, state):
     """With no v7 initiative active the run scope is `""`, the value a run that

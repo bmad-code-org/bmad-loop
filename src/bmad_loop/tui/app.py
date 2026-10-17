@@ -494,9 +494,11 @@ class BmadLoopApp(App[None]):
         if not missed.items:
             self.notify("no unanswered decisions from past sweeps")
             return
-        self._walk_decisions(list(missed.items), 0, 0)
+        self._walk_decisions(list(missed.items), 0, 0, missed.ledger)
 
-    def _walk_decisions(self, pending: list, idx: int, answered: int) -> None:
+    def _walk_decisions(
+        self, pending: list, idx: int, answered: int, ledger: Path | None = None
+    ) -> None:
         if idx >= len(pending):
             if answered:
                 self.notify(f"recorded {answered} decision(s) — run a sweep to act on any builds")
@@ -510,12 +512,14 @@ class BmadLoopApp(App[None]):
                     self.notify(f"recorded {answered} decision(s)")
                     self._dashboard._tick(force_rescan=True)
                 return
-            ok = self._record_decision(decision, option)
-            self._walk_decisions(pending, idx + 1, answered + (1 if ok else 0))
+            ok = self._record_decision(decision, option, ledger)
+            self._walk_decisions(pending, idx + 1, answered + (1 if ok else 0), ledger)
 
         self.push_screen(DecisionModal(decision), on_choice)
 
-    def _record_decision(self, decision: object, option: object) -> bool:
+    def _record_decision(
+        self, decision: object, option: object, ledger: Path | None = None
+    ) -> bool:
         """Record one answered decision, answering whether `_walk_decisions` may
         count it into `recorded N decision(s)`.
 
@@ -542,6 +546,7 @@ class BmadLoopApp(App[None]):
                 decision,  # pyright: ignore[reportArgumentType]
                 option,  # pyright: ignore[reportArgumentType]
                 date=time.strftime("%Y-%m-%d"),
+                listed_ledger=ledger,
             )
         except (
             OSError,

@@ -1100,10 +1100,13 @@ class MissedDecisions:
     """:func:`pending_missed_decisions`' answer. ``fault`` is None for a real
     answer (``items`` may then be empty: nothing is pending); otherwise it names
     why nothing could be read, and ``items`` is empty because nothing was — not
-    because nothing is pending (DW-473)."""
+    because nothing is pending (DW-473). ``ledger`` is the deferred-work ledger
+    ``items`` were listed from, for :func:`decisions.apply_pre_answer`'s
+    ``listed_ledger``."""
 
     items: list[Any]
     fault: str | None = None
+    ledger: Path | None = None
 
 
 def pending_missed_decisions(project: Path) -> MissedDecisions:
@@ -1130,6 +1133,7 @@ def pending_missed_decisions(project: Path) -> MissedDecisions:
     if listing_fault is not None:
         return MissedDecisions([], fault=f"run listing incomplete ({listing_fault})")
     sig = (
+        paths.deferred_work,
         _stat_sig(paths.deferred_work),
         _stat_sig(decisions.store_path(project, decisions.store_scope(paths))),
         tuple(d.name for d in run_dirs),
@@ -1138,12 +1142,12 @@ def pending_missed_decisions(project: Path) -> MissedDecisions:
     if cached is not None and cached[0] == sig:
         return cached[1]
     try:
-        items = decisions.pending_missed_decisions(project)
+        items = decisions.pending_missed_decisions(project, paths)
     except (bmadconfig.BmadConfigError, OSError) as e:
         return MissedDecisions([], fault=_describe(e))
     _, ledger_fault = deferredwork.read_for_observation(paths.deferred_work)
     if ledger_fault is not None:
         return MissedDecisions([], fault=f"deferred-work ledger unreadable ({ledger_fault})")
-    result = MissedDecisions(items)
+    result = MissedDecisions(items, ledger=paths.deferred_work)
     _missed_cache[project] = (sig, result)
     return result

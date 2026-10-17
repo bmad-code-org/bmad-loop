@@ -1874,7 +1874,7 @@ def test_pending_missed_decisions_read_fault_is_named_and_not_cached(project, mo
 
     with monkeypatch.context() as m:
 
-        def boom(_project):
+        def boom(_project, _paths=None):
             raise PermissionError(13, "stubbed: permission denied")
 
         m.setattr(decisions, "pending_missed_decisions", boom)
@@ -1949,4 +1949,6 @@ def test_pending_missed_decisions_none_pending_is_an_answer(project):
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "done 2026-06-01"})
     missed = data.pending_missed_decisions(project.project)
-    assert missed == data.MissedDecisions([])
+    # `ledger` names what the (empty) listing was read from, for the answer's
+    # `listed_ledger` guard.
+    assert missed == data.MissedDecisions([], ledger=project.deferred_work)

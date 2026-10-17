@@ -7079,7 +7079,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     project = _project(args)
     try:
         paths = bmadconfig.load_paths(project)
-        pending = decisions.pending_missed_decisions(project)
+        pending = decisions.pending_missed_decisions(project, paths)
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -7143,7 +7143,9 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     for decision in pending:
         option = prompter.ask(decision)
         try:
-            result = decisions.apply_pre_answer(project, decision, option, date=today)
+            result = decisions.apply_pre_answer(
+                project, decision, option, date=today, listed_ledger=paths.deferred_work
+            )
         except (
             OSError,
             bmadconfig.BmadConfigError,
