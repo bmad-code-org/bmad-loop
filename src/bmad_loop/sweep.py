@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, NoReturn, Ty
 
 from . import deferredwork, gates, sprintstatus, ticketstore, verify
 from .adapters.generic import load_result_document
+from .bmadconfig import ProjectPaths
 from .engine import (
     Engine,
     RunPaused,
@@ -1504,6 +1505,17 @@ class SweepEngine(Engine):
         # distinct triage adapter arrives after that, so attach it here too or every
         # sweep triage session would emit no `session-idle`/`session-active` (#680).
         self.adapters["triage"].journal = self.journal
+        # A synthesizing adapter scans its own `paths` for a bundle's first-attempt
+        # plan (`_artifact_dirs`), and `make_adapters` loads them without the shared
+        # store, so under worktree isolation it would look in the unit checkout
+        # while the redirected mount writes the plan to the main checkout's store.
+        # Hand it the store too. A tickets run pins its plan from attempt 1 and
+        # never scans.
+        if self.paths.shared_store is not None:
+            for owned in self.adapters.values():
+                held = getattr(owned, "paths", None)
+                if isinstance(held, ProjectPaths) and held.shared_store is None:
+                    setattr(owned, "paths", replace(held, shared_store=self.paths.shared_store))
         self.prompting = prompting
         self.decisions_only = decisions_only
         self.max_bundles = resolve_sweep_override(max_bundles, self.policy.sweep.max_bundles)

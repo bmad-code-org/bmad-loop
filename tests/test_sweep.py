@@ -38244,6 +38244,39 @@ def test_v7_sweep_store_record_moves_with_a_renamed_project(project_v7_store_rep
     assert resumed.store_topology == live
 
 
+def test_v7_sweep_hands_the_shared_store_to_synthesizing_adapters(project_v7_store_repo, tmp_path):
+    """A bundle's first dev attempt has no recorded plan, so the synthesizing
+    adapter scans its own `paths` for it (`_artifact_dirs`). Under worktree
+    isolation with a shared store (T3 here) build-auto writes the plan to the main
+    checkout's store, so the scan must look there, not in the unit checkout.
+    ABLATION (performed): drop the adapter hand-off in `SweepEngine.__init__` and
+    the scan names `<worktree>/_bmad-output/...`."""
+    from bmad_loop.adapters.generic import _DevSynthesisMixin
+
+    paths = _v7_paths(project_v7_store_repo)
+    live = ticketstore.assess_store(paths, "none")
+    assert isinstance(live, ticketstore.StoreTopology) and live.store_repo is not None
+    engine, _ = make_sweep(paths, [], store_topology=live.to_dict())
+    dev = MockAdapter([])
+    dev.paths = paths  # what `make_adapters` loads: no shared store
+    triage = MockAdapter([])
+    SweepEngine(
+        paths=paths,
+        policy=engine.policy,
+        adapter=dev,
+        triage_adapter=triage,
+        run_dir=engine.run_dir,
+        journal=engine.journal,
+        state=engine.state,
+    )
+
+    assert dev.paths.shared_store == live.store_root
+    assert _DevSynthesisMixin._artifact_dirs(dev, tmp_path / "unit") == [  # type: ignore[arg-type]
+        paths.implementation_artifacts
+    ]
+    assert not hasattr(triage, "paths")
+
+
 def test_v7_bundle_review_accepts_built(project_v7):
     """A follow-up review of a `built` plan leaves it `built`. The review gate
     accepts that, and its reclose finds the plan at a success status: a review
