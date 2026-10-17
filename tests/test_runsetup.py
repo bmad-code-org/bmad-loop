@@ -29,7 +29,7 @@ import pytest
 from bmad_loop import bmadconfig
 from bmad_loop import journal as journal_mod
 from bmad_loop import policy as policy_mod
-from bmad_loop import runs, runsetup
+from bmad_loop import runs, runsetup, worksource
 from bmad_loop.adapters.profile import ProfileError
 from bmad_loop.journal import Journal, load_state, state_lock
 from bmad_loop.model import RunState
@@ -1194,7 +1194,7 @@ def test_composition_persists_the_code_root(tmp_path, run_type):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=_accepting_adapters,
@@ -1258,7 +1258,7 @@ def test_composition_records_the_run_dir_mint_identity(tmp_path, monkeypatch, ru
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=_accepting_adapters,
@@ -1309,7 +1309,7 @@ def test_story_compositions_wire_the_retro_adapter(tmp_path, monkeypatch, compos
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=make_adapters,
@@ -1337,6 +1337,222 @@ def test_story_compositions_wire_the_retro_adapter(tmp_path, monkeypatch, compos
 
     assert composed.engine.kwargs["retro_adapter"] is built["retro"]
     assert composed.engine.kwargs["adapter"] is built["dev"]
+
+
+class _SprintCapturingEngine(_CapturingEngine):
+    """`engine_cls` stand-in distinguishable from the stories one by type."""
+
+
+class _StoriesCapturingEngine(_CapturingEngine):
+    """`stories_engine_cls` stand-in distinguishable from the sprint one by type."""
+
+
+class _TicketsCapturingEngine(_CapturingEngine):
+    """`tickets_engine_cls` stand-in distinguishable from the other two by type."""
+
+
+# The kwargs both story composers hand either engine class; the stories class
+# additionally receives `spec_folder`.
+_STORY_ENGINE_KWARGS = {
+    "paths",
+    "policy",
+    "adapter",
+    "review_adapter",
+    "retro_adapter",
+    "run_dir",
+    "journal",
+    "state",
+    "max_stories",
+    "epic_filter",
+    "story_filter",
+    "sweep_factory",
+    "plugin_grants",
+}
+
+
+def _compose_run_for_source(project, *, source, spec_folder):
+    """The one `compose_run` call the per-source pin makes — kept in a single
+    helper so a signature change to `compose_run` is a one-line edit."""
+    return runsetup.compose_run(
+        project=project,
+        paths=_fake_paths(project),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=source,
+        spec_folder=spec_folder,
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_SprintCapturingEngine,
+        stories_engine_cls=_StoriesCapturingEngine,
+        tickets_engine_cls=_TicketsCapturingEngine,
+        trusted_config_digest="deadbeef",
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "pinned"),
+    [("tickets", True), ("sprint-status", False), ("stories", False)],
+)
+def test_build_run_state_pins_initiative_for_tickets_only(tmp_path, source, pinned):
+    """A tickets run records the active initiative and its folder, which its tree
+    reads compare against the live config; every other source records them
+    empty, so a v6 state is unchanged. Ablation (performed): stamp the pins for
+    every source and the sprint and stories rows FAIL; drop the stamp and the
+    tickets row FAILS."""
+    state = runsetup.build_run_state(
+        run_id=RUN_ID,
+        project=tmp_path,
+        repo_root=tmp_path,
+        policy=policy_mod.loads(""),
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=source,
+        spec_folder="",
+        trusted_config_digest="deadbeef",
+        run_dir_identity=None,
+        initiative="shop",
+        initiative_folder=str(tmp_path / "_bmad-output" / "shop"),
+    )
+
+    expected = ("shop", str(tmp_path / "_bmad-output" / "shop")) if pinned else ("", "")
+    assert (state.initiative, state.initiative_folder) == expected
+
+
+def _build_run_state_for_source(project, *, source, spec_folder):
+    """The one `build_run_state` call the per-source pin makes (see above)."""
+    return runsetup.build_run_state(
+        run_id=RUN_ID,
+        project=project,
+        repo_root=project,
+        policy=policy_mod.loads(""),
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=source,
+        spec_folder=spec_folder,
+        trusted_config_digest="deadbeef",
+        run_dir_identity=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "engine_type", "extra_kwargs", "persisted_folder"),
+    [
+        ("sprint-status", _SprintCapturingEngine, set(), ""),
+        ("stories", _StoriesCapturingEngine, {"spec_folder"}, "epic-1"),
+        ("tickets", _TicketsCapturingEngine, set(), ""),
+    ],
+    ids=["sprint", "stories", "tickets"],
+)
+def test_compose_run_engine_class_per_source(
+    tmp_path, source, engine_type, extra_kwargs, persisted_folder
+):
+    """Characterization pin for the WorkSource refactor: `compose_run` builds
+    `engine_cls` for a sprint launch, `stories_engine_cls` (plus `spec_folder`)
+    for a stories launch and `tickets_engine_cls` for a tickets launch, stamping `source` / `spec_folder` on the state — in
+    memory, on disk, and on the `run-start` journal row. `build_run_state` drops a
+    spec folder handed to a sprint launch (persists "")."""
+    composed = _compose_run_for_source(tmp_path, source=source, spec_folder="epic-1")
+
+    assert type(composed.engine) is engine_type
+    assert set(composed.engine.kwargs) == _STORY_ENGINE_KWARGS | extra_kwargs
+    if source == "stories":
+        assert composed.engine.kwargs["spec_folder"] == "epic-1"
+    assert composed.engine.kwargs["state"] is composed.state
+    assert (composed.state.source, composed.state.spec_folder) == (source, persisted_folder)
+    persisted = load_state(composed.run_dir)
+    assert (persisted.source, persisted.spec_folder) == (source, persisted_folder)
+    (start,) = [e for e in composed.journal.entries() if e["kind"] == "run-start"]
+    assert start["source"] == source
+
+    state = _build_run_state_for_source(tmp_path, source=source, spec_folder="epic-1")
+    assert (state.source, state.spec_folder) == (source, persisted_folder)
+
+
+def test_compose_run_tickets_builds_tickets_engine(project_v7):
+    """A tickets launch with no injected class builds the real `TicketsEngine`
+    on the v7 sandbox, pinned to the active initiative — and a resume of that
+    run selects the same class from the persisted source. Ablation (performed):
+    drop the tickets arm of `_engine_cls_for` and the sprint `Engine` is built —
+    this FAILS; flip `TRAITS["tickets"].runnable` back and both launches refuse."""
+    from bmad_loop.adapters.mock import MockAdapter
+    from bmad_loop.engine import Engine
+    from bmad_loop.stories_engine import StoriesEngine
+    from bmad_loop.tickets_engine import TicketsEngine
+
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    composed = runsetup.compose_run(
+        project=project_v7.project,
+        paths=paths,
+        policy=policy_mod.loads('[stories]\nsource = "tickets"\n'),
+        run_id=RUN_ID,
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source="tickets",
+        spec_folder="",
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=lambda *_a, **_k: {role: MockAdapter([]) for role in runsetup.ROLES},
+        engine_cls=Engine,
+        stories_engine_cls=StoriesEngine,
+        trusted_config_digest="deadbeef",
+    )
+
+    assert type(composed.engine) is TicketsEngine
+    persisted = load_state(composed.run_dir)
+    assert (persisted.source, persisted.initiative) == ("tickets", project_v7.initiative)
+    assert persisted.initiative_folder == str(paths.initiative_folder)
+    assert runsetup._engine_cls_for(
+        persisted.source, "", engine_cls=Engine, stories_engine_cls=StoriesEngine
+    ) == (TicketsEngine, {})
+
+
+@pytest.mark.parametrize(("source", "error"), [("bogus", worksource.UnknownSource)])
+def test_compose_resume_refuses_a_source_it_cannot_drive(tmp_path, monkeypatch, source, error):
+    """`compose_resume` refuses a persisted story run whose source this version
+    cannot drive — unknown to the registry (a newer bmad-loop wrote it), or
+    registered but not runnable yet — before any side effect: no session kill,
+    no adapters, no journal row. It used to rebuild an unknown source as a sprint
+    run.
+
+    Ablation (performed): restoring the sprint fallback in `_engine_cls_for` turns
+    the `bogus` row red; moving the engine selection back below the session kills
+    and the adapter build turns both rows red (the build is reached)."""
+    run_dir = tmp_path / runs.RUNS_DIR / RUN_ID
+    run_dir.mkdir(parents=True)
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", killed.append)
+    monkeypatch.setattr(runs, "kill_displaced_session", lambda _project, _run_id: [])
+    journal = Journal(run_dir)
+    state = RunState(
+        run_id=RUN_ID,
+        project=str(tmp_path),
+        started_at="now",
+        source=source,
+        spec_folder="epic-1",
+    )
+
+    with pytest.raises(error, match=repr(source)):
+        runsetup.compose_resume(
+            project=tmp_path,
+            paths=_fake_paths(tmp_path),
+            run_dir=run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=journal,
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_NeverBuilt,
+            engine_cls=_NeverBuilt,
+            stories_engine_cls=_NeverBuilt,
+            sweep_engine_cls=_NeverBuilt,
+        )
+
+    assert killed == []
+    assert journal.entries() == []
 
 
 @pytest.mark.parametrize("run_type", ["run", "sweep"])
@@ -1376,7 +1592,7 @@ def test_initial_state_and_pid_are_one_locked_publication(tmp_path, monkeypatch,
                     epic_filter=None,
                     story_filter=None,
                     max_stories=None,
-                    stories_on=False,
+                    source="sprint-status",
                     spec_folder="",
                     sweep_factory=lambda _trigger, *, started: None,
                     make_adapters=_accepting_adapters,
@@ -1484,7 +1700,7 @@ def test_compose_run_unwinds_the_run_when_the_adapters_abort(unwinding):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
@@ -1641,7 +1857,7 @@ def test_compose_run_unwinds_a_claim_abandoned_before_save_state(unwinding, monk
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
@@ -1754,7 +1970,7 @@ def test_compose_run_refuses_a_run_id_that_already_exists(unwinding):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             make_adapters=unwinding.make_adapters,
@@ -1978,7 +2194,7 @@ def _compose(composer: str, tmp_path: Path, monkeypatch, **extra):
             epic_filter=None,
             story_filter=None,
             max_stories=None,
-            stories_on=False,
+            source="sprint-status",
             spec_folder="",
             sweep_factory=lambda _trigger, *, started: None,
             engine_cls=_CapturingEngine,
@@ -2038,3 +2254,91 @@ def test_compose_defaults_to_no_grants_and_never_reads_the_store(tmp_path, monke
     composed = _compose(composer, tmp_path, monkeypatch)
     grants = composed.engine.kwargs["plugin_grants"]
     assert grants.records == () and grants.fault is None and grants.snapshot_root is None
+
+
+# ------------------------------------------------- v7: the sweep's initiative pin
+
+
+def test_sweep_resume_refuses_initiative_change(project_v7, monkeypatch):
+    """A v7 sweep pins the initiative whose ledger it works. Resumed after the
+    operator switched `[core] active_initiative`, it would apply its triage and
+    bundles to another ledger whose DW ids name other entries, so the resume is
+    refused with the fix (switch back, or start a new sweep) before it touches
+    any session. The unchanged initiative resumes.
+
+    ABLATION (performed): drop the `sweep_initiative_conflict` raise in
+    `compose_resume` and the switched resume composes an engine (and kills the
+    run's session first)."""
+    from conftest import V7_USER_CONFIG_REL
+
+    project = project_v7.project
+    paths = bmadconfig.load_paths(project)
+    composed = runsetup.compose_sweep(
+        project=project,
+        paths=paths,
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="cli",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+    )
+    state = load_state(composed.run_dir)
+    assert state.initiative == project_v7.initiative
+    assert state.initiative_folder == str(paths.initiative_folder)
+    assert state.store_topology["layout"] == "T1"
+    assert runsetup.sweep_initiative_conflict(state, paths) is None
+
+    (project_v7.output_folder / "other").mkdir()
+    (project / V7_USER_CONFIG_REL).write_text(
+        '[core]\nactive_initiative = "other"\n', encoding="utf-8"
+    )
+    switched = bmadconfig.load_paths(project)
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", killed.append)
+
+    def resume(live_paths):
+        return runsetup.compose_resume(
+            project=project,
+            paths=live_paths,
+            run_dir=composed.run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(composed.run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    with pytest.raises(runsetup.SweepPinError) as refused:
+        resume(switched)
+    message = str(refused.value)
+    assert f"started on initiative {project_v7.initiative!r}" in message
+    assert "now 'other'" in message
+    assert f"set `[core] active_initiative` back to {project_v7.initiative!r}" in message
+    assert "start a new sweep" in message
+    assert killed == []
+
+    assert resume(paths).engine.kwargs["state"] is state
+
+
+def test_sweep_initiative_conflict_ignores_story_runs_and_v6():
+    """Only a sweep is judged here (a tickets run checks its pin on every tree
+    read), and a v6 sweep pins nothing."""
+    v6 = _fake_paths(Path("/p"))
+    sweep = RunState(run_id=RUN_ID, project="/p", started_at="now", run_type="sweep")
+    assert runsetup.sweep_initiative_conflict(sweep, v6) is None
+    story = RunState(run_id=RUN_ID, project="/p", started_at="now", initiative="a")
+    assert runsetup.sweep_initiative_conflict(story, v6) is None
+    pinned = dataclasses.replace(sweep, initiative="a")
+    assert "unset `[core] active_initiative`" not in (
+        runsetup.sweep_initiative_conflict(pinned, v6) or ""
+    )
+    assert "now unset" in (runsetup.sweep_initiative_conflict(pinned, v6) or "")

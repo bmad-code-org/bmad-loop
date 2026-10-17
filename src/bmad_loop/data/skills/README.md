@@ -16,6 +16,7 @@ the table below).
 | `bmad-loop-resolve` | — (bmad-loop-native) | interactive CRITICAL-escalation resolution: a human disambiguates a frozen spec so a paused story can be re-driven (`/bmad-loop-resolve <story>`) |
 | `bmad-loop-sweep`   | — (bmad-loop-native) | read-only deferred-work ledger triage; owns the canonical `deferred-work-format.md`                                                               |
 | `bmad-loop-setup`   | — (scaffolded)       | **installs the orchestrator tool from Git**, runs `bmad-loop init` + `validate`, refreshes `_bmad/bmad-loop/module-help.csv`                      |
+| `bmod-bmad-loop`    | — (module record)    | the BMAD v7 module record (`bmod.toml`, `help/help.md`) that `bmad setup` discovers; metadata only, never invoked                                 |
 
 The **inner dev primitive is the upstream `bmad-build-auto` skill** (BMAD-METHOD's
 generic unattended dev session; `bmad-dev-auto` on pre-rename releases, resolved
@@ -43,6 +44,9 @@ claude "/bmad-loop-setup accept all defaults"            # installs the tool + w
 (claude) and/or `.agents/skills/` (codex/gemini), registers hooks, writes
 `.bmad-loop/policy.toml`, and gitignores the runs dir. Existing skill dirs are
 left untouched (`--force-skills` to overwrite, `--no-skills` to skip).
+On BMAD v7, `npx skills add bmad-code-org/bmad-loop` followed by `bmad setup` installs
+the same skills as a module: `bmod-bmad-loop/bmod.toml` is the module record, and each
+`bmad-loop-*` skill's `[skill]` `bmod.toml` names it.
 `bmad-loop-setup` is one-shot for the bootstrap the BMAD installer cannot do: it
 ensures the orchestrator tool is installed, then runs `bmad-loop init` and
 `bmad-loop validate` (preflight). Module registration — `_bmad/bmad-loop/`, the
@@ -55,8 +59,10 @@ The skills must be installed **together**: `bmad-loop-sweep` owns the canonical
 primitive must also be present (since BMAD-METHOD 6.10.1-next.33 it records
 deferred findings in its spec's frontmatter for the orchestrator to harvest into
 the ledger; pre-rename copies append flat entries the sweep normalizes instead).
-Requires the BMad Method (bmm) module (`_bmad/bmm/config.yaml`) and a `sprint-status.yaml` from
-`bmad-sprint-planning`.
+On BMAD v6 this requires the BMad Method (bmm) module (`_bmad/bmm/config.yaml`), and sprint
+mode needs a `sprint-status.yaml` from `bmad-sprint-planning`. On BMAD v7 it requires the
+`bmad` and `bmad-build-auto` skills from the method module (6.13.0 or newer), and tickets
+mode needs a `bmad-ticket` ticket tree.
 
 `_bmad/custom/<skill-name>.toml` customization overrides are keyed by skill
 directory name.
@@ -85,6 +91,9 @@ directory name.
     `devcontract` when synthesizing the dev result from the spec).
   - sweep triage / migrate → `"deferred-sweep-triage"` / `"deferred-sweep-migrate"`
     (checked in `sweep.py`).
+- The `[bmod] version` in `bmod-bmad-loop/bmod.toml` is stamped by
+  `scripts/sync_version.py` like every other version field; never edit it by hand. The
+  `required_skills` minimums are upstream versions and are edited by hand.
 - An `Environment fault: <text>` line in a session's last `## Auto Run Result`
   becomes `env_fault_claim` in the synthesized dev result (DW-523). It is a claim
   contract, not a verdict: it only triggers the orchestrator's own

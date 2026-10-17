@@ -12,8 +12,10 @@ module_greeting: >
   (preflight). The skills
   are invoked by the orchestrator and must stay installed together — the
   bmad-loop-sweep skill normalizes and migrates the deferred-work ledger per its
-  own deferred-work-format.md. They require the BMad Method (bmm) module:
-  _bmad/bmm/config.yaml and a sprint-status.yaml from bmad-sprint-planning. Run
-  `bmad-loop run` to start, `bmad-loop tui` for the dashboard. To upgrade later,
+  own deferred-work-format.md. They require the upstream bmad-build-auto skill.
+  On BMAD v6 that comes with the BMad Method (bmm) module (_bmad/bmm/config.yaml),
+  and sprint mode needs a sprint-status.yaml from bmad-sprint-planning; on BMAD v7
+  it comes with the method module, and tickets mode needs a bmad-ticket ticket
+  tree. Run `bmad-loop run` to start, `bmad-loop tui` for the dashboard. To upgrade later,
   just re-run `/bmad-loop-setup` (or `/bmad-loop-setup upgrade`) — it upgrades the
   orchestrator tool and refreshes the per-project skills for you.

@@ -42,10 +42,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from . import policy, runs
+from .worksource import SOURCE_TICKETS, QueueMode
 
 if TYPE_CHECKING:
     from .checks import ValidationReport
-    from .model import RunState
+    from .model import RunState, StoryTask
     from .operatoractions import ParkedStory
     from .runs import RunInfo
     from .sweep import Decision
@@ -55,9 +56,25 @@ VALIDATE_SCHEMA_VERSION = 1
 
 
 def validate_document(
-    report: ValidationReport, stories_on: bool, spec_folder: str
+    report: ValidationReport,
+    mode: QueueMode,
+    spec_folder: str,
+    *,
+    initiative: str = "",
+    era: str = "",
+    ticket_store: dict[str, str | None] | None = None,
 ) -> dict[str, object]:
     """The `validate --json` document: the verdict plus every check that produced it.
+
+    ``mode`` is the source's ``validate_mode`` trait (``worksource``) — an open
+    enum (``sprint``, ``stories``, ``tickets`` today) that a new source extends
+    additively, without a schema bump: an existing value never changes meaning.
+    ``initiative`` is the BMAD v7 active initiative a tickets run would drive
+    ("" in the other modes, as ``spec_folder`` is outside stories mode); ``era``
+    is the BMAD config shape the project resolved as (``v6``/``v7``, "" when the
+    config failed to load). ``ticket_store`` is the classified ticket-store topology
+    (``ticketstore.StoreTopology.to_dict``) in tickets mode, null when the store was
+    not classified (refused, no initiative) and outside tickets mode.
 
     Obeys the pure-document contract in machine.py (additive-only evolution;
     anything breaking bumps VALIDATE_SCHEMA_VERSION). ``ok`` is true when no
@@ -98,10 +115,13 @@ def validate_document(
     return {
         "schema_version": VALIDATE_SCHEMA_VERSION,
         "ok": report.passed,
-        "mode": "stories" if stories_on else "sprint",
+        "mode": mode,
         # "" rather than null in sprint mode, where a spec folder is inapplicable —
         # the same convention as list_document's paused_stage.
-        "spec_folder": spec_folder if stories_on else "",
+        "spec_folder": spec_folder if mode == "stories" else "",
+        "initiative": initiative if mode == "tickets" else "",
+        "era": era,
+        "ticket_store": dict(ticket_store) if ticket_store and mode == "tickets" else None,
         "counts": report.counts(),
         "findings": [
             {
@@ -235,6 +255,48 @@ def run_token_totals(state: RunState) -> tuple[int, int, float]:
     return raw, weighted, weight
 
 
+def _ticket_projection(task: StoryTask) -> dict[str, object] | None:
+    """A task's ``ticket`` object in the status document: the ticket-tree identity
+    the unit was dispatched for (its persisted :class:`~bmad_loop.model.TicketBinding`)
+    and the shared-store writes still owed after its code landed. None for a task
+    with no binding — every sprint, stories and sweep unit."""
+    binding = task.ticket
+    if binding is None:
+        return None
+    return {
+        "ref": binding.ref,
+        "id": binding.id,
+        "epic_slug": binding.epic_slug,
+        "epic_id": binding.epic_id,
+        "title": binding.title,
+        # the absolute plan path `find` named at the pick, verbatim
+        "plan": binding.plan,
+        "done_pending": task.ticket_done_pending,
+        # the owed park's `blocked_reason`, or null when no park is owed
+        "park_pending": task.ticket_park_pending or None,
+        # `mark_done = "never"` in a store repository: only the plan's commit is owed
+        "commit_pending": task.ticket_commit_pending,
+    }
+
+
+def _tickets_projection(state: RunState) -> dict[str, object] | None:
+    """The run-level ``tickets`` object: the initiative the run is pinned to, its
+    ``--epic`` selector, the classified ticket store and the epic closures it
+    recorded. None unless the run's source is ``tickets``."""
+    if state.source != SOURCE_TICKETS:
+        return None
+    return {
+        "initiative": state.initiative,
+        "initiative_folder": state.initiative_folder,
+        # the `--epic` selector as an epic slug, or null for every epic
+        "epic_filter": state.ticket_epic_filter or None,
+        # `ticketstore.StoreTopology.to_dict`, or null when none was recorded
+        "store_topology": dict(state.store_topology) if state.store_topology else None,
+        "epic_closures": dict(state.ticket_epic_closures),
+        "epic_closures_acked": list(state.ticket_epic_closure_acked),
+    }
+
+
 def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> dict[str, object]:
     """The `status --json` document: the stable machine-readable contract.
 
@@ -264,6 +326,14 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
       sessions, ``{role: {"name", "model"}}``. ``{}`` for a task whose sessions
       predate stamping (``adapter == ""``). Configured need not equal used — a
       policy edited mid-run, or a role that never ran, diverge.
+
+    Tickets mode adds two keys, additive with no schema bump: per task
+    ``ticket`` (:func:`_ticket_projection`, null for a task with no ticket) and
+    run-level ``tickets`` (:func:`_tickets_projection`, null unless ``source`` is
+    ``tickets``). Both are always present. ``epic`` stays an int: a tickets unit's
+    is 0, as a stories or sweep unit's is, and its epic is named by
+    ``ticket.epic_slug``. A plan's live ``status`` is not projected — it is not
+    in state.json; the text board reads it from the tree.
     """
     raw_total, weighted_total, weight = run_token_totals(state)
     adapter_policy = policy.adapter_policy_from_snapshot(state.policy_snapshot)
@@ -309,6 +379,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
                 # against git here (retention may since have pruned it).
                 "preserve_ref": task.preserve_ref,
                 "adapters_used": adapters_used,
+                "ticket": _ticket_projection(task),
             }
         )
     return {
@@ -338,6 +409,7 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
         # between "swept fine" and "old state.json". Additive per machine.py, so
         # STATUS_SCHEMA_VERSION does not move.
         "sweeps_refused": dict(state.sweeps_refused),
+        "tickets": _tickets_projection(state),
         "tasks": tasks,
     }
 
@@ -400,6 +472,7 @@ def cleanup_document(
     legacy_kill_commands: dict[str, str | None] | None = None,
     sessions_scan_error: str | None = None,
     superseded_ctl_unverified: list[str] | None = None,
+    superseded_ctl_sessions: list[str] | None = None,
 ) -> dict[str, object]:
     """The `cleanup --json` document: the multiplexer artifacts this invocation
     removed, or — under ``--dry-run`` — would remove.
@@ -460,15 +533,20 @@ def cleanup_document(
     `legacy_unverified` means "not looked at", not "nothing left". Additive, no
     schema bump; the text mode prints each line on stderr.
 
-    `sessions.legacy_kill_commands` maps each pre-upgrade control session in
-    this project's own registry (#733) — also named in `legacy_leftovers` — to
-    the paste-ready command that ends it, or to ``null`` when the backend is
+    `sessions.superseded_ctl_sessions` names each pre-upgrade control session
+    an earlier release minted for this project in its own registry (#733),
+    as listed. That registry is no legacy one, so these are never in
+    `legacy_leftovers` (#917). Additive, no schema bump; the text mode names
+    each on stderr.
+
+    `sessions.legacy_kill_commands` maps each session in
+    `superseded_ctl_sessions` to the paste-ready command that ends it, or to ``null`` when the backend is
     not psmux and no command can be spelled for it. No bmad-loop command
     addresses such a session, so this is the only way out; run it once every
     window in it has parked. A session a run may own (a run dir exists for the
     id its name spells, or the session carries a session-level project tag,
-    #915) gets no command and is left out, though `legacy_leftovers` still
-    names it; a check that could not be made withholds it too. Additive, no
+    #915) gets no command and is left out, though `superseded_ctl_sessions`
+    still names it; a check that could not be made withholds it too. Additive, no
     schema bump; the text mode prints each on stderr.
 
     `sessions.superseded_ctl_unverified` is one line per check on this
@@ -500,6 +578,7 @@ def cleanup_document(
         "legacy_leftovers": list(legacy_leftovers or []),
         "legacy_unverified": list(legacy_unverified or []),
         "legacy_kill_commands": dict(legacy_kill_commands or {}),
+        "superseded_ctl_sessions": list(superseded_ctl_sessions or []),
         "superseded_ctl_unverified": list(superseded_ctl_unverified or []),
     }
     if sessions_scan_error is not None:

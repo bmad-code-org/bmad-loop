@@ -128,6 +128,11 @@ _JOURNAL_ALIAS_FIELDS = {
     "log_task": "story",
     "task_id": "story",
     "bundle": "bundle",
+    # A tickets-mode epic slug (`epic-<name>`, the epic folder's name) on the
+    # `retro-auto-*` rows and the epic-closure rows, beside `epic` 0. The slug is
+    # the customer's epic name, so it is aliased in its own namespace: one epic,
+    # one alias across the retro and its closure.
+    "epic_ref": "epic",
     "branch": "branch",
     "target_branch": "branch",
     # The branch the main checkout had instead of the target, when a merge paused
@@ -286,6 +291,16 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     },
     "resume-unit-merge": {"target": "branch", "operation_id": "operation", "source": "commit"},
     "sentinel-cleared": {"sentinel": "spec"},
+    # A BMAD v7 ticket key (`story-acme-vault-rotation`, `1.3`): the plan's title
+    # slug, identifier-shaped, so `scrub_json` would ship it verbatim. Kind-scoped
+    # because `ref` elsewhere names a git ref (`attempt-worktree-preserved`).
+    "ticket-mark": {"ref": "ticket"},
+    "ticket-foreign-active": {"ref": "ticket"},
+    "ticket-skipped": {"ref": "ticket"},
+    "ticket-hitl-pause": {"ref": "ticket"},
+    "ticket-refine-pause": {"ref": "ticket"},
+    "ticket-pick-halt": {"ref": "ticket"},
+    "ticket-story-approved": {"ref": "ticket"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
@@ -406,8 +421,9 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # drop per kind at the routing seam — both need updating by hand.
         "patch",
         # The absolute deferred-stash target embeds the run directory, story key,
-        # and spec filename. Drop rather than create a second spec correlation;
-        # the fallback redacts it only by virtue of its current separators.
+        # and spec filename (also the run-dir copy `restore-patch-evacuated` moves a
+        # ticket plan's intent-gap patch to). Drop rather than create a second spec
+        # correlation; the fallback redacts it only by virtue of its current separators.
         "stashed_to",
         # A non-completed sweep triage/migration session's post-mortem (#752):
         # a nested mapping carrying the session task id, validation errors that
@@ -421,6 +437,11 @@ _JOURNAL_DROP_FIELDS = frozenset(
         # correlation beyond the record's story key, so every kind gets the same
         # presence-only treatment.
         "path",
+        # A BMAD v7 ticket plan's absolute path (`ticket-mark`,
+        # `ticket-plan-restored`): a host path embedding the initiative and epic
+        # folders and the ticket's title slug. Presence-only for `path`'s reason;
+        # `ticket-mark` correlates through its `ref`.
+        "plan",
         # The kept worktree's path BEFORE the DW-525 replay moved it into the replay
         # run (`unit-replay-start`, `unit-replay-handoff`): a host path embedding the
         # finished run dir and the story slug, presence-only for `path`'s reason —

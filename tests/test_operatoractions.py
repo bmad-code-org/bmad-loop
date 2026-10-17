@@ -1067,3 +1067,44 @@ def test_record_park_pinned_intact_mount_writes(tmp_path):
     path = _park_into(mount, root_identity=os.lstat(mount))
 
     assert json.loads(path.read_text(encoding="utf-8"))["story_key"] == "1-1-a"
+
+
+def _ticket_park(status: str | None, *, reason: str = "awaiting operator: buy a domain", **kw):
+    """A tickets-run park joined to its plan (no board: tickets mode reads none)."""
+    from pathlib import Path
+
+    fields = dict(
+        story_key="1.1",
+        actions=("buy a domain",),
+        spec_path=Path("plan.md"),
+        spec_status=status,
+        board_status=None,
+        confirmation_recorded=False,
+        commit="",
+        run_id="run-1",
+        parked_at="2026-10-15",
+        source="tickets",
+        ref="1.1",
+        blocked_reason=reason,
+    )
+    fields.update(kw)
+    return operatoractions.ParkedStory(**fields)
+
+
+def test_a_ticket_park_is_judged_by_its_plan_alone():
+    """A ticket park has no board: it is confirmable while its plan reads as an
+    operator park (`blocked` with an `awaiting operator: ` reason), resumable once
+    a recorded confirmation left the plan `done` or `built`, and drift otherwise.
+    Ablation (performed): drop the `ticket` branch from `confirmable` and the park
+    reads "not on the sprint board" — this FAILS."""
+    parked = _ticket_park("blocked")
+    assert parked.confirmable and parked.drift() is None and not parked.resumable
+
+    assert not _ticket_park("blocked", reason="build halted: missing creds").confirmable
+    assert "not an operator park" in (_ticket_park("in-progress").drift() or "")
+    assert "names no ticket ref" in (_ticket_park("blocked", ref="").drift() or "")
+    for landed in ("done", "built"):
+        assert _ticket_park(landed, confirmation_recorded=True).resumable
+    assert not _ticket_park("done").resumable
+    # a v6 record keeps its board join
+    assert _ticket_park("blocked", source="").drift() == "its spec now says status: blocked"

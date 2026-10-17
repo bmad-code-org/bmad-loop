@@ -90,7 +90,7 @@ from .platform_util import (
 )
 from .plugins import GrantSet, HookBus, HookContext, PluginRegistry, PluginTrustError, Refusal
 from .policy import Policy
-from .recovery_flow import RecoveryFlow
+from .recovery_flow import OwnedPlanWriter, RecoveryFlow
 from .runs import (
     StateRootError,
     clear_graceful_stop,
@@ -110,22 +110,18 @@ from .runs import (
     set_owner_run_dir,
     task_spec_path,
 )
+from .sprint_source import SprintWorkSource
 from .sprintstatus import (
-    ACTIONABLE_STATUSES,
     STATUS_ORDER,
     SprintStatusError,
     SprintStatusWriteRefused,
 )
 from .sprintstatus import advance as sprint_advance
 from .sprintstatus import advanced_bytes as sprint_advanced_bytes
-from .sprintstatus import load as load_sprint_status
-from .sprintstatus import (
-    next_actionable,
-    parse_selector,
-)
 from .sprintstatus import status_in_bytes as sprint_status_in_bytes
 from .sprintstatus import story_status as sprint_story_status
 from .statemachine import advance
+from .worksource import Halt, SourceUnreadable, WorkRef, WorkSource, resumed_traits_for
 from .workspace import UnitWorkspace, Workspace, discard_worktree, open_unit_workspace
 from .worktree_flow import WorktreeFlow
 
@@ -291,6 +287,23 @@ class RunPaused(Exception):
         self.reason = reason
         self.stage = stage
         self.story_key = story_key
+
+
+SpecWriteReason = Literal["salvage", "reconcile", "adoption", "repair"]
+"""Why an engine site writes a spec's frontmatter ``status`` — the token
+:meth:`Engine._spec_status_write` receives, one per writer site."""
+
+
+class SpecStatusWriteRefused(RuntimeError):
+    """:meth:`Engine._spec_status_write` refused a write the run's mode does not
+    allow: nothing was written. A ``RuntimeError``, so a repair-write site that
+    does not catch it fails as loudly as a write that raised."""
+
+    def __init__(self, reason: SpecWriteReason, target: str, why: str):
+        super().__init__(f"{reason} write to status {target!r} refused: {why}")
+        self.reason = reason
+        self.target = target
+        self.why = why
 
 
 class RunStopped(Exception):
@@ -527,8 +540,10 @@ RETRO_VERDICT_REJECTED = "rejected"
 RETRO_VERDICT_UNKNOWN = "unknown"
 
 
-def _retro_auto_prompt(epic: int) -> str:
-    return RETRO_AUTO_PROMPT.format(epic=epic)
+def _retro_auto_prompt(target: str) -> str:
+    """The auto-retro session prompt for ``target``, the source's
+    ``retro_target(epic)`` (the sprint source's is ``str(epic)``)."""
+    return RETRO_AUTO_PROMPT.format(epic=target)
 
 
 def _session_task_id(story_key: str, part: str, seq: int, generation: int) -> str:
@@ -912,9 +927,10 @@ class Engine:
         self.max_stories = max_stories
         self.epic_filter = epic_filter
         self.story_filter = story_filter
-        # widen --story interpretation: full key, short ref (3-1/3.1), bare
-        # number (+ --epic), or slug fragment. See sprintstatus.StorySelector.
-        self._selector = parse_selector(epic_filter, story_filter)
+        # the runtime work source this engine picks from (worksource.WorkSource).
+        # Built without I/O — SweepEngine inherits this __init__ — but it parses
+        # the --epic/--story selector here, so a bad --story still raises now.
+        self.source: WorkSource = self._make_work_source()
         # spawns a child deferred-work sweep run (injected by the CLI to
         # avoid an engine -> sweep import cycle); see _maybe_auto_sweep
         self.sweep_factory = sweep_factory
@@ -1015,9 +1031,12 @@ class Engine:
             save=self._save,
             gate_unit=self._gate_unit,
             carry_isolated_ledger_writes=lambda task: self._carry_isolated_ledger_writes(task),
+            land_post_landing_writes=lambda task: self._land_post_landing_writes(task),
             escalation_pause=self._escalation_pause,
             workspace_get=lambda: self.workspace,
             workspace_set=lambda ws: setattr(self, "workspace", ws),
+            unit_branch_epic=lambda task: self._unit_branch_epic(task),
+            sprint_board=lambda: self._has_sprint_board(),
         )
         # Attempt rollback + recovery-ref preservation flow (issue #244 PR 2/2).
         # Same narrow-deps + engine-callbacks pattern as _worktree_flow: `emit` is
@@ -1027,7 +1046,9 @@ class Engine:
         # the engine's escalation; `escalation_pause` raises RunPaused for it
         # (injected so recovery_flow need not import engine — that would reintroduce
         # a runtime<->engine cycle); `dev_attempt_dispatched` is the preserve-ref
-        # provenance probe (#777).
+        # provenance probe (#777); `spec_confine_root` and `owned_plan` are the
+        # work source's say over where an attempt-owned spec may be restored, and
+        # who restores it (`_spec_confine_root`, `_owned_plan_writer`).
         self._recovery_flow = RecoveryFlow(
             paths=self.paths,
             policy=self.policy,
@@ -1040,6 +1061,8 @@ class Engine:
             escalate=self._escalate,
             escalation_pause=self._escalation_pause,
             dev_attempt_dispatched=self._dev_attempt_dispatched,
+            spec_confine_root=lambda task: self._spec_confine_root(task),
+            owned_plan=self._owned_plan_writer(),
         )
 
     def _escalation_pause(
@@ -1177,6 +1200,7 @@ class Engine:
                 self._ensure_target_branch()
                 self._prune_preserve_refs()
                 self._replay_unlatched_ledger_carries()
+                self._replay_post_landing_writes()
                 self._loop()
                 # A hard request that landed after `_loop`'s head check reaches none
                 # of the raise sites on an exhausted-queue return: sites A and B live
@@ -1563,14 +1587,9 @@ class Engine:
         backlog count, minus anything already in ``state.tasks``). It is a hint,
         never a contract — the whole body is guarded so an unreadable/invalid
         sprint-status file returns None rather than derailing a graceful stop.
-        StoriesEngine overrides this against the manifest scheduler."""
+        Stories mode counts against the manifest scheduler through its own source."""
         try:
-            ss = load_sprint_status(self.paths.sprint_status)
-            return sum(
-                1
-                for s in ss.stories
-                if s.status in ACTIONABLE_STATUSES and s.key not in self.state.tasks
-            )
+            return self.source.remaining_estimate(self._phases())
         except Exception:  # a hint must never break the stop
             return None
 
@@ -1723,6 +1742,10 @@ class Engine:
         ``sessions`` is written only after one returns, and ``rearmed`` covers a
         stories-mode wedge (``StoriesEngine._pause_wedged``) that reaches ESCALATED
         with no session at all. The arm's own unwinding is the stronger guarantee.
+
+        Which tokens gate which key is :meth:`_gate_hits`; tokens in a grammar the
+        queue no longer reads (:meth:`_legacy_gate_tokens`) pause every pick, since
+        no key can be shown free of them.
         """
         ledger = self.paths.deferred_work
         # OBSERVATION arm of the ledger-read contract (DW-146), kept inline rather
@@ -1755,69 +1778,98 @@ class Engine:
             )
             gates.notify(self.policy, self.run_dir, f"story gated: {story_key}", reason)
             raise RunPaused(reason, PAUSE_STORY_GATE, story_key) from e
-        blocking = [
-            (entry.id, hits)
-            for entry, hits in (
-                (
-                    entry,
-                    [
-                        token
-                        for token in deferredwork.gates(entry).tokens
-                        if deferredwork.gates_story(token, story_key)
-                    ],
-                )
-                # `done`, not `not open`: an entry whose status the format cannot
-                # read is not evidence the work landed, and reading it as closed
-                # would let a one-character typo disable the gate.
-                for entry in deferredwork.parse_ledger(text)
-                if not entry.done
-            )
-            if hits
-        ]
-        if not blocking:
+        blocking: list[tuple[str, list[str]]] = []
+        legacy: list[tuple[str, tuple[str, ...]]] = []
+        # `done`, not `not open`: an entry whose status the format cannot read is
+        # not evidence the work landed, and reading it as closed would let a
+        # one-character typo disable the gate.
+        for entry in deferredwork.parse_ledger(text):
+            if entry.done:
+                continue
+            hits = self._gate_hits(entry, story_key)
+            if hits:
+                blocking.append((entry.id, hits))
+            stale = self._legacy_gate_tokens(entry)
+            if stale:
+                legacy.append((entry.id, stale))
+        if not blocking and not legacy:
             return
-        named = ", ".join(f"{dw_id} (gate: {', '.join(hits)})" for dw_id, hits in blocking)
-        reason = (
-            f"{story_key} is gated by unlanded deferred work: {named} — close the "
-            f"entry in {ledger.name} (`status: done <date>`) or run `bmad-loop sweep`, "
-            f"then `bmad-loop resume {self.state.run_id}`"
-        )
-        self.journal.append(
-            "story-gated",
-            story_key=story_key,
-            dw_ids=[dw_id for dw_id, _ in blocking],
-        )
+        clauses: list[str] = []
+        if blocking:
+            named = ", ".join(f"{dw_id} (gate: {', '.join(hits)})" for dw_id, hits in blocking)
+            clauses.append(
+                f"{story_key} is gated by unlanded deferred work: {named} — close the "
+                f"entry in {ledger.name} (`status: done <date>`) or run `bmad-loop sweep`"
+            )
+        if legacy:
+            clauses.append(self._legacy_gate_clause(story_key, legacy, ledger.name))
+        reason = "; ".join(clauses) + f", then `bmad-loop resume {self.state.run_id}`"
+        dw_ids = [dw_id for dw_id, _ in blocking]
+        dw_ids += [dw_id for dw_id, _ in legacy if dw_id not in dw_ids]
+        self.journal.append("story-gated", story_key=story_key, dw_ids=dw_ids)
         gates.notify(self.policy, self.run_dir, f"story gated: {story_key}", reason)
         raise RunPaused(reason, PAUSE_STORY_GATE, story_key)
 
-    def _pick_next(self):
-        ss = load_sprint_status(self.paths.sprint_status)
-        if ss.unknown_keys:
-            self.journal.append("sprint-status-unknown-keys", keys=list(ss.unknown_keys))
-        base_skip = set(self.state.tasks)  # anything this run already touched
+    def _gate_hits(self, entry: deferredwork.DWEntry, story_key: str) -> list[str]:
+        """The ``gate:`` tokens of ``entry`` that gate ``story_key``, in entry order.
 
-        def _first(epic: int | None):
-            # local skip copy so selector-rejections in this pass don't leak into
-            # the next one (a story rejected here may still match the fallback).
-            skip = set(base_skip)
-            while True:
-                story = next_actionable(ss, skip, epic=epic)
-                if story is None:
-                    return None
-                if not self._selector.matches(story):
-                    skip.add(story.key)
-                    continue
-                return story
+        The predicate half of :meth:`_refuse_gated_story`, split out so a queue
+        with its own key grammar reads the same ledger the same way: the base
+        engine matches story keys (sprint and stories queues), and
+        ``TicketsEngine`` matches ticket refs."""
+        return [
+            token
+            for token in deferredwork.gates(entry).tokens
+            if deferredwork.gates_story(token, story_key)
+        ]
 
-        # Exhaust the current epic before advancing. Selection is otherwise
-        # strict file order, and epics need not be file-ordered by number (an
-        # epic can be appended out of place); without this, a still-open earlier-
-        # in-file epic would "steal" the pick and fire a spurious epic boundary.
-        if self.state.current_epic is not None:
-            story = _first(self.state.current_epic)
-            if story is not None:
-                return story
-        return _first(None)
+    def _legacy_gate_tokens(self, entry: deferredwork.DWEntry) -> tuple[str, ...]:
+        """``entry``'s ``gate:`` tokens written in a key grammar this queue no
+        longer reads, which pause every pick until rewritten. None for the base
+        engine: its queue reads the story grammar the tokens were written in."""
+        return ()
+
+    def _legacy_gate_clause(
+        self, story_key: str, legacy: list[tuple[str, tuple[str, ...]]], ledger_name: str
+    ) -> str:
+        """The pause-reason clause for :meth:`_legacy_gate_tokens` hits. Only an
+        engine that overrides that seam ever reaches it."""
+        named = ", ".join(f"{dw_id} (gate: {', '.join(tokens)})" for dw_id, tokens in legacy)
+        return f"{named} declare gate tokens {story_key}'s queue cannot read ({ledger_name})"
+
+    def _make_work_source(self) -> WorkSource:
+        """The work source this engine picks from. The base engine reads the
+        sprint board through the live ``self.paths`` (the main checkout)."""
+        return SprintWorkSource(lambda: self.paths, self.epic_filter, self.story_filter)
+
+    def _review_converged_statuses(self) -> frozenset[str]:
+        """The review result statuses that finalize a pass: the review loop
+        converges on them (verify, then commit) unless the pass recommends a
+        follow-up. Base: the v6 ``done``."""
+        return frozenset({devcontract.DONE})
+
+    def _has_sprint_board(self) -> bool:
+        """Whether this run keeps the v6 sprint board: the worktree seed carries
+        it into a unit. Base: the persisted source's ``SourceTraits.sprint_board``.
+        A sweep on a v7 project has none."""
+        return resumed_traits_for(self.state.source).sprint_board
+
+    def _phases(self) -> dict[str, Phase]:
+        """Every unit this run already touched, by key, with its phase."""
+        return {key: task.phase for key, task in self.state.tasks.items()}
+
+    def _pick_next(self) -> WorkRef | None:
+        pick = self.source.pick(self._phases(), self.state.current_epic)
+        if pick.unknown_keys:
+            self.journal.append("sprint-status-unknown-keys", keys=list(pick.unknown_keys))
+        if pick.halt is not None:
+            self._halt_pick(pick.halt)
+        return pick.ref
+
+    def _halt_pick(self, halt: Halt) -> NoReturn:
+        """Stop the run on a pick the source halted. The sprint source never
+        halts; an engine whose source does overrides this to pause."""
+        raise AssertionError(f"{self.source.name} source halted the pick: {halt!r}")
 
     # --------------------------------------- attempt rollback / recovery refs
 
@@ -1840,6 +1892,28 @@ class Engine:
         # so the next dispatch re-probes the restored tree (DW-523).
         self._env_probes_fresh_root = None
         self._recovery_flow.rollback_or_pause(task, cause=cause, restart=restart)
+        self._after_code_rollback(task)
+
+    def _after_code_rollback(self, task: StoryTask) -> None:
+        """The work source's follow-up once a rollback (or its clean no-op)
+        returned: ``TicketsEngine`` re-arms the unit's plan, which the reset keeps
+        when the attempt created it (the artifact folders are kept from the
+        untracked sweep). Base: nothing — the spec route is the recovery flow's
+        own."""
+        del task
+
+    def _spec_confine_root(self, task: StoryTask) -> Path:
+        """The root an attempt-owned spec write for ``task`` is confined to
+        (``RecoveryFlow``'s restore and normalization sites). Base: the active
+        workspace's project, where every v6 spec lives."""
+        del task
+        return self.workspace.paths.project
+
+    def _owned_plan_writer(self) -> OwnedPlanWriter | None:
+        """Who restores and re-routes an attempt-owned spec instead of the recovery
+        flow's own anchored writers: ``TicketsEngine``'s ticket chokepoint for a
+        bound plan. Base: None — the recovery flow writes v6 specs itself."""
+        return None
 
     def _accept_current_baseline(self, task: StoryTask) -> None:
         self._recovery_flow.accept_current_baseline(task)
@@ -2062,12 +2136,17 @@ class Engine:
             # the ordinary case of exactly that: nearly every generic story records
             # one and nothing else, so leaving it out here would strand the write
             # that keeps `_pick_next` from re-picking the finished story.
+            # A shared ticket store's latched mark (tickets mode) is such a write
+            # too: it is made only once the code has merged back.
             if not task.worktree_path or not (
                 task.harvested_deferrals
                 or task.bundle_closes_intended
                 or task.story_closes_intended
                 or task.board_advance_intended
                 or publication_pending
+                or task.ticket_done_pending
+                or task.ticket_park_pending
+                or task.ticket_commit_pending
             ):
                 continue
             merged = merged_key in merged_units
@@ -2185,6 +2264,7 @@ class Engine:
             self._carry_isolated_ledger_writes(task)
             task.isolated_ledger_carried = True
             self._save()
+            self._land_post_landing_writes(task)
             # The failed integration unwound before _run_story returned, so the
             # loop never reached its normal post-integration continuation.
             self._after_story(task)
@@ -3165,6 +3245,37 @@ class Engine:
         self._refresh_dispatched_spec_snapshot(task)
         task.dispatched_spec_absent = task.dispatched_spec_file is None and not task.spec_file
 
+    def _expected_spec_for(self, task: StoryTask, prompt: str, label: str | None) -> str | None:
+        """The spec a session's read-back is pinned to (``SessionSpec.expected_spec``,
+        #261), or None to let the adapter scan. Base: the recorded spec, only for a
+        primary generic-dev session whose prompt names it — see the pin's comment in
+        :meth:`_run_session`. ``TicketsEngine`` pins the bound plan from attempt 1."""
+        if (
+            label is None
+            and self._generic_dev()
+            and task.spec_file
+            and self._prompt_names_recorded_spec(task, prompt)
+        ):
+            return task.spec_file
+        return None
+
+    def _session_success_statuses(self, role: str, label: str | None) -> tuple[str, ...]:
+        """The frontmatter statuses that end a session successfully
+        (``SessionSpec.success_statuses``). Base: the v6 ``done``."""
+        del role, label
+        return (devcontract.DONE,)
+
+    def _session_fallback_dirs(self, role: str, label: str | None) -> tuple[Path, ...]:
+        """Extra directories the read-back probes for the skill's no-spec fallback
+        result (``SessionSpec.fallback_result_dirs``). Base: none."""
+        del role, label
+        return ()
+
+    def _dev_success_status(self) -> str:
+        """The status a dev session finalizes its spec to: ``done`` for a v6 spec.
+        Read by the generic reconcile and the follow-up-review routing."""
+        return devcontract.DONE
+
     @staticmethod
     def _prompt_names_recorded_spec(task: StoryTask, prompt: str) -> bool:
         """Whether the prompt contains an engine-authored explicit-spec token."""
@@ -3921,7 +4032,8 @@ class Engine:
             last_status = status  # remember the last completed pass for the defer reason
             followup = bool(rj.get("followup_review_recommended", False))
             task.followup_review_recommended = followup  # latest pass wins
-            refileable_followup = status == "done" and followup
+            converged = status in self._review_converged_statuses()
+            refileable_followup = converged and followup
             # Damping: a finalized round that still recommends its own follow-up is
             # honored only while the story has damping grants left. Once
             # followup_reviews_spent has reached limits.max_followup_reviews, such a
@@ -3952,7 +4064,7 @@ class Engine:
             # latched actions). Under the default "escalate" it is not taken: the
             # status falls through as non-terminal, exactly as before.
             demoted = status == verify.AWAITING_OPERATOR and self._review_demotion_parks()
-            if demoted or (status == "done" and (not followup or damped)):
+            if demoted or (converged and (not followup or damped)):
                 if demoted:
                     outcome = self._park_review_demotion(task, result)
                 else:
@@ -4087,7 +4199,7 @@ class Engine:
             # (callers grep it).
             if refileable_followup:
                 detail = "still recommending a follow-up pass"
-            elif last_status == "done":
+            elif last_status in self._review_converged_statuses():
                 detail = "last review pass finalized but its verification failed"
             elif last_status is not None:
                 # A pass completed but its status is non-terminal — or "" when the
@@ -4151,20 +4263,22 @@ class Engine:
         if fm is None:
             return False
         fm_status = verify.status_of(fm)
-        if fm_status not in ("done", "in-review"):
+        success_status = self._dev_success_status()
+        if fm_status not in (success_status, "in-review"):
             return False
         reset_from: str | None = None
         if fm_status == "in-review":
             # Repair-write doctrine: these raise on an unreadable spec rather
-            # than silently proceeding stale (see _reset_spec_for_repair).
+            # than silently proceeding stale (see _reset_spec_for_repair). A mode
+            # that refuses the reset leaves salvage inapplicable, before any write.
             reset_from = fm_status
             confine_root = self.workspace.paths.project
-            devcontract.reset_spec_status(
-                spec_path,
-                "done",
-                confine_root=confine_root,
-                root_identity=self._mount_root_identity(task, confine_root),
-            )
+            try:
+                self._spec_status_write(
+                    task, spec_path, success_status, "salvage", confine_root=confine_root
+                )
+            except SpecStatusWriteRefused:
+                return False
             devcontract.strip_auto_run_result(
                 spec_path,
                 confine_root=confine_root,
@@ -4535,6 +4649,9 @@ class Engine:
             return
         advance(task, Phase.COMMITTING)
         task.salvage_refile_pending = False
+        # Latched in the COMMITTING save itself, so no crash window between here
+        # and the mark after landing can lose it.
+        self._latch_post_landing_writes(task)
         self._save()
         self._finalize_commit_phase(task)
 
@@ -4582,12 +4699,16 @@ class Engine:
         # reopen no matter where in the window a raise lands.
         snapshot: list[_ArmedClose] = []
         park_record: tuple[Path, str | None] | None = None
+        plan_undo: object | None = None
         try:
             self._close_declared_deferred(task, snapshot)
             # A parked story's record rides this same commit (#356): written into
             # the workspace ahead of the `git add -A`, it reaches every clone the
             # story's commit does — including through the worktree merge-back.
             park_record = self._write_park_record(task)
+            # The work source's own terminal write to the unit's plan (tickets
+            # mode marks `done`) rides the commit the same way; base: none.
+            plan_undo = self._terminal_plan_write(task)
 
             # bmad-build-auto commits its own work each iteration; the orchestrator
             # squashes that chain plus its uncommitted bookkeeping back onto the
@@ -4643,7 +4764,8 @@ class Engine:
         except verify.GitError as e:
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
-            self._escalate(task, f"commit failed: {e}")
+            unrestored = self._undo_terminal_plan_write(task, plan_undo)
+            self._escalate(task, f"commit failed: {e}" + (f"; {unrestored}" if unrestored else ""))
         except BaseException:
             # A failed commit is not the only way out of this window: the signal
             # handler `_run` installed raises RunStopped from wherever the main
@@ -4654,6 +4776,9 @@ class Engine:
             # does not exist. Restore, then re-raise untouched.
             self._restore_deferred_closes(task, snapshot)
             self._restore_park_record(task, park_record)
+            # A failed put-back is journaled by the work source; the task stays
+            # COMMITTING, so a resume re-drives this window over the written plan.
+            self._undo_terminal_plan_write(task, plan_undo)
             raise
         if task.dw_ids and task.worktree_path:
             self._worktree_flow.prepare_publication(task, self.workspace.paths)
@@ -4679,6 +4804,76 @@ class Engine:
             self.journal.append("story-done", story_key=task.story_key, commit=task.commit_sha)
         self._emit("post_commit", task)
         self._save()
+        # In place the code is on the target now; under isolation it lands with
+        # the merge-back (`WorktreeFlow.integrate_unit`), which makes this call.
+        if not task.worktree_path:
+            self._land_post_landing_writes(task)
+
+    def _latch_post_landing_writes(self, task: StoryTask) -> None:
+        """Record on ``task``, before ``_commit``'s COMMITTING save, the work
+        source's writes owed once the unit's code has landed on the target (tickets
+        mode with a shared ticket store marks the plan then:
+        ``StoryTask.ticket_done_pending`` / ``ticket_park_pending``, or only commits
+        it: ``ticket_commit_pending``). Base: none."""
+        del task
+
+    def _land_post_landing_writes(self, task: StoryTask) -> None:
+        """Make the writes :meth:`_latch_post_landing_writes` latched, now that
+        ``task``'s code is on the target: after ``finalize_commit`` in place, after
+        the merge-back under isolation, or on resume. Clears the latch once made; a
+        write that fails raises ``RunPaused`` with the latch kept. Base: none."""
+        del task
+
+    def _landed_code_commit(self, task: StoryTask) -> str | None:
+        """The code commit a store commit's trailers name for ``task`` (a tickets
+        run's marked plan, a v7 sweep's bundle plan): the unit's own commit while
+        the target holds it (in place, or merged back by ``merge`` / ``ff``), else
+        the target's head — a ``squash`` merge-back lands a different commit and
+        the unit branch's teardown leaves the unit's unreachable. None when git
+        cannot read the head: the trailer is provenance, and the commit still
+        lands."""
+        sha = task.commit_sha
+        if not task.worktree_path or not sha:
+            return sha
+        repo = self.paths.repo_root
+        try:
+            head = verify.rev_parse_head(repo)
+        except verify.GitError:
+            return None
+        return sha if verify.is_ancestor(repo, sha, head) else head
+
+    def _replay_post_landing_writes(self) -> None:
+        """Make, on resume, every latched post-landing write whose code had
+        already landed when the host stopped. Called from ``run()`` after
+        :meth:`_replay_unlatched_ledger_carries` (which replays a terminal unit's
+        lost merge-back first) and before ``_loop`` picks. Base: none."""
+
+    def _unit_branch_epic(self, task: StoryTask) -> str | None:
+        """The epic segment of ``task``'s unit branch under worktree isolation
+        (``bmad-loop/<run>/<epic>/<unit>``). Base: None — the unit key alone
+        names the branch."""
+        del task
+        return None
+
+    def _terminal_plan_write(self, task: StoryTask) -> object | None:
+        """The work source's terminal write to ``task``'s plan, made inside the
+        commit window — after every gate, before ``finalize_commit``'s ``git add
+        -A`` — so it rides the unit's own commit and lands only with its code.
+        Returns the token :meth:`_undo_terminal_plan_write` takes, None when
+        nothing was written. Base: no write (the sprint board and a stories spec
+        are finished by the session and the board advance, not here)."""
+        del task
+        return None
+
+    def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> str | None:
+        """Put back what :meth:`_terminal_plan_write` wrote, for the commit
+        window's failure arms: a plan marked finished for a commit that does not
+        exist would unblock work on code that is not there. Never raises, like
+        :meth:`_restore_park_record`; a put-back that failed is returned as the
+        operator-facing detail the escalation carries, None when there was
+        nothing to undo or it was undone. Base: nothing to undo."""
+        del task, undo
+        return None
 
     def _park_spec_relpath(self, task: StoryTask) -> str:
         """The parked story's spec as a path relative to the WORKSPACE root, so
@@ -4743,11 +4938,19 @@ class Engine:
                 run_id=self.state.run_id,
                 parked_at=self._today(),
                 root_identity=self._mount_root_identity(task, self.workspace.paths.project),
+                **self._park_record_fields(task),
             )
         except (OSError, RuntimeError) as e:
             self.journal.append("operator-index-failed", story_key=task.story_key, error=str(e))
             return None
         return (path, prior)
+
+    def _park_record_fields(self, task: StoryTask) -> dict[str, str]:
+        """The work source's extra park-record keys (``source``, ``ref``) for
+        ``operatoractions.record_park``. Base: none, so a v6 record keeps its
+        shape."""
+        del task
+        return {}
 
     def _restore_park_record(self, task: StoryTask, record: tuple[Path, str | None] | None) -> None:
         """Put the park record back the way `_write_park_record` found it, for
@@ -5002,7 +5205,9 @@ class Engine:
         fm = self._observed_frontmatter(spec_path, task.story_key, "followup-routing")
         if fm is None:
             return False
-        return verify.status_of(fm) == "done" and bool(fm.get("followup_review_recommended", False))
+        return verify.status_of(fm) == self._dev_success_status() and bool(
+            fm.get("followup_review_recommended", False)
+        )
 
     def _reconcile_generic_terminal_status(self, task: StoryTask, result_json: dict | None) -> None:
         """Repair a generic-skill spec the session finalized in prose but not in
@@ -5061,7 +5266,7 @@ class Engine:
         faulted, without trusting result JSON or launching a replacement session
         over the first session's findings. Returns the effective status.
         """
-        success_status = "in-review" if self._dev_review_enabled() else "done"
+        success_status = "in-review" if self._dev_review_enabled() else self._dev_success_status()
         # A blank `status:` reads "" here (status_of normalizes YAML-null), so the
         # blank-status template shape reconciles like a missing key does.
         fm_status = verify.status_of(fm)
@@ -5080,7 +5285,10 @@ class Engine:
             # be clobbered to a phantom False.
             if isinstance(result_json, dict):
                 result_json["status"] = success_status
-                if success_status == "done" and "followup_review_recommended" in fm:
+                if (
+                    success_status == self._dev_success_status()
+                    and "followup_review_recommended" in fm
+                ):
                     result_json["followup_review_recommended"] = bool(
                         fm.get("followup_review_recommended")
                     )
@@ -5104,17 +5312,22 @@ class Engine:
             self._journal_spec_read_failed(spec_path, task.story_key, "reconcile-prose", e)
             return fm_status
         arr = devcontract.parse_auto_run_result(text)
-        if not arr.present or arr.status != devcontract.DONE:
+        if not arr.present or arr.status != self._dev_success_status():
             return fm_status  # no terminal prose, or blocked: leave for escalation
         # Repair-write doctrine: the False arm is "nothing to change" only. A status
         # the reader can see but no line edit can move raises instead, and that raise
-        # is deliberately left uncaught (see _reset_spec_for_repair).
-        if not devcontract.reset_spec_status(
-            spec_path,
-            success_status,
-            confine_root=self.workspace.paths.project,
-            root_identity=self._mount_root_identity(task, self.workspace.paths.project),
-        ):
+        # is deliberately left uncaught (see _reset_spec_for_repair). A mode that
+        # refuses the write leaves the status for verification, as a no-op would.
+        try:
+            if not self._spec_status_write(
+                task,
+                spec_path,
+                success_status,
+                "reconcile",
+                confine_root=self.workspace.paths.project,
+            ):
+                return fm_status
+        except SpecStatusWriteRefused:
             return fm_status
         # Keep the in-place result_json the rest of _dev_phase reads consistent with
         # the now-reconciled spec (the followup flag is only carried on a done exit).
@@ -5123,7 +5336,7 @@ class Engine:
         # followup flag, at the cost of a second racy read that can now fail.
         if isinstance(result_json, dict):
             result_json["status"] = success_status
-            if success_status == "done":
+            if success_status == self._dev_success_status():
                 result_json["followup_review_recommended"] = bool(
                     fm.get("followup_review_recommended", False)
                 )
@@ -5273,14 +5486,11 @@ class Engine:
                 if verify.status_of(fm) == verify.AWAITING_OPERATOR and actions:
                     task.operator_actions = list(actions)
             target = verify.AWAITING_OPERATOR if task.operator_actions else "done"
-            verify.set_frontmatter_status(
-                spec,
-                target,
-                confine_root=self.workspace.root,
-                root_identity=self._mount_root_identity(task, self.workspace.root),
+            self._spec_status_write(
+                task, spec, target, "adoption", confine_root=self.workspace.root
             )
             status = verify.status_of(verify.read_frontmatter(spec))
-        except (OSError, FrontmatterWriteError) as e:
+        except (OSError, FrontmatterWriteError, SpecStatusWriteRefused) as e:
             self._escalate(
                 task,
                 f"cannot adopt {task.story_key}: setting the status of {spec} failed "
@@ -5539,6 +5749,32 @@ class Engine:
         if changed:
             self._save()
 
+    def _harvest_success_statuses(self) -> frozenset[str]:
+        """The spec statuses at which a dev session's ``deferred:`` findings are
+        harvested: the status the session finalizes to — ``in-review`` when the
+        legacy dev skill hands off to review, else :meth:`_dev_success_status`."""
+        if self._dev_review_enabled():
+            return frozenset({"in-review"})
+        return frozenset({self._dev_success_status()})
+
+    def _harvest_source_name(self, spec_path: Path) -> str:
+        """The ``source_spec:`` value harvested entries carry for ``spec_path``.
+
+        On v6 it is the spec's bare file name. On v7 plan names repeat across epics
+        (``epic-auth/story-login-plan.md`` and ``epic-billing/story-login-plan.md``),
+        so it is the POSIX path relative to the initiative folder — the artifact dir
+        the ledger itself sits in — and the bare name for a plan outside it. The
+        value is half of the replay dedupe key, so it must be stable per plan."""
+        paths = self.workspace.paths
+        if paths.era == "v7":
+            try:
+                rel = spec_path.resolve().relative_to(paths.implementation_artifacts.resolve())
+            except (OSError, RuntimeError, ValueError):
+                pass
+            else:
+                return rel.as_posix()
+        return spec_path.name
+
     def _harvest_spec_deferrals(
         self, task: StoryTask, result_json: dict | None
     ) -> VerifyOutcome | None:
@@ -5645,9 +5881,9 @@ class Engine:
         if devcontract.DEFERRED_FIELD not in fm:
             return
         status = verify.status_of(fm)
-        success_status = "in-review" if self._dev_review_enabled() else "done"
+        success_statuses = self._harvest_success_statuses()
         parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
-        if status != success_status and not parked:
+        if status not in success_statuses and not parked:
             # Stories mode's explicit plan checkpoint is a verified terminal for
             # that leg, not a half-finalized implementation. Its deferred notes
             # remain in the spec until the post-checkpoint implementation pass.
@@ -5664,7 +5900,7 @@ class Engine:
             # session can replace its `deferred:` list.
             status = self._reconcile_generic_terminal_frontmatter(task, result_json, spec_path, fm)
             parked = self._operator_park_enabled() and status == verify.AWAITING_OPERATOR
-            if status != success_status and not parked:
+            if status not in success_statuses and not parked:
                 shown_status = status or "<blank>"
                 return VerifyOutcome.retry(
                     "spec remained at reconcilable nonterminal status "
@@ -5674,7 +5910,7 @@ class Engine:
         if not findings and not malformed:
             return
 
-        spec_name = spec_path.name
+        spec_name = self._harvest_source_name(spec_path)
         # Read BEFORE building records: the seen-again match below decides which
         # findings become records at all. The durability ordering (records saved
         # before any ledger write) is preserved by the reorder — both writes,
@@ -8309,16 +8545,11 @@ class Engine:
             # pinning it to task.spec_file would point the read-back at the wrong
             # file. Same doctrine as StoriesEngine withholding BMAD_LOOP_SPEC_FOLDER
             # from labeled sessions.
-            expected_spec=(
-                task.spec_file
-                if (
-                    label is None
-                    and self._generic_dev()
-                    and task.spec_file
-                    and self._prompt_names_recorded_spec(task, prompt)
-                )
-                else None
-            ),
+            expected_spec=self._expected_spec_for(task, prompt, label),
+            # The read-back's terminal vocabulary and fallback-result probe dirs:
+            # the v6 defaults (`done`, none) for every base and stories session.
+            success_statuses=self._session_success_statuses(role, label),
+            fallback_result_dirs=self._session_fallback_dirs(role, label),
         )
         self.journal.set_active_log(task_id)
         self.journal.append(
@@ -8913,16 +9144,40 @@ class Engine:
         # attempt against a spec still reading `done` — step-01 would ingest it as
         # context and not resume, re-wedging silently (cf. runs.rearm_escalation).
         confine_root = self.workspace.paths.project
-        devcontract.reset_spec_status(
-            resolved,
-            "in-progress",
-            confine_root=confine_root,
-            root_identity=self._mount_root_identity(task, confine_root),
-        )
+        self._spec_status_write(task, resolved, "in-progress", "repair", confine_root=confine_root)
         devcontract.strip_auto_run_result(
             resolved,
             confine_root=confine_root,
             root_identity=self._mount_root_identity(task, confine_root),
+        )
+
+    def _spec_status_write(
+        self,
+        task: StoryTask,
+        spec: Path,
+        target: str,
+        reason: SpecWriteReason,
+        *,
+        confine_root: Path,
+    ) -> bool:
+        """The engine's one write path to a spec's frontmatter ``status``: every
+        engine writer site calls it with its own ``reason``
+        (``tests/test_portability_guard.py::SPEC_STATUS_WRITERS`` pins the sites).
+
+        The base makes each site's own write, unchanged: ``adoption`` sets an
+        existing ``status`` line (``verify.set_frontmatter_status``), and the
+        repair-family reasons fill or insert it (``devcontract.reset_spec_status``),
+        both confined to ``confine_root`` and pinned to its mount identity. Returns
+        the writer's "changed" answer; a fault raises, per the repair-write
+        doctrine. A mode whose status writes go elsewhere overrides this, and may
+        raise :class:`SpecStatusWriteRefused` for a write it does not allow."""
+        root_identity = self._mount_root_identity(task, confine_root)
+        if reason == "adoption":
+            return verify.set_frontmatter_status(
+                spec, target, confine_root=confine_root, root_identity=root_identity
+            )
+        return devcontract.reset_spec_status(
+            spec, target, confine_root=confine_root, root_identity=root_identity
         )
 
     def _reset_spec_for_review(self, task: StoryTask) -> SpecSnapshot | None:
@@ -9360,8 +9615,7 @@ class Engine:
         if not task.preserve_ref:
             return ""
         recover = (
-            f'; recover with `git -C "{self.workspace.root}" '
-            f"merge --ff-only {task.preserve_ref}`"
+            f'; recover with `git -C "{self.workspace.root}" merge --ff-only {task.preserve_ref}`'
         )
         if task.preserve_partial:
             return (
@@ -10865,35 +11119,31 @@ class Engine:
             latch()
             self.journal.append("sweep-auto-finished", trigger=trigger)
 
-    def _skip_auto_retro(self, epic: int, reason: str, error: str | None = None) -> None:
+    def _skip_auto_retro(
+        self, epic: int, reason: str, error: str | None = None, *, epic_ref: str | None = None
+    ) -> None:
         """Journal a pre-dispatch refusal of the auto retrospective and, unless the
-        retro is simply already done, tell the operator to run it by hand."""
-        extra = {} if error is None else {"error": error}
+        retro is simply already done, tell the operator to run it by hand.
+        ``epic_ref`` names a slug-keyed epic (tickets mode, ``epic`` 0): it rides
+        the row and the notice names it."""
+        extra: dict[str, str] = {} if error is None else {"error": error}
+        if epic_ref is not None:
+            extra["epic_ref"] = epic_ref
         self.journal.append("retro-auto-skipped", epic=epic, reason=reason, **extra)
+        label = f"epic {epic}" if epic_ref is None else epic_ref
         if reason != "already-done":
             gates.notify(
                 self.policy,
                 self.run_dir,
-                f"auto retrospective skipped for epic {epic}",
-                f"{reason}: run /bmad-retrospective for epic {epic} by hand",
+                f"auto retrospective skipped for {label}",
+                f"{reason}: run /bmad-retrospective for {label} by hand",
             )
 
     def _retro_docs(self, epic: int) -> list[Path]:
-        """The regular files matching ``epic-{epic}-retro-*.md`` in the
-        implementation-artifacts dir, sorted. ``lstat``-checked, so a symlink or a
-        directory of that name is not a retro doc. Raises ``OSError`` when the
-        directory cannot be listed; a single entry that vanishes or cannot be
-        stat'd is simply not counted."""
-        docs: list[Path] = []
-        for candidate in sorted(
-            self.paths.implementation_artifacts.glob(f"epic-{epic}-retro-*.md")
-        ):
-            try:
-                if S_ISREG(candidate.lstat().st_mode):
-                    docs.append(candidate)
-            except OSError:
-                continue
-        return docs
+        """``epic``'s retrospective docs on disk, sorted — the source's
+        :meth:`~bmad_loop.worksource.WorkSource.retro_docs`. Raises ``OSError``
+        when their directory cannot be listed."""
+        return self.source.retro_docs(epic)
 
     def _verify_retro(
         self, epic: int, result: SessionResult | None
@@ -10911,21 +11161,9 @@ class Engine:
                 errors.append(f"session status {result.status}, not completed")
             elif result_mapping(result.result_json).get("status") != "done":
                 errors.append("result.json status is not done")
-        try:
-            board = load_sprint_status(self.paths.sprint_status).retros.get(epic)
-        except (SprintStatusError, OSError, UnicodeDecodeError):
-            errors.append("sprint-status unreadable")
-        else:
-            if board != "done":
-                errors.append(f"sprint-status epic-{epic}-retrospective is {board or 'absent'}")
-        try:
-            docs = self._retro_docs(epic)
-        except OSError:
-            docs = []
-            errors.append("implementation-artifacts unreadable")
-        else:
-            if not docs:
-                errors.append(f"no epic-{epic}-retro-*.md retrospective doc")
+        # the board and doc checks belong to the source; they follow the session's
+        artifact_errors, docs = self.source.retro_artifact_errors(epic)
+        errors.extend(artifact_errors)
         return errors, docs
 
     def _retro_verdict(self, docs: list[Path]) -> tuple[str, Path | None]:
@@ -10962,7 +11200,9 @@ class Engine:
         except (OSError, RuntimeError, ValueError):
             return None
 
-    def _settle_retro_tree(self, epic: int, ok: bool, docs: list[Path]) -> None:
+    def _settle_retro_tree(
+        self, epic: int, ok: bool, docs: list[Path], *, epic_ref: str | None = None
+    ) -> None:
         """Leave the tree clean after an auto-retro session, or pause.
 
         On success, commit exactly the dirty members of {sprint-status, the retro
@@ -10974,41 +11214,48 @@ class Engine:
         baseline, so an uncommitted retro doc would be destroyed or swept into that
         story's commit, and an LLM session's stray write must not enter history
         silently. Resume re-enters this boundary; ``already-done`` keeps a
-        succeeded retro from running twice."""
+        succeeded retro from running twice. ``epic_ref`` names a slug-keyed epic
+        (tickets mode, ``epic`` 0) on every row, the commit and the pause."""
         repo = self.paths.repo_root
+        label = f"epic {epic}" if epic_ref is None else epic_ref
+        ref: dict[str, str] = {} if epic_ref is None else {"epic_ref": epic_ref}
         try:
             dirty = verify.dirty_paths(repo)
             if ok:
-                expected = {self.paths.sprint_status, *docs}
+                expected = self.source.retro_commit_paths(docs)
                 wanted = {rel for p in expected if (rel := self._repo_relpath(p)) is not None}
                 to_commit = sorted(rel for rel in dirty if rel in wanted)
                 if to_commit:
                     try:
                         verify.commit_paths(
                             repo,
-                            f"chore(retro): epic {epic} retrospective",
+                            f"chore(retro): {label} retrospective",
                             [repo / rel for rel in to_commit],
                         )
                     except verify.GitError as e:
-                        self.journal.append("retro-auto-uncommitted", epic=epic, error=str(e))
+                        self.journal.append(
+                            "retro-auto-uncommitted", epic=epic, error=str(e), **ref
+                        )
                     dirty = verify.dirty_paths(repo)
         except verify.GitError as e:
-            self.journal.append("retro-auto-dirty", epic=epic, paths=[], error=str(e))
+            self.journal.append("retro-auto-dirty", epic=epic, paths=[], error=str(e), **ref)
             raise RunPaused(
-                f"epic {epic} boundary — could not read the worktree after the auto "
+                f"{label} boundary — could not read the worktree after the auto "
                 f"retrospective ({e}); check it, then `bmad-loop resume {self.state.run_id}`",
                 PAUSE_EPIC_BOUNDARY,
             ) from e
         if not dirty:
             return
         leftover = sorted(dirty)
-        self.journal.append("retro-auto-dirty", epic=epic, paths=leftover, count=len(leftover))
+        self.journal.append(
+            "retro-auto-dirty", epic=epic, paths=leftover, count=len(leftover), **ref
+        )
         shown = ", ".join(leftover[:_RETRO_DIRTY_REASON_PATHS])
         more = len(leftover) - _RETRO_DIRTY_REASON_PATHS
         if more > 0:
             shown += f" (+{more} more)"
         raise RunPaused(
-            f"epic {epic} boundary — the auto retrospective left uncommitted changes: "
+            f"{label} boundary — the auto retrospective left uncommitted changes: "
             f"{shown}; commit or clean them, then `bmad-loop resume {self.state.run_id}`",
             PAUSE_EPIC_BOUNDARY,
         )
@@ -11042,11 +11289,11 @@ class Engine:
         if self.policy.gates.retrospective != "auto":
             return
         try:
-            board = load_sprint_status(self.paths.sprint_status)
-        except (SprintStatusError, OSError, UnicodeDecodeError) as e:
+            retro_done = self.source.retro_done(epic)
+        except SourceUnreadable as e:
             self._skip_auto_retro(epic, "board-unreadable", str(e))
             return
-        if board.retros.get(epic) == "done":
+        if retro_done:
             self._skip_auto_retro(epic, "already-done")
             return
         if graceful_stop_requested(self.run_dir):
@@ -11071,7 +11318,9 @@ class Engine:
         result: SessionResult | None = None
         raised: Exception | None = None
         try:
-            result = self._run_session(task, role="retro", prompt=_retro_auto_prompt(epic), seq=1)
+            result = self._run_session(
+                task, role="retro", prompt=_retro_auto_prompt(self.source.retro_target(epic)), seq=1
+            )
         except (RunStopped, RunPaused):
             raise
         except Exception as e:  # a failed retro, never a failed run
@@ -11157,22 +11406,26 @@ class Engine:
         :meth:`_maybe_auto_retro` (its failures notify and never fail the run; a
         dirty tree after it pauses at ``PAUSE_EPIC_BOUNDARY``, and resume re-enters
         here, where an already-done retro is skipped) and ``notify`` sends
-        :meth:`_nudge_retrospective`'s nudge."""
+        :meth:`_nudge_retrospective`'s nudge.
+
+        A source without epics (``has_epics`` false) never crosses an epic
+        boundary, so it never fires this gate either."""
+        if not self.source.has_epics:
+            return
         epic = self.state.current_epic
         if epic is None or self.policy.gates.retrospective == "never":
             return  # no epic dispatched, or no gate to fire: leave the board unread
         try:
-            board = load_sprint_status(self.paths.sprint_status)
-        except (SprintStatusError, OSError, UnicodeDecodeError) as e:
+            progress = self.source.epic_progress(epic)
+        except SourceUnreadable as e:
             self.journal.append(
                 "retro-run-end-skipped", epic=epic, reason="board-unreadable", error=str(e)
             )
             return
-        stories = [s for s in board.stories if s.epic == epic]
-        if not stories or any(s.status != "done" for s in stories):
+        if not progress.complete:
             self.journal.append("retro-run-end-skipped", epic=epic, reason="epic-incomplete")
             return
-        if board.retros.get(epic) == "done":
+        if progress.retro_done:
             self.journal.append("retro-run-end-skipped", epic=epic, reason="already-done")
             return
         self.journal.append("retro-run-end", epic=epic)
@@ -11185,7 +11438,7 @@ class Engine:
         # Before the per-epic sweep, so the sweep starts on a clean tree and sees
         # the retro's committed action items (DW-388 ingests them).
         self._maybe_auto_retro(finished_epic)
-        self._maybe_auto_sweep("per-epic", f"epic-{finished_epic}")
+        self._maybe_auto_sweep("per-epic", self.source.epic_label(finished_epic))
         self._nudge_retrospective(finished_epic)
         self._emit("post_epic_boundary", epic=finished_epic)
         if gates.pause_at_epic_boundary(self.policy):

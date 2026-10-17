@@ -2,6 +2,8 @@
 
 A sweep works through the deferred-work ledger (`deferred-work.md`), the list of follow-ups that dev and review sessions defer. A fresh triage session checks every selected open entry against the code and sorts it: already resolved, buildable bundles, blocked, skip, or a decision that needs a human. You answer the decisions. Each bundle then runs through the normal story pipeline (dev → verify → review → commit), and its review gate also requires every bundled entry to be `status: done` in the ledger.
 
+On a BMAD v7 project the ledger is `deferred-work.md` in the active initiative folder, or in `output_folder` when no initiative is active. Entries harvested from a ticket plan name it in `source_spec:` by its path inside the initiative folder, because plan file names repeat across epics. See [Sweeps on BMAD v7](#sweeps-on-bmad-v7) for what else changes.
+
 ```text
 bmad-loop sweep [--only DW-1,DW-3 | --min-severity LEVEL] [--no-prompt] [--decisions-only]
                 [--max-bundles N] [--repeat | --no-repeat] [--max-cycles N] [--dry-run]
@@ -76,6 +78,20 @@ A ledger with entries that are not in `DW-<n>` format is migrated automatically 
 
 A migration fails validation if it drops an existing `gate:` token, changes an existing status, or breaks the numbering.
 
+## Sweeps on BMAD v7
+
+A sweep runs on a v7 project the same way, with these differences:
+
+- **No sprint board.** A v7 sweep never reads `sprint-status.yaml`, never seeds one into a unit worktree, and its review prompts say nothing about one. A stray board at the old path is ignored.
+- **Bundle plans.** Each bundle hands `bmad-build-auto` its free-form intent. The skill writes `plan-<slug>.md` in the initiative folder (or `output_folder`) and is asked to lead the slug with the bundle key, such as `dw-fix-things`. The orchestrator still finds the plan by scanning that folder; the ledger there never counts as a result.
+- **Ledger appends.** Attended `bmad-build` on v7 appends flat `- source_plan: <plan>` blocks; the ledger reads them like `- source_spec:` blocks. A tickets run also harvests a plan's `deferred:` findings when the plan reaches `built`.
+- **`built` closes a bundle.** build-auto finishes a plan at `built`. The dev gate, the ledger close, the review gate and the review reclose all accept `built` or `done`. A bundle is not a ticket, so nothing marks its plan `done`: it stays `built`.
+- **No retro ingest.** v7 retrospective action items are prose in the epic retrospective, not records. A fresh sweep files none and journals `sweep-retro-ingest-unavailable` with `ingest_cause="no-board"`.
+- **Store layout.** The store-topology check judges a v7 sweep as a tickets run, because its ledger lives in the ticket store. The sweep records the store's topology at its start, and a resume refuses a store that changed since, or whose initiative folder is gone.
+- **Pinned initiative.** A sweep records the active initiative it started on. A resume, `resolve` or the dashboard's re-arm refuses while `[core] active_initiative` names another: set it back, or start a new sweep.
+- **Decisions per initiative.** Each initiative has its own ledger and DW numbering, so pre-answers are kept per initiative in `.bmad-loop/decisions-<initiative>.json`. `bmad-loop decisions` and the TUI answer the active initiative's decisions and offer only those its own sweeps raised. An answer given after another initiative was made active than the one its decision was listed from is refused; list the decisions again. With no initiative active, the project store stays `.bmad-loop/decisions.json` and only sweeps that ran with no initiative are offered.
+- **Plans in a store repository.** When the ticket store is its own git repository (nested or outside the checkout), the bundle's code commit cannot carry its plan. Once the code has landed, the accepted plan gets its own commit there, `chore(sweep): <bundle> plan [bmad-loop <run>]`, with `Bmad-Code-*` trailers naming the code. This is best effort, like a tickets run's store commit: a failure is journaled (`store-commit-failed` or `store-commit-foreign-dirt`) and the plan stays uncommitted for a human.
+
 ## Story-declared closure (`closes_deferred`)
 
 A story can close ledger entries when it commits.
@@ -95,6 +111,8 @@ A ledger entry can block stories until it is done.
 1. In the entry, add a line `gate: 3-2, 3-3`: lowercase, at the start of the line, comma-separated story keys. A token matches a key it equals or prefixes at a `-` (and `3-2` also matches `3-2a-…`), so `3-2` matches `3-2-login` but not `3-20-x`.
 2. `bmad-loop validate` fails `deferred.hard-gate` for each actionable story a gate matches, and warns `deferred.hard-gate-unstructured` for a malformed or misspelled gate line (`Gate:`, an indented line, or prose `HARD GATE:` with no `gate:` line).
 3. If a run pauses at stage `story-gate` with `<story> is gated by unlanded deferred work`, either set the entry to `status: done <date>`, drop the token, or run `bmad-loop sweep`. Then `bmad-loop resume <run-id>`.
+
+In tickets mode a token names a ticket instead: its ref (`1.2`), or its epic's id (`1`) or folder (`epic-cart`), with no prefix matching. A backlog file name gates nothing, because a run never dispatches a backlog row, so validate warns about it. A v6 story key such as `3-2` names no ticket, so validate fails it and a run pauses at `story-gate` until you rewrite it; the v7 migration keeps each story's old key as `v6_key` in its ticket file. To compare a gate against the queue, validate runs the project's `tickets.py next`, but only while an unlanded entry declares one. See [the format doc](../src/bmad_loop/data/skills/bmad-loop-sweep/deferred-work-format.md).
 
 Only an explicit `status: done` releases a gate; a missing or misspelled status still gates. Sweep runs are never gated. If the ledger cannot be read, validate fails `deferred.ledger-unreadable` and a run pauses at stage `story-gate` with `<ledger> cannot be read (…)` (journaled `story-gate-unreadable`): fix the file, then resume.
 
@@ -123,10 +141,10 @@ Each decision offers options, and each option has one effect:
 
 ### Project store and run store
 
-| Store         | Path                                      | Written by                     | Holds                                  |
-| ------------- | ----------------------------------------- | ------------------------------ | -------------------------------------- |
-| Project store | `.bmad-loop/decisions.json`               | `bmad-loop decisions`, TUI `d` | `build` and `keep-open` answers        |
-| Run store     | `.bmad-loop/runs/<run-id>/decisions.json` | answers given during a sweep   | every in-run answer, including `close` |
+| Store         | Path                                                            | Written by                     | Holds                                  |
+| ------------- | --------------------------------------------------------------- | ------------------------------ | -------------------------------------- |
+| Project store | `.bmad-loop/decisions.json` (v7: `decisions-<initiative>.json`) | `bmad-loop decisions`, TUI `d` | `build` and `keep-open` answers        |
+| Run store     | `.bmad-loop/runs/<run-id>/decisions.json`                       | answers given during a sweep   | every in-run answer, including `close` |
 
 An out-of-band `close` goes straight to the ledger and is not stored. A sweep reads its run store first. It uses a project-store answer only for an id that this triage asks and the run store has not answered (journaled `decision-preanswered`). `bmad-loop decisions` offers only ids that are still open, appear in a past triage, and have no usable project-store answer.
 

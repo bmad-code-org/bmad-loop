@@ -1,0 +1,20 @@
+# Vendored byte-for-byte from upstream BMAD-METHOD (MIT, see LICENSE-BMAD-METHOD).
+# tests/test_conftest.py checks every file's sha256 against this pin. Re-vendor by
+# copying the files at a new commit and updating commit and every sha256 together.
+source_repo = "https://github.com/bmad-code-org/BMAD-METHOD"
+commit = "8f0d50e1817fdd8fcf05a20c524218222d13cd8d"
+
+[[files]]
+path = "tickets.py"
+upstream_path = "skills/bmad-ticket/scripts/tickets.py"
+sha256 = "05e83d55dca73075df3590832104816b1f8c232be0be517990a586b2a60408fa"
+
+[[files]]
+path = "config_utils.py"
+upstream_path = "skills/bmad/scripts/config_utils.py"
+sha256 = "a4bba671cb3aedbf80fa4309d9c96afe6674f8de656a44a7fe67324815de437d"
+
+[[files]]
+path = "LICENSE-BMAD-METHOD"
+upstream_path = "LICENSE"
+sha256 = "0aa79baf6328b4a1e694ce10a12ffc36d7666554da128dff0e8fcda0fc536a66"

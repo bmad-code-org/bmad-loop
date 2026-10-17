@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -126,7 +127,7 @@ def test_stamp_writes_lf_under_windows_newline_translation(
     """A Windows release cut must not rewrite the stamped LF files as CRLF —
     `.gitattributes` has no `text=auto` rule to normalize them back."""
     stamped = {}
-    for name in ("INIT", "PYPROJECT", "CANONICAL_MODULE_YAML", "MARKETPLACE"):
+    for name in ("INIT", "PYPROJECT", "CANONICAL_MODULE_YAML", "MARKETPLACE", "BMOD_TOML"):
         src = getattr(sync_version, name)
         dst = tmp_path / f"{name.lower()}{src.suffix}"
         shutil.copyfile(src, dst)
@@ -143,3 +144,111 @@ def test_stamp_writes_lf_under_windows_newline_translation(
         # Control: the file was actually rewritten, so "no CRLF" is not vacuous.
         assert b"99.0.0" in data, name
         assert b"\r\n" not in data, name
+
+
+# --- bmod.toml: the BMAD v7 module record ------------------------------------ #
+@pytest.fixture
+def bmod_toml(tmp_path, monkeypatch):
+    """Point `check()`/`stamp()` at a throwaway copy of the shipped module record."""
+    target = tmp_path / "bmod.toml"
+    shutil.copyfile(sync_version.BMOD_TOML, target)
+    monkeypatch.setattr(sync_version, "BMOD_TOML", target)
+    return target
+
+
+def test_bmod_version_drift_is_caught(bmod_toml):
+    """A record whose `[bmod] version` lags `__version__` reddens the gate.
+
+    The unmodified copy is the positive control: green before the edit, so the red
+    after it is the drift and not a broken fixture. Delete the bmod arm of `check()`
+    and this fails.
+    """
+    assert sync_version.check() == 0
+    text = bmod_toml.read_text(encoding="utf-8")
+    canonical = sync_version.read_canonical()
+    bmod_toml.write_text(
+        text.replace(f'version = "{canonical}"', 'version = "0.0.1-stale"', 1), encoding="utf-8"
+    )
+    assert sync_version.check() == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "body"),
+    [
+        ("no [bmod] table", '[skill]\nbmod = "bmod-bmad-loop"\n'),
+        ("no version key", '[bmod]\ncode = "bmad-loop"\n'),
+        ("not TOML", "[bmod\nversion = \n"),
+    ],
+)
+def test_unreadable_bmod_record_fails_instead_of_passing(bmod_toml, label, body):
+    """A record the check cannot read is drift, never a vacuous pass."""
+    bmod_toml.write_text(body, encoding="utf-8")
+    assert sync_version.check() == 1, label
+
+
+def test_missing_bmod_record_is_reported(bmod_toml):
+    bmod_toml.unlink()
+    assert sync_version.check() == 1
+
+
+def test_bmod_stamp_leaves_requirement_minimums(bmod_toml):
+    """Only the `[bmod]` table's own `version` moves.
+
+    `required_skills` minimums are other modules' versions, and a `version` key in
+    another table (here a `[skill]` table placed first) is not the module's. An
+    unscoped `version = "…"` substitution — the marketplace stamper's shape — would
+    rewrite them, and this fails.
+    """
+    original = bmod_toml.read_text(encoding="utf-8")
+    text = '[skill]\nversion = "1.2.3"\n\n' + original
+    stamped = sync_version._stamp_bmod(text, "99.0.0", bmod_toml)
+
+    before, after = tomllib.loads(text), tomllib.loads(stamped)
+    assert after["bmod"]["version"] == "99.0.0"
+    assert after["skill"] == before["skill"]
+    assert after["bmod"]["required_skills"] == before["bmod"]["required_skills"]
+    # The minimums are real data, so "unchanged" is not vacuous.
+    assert {r["version"] for r in after["bmod"]["required_skills"]} == {"6.13.0"}
+    # Exactly one line differs.
+    changed = [
+        (a, b) for a, b in zip(text.splitlines(), stamped.splitlines(), strict=True) if a != b
+    ]
+    assert len(changed) == 1 and changed[0][1] == 'version = "99.0.0"'
+
+
+def test_bmod_stamp_refuses_a_record_without_a_version_line(bmod_toml):
+    with pytest.raises(SystemExit):
+        sync_version._stamp_bmod('[bmod]\ncode = "x"\n', "1.0.0", bmod_toml)
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "0.14.0.dev1",  # PEP 440 dev release: four dot parts
+        "0.14.0-dev1",  # upstream parse_orderable_semver refuses any `-dev`
+        "0.14.0-rc-DEV",
+        "01.2.3",  # leading zero
+        "1.2.03",
+        "1.2.3-01",  # numeric pre-release identifier with a leading zero
+        "1.2.3+build.5",  # build metadata: upstream's validator refuses it on a record
+        "1.2.3-",
+        "1.2.3-rc..1",
+        "1.2",
+        "v1.2.3",
+    ],
+)
+def test_version_regex_refuses_non_semver(version, tmp_path, monkeypatch):
+    """Every shape `bmad setup` cannot order is refused, and `stamp()` writes nothing."""
+    assert not sync_version._VERSION_RE.match(version)
+    target = tmp_path / "__init__.py"
+    target.write_text('__version__ = "0.13.2"\n', encoding="utf-8")
+    monkeypatch.setattr(sync_version, "INIT", target)
+    with pytest.raises(SystemExit):
+        sync_version.stamp(version)
+    assert target.read_text(encoding="utf-8") == '__version__ = "0.13.2"\n'
+
+
+@pytest.mark.parametrize("version", ["0.13.2", "1.0.0-rc1", "1.0.0-rc.1", "6.13.0-next", "0.0.0"])
+def test_version_regex_accepts_semver(version):
+    """Positive control for the refusals above."""
+    assert sync_version._VERSION_RE.match(version)

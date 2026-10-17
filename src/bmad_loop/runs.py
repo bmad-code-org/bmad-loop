@@ -33,7 +33,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from . import bmadconfig, deferredwork, devcontract, envvars, platform_util, sprintstatus, verify
+from . import (
+    bmadconfig,
+    deferredwork,
+    devcontract,
+    envvars,
+    platform_util,
+    sprintstatus,
+    tickettree,
+    verify,
+    worksource,
+)
 from .adapters.multiplexer import (
     MultiplexerError,
     TerminalMultiplexer,
@@ -2376,11 +2386,18 @@ def legacy_registry_leftovers(
     *,
     announced: Iterable[str] = (),
     on_primary_fault: Callable[[str], None] | None = None,
-) -> tuple[dict[str, list[str]], list[str]]:
-    """``(grouped, faults)``: session names a legacy registry **still holds** after
-    :func:`prune_sessions` ran — the migration's honest remainder, for the cleanup
-    frontends to print — and one operator-facing line per registry that could not
-    be asked. ``({}, [])`` when there is no legacy registry or they hold nothing.
+) -> tuple[dict[str, list[str]], list[str], list[str]]:
+    """``(grouped, faults, superseded)``: session names a legacy registry **still
+    holds** after :func:`prune_sessions` ran — the migration's honest remainder, for
+    the cleanup frontends to print — one operator-facing line per registry that
+    could not be asked, and the pre-upgrade control session standing in the
+    project's **own** registry (:func:`superseded_ctl_sessions`, #733). ``({}, [],
+    [])`` when there is no legacy registry, they hold nothing and the own registry
+    holds no such session.
+
+    ``superseded`` is kept out of ``grouped`` (#917): the own registry is no
+    legacy one, and ``grouped`` is what ``cleanup --json`` reports as
+    ``legacy_leftovers``.
 
     **An unanswerable registry is a fault, not an empty one** (DW-469). A backend
     that cannot be selected (so no legacy registry could even be named) or a
@@ -2493,7 +2510,11 @@ def legacy_registry_leftovers(
     try:
         primary = get_multiplexer()
     except MultiplexerError as exc:
-        return grouped, [f"no legacy registry could be checked: backend selection failed: {exc}"]
+        return (
+            grouped,
+            [f"no legacy registry could be checked: backend selection failed: {exc}"],
+            [],
+        )
     # Its own try (#915): a legacy discovery that raises must not skip the
     # primary-registry scan below, which needs only the backend selected above.
     try:
@@ -2549,9 +2570,7 @@ def legacy_registry_leftovers(
     except MultiplexerError as exc:
         primary_fault(f"{label}: could not be listed: {exc}")
         stale = []
-    if stale:
-        grouped[label] = sorted(set(grouped.get(label, []) + stale))
-    return grouped, faults
+    return grouped, faults, stale
 
 
 def superseded_ctl_name(project: Path, registry: str | None = None) -> str:
@@ -3411,12 +3430,15 @@ def live_session_may_be_ours(
     if key(name) == key(ctl_session_for(project, mux)):
         return False
 
-    def folded(fault: str) -> None:
-        _warn_unasked_session_guard(run_id, "the session listing failed", fault, warn)
-
+    # A fault is said only when the session is then read as absent: a partial
+    # listing that still names it (#919) goes on to the tag check below, so
+    # "proceeding as if none is live" would be the opposite of what happens.
+    faults: list[str] = []
     try:
-        listing = mux_sessions(on_fault=folded if warn is not None else None)
+        listing = mux_sessions(on_fault=faults.append if warn is not None else None)
         if key(name) not in {key(s) for s in listing}:
+            for fault in faults:
+                _warn_unasked_session_guard(run_id, "the session listing failed", fault, warn)
             return False
     except MultiplexerError as exc:
         _warn_unasked_session_guard(run_id, "the session listing raised", exc, warn)
@@ -4416,7 +4438,7 @@ def validate_restore_latch(
     # implementation to restore, and its re-arm re-dispatches a planning leg.
     # Keyed on the recorded detection verdict (task.sentinel_kind), not the on-disk
     # basename, mirroring rearm_escalation's sentinel-clear branch.
-    if state.source == "stories" and task.sentinel_kind:
+    if worksource.resumed_traits_for(state.source).sentinels and task.sentinel_kind:
         return (
             f"story {story_key} is wedged on a pre-planning {task.sentinel_kind} sentinel — "
             "there is no attempted implementation to restore, and the re-drive starts "
@@ -4487,6 +4509,30 @@ def rebase_recorded_project_path(path: Path, state: RunState, project_root: Path
     if ".." in relative.parts:
         return path
     return project_root / relative
+
+
+def judged_store_source(state: RunState, sweep_source: str) -> str:
+    """The source whose ticket store a paused run is judged under on resume and
+    re-arm: a story run's own `state.source`; a sweep persists no source (its
+    `RunState.source` is the launch default), so the caller's `sweep_source` — the
+    one a sweep launch is judged under."""
+    return sweep_source if state.run_type == "sweep" else state.source
+
+
+def live_store_topology(state: RunState, project_root: Path) -> dict[str, str | None]:
+    """`state.store_topology` located on the live project: its `store_root` and
+    `store_repo` moved with a renamed project (`rebase_recorded_project_path`), so a
+    store inside the project (T1–T3) still equals the one `load_paths` classifies
+    under the new path, and the engine marks and commits there. A store outside the
+    recorded project (T4) is unchanged; empty when the run recorded none."""
+    live = dict(state.store_topology)
+    for key in ("store_root", "store_repo"):
+        value = live.get(key)
+        if isinstance(value, str) and value:
+            rebased = rebase_recorded_project_path(Path(value), state, project_root)
+            if rebased != Path(value):
+                live[key] = str(rebased)
+    return live
 
 
 def rebase_recorded_code_root(state: RunState, project_root: Path) -> Path:
@@ -5363,12 +5409,121 @@ def _redrive_reads_the_upstream_artifacts(state: RunState) -> bool:
     return True
 
 
+def _rearm_ticket_tree(
+    project_root: Path, pinned_initiative: str | None
+) -> tickettree.TicketTreeLike:
+    """The tree a tickets-mode re-arm marks its plan through: the installed
+    ``tickets.py`` under ``project_root`` (the plan's live root), pinned to the run's
+    initiative. Tests replace it with a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative)
+
+
+def _rearm_ticket_plan(
+    tree: tickettree.TicketTreeLike, ref: str, plan: Path, target: str, journal: Journal
+) -> bool:
+    """Re-open a ticket's plan to ``target`` through ``TicketTree.mark`` (reason
+    ``rearm``), which also clears the ``blocked_*`` fields build-auto's HALT set.
+    True when the mark wrote; False for a no-op, and for a plan that is not a file —
+    the caller's read-back then journals the skip exactly as it does for a spec.
+    Any ``tickets.py`` failure, a refused transition included, aborts the re-arm."""
+    if not plan.is_file():
+        return False
+    try:
+        return tree.mark(
+            ref, target, reason="rearm", expected_plan=plan, journal=journal
+        ).outcome == ("written")
+    except tickettree.TicketsError as e:
+        raise RearmError(
+            f"cannot re-open ticket {ref}'s plan {plan} to `{target}` for the re-drive "
+            f"(tickets.py {e.kind}: {e}) — fix the ticket tree or the plan, then re-run resolve"
+        ) from e
+
+
+def evacuated_patch_path(run_dir: Path, story_key: str) -> Path:
+    """Where a tickets-mode re-arm moves a plan's intent-gap patch:
+    ``{run_dir}/restore/<story key>.patch``, the key made one safe path segment. One
+    definition for the re-arm and for ``cli._resolve_restore_patch``, which trusts it."""
+    return run_dir / "restore" / f"{safe_segment(story_key)}.patch"
+
+
+def plan_patch_path(plan: Path) -> Path:
+    """build-auto's intent-gap patch for ``plan``: saved beside it, named after it
+    with ``.patch`` for ``.md`` (``<type>-<slug>-plan.patch``)."""
+    return plan.with_suffix(".patch")
+
+
+@dataclass(frozen=True)
+class _EvacuatedPatch:
+    """One intent-gap patch a re-arm moved out of the tree: where it was, where it is
+    now, its bytes, and whether the restore latch was moved onto the copy."""
+
+    original: Path
+    copy: Path
+    data: bytes
+    latched: bool
+
+
+def _evacuate_plan_patch(
+    run_dir: Path, journal: Journal, story_key: str, plan: Path, restore_patch: str | None
+) -> _EvacuatedPatch | None:
+    """Move ``plan``'s intent-gap patch (:func:`plan_patch_path`) out of the tracked
+    tree into :func:`evacuated_patch_path`: write the copy (``atomic_write_bytes``
+    fsyncs it before it lands), then delete the original, then journal
+    ``restore-patch-evacuated``. ``latched`` says the re-arm's ``restore_patch`` named
+    the original, so the caller latches the copy instead. None when there is no
+    patch. A copy or delete that fails aborts the re-arm; the transaction guard then
+    puts the original back (:func:`_return_evacuated_patch`)."""
+    patch = plan_patch_path(plan)
+    if plan.suffix != ".md" or not patch.is_file():
+        return None
+    copy = evacuated_patch_path(run_dir, story_key)
+    try:
+        latched = restore_patch is not None and Path(restore_patch).resolve() == patch.resolve()
+        data = patch.read_bytes()
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(copy, data)
+        patch.unlink()
+    except OSError as e:
+        raise RearmError(
+            f"cannot move the intent-gap patch {patch} out of the tree to {copy} "
+            f"({e.__class__.__name__}: {e}) — left beside the plan it fails the re-drive's "
+            "clean-tree check; fix the file or the run directory, then re-run resolve"
+        ) from e
+    journal.append(
+        "restore-patch-evacuated",
+        story_key=story_key,
+        patch=str(patch),
+        stashed_to=str(copy),
+        latched=latched,
+    )
+    return _EvacuatedPatch(patch, copy, data, latched)
+
+
+def _return_evacuated_patch(evacuated: _EvacuatedPatch) -> None:
+    """Undo :func:`_evacuate_plan_patch` for an aborted re-arm: the original goes back
+    beside the plan with the bytes it had, so a retried resolve finds the patch it
+    names. A repair write, so a failure raises (the copy still holds the bytes)."""
+    if evacuated.original.exists():
+        return
+    try:
+        atomic_write_bytes(evacuated.original, evacuated.data)
+    except OSError as e:
+        raise RearmError(
+            f"cannot put the intent-gap patch back at {evacuated.original} after a failed "
+            f"re-arm ({e.__class__.__name__}: {e}) — its copy is at {evacuated.copy}; move "
+            "it back, then re-run resolve"
+        ) from e
+
+
 def _restore_rearmed_spec(
     spec_path: Path,
     original: bytes | None,
     task: StoryTask,
     state: RunState,
     live_project: Path,
+    *,
+    ticket_tree: tickettree.TicketTreeLike | None = None,
+    journal: Journal | None = None,
 ) -> Literal["restored", "unchanged", "unknown"]:
     """Put back the bytes a re-arm FOUND on the spec, and say what is now on disk.
 
@@ -5472,6 +5627,19 @@ def _restore_rearmed_spec(
         # raises `RearmError` if it cannot land, which is the loud outcome the docstring
         # above promises. The cost of being wrong here is one redundant identical write.
         pass
+    if ticket_tree is not None and journal is not None:
+        # tickets mode: a ticket plan's bytes go back through the chokepoint's own
+        # byte-exact restore, under the lock its `mark` wrote them with.
+        try:
+            ticket_tree.restore_preimage(spec_path, original, journal)
+        except (tickettree.TicketsError, OSError) as e:
+            raise RearmError(
+                f"cannot restore ticket plan {spec_path} after a failed re-arm "
+                f"({e.__class__.__name__}: {e}) — the plan may carry this re-arm's status "
+                "while the ticket is still escalated; restore it from git or from your own "
+                "copy, then re-run resolve"
+            ) from e
+        return "restored"
     confine_root = live_spec_root(task, state, live_project)
     try:
         root_identity = live_spec_root_identity(task, state, live_project)
@@ -5508,6 +5676,8 @@ def _rollback_rearm(
     state: RunState,
     live_project: Path,
     error: BaseException,
+    *,
+    ticket_tree: tickettree.TicketTreeLike | None = None,
 ) -> None:
     """Undo an aborted re-arm's spec writes and RECORD that the re-arm aborted.
 
@@ -5560,7 +5730,15 @@ def _rollback_rearm(
     rollback = "unknown"
     try:
         if spec_path is not None:
-            rollback = _restore_rearmed_spec(spec_path, spec_before, task, state, live_project)
+            rollback = _restore_rearmed_spec(
+                spec_path,
+                spec_before,
+                task,
+                state,
+                live_project,
+                ticket_tree=ticket_tree,
+                journal=journal,
+            )
     except BaseException:
         rollback = "failed"
         raise
@@ -6251,6 +6429,12 @@ def _rearm_escalation_locked(
     # of them.
     spec_before: bytes | None = None
     spec_path: Path | None = None
+    # tickets mode: the tree the plan's status moves through (`mark`, reason `rearm`)
+    # and its rollback restores through (`restore_preimage`), and build-auto's
+    # intent-gap patch moved out of the tree beside the plan — the guard's `except`
+    # arm puts both back.
+    ticket_tree: tickettree.TicketTreeLike | None = None
+    evacuated: _EvacuatedPatch | None = None
 
     # ONE transaction, from the first spec write to the commit point. `save_state` IS
     # that commit point: until it returns the run still calls this story ESCALATED, so
@@ -6294,7 +6478,9 @@ def _rearm_escalation_locked(
             # status-flip path so it is kept, not deleted. Gate on the run source too (the
             # convention exists only in stories mode) and defensively re-confirm the
             # on-disk name still matches the recorded slug before deleting.
-            sentinel_kind = task.sentinel_kind if state.source == "stories" else ""
+            sentinel_kind = (
+                task.sentinel_kind if worksource.resumed_traits_for(state.source).sentinels else ""
+            )
             if sentinel_kind and _sentinel_condition(spec_path, key) == sentinel_kind:
                 # a sentinel is cleared by deletion, not a status flip; drop the stale
                 # spec_file so the re-dispatch starts from PENDING (clean re-plan).
@@ -6489,13 +6675,24 @@ def _rearm_escalation_locked(
                             "the file, then re-run resolve"
                         ) from e
                     spec_before = None
-                try:
-                    flipped = verify.set_frontmatter_status(
-                        spec_path,
-                        target_status,
-                        confine_root=live_spec_root(task, state, live_project),
-                        root_identity=live_spec_root_identity(task, state, live_project),
+                if state.source == worksource.SOURCE_TICKETS and task.ticket is not None:
+                    ticket_tree = _rearm_ticket_tree(
+                        live_spec_root(task, state, live_project), state.initiative or None
                     )
+                try:
+                    if ticket_tree is not None and task.ticket is not None:
+                        # A ticket plan's `status` moves only through the chokepoint,
+                        # which also clears the `blocked_*` fields build-auto's HALT set.
+                        flipped = _rearm_ticket_plan(
+                            ticket_tree, task.ticket.ref, spec_path, target_status, journal
+                        )
+                    else:
+                        flipped = verify.set_frontmatter_status(
+                            spec_path,
+                            target_status,
+                            confine_root=live_spec_root(task, state, live_project),
+                            root_identity=live_spec_root_identity(task, state, live_project),
+                        )
                     # `set_frontmatter_status` answers "nothing to change" with `False`
                     # for FOUR causes, not three — its own docstring lists them: no file,
                     # no frontmatter block, no top-level `status:`, and ALREADY AT THE
@@ -6664,6 +6861,17 @@ def _rearm_escalation_locked(
                         f"({e.__class__.__name__}: {e}) — fix or replace the file "
                         f"(it must be readable UTF-8), then re-run resolve"
                     ) from e
+
+        # tickets mode: build-auto's intent-gap HALT saves the attempted change as
+        # `<plan>.patch` beside the plan, in the tracked tree. Left there, the re-drive's
+        # step-04 clean-tree check fails on it and `finalize_commit`'s `add -A` would
+        # commit it, so it moves to the run dir on BOTH legs — and a restore that named
+        # it latches the moved copy. Before the snapshot refresh below, which would
+        # otherwise bless it as pre-existing untracked content.
+        if ticket_tree is not None and spec_path is not None:
+            evacuated = _evacuate_plan_patch(run_dir, journal, key, spec_path, restore_patch)
+            if evacuated is not None and evacuated.latched:
+                task.restore_patch = str(evacuated.copy)
 
         # A previous restore latch is being replaced (or re-latched onto the same
         # patch): the abandoned attempt applied that patch, so its NEW files sit
@@ -6901,7 +7109,21 @@ def _rearm_escalation_locked(
         # undoing the spec then would build the mirror image of the defect this guard
         # closes, persisted state re-armed against a spec that is not.
         if not _rearm_commit_landed(run_dir, key, task):
-            _rollback_rearm(journal, key, spec_path, spec_before, task, state, live_project, e)
+            try:
+                _rollback_rearm(
+                    journal,
+                    key,
+                    spec_path,
+                    spec_before,
+                    task,
+                    state,
+                    live_project,
+                    e,
+                    ticket_tree=ticket_tree,
+                )
+            finally:
+                if evacuated is not None:
+                    _return_evacuated_patch(evacuated)
         raise
     journal.append(
         "story-escalation-resolved",
@@ -7204,10 +7426,14 @@ def standalone_replay_refusal(
             f"`bmad-loop resolve {run_id} --reverify --story {story_key}`"
         )
     if state.run_type == "sweep":
-        return f"a finished sweep run's bundle ({story_key}) cannot be replayed; " f"{by_hand}"
-    if state.source == "stories":
+        return f"a finished sweep run's bundle ({story_key}) cannot be replayed; {by_hand}"
+    # An allowlist, not a denylist: only a source whose queue a replay can read is
+    # admitted. A source the registry does not carry is refused here rather than
+    # falling through to the sprint-board read below as if it were a sprint run.
+    traits = worksource.TRAITS.get(state.source)
+    if traits is None or not traits.replay:
         return (
-            f"a finished stories-mode run's story ({story_key}) cannot be replayed "
+            f"a finished {state.source}-mode run's story ({story_key}) cannot be replayed "
             f"(sprint-status runs only); {by_hand}"
         )
     if task.phase != Phase.DEFERRED:
