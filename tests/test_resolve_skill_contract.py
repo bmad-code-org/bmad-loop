@@ -245,3 +245,26 @@ def test_skill_explains_null_reachability_for_stories_sentinels(skill_md):
     assert "no ordinary frozen spec to edit" in normalized
     assert "stories mode recorded a sentinel path instead" in normalized
     assert "follow the sentinel guidance below" in normalized
+
+
+def test_skill_names_intent_contract_block(skill_md):
+    """A v7 ticket plan's frozen intent is its `<intent-contract>` block, so both the
+    read step and the amend step name it — beside the v6 `<frozen-after-approval>`
+    wording an older spec still carries. Ablation (performed): revert either step to
+    the v6 wording alone and the count drops — this FAILS."""
+    steps = skill_md.split("## What you MUST do", 1)[1].split("## What you MUST NOT do", 1)[0]
+    read_step = steps.split("\n2. ", 1)[0]
+    amend_step = steps.split("\n4. ", 1)[1].split("\n5. ", 1)[0]
+    for step in (read_step, amend_step):
+        assert "<intent-contract>" in step and "<frozen-after-approval>" in step
+
+
+def test_skill_forbids_tickets_mark(skill_md):
+    """The orchestrator re-arms a ticket through its own `mark`; a resolve agent that
+    ran `tickets.py mark` (or edited the plan's status or blocked fields) would race
+    the re-arm's transition check. Ablation (performed): drop the sentence and this
+    FAILS."""
+    must_not = skill_md.split("## What you MUST NOT do", 1)[1].split("\n## ", 1)[0]
+    assert "never run `tickets.py mark`" in must_not
+    for field in ("`status`", "`blocked_at`", "`blocked_reason`"):
+        assert field in must_not

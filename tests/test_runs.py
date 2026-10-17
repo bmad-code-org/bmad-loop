@@ -10944,6 +10944,11 @@ _STANDALONE_REFUSALS = [
     ("sweep_run", _state_edit(lambda s, _t: setattr(s, "run_type", "sweep")), "sweep run"),
     ("stories_mode", _state_edit(lambda s, _t: setattr(s, "source", "stories")), "stories-mode"),
     (
+        "unknown_source",
+        _state_edit(lambda s, _t: setattr(s, "source", "legacy-src")),
+        "legacy-src-mode",
+    ),
+    (
         "not_deferred",
         _state_edit(lambda _s, t: setattr(t, "phase", Phase.DONE)),
         "is not deferred (phase: done)",
@@ -10980,7 +10985,11 @@ def test_standalone_replay_refuses(tmp_path, arrange, fragment):
 
     Ablation: delete the `wt.is_dir()` check in `runs._mounted_reverify_refusal` and
     the worktree-gone row fails (it falls to the registration check's message);
-    delete the `current_branch` check there and the detached row is admitted."""
+    delete the `current_branch` check there and the detached row is admitted.
+    Setting the stories source's `replay` trait to True (`worksource.TRAITS`) admits
+    the stories-mode row; narrowing the source allowlist back to a `== "stories"`
+    denylist admits the unknown-source row through the sprint-board read (both
+    performed)."""
     run_dir, project, _wt = _finished_mounted_run(tmp_path)
     arrange(run_dir, project)
 

@@ -43,8 +43,14 @@ STAGES = ("dev", "review", "triage", "retro")
 # Where the run gets its story queue. "sprint-status" (default) is the classic
 # flow — bmad-sprint-planning writes sprint-status.yaml from prose epics.
 # "stories" is the opt-in folder+id dispatch flow (BMAD-METHOD #2549): a typed,
-# human-reviewed stories.yaml sibling of SPEC.md drives the loop.
-STORIES_SOURCES = {"sprint-status", "stories"}
+# human-reviewed stories.yaml sibling of SPEC.md drives the loop. "tickets" drives
+# the BMAD v7 ticket tree of `[core] active_initiative` through the project's
+# `_bmad/method/scripts/tickets.py`.
+STORIES_SOURCES = {"sprint-status", "stories", "tickets"}
+# [tickets] knobs: who marks a verified ticket done, and when its dev and review
+# sessions run the thorough review.
+TICKETS_MARK_DONE_MODES = {"auto", "never"}
+TICKETS_THOROUGH_REVIEW_MODES = {"never", "high-risk", "always"}
 ISOLATION_MODES = {"none", "worktree"}
 BRANCH_PER_MODES = {"story", "run"}
 MERGE_STRATEGIES = {"ff", "merge", "squash"}
@@ -299,6 +305,23 @@ class StoriesPolicy:
 
     source: str = "sprint-status"
     spec_folder: str = ""
+
+
+@dataclass(frozen=True)
+class TicketsPolicy:
+    """Ticket-tree (``[stories] source = "tickets"``) behavior. Inert under the
+    other sources.
+
+    ``mark_done``: "auto" (default) has bmad-loop run ``tickets.py mark <ref> done``
+    once a ticket's build passes its verify and review gates; "never" leaves the
+    plan at ``built`` for a human to mark.
+
+    ``thorough_review``: when a ticket gets the thorough review — "high-risk"
+    (default) for a ticket whose ``risk`` is high, "always" for every ticket,
+    "never" for none."""
+
+    mark_done: str = "auto"
+    thorough_review: str = "high-risk"
 
 
 @dataclass(frozen=True)
@@ -698,6 +721,7 @@ class Policy:
     notify: NotifyPolicy = field(default_factory=NotifyPolicy)
     review: ReviewPolicy = field(default_factory=ReviewPolicy)
     stories: StoriesPolicy = field(default_factory=StoriesPolicy)
+    tickets: TicketsPolicy = field(default_factory=TicketsPolicy)
     dev: DevPolicy = field(default_factory=DevPolicy)
     adapter: AdapterPolicy = field(default_factory=AdapterPolicy)
     sweep: SweepPolicy = field(default_factory=SweepPolicy)
@@ -916,6 +940,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     notify_d = _section(doc, "notify")
     review_d = _section(doc, "review")
     stories_d = _section(doc, "stories")
+    tickets_d = _section(doc, "tickets")
     dev_d = _section(doc, "dev")
     adapter_d = _section(doc, "adapter")
     sweep_d = _section(doc, "sweep")
@@ -1145,6 +1170,22 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     # at run time — no error, so switching source back and forth keeps the path.
     if stories.source == "stories" and not stories.spec_folder:
         raise PolicyError('stories.source = "stories" requires stories.spec_folder to be set')
+    tickets = TicketsPolicy(
+        mark_done=_typed_str(tickets_d, "tickets", "mark_done", TicketsPolicy.mark_done).strip(),
+        thorough_review=_typed_str(
+            tickets_d, "tickets", "thorough_review", TicketsPolicy.thorough_review
+        ).strip(),
+    )
+    if tickets.mark_done not in TICKETS_MARK_DONE_MODES:
+        raise PolicyError(
+            f"tickets.mark_done must be one of {sorted(TICKETS_MARK_DONE_MODES)}:"
+            f" got {tickets.mark_done!r}"
+        )
+    if tickets.thorough_review not in TICKETS_THOROUGH_REVIEW_MODES:
+        raise PolicyError(
+            "tickets.thorough_review must be one of "
+            f"{sorted(TICKETS_THOROUGH_REVIEW_MODES)}: got {tickets.thorough_review!r}"
+        )
     dev = DevPolicy(skill=_typed_str(dev_d, "dev", "skill", DevPolicy.skill))
     if dev.skill not in DEV_SKILLS:
         raise PolicyError(
@@ -1397,6 +1438,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         notify=notify,
         review=review,
         stories=stories,
+        tickets=tickets,
         dev=dev,
         adapter=adapter,
         sweep=sweep,
@@ -1517,12 +1559,23 @@ on_status_contradiction = "escalate"
 # Story-queue source. "sprint-status" (default) walks sprint-status.yaml written
 # by bmad-sprint-planning. "stories" opts into folder+id dispatch: the loop reads
 # a typed stories.yaml (Story Breakdown output, sibling of SPEC.md) and dispatches
-# each entry by spec-folder + story id. `bmad-loop run --spec <folder>` forces
-# stories mode for a single run regardless of this setting.
-source = "sprint-status"     # sprint-status | stories
+# each entry by spec-folder + story id. "tickets" drives the BMAD v7 ticket tree
+# of [core] active_initiative through _bmad/method/scripts/tickets.py
+# (experimental; see docs/tickets-guide.md). `bmad-loop run --spec <folder>`
+# forces stories mode for a single run regardless of this setting.
+source = "sprint-status"     # sprint-status | stories | tickets
 # Required (and must parse) when source = "stories": the project-relative path to
-# the epic's spec folder holding stories.yaml + SPEC.md. Ignored under sprint-status.
+# the epic's spec folder holding stories.yaml + SPEC.md. Ignored by the other sources.
 spec_folder = ""
+
+[tickets]
+# Ticket-tree runs (source = "tickets"); ignored by the other sources.
+# Who marks a ticket done once its build passes the verify and review gates:
+#   "auto"  -> bmad-loop runs `tickets.py mark <ref> done` (default).
+#   "never" -> the plan stays at `built` for a human to mark.
+mark_done = "auto"           # auto | never
+# When a ticket gets the thorough review: "high-risk" (its risk is high), "always", "never".
+thorough_review = "high-risk"  # never | high-risk | always
 
 [adapter]
 name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>

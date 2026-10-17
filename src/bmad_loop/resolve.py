@@ -22,10 +22,11 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import Any
 
+from . import devcontract, frontmatter, worksource
 from .adapters.base import SessionSpec
 from .engine import _session_task_id
 from .escalation import critical_escalations
-from .journal import TASK_CYCLE_ARTIFACTS
+from .journal import TASK_CYCLE_ARTIFACTS, Journal
 from .model import RunState, StoryTask
 from .platform_util import safe_segment
 from .runs import (
@@ -349,8 +350,9 @@ def build_context(
     restore_supported = task is not None and (
         validate_restore_latch(state, task, story_key, worktree_isolation=isolated_redrive) is None
     )
+    traits = worksource.resumed_traits_for(state.source)
     stories_ctx: dict[str, Any] | None = None
-    if state.source == "stories":
+    if traits.has_spec_folder:
         # Which tree holds this run's STORY MANIFEST — the workspace root, answered by
         # `runs.live_stories_root` rather than by `task_spec_root`. Sprint mode consumes
         # no stories data, so it must not probe for a stories root at all.
@@ -361,7 +363,7 @@ def build_context(
     # The persisted detection verdict is authoritative, matching re-arm. A real spec
     # may legally have a sentinel-shaped basename, while a recorded sentinel remains a
     # sentinel even when its file is unreadable or has disappeared.
-    sentinel = state.source == "stories" and task is not None and bool(task.sentinel_kind)
+    sentinel = traits.sentinels and task is not None and bool(task.sentinel_kind)
     # DW-11: hide what an earlier resolve cycle already answered. `start` is the task's
     # own watermark — 0 for a task never resolved, and for every pre-upgrade
     # `state.json`, which is the unfiltered pre-DW-11 walk.
@@ -452,6 +454,16 @@ def build_context(
     # underlying ambiguity instead). Sprint mode leaves the context unchanged.
     if stories_ctx:
         context["stories"] = stories_ctx
+    # tickets mode: the ticket the escalation is about, and its plan as it reads now —
+    # the status and blocked reason build-auto's HALT left, and its result excerpt.
+    if traits.name == worksource.SOURCE_TICKETS:
+        ticket_plan = context_spec_path
+        if ticket_plan is None and task is not None and task.ticket is not None:
+            # the binding records the plan absolute under the launch-time project
+            ticket_plan = rebase_recorded_project_path(
+                Path(task.ticket.plan), state, current_project_root
+            )
+        context["tickets"] = _tickets_context(run_dir, story_key, task, plan_path=ticket_plan)
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2, allow_nan=False), encoding="utf-8")
@@ -510,6 +522,61 @@ def _stories_context(
             "path": sentinel_path.as_posix() if sentinel_path is not None else None,
             "blocking_condition": condition,
         }
+    return ctx
+
+
+# How much of a ticket plan's `## Auto Run Result` the resolve context carries.
+TICKET_RESULT_EXCERPT_CHARS = 2000
+
+
+def _tickets_context(
+    run_dir: Path, story_key: str, task: StoryTask | None, *, plan_path: Path | None
+) -> dict[str, Any]:
+    """The tickets-mode extension of the resolve context: the ticket binding the run
+    persisted (``ref``, ``ticket_id``, ``title``, ``epic``), the plan path, and what
+    the plan reads now — ``plan_status``, ``blocked_reason`` and an excerpt of its
+    ``## Auto Run Result`` (``auto_run_result``). Read natively, never through
+    ``tickets.py``. A plan that is absent reads as nulls; one that cannot be read
+    reads as nulls too, and so do the frontmatter fields of a plan whose
+    frontmatter is missing, unparseable or not a mapping. Either fault is
+    journaled as ``resolve-ticket-context-unreadable`` so the null is never
+    mistaken for an empty plan."""
+    ticket = task.ticket if task is not None else None
+    plan = plan_path if plan_path is not None else Path(ticket.plan) if ticket else None
+    ctx: dict[str, Any] = {
+        "ref": ticket.ref if ticket else None,
+        "ticket_id": ticket.id if ticket else None,
+        "title": ticket.title if ticket else None,
+        "epic": ticket.epic_slug if ticket else None,
+        "plan": plan.as_posix() if plan is not None else None,
+        "plan_status": None,
+        "blocked_reason": None,
+        "auto_run_result": None,
+    }
+    if plan is None or not plan.exists():
+        return ctx
+    try:
+        text = plan.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as e:
+        Journal(run_dir).append(
+            "resolve-ticket-context-unreadable",
+            story_key=story_key,
+            plan=str(plan),
+            error=f"{e.__class__.__name__}: {e}",
+        )
+        return ctx
+    result = devcontract.parse_auto_run_result(text)
+    ctx["auto_run_result"] = result.detail[:TICKET_RESULT_EXCERPT_CHARS] if result.present else None
+    fault = frontmatter.frontmatter_fault(text)
+    if fault is not None:
+        Journal(run_dir).append(
+            "resolve-ticket-context-unreadable", story_key=story_key, plan=str(plan), error=fault
+        )
+        return ctx
+    fm = frontmatter.parse_frontmatter(text)
+    reason = fm.get("blocked_reason")
+    ctx["plan_status"] = frontmatter.status_of(fm) or None
+    ctx["blocked_reason"] = str(reason) if reason not in (None, "") else None
     return ctx
 
 

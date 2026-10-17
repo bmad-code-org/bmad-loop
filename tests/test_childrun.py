@@ -483,7 +483,41 @@ def test_run_argv_spawns_the_list_without_a_shell_and_with_devnull_stdin(tmp_pat
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["stdout"] is subprocess.PIPE and kwargs["stderr"] is subprocess.PIPE
     assert kwargs["text"] is True and kwargs["errors"] == "replace"
+    assert kwargs["encoding"] is None  # the locale codec unless a caller asks
     assert kwargs["cwd"] == tmp_path
+
+
+def test_run_argv_decodes_with_the_requested_encoding(tmp_path, monkeypatch):
+    """`encoding=` reaches `Popen`, so a child that writes UTF-8 decodes as UTF-8
+    even where the locale codec is cp1252 (Windows). The locale is simulated by a
+    `Popen` wrapper that fills in cp1252 wherever the caller left the codec
+    unset; the default call is the control, showing the simulation bites.
+
+    Ablation: drop `encoding=encoding` from `run_argv`'s `Popen` call and the
+    requested-codec run decodes as cp1252 mojibake, failing the first assertion."""
+    real_popen = subprocess.Popen
+
+    def cp1252_locale_popen(args, **kwargs):
+        if kwargs.get("encoding") is None:
+            kwargs["encoding"] = "cp1252"
+        return real_popen(args, **kwargs)
+
+    monkeypatch.setattr(childrun.subprocess, "Popen", cp1252_locale_popen)
+    text = "café ✓"
+    code = (
+        "import sys;"
+        f"sys.stdout.buffer.write({text!r}.encode('utf-8'));"
+        f"sys.stderr.buffer.write({text!r}.encode('utf-8'))"
+    )
+    argv = (sys.executable, "-c", code)
+
+    run = childrun.run_argv(argv, cwd=tmp_path, timeout=30, encoding="utf-8")
+    assert run.returncode == 0
+    assert (run.stdout, run.stderr) == (text, text)
+
+    default = childrun.run_argv(argv, cwd=tmp_path, timeout=30)
+    assert default.returncode == 0
+    assert default.stdout != text and default.stdout == text.encode("utf-8").decode("cp1252")
 
 
 def test_run_argv_propagates_spawn_faults(tmp_path):

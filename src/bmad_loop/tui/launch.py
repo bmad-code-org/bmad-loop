@@ -1377,7 +1377,7 @@ def start_run_detached(
     run_id: str,
     *,
     spec: str | None = None,
-    epic: int | None = None,
+    epic: int | str | None = None,  # str: a tickets-mode epic id or slug
     story: str | None = None,
     max_stories: int | None = None,
 ) -> str | None:

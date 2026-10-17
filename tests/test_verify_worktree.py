@@ -6902,3 +6902,29 @@ def test_integrated_stray_paths_leaves_the_receipt_sets_to_their_own_readings(pr
     assert verify.integrated_stray_paths(
         repo, tolerated=(), incoming=(), retained_checkouts=()
     ) == ("module/", "src.txt", "stray.txt")
+
+
+def test_git_toplevel_none_outside_repo(tmp_path):
+    """A repo answers its canonical working-tree root (from a subdirectory too); a
+    folder in no repository — or one that does not exist — answers None."""
+    repo = tmp_path / "repo"
+    (repo / "sub").mkdir(parents=True)
+    git(repo, "init", "-q")
+    assert verify.git_toplevel(repo / "sub") == repo.resolve()
+    outside = tmp_path / "plain"
+    outside.mkdir()
+    assert verify.git_toplevel(outside) is None
+    assert verify.git_toplevel(tmp_path / "missing") is None
+
+
+def test_git_toplevel_raises_on_spawn_fault(tmp_path, monkeypatch):
+    """A git that never answered is not "no repository": the typed fault propagates.
+    Ablation (performed): wrap the `_run_git` call in `except GitError: return None`
+    and this FAILS."""
+
+    def boom(*_a, **_k):
+        raise verify.GitSpawnError(f"git rev-parse failed to spawn in {tmp_path}")
+
+    monkeypatch.setattr(verify, "_run_git", boom)
+    with pytest.raises(verify.GitSpawnError):
+        verify.git_toplevel(tmp_path)

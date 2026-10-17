@@ -1,0 +1,16 @@
+[bmod]
+code = "bmad-loop"
+version = "0.13.2"
+update_source = "github:bmad-code-org/bmad-loop/src/bmad_loop/data/skills"
+skills = ["bmad-loop-setup", "bmad-loop-resolve", "bmad-loop-sweep"]
+required_skills = [
+  { skill = "bmad", version = "6.13.0", source = "github:bmad-code-org/BMAD-METHOD/skills" },
+  { skill = "bmad-build-auto", version = "6.13.0", source = "github:bmad-code-org/BMAD-METHOD/skills" },
+]
+recommended_skills = [
+  { skill = "bmad-ticket", source = "github:bmad-code-org/BMAD-METHOD/skills" },
+  { skill = "bmad-retrospective", source = "github:bmad-code-org/BMAD-METHOD/skills" },
+]
+pre_install_message = ""
+post_install_message = """BMAD Loop skills are installed.
+Run /bmad-loop-setup to install the bmad-loop orchestrator (a uv tool) and wire this project for it."""
