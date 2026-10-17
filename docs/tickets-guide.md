@@ -138,7 +138,7 @@ A code rollback re-arms the plan too: a plan past `ready-for-dev` returns to `re
 
 On v7 the deferred-work ledger is `deferred-work.md` in the initiative folder. When a ticket's plan reaches `built`, its frontmatter `deferred:` findings are harvested into the ledger, each naming the plan by its path inside the initiative folder.
 
-A ledger `gate:` holds a ticket until the entry closes. In tickets mode a gate token names a ticket ref (`1.2`), or an epic by id (`1`) or folder (`epic-cart`). A backlog file name gates nothing, since backlog rows never dispatch, so `validate` warns about it. A v6 story key (`1-2-foo`) cannot be matched: it fails `deferred.hard-gate` in `validate` and pauses the run at `story-gate` until it is rewritten.
+A ledger `gate:` holds a ticket until the entry closes. In tickets mode a gate token names a ticket ref (`1.2`), or an epic by id (`1`) or folder (`epic-cart`). A backlog file name gates nothing, since backlog rows never dispatch, and neither does an id of `true` or `false`, which `tickets.py` reads as a boolean. `validate` warns about both. A v6 story key (`1-2-foo`) cannot be matched: it fails `deferred.hard-gate` in `validate` and pauses the run at `story-gate` until it is rewritten.
 
 Sweeps run on v7 initiatives with no sprint board; each bundle writes `plan-<slug>.md` in the initiative folder and closes at `built`. A sweep is pinned to the initiative it started on, and pre-answers are kept per initiative in `.bmad-loop/decisions-<initiative>.json`. See [Sweeps on BMAD v7](sweep-guide.md#sweeps-on-bmad-v7) and [Hard gates](sweep-guide.md#hard-gates).
 
