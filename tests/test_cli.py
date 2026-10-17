@@ -7389,15 +7389,49 @@ def test_a_refusal_journal_never_recreates_a_run_cleanup_removed(tmp_path, monke
     assert not run_dir.exists()
 
 
-def test_a_refusal_journal_never_lands_in_a_run_its_id_only_suffixes(tmp_path):
+def test_a_refusal_journal_never_lands_in_a_run_its_id_only_suffixes(tmp_path, capsys):
     # The refused run is gone; a re-resolve of its id would fall back to a
     # suffix match. Ablation: journal through `runs.resolve_run_dir` and the
-    # entry lands in `other-r1`.
+    # entry lands in `other-r1`; return silently on the partial match and no
+    # warning is printed.
     other = _escalated_run(tmp_path, "other-r1")
     cli._journal_unaccepted_launch(
         argparse.Namespace(project=str(tmp_path), run_id="r1", command="resume"), "refused"
     )
     assert _ctl_launch_entries(other) == []
+    err = capsys.readouterr().err
+    assert "could not journal this refused launch: run 'r1' is gone" in err
+    assert "'other-r1'" in err
+
+
+@pytest.mark.parametrize("raised", [False, True])
+def test_a_launched_refusal_with_one_huge_line_is_cut_before_journaling(
+    tmp_path, monkeypatch, capsys, raised
+):
+    # The line trim bounds the count, not a line, and an exception's message
+    # skips it. Ablation: drop the cut in `_journal_unaccepted_launch` and the
+    # entry holds the whole scalar in both rows.
+    run_dir = _escalated_run(tmp_path, "r1")
+    huge = "x" * 100_000
+
+    def refuse(_args):
+        if raised:
+            raise policy_mod.PolicyError(f"bad scalar {huge}")
+        print(f"bad scalar {huge}", file=sys.stderr)
+        return 1
+
+    args = argparse.Namespace(
+        func=refuse, project=str(tmp_path), run_id="r1", command="resume", ctl_launch=True
+    )
+    if raised:
+        with pytest.raises(policy_mod.PolicyError):
+            cli._drive_ctl_launch(args)
+    else:
+        assert cli._drive_ctl_launch(args) == 1
+    capsys.readouterr()
+    [error] = [e["error"] for e in _ctl_launch_entries(run_dir)]
+    assert "bad scalar x" in error and "more chars cut]" in error
+    assert len(error) < cli._CTL_REFUSAL_MAX_CHARS + 500
 
 
 def test_a_refusal_journal_never_lands_outside_the_runs_dir(tmp_path):

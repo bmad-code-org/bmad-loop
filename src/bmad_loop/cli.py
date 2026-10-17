@@ -5314,7 +5314,8 @@ class _CtlLaunch:
 
     def write(self, text: str) -> int:
         if not self.accepted:
-            # ponytail: capped so a chatty refusal cannot bloat the journal entry.
+            # ponytail: capped so a chatty refusal cannot bloat the journal entry;
+            # one huge line is bounded by `_CTL_REFUSAL_MAX_CHARS` instead.
             self.lines.extend(line.strip() for line in text.splitlines() if line.strip())
             del self.lines[:-20]
         return self._stream.write(text)
@@ -5328,6 +5329,11 @@ class _CtlLaunch:
 
 # ponytail: process-wide, which is what the flag is — one command per process.
 _ctl_launch: _CtlLaunch | None = None
+
+# The most of a refused launch's reason one journal entry keeps: the line trim
+# bounds the count, not a line (a validator echoing one huge policy scalar), and
+# an exception's message skips it.
+_CTL_REFUSAL_MAX_CHARS = 4000
 
 
 def _claim_ctl_window(project: Path, run_dir: Path) -> None:
@@ -5399,11 +5405,24 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
     `finally`, so a raise from it would replace the child's own exception or
     return code. A `RunRefError` is said like any other fault, never read as
     absence: an incomplete run listing raises one for a run that is still
-    there, and a silent return would strand the refusal again."""
+    there, and a silent return would strand the refusal again. A partial match is
+    said too: it is not journaled into, so the refusal is on no record.
+
+    The reason is cut to `_CTL_REFUSAL_MAX_CHARS`, so a huge refusal cannot bloat
+    every failed resume's journal row."""
+    if len(reason) > _CTL_REFUSAL_MAX_CHARS:
+        cut = len(reason) - _CTL_REFUSAL_MAX_CHARS
+        reason = f"{reason[:_CTL_REFUSAL_MAX_CHARS]}… [{cut} more chars cut]"
     try:
         run_dir = runs.resolve_run_dir(_project(args), args.run_id)
         if run_dir.name != args.run_id:
-            return  # a partial match, not the run this command resolved
+            # a partial match, not the run this command resolved
+            print(
+                f"warning: could not journal this refused launch: run {args.run_id!r} "
+                f"is gone; its id only matches run {run_dir.name!r}",
+                file=sys.stderr,
+            )
+            return
         with state_lock(run_dir):
             if runs.is_run(run_dir):
                 Journal(run_dir).append(
