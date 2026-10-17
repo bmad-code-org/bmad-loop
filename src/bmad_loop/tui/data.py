@@ -931,6 +931,10 @@ _deferred_cache: dict[Path, tuple[_StatSig | None, list[DeferredItem] | None]] =
 _missed_cache: dict[Path, tuple[Any, MissedDecisions]] = {}
 # project spelling as asked -> why `_project_paths` last answered None for it
 _paths_fault: dict[Path, str] = {}
+# the same two, for the tickets-mode resolution (`want_tickets`): a mixed v6/v7
+# install answers v6 paths without it and v7 paths with it
+_tickets_paths_cache: dict[Path, tuple[tuple[object, ...], bmadconfig.ProjectPaths]] = {}
+_tickets_paths_fault: dict[Path, str] = {}
 
 
 def _config_source_sig(path: Path) -> object:
@@ -947,27 +951,38 @@ def _config_source_sig(path: Path) -> object:
     return ((st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode), _stat_sig(path))
 
 
-def _project_paths(project: Path) -> bmadconfig.ProjectPaths | None:
+def _project_paths(project: Path, *, want_tickets: bool = False) -> bmadconfig.ProjectPaths | None:
     """BMAD artifact paths, stat-gated on every config source `load_paths` reads
-    (the four central TOML layers and the legacy config.yaml), so an edit to any
-    of them is seen on the next call; None when the project is not initialized
-    (or the config is unreadable) — why is left in ``_paths_fault`` under the
-    spelling asked, for a caller that must say so rather than answer empty."""
+    (the four central TOML layers, the legacy config.yaml and the v7 marker that
+    picks the era), so an edit to any of them is seen on the next call; None when
+    the project is not initialized (or the config is unreadable) — why is left in
+    ``_paths_fault`` (``_tickets_paths_fault`` under ``want_tickets``) under the
+    spelling asked, for a caller that must say so rather than answer empty.
+    ``want_tickets`` resolves as a tickets run does, so a mixed install answers v7."""
     asked = project
     project = resolve_or_lexical(project)
-    sources = (*bmadconfig.CENTRAL_LAYERS_REL, bmadconfig.LEGACY_CONFIG_REL)
+    cache, faults = (
+        (_tickets_paths_cache, _tickets_paths_fault)
+        if want_tickets
+        else (_paths_cache, _paths_fault)
+    )
+    sources = (
+        *bmadconfig.CENTRAL_LAYERS_REL,
+        bmadconfig.LEGACY_CONFIG_REL,
+        bmadconfig.V7_MARKER_REL,
+    )
     config_sigs = tuple(_config_source_sig(project / rel) for rel in sources)
-    cached_paths = _paths_cache.get(project)
+    cached_paths = cache.get(project)
     if cached_paths is not None and cached_paths[0] == config_sigs:
-        _paths_fault.pop(asked, None)
+        faults.pop(asked, None)
         return cached_paths[1]
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = bmadconfig.load_paths(project, want_tickets=want_tickets)
     except (bmadconfig.BmadConfigError, OSError) as e:
-        _paths_fault[asked] = _describe(e)
+        faults[asked] = _describe(e)
         return None
-    _paths_fault.pop(asked, None)
-    _paths_cache[project] = (config_sigs, paths)
+    faults.pop(asked, None)
+    cache[project] = (config_sigs, paths)
     return paths
 
 
@@ -1129,10 +1144,12 @@ def tickets_overview(project: Path, state: RunState) -> TicketsBoard:
 def project_tickets_overview(project: Path) -> TicketsBoard:
     """The board a new tickets run would start from: the project's live ``[core]
     active_initiative``. A project that is not v7, or names no initiative, says
-    so in ``fault``. Spawns like :func:`initiative_board` — off the UI thread."""
-    paths = _project_paths(project)
+    so in ``fault``. Resolves as ``bmad-loop run`` does in tickets mode, so a mixed
+    v6/v7 install previews its v7 initiative. Spawns like :func:`initiative_board`
+    — off the UI thread."""
+    paths = _project_paths(project, want_tickets=True)
     if paths is None:
-        why = _paths_fault.get(project, "the project is not initialized")
+        why = _tickets_paths_fault.get(project, "the project is not initialized")
         return TicketsBoard((), f"BMAD config unreadable: {why}", "")
     if paths.era != "v7" or paths.initiative_folder is None or not paths.active_initiative:
         return TicketsBoard((), "no v7 active initiative ([core] active_initiative)", "")

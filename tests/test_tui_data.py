@@ -16,6 +16,7 @@ from conftest import (
     FakeTicketTree,
     install_bmad_central_config,
     install_bmad_config,
+    install_bmad_v7,
     refuse_to_resolve,
     ticket_row,
     write_sprint,
@@ -1503,6 +1504,41 @@ def test_tickets_overview_unavailable_without_initiative(tmp_path, monkeypatch):
     preview = data.project_tickets_overview(tmp_path)  # no BMAD config at all
     assert preview.rows == ()
     assert preview.fault is not None and preview.fault.startswith("BMAD config unreadable")
+
+
+def test_project_tickets_overview_resolves_a_mixed_install_as_tickets_mode(tmp_path, monkeypatch):
+    """A v7 install with the v6 keys left behind resolves v6 for an auto-detecting
+    read but v7 for a tickets run (`load_paths(want_tickets=True)`). The start-run
+    preview shows the board that run would start from, so it reads the v7 active
+    initiative rather than answering "no v7 active initiative".
+
+    Ablation (performed): resolve the preview with `_project_paths(project)` (no
+    `want_tickets`) and this FAILS on the fault."""
+    root = tmp_path / "mixed"
+    root.mkdir()
+    layout = install_bmad_v7(root)
+    (root / "_bmad" / "custom" / "config.toml").write_text(
+        "[modules.bmm]\n"
+        'planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"\n'
+        'implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(data, "_paths_cache", {})
+    monkeypatch.setattr(data, "_tickets_paths_cache", {})
+    read: list[tuple[str, Path]] = []
+
+    def board(project: Path, initiative: str, folder: Path) -> data.TicketsBoard:
+        read.append((initiative, folder))
+        return data.TicketsBoard((), None, initiative)
+
+    monkeypatch.setattr(data, "initiative_board", board)
+    sprint_paths = data._project_paths(root)
+    assert sprint_paths is not None and sprint_paths.era == "v6"  # the auto-detect stays v6
+
+    preview = data.project_tickets_overview(root)
+    assert preview.fault is None
+    assert read == [(layout.initiative, layout.initiative_folder.resolve())]
+    assert data._project_paths(root) is sprint_paths  # its own cache entry, untouched
 
 
 # ------------------------------------------------------------- deferred work
