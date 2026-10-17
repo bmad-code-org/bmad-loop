@@ -11949,3 +11949,271 @@ def test_capture_pane_argv_reads_the_visible_screen(monkeypatch, force_tmux_back
     monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
     assert get_multiplexer().capture_pane("@7") == BYPASS_FOOTER
     assert calls == [["tmux", "-u", "capture-pane", "-p", "-t", "@7"]]
+
+
+# --- BMAD v7 ticket contract: success_statuses / fallback_result_dirs ---
+#
+# A v7 ticket session is always pinned to its plan (`expected_spec`, attempt one
+# included: `tickets.py find` names the plan before dispatch). A build finishes the
+# plan at `built`, so the tickets engine hands `success_statuses=("built",)`; a
+# build that cannot resolve its ticket HALTs into the initiative folder, which the
+# engine names through `fallback_result_dirs`. Every v6 session keeps the defaults
+# (`("done",)`, `()`), so each test below also pins the v6 answer.
+
+# A whole-second launch floor, so `older`/`newer` mtimes clear every filesystem's
+# granularity (see `_MTIME_TICK_NS`).
+_V7_LAUNCH_NS = 1_700_000_000 * 10**9
+
+_BUILT_PLAN = (
+    "---\nticket: 7\nstatus: built\nbaseline_revision: abc123\n"
+    "followup_review_recommended: true\n---\n\n# Plan\n\n"
+    "## Auto Run Result\n\nStatus: built\nBuilt the ticket.\n"
+)
+_MARKERLESS_BUILT_PLAN = (
+    "---\nticket: 7\nstatus: built\nbaseline_revision: abc123\n---\n\n# Plan\n\nBuilt.\n"
+)
+_UNTOUCHED_PLAN = "---\nticket: 7\nstatus: ready-for-dev\n---\n\n# Plan\n\nNot started.\n"
+_FALLBACK_BLOCKED = (
+    "---\nstatus: blocked\n---\n\n# BMad Build Auto Result\n\n"
+    "Status: blocked\nBlocking condition: could not resolve ticket 7\n"
+)
+
+
+def _v7_write(path: Path, body: str, *, after_launch: bool = True) -> Path:
+    """Write ``body`` to ``path`` with an mtime one second after (or before) the
+    v7 test launch floor."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    ns = _V7_LAUNCH_NS + (10**9 if after_launch else -(10**9))
+    os.utime(path, ns=(ns, ns))
+    return path
+
+
+def _v7_handle() -> SessionHandle:
+    return _dev_handle(launched_ns=_V7_LAUNCH_NS)
+
+
+def _v7_initiative(tmp_path) -> Path:
+    return tmp_path / "_bmad-output" / "initiatives" / "init-a"
+
+
+def _ticket_spec(
+    tmp_path,
+    plan: Path,
+    *,
+    success: tuple[str, ...] = ("built",),
+    fallback_dirs: tuple[Path, ...] = (),
+) -> SessionSpec:
+    """A dev SessionSpec pinned to a v7 ticket plan, as the tickets engine threads it."""
+    return dataclasses.replace(
+        _dev_spec(tmp_path),
+        expected_spec=str(plan),
+        success_statuses=success,
+        fallback_result_dirs=fallback_dirs,
+    )
+
+
+def test_known_plan_readback_on_attempt_one(tmp_path, monkeypatch):
+    """Attempt one of a ticket is already pinned to its plan. A plan at `built`
+    carrying its marker synthesizes `built` with no escalation, and the threaded
+    `success_statuses` carries `followup_review_recommended` (a successful exit).
+    Under the v6 default the marker alone still makes the plan terminal, so it
+    synthesizes too, but `built` is no success there and the flag is not carried.
+
+    Marker-less, only the frontmatter can end the session: `built` is a
+    frontmatter candidate (dead-window single sighting) under `("built",)` and not
+    one at all under the default, which never treated `built` as terminal."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    plan = _v7_write(_v7_initiative(tmp_path) / "plans" / "plan-7-foo.md", _BUILT_PLAN)
+
+    rj = adapter._result_json(_v7_handle(), _ticket_spec(tmp_path, plan), wait=False)
+    assert rj is not None
+    assert rj["status"] == "built"
+    assert rj["escalations"] == []
+    assert rj["spec_file"] == str(plan)
+    assert rj["story_key"] == "3-1"
+    assert rj["followup_review_recommended"] is True
+
+    v6 = _ticket_spec(tmp_path, plan, success=("done",))
+    rj = adapter._result_json(_v7_handle(), v6, wait=False)
+    assert rj is not None and rj["status"] == "built" and rj["escalations"] == []
+    assert "followup_review_recommended" not in rj
+
+    _v7_write(plan, _MARKERLESS_BUILT_PLAN)
+    sr = adapter._synth_result(
+        _v7_handle(), _ticket_spec(tmp_path, plan), wait=False, dead_window=True
+    )
+    assert sr is not None and sr.result_json is not None
+    assert sr.result_json["status"] == "built"
+    assert sr.result_json["synthesized_from_frontmatter"] is True
+    assert sr.result_json["escalations"] == []
+
+    assert adapter._synth_result(_v7_handle(), v6, wait=False, dead_window=True) is None
+
+
+def test_fallback_dirs_only_prefixed_files(tmp_path, monkeypatch):
+    """The owed plan is untouched (pre-launch, non-terminal, no marker), so the
+    read-back probes `fallback_result_dirs` for the skill's no-spec fallback, by
+    NAME only: a `bmad-build-auto-result-*` file written after launch is this
+    session's HALT and synthesizes as a blocked escalation. A foreign spec in the
+    same folder carries a real marker and a terminal status and is never read
+    (#261) — without the prefixed file the answer is None, not the foreign spec.
+
+    Also pinned: a prefixed file older than launch is not this session's; a
+    RELATIVE fallback dir rebases on `spec.cwd`, not the process cwd; an empty
+    `fallback_result_dirs` (every v6 session) never probes; and a plan that IS a
+    terminal frontmatter candidate is never second-guessed by the probe.
+
+    Ablation, performed: probing with `devcontract.find_result_artifact` (every
+    marker-carrying `*.md`) instead of `find_fallback_result_artifact` adopts the
+    foreign `spec-other.md` and fails the "without (b)" assertion; dropping the
+    `not is_frontmatter_candidate(...)` guard trips the boom below."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    initiative = _v7_initiative(tmp_path)
+    plan = _v7_write(initiative / "plans" / "plan-7-foo.md", _UNTOUCHED_PLAN, after_launch=False)
+    foreign = _v7_write(initiative / "spec-other.md", _FOREIGN_DONE)
+
+    # Without the prefixed file: the foreign marker spec is never adopted.
+    spec = _ticket_spec(tmp_path, plan, fallback_dirs=(initiative,))
+    assert adapter._result_json(_v7_handle(), spec, wait=False) is None
+    assert adapter._synth_result(_v7_handle(), spec, wait=False, dead_window=True) is None
+
+    # A prefixed file from before launch belongs to some earlier session.
+    fallback = _v7_write(
+        initiative / "bmad-build-auto-result-x.md", _FALLBACK_BLOCKED, after_launch=False
+    )
+    assert adapter._result_json(_v7_handle(), spec, wait=False) is None
+
+    # Written after launch: this session's HALT.
+    _v7_write(fallback, _FALLBACK_BLOCKED)
+    rj = adapter._result_json(_v7_handle(), spec, wait=False)
+    assert rj is not None
+    assert rj["status"] == "blocked"
+    assert rj["spec_file"] == str(fallback)
+    (esc,) = rj["escalations"]
+    assert esc["type"] == "blocked"
+    assert esc["spec_file"] == str(fallback) != str(foreign)
+
+    # A relative entry resolves against spec.cwd, never the process cwd.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    relative = _ticket_spec(tmp_path, plan, fallback_dirs=(initiative.relative_to(tmp_path),))
+    rj = adapter._result_json(_v7_handle(), relative, wait=False)
+    assert rj is not None and rj["spec_file"] == str(fallback)
+
+    # v6: no fallback dirs, no probe — the prefixed file outside the owed path is
+    # invisible, exactly as before.
+    v6 = _ticket_spec(tmp_path, plan, success=("done",))
+    assert adapter._result_json(_v7_handle(), v6, wait=False) is None
+    assert adapter._synth_result(_v7_handle(), v6, wait=False, dead_window=True) is None
+
+    # The plan carries a terminal frontmatter: the plan is the answer, the
+    # fallback folder is never probed.
+    _v7_write(plan, _MARKERLESS_BUILT_PLAN)
+
+    def boom(*a, **k):
+        raise AssertionError("fallback dirs must not be probed while the plan is terminal")
+
+    monkeypatch.setattr(generic.devcontract, "find_fallback_result_artifact", boom)
+    sr = adapter._synth_result(_v7_handle(), spec, wait=False, dead_window=True)
+    assert sr is not None and sr.result_json is not None
+    assert sr.result_json["status"] == "built"
+    assert sr.result_json["spec_file"] == str(plan)
+
+
+def test_post_kill_rescue_honors_success_statuses(tmp_path):
+    """Dead window, plan at `built` with a consistent marker: a ticket session
+    (`success_statuses=("built",)`) lost its Stop after finishing, so it is
+    rescued exactly like a v6 `done`. Under the default `("done",)` the same
+    artifact is no successful terminal and the original verdict stands.
+
+    Ablation, performed: reverting the rescue gate to
+    `rj.get("status") == devcontract.DONE` keeps the stall verdict for the
+    `built` case and fails the first assertion."""
+    adapter, _ = make_dev_adapter(tmp_path)
+    adapter._window_alive = lambda handle: False
+    plan = _v7_write(_v7_initiative(tmp_path) / "plans" / "plan-7-foo.md", _BUILT_PLAN)
+
+    result = adapter._post_kill_reconcile(_v7_handle(), _ticket_spec(tmp_path, plan), _unvouched())
+    assert result.status == "completed"
+    assert result.result_json["status"] == "built"
+    assert result.result_json["post_kill_reconciled"] is True
+    assert result.session_id == "sess"
+
+    original = _unvouched()
+    v6 = _ticket_spec(tmp_path, plan, success=("done",))
+    assert adapter._post_kill_reconcile(_v7_handle(), v6, original) is original
+
+
+def test_observe_tick_ignores_success_status(tmp_path):
+    """#276 M2 under the ticket contract: a plan moving from its launch
+    `in-review` to `built` reaches a successful terminal, which is the Stop
+    harvest's business, so no transition is recorded. Under the v6 default
+    `built` is just another non-terminal token and IS recorded, unchanged."""
+    for success, expected in ((("built",), None), (("done",), "built")):
+        sub = tmp_path / success[0]
+        sub.mkdir()
+        adapter, impl = make_dev_adapter(sub)
+        plan = impl / "plan-7-foo.md"
+        plan.write_text("---\nstatus: in-review\n---\n\n# Plan\n", encoding="utf-8")
+        snap = dataclasses.replace(_snap(plan), fm_status="in-review")
+        plan.write_text("---\nstatus: built\n---\n\n# Plan\n\nBuilt.\n", encoding="utf-8")
+        spec = dataclasses.replace(
+            _dev_spec(sub), role="review", spec_snapshot=snap, success_statuses=success
+        )
+
+        adapter._observe_tick(_dev_handle(), spec)
+
+        crumbs = _lifecycle_events(adapter, "spec-status-transition-observed")
+        if expected is None:
+            assert adapter._fm_transition_obs == {}
+            assert crumbs == []
+        else:
+            assert adapter._fm_transition_obs == {"3-1-dev-1": expected}
+            (crumb,) = crumbs
+            assert crumb["status"] == expected
+
+
+@pytest.mark.parametrize("known_spec", [False, True], ids=["scan", "known-spec"])
+def test_synthesize_from_threads_plan_halt_and_success_statuses(tmp_path, monkeypatch, known_spec):
+    """`_synthesize_from` hands `synthesize_result` the session's plan-halt leg
+    (`BMAD_LOOP_PLAN_HALT`) on the scan and known-spec paths, not only on the
+    stories read-back. A marker-carrying plan at `ready-for-dev` synthesizes the
+    `plan_halt` marker only with the env set; a marker-less one is a terminal
+    frontmatter candidate only with it set, and without it is non-terminal."""
+    adapter, impl = make_dev_adapter(tmp_path)
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    plan = impl / "spec-3-1-foo.md"
+
+    def make_spec(halt: bool) -> SessionSpec:
+        spec = _dev_spec(tmp_path)
+        if known_spec:
+            spec = dataclasses.replace(spec, expected_spec=str(plan))
+        if halt:
+            spec.env["BMAD_LOOP_PLAN_HALT"] = "1"
+        return spec
+
+    plan.write_text(
+        "---\nstatus: ready-for-dev\nbaseline_revision: abc123\n---\n\n# Plan\n\n"
+        "## Auto Run Result\n\nStatus: ready-for-dev\nPlanned.\n",
+        encoding="utf-8",
+    )
+    rj = adapter._result_json(_dev_handle(), make_spec(True), wait=False)
+    assert rj is not None and rj["plan_halt"] is True and rj["escalations"] == []
+    rj = adapter._result_json(_dev_handle(), make_spec(False), wait=False)
+    assert rj is not None and "plan_halt" not in rj
+
+    plan.write_text(
+        "---\nstatus: ready-for-dev\nbaseline_revision: abc123\n---\n\n# Plan\n\nPlanned.\n",
+        encoding="utf-8",
+    )
+    sr = adapter._synth_result(_dev_handle(), make_spec(True), wait=False, dead_window=True)
+    assert sr is not None and sr.result_json is not None
+    assert sr.result_json["plan_halt"] is True
+    assert sr.result_json["synthesized_from_frontmatter"] is True
+    assert (
+        adapter._synth_result(_dev_handle(), make_spec(False), wait=False, dead_window=True) is None
+    )

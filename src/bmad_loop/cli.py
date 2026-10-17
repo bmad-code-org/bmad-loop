@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from stat import S_ISREG
@@ -38,7 +39,12 @@ from . import (
 )
 from . import stories as stories_mod
 from . import (
+    ticketmodel,
+    tickets_source,
+    ticketstore,
+    tickettree,
     verify,
+    worksource,
 )
 
 # Re-exported for the test suite, which stubs `_platform_preflight` with
@@ -107,6 +113,7 @@ from .sweep import (
     resolve_sweep_override,
     select_entries,
 )
+from .tickets_engine import TicketsEngine
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -336,6 +343,36 @@ def _reject_isolation_conflict(paths: bmadconfig.ProjectPaths, pol) -> int | Non
         return None
     print(conflict, file=sys.stderr)
     return 1
+
+
+def _sweep_store_source(paths: bmadconfig.ProjectPaths, pol: policy_mod.Policy) -> str:
+    """:func:`ticketstore.sweep_store_source` under the policy's ``[stories]
+    source``."""
+    return ticketstore.sweep_store_source(paths, pol.stories.source)
+
+
+def _reject_store_topology(
+    project: Path, pol, source: str, *, recorded: dict[str, str | None] | None = None
+) -> int | None:
+    """Refuse a tickets run whose ticket store tickets runs cannot drive
+    (:func:`ticketstore.store_conflict`: a refused layout, or — given the run's
+    ``recorded`` ``RunState.store_topology`` — a store that changed since the run
+    started). Returns 1 to abort, None to proceed — the
+    :func:`_reject_isolation_conflict` sibling, called beside it from every
+    run-arming surface that returns an rc to a human; the surfaces without an rc
+    channel call the predicate itself. Outside tickets mode it is a no-op."""
+    conflict = ticketstore.store_conflict(project, source, pol.scm.isolation, recorded=recorded)
+    if conflict is None:
+        return None
+    print(f"error: {conflict}", file=sys.stderr)
+    return 1
+
+
+def _store_extra_args_roles(pol, source: str) -> tuple[str, ...]:
+    """The roles a ``source`` run launches whose resolved adapter sets
+    ``extra_args`` — for the ``tickets.store-sandbox`` warning."""
+    roles = worksource.launch_roles(source, pol.gates.retrospective)
+    return tuple(role for role in roles if pol.adapter.resolved(role).extra_args)
 
 
 def _reject_under_floor_git(project: Path) -> int | None:
@@ -651,35 +688,84 @@ def _check_opencode_version(report: ValidationReport, profile_name: str, resolve
         )
 
 
+def _report_bmad_config(report: ValidationReport, paths: bmadconfig.ProjectPaths) -> None:
+    """The `bmad-config` ok line, plus the v7 warnings. A v6 config reports exactly
+    as it always has; a v7 one names the era and the active initiative, warns when
+    none is active (the artifact dirs fell back to `output_folder`), and names each
+    leftover v6 key a mixed install resolved past."""
+    if paths.era != "v7":
+        report.ok(
+            "bmad-config",
+            f"BMAD config OK: artifacts at {paths.implementation_artifacts}",
+            {"implementation_artifacts": str(paths.implementation_artifacts)},
+        )
+        return
+    initiative = paths.active_initiative
+    report.ok(
+        "bmad-config",
+        f"BMAD v7 config OK: initiative {initiative or '(none)'}, "
+        f"artifacts at {paths.implementation_artifacts}",
+        {
+            "implementation_artifacts": str(paths.implementation_artifacts),
+            "era": paths.era,
+            "initiative": initiative,
+        },
+    )
+    if not initiative:
+        report.warn(
+            "bmad-config.initiative-unset",
+            "BMAD v7: no `[core] active_initiative` is set, so artifacts resolve to "
+            f"the output folder {paths.output_folder} — set one in "
+            "_bmad/custom/config.user.toml (or ask the `bmad` skill to switch it)",
+            {"output_folder": str(paths.output_folder)},
+        )
+    if paths.ignored_v6_keys:
+        report.warn(
+            "bmad-config.v6-keys-ignored",
+            "BMAD v7 resolved past leftover v6 keys: "
+            f"{'; '.join(paths.ignored_v6_keys)} — remove them (accept `bmad setup`'s "
+            "v6 cleanup) so every mode reads the same artifact home",
+            {"keys": list(paths.ignored_v6_keys)},
+        )
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     from .install import relay_registered
 
     project = _project(args)
     report = ValidationReport()
 
+    # Policy is READ first — its [stories].source (or a --spec override) selects
+    # which story-queue gate runs below (the sprint-status file, the stories.yaml
+    # manifest, or the v7 ticket tree), and tickets mode resolves a mixed install
+    # as BMAD v7 — but REPORTED after the BMAD config, as it always was. Loaded
+    # before the queue gate so a stories-only project is not failed on a missing
+    # sprint-status.yaml.
+    loaded_pol = None
+    policy_error: policy_mod.PolicyError | None = None
     try:
-        paths = bmadconfig.load_paths(project)
-        report.ok(
-            "bmad-config",
-            f"BMAD config OK: artifacts at {paths.implementation_artifacts}",
-            {"implementation_artifacts": str(paths.implementation_artifacts)},
-        )
+        loaded_pol = policy_mod.load(_policy_path(project))
+    except policy_mod.PolicyError as e:
+        policy_error = e
+    source, spec_folder = _resolve_source(args, loaded_pol)
+
+    try:
+        paths = bmadconfig.load_paths(project, want_tickets=source == worksource.SOURCE_TICKETS)
+        _report_bmad_config(report, paths)
     except bmadconfig.BmadConfigError as e:
         report.fail("bmad-config", str(e))
         paths = None
 
-    # Policy first — its [stories].source (or a --spec override) selects which
-    # story-queue gate runs below: the sprint-status file (sprint mode) or the
-    # stories.yaml manifest (stories mode). Loaded before the queue gate so a
-    # stories-only project is not failed on a missing sprint-status.yaml.
     from .adapters import registry as adapter_registry
     from .adapters.profile import ProfileError, external_profile_errors, get_profile
 
     profiles = []
     profile_by_name: dict[str, CLIProfile] = {}
     pol = None
-    try:
-        pol = policy_mod.load(_policy_path(project))
+    if policy_error is not None:
+        report.fail("policy", str(policy_error))
+    elif loaded_pol is not None:
+        pol = loaded_pol
         role_names = {role: pol.adapter.resolved(role).name for role in ROLES}
         report.ok(
             "policy",
@@ -695,8 +781,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 profile_by_name[name] = profile
             except ProfileError as e:
                 report.fail("adapter.profile", str(e), {"profile": name})
-    except policy_mod.PolicyError as e:
-        report.fail("policy", str(e))
 
     # #414: the one configuration where every gate below reports on a surface the
     # isolated run will never see — worktree isolation beside a `repo_root` the
@@ -754,31 +838,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else []
     )
 
-    stories_on, spec_folder = _stories_mode(args, pol)
     if paths:
-        if stories_on:
-            _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
-            _validate_deferred_ledger(paths, report, spec_folder=spec_folder)
-        else:
-            _validate_deferred_ledger(paths, report)
-            _validate_operator_registry(project, paths, report)
-            try:
-                ss = sprintstatus.load(paths.sprint_status)
-                actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-                report.ok(
-                    "queue.sprint-status",
-                    f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable",
-                    {"stories": len(ss.stories), "actionable": len(actionable)},
-                )
-                if ss.unknown_keys:
-                    report.warn(
-                        "queue.sprint-status-unknown-keys",
-                        f"unknown keys ignored: {', '.join(ss.unknown_keys)}",
-                        {"unknown_keys": list(ss.unknown_keys)},
-                    )
-                _validate_nested_specs(paths.implementation_artifacts, report)
-            except sprintstatus.SprintStatusError as e:
-                report.fail("queue.sprint-status", str(e))
+        _QUEUE_VALIDATORS[source](
+            project,
+            paths,
+            spec_folder,
+            dev_trees,
+            report,
+            bool(getattr(args, "probes", False)),
+            pol,
+        )
 
     # `git_answers` carries ONE fact from this probe to the two below it: not
     # whether the tree was clean, but whether the binary answered at all. A
@@ -1383,10 +1452,30 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         # getattr, not args.json: cmd_validate is called directly by tests (and by
         # anything holding a hand-built Namespace) that predate the flag.
-        machine.emit(validate_document(report, stories_on, spec_folder))
+        machine.emit(
+            validate_document(
+                report,
+                worksource.validate_mode(source),
+                spec_folder,
+                initiative=paths.active_initiative if paths is not None else "",
+                era=paths.era if paths is not None else "",
+                ticket_store=_reported_ticket_store(report),
+            )
+        )
     else:
         report.render()
     return 0 if report.passed else 1
+
+
+def _reported_ticket_store(report: ValidationReport) -> dict[str, str | None] | None:
+    """The topology the ``tickets.store-topology`` ok finding classified, for
+    ``validate --json``'s ``ticket_store``; None when no store was classified."""
+    for finding in report.findings:
+        if finding.check == "tickets.store-topology" and finding.severity == "ok":
+            topology = (finding.detail or {}).get("topology")
+            if isinstance(topology, dict):
+                return {str(k): None if v is None else str(v) for k, v in topology.items()}
+    return None
 
 
 def cmd_mux(args: argparse.Namespace) -> int:
@@ -2047,7 +2136,7 @@ def _sprint_launch_roles(pol) -> tuple[str, ...]:
     """The roles a SPRINT-mode story run launches: dev + review, plus the auto
     retrospective's ``retro`` session when ``gates.retrospective = "auto"``
     (DW-389). Stories mode never crosses an epic boundary, so it stays dev + review."""
-    return ("dev", "review", "retro") if pol.gates.retrospective == "auto" else ("dev", "review")
+    return worksource.launch_roles(worksource.SOURCE_SPRINT, pol.gates.retrospective)
 
 
 def _warn_bypass_dropped(
@@ -2112,6 +2201,7 @@ def _warn_preflight_would_abort(
     pol,
     *,
     require_stories: bool = False,
+    require_tickets: bool = False,
     require_sweep: bool = False,
 ) -> None:
     """Dry-run honesty banner: say so when the real command would refuse to run.
@@ -2154,7 +2244,11 @@ def _warn_preflight_would_abort(
 
     ``require_sweep`` (the sweep dry-run) also mirrors `_require_sweep_skill`:
     the triage tree's ``bmad-loop-sweep`` is a sweep-only gate, so a story-run
-    preview must not promise an abort over it.
+    preview must not promise an abort over it. ``require_tickets`` (the tickets
+    dry-run) mirrors `_require_base_skills`' ``require_tickets`` finding set.
+    Both mirror the store-topology refusal (`_reject_store_topology`) the real
+    command applies: a tickets run's store, and the store of the source a sweep
+    works.
 
     The plugin trust preflight (`_reject_plugin_trust`, #496/#497) is mirrored too,
     fatal verdicts only: an inert never-granted plugin does not abort the launch.
@@ -2166,6 +2260,7 @@ def _warn_preflight_would_abort(
         p.message
         for p in install.missing_base_skills(paths.project, trees)
         + (install.missing_stories_support(paths.project, trees) if require_stories else [])
+        + (install.missing_tickets_support(paths.project, trees) if require_tickets else [])
         + (
             install.missing_sweep_skill(paths.project, _triage_trees(paths.project, pol))
             if require_sweep
@@ -2173,6 +2268,16 @@ def _warn_preflight_would_abort(
         )
         if p.severity == "problem"
     ]
+    # the store the launch judges: a tickets run's, or the one a sweep works
+    store_source = (
+        worksource.SOURCE_TICKETS
+        if require_tickets
+        else _sweep_store_source(paths, pol) if require_sweep else None
+    )
+    if store_source is not None and (
+        store := ticketstore.store_conflict(paths.project, store_source, pol.scm.isolation)
+    ):
+        problems.insert(0, store)
     conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
     if conflict is not None:
         problems.insert(0, conflict)
@@ -2259,6 +2364,7 @@ def _require_base_skills(
     grants: GrantSet,
     *,
     require_stories: bool = False,
+    require_tickets: bool = False,
     review_owed: bool = False,
 ) -> bool:
     """Preflight the upstream skills the orchestrator drives (the dev primitive —
@@ -2275,11 +2381,15 @@ def _require_base_skills(
     ``require_stories`` additionally content-probes the resolved primitive for
     folder+id dispatch — stories mode needs a newer skill than sprint mode, so an
     older install must fail loudly here rather than HALT `no stories.yaml`-style at
-    dispatch time. ``review_owed`` keeps the review tree gated (`_skill_trees`)."""
+    dispatch time. ``require_tickets`` likewise probes it for the ticket-tree
+    route tickets mode dispatches through. ``review_owed`` keeps the review tree
+    gated (`_skill_trees`)."""
     skill_trees = _skill_trees(project, pol, root, grants, review_owed=review_owed)
     findings = install.missing_base_skills(project, skill_trees)
     if require_stories:
         findings += install.missing_stories_support(project, skill_trees)
+    if require_tickets:
+        findings += install.missing_tickets_support(project, skill_trees)
     # Severity decides. A review layer we can't statically resolve (a `when` gate,
     # an unrecognized handoff phrasing, an unparseable override) is reported and
     # then stepped over: aborting on it would be the false FAIL of #260, only now
@@ -2329,19 +2439,29 @@ def _require_sweep_skill(project: Path, pol) -> bool:
     return False
 
 
-def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
-    """Resolve whether this run is stories mode and its spec folder.
+def _resolve_source(args: argparse.Namespace, pol) -> tuple[str, str]:
+    """Resolve the work source this run dispatches from and its spec folder.
 
     ``run --spec <folder>`` forces stories mode (overrides policy); otherwise the
-    run follows ``[stories].source``. Returns ``(is_stories, spec_folder)`` — the
-    folder is "" in sprint mode. ``pol`` may be None (e.g. a policy that failed to
-    load in ``validate``): then only an explicit ``--spec`` can force stories mode."""
+    run follows ``[stories].source``. Returns ``(source, spec_folder)`` — the
+    folder is "" for a source without one. ``pol`` may be None (e.g. a policy that
+    failed to load in ``validate``): then only an explicit ``--spec`` can move the
+    run off the sprint source."""
     spec = getattr(args, "spec", None)
     if spec:
-        return True, spec
-    if pol is not None and pol.stories.source == "stories":
-        return True, pol.stories.spec_folder
-    return False, ""
+        return worksource.SOURCE_STORIES, spec
+    if pol is None:
+        return worksource.SOURCE_SPRINT, ""
+    source = pol.stories.source
+    if worksource.traits_for(source).has_spec_folder:
+        return source, pol.stories.spec_folder
+    return source, ""
+
+
+def _stories_mode(args: argparse.Namespace, pol) -> tuple[bool, str]:
+    """:func:`_resolve_source` as ``(is_stories, spec_folder)``."""
+    source, spec_folder = _resolve_source(args, pol)
+    return source == worksource.SOURCE_STORIES, spec_folder
 
 
 def _validate_stories_folder(
@@ -2639,6 +2759,110 @@ def _validate_nested_specs(impl: Path, report: ValidationReport) -> None:
     )
 
 
+def _validate_sprint_mode_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    dev_trees: list[str],
+    report: ValidationReport,
+    probes: bool,
+    pol,
+) -> None:
+    """``validate``'s queue checks for a sprint-status run: the ledger, the park
+    records, and the sprint board itself."""
+    _validate_deferred_ledger(paths, report)
+    _validate_operator_registry(project, paths, report)
+    try:
+        ss = sprintstatus.load(paths.sprint_status)
+        actionable = [s for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+        report.ok(
+            "queue.sprint-status",
+            f"sprint-status OK: {len(ss.stories)} stories, {len(actionable)} actionable",
+            {"stories": len(ss.stories), "actionable": len(actionable)},
+        )
+        if ss.unknown_keys:
+            report.warn(
+                "queue.sprint-status-unknown-keys",
+                f"unknown keys ignored: {', '.join(ss.unknown_keys)}",
+                {"unknown_keys": list(ss.unknown_keys)},
+            )
+        _validate_nested_specs(paths.implementation_artifacts, report)
+    except sprintstatus.SprintStatusError as e:
+        report.fail("queue.sprint-status", str(e))
+
+
+def _validate_stories_mode_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    dev_trees: list[str],
+    report: ValidationReport,
+    probes: bool,
+    pol,
+) -> None:
+    """``validate``'s queue checks for a stories run: the manifest and the
+    ledger, read against the spec folder."""
+    _validate_stories_queue(project, paths, spec_folder, dev_trees, report)
+    _validate_deferred_ledger(
+        paths, report, source=worksource.SOURCE_STORIES, spec_folder=spec_folder
+    )
+
+
+def _validate_tickets_mode_queue(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    spec_folder: str,
+    dev_trees: list[str],
+    report: ValidationReport,
+    probes: bool,
+    pol,
+) -> None:
+    """``validate``'s queue checks for a tickets run: the initiative's
+    deferred-work ledger (its ``gate:`` lines read as ticket refs), the v7 ticket
+    tree's preflight (:func:`install.tickets_preflight`; the script's capability
+    probe only under ``--probes``, since it executes the project's script) and the
+    dev primitive's ticket route."""
+    _validate_deferred_ledger(paths, report, source=worksource.SOURCE_TICKETS)
+    report.extend(
+        install.tickets_preflight(
+            paths,
+            dev_trees,
+            probe_capability=probes,
+            branch_per=pol.scm.branch_per if pol is not None else None,
+            isolation=pol.scm.isolation if pol is not None else "none",
+            extra_args_roles=(
+                _store_extra_args_roles(pol, worksource.SOURCE_TICKETS) if pol is not None else ()
+            ),
+        )
+    )
+    tickets_probs = install.missing_tickets_support(project, dev_trees)
+    if dev_trees and not tickets_probs:
+        probed = list(
+            dict.fromkeys(
+                install.dev_primitive_or_default(project, tree) for tree in dict.fromkeys(dev_trees)
+            )
+        )
+        report.ok(
+            "skills.tickets-dispatch",
+            f"{' + '.join(probed)} dispatches from the ticket tree (tickets mode)",
+            {"trees": list(dict.fromkeys(dev_trees)), "dev_primitive": probed},
+        )
+    report.extend(tickets_probs)
+
+
+# `validate`'s queue checks, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py). The last argument is
+# `validate --probes`.
+_QUEUE_VALIDATORS: dict[
+    str,
+    Callable[[Path, bmadconfig.ProjectPaths, str, list[str], ValidationReport, bool, Any], None],
+] = {
+    worksource.SOURCE_SPRINT: _validate_sprint_mode_queue,
+    worksource.SOURCE_STORIES: _validate_stories_mode_queue,
+    worksource.SOURCE_TICKETS: _validate_tickets_mode_queue,
+}
+
+
 def _validate_operator_registry(
     project: Path, paths: bmadconfig.ProjectPaths, report: ValidationReport
 ) -> None:
@@ -2740,6 +2964,7 @@ def _validate_deferred_ledger(
     paths: bmadconfig.ProjectPaths,
     report: ValidationReport,
     *,
+    source: str = worksource.SOURCE_SPRINT,
     spec_folder: str | None = None,
 ) -> None:
     """Read the deferred-work ledger once, then run every check that needs it.
@@ -2806,7 +3031,7 @@ def _validate_deferred_ledger(
             {"ledger": str(ledger), "error": str(e)},
         )
         return
-    _validate_hard_gates(paths, text, report, spec_folder=spec_folder)
+    _validate_hard_gates(paths, text, report, source=source, spec_folder=spec_folder)
     _validate_closes_deferred(paths, text, report, spec_folder=spec_folder)
 
 
@@ -2913,6 +3138,7 @@ def _validate_hard_gates(
     text: str,
     report: ValidationReport,
     *,
+    source: str = worksource.SOURCE_SPRINT,
     spec_folder: str | None = None,
 ) -> None:
     """FAIL when the queue would dispatch a story an unlanded ledger entry gates.
@@ -2943,27 +3169,75 @@ def _validate_hard_gates(
     Once a gate exists the passing case reports itself — a gate that only ever
     speaks when it fires is indistinguishable, on the day it matters, from one
     nobody remembered to write.
+
+    Tickets mode reads ``gate:`` tokens as ticket refs and its queue through the
+    project's ``tickets.py next``. That spawn is the one exception to plain
+    ``validate`` executing no project code, and it happens only when an unlanded
+    entry carries a ticket-grammar or v6 story-key token; a ledger whose gates
+    have all landed reports its ``ok`` without it.
     """
-    declared = [(entry, deferredwork.gates(entry)) for entry in deferredwork.parse_ledger(text)]
+    grammar: deferredwork.GateGrammar = "ticket" if source == worksource.SOURCE_TICKETS else "story"
+    noun = "ticket" if grammar == "ticket" else "story"
+    declared = [
+        (entry, deferredwork.gates(entry, grammar=grammar))
+        for entry in deferredwork.parse_ledger(text)
+    ]
+    # v6 story keys in a ticket queue's ledger (a migrated ledger keeps them): no
+    # ticket carries one, and the run pauses before every ticket while one stands
+    # (`TicketsEngine._legacy_gate_tokens`), so they fail here rather than warn.
+    legacy = {
+        entry.id: stale
+        for entry, _ in declared
+        if grammar == "ticket" and not entry.done
+        for stale in (deferredwork.legacy_story_tokens(entry),)
+        if stale
+    }
     for entry, entry_gates in declared:
         if entry.done:
             continue  # a landed entry gates nothing; that is what closing it means
-        _report_unstructured_gate(entry, entry_gates, report)
+        _report_unstructured_gate(
+            entry, entry_gates, report, grammar=grammar, legacy=legacy.get(entry.id, ())
+        )
     # Keyed on enforceable tokens, not on `gate:` lines: a ledger whose only gate is
     # malformed enforced nothing, and an `ok` there would be the same false all-clear
     # the warning above exists to break. Closed entries still count, deliberately —
     # the passing case has to keep speaking after the gate lands, or `ok` and "nobody
     # ever wrote a gate" become the same silence. Reading the queue sits behind this
     # test so a project that gates nothing pays neither the walk nor its failure modes.
-    if not any(entry_gates.tokens for _, entry_gates in declared):
+    if not any(entry_gates.tokens for _, entry_gates in declared) and not legacy:
         return
-    story_keys = _actionable_story_keys(paths, spec_folder)
-    if story_keys is None:
+    # Tickets mode reads its queue by executing the project's `tickets.py next`, and
+    # plain `validate` otherwise executes no project code. So only an UNLANDED gate
+    # pays for that spawn; landed ones still get their `ok`, from the ledger alone.
+    if grammar == "ticket" and not any(
+        not e.done and (g.tokens or e.id in legacy) for e, g in declared
+    ):
+        report.ok(
+            "deferred.hard-gate",
+            "deferred-work gates OK: no unlanded entry declares a gate, so the ticket "
+            "queue was not read",
+            {"gating_ids": []},
+        )
+        return
+    try:
+        targets = _actionable_story_keys(paths, source, spec_folder or "")
+    except tickettree.TicketsError as e:
+        # No `queue.*` check runs `tickets.py next`, so this one owns the outage:
+        # the gates were declared and never compared, which is no all-clear.
+        report.fail(
+            "deferred.hard-gate",
+            f"tickets.py next could not be read ({e.kind}: {e}), so the `gate:` lines in "
+            f"{paths.deferred_work.name} were not compared against the startable tickets "
+            f"— fix the ticket tree, then re-run `bmad-loop validate`",
+            {"error": str(e), "kind": e.kind},
+        )
+        return
+    if targets is None:
         # The queue could not be read, so nothing was compared. `queue.sprint-status`
         # and `queue.stories-manifest` already fail for it; adding an `ok` here would
         # say "no story is gated" about a queue this check never saw.
         return
-    gating = [e.id for e, g in declared if not e.done and g.tokens]
+    gating = [e.id for e, g in declared if not e.done and (g.tokens or e.id in legacy)]
     gated = False
     for entry, entry_gates in declared:
         # `done`, not `not open` — the tri-state is the whole point. An entry whose
@@ -2973,15 +3247,35 @@ def _validate_hard_gates(
         # retires a gate; everything else holds until someone writes that word.
         if entry.done:
             continue
-        for story_key in story_keys:
-            hits = [t for t in entry_gates.tokens if deferredwork.gates_story(t, story_key)]
+        stale = legacy.get(entry.id, ())
+        if stale and targets:
+            gated = True
+            report.fail(
+                "deferred.hard-gate",
+                f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and declares v6 "
+                f"story-key gate tokens no ticket ref can match ({', '.join(stale)}) — a "
+                f"tickets run pauses before every ticket while it stands, starting with "
+                f"{targets[0].key}. The v7 migration keeps each story's old key as "
+                f"`v6_key` in its ticket file: rewrite the tokens as ticket refs (`E.M`, "
+                f"an epic id or `epic-<slug>`), or close the entry in "
+                f"{paths.deferred_work.name} (`status: done <date>`)",
+                {
+                    "dw_id": entry.id,
+                    "title": entry.title,
+                    "story_key": targets[0].key,
+                    "tokens": list(stale),
+                },
+            )
+        for target in targets:
+            story_key = target.key
+            hits = [t for t in entry_gates.tokens if _gate_matches(t, target, grammar)]
             if not hits:
                 continue
             gated = True
             report.fail(
                 "deferred.hard-gate",
                 f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and gates "
-                f"{story_key} (gate: {', '.join(hits)}) — that story must not run until "
+                f"{story_key} (gate: {', '.join(hits)}) — that {noun} must not run until "
                 f"the entry lands. Close it in {paths.deferred_work.name} "
                 f"(`status: done <date>`), or drop the token from its `gate:` line if it "
                 f"no longer blocks this work",
@@ -2995,10 +3289,31 @@ def _validate_hard_gates(
     if not gated:
         report.ok(
             "deferred.hard-gate",
-            f"deferred-work gates OK: no actionable story is gated by an unlanded entry "
+            f"deferred-work gates OK: no actionable {noun} is gated by an unlanded entry "
             f"({', '.join(gating) if gating else 'no unlanded gated entries'})",
-            {"gating_ids": gating, "actionable": list(story_keys)},
+            {"gating_ids": gating, "actionable": [t.key for t in targets]},
         )
+
+
+@dataclass(frozen=True)
+class _GateTarget:
+    """One key a queue could dispatch, as :func:`_validate_hard_gates` matches
+    ``gate:`` tokens against it: the key, plus a ticket's epic (its initiative id,
+    ``""`` when unlisted, and its folder) for the ticket grammar's epic arms."""
+
+    key: str
+    epic_id: str = ""
+    epic_slug: str = ""
+
+
+def _gate_matches(token: str, target: _GateTarget, grammar: deferredwork.GateGrammar) -> bool:
+    """The dispatch-side predicate for ``grammar`` (``Engine._gate_hits`` and its
+    ``TicketsEngine`` override), so preflight and dispatch refuse the same keys."""
+    if grammar == "ticket":
+        return deferredwork.gates_ticket(
+            token, target.key, epic_id=target.epic_id, epic_slug=target.epic_slug
+        )
+    return deferredwork.gates_story(token, target.key)
 
 
 def _gate_status_clause(entry: deferredwork.DWEntry) -> str:
@@ -3021,6 +3336,9 @@ def _report_unstructured_gate(
     entry: deferredwork.DWEntry,
     entry_gates: deferredwork.EntryGates,
     report: ValidationReport,
+    *,
+    grammar: deferredwork.GateGrammar = "story",
+    legacy: tuple[str, ...] = (),
 ) -> None:
     """Warn about a hard gate the mechanical check cannot enforce.
 
@@ -3045,22 +3363,27 @@ def _report_unstructured_gate(
     Runs for every entry that is not ``done``, which is the same set the refusal
     holds against. Keying it on ``open`` instead would have left an entry with an
     unreadable status silent about a malformed token as well as about its gate.
+
+    Under the ticket ``grammar`` the wording names ticket refs, and ``legacy`` (the
+    entry's v6 story-key tokens) is left out of ``malformed``: those fail
+    ``deferred.hard-gate`` instead, because the run pauses on them.
     """
+    ticket = grammar == "ticket"
+    noun, shape = ("ticket", "a ticket ref (`E.M`)") if ticket else ("story", "a story")
+    malformed = [t for t in entry_gates.malformed if t not in legacy]
     reasons: list[str] = []
-    if entry_gates.malformed:
-        reasons.append(
-            f"declares `gate:` tokens that cannot name a story: {', '.join(entry_gates.malformed)}"
-        )
+    if malformed:
+        reasons.append(f"declares `gate:` tokens that cannot name {shape}: {', '.join(malformed)}")
     if entry_gates.empty == 1:
-        reasons.append("declares an empty `gate:` line, which names no story")
+        reasons.append(f"declares an empty `gate:` line, which names no {noun}")
     elif entry_gates.empty:
-        reasons.append(f"declares {entry_gates.empty} empty `gate:` lines, which name no story")
+        reasons.append(f"declares {entry_gates.empty} empty `gate:` lines, which name no {noun}")
     if entry_gates.near_miss:
         reasons.append(
             f"spells {entry_gates.near_miss} `gate:` line(s) in a form the field does not "
             f"read (the field is a lowercase `gate:` at the very start of a line)"
         )
-    prose_only = not entry_gates.tokens and not reasons
+    prose_only = not entry_gates.tokens and not legacy and not reasons
     if prose_only and deferredwork.declares_prose_gate(entry):
         reasons.append("declares a `HARD GATE:` in prose but carries no `gate:` line")
     if not reasons:
@@ -3068,11 +3391,12 @@ def _report_unstructured_gate(
     report.warn(
         "deferred.hard-gate-unstructured",
         f"{entry.id} ({entry.title}) {' and '.join(reasons)} — so `validate` cannot refuse "
-        f"the gated story and nothing holds it back; name the blocked stories on a `gate:` "
-        f"line (comma-separated) to make the gate enforceable",
+        f"the gated {noun} and nothing holds it back; name the blocked "
+        f"{'ticket refs' if ticket else 'stories'} on a `gate:` line (comma-separated) to "
+        f"make the gate enforceable",
         {
             "dw_id": entry.id,
-            "malformed": list(entry_gates.malformed),
+            "malformed": malformed,
             "empty": entry_gates.empty,
             "near_miss": entry_gates.near_miss,
         },
@@ -3080,9 +3404,10 @@ def _report_unstructured_gate(
 
 
 def _actionable_story_keys(
-    paths: bmadconfig.ProjectPaths, spec_folder: str | None
-) -> list[str] | None:
-    """The story keys this queue could dispatch, in queue order, in either mode.
+    paths: bmadconfig.ProjectPaths, source: str, spec_folder: str
+) -> list[_GateTarget] | None:
+    """The story keys ``source``'s queue could dispatch, in queue order — one
+    reader per work source in ``_ACTIONABLE_KEY_READERS``.
 
     ``None`` when the queue could not be read, which is not the same answer as an
     empty list: ``queue.sprint-status`` and ``queue.stories-manifest`` own queue
@@ -3117,23 +3442,66 @@ def _actionable_story_keys(
     resolution first is the cheaper wrong answer, and dispatch still refuses
     independently.
     """
-    if spec_folder is not None:
-        keys: list[str] = []
-        try:
-            folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
-            for entry in stories_mod.load_stories(folder).entries:
-                state = stories_mod.resolve_story_spec(folder, entry.id)
-                if stories_mod._classify(state) != "actionable":
-                    continue
-                keys.append(entry.id)
-        except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
-            return None
-        return keys
+    return _ACTIONABLE_KEY_READERS[source](paths, spec_folder)
+
+
+def _actionable_sprint_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[_GateTarget] | None:
+    """Sprint half of :func:`_actionable_story_keys`: the board's actionable keys."""
     try:
         ss = sprintstatus.load(paths.sprint_status)
     except (sprintstatus.SprintStatusError, OSError, UnicodeDecodeError):
         return None
-    return [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+    return [_GateTarget(s.key) for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+
+
+def _actionable_stories_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[_GateTarget] | None:
+    """Stories half of :func:`_actionable_story_keys`: the manifest entries the
+    scheduler's per-entry predicate calls actionable."""
+    keys: list[_GateTarget] = []
+    try:
+        folder = stories_mod.resolve_spec_folder(paths.project, spec_folder)
+        for entry in stories_mod.load_stories(folder).entries:
+            state = stories_mod.resolve_story_spec(folder, entry.id)
+            if stories_mod._classify(state) != "actionable":
+                continue
+            keys.append(_GateTarget(entry.id))
+    except (OSError, UnicodeDecodeError, stories_mod.StoriesError):
+        return None
+    return keys
+
+
+def _actionable_ticket_keys(
+    paths: bmadconfig.ProjectPaths, spec_folder: str
+) -> list[_GateTarget] | None:
+    """Tickets half of :func:`_actionable_story_keys`: the refs of the active
+    initiative's ``ready_to_start`` and ``in_progress`` rows, in ``next`` order,
+    each with its epic. ``ready_to_refine`` and hitl-free checks are the pick's
+    business; backlog rows are never dispatched. Runs the project's ``tickets.py
+    next`` (unpinned: ``validate`` reads the live initiative), so it is reached
+    only when the ledger declares a gate; a fault raises
+    :class:`~bmad_loop.tickettree.TicketsError` for the caller to report, since no
+    ``queue.*`` check reads ``next``."""
+    view = tickettree.TicketTree(paths.project).next()
+    targets: list[_GateTarget] = []
+    for row in (*view.ready_to_start, *view.in_progress):
+        if not row.ref:
+            continue
+        epic_id, dot, _ = row.ref.partition(".")
+        targets.append(_GateTarget(row.ref, epic_id if dot else "", row.epic))
+    return targets
+
+
+_ACTIONABLE_KEY_READERS: dict[
+    str, Callable[[bmadconfig.ProjectPaths, str], list[_GateTarget] | None]
+] = {
+    worksource.SOURCE_SPRINT: _actionable_sprint_keys,
+    worksource.SOURCE_STORIES: _actionable_stories_keys,
+    worksource.SOURCE_TICKETS: _actionable_ticket_keys,
+}
 
 
 def _validate_closes_deferred(
@@ -3267,15 +3635,97 @@ def _warn_unknown_keys(ss: sprintstatus.SprintStatus) -> None:
         )
 
 
+def _preflight_sprint_queue(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int | None:
+    """``run``'s queue preflight for a sprint-status run: the board parses and the
+    ``--epic`` / ``--story`` selection resolves. An exit code refuses the run."""
+    try:
+        ss = sprintstatus.load(paths.sprint_status)
+        _warn_unknown_keys(ss)
+        sprintstatus.select_actionable(ss, args.epic, args.story)
+    except sprintstatus.SprintStatusError as e:
+        print(e, file=sys.stderr)
+        return 1
+    return None
+
+
+def _preflight_stories_queue(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int | None:
+    """``run``'s queue preflight for a stories run: the manifest and SPEC.md pass
+    and the ``--story`` selector names an entry. An exit code refuses the run."""
+    problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
+    if problem:
+        print(problem, file=sys.stderr)
+        return 1
+    return None
+
+
+def _preflight_tickets_queue(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int | None:
+    """``run``'s queue preflight for a tickets run: :func:`_check_tickets_preflight`."""
+    del args, spec_folder
+    return _check_tickets_preflight(paths, pol)
+
+
+def _check_tickets_preflight(paths: bmadconfig.ProjectPaths, pol) -> int | None:
+    """The v7 tree's checks for a tickets run, at launch and on resume
+    (:func:`install.tickets_preflight`, the script's capability probe included —
+    the run executes the script anyway). Warnings print; a problem refuses the
+    run."""
+    findings = install.tickets_preflight(
+        paths,
+        [],
+        probe_capability=True,
+        branch_per=pol.scm.branch_per,
+        isolation=pol.scm.isolation,
+        extra_args_roles=_store_extra_args_roles(pol, worksource.SOURCE_TICKETS),
+    )
+    for warning in (f for f in findings if f.severity == "warning"):
+        print(f"warning: {warning.message}", file=sys.stderr)
+    problems = [f for f in findings if f.severity == "problem"]
+    if not problems:
+        return None
+    for problem in problems:
+        print(f"FAIL: {problem.message}", file=sys.stderr)
+    print("run `bmad-loop validate --probes` for details", file=sys.stderr)
+    return 1
+
+
+# `run`'s queue preflight, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_RUN_PREFLIGHTS: dict[
+    str, Callable[[bmadconfig.ProjectPaths, Any, argparse.Namespace, str], int | None]
+] = {
+    worksource.SOURCE_SPRINT: _preflight_sprint_queue,
+    worksource.SOURCE_STORIES: _preflight_stories_queue,
+    worksource.SOURCE_TICKETS: _preflight_tickets_queue,
+}
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     if (rc := _reject_bad_run_id(args.run_id)) is not None:
         return rc
     project = _project(args)
-    paths = bmadconfig.load_paths(project)
     pol = policy_mod.load(_policy_path(project))
-    stories_on, spec_folder = _stories_mode(args, pol)
+    source, spec_folder = _resolve_source(args, pol)
+    traits = worksource.traits_for(source)
+    tickets = source == worksource.SOURCE_TICKETS
+    if not tickets and isinstance(args.epic, str):
+        # `_epic_selector` lets a non-integer through for tickets mode only; every
+        # other source keeps the exit code argparse's `type=int` gave it, ahead of
+        # any project read as argparse's was.
+        print(
+            f"error: argument --epic: invalid int value: {args.epic!r} "
+            "(an epic slug selects only in tickets mode)",
+            file=sys.stderr,
+        )
+        return ExitCode.USAGE
+    paths = bmadconfig.load_paths(project, want_tickets=tickets)
 
-    if stories_on and args.epic is not None:
+    if not tickets and not traits.has_epics and args.epic is not None:
         # stories mode dispatches the manifest's single flat schedule; StoriesEngine
         # nulls epic_filter, so --epic has no effect. Warn rather than silently drop
         # it, so a caller who passed both (e.g. `run --spec ... --epic 3`) isn't
@@ -3286,7 +3736,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
 
     if args.dry_run:
-        return _dry_run(paths, pol, args, stories_on, spec_folder)
+        return _dry_run(paths, pol, args, source, spec_folder)
 
     # The HOST refusal leads the configuration ones: an under-floor git is a fact
     # about the machine that no edit to policy.toml can answer, so telling the
@@ -3302,20 +3752,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     # same abort.
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
+    if (rc := _reject_store_topology(project, pol, source)) is not None:
+        return rc
 
-    if stories_on:
-        problem = _validate_stories_folder(paths, spec_folder, selector=args.story)
-        if problem:
-            print(problem, file=sys.stderr)
-            return 1
-    else:
-        try:
-            ss = sprintstatus.load(paths.sprint_status)
-            _warn_unknown_keys(ss)
-            sprintstatus.select_actionable(ss, args.epic, args.story)
-        except sprintstatus.SprintStatusError as e:
-            print(e, file=sys.stderr)
-            return 1
+    if (rc := _RUN_PREFLIGHTS[source](paths, pol, args, spec_folder)) is not None:
+        return rc
+    scope = tickets_source.EVERYTHING
+    if tickets:
+        resolved = _resolve_ticket_scope(_selector_ticket_tree(paths.project), args)
+        if isinstance(resolved, int):
+            return resolved
+        scope = resolved
 
     if not verify.worktree_clean(paths.repo_root, project=paths.project):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
@@ -3327,7 +3774,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     # layer reads the store.
     plugin_grants = _launch_plugin_grants(project)
     if not _require_base_skills(
-        project, pol, paths.repo_root, plugin_grants, require_stories=stories_on
+        project,
+        pol,
+        paths.repo_root,
+        plugin_grants,
+        require_stories=traits.stories_primitive,
+        require_tickets=source == worksource.SOURCE_TICKETS,
     ):
         return 1
 
@@ -3358,15 +3810,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         paths=paths,
         policy=pol,
         run_id=args.run_id,
-        epic_filter=args.epic,
-        story_filter=args.story,
+        # a tickets run's selectors are resolved: an epic slug and a ticket ref
+        epic_filter=None if tickets else args.epic,
+        story_filter=(scope.ref or None) if tickets else args.story,
+        ticket_epic_filter=scope.epic,
         max_stories=args.max_stories,
-        stories_on=stories_on,
+        source=source,
         spec_folder=spec_folder,
         sweep_factory=_sweep_factory(project, paths, trusted_digest, plugin_grants=plugin_grants),
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
+        tickets_engine_cls=TicketsEngine,
         trusted_config_digest=trusted_digest,
         profiles=profiles,
         plugin_grants=plugin_grants,
@@ -3374,7 +3829,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     _warn_bypass_dropped(
         pol,
         project,
-        ("dev", "review") if stories_on else _sprint_launch_roles(pol),
+        worksource.launch_roles(source, pol.gates.retrospective),
         profiles=profiles,
         journal=composed.journal,
     )
@@ -3450,12 +3905,18 @@ def _dry_run(
     paths: bmadconfig.ProjectPaths,
     pol,
     args: argparse.Namespace,
-    stories_on: bool = False,
+    source: str = worksource.SOURCE_SPRINT,
     spec_folder: str = "",
 ) -> int:
-    if stories_on:
-        return _dry_run_stories(paths, pol, args, spec_folder)
+    """``run --dry-run``: print what ``source``'s queue would dispatch, spawning
+    nothing — one printer per work source in ``_DRY_RUNNERS``."""
+    return _DRY_RUNNERS[source](paths, pol, args, spec_folder)
 
+
+def _dry_run_sprint(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int:
+    """Print the sprint-status queue ``run`` would process, one story per block."""
     _warn_preflight_would_abort(paths, pol)
     _warn_bypass_dropped(pol, paths.project, _sprint_launch_roles(pol))
 
@@ -3552,6 +4013,228 @@ def _dry_run_stories(
     return 0
 
 
+def _epic_selector(text: str) -> int | str:
+    """``run --epic``'s argparse type: an int whenever ``int()`` reads one (sprint
+    mode's epic number, unchanged), else the text — an epic id, slug or
+    ``epic-<slug>`` that only tickets mode accepts (``cmd_run`` refuses it with
+    ``ExitCode.USAGE`` elsewhere)."""
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+class _TicketSelectorError(Exception):
+    """A ``--epic``/``--story`` selector that names no ticket a tickets run can start."""
+
+
+def _ticket_epic_slug(status_view: ticketmodel.StatusView, selector: int | str) -> str:
+    """The epic slug ``selector`` names in the initiative: an epic id (numbers
+    compare as numbers), a slug, or a slug without its ``epic-`` prefix."""
+    text = str(selector).strip()
+    hits: list[str] = []
+    for epic in status_view.epics:
+        by_id = epic.id is not None and (
+            epic.id == text or (text.isdigit() and epic.id.isdigit() and int(epic.id) == int(text))
+        )
+        if by_id or epic.slug in (text, f"epic-{text}"):
+            hits.append(epic.slug)
+    hits = list(dict.fromkeys(hits))
+    if not hits:
+        known = ", ".join(e.slug for e in status_view.epics) or "none"
+        raise _TicketSelectorError(
+            f"--epic {text!r} names no epic of the initiative (epics: {known})"
+        )
+    if len(hits) > 1:
+        raise _TicketSelectorError(f"--epic {text!r} names more than one epic: {', '.join(hits)}")
+    return hits[0]
+
+
+def _ticket_story_ref(
+    tree: tickettree.TicketTreeLike, next_view: ticketmodel.NextView, selector: str, epic: str
+) -> str:
+    """The ref of the one startable ticket ``selector`` names, through ``find``:
+    a ticket ``next`` lists as ready to start or to refine (in ``epic`` when one
+    is selected). ``find``'s no-match and ambiguity faults propagate."""
+    row = tree.find(selector).row
+    ref = row.ref
+    label = tickets_source.row_label(row)
+    if ref is None:
+        raise _TicketSelectorError(
+            f"--story {selector!r} names {label}, which has no ref: a tickets run never "
+            "dispatches a backlog ticket"
+        )
+    if epic and row.epic != epic:
+        raise _TicketSelectorError(f"--story {selector!r} names {ref}, which is not in {epic}")
+    ready = (*next_view.ready_to_refine, *next_view.ready_to_start)
+    if not any(r.ref == ref for r in ready):
+        status = row.status or "no plan"
+        raise _TicketSelectorError(
+            f"--story {selector!r} names {ref}, which is not startable "
+            f"(state {row.state}, plan {status})"
+        )
+    return ref
+
+
+def _selector_ticket_tree(project: Path) -> tickettree.TicketTreeLike:
+    """The tree ``run`` resolves a tickets run's selectors against: the project's
+    installed ``tickets.py``, unpinned — no run exists yet."""
+    return tickettree.TicketTree(project)
+
+
+def _resolve_ticket_scope(
+    tree: tickettree.TicketTreeLike,
+    args: argparse.Namespace,
+    views: tuple[ticketmodel.NextView, ticketmodel.StatusView] | None = None,
+) -> tickets_source.PickScope | int:
+    """A tickets run's ``--epic``/``--story`` selectors resolved against the active
+    initiative (``views`` when the caller already read them), or exit 1 with the
+    reason on stderr: no match, an ambiguous match, a ticket that is not
+    startable, or a tree that cannot be read."""
+    if args.epic is None and not args.story:
+        return tickets_source.EVERYTHING
+    try:
+        next_view, status_view = views if views is not None else (tree.next(), tree.status())
+        epic = _ticket_epic_slug(status_view, args.epic) if args.epic is not None else ""
+        ref = _ticket_story_ref(tree, next_view, args.story, epic) if args.story else ""
+    except _TicketSelectorError as e:
+        print(f"tickets mode: {e}", file=sys.stderr)
+        return 1
+    except tickettree.TicketsError as e:
+        print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
+        return 1
+    return tickets_source.PickScope(epic, ref)
+
+
+def _ticket_badge(row: ticketmodel.TicketRow) -> str:
+    """`` [hitl, refine, plan-checkpoint, done-checkpoint]`` for the flags a tickets
+    run pauses on, or ``""`` when it sets none. Shared spelling for the dry-run
+    schedule and status."""
+    marks = []
+    if row.hitl:
+        marks.append("hitl")
+    if tickets_source.needs_refine(row):
+        marks.append("refine")
+    if row.plan_checkpoint:
+        marks.append("plan-checkpoint")
+    if row.done_checkpoint:
+        marks.append("done-checkpoint")
+    return f" [{', '.join(marks)}]" if marks else ""
+
+
+def _predicted_pause(decision: tickets_source.PickDecision, max_stories: int | None) -> str:
+    """The first pause a fresh tickets run would reach, as one line. A
+    ``--max-stories 1`` run skips the first ticket's done checkpoint, as the
+    engine's skip-if-last does once the cap is spent. A cap of 0 or less stops
+    the run before its first pick, so it predicts no ticket at all."""
+    if max_stories is not None and max_stories <= 0:
+        return f"run would stop: --max-stories {max_stories} dispatches no ticket"
+    if isinstance(decision, tickets_source.Halt):
+        where = f" before {decision.key}" if decision.key else ""
+        return f"run would pause{where} ({decision.stage}): {decision.detail}"
+    if isinstance(decision, tickets_source.Skip):
+        if decision.reason == tickets_source.SKIP_PARKED:
+            return f"run would end: {', '.join(decision.waiting)} wait behind parked tickets"
+        return "run would finish: no ticket is ready to start"
+    row = decision.row
+    if tickets_source.is_plan_halt_leg(row):
+        return (
+            f"run would pause after planning {decision.ref} (plan-checkpoint): "
+            "approve the plan, then resume"
+        )
+    if row.done_checkpoint and max_stories != 1:
+        return f"run would pause after {decision.ref} (story-checkpoint): done checkpoint"
+    return f"no pause predicted before {decision.ref} finishes"
+
+
+def _dry_run_tickets(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
+) -> int:
+    """Print what a tickets run would dispatch from the active initiative: the
+    startable tickets in build order with their dispatch lines, the pause a fresh
+    run would reach first, the group counts and the tree's problems. Reads the
+    tree with ``tickets.py next``/``status`` only — it never marks a ticket."""
+    _warn_preflight_would_abort(paths, pol, require_tickets=True)
+    _warn_bypass_dropped(pol, paths.project, ("dev", "review"))
+    tree = tickettree.TicketTree(paths.project)
+    try:
+        next_view = tree.next()
+        status_view = tree.status()
+    except tickettree.TicketsError as e:
+        print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
+        return 1
+    scope = _resolve_ticket_scope(tree, args, (next_view, status_view))
+    if isinstance(scope, int):
+        return scope
+    decision = tickets_source.decide_pick(next_view, status_view, {}, {}, (), scope)
+    rank = tickets_source.build_order(status_view)
+    last = len(rank)
+    ready = sorted(
+        (
+            row
+            for row in (*next_view.ready_to_refine, *next_view.ready_to_start)
+            if row.ref is not None and scope.admits(row)
+        ),
+        key=lambda row: rank.get(tickets_source.row_label(row), last),
+    )
+    if args.max_stories is not None:
+        ready = ready[: args.max_stories]
+    print(
+        f"tickets mode: initiative {paths.active_initiative or next_view.folder} — "
+        f"{len(ready)} ready of {len(status_view.tickets)} tickets (gates={pol.gates.mode})"
+    )
+    if (events_dir := _events_dir_preview(paths.project)) is not None:
+        print(f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}")
+    print("build order (initiative epic table, then entry order):")
+    dev_skill = _dev_skill_for_role(pol, paths.project, "dev")
+    for position, row in enumerate(ready, 1):
+        status = row.status or "no plan"
+        print(f"\n  {position}. {row.ref}  ({status}){_ticket_badge(row)}  {row.title}")
+        plan_halt = tickets_source.is_plan_halt_leg(row)
+        dispatch = tickets_source.dispatch_invocation(
+            dev_skill,
+            tickets_source.row_label(row),
+            thorough=tickets_source.wants_thorough(pol.tickets.thorough_review, row.risk),
+            plan_halt=plan_halt,
+        )
+        print(f"    dev:    {_render_invocation(pol, paths.project, 'dev', dispatch)}")
+        env = f"BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY={row.ref}"
+        if plan_halt:
+            env += " BMAD_LOOP_PLAN_HALT=1"
+        print(f"    env:    {env}")
+    print(f"\npredicted: {_predicted_pause(decision, args.max_stories)}")
+    if next_view.backlog is not None:
+        backlog = str(sum(len(next_view.backlog.group(g)) for g in ticketmodel.NEXT_GROUPS))
+    else:
+        backlog = "unreadable" if next_view.backlog_error is not None else "0"
+    counts = " ".join(f"{g}={len(next_view.group(g))}" for g in ticketmodel.NEXT_GROUPS)
+    print(f"groups: {counts} backlog={backlog}")
+    for problem in dict.fromkeys((*next_view.problems, *status_view.problems)):
+        print(f"problem: {problem}")
+    return 0
+
+
+# `run --dry-run`'s queue printer, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_DRY_RUNNERS: dict[str, Callable[[bmadconfig.ProjectPaths, Any, argparse.Namespace, str], int]] = {
+    worksource.SOURCE_SPRINT: _dry_run_sprint,
+    worksource.SOURCE_STORIES: _dry_run_stories,
+    worksource.SOURCE_TICKETS: _dry_run_tickets,
+}
+
+
+def _print_sprint_status(state: RunState, project: Path) -> None:
+    """``status``'s queue footer for a sprint-status run: the board's remaining
+    actionable stories, or nothing when the config or board cannot be read."""
+    try:
+        paths = bmadconfig.load_paths(project)
+        ss = sprintstatus.load(paths.sprint_status)
+        remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
+        print(f"sprint backlog remaining: {len(remaining)}")
+    except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
+        pass
+
+
 def _print_stories_status(state: RunState, project: Path) -> None:
     """The stories-mode board for `status`: id, live on-disk state, checkpoint
     markers and title, read from the run's pinned spec folder. Mode-aware
@@ -3570,6 +4253,99 @@ def _print_stories_status(state: RunState, project: Path) -> None:
             f"  {row.position:2d}. {row.id:12s} {row.label:16s}"
             f"{_checkpoint_badge(row)}  {row.title}"
         )
+
+
+def _owed_post_landing_label(task: StoryTask) -> str:
+    if task.ticket_park_pending:
+        return "blocked"
+    return "done" if task.ticket_done_pending else "built"
+
+
+def _status_ticket_tree(state: RunState, project: Path) -> tickettree.TicketTreeLike:
+    """The tree ``status`` reads a tickets run's board from: the project's
+    installed ``tickets.py``, pinned to the run's initiative, so a board for
+    another initiative is never shown under this run."""
+    return tickettree.TicketTree(project, pinned_initiative=state.initiative or None)
+
+
+def _print_tickets_status(state: RunState, project: Path) -> None:
+    """``status``'s queue footer for a tickets run: the initiative's board, read
+    live through ``tickets.py status`` (pinned to the run's initiative) — the
+    state counts, then one block per epic in build order with each ticket's plan
+    status, flags and this run's phase for the tickets it touched. A tree that
+    cannot be read is printed as such, never dropped (``status`` still exits 0).
+    Then every shared-store write still owed after its code landed: a latched
+    mark, or a store-repository commit that failed (the latch is kept until it
+    lands)."""
+    folder = f"  ({state.initiative_folder})" if state.initiative_folder else ""
+    print(f"tickets: initiative {state.initiative or '(none)'}{folder}")
+    if state.ticket_epic_filter or state.story_filter:
+        selected = " ".join(
+            f"{flag} {value}"
+            for flag, value in (
+                ("--epic", state.ticket_epic_filter),
+                ("--story", state.story_filter),
+            )
+            if value
+        )
+        print(f"tickets: this run is limited to {selected}")
+    try:
+        status_view = _status_ticket_tree(state, project).status()
+    except tickettree.TicketsError as e:
+        print(f"tickets board unavailable: tickets.py {e.kind}: {e}")
+    else:
+        _print_tickets_board(state, status_view)
+    owed = [
+        f"{key} ({_owed_post_landing_label(task)})"
+        for key, task in state.tasks.items()
+        if task.ticket_park_pending or task.ticket_done_pending or task.ticket_commit_pending
+    ]
+    if owed:
+        print(
+            f"tickets: mark or store commit owed after landing: {', '.join(owed)} "
+            "— see the journal's store-commit-* rows; a resume retries"
+        )
+
+
+def _print_tickets_board(state: RunState, status_view: ticketmodel.StatusView) -> None:
+    """The board body: counts by derived state, then the tickets grouped by epic
+    in the initiative's build order (tickets of no listed epic last)."""
+    rows = status_view.tickets
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row.state] = counts.get(row.state, 0) + 1
+    tally = " · ".join(f"{n} {name}" for name, n in counts.items()) or "no tickets"
+    print(f"tickets: {tally}  ({len(rows)} total)")
+    groups: dict[str, list[ticketmodel.TicketRow]] = {e.slug: [] for e in status_view.epics}
+    for row in rows:
+        groups.setdefault(row.epic, []).append(row)
+    epic_status = {e.slug: e.status for e in status_view.epics}
+    for slug, members in groups.items():
+        done = sum(1 for r in members if r.state in ("done", "dropped"))
+        closure = state.ticket_epic_closures.get(slug)
+        notes = [epic_status.get(slug) or "not in the initiative table"]
+        if closure:
+            notes.append(f"closure {closure}")
+        print(f"  {slug}  {done}/{len(members)} done  ({', '.join(notes)})")
+        for row in members:
+            label = tickets_source.row_label(row)
+            task = state.tasks.get(label)
+            mine = f"  [run: {task.phase}]" if task is not None else ""
+            plan = row.status or "no plan"
+            print(
+                f"    {label:8s} {row.state:12s} {plan:14s}{_ticket_badge(row)}  {row.title}{mine}"
+            )
+    for problem in status_view.problems:
+        print(f"tickets: problem: {problem}")
+
+
+# `status`'s queue footer, one entry per work source (held exhaustive over
+# `worksource.SOURCES` by tests/test_worksource.py).
+_STATUS_PRINTERS: dict[str, Callable[[RunState, Path], None]] = {
+    worksource.SOURCE_SPRINT: _print_sprint_status,
+    worksource.SOURCE_STORIES: _print_stories_status,
+    worksource.SOURCE_TICKETS: _print_tickets_status,
+}
 
 
 def _start_sweep(
@@ -3717,6 +4493,11 @@ def _sweep_factory(
         conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
         if conflict is not None:
             raise RuntimeError(conflict)
+        store = ticketstore.store_conflict(
+            project, _sweep_store_source(paths, pol), pol.scm.isolation
+        )
+        if store is not None:
+            raise RuntimeError(store)
         # Same refusal as the three rc-returning sites, same raise-not-return reason
         # as the two above it. A `GitError` here needs no arm of its own: it is
         # already an exception, and this factory's contract is that any raise before
@@ -3805,6 +4586,9 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         return rc
 
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    # a sweep works its ledger's store: the ticket store on v7
+    if (rc := _reject_store_topology(project, pol, _sweep_store_source(paths, pol))) is not None:
         return rc
 
     if not verify.worktree_clean(paths.repo_root, project=paths.project):
@@ -4144,11 +4928,19 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
             file=sys.stderr,
         )
         return 1
-    paths = bmadconfig.load_paths(project)
     state = load_state(run_dir)
     if state.finished:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
+    # A story run resumes only from a source this version can drive: one a newer
+    # bmad-loop persisted is refused rather than rebuilt as a sprint run, and a
+    # registered source whose runs land later is refused the way `run` refuses it.
+    # Ahead of every side effect below. A sweep's `source` is its launch default and
+    # never selects its engine.
+    if (refusal := _unresumable_source(state)) is not None:
+        print(f"cannot resume {run_dir.name}: {refusal}", file=sys.stderr)
+        return 1
+    paths = bmadconfig.load_paths(project, want_tickets=state.source == worksource.SOURCE_TICKETS)
     sweep_options = None
     if state.run_type == "sweep":
         try:
@@ -4165,6 +4957,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         except runsetup.SweepOptionsError as exc:
             print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)
             return 1
+        # v7: a sweep resumes only on the initiative it started on. Ahead of every
+        # side effect below; `compose_resume` raises the same text as a backstop.
+        if (conflict := runsetup.sweep_initiative_conflict(state, paths)) is not None:
+            print(f"cannot resume {run_dir.name}: {conflict}", file=sys.stderr)
+            return 1
     pol = policy_mod.load(_policy_path(project))
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
     # entrypoint into the same engine and gets the same refusal — a run started
@@ -4175,13 +4972,28 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
+    # A sweep persists no source; on v7 its store is judged as a tickets run's,
+    # as at launch (`_sweep_store_source`), against the topology it recorded.
+    store_source = runs.judged_store_source(state, _sweep_store_source(paths, pol))
+    if (
+        rc := _reject_store_topology(
+            project, pol, store_source, recorded=runs.live_store_topology(state, project) or None
+        )
+    ) is not None:
+        return rc
+    # A tickets run re-reads the tree it dispatches from, so the tree's own
+    # refusals (script, layout, store, capability) apply on resume as at launch.
+    tickets = state.run_type != "sweep" and state.source == worksource.SOURCE_TICKETS
+    if tickets and (rc := _check_tickets_preflight(paths, pol)) is not None:
+        return rc
     plugin_grants = _launch_plugin_grants(project)  # read ONCE; see the trust gate below
     if not _require_base_skills(
         project,
         pol,
         paths.repo_root,
         plugin_grants,
-        require_stories=state.source == "stories",
+        require_stories=worksource.resumed_traits_for(state.source).stories_primitive,
+        require_tickets=tickets,
         review_owed=any(t.salvage_refile_pending for t in state.tasks.values()),
     ):
         return 1
@@ -4462,6 +5274,15 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # remount) is re-bound (one `root-identity-rebound`). An inode mismatch is never
     # re-recorded — its pinned writes keep refusing.
     runs.reconcile_root_identities(state, run_dir, journal, project)
+    # A tickets run paused for a refined ticket's story-file approval: this resume
+    # is that approval, recorded while the pause still names the ticket and past
+    # every refusal above, so a refused resume approves nothing.
+    approved = tickets_source.approve_paused_story_file(state)
+    if approved is not None:
+        journal.append("ticket-story-approved", ref=approved)
+    # Likewise a tickets run paused for an epic's closure: this resume answers that
+    # pause, so the engine acknowledges the closure instead of pausing for it again.
+    tickets_source.resume_epic_closure(state)
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
@@ -4476,6 +5297,20 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
     return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants
+
+
+def _unresumable_source(state: RunState) -> str | None:
+    """Why this version cannot drive a story run's persisted source, or None: one a
+    newer bmad-loop persisted, or a registered source whose runs land later. A
+    sweep's `source` is its launch default and never selects its engine."""
+    if state.run_type == "sweep":
+        return None
+    try:
+        if not worksource.resumable_traits_for(state.source).runnable:
+            worksource.refuse_unrunnable(state.source)
+    except (worksource.UnknownSource, worksource.SourceNotRunnable) as e:
+        return str(e)
+    return None
 
 
 def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
@@ -4518,6 +5353,7 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
+        tickets_engine_cls=TicketsEngine,
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
         sweep_options=sweep_options,
@@ -4529,7 +5365,9 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         (
             ("triage", "dev", "review")
             if state.run_type == "sweep"
-            else ("dev", "review") if state.source == "stories" else _sprint_launch_roles(pol)
+            else worksource.launch_roles(
+                worksource.resumed_traits_for(state.source).name, pol.gates.retrospective
+            )
         ),
         profiles=profiles,
         journal=composed.journal,
@@ -4696,10 +5534,21 @@ def _resolve_restore_patch(
     # bmad-build-auto saves the patch under implementation_artifacts, and artifact
     # dirs configured OUTSIDE the project tree are a supported layout — a bare
     # is_relative_to(project) check would reject every legitimate restore there.
+    tickets = state.source == worksource.SOURCE_TICKETS
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = bmadconfig.load_paths(project, want_tickets=tickets)
     except bmadconfig.BmadConfigError as e:
         return None, f"cannot validate the restore patch path against the project config: {e}"
+    # tickets mode: an earlier re-arm moved the plan's intent-gap patch to the run dir
+    # (`runs.evacuated_patch_path`), so a later cycle naming the original latches the
+    # moved copy, and that copy is trusted by its own location.
+    evacuated = runs.evacuated_patch_path(run_dir, story_key).resolve()
+    if tickets and not patch.exists() and task.spec_file:
+        plan = runs.live_spec_path(task, state, project)
+        if patch == runs.plan_patch_path(plan).resolve() and evacuated.is_file():
+            patch = evacuated
+    if tickets and patch == evacuated and patch.is_file():
+        return str(patch), None
     if not patch.is_file() or not verify.spec_within_roots(patch, paths):
         return None, (
             f"restore patch {raw!r} is not a file under the project or its "
@@ -4802,6 +5651,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     state = load_state(run_dir)
+    # Ahead of every side effect, for `_resume_paused_run`'s source gate: re-arming
+    # (or even `--no-resume`) a run this version cannot drive mutates it, and the
+    # resolve session would be spent before the resume refused.
+    if (refusal := _unresumable_source(state)) is not None:
+        print(f"cannot resolve {run_dir.name}: {refusal}", file=sys.stderr)
+        return 1
     # DW-525: a FINISHED run has no resume to replay on, so `--reverify` there mints a
     # replay run for the named kept worktree unit instead. Routed ahead of the pause
     # gate (a finished run is not paused); every paused-run branch below is untouched.
@@ -4873,6 +5728,25 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
 
+    # v7: a sweep resolves only on the initiative it started on — the resume's
+    # refusal (`_prepare_resume_locked`), judged ahead of every dispatch below:
+    # reverify, adopt and the re-arm each persist a transition before the resume
+    # that would refuse it, and the interactive session would be spent first.
+    # Re-judged after the confirm against the config the re-arm reads. An
+    # unreadable config skips this early exit only, as the trust gate below
+    # does; the resume's own config read refuses it.
+    if state.run_type == "sweep":
+        try:
+            pin_paths = bmadconfig.load_paths(project)
+        except (bmadconfig.BmadConfigError, OSError):
+            pin_paths = None
+        if (
+            pin_paths is not None
+            and (conflict := runsetup.sweep_initiative_conflict(state, pin_paths)) is not None
+        ):
+            print(f"cannot resolve {run_dir.name}: {conflict}", file=sys.stderr)
+            return 1
+
     # #496/#497: every resolve that resumes ends in the resume's plugin-trust refusal,
     # so judge it here — ahead of the reverify/adopt dispatches (each persists its
     # transition before resuming) and of the interactive session (a refusal after it
@@ -4898,6 +5772,25 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             is not None
         ):
             return rc
+
+    # The resume's ticket-store refusal, judged ahead of the reverify/adopt
+    # dispatches for the same reason: each persists its transition before the
+    # resume that would refuse a changed store. The re-arm path judges it below.
+    early = reverify or getattr(args, "adopt_branch", False)
+    if (
+        early
+        and state.source == worksource.SOURCE_TICKETS
+        and (
+            rc := _reject_store_topology(
+                project,
+                policy_mod.load(_policy_path(project)),
+                state.source,
+                recorded=runs.live_store_topology(state, project) or None,
+            )
+        )
+        is not None
+    ):
+        return rc
 
     # DW-522: re-verify the kept attempt instead of re-arming. Behind the same gates
     # as --adopt-branch, and likewise ahead of the interactive session it never runs.
@@ -4976,6 +5869,15 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # `--no-interactive` path reaches. This is a strictly earlier exit on the
             # same predicate, so an operator who declines still gets no config lecture.
             if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
+                return rc
+            if (
+                rc := _reject_store_topology(
+                    project,
+                    pol,
+                    runs.judged_store_source(state, _sweep_store_source(pre_session_paths, pol)),
+                    recorded=runs.live_store_topology(state, project) or None,
+                )
+            ) is not None:
                 return rc
         adapters = _make_adapters(project, run_dir, pol)
         dev_cfg = pol.adapter.resolved("dev")
@@ -5163,6 +6065,20 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # config lecture about a gesture they did not make.
         if (rc := _reject_isolation_conflict(paths, pol)) is not None:
             return rc
+        if (
+            rc := _reject_store_topology(
+                project,
+                pol,
+                runs.judged_store_source(state, _sweep_store_source(paths, pol)),
+                recorded=runs.live_store_topology(state, project) or None,
+            )
+        ) is not None:
+            return rc
+        # The sweep's initiative pin, re-judged: the active initiative can change
+        # during the resolve session, and the re-arm below precedes the resume.
+        if (conflict := runsetup.sweep_initiative_conflict(state, paths)) is not None:
+            print(f"cannot resolve {args.run_id}: {conflict}", file=sys.stderr)
+            return 1
         # #496/#497: the resume's plugin-trust refusal, hoisted ahead of the re-arm
         # for the same reason — a refusal after it has already spent the escalation.
         # A re-arm-only resolve (`--no-resume`) launches nothing, so it is not judged.
@@ -5673,6 +6589,12 @@ def _resolve_reverify_finished(
         return rc
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
+    if (
+        rc := _reject_store_topology(
+            project, pol, state.source, recorded=runs.live_store_topology(state, project) or None
+        )
+    ) is not None:
+        return rc
     plugin_grants = _launch_plugin_grants(project)  # read ONCE, for both preflights
     if not _require_base_skills(
         project, pol, paths.repo_root, plugin_grants, review_owed=task.salvage_refile_pending
@@ -5834,6 +6756,33 @@ def _reverify(project: Path, cwd: Path) -> str | None:
     return None
 
 
+def _confirm_policy(project: Path) -> policy_mod.Policy | None:
+    """The project's policy for ``confirm``, None when it cannot be read."""
+    try:
+        return policy_mod.load(_policy_path(project))
+    except (policy_mod.PolicyError, OSError):
+        return None
+
+
+def _confirm_ticket_tree(project: Path) -> tickettree.TicketTreeLike:
+    """The tree ``confirm`` marks a ticket park's plan through: the project's
+    installed ``tickets.py``, unpinned — ``confirm`` runs outside any run, and the
+    park record's plan path is the cross-check ``mark`` holds the write to."""
+    return tickettree.TicketTree(project)
+
+
+class _ConfirmMarkLog(Journal):
+    """Where the ticket chokepoint's ``ticket-mark`` row goes during ``confirm``,
+    which runs outside any run and so has no run journal: kept in memory (nothing
+    is written), while the outcome itself is printed."""
+
+    def __init__(self) -> None:  # no run dir: `confirm` writes no journal
+        self.rows: list[dict[str, object]] = []
+
+    def append(self, kind: str, **fields: Any) -> None:
+        self.rows.append({"kind": kind, **fields})
+
+
 def cmd_confirm(args: argparse.Namespace) -> int:
     """Complete a story parked at `awaiting-operator` once the human has carried
     out the external actions it owes (#335).
@@ -5847,8 +6796,12 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     stayed outside the repo. `--reverify` is there for the case that matters —
     the external action may have changed what the tests see."""
     project = _project(args)
+    pol = _confirm_policy(project)
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = bmadconfig.load_paths(
+            project,
+            want_tickets=pol is not None and pol.stories.source == worksource.SOURCE_TICKETS,
+        )
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -5945,9 +6898,13 @@ def _resume_confirmation(
     advanced", since the confirmation itself already happened."""
     spec = story.spec_path
     assert spec is not None  # resumable requires a spec that read back as done
+    left = (
+        f"its plan is signed off and reads {story.spec_status}, but the park entry was"
+        if story.ticket
+        else "its spec is signed off and reads done, but the board and the park entry were"
+    )
     print(
-        f"{story.story_key} was already confirmed — its spec is signed off and reads "
-        f"done, but the board and the park entry were left behind. Finishing that; "
+        f"{story.story_key} was already confirmed — {left} left behind. Finishing that; "
         f"you will not be asked to acknowledge anything again.\n"
     )
     if args.reverify:
@@ -6016,6 +6973,10 @@ def _apply_confirmation(
             file=sys.stderr,
         )
         return 1
+    if story.ticket:
+        # A ticket plan's status is written only by the ticket chokepoint: the
+        # `confirm` mark is the landing half's, which a resume re-enters too.
+        return _land_confirmation(project, paths, story, spec, today)
     try:
         frontmatter.set_frontmatter_status(spec, "done", confine_root=project)
     except frontmatter.FrontmatterWriteError as e:
@@ -6061,7 +7022,18 @@ def _land_confirmation(
 
     A board row the writer refuses (``SprintStatusWriteRefused``) and one that
     otherwise did not reach ``done`` both exit 1 with the park entry kept, so a
-    re-run after the operator repairs the board resumes here."""
+    re-run after the operator repairs the board resumes here.
+
+    A ticket park has no board: its plan is marked instead
+    (:func:`_mark_ticket_confirmed`), and the commit carries the record's
+    deletion and — when the code checkout tracks the store — the plan
+    (:func:`_confirmed_plan_operands`)."""
+    if story.ticket:
+        target = _mark_ticket_confirmed(project, story, spec)
+        if target is None:
+            return 1
+        files = _confirmed_plan_operands(project, story, spec)
+        return _commit_confirmation(project, paths, story, files, f"plan is {target}")
     # The sole write path to the board, and an ordinary FORWARD move:
     # `awaiting-operator` sits immediately below `done` in STATUS_ORDER, so
     # confirming needs no exception to never-regress. Idempotent at `done`, which
@@ -6090,13 +7062,6 @@ def _land_confirmation(
             file=sys.stderr,
         )
         return 1
-    # Resolve the record path BEFORE dropping it: the drop unlinks the file, and
-    # a committed record's deletion must ride the confirm commit (#356) — the
-    # record arrived in the park's commit, so leaving its removal uncommitted
-    # would dirty the tree the next run's preflight refuses. `commit_paths`
-    # skips the path when no record was ever committed (a legacy-index park).
-    record = operatoractions.record_path(project, story.story_key)
-    operatoractions.drop(project, story.story_key)
     # A GITIGNORED board is left OUT of the list rather than handed over and
     # forgiven (#577). `commit_paths` forces every operand literal, so `git add`
     # refuses an ignored one with rc 1 — and refuses the whole operand list with
@@ -6104,12 +7069,127 @@ def _land_confirmation(
     # of the other two. That is right for the board (a file git will not track has
     # no commit to ride; the status on disk is the value) and wrong for the spec
     # and the record, whose deletion in particular MUST land per the #356 note
-    # above. #350's board carry makes a gitignored board an ordinary shape, so
-    # this is the common park's exit and not an exotic one.
+    # in `_commit_confirmation`. #350's board carry makes a gitignored board an
+    # ordinary shape, so this is the common park's exit and not an exotic one.
     try:
         board_ignored = verify.path_ignored(paths.repo_root, paths.sprint_status)
     except verify.GitError:
         board_ignored = False  # uncertainty keeps the board in: the older behavior
+    files = [spec] if board_ignored else [spec, paths.sprint_status]
+    return _commit_confirmation(project, paths, story, files, "spec and board are done")
+
+
+def _mark_ticket_confirmed(
+    project: Path, story: operatoractions.ParkedStory, spec: Path
+) -> str | None:
+    """Mark a confirmed ticket park's plan through the ticket chokepoint: reason
+    ``confirm``, to ``done`` under ``[tickets] mark_done = "auto"``, else to
+    ``built`` for a person to accept. ``mark`` clears the plan's ``blocked_*``
+    fields, holds the write to the record's plan, and reads it back; a plan
+    already at the target (an interrupted confirmation) is a no-op. Returns the
+    target, or None after printing why nothing was marked — the park entry stays,
+    so a re-run finishes the job."""
+    pol = _confirm_policy(project)
+    if pol is None:
+        print(
+            f"error: cannot read {_policy_path(project)}, so whether {story.story_key} "
+            f"lands done or built (`[tickets] mark_done`) is unknown — its plan was NOT "
+            f"marked and the park entry has been left in place. Repair the policy, then "
+            f"re-run `bmad-loop confirm {story.story_key}`. {_SECOND_SECTION_NOTE}",
+            file=sys.stderr,
+        )
+        return None
+    target = "done" if pol.tickets.mark_done == "auto" else "built"
+    try:
+        _confirm_ticket_tree(project).mark(
+            story.ref, target, reason="confirm", expected_plan=spec, journal=_ConfirmMarkLog()
+        )
+    except tickettree.TicketsError as e:
+        print(
+            f"error: marking ticket {story.ref} {target} failed (tickets.py {e.kind}: {e}), so "
+            f"{story.story_key} was NOT confirmed. The audit section was appended to {spec}; "
+            f"the plan and the park entry are untouched. Fix the ticket tree, then re-run "
+            f"`bmad-loop confirm {story.story_key}`. {_SECOND_SECTION_NOTE}",
+            file=sys.stderr,
+        )
+        return None
+    return target
+
+
+def _confirmed_plan_operands(
+    project: Path, story: operatoractions.ParkedStory, spec: Path
+) -> list[Path]:
+    """The confirm commit's operands for a ticket's marked plan, by store layout:
+    ``[spec]`` when the code checkout tracks the store (T1, or no initiative to
+    classify), else nothing. A store with its own repository (T3/T4) gets the plan
+    committed there first, through :class:`~bmad_loop.ticketstore.StoreCommitter`;
+    an unversioned store (T2/T6) has nothing to commit. Handed to the code
+    repository, a store plan is skipped as outside it (T4) or fails ``git add`` as
+    ignored (T2/T3) — sinking the record's deletion with it.
+
+    A store that cannot be classified or committed is warned about on stderr and
+    left out: the mark already landed, so ``confirm`` still finishes."""
+    try:
+        tpaths = bmadconfig.load_paths(project, want_tickets=True)
+    except bmadconfig.BmadConfigError as e:
+        return _plan_left_uncommitted(
+            spec, f"cannot read the BMAD config to classify the ticket store: {e}"
+        )
+    # `none`: only the layout matters here; worktree isolation's extra refusals are
+    # about arming a run, and `confirm` arms none.
+    result = ticketstore.assess_store(tpaths, "none")
+    if result is None:
+        return [spec]
+    if isinstance(result, ticketstore.StoreRefusal):
+        # The code, not the refusal text: that text is a run-arming refusal
+        # (`STORE_TOPOLOGY_CALLERS`), and `confirm` only needs to say why it stopped.
+        return _plan_left_uncommitted(
+            spec, f"the ticket store layout is refused: {result.code} at {result.path}"
+        )
+    if result.per_worktree():
+        return [spec]
+    if result.store_repo is None:
+        return []
+    committer = ticketstore.StoreCommitter(result.store_repo, tpaths.repo_root)
+    try:
+        commit = committer.commit(
+            story.story_key, [spec], f"chore(operator): confirm {story.story_key}"
+        )
+    except ticketstore.StoreCommitError as e:
+        return _plan_left_uncommitted(spec, str(e))
+    if commit.foreign:
+        return _plan_left_uncommitted(
+            spec, f"the store's index holds a staged version of {', '.join(commit.foreign)}"
+        )
+    return []
+
+
+def _plan_left_uncommitted(spec: Path, why: str) -> list[Path]:
+    """Warn that a confirmed plan's mark landed uncommitted; no operands."""
+    print(
+        f"warning: {spec} was marked but not committed ({' '.join(why.split())}) — "
+        "commit it in its ticket store by hand.",
+        file=sys.stderr,
+    )
+    return []
+
+
+def _commit_confirmation(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    story: operatoractions.ParkedStory,
+    files: list[Path],
+    landed: str,
+) -> int:
+    """Drop the park record and commit ``files`` with the record's deletion: the
+    shared tail of a board and a ticket confirmation."""
+    # Resolve the record path BEFORE dropping it: the drop unlinks the file, and
+    # a committed record's deletion must ride the confirm commit (#356) — the
+    # record arrived in the park's commit, so leaving its removal uncommitted
+    # would dirty the tree the next run's preflight refuses. `commit_paths`
+    # skips the path when no record was ever committed (a legacy-index park).
+    record = operatoractions.record_path(project, story.story_key)
+    operatoractions.drop(project, story.story_key)
     # THE PUBLISHABLE-TARGET GUARD (DW-237), per operand and before any git runs.
     # `commit_paths` forces every operand LITERAL, so an operand replaced by a
     # DIRECTORY is handed to `git add` as a pathspec and staged RECURSIVELY —
@@ -6120,7 +7200,7 @@ def _land_confirmation(
     # PER OPERAND, like `decisions.apply_pre_answer`'s GATE TWO: a dropped one must
     # not sink its siblings, which is the whole point of the `board_ignored` drop
     # this joins.
-    operands: list[Path] = [spec, record] if board_ignored else [spec, paths.sprint_status, record]
+    operands: list[Path] = [*files, record]
     survivors: list[Path] = []
     for path in operands:
         # The SAME resolve-then-guard the four carries take, imported rather than
@@ -6157,7 +7237,7 @@ def _land_confirmation(
             )
         except verify.GitError:
             pass  # files are written; git history is best effort (as `decisions`)
-    print(f"✓ {story.story_key} confirmed — spec and board are done")
+    print(f"✓ {story.story_key} confirmed — {landed}")
     return 0
 
 
@@ -6170,7 +7250,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     project = _project(args)
     try:
         paths = bmadconfig.load_paths(project)
-        pending = decisions.pending_missed_decisions(project)
+        pending = decisions.pending_missed_decisions(project, paths)
     except bmadconfig.BmadConfigError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -6234,7 +7314,9 @@ def cmd_decisions(args: argparse.Namespace) -> int:
     for decision in pending:
         option = prompter.ask(decision)
         try:
-            result = decisions.apply_pre_answer(project, decision, option, date=today)
+            result = decisions.apply_pre_answer(
+                project, decision, option, date=today, listed_ledger=paths.deferred_work
+            )
         except (
             OSError,
             bmadconfig.BmadConfigError,
@@ -6464,16 +7546,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"  {key:40s} {task.phase:17s} dev×{task.attempt} review×{task.review_cycle} "
             f"{tokens} {extra}"
         )
-    if state.source == "stories":
-        _print_stories_status(state, project)
-    else:
-        try:
-            paths = bmadconfig.load_paths(project)
-            ss = sprintstatus.load(paths.sprint_status)
-            remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
-            print(f"sprint backlog remaining: {len(remaining)}")
-        except (bmadconfig.BmadConfigError, sprintstatus.SprintStatusError):
-            pass
+    _STATUS_PRINTERS[worksource.resumed_traits_for(state.source).name](state, project)
     try:
         missed = decisions.pending_missed_decisions(project)
         if missed:
@@ -7771,7 +8844,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also execute every [environment] probe from .bmad-loop/policy.toml on this "
         "host (all of them, not fail-fast; each bounded by probe_timeout_s); a probe "
-        "that fails, times out or cannot be started fails validate",
+        "that fails, times out or cannot be started fails validate. In tickets mode, "
+        "also probe the project's tickets.py for the commands bmad-loop needs",
     )
     machine.add_json_flag(validate_p, "check findings")
 
@@ -7870,11 +8944,17 @@ def main(argv: list[str] | None = None) -> int:
         help="force stories mode: dispatch the epic spec folder's stories.yaml by "
         "folder+id (overrides [stories].source)",
     )
-    run_p.add_argument("--epic", type=int, help="only stories from this epic (sprint mode)")
+    run_p.add_argument(
+        "--epic",
+        type=_epic_selector,
+        help="only stories from this epic: its number (sprint mode); its id, slug "
+        "or epic-<slug> (tickets mode)",
+    )
     run_p.add_argument(
         "--story",
         help="story: E-S / E.S (split suffix ok, e.g. 2-6a), a slug fragment, "
-        "or full key (sprint mode); a story id (stories mode)",
+        "or full key (sprint mode); a story id (stories mode); a ticket ref "
+        "(tickets mode)",
     )
     run_p.add_argument("--max-stories", type=int, help="stop after N stories")
     run_p.add_argument("--dry-run", action="store_true", help="print the plan, spawn nothing")
@@ -8247,6 +9327,8 @@ def main(argv: list[str] | None = None) -> int:
         sprintstatus.SprintStatusError,
         policy_mod.PolicyError,
         verify.GitError,
+        worksource.SourceNotRunnable,
+        worksource.UnknownSource,
     ) as e:
         print(f"error: {e}", file=sys.stderr)
         return ExitCode.FAILURE

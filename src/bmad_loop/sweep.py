@@ -21,10 +21,11 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, NoReturn, TypeVar, assert_never
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, NoReturn, TypeVar, assert_never
 
-from . import deferredwork, gates, sprintstatus, verify
+from . import deferredwork, gates, sprintstatus, ticketstore, verify
 from .adapters.generic import load_result_document
+from .bmadconfig import ProjectPaths
 from .engine import (
     Engine,
     RunPaused,
@@ -50,9 +51,10 @@ from .platform_util import (
     open_dir_confined,
     safe_segment,
 )
-from .runs import StateRootError, _project_of_run_dir, events_dir_for
+from .runs import StateRootError, _project_of_run_dir, events_dir_for, live_store_topology
 from .signals import attribute_events, session_events
 from .statemachine import advance
+from .worksource import EpicProgress, Pick, WorkSource
 
 
 def _read_json(path: Path) -> Any:
@@ -1402,6 +1404,67 @@ def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
     return f" [result.json: {artifact}; hook events: {hooks}]"
 
 
+class NoBoardWorkSource:
+    """The work source of a sweep on a BMAD v7 project: an empty queue with no
+    board behind it.
+
+    A sweep never picks from its work source: its own ``_loop`` reads the
+    deferred-work ledger. The source only answers the Engine code a sweep
+    inherits. The base engine's sprint source reads ``sprint-status.yaml`` and
+    has epics, and a v7 project has neither. This one reads nothing: the queue
+    is empty and there are no epics, so the epic and retrospective methods give
+    the same inert answers as a stories run's. ``name`` is the run's persisted
+    source, which a sweep never sets."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def has_epics(self) -> bool:
+        return False
+
+    def pick(self, phases: Any, current_epic: int | None) -> Pick:
+        del phases, current_epic
+        return Pick()
+
+    def remaining_estimate(self, phases: Any) -> int:
+        del phases
+        return 0
+
+    def epic_progress(self, epic: int) -> EpicProgress:
+        del epic
+        return EpicProgress(complete=False, retro_done=False)
+
+    def retro_done(self, epic: int) -> bool:
+        del epic
+        return False
+
+    def retro_artifact_errors(self, epic: int) -> tuple[list[str], list[Path]]:
+        del epic
+        return ["a v7 sweep has no epic retrospective"], []
+
+    def retro_docs(self, epic: int) -> list[Path]:
+        del epic
+        return []
+
+    def retro_commit_paths(self, docs: Iterable[Path]) -> set[Path]:
+        return set(docs)
+
+    def retro_target(self, epic: int) -> str:
+        return str(epic)
+
+    def epic_label(self, epic: int) -> str:
+        return f"epic-{epic}"
+
+
+if TYPE_CHECKING:
+    _conforms: type[WorkSource] = NoBoardWorkSource
+
+
 class SweepEngine(Engine):
     """Engine variant whose loop processes the deferred-work ledger instead
     of sprint-status. Bundles reuse the inherited story pipeline through the
@@ -1421,6 +1484,19 @@ class SweepEngine(Engine):
         prompter: DecisionPrompter | None = None,
         **kwargs: Any,
     ):
+        # v7: a ticket store no checkout carries is shared, as in a tickets run
+        # (`TicketsEngine.__init__`) — the ledger and bundle plans under it stay at
+        # the main checkout and worktree mounts are redirected to it. Read from the
+        # topology the sweep recorded at its start (`runsetup.compose_sweep`), moved
+        # with a renamed project.
+        state, paths = kwargs.get("state"), kwargs.get("paths")
+        if state is not None and paths is not None and state.store_topology:
+            kwargs["paths"] = ticketstore.with_shared_store(
+                paths, live_store_topology(state, paths.project)
+            )
+        # Whether `store-unversioned` is already journaled for this run (None until
+        # the journal is first read for it, `_note_store_unversioned`).
+        self._unversioned_noted: bool | None = None
         super().__init__(*args, **kwargs)
         self.adapters["triage"] = (
             triage_adapter if triage_adapter is not None else self.adapters["dev"]
@@ -1429,6 +1505,17 @@ class SweepEngine(Engine):
         # distinct triage adapter arrives after that, so attach it here too or every
         # sweep triage session would emit no `session-idle`/`session-active` (#680).
         self.adapters["triage"].journal = self.journal
+        # A synthesizing adapter scans its own `paths` for a bundle's first-attempt
+        # plan (`_artifact_dirs`), and `make_adapters` loads them without the shared
+        # store, so under worktree isolation it would look in the unit checkout
+        # while the redirected mount writes the plan to the main checkout's store.
+        # Hand it the store too. A tickets run pins its plan from attempt 1 and
+        # never scans.
+        if self.paths.shared_store is not None:
+            for owned in self.adapters.values():
+                held = getattr(owned, "paths", None)
+                if isinstance(held, ProjectPaths) and held.shared_store is None:
+                    setattr(owned, "paths", replace(held, shared_store=self.paths.shared_store))
         self.prompting = prompting
         self.decisions_only = decisions_only
         self.max_bundles = resolve_sweep_override(max_bundles, self.policy.sweep.max_bundles)
@@ -2877,7 +2964,10 @@ class SweepEngine(Engine):
         # `deferred_work` hangs off `implementation_artifacts`, which stays
         # project-rooted under the override.
         project = _project_of_run_dir(self.run_dir)
-        dropped = decisions_store.prune_pre_answers(project, deferredwork.open_ids(text))
+        scope = decisions_store.store_scope(self.paths)
+        dropped = decisions_store.prune_pre_answers(
+            project, deferredwork.open_ids(text), scope=scope
+        )
         if dropped:
             self.journal.append("decision-preanswers-pruned", dw_ids=dropped)
             # The STORE FILE, not the workspace root: the same divergence that
@@ -2892,7 +2982,7 @@ class SweepEngine(Engine):
             # nothing wrote nothing and spawns no git.
             self._commit_ledger(
                 "chore(sweep): drop consumed deferred-work pre-answers",
-                path=decisions_store.store_path(project),
+                path=decisions_store.store_path(project, scope),
                 family="store",
             )
 
@@ -2957,7 +3047,8 @@ class SweepEngine(Engine):
         # way). The nested/monorepo shape is unaffected — `repo_root` is an
         # ancestor there, so the store sits inside it.
         project = _project_of_run_dir(self.run_dir)
-        if not decisions_store.drop_pre_answer(project, dw_id, answer=answer):
+        scope = decisions_store.store_scope(self.paths)
+        if not decisions_store.drop_pre_answer(project, dw_id, answer=answer, scope=scope):
             # Either no store entry (a run-local-only answer) or an entry that is
             # no longer the value dropped (a human's later replacement): no write,
             # no row — the store's bytes are untouched either way.
@@ -2977,7 +3068,7 @@ class SweepEngine(Engine):
         # Guarded on `drop_pre_answer` above: no store entry, no write, no git.
         self._commit_ledger(
             "chore(sweep): drop stale deferred-work pre-answer",
-            path=decisions_store.store_path(project),
+            path=decisions_store.store_path(project, scope),
             family="store",
         )
 
@@ -5358,7 +5449,15 @@ class SweepEngine(Engine):
         phase's arms: `_loop` has already refused to call this under a doubt, but
         a doubt armed between the two — `_commit_ledger`'s own refusal arm on an
         earlier publisher — must still withhold rather than walk the file into
-        HEAD."""
+        HEAD.
+
+        A v7 project has no sprint board, and its retro action items are prose in
+        the epic retrospective, which nothing can read as records. The ingest is
+        unavailable there: it journals `ingest_cause="no-board"` once per fresh
+        sweep and reads no file."""
+        if self._v7_sweep():
+            self.journal.append("sweep-retro-ingest-unavailable", ingest_cause="no-board")
+            return False
         try:
             items = sprintstatus.load_action_items(self.workspace.paths.sprint_status)
         except sprintstatus.ActionItemsMalformed as e:
@@ -5921,7 +6020,10 @@ class SweepEngine(Engine):
         # unattended/abandoned sweep left). The ledger edits were already applied
         # when they answered, so here we only take the answer onboard — this run
         # won't re-prompt/re-skip and build answers materialize into bundles.
-        pre = decisions_store.load_pre_answers(project_root)
+        # The store that answers THIS sweep's ledger: on v7 the pinned initiative's.
+        pre = decisions_store.load_pre_answers(
+            project_root, decisions_store.store_scope(self.paths)
+        )
         # The ids adopted from the project store THIS cycle, not every id in
         # `answers`: the write-back rows below name exactly what this phase tried
         # to persist, not the answers the run store already held.
@@ -6899,10 +7001,10 @@ class SweepEngine(Engine):
           no repository at all, and git resolves the enclosing repository in all
           three. The WORKSPACE's copy, never `self.paths.deferred_work`, which is
           a different file in a different tree under worktree isolation.
-        * the two pre-answer PRUNES pass `decisions.store_path(project)`. The
-          pre-answer store is a bare join off the project root
-          (`decisions.STORE_REL`) that no config knob can move, and the run dir is
-          the anchor no workspace swap relocates.
+        * the two pre-answer PRUNES pass `decisions.store_path(project, scope)`.
+          The pre-answer store is a bare join off the project root
+          (`decisions.STORE_REL`, per initiative on v7) that no config knob can
+          move, and the run dir is the anchor no workspace swap relocates.
 
         `self.workspace.root` is refused at every site. Where `repo_root` names a
         tree DISJOINT from the project it is the separate CODE repo, so a
@@ -8616,6 +8718,150 @@ class SweepEngine(Engine):
     def _dev_prompt(self, task: StoryTask, feedback: Path | None) -> str:
         return self._generic_bundle_prompt(task, feedback)
 
+    def _v7_sweep(self) -> bool:
+        """Whether this sweep runs on a BMAD v7 project. The ledger and the bundle
+        plans then live in the initiative folder (``output_folder`` when no
+        initiative is active), there is no sprint board, and build-auto finishes a
+        plan at ``built``."""
+        return self.paths.era == "v7"
+
+    # ----------------------------------------------------- v7: no sprint board
+    # A sweep persists no source of its own (`RunState.source` keeps its
+    # "sprint-status" default), so the sprint-board seams key on the era here.
+    # `Engine.__init__` builds the source before `__init__` below runs, so these
+    # read `self.paths`, which it has already set.
+
+    def _make_work_source(self) -> WorkSource:
+        if self._v7_sweep():
+            return NoBoardWorkSource(self.state.source)
+        return super()._make_work_source()
+
+    def _has_sprint_board(self) -> bool:
+        return not self._v7_sweep() and super()._has_sprint_board()
+
+    def _sprint_board_instruction(self) -> str:
+        """No board sentence in a v7 sweep's review prompt: there is no board.
+        Empty also drops the review hand-back redirect gated on it."""
+        if self._v7_sweep():
+            return ""
+        return super()._sprint_board_instruction()
+
+    def _session_success_statuses(self, role: str, label: str | None) -> tuple[str, ...]:
+        """On v7 a bundle's dev and review sessions end at ``built`` (or ``done``
+        on a plan a human accepted); see :meth:`_bundle_success_statuses`."""
+        if self._v7_sweep() and label is None and role in ("dev", "review"):
+            return (verify.PLAN_BUILT, verify.PLAN_DONE)
+        return super()._session_success_statuses(role, label)
+
+    def _review_converged_statuses(self) -> frozenset[str]:
+        if self._v7_sweep():
+            return self._bundle_success_statuses("review")
+        return super()._review_converged_statuses()
+
+    def _dev_success_status(self) -> str:
+        if self._v7_sweep():
+            return verify.PLAN_BUILT
+        return super()._dev_success_status()
+
+    def _harvest_success_statuses(self) -> frozenset[str]:
+        if self._v7_sweep():
+            return self._bundle_success_statuses("dev")
+        return super()._harvest_success_statuses()
+
+    # ------------------------------------------- v7: bundle plan in a store repo
+
+    @property
+    def store_topology(self) -> ticketstore.StoreTopology | None:
+        """The ticket store a v7 sweep recorded at its start, located on the live
+        project (:func:`~bmad_loop.runs.live_store_topology`); None on v6, and when
+        it recorded none (no store to classify, or a sweep older than the record)."""
+        recorded = live_store_topology(self.state, self.paths.project)
+        return ticketstore.StoreTopology.from_dict(recorded) if recorded else None
+
+    def _land_post_landing_writes(self, task: StoryTask) -> None:
+        """Once a bundle's code has landed, publish its accepted plan when the plan
+        lives in a ticket store with its own repository (T3/T4): the code commit
+        cannot carry a file in another repository. See
+        :meth:`_publish_bundle_plan`."""
+        super()._land_post_landing_writes(task)
+        self._publish_bundle_plan(task)
+
+    def _publish_bundle_plan(self, task: StoryTask) -> None:
+        """Commit ``task``'s accepted bundle plan in the store's repository through
+        :class:`~bmad_loop.ticketstore.StoreCommitter`, as ``chore(sweep): <bundle>
+        plan [bmad-loop <run>]`` with the ``Bmad-Code-*`` trailers. The ledger is
+        not part of it: the sweep's ledger publishers already commit it in the
+        ledger's own repository. An unversioned store (T2/T6) journals
+        ``store-unversioned`` once per run.
+
+        Best effort, like a tickets run's retro commit, and never a pause: the plan
+        on disk is the record, and the code has already landed. A failed commit
+        journals ``store-commit-failed``, a staged foreign version of the plan
+        ``store-commit-foreign-dirt``; the plan then stays uncommitted in the store
+        for a human (no latch replays it)."""
+        topology = self.store_topology
+        if topology is None or topology.per_worktree() or not task.spec_file:
+            return
+        if topology.store_repo is None:
+            self._note_store_unversioned(topology)
+            return
+        plan = verify.resolve_spec_path(task.spec_file, self.paths)
+        try:
+            inside = plan.resolve().is_relative_to(topology.store_repo.resolve())
+        except (OSError, RuntimeError, ValueError):
+            inside = False
+        if not inside or not plan.is_file():
+            return  # not a store-repo plan: the code commit carried it, or nothing
+        committer = ticketstore.StoreCommitter(topology.store_repo, self.paths.repo_root)
+        try:
+            result = committer.commit(
+                task.story_key,
+                [plan],
+                f"chore(sweep): {task.story_key} plan [bmad-loop {self.state.run_id}]",
+                code_commit=self._landed_code_commit(task),
+                code_baseline=task.baseline_commit,
+            )
+        except ticketstore.StoreCommitError as e:
+            self.journal.append("store-commit-failed", story_key=task.story_key, error=str(e))
+            return
+        if result.foreign:
+            self.journal.append(
+                "store-commit-foreign-dirt", story_key=task.story_key, count=len(result.foreign)
+            )
+            return
+        self.journal.append("store-committed", story_key=task.story_key, commit=result.sha)
+
+    def _note_store_unversioned(self, topology: ticketstore.StoreTopology) -> None:
+        """Journal ``store-unversioned`` once per run: a bundle plan in an
+        unversioned store lives on disk only, with no history to recover it from."""
+        if self._unversioned_noted is None:
+            self._unversioned_noted = any(
+                e.get("kind") == "store-unversioned" for e in self.journal.entries()
+            )
+        if not self._unversioned_noted:
+            self.journal.append("store-unversioned", layout=topology.layout)
+            self._unversioned_noted = True
+
+    def _bundle_artifact_home_wording(self) -> tuple[str, str]:
+        """How the bundle prompt names the artifact home: the phrase after "in"
+        and the phrase after "relative to". v6 names the configured
+        ``implementation_artifacts`` key; v7 has no such key and names the
+        initiative folder (or ``output_folder``) by its project-relative path."""
+        if not self._v7_sweep():
+            return (
+                "the configured `implementation_artifacts` directory",
+                "`implementation_artifacts`",
+            )
+        paths = self.workspace.paths
+        home = paths.implementation_artifacts
+        try:
+            shown = home.relative_to(paths.project).as_posix()
+        except ValueError:
+            shown = home.as_posix()
+        if paths.initiative_folder is None:
+            return f"the `output_folder` directory `{shown}`", "the `output_folder` directory"
+        return f"the initiative folder `{shown}`", "the initiative folder"
+
     def _generic_bundle_prompt(self, task: StoryTask, feedback: Path | None) -> str:
         """Bundle invocation for the generic dev primitive (disk-resolved, see
         ``Engine._dev_skill``): the self-contained
@@ -8631,10 +8877,11 @@ class SweepEngine(Engine):
         `_restore_patch` just laid onto the tree. The freeform intent.md pointer
         takes the path where that dirty-tree check runs first."""
         bundle_ref = task.bundle_file or task.story_key
+        home_in, home_rel = self._bundle_artifact_home_wording()
         artifact_only_guidance = (
             "\n\nArtifact-only receipt: only if this session's actual deliverables are "
-            "confined to ignored content in the configured `implementation_artifacts` "
-            "directory strictly inside the code repository, you may write "
+            f"confined to ignored content in {home_in} "
+            "strictly inside the code repository, you may write "
             "`Artifact only: true` on its own line beside `Status:` in this session's "
             "last genuine `## Auto Run Result` section. Author that marker in the "
             "current session, outside fenced blocks and without an orchestrator "
@@ -8647,7 +8894,7 @@ class SweepEngine(Engine):
             "All other verification and ledger-close checks still apply. In an "
             "isolated worktree, successful integration publishes the accepted ignored "
             "bundle spec before teardown. To publish additional ignored regular files, "
-            "list their exact paths relative to `implementation_artifacts` in the "
+            f"list their exact paths relative to {home_rel} in the "
             "accepted spec's `artifact_deliverables` frontmatter list. Directories, "
             "globs, absolute paths, traversal, symlinks, and the orchestrator-owned "
             "ledger and sprint board are forbidden. Undeclared files are not copied. "
@@ -8660,6 +8907,11 @@ class SweepEngine(Engine):
         # the default prompt is unchanged. This engine has no park clause.
         env_claim = self._environment_claim_instruction()
         env_sentence = f" {env_claim}" if env_claim else ""
+        # On v7 build-auto names the plan it writes for a free-form intent
+        # (`plan-<slug>.md` in the initiative folder) and leads the slug with a
+        # tracking identifier when told to. The hint only makes the plan easy for
+        # an operator to find: the read-back still discovers it by scan.
+        slug_hint = f" Lead the plan slug with `{task.story_key}`." if self._v7_sweep() else ""
         if feedback is None:
             if task.restore_patch and task.spec_file:
                 return (
@@ -8677,7 +8929,8 @@ class SweepEngine(Engine):
                 f"/{self._dev_skill()} Implement the deferred-work bundle described in "
                 f"`{bundle_ref}` — it carries the intent and the verbatim ledger "
                 f"entries to resolve. Do NOT edit the deferred-work ledger; the "
-                f"orchestrator records resolution.{env_sentence}{artifact_only_guidance}"
+                f"orchestrator records resolution.{slug_hint}{env_sentence}"
+                f"{artifact_only_guidance}"
             ) + (f"\n\n{preserved}" if preserved else "")
         self._reset_spec_for_repair(task)
         spec_ref = task.spec_file or bundle_ref
@@ -8716,10 +8969,26 @@ class SweepEngine(Engine):
         spec_file = result_mapping(result_json).get("spec_file")
         if not spec_file:
             return
-        success_status = "in-review" if self._dev_review_enabled() else "done"
+        success_statuses = self._bundle_success_statuses("dev")
         self._close_bundle_ledger_when_spec_status(
-            task, str(spec_file), success_status, site="bundle-close-locked"
+            task, str(spec_file), success_statuses, site="bundle-close-locked"
         )
+
+    def _bundle_success_statuses(self, stage: Literal["dev", "review"]) -> frozenset[str]:
+        """The spec statuses at which a bundle's ``stage`` has finished its spec:
+        the dev close and the review reclose read them, and so do
+        ``verify_dev_bundle`` and ``verify_review_bundle``.
+
+        v6: dev hands off at ``in-review`` when the legacy dev skill does,
+        otherwise both stages end at ``done``. v7: build-auto finishes a plan at
+        ``built``, and a follow-up review of a ``built`` plan leaves it ``built``;
+        ``done`` is accepted too, for a plan a human already accepted. A bundle is
+        not a ticket, so nothing marks its plan ``done``: it stays ``built``."""
+        if self._v7_sweep():
+            return frozenset({verify.PLAN_BUILT, verify.PLAN_DONE})
+        if stage == "dev" and self._dev_review_enabled():
+            return frozenset({"in-review"})
+        return frozenset({"done"})
 
     def _bundle_close_operation_id(self, task: StoryTask) -> str:
         """Stable identity for a close and its possible defer-time undo."""
@@ -8743,12 +9012,13 @@ class SweepEngine(Engine):
         self,
         task: StoryTask,
         spec_file: str,
-        success_status: str,
+        success_statuses: frozenset[str],
         kind: str = "sweep-bundle-closed",
         *,
         site: str,
     ) -> None:
-        """Mark the bundle's ids ``done`` once its spec reaches ``success_status``.
+        """Mark the bundle's ids ``done`` once its spec reaches one of
+        ``success_statuses`` (:meth:`_bundle_success_statuses` for the stage).
 
         Called once after accepted dev (``_post_dev_accepted_sync``,
         ``site="bundle-close-locked"``) and again by the review-leg reclose
@@ -8775,7 +9045,7 @@ class SweepEngine(Engine):
         fm = self._observed_frontmatter(spec_path, task.story_key, "bundle-ledger-close")
         if fm is None:
             return
-        if verify.status_of(fm) != success_status:
+        if verify.status_of(fm) not in success_statuses:
             return
         ledger = self.workspace.paths.deferred_work
         note = self._bundle_close_note(task)
@@ -9012,6 +9282,7 @@ class SweepEngine(Engine):
             result_json,
             review_enabled=self._dev_review_enabled(),
             engine_written=self._harvest_gate_exclude(task),
+            accept_statuses=self._bundle_success_statuses("dev"),
         )
         # The accepted artifact-only receipt (DW-273) is never silent: one row per
         # accepted attempt, mirroring `Engine._verify_dev_artifacts`'s
@@ -9045,7 +9316,7 @@ class SweepEngine(Engine):
             self._close_bundle_ledger_when_spec_status(
                 task,
                 task.spec_file,
-                "done",
+                self._bundle_success_statuses("review"),
                 kind="sweep-bundle-reclosed",
                 site="bundle-reclose-locked",
             )
@@ -9055,6 +9326,7 @@ class SweepEngine(Engine):
             self.policy,
             on_results=self._review_command_sink(task),
             on_probes=self._review_probe_sink(task),
+            accept_statuses=self._bundle_success_statuses("review"),
         )
         if outcome.ok:
             self._accept_review_artifact_source(task)

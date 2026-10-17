@@ -8,13 +8,22 @@ A run pauses when it needs a human: an escalation, an environment fault, a merge
 - **`bmad-loop status <run-id>`** shows the pause stage, the paused story and the reason. A parked attempt's recovery ref appears as `[ref]` (`preserve_ref` in `status --json`).
 - **The TUI** shows the same, and its keys launch the commands below: `R` resolve, `V` re-verify, `e` resume, `p` review the paused run.
 
-| Pause stage                           | Cause                                                        | Clear it with                                                                 |
-| ------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------- |
-| `escalation`                          | a CRITICAL escalation, or a story still escalated at run end | [`bmad-loop resolve`](#resolving-an-escalation)                               |
-| `environment`                         | an environment probe failed before a session launched        | fix the environment, then `bmad-loop resume` ([details](#environment-faults)) |
-| `story-gate`                          | a ledger `gate:`, or a ledger that cannot be read            | see the [sweep guide](sweep-guide.md#hard-gates)                              |
-| `spec-approval`, `epic-boundary`      | a configured gate or a retrospective                         | `bmad-loop resume`                                                            |
-| `plan-checkpoint`, `story-checkpoint` | a stories-mode checkpoint                                    | `bmad-loop resume`                                                            |
+| Pause stage                           | Cause                                                                                                                                                                                                                                                                                                                                         | Clear it with                                                                                       |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `escalation`                          | a CRITICAL escalation, or a story still escalated at run end                                                                                                                                                                                                                                                                                  | [`bmad-loop resolve`](#resolving-an-escalation)                                                     |
+| `environment`                         | an environment probe failed before a session launched                                                                                                                                                                                                                                                                                         | fix the environment, then `bmad-loop resume` ([details](#environment-faults))                       |
+| `story-gate`                          | a ledger `gate:`, or a ledger that cannot be read                                                                                                                                                                                                                                                                                             | see the [sweep guide](sweep-guide.md#hard-gates)                                                    |
+| `spec-approval`, `epic-boundary`      | a configured gate or a retrospective                                                                                                                                                                                                                                                                                                          | `bmad-loop resume`                                                                                  |
+| `plan-checkpoint`, `story-checkpoint` | a stories- or tickets-mode checkpoint                                                                                                                                                                                                                                                                                                         | `bmad-loop resume`                                                                                  |
+| `ticket-hitl`, `ticket-refine`        | tickets mode: the next ticket is a hitl ticket, or needs refining                                                                                                                                                                                                                                                                             | build or refine it, then `bmad-loop resume`                                                         |
+| `ticket-tree`                         | tickets mode: the active initiative changed, `tickets.py` failed (including a park, a post-rollback re-arm, or a `done` or park mark owed after the code landed), only tickets the run did not start are in the way, the initiative folder has uncommitted changes, or worktree isolation would drop a gitignored plan from the unit's commit | fix the tree, or commit or stash the changes, then `bmad-loop resume`                               |
+| `epic-boundary` (tickets)             | tickets mode: an epic this run finished reaches its one closure pause, its retrospective verdict is `rejected`, or a later ticket waits on an epic that is not closed                                                                                                                                                                         | close the epic with bmad-ticket, then `bmad-loop resume` ([details](#epic-closure-in-tickets-mode)) |
+
+### Epic closure in tickets mode
+
+Before each pick and at run end, a tickets run checks the epic table. An open epic counts as finished once every ticket is `built`, `done` or `dropped`. If this run committed one of its tickets, the epic gets its retrospective: under `gates.retrospective = "auto"` the run dispatches `/bmad-retrospective -H <epic-slug>` and commits only its `<epic-slug>-retrospective.md`. A valid document already on disk counts as done. `notify` and `never` run no session. The run records the document's `verdict` (or `unknown`) and pauses at `epic-boundary`. bmad-loop never writes the epic's file, so close the epic with bmad-ticket, then resume.
+
+A `rejected` verdict pauses the run again at every pick while the epic stays open. Fix-up tickets added to the epic are built first. Any other verdict pauses once: a resume past an epic still open journals `epic-closure-not-recorded` and goes on.
 
 ## Escalations
 
@@ -58,6 +67,14 @@ When an escalation names a saved patch (in the spec's `## Auto Run Result`), you
 2. The spec is re-armed to `in-review` and the patch re-applied, so the re-drive resumes at review. A patch that does not apply escalates again.
 
 In-place runs only: it is refused under worktree isolation, for a task with a worktree, and for a story with no recorded spec.
+
+### Resolve in tickets mode
+
+A tickets run's frozen spec is the ticket's plan, and its intent is the plan's `<intent-contract>` block. The resolve agent's context adds a `tickets` block: the ticket's ref, the plan's status and blocked reason, and an excerpt of its `## Auto Run Result`.
+
+The re-arm moves the plan through `tickets.py mark` (reason `rearm`): to `ready-for-dev`, or `in-review` for a restore. This clears the plan's `blocked_*` fields. A move the plan transition table refuses aborts the re-arm, and the ticket stays escalated. An aborted re-arm puts the plan back byte for byte.
+
+build-auto saves an intent-gap patch beside the plan as `<plan>.patch`. The re-arm moves it to the run's `restore/` directory either way, because a patch left in the tree fails the re-drive's clean-tree check. A restore that names the patch latches the moved copy. A later `--restore-patch` naming the original path finds the copy.
 
 ### Adopt the kept branch
 
@@ -170,6 +187,8 @@ A story that needs an action no agent can take (buy a domain, publish a DNS reco
 4. Add `--reverify` to re-run the environment probes and `[verify]` commands first; a failure blocks the confirmation.
 
 If `confirm` is interrupted, run the same command again; it finishes without prompting twice. If the park is not found, pull the branch that carries the park commit. If the park record has drifted, `confirm` refuses and changes nothing: fix what `bmad-loop validate` reports (`operator.*` checks). `[operator] enabled = false` turns parking off.
+
+In tickets mode the park lives on the ticket's plan, not a board. The unit's commit marks the plan `blocked` with a reason starting `awaiting operator: ` that lists the actions, and the park record names the ticket ref. Tickets that wait on it end the run with a parked summary. `confirm <ref>` appends the same section, then marks the plan through `tickets.py mark`: `done` under `[tickets] mark_done = "auto"`, `built` under `"never"`. A review that demotes a built ticket parks the same way under `[operator] on_review_demotion = "park"`.
 
 ## Environment faults
 

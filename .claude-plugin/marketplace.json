@@ -19,7 +19,8 @@
       "skills": [
         "./src/bmad_loop/data/skills/bmad-loop-setup",
         "./src/bmad_loop/data/skills/bmad-loop-resolve",
-        "./src/bmad_loop/data/skills/bmad-loop-sweep"
+        "./src/bmad_loop/data/skills/bmad-loop-sweep",
+        "./src/bmad_loop/data/skills/bmod-bmad-loop"
       ]
     }
   ]

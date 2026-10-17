@@ -1277,6 +1277,8 @@ def _make_flow(
     journal: _RecordingJournal | None = None,
     run_dir: Path | None = None,
     dev_attempt_dispatched: bool = True,
+    spec_confine_root=None,
+    owned_plan=None,
 ):
     """Build a RecoveryFlow wired to recording stubs. The returned flow carries a
     ``.calls`` namespace tallying the injected callbacks for assertions. ``paths``
@@ -1312,6 +1314,8 @@ def _make_flow(
         escalate=_escalate,
         escalation_pause=_pause,
         dev_attempt_dispatched=lambda task: dev_attempt_dispatched,
+        spec_confine_root=spec_confine_root,
+        owned_plan=owned_plan,
     )
     flow.calls = calls
     return flow
@@ -5816,3 +5820,62 @@ def test_owned_spec_pause_folds_multiline_spec_and_root_paths(project, tmp_path,
     # `root` reaches the notice through `Path`, so it carries the platform separator.
     assert text.count(f"{os.sep}checkout{os.sep}{_FOLDED_FAULT}") == 4
     assert flow.journal.fields("rollback-owned-spec-manual-required")["spec"] == spec
+
+
+class _RecordingPlanWriter:
+    """An `OwnedPlanWriter` owning every spec, recording its calls; its restore
+    writes the bytes back, as `TicketTree.restore_preimage` does."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Path, object]] = []
+
+    def owns(self, task, spec_path) -> bool:
+        return True
+
+    def restore(self, task, spec_path, data) -> None:
+        self.calls.append(("restore", spec_path, data))
+        spec_path.write_bytes(data)
+
+    def normalize(self, task, spec_path, target_status) -> None:
+        self.calls.append(("normalize", spec_path, target_status))
+
+
+@pytest.mark.parametrize("inside", [True, False], ids=["in-store", "outside-store"])
+def test_owned_plan_restore_confined_to_store_root(project, tmp_path, inside):
+    """A work item's plan is restored by its own writer (tickets mode:
+    `TicketTree.restore_preimage`), never the anchored writers here — and only
+    inside the store root `spec_confine_root` answers. A bound plan resolving
+    outside it is never handed to the writer: recovery pauses for the operator
+    with the plan untouched. Ablation (performed): drop the confinement check in
+    `RecoveryFlow._route_owned_plan` and the outside plan is restored — this
+    FAILS."""
+    repo = project.project
+    spec = _tracked_spec(project)
+    baseline = spec.read_bytes()
+    task = _task(repo)
+    operator = baseline.replace(b"baseline intent", b"operator input outside HEAD")
+    task.dispatched_spec_file = str(spec)
+    task.dispatched_spec_snapshot = operator
+    # the failed child put the plan back at HEAD, discarding the pre-launch input
+    spec.write_bytes(baseline)
+    store = spec.parent if inside else tmp_path / "another-store"
+    store.mkdir(exist_ok=True)
+    writer = _RecordingPlanWriter()
+    flow = _make_flow(
+        workspace=Workspace.default(project),
+        policy=_policy(rollback_on_failure=False),
+        spec_confine_root=lambda _task: store,
+        owned_plan=writer,
+    )
+
+    if inside:
+        flow.rollback_or_pause(task)
+        assert ("restore", spec, operator) in [(k, Path(p), d) for k, p, d in writer.calls]
+        assert spec.read_bytes() == operator
+        assert flow.calls.pauses == []
+    else:
+        with pytest.raises(_Pause):
+            flow.rollback_or_pause(task)
+        assert writer.calls == []
+        assert spec.read_bytes() == baseline
+        assert any("outside the store root" in reason for reason, *_ in flow.calls.pauses)

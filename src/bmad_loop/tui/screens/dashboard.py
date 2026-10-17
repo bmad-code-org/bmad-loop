@@ -48,6 +48,7 @@ from ..widgets import (
     Splitter,
     SprintTree,
     StoriesTable,
+    TicketsTable,
     agent_label,
     pause_tag,
     status_cell,
@@ -139,6 +140,8 @@ class _Snapshot:
     read_faults: tuple[str, ...] = ()  # run-dir files unreadable this tick (DW-475)
     stories_mode: bool = False  # selected run is stories mode (source == "stories")
     stories: list[stories.StoryRow] | None = None  # stories board rows, when stories_mode
+    tickets_mode: bool = False  # selected run is tickets mode (its loader gave a TicketsBoard)
+    tickets: data.TicketsBoard | None = None  # tickets board, when tickets_mode
     new_entries: list[dict[str, Any]] = field(default_factory=list)
     log_task: str | None = None
     log_reset: bool = False
@@ -232,7 +235,7 @@ class DashboardScreen(Screen[None]):
                 yield runs
                 # The section titles that used to ride each pane's border-top now
                 # ride the splitter bar above that pane (its border-top is dropped
-                # in CSS). split-runs' label tracks the sprint/stories toggle.
+                # in CSS). split-runs' label tracks the sprint/stories/tickets toggle.
                 yield Splitter(
                     horizontal=True,
                     label="Sprint",
@@ -242,6 +245,7 @@ class DashboardScreen(Screen[None]):
                 )
                 yield SprintTree("sprint", id="sprint-tree")
                 yield StoriesTable(id="stories-table")
+                yield TicketsTable(id="tickets-table")
                 yield Splitter(
                     horizontal=True,
                     label="Deferred Work",
@@ -282,9 +286,10 @@ class DashboardScreen(Screen[None]):
         runs.add_column("run", key="run")
         runs.add_column("type", key="type")
         runs.add_column("note", key="note", width=6)  # pause-kind badge for paused runs
-        # the stories board shares the sprint-tree slot; hidden until a stories-mode
-        # run is selected (the poll worker toggles both by the run's source).
+        # the stories and tickets boards share the sprint-tree slot; hidden until a
+        # run of that mode is selected (the poll worker toggles them by its source).
         self.query_one("#stories-table", StoriesTable).display = False
+        self.query_one("#tickets-table", TicketsTable).display = False
         tasks = self.query_one("#tasks", DataTable)
         tasks.add_column("story", key="story", width=30)
         tasks.add_column("phase", key="phase", width=16)
@@ -509,7 +514,7 @@ class DashboardScreen(Screen[None]):
 
     def _freeze_left(self) -> None:
         """Switch the left column to explicit Runs/Deferred heights with the
-        Sprint/Stories slot as the sole vertical flex. Idempotent."""
+        Sprint/Stories/Tickets slot as the sole vertical flex. Idempotent."""
         if self._left_frozen:
             return
         self._left_frozen = True
@@ -520,7 +525,7 @@ class DashboardScreen(Screen[None]):
         # #runs' titled border.
         runs_seed = max(_MIN_PANE, self.query_one("#runs").outer_size.height)
         deferred_seed = max(_MIN_PANE, self.query_one("#deferred").outer_size.height)
-        for wid in ("#sprint-tree", "#stories-table"):
+        for wid in ("#sprint-tree", "#stories-table", "#tickets-table"):
             self.query_one(wid).styles.height = "1fr"
         if self.runs_height <= 0:
             self.runs_height = runs_seed
@@ -783,11 +788,21 @@ class DashboardScreen(Screen[None]):
                 snap.stopping = (
                     snap.status in (data.RUNNING, data.UNKNOWN) and ctx.watcher.stopping()
                 )
-                if snap.state is not None and snap.state.source == "stories":
-                    # per-run board: re-derived each tick (only while a stories run
-                    # is selected) so it tracks the dev sessions writing story specs.
-                    snap.stories_mode = True
-                    snap.stories = data.stories_overview(self.project, snap.state.spec_folder)
+                # per-run board (`data.BOARD_LOADERS`): re-derived each tick (only while
+                # a stories or tickets run is selected) so it tracks the sessions
+                # writing specs and plans. The tickets loader is stat-gated and may
+                # spawn tickets.py, which is why it runs here, on the poll worker.
+                board = (
+                    data.BOARD_LOADERS.get(snap.state.source) if snap.state is not None else None
+                )
+                if snap.state is not None and board is not None:
+                    loaded = board(self.project, snap.state)
+                    if isinstance(loaded, data.TicketsBoard):
+                        snap.tickets_mode = True
+                        snap.tickets = loaded
+                    else:
+                        snap.stories_mode = True
+                        snap.stories = loaded
                 snap.new_entries = ctx.journal.read_new()
                 ctx.entries.extend(snap.new_entries)
                 del ctx.entries[:-_MAX_ENTRIES]
@@ -1055,21 +1070,26 @@ class DashboardScreen(Screen[None]):
         table.border_title = f"{title} — listing incomplete" if fault is not None else title
 
     def _apply_board(self, snap: _Snapshot) -> None:
-        """Toggle the sprint tree vs the stories board by the selected run's mode
-        and refresh whichever is live. The stories board is per-run (keyed by the
-        run's spec folder); the sprint tree is project-level and painted
-        separately on rescan."""
+        """Toggle the sprint tree, the stories board and the tickets board by the
+        selected run's mode and refresh whichever is live. The stories and
+        tickets boards are per-run (keyed by the run's spec folder or pinned
+        initiative); the sprint tree is project-level and painted separately on
+        rescan."""
         sprint_tree = self.query_one("#sprint-tree", SprintTree)
         stories_table = self.query_one("#stories-table", StoriesTable)
-        sprint_tree.display = not snap.stories_mode
+        tickets_table = self.query_one("#tickets-table", TicketsTable)
+        sprint_tree.display = not (snap.stories_mode or snap.tickets_mode)
         stories_table.display = snap.stories_mode
+        tickets_table.display = snap.tickets_mode
         # The splitter above this slot carries its section title; set_label already
         # no-ops when the label is unchanged (this runs every poll tick).
         self.query_one("#split-runs", Splitter).set_label(
-            "Stories" if snap.stories_mode else "Sprint"
+            "Tickets" if snap.tickets_mode else "Stories" if snap.stories_mode else "Sprint"
         )
         if snap.stories_mode:
             stories_table.update_stories(snap.stories)
+        elif snap.tickets_mode:
+            tickets_table.update_tickets(snap.tickets)
 
     def _apply_sprint_tree(self, ss: sprintstatus.SprintStatus | None) -> None:
         if ss is self._last_sprint:

@@ -265,6 +265,105 @@ def test_artifact_size_refusal_keeps_counts_but_drops_path_and_error():
     assert secret_path not in json.dumps(scrubbed)
 
 
+def test_ticket_pick_journals_keep_tokens_but_drop_free_text():
+    """The tickets pick's records keep the closed tokens (cause, stage, skip,
+    phase, status), alias the ticket ref (it can be a plan's file name), and drop
+    the halt's free-text detail — it can quote a plan's `blocked_reason` or a
+    tickets.py error naming a path."""
+    secret_path = "/home/canaryuser/AcmeSecret/plan.md"
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    halt = diagnostics._scrub_entry(
+        {
+            "kind": "ticket-pick-halt",
+            "ref": "1.2",
+            "cause": "tree-fault",
+            "stage": "ticket-tree",
+            "detail": f"tickets.py crashed: {secret_path}",
+        },
+        pseudo,
+        {},
+        None,
+    )
+    skipped = diagnostics._scrub_entry(
+        {"kind": "ticket-skipped", "ref": "1.1", "skip": "touched", "phase": "deferred"},
+        pseudo,
+        {},
+        None,
+    )
+    foreign = diagnostics._scrub_entry(
+        {"kind": "ticket-foreign-active", "ref": "2.1", "status": "built"},
+        pseudo,
+        {},
+        None,
+    )
+
+    assert (halt["cause"], halt["stage"]) == ("tree-fault", "ticket-tree")
+    assert all(e["ref"].startswith("ticket-") for e in (halt, skipped, foreign))
+    assert halt["detail_present"] is True
+    assert secret_path not in json.dumps(halt)
+    assert (skipped["skip"], skipped["phase"]) == ("touched", "deferred")
+    assert foreign["status"] == "built"
+
+
+def test_ticket_epic_retro_journals_alias_the_epic_slug():
+    """Tickets mode's epic-boundary rows carry the epic slug in `epic_ref`, which
+    names the customer's epic: it is aliased in its own `epic` namespace (one
+    alias across the retro and its closure), while `epic` 0 and the closed
+    verdict token stay readable."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    finished = diagnostics._scrub_entry(
+        {
+            "kind": "retro-auto-finished",
+            "epic": 0,
+            "epic_ref": "epic-acme-vault",
+            "docs": ["epic-acme-vault-retrospective.md"],
+            "verdict": "rejected",
+        },
+        pseudo,
+        {},
+        None,
+    )
+    closure = diagnostics._scrub_entry(
+        {"kind": "ticket-epic-closure", "epic_ref": "epic-acme-vault", "verdict": "rejected"},
+        pseudo,
+        {},
+        None,
+    )
+
+    assert "acme" not in json.dumps([finished, closure])
+    assert finished["epic_ref"] == closure["epic_ref"]
+    assert str(finished["epic_ref"]).startswith("epic-")
+    assert (finished["epic"], finished["verdict"], closure["verdict"]) == (
+        0,
+        "rejected",
+        "rejected",
+    )
+
+
+def test_ticket_status_write_refusal_keeps_its_closed_tokens():
+    """A refused engine status write keeps the site, the plan status it targeted
+    and the refusal token — all closed vocabularies — so a bundle shows which
+    writer tickets mode turned away."""
+    refused = diagnostics._scrub_entry(
+        {
+            "kind": "ticket-status-write-refused",
+            "story_key": "1.1",
+            "site": "salvage",
+            "target": "built",
+            "cause": "no-plan-reason",
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert (refused["site"], refused["target"], refused["cause"]) == (
+        "salvage",
+        "built",
+        "no-plan-reason",
+    )
+
+
 def test_artifact_size_refusal_rejects_malformed_safe_fields():
     scrubbed = diagnostics._scrub_entry(
         {
@@ -1055,6 +1154,48 @@ def test_non_string_sentinel_is_safely_pseudonymized():
     assert pseudo.entries() == [("spec", str(raw), scrubbed["sentinel"])]
 
 
+def test_ticket_mark_ref_is_pseudonymized():
+    """A ticket key is the plan's title slug and identifier-shaped.
+
+    Ablation: remove the `ticket-mark` kind route and `scrub_json` ships the key
+    verbatim.
+    """
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": "ticket-mark", "ref": "story-acme-vault-rotation", "outcome": "marked"},
+        pseudo,
+        {},
+        None,
+    )
+
+    assert scrubbed["ref"].startswith("ticket-")
+    assert "acme" not in json.dumps(scrubbed)
+    assert pseudo.entries() == [("ticket", "story-acme-vault-rotation", scrubbed["ref"])]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "ticket-foreign-active",
+        "ticket-skipped",
+        "ticket-hitl-pause",
+        "ticket-refine-pause",
+        "ticket-pick-halt",
+        "ticket-story-approved",
+    ],
+)
+def test_ticket_engine_kinds_pseudonymize_their_ref(kind):
+    """The tickets engine's pick and pause records carry the same ticket key.
+
+    Ablation: remove a kind's route and its row ships the key verbatim."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": kind, "ref": "story-acme-vault-rotation"}, pseudo, {}, None
+    )
+    assert scrubbed["ref"].startswith("ticket-")
+    assert "acme" not in json.dumps(scrubbed)
+
+
 def test_journal_alias_routes_accept_lone_unicode_surrogates(project):
     run_dir = _seed_run(project.project)
     sentinel_value = chr(0xDC80)
@@ -1338,6 +1479,12 @@ _PATCH_PATH_ROUTING_ROWS = (
         "unit-closed",
         "patch",
         f"{HOME_PATH}/.bmad-loop/runs/r1/failed/{STORY_KEY}/changes.patch",
+    ),
+    ("restore-patch-evacuated", "patch", f"{HOME_PATH}/artifacts/epic-x/story-x-plan.patch"),
+    (
+        "restore-patch-evacuated",
+        "stashed_to",
+        f"{HOME_PATH}/.bmad-loop/runs/r1/restore/{STORY_KEY}.patch",
     ),
     (
         "deferred-artifacts-stashed",

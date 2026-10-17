@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from conftest import (
     NUL_PATH_RESOLVE_FAULTS,
+    V7_USER_CONFIG_REL,
     fault_metadata_probe,
     fault_read_text,
     git,
@@ -18,7 +19,7 @@ from conftest import (
     write_ledger,
 )
 
-from bmad_loop import decisions, deferredwork, platform_util, runs
+from bmad_loop import bmadconfig, decisions, deferredwork, platform_util, runs
 from bmad_loop.sweep import DecisionOption
 
 
@@ -49,10 +50,12 @@ def _triage(open_ids, decisions_):
     }
 
 
-def _make_run(project, run_id, triage_rj, cycle=1):
+def _make_run(project, run_id, triage_rj, cycle=1, *, initiative=None):
     run_dir = project.project / ".bmad-loop" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "state.json").write_text("{}", encoding="utf-8")  # so list_run_dirs sees it
+    # so list_run_dirs sees it; a v7 sweep records the initiative it pinned
+    state = {} if initiative is None else {"initiative": initiative}
+    (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
     name = "triage.json" if cycle == 1 else f"triage-{cycle}.json"
     (run_dir / name).write_text(json.dumps(triage_rj), encoding="utf-8")
     return run_dir
@@ -2286,3 +2289,217 @@ def test_pre_answer_locked_read_fault_preserves_ledger_store_and_head(
     assert project.deferred_work.read_bytes() == before
     assert store.read_bytes() == b"{}\n"
     assert _git(project, "rev-parse", "HEAD") == head
+
+
+# ---------------------------------------------------- per-initiative store (v7)
+
+
+def _activate(layout, initiative):
+    """Switch the v7 project's `[core] active_initiative` (creating its folder)."""
+    (layout.output_folder / initiative).mkdir(parents=True, exist_ok=True)
+    (layout.project / V7_USER_CONFIG_REL).write_text(
+        f"[core]\nactive_initiative = {json.dumps(initiative)}\n", encoding="utf-8"
+    )
+    paths = bmadconfig.load_paths(layout.project)
+    assert paths.era == "v7" and paths.active_initiative == initiative
+    return paths
+
+
+def test_pre_answer_store_scoped_per_initiative(project_v7):
+    """On BMAD v7 each initiative folder has its own ledger and DW numbering, so
+    an answer to one initiative's `DW-1` must not answer another's. The answer
+    lands in `decisions-<initiative>.json`, the other initiative still lists its
+    own `DW-1` as unanswered, and only that initiative's sweeps are read for the
+    question (the newer `alpha` triage's wording does not leak into `beta`).
+
+    ABLATION (performed): make `store_scope` return None and `beta` reads the
+    shared store, which already answers `DW-1` (its pending list comes back
+    empty); drop the `_run_initiative` filter and `beta` lists `alpha`'s
+    question."""
+    layout = project_v7
+    project = layout.project
+    alpha = _activate(layout, "alpha")
+    _open_ledger(alpha.deferred_work, "DW-1")
+    beta = _activate(layout, "beta")
+    _open_ledger(beta.deferred_work, "DW-1")
+    _make_run(
+        layout,
+        "20260601-000000-aaaa",
+        _triage(["DW-1"], [_decision("DW-1", question="beta q")]),
+        initiative="beta",
+    )
+    _make_run(
+        layout,
+        "20260602-000000-bbbb",
+        _triage(["DW-1"], [_decision("DW-1", question="alpha q")]),
+        initiative="alpha",
+    )
+
+    _activate(layout, "alpha")
+    decision, option = _build_decision("DW-1")
+    decisions.apply_pre_answer(project, decision, option, date="2026-06-13", commit=False)
+
+    assert decisions.store_scope(alpha) == "alpha"
+    assert decisions.store_path(project, "alpha") == project / ".bmad-loop" / "decisions-alpha.json"
+    assert set(decisions.load_pre_answers(project, "alpha")) == {"DW-1"}
+    assert not decisions.store_path(project).exists()
+    assert decisions.pending_missed_decisions(project) == []
+
+    _activate(layout, "beta")
+    assert decisions.load_pre_answers(project, "beta") == {}
+    pending = decisions.pending_missed_decisions(project)
+    assert [(d.id, d.question) for d in pending] == [("DW-1", "beta q")]
+
+
+def test_pending_with_no_initiative_skips_initiative_runs(project_v7):
+    """On BMAD v7 with no initiative active the ledger is the `output_folder`
+    one, whose DW ids are numbered independently of every initiative's. An old
+    initiative's triage naming the same `DW-1` must not be offered (and so
+    answered) against it; a run that recorded no initiative still is.
+
+    ABLATION (performed): filter only when `scope` is set and the `alpha`
+    run's question comes back instead of the unscoped run's."""
+    layout = project_v7
+    project = layout.project
+    alpha = _activate(layout, "alpha")
+    _open_ledger(alpha.deferred_work, "DW-1")
+    _make_run(
+        layout,
+        "20260601-000000-aaaa",
+        _triage(["DW-1"], [_decision("DW-1", question="unscoped q")]),
+    )
+    _make_run(
+        layout,
+        "20260602-000000-bbbb",
+        _triage(["DW-1"], [_decision("DW-1", question="alpha q")]),
+        initiative="alpha",
+    )
+
+    (project / V7_USER_CONFIG_REL).write_text("[core]\n", encoding="utf-8")
+    paths = bmadconfig.load_paths(project)
+    assert paths.era == "v7" and not paths.active_initiative
+    _open_ledger(paths.deferred_work, "DW-1")
+
+    pending = decisions.pending_missed_decisions(project)
+    assert [(d.id, d.question) for d in pending] == [("DW-1", "unscoped q")]
+
+
+def test_pre_answer_refuses_a_ledger_switched_since_listing(project_v7):
+    """A decision is listed from one initiative's ledger, then the human answers
+    after another initiative was made active. Both ledgers hold a `DW-1`, so the
+    answer would land on unrelated work: the write is refused before either the
+    ledger or a store is touched. Answered against the ledger it was listed from,
+    it records as before.
+
+    ABLATION (performed): drop the `listed_ledger` check in `apply_pre_answer`
+    and `beta`'s ledger and store take `alpha`'s answer."""
+    layout = project_v7
+    project = layout.project
+    alpha = _activate(layout, "alpha")
+    _open_ledger(alpha.deferred_work, "DW-1")
+    _make_run(
+        layout,
+        "20260601-000000-aaaa",
+        _triage(["DW-1"], [_decision("DW-1", question="alpha q")]),
+        initiative="alpha",
+    )
+    beta = _activate(layout, "beta")
+    _open_ledger(beta.deferred_work, "DW-1")
+    alpha = _activate(layout, "alpha")
+    pending = decisions.pending_missed_decisions(project, alpha)
+    assert [d.question for d in pending] == ["alpha q"]
+    decision, option = _build_decision("DW-1")
+    beta = _activate(layout, "beta")
+    beta_ledger = beta.deferred_work.read_bytes()
+
+    with pytest.raises(bmadconfig.BmadConfigError, match="list the decisions again"):
+        decisions.apply_pre_answer(
+            project,
+            decision,
+            option,
+            date="2026-06-13",
+            commit=False,
+            listed_ledger=alpha.deferred_work,
+        )
+
+    assert beta.deferred_work.read_bytes() == beta_ledger
+    assert not decisions.store_path(project, "beta").exists()
+
+    _activate(layout, "alpha")
+    result = decisions.apply_pre_answer(
+        project,
+        decision,
+        option,
+        date="2026-06-13",
+        commit=False,
+        listed_ledger=alpha.deferred_work,
+    )
+    assert result.recorded
+    assert set(decisions.load_pre_answers(project, "alpha")) == {"DW-1"}
+
+
+@pytest.mark.parametrize("state", [b"{not json", b"[]"], ids=["unreadable", "non-object"])
+def test_pending_with_no_initiative_skips_unreadable_runs(project_v7, state):
+    """With no v7 initiative active the run scope is `""`, the value a run that
+    recorded no initiative has. A run whose state cannot be read (or is not an
+    object) says nothing about its initiative, so its triage is left out rather
+    than read as unscoped — even when it is the newest run.
+
+    ABLATION (performed): return `""` from `_run_initiative` for an unreadable
+    state and the newer run's question replaces the unscoped run's."""
+    layout = project_v7
+    project = layout.project
+    _make_run(
+        layout,
+        "20260601-000000-aaaa",
+        _triage(["DW-1"], [_decision("DW-1", question="unscoped q")]),
+    )
+    unread = _make_run(
+        layout,
+        "20260602-000000-bbbb",
+        _triage(["DW-1"], [_decision("DW-1", question="unreadable q")]),
+    )
+    (unread / "state.json").write_bytes(state)
+    (project / V7_USER_CONFIG_REL).write_text("[core]\n", encoding="utf-8")
+    paths = bmadconfig.load_paths(project)
+    assert paths.era == "v7" and not paths.active_initiative
+    _open_ledger(paths.deferred_work, "DW-1")
+
+    pending = decisions.pending_missed_decisions(project)
+    assert [(d.id, d.question) for d in pending] == [("DW-1", "unscoped q")]
+
+
+def test_v6_store_path_unchanged(project):
+    """v6 (and v7 with no initiative active) keeps the single
+    `.bmad-loop/decisions.json` store, written by an out-of-band answer exactly
+    where it always was."""
+    install_bmad_config(project)
+    paths = bmadconfig.load_paths(project.project)
+    assert paths.era != "v7"
+    assert decisions.store_scope(paths) is None
+    assert (
+        decisions.store_path(project.project) == project.project / ".bmad-loop" / "decisions.json"
+    )
+    assert decisions.store_path(project.project, None) == decisions.store_path(project.project)
+    no_initiative = bmadconfig.ProjectPaths(
+        project=project.project,
+        implementation_artifacts=project.project / "out",
+        planning_artifacts=project.project / "out",
+        era="v7",
+    )
+    assert decisions.store_scope(no_initiative) is None
+
+    write_ledger(project, {"DW-1": "open"})
+    decision, option = _build_decision("DW-1")
+    decisions.apply_pre_answer(project.project, decision, option, date="2026-06-13", commit=False)
+    stored = json.loads((project.project / ".bmad-loop" / "decisions.json").read_text("utf-8"))
+    assert set(stored) == {"DW-1"}
+    assert list((project.project / ".bmad-loop").glob("decisions-*.json")) == []
+
+
+def test_store_path_reduces_an_initiative_to_one_safe_segment(tmp_path):
+    """An initiative name that is not a legal path segment cannot steer the store
+    out of `.bmad-loop/`: it is reduced to one safe segment."""
+    path = decisions.store_path(tmp_path, "../evil/x")
+    assert path.parent == tmp_path / ".bmad-loop"
+    assert path.name.startswith("decisions-") and path.name.endswith(".json")
