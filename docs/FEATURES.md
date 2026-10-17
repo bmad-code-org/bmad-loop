@@ -47,7 +47,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 ### Ticket-tree mode
 
 - **Stability:** experimental
-- **Description:** An opt-in third story source for BMAD v7 projects. It drives the same pipeline from the active initiative's ticket tree through the project's own `tickets.py`, dispatching each ticket as `/<dev skill> ticket <ref>` in initiative build order, and marks a verified ticket `done` itself.
+- **Description:** An opt-in third story source for BMAD v7 projects. It drives the same pipeline from the active initiative's ticket tree through the project's own `tickets.py`, dispatching each ticket as `/<dev skill> ticket <ref>` in initiative build order, and, under the default `mark_done`, marks a verified ticket `done` itself.
 - **Properties:**
   - A run is pinned to `[core] active_initiative` at start; a changed initiative pauses the run at `ticket-tree` instead of building another initiative's ticket.
   - A hitl ticket pauses at `ticket-hitl` and a ticket that needs refining at `ticket-refine`, both before any session runs for it.
@@ -55,7 +55,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Tickets this run did not start are never dispatched or marked.
   - A store tracked in the checkout is marked inside the unit's commit; a shared store's mark is latched and made after the code lands, and a store with its own repository gets a plan-only commit.
   - `run` refuses a tracker store and the multi-repo workspace layout before creating a run directory; resume and resolve refuse a store whose layout changed.
-  - When the run finishes an epic, it runs the retrospective and pauses once at `epic-boundary` for a person to close the epic; a `rejected` verdict pauses every later pick while the epic stays open, and an epic gated on an open one waits for its closure.
+  - When a run without `--story` finishes an epic, it runs the retrospective and pauses once at `epic-boundary` for a person to close the epic; a `rejected` verdict pauses every later pick while the epic stays open, and an epic gated on an open one waits for its closure.
 - **Config:** `[stories] source = "tickets"`, `[core] active_initiative`, `[tickets] mark_done`, `[tickets] thorough_review`, `[gates] retrospective`; `bmad-loop run --epic ID|SLUG`, `--story REF`, `--dry-run`; `bmad-loop confirm <ref>`
 - **Tested by:** `tests/test_tickets_engine.py`, `tests/test_tickets_source.py`, `tests/test_tickettree.py`, `tests/test_ticketmodel.py`, `tests/test_ticketstore.py`, `tests/test_statemachine.py`, `tests/test_tickets_e2e.py`
 - **Docs:** [Ticket-tree mode guide](tickets-guide.md), [Setup: BMAD v7](setup-guide.md#installing-on-bmad-v7-bmad-setup), [Configuration: [tickets]](reference/configuration.md#tickets), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [TUI: tickets mode](tui-guide.md#tickets-mode)
