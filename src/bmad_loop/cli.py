@@ -7892,8 +7892,8 @@ def _psmux_command(registry: str | None, verb: str) -> str:
 
 def _superseded_ctl_kill_commands(
     project: Path, superseded: list[str], on_fault: Callable[[str], None]
-) -> tuple[dict[str, str | None], list[str]]:
-    """``({name: command that ends it}, ambiguous)`` for each control session
+) -> tuple[dict[str, str | None], list[str], list[str]]:
+    """``({name: command that ends it}, ambiguous, withheld)`` for each control session
     in the registry in force under the name an earlier release minted for this
     project there (#733, ``runs.superseded_ctl_name``), picked out of
     ``superseded`` (``runs.legacy_registry_leftovers``' own-registry answer)
@@ -7912,12 +7912,14 @@ def _superseded_ctl_kill_commands(
     it is left out of the dict (and of ``--json`` ``legacy_kill_commands``)
     while ``superseded_ctl_sessions`` still names it. A check that could not
     be made goes to ``on_fault``, labelled with the registry (``cleanup`` keeps
-    it apart from ``legacy_unverified``: the registry itself was listed); a
-    name that can no longer be derived withholds every command, and each
-    session lands in ``ambiguous``, as does a listed name that no longer
-    matches it (each said through ``on_fault``)."""
+    it apart from ``legacy_unverified``: the registry itself was listed).
+
+    ``withheld`` holds each name withheld for a fault rather than a possible
+    owner: every session when the name can no longer be derived, and a listed
+    name that no longer matches it (each said through ``on_fault``). It gets no
+    command either, but no run-ownership claim: nothing suggests a run owns it."""
     if not superseded:
-        return {}, []
+        return {}, [], []
     from .adapters.multiplexer import MultiplexerError, get_multiplexer
 
     try:
@@ -7926,29 +7928,30 @@ def _superseded_ctl_kill_commands(
         old = mux.session_name_key(runs.superseded_ctl_name(project, root))
     except (MultiplexerError, runs.StateRootError, OSError, RuntimeError) as exc:
         # The listing derived it moments ago, so this is a fault, not "no such
-        # session": withhold every command, and keep each name in `ambiguous`
+        # session": withhold every command, and keep each name in `withheld`
         # so the text mode still names it.
         on_fault(f"could not derive the pre-upgrade control-session name: {exc}")
-        return {}, list(superseded)
+        return {}, [], list(superseded)
     # The exact name `runs.superseded_ctl_sessions` matched, never the shape: a
     # run's agent session `bmad-loop-ctl-<16 hex>` is spelled the same way.
     psmux = _is_psmux(mux)
     commands: dict[str, str | None] = {}
     ambiguous: list[str] = []
+    withheld: list[str] = []
     label = root or runs.DEFAULT_REGISTRY_LABEL
     for name in superseded:
         if mux.session_name_key(name) != old:
             # Listed under a name that no longer derives (the root moved in
             # between): no command, but still named.
             on_fault(f"{label}: {name} no longer matches the pre-upgrade control-session name")
-            ambiguous.append(name)
+            withheld.append(name)
         elif runs.superseded_ctl_may_be_run(
             project, name, mux, on_fault=lambda msg: on_fault(f"{label}: {msg}")
         ):
             ambiguous.append(name)
         else:
             commands[name] = _psmux_command(root, f"kill-session -t '={name}'") if psmux else None
-    return commands, ambiguous
+    return commands, ambiguous, withheld
 
 
 #: Why a pre-upgrade control-session name gets no command (#915), said the
@@ -7957,7 +7960,10 @@ _MAY_BE_RUN = "a run with that id may own it"
 
 
 def _warn_superseded_ctl(
-    kill_commands: dict[str, str | None], ambiguous: list[str], faults: list[str]
+    kill_commands: dict[str, str | None],
+    ambiguous: list[str],
+    withheld: list[str],
+    faults: list[str],
 ) -> None:
     for fault in faults:
         print(f"note: {fault}", file=sys.stderr)
@@ -7965,6 +7971,15 @@ def _warn_superseded_ctl(
         print(
             f"pre-upgrade control session {name} is still running in this project's "
             f"registry; {_MAY_BE_RUN} and no command is printed for it",
+            file=sys.stderr,
+        )
+    for name in withheld:
+        # A fault, not a possible owner (the note above says which): no
+        # ownership claim, and no command until a cleanup can confirm the name.
+        print(
+            f"pre-upgrade control session {name} is still running in this project's "
+            "registry; its name could not be confirmed (see the note above) and no "
+            "command is printed for it",
             file=sys.stderr,
         )
     for name, command in kill_commands.items():
@@ -8068,7 +8083,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         announced=killed if args.dry_run else (),
         on_primary_fault=ctl_command_faults.append,
     )
-    kill_commands, ambiguous_ctl = _superseded_ctl_kill_commands(
+    kill_commands, ambiguous_ctl, withheld_ctl = _superseded_ctl_kill_commands(
         project, superseded_ctl, ctl_command_faults.append
     )
     # The listing behind prune_sessions reads an unavailable backend as no
@@ -8164,7 +8179,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         if live:
             print(f"leaving {len(live)} live session(s) untouched")
         _warn_legacy_leftovers(project, leftovers, unverified)
-        _warn_superseded_ctl(kill_commands, ambiguous_ctl, ctl_command_faults)
+        _warn_superseded_ctl(kill_commands, ambiguous_ctl, withheld_ctl, ctl_command_faults)
         return 0
     # The count now excludes non-removals, so on stdout alone a smaller number is
     # indistinguishable from a quieter sweep — and `cleanup > log` keeps only
@@ -8183,7 +8198,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         # moving between the two surfaces is reading the same thing.
         print(f"ctl window(s) still open after the kill: {', '.join(survived)}", file=sys.stderr)
     _warn_legacy_leftovers(project, leftovers, unverified)
-    _warn_superseded_ctl(kill_commands, ambiguous_ctl, ctl_command_faults)
+    _warn_superseded_ctl(kill_commands, ambiguous_ctl, withheld_ctl, ctl_command_faults)
     if unverifiable:
         # Not "killed but unverifiable": kill_window is a silent no-op on a
         # transport failure, so whether the kill even reached the server is part

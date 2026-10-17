@@ -22016,6 +22016,14 @@ def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(
     err = capsys.readouterr().err
     assert f"pre-upgrade control session {_DIGEST_CTL}" in err and command in err
     assert err.count("kill-session") == 1
+    # The mismatched name is withheld for a fault, not a possible owner: its
+    # line makes no run-ownership claim. Route it back into `ambiguous` and
+    # this fails.
+    other = runs.CTL_SESSION + "-fedcba9876543210"
+    (mismatch,) = [
+        ln for ln in err.splitlines() if ln.startswith(f"pre-upgrade control session {other}")
+    ]
+    assert "could not be confirmed" in mismatch and "may own it" not in mismatch
 
     assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
     captured = capsys.readouterr()
@@ -22025,7 +22033,6 @@ def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(
     assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-old-1"]
     # #917: a listed name that does not match gets no command but is not
     # dropped either: the mismatch is said. Ablate that report and this fails.
-    other = runs.CTL_SESSION + "-fedcba9876543210"
     assert (
         f"{_OWN_REG}: {other} no longer matches the pre-upgrade control-session name"
         in doc["sessions"]["superseded_ctl_unverified"]
@@ -22077,8 +22084,10 @@ def test_cleanup_still_names_a_pre_upgrade_control_session_whose_name_cannot_be_
     """#917: the listing matched the session, but deriving its name again for
     the command lookup faults. The session is no longer in the legacy grouping
     to fall back on, so it must still be named once, with no command, and the
-    fault said. Ablate the `ambiguous` fallback in the `except` of
-    `_superseded_ctl_kill_commands` and this fails."""
+    fault said, with no claim that a run may own it: nothing suggests one does.
+    Ablate the `withheld` fallback in the `except` of
+    `_superseded_ctl_kill_commands`, or route it into `ambiguous`, and this
+    fails."""
     from bmad_loop.tui import launch
 
     def _boom(_p, _r=None):
@@ -22098,6 +22107,7 @@ def test_cleanup_still_names_a_pre_upgrade_control_session_whose_name_cannot_be_
     err = capsys.readouterr().err
     (line,) = [ln for ln in err.splitlines() if _DIGEST_CTL in ln]
     assert "no command is printed" in line
+    assert "could not be confirmed" in line and "may own it" not in line
     assert "could not derive the pre-upgrade control-session name: unresolvable" in err
 
     assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0

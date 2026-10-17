@@ -182,9 +182,9 @@ breaking changes may land in a minor release.
   running; the stderr
   note names it too (#906).
 - Report a pre-upgrade `bmad-loop-ctl-<16 hex>` control session left in the project's own
-  psmux registry: `cleanup` names it on stderr and in `sessions.legacy_leftovers` with the
-  command that ends it (`sessions.legacy_kill_commands`), and `attach` names it when it finds
-  nothing to attach (#733).
+  psmux registry: `cleanup` names it on stderr and in `sessions.superseded_ctl_sessions`
+  with the command that ends it (`sessions.legacy_kill_commands`), and `attach` names it
+  when it finds nothing to attach (#733).
 - Print no kill or attach command for a pre-upgrade control-session name that may be a run's
   own session (a run of this project has that id, or the session carries a run's project tag,
   as a neighbour's run can in a shared registry), still check the project's own registry

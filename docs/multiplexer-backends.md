@@ -149,6 +149,9 @@ may be a run's own session (a run of this project has that id, or the session ca
 project tag, as a neighbour's run can in a shared registry) is named with no command; do not
 end it by hand until you know which it is.
 
+A name `cleanup` could not confirm (its derivation failed, or the listed name no longer
+matches it) is also named with no command, beside the fault that withheld it.
+
 **If the state root cannot be derived** (for example, `BMAD_LOOP_STATE_DIR` is a relative
 path), bmad-loop says so and leaves whatever `PSMUX_DATA_DIR` was in force. `cleanup` then
 claims only sessions carrying this project's ownership tag.
