@@ -5393,14 +5393,18 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
     could escape the runs dir (a command can refuse its ref before normalizing
     `args.run_id`), and kept only on an exact-name hit: the command normalized
     `args.run_id` to the run it resolved, and a removed run's id would otherwise
-    fall back to a suffix match and journal into another run."""
+    fall back to a suffix match and journal into another run.
+
+    The resolve sits inside the guard too: this runs in `_drive_ctl_launch`'s
+    `finally`, so a raise from it would replace the child's own exception or
+    return code."""
     try:
-        run_dir = runs.resolve_run_dir(_project(args), args.run_id)
-    except runs.RunRefError:
-        return  # no run to record against
-    if run_dir.name != args.run_id:
-        return  # a partial match, not the run this command resolved
-    try:
+        try:
+            run_dir = runs.resolve_run_dir(_project(args), args.run_id)
+        except runs.RunRefError:
+            return  # no run to record against
+        if run_dir.name != args.run_id:
+            return  # a partial match, not the run this command resolved
         with state_lock(run_dir):
             if runs.is_run(run_dir):
                 Journal(run_dir).append(

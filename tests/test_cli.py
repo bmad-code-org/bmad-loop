@@ -7323,6 +7323,36 @@ def test_a_launched_resume_that_raised_before_accepting_journals_the_reason(tmp_
     assert len(errors) == 1 and "policy.toml is broken" in errors[0]
 
 
+def test_a_refusal_journal_that_cannot_resolve_the_run_keeps_the_childs_outcome(
+    tmp_path, monkeypatch, capsys
+):
+    # The journaler runs in the wrapper's `finally`; a fault resolving the run
+    # there must not replace the child's return code or exception. Ablation:
+    # move the resolve back out of the guard and both rows raise OSError.
+    _escalated_run(tmp_path, "r1")
+
+    def unreadable_cwd(_args):
+        raise OSError("cwd is gone")
+
+    monkeypatch.setattr(cli, "_project", unreadable_cwd)
+
+    def refuse(_args):
+        return 1
+
+    def raises(_args):
+        raise policy_mod.PolicyError("policy.toml is broken")
+
+    def args(func):
+        return argparse.Namespace(
+            func=func, project=str(tmp_path), run_id="r1", command="resume", ctl_launch=True
+        )
+
+    assert cli._drive_ctl_launch(args(refuse)) == 1
+    with pytest.raises(policy_mod.PolicyError, match="policy.toml is broken"):
+        cli._drive_ctl_launch(args(raises))
+    assert capsys.readouterr().err.count("could not journal this refused launch: cwd is gone") == 2
+
+
 def test_a_refusal_journal_never_recreates_a_run_cleanup_removed(tmp_path, monkeypatch):
     # Cleanup removes the run under the state lock; one removed between the
     # journaler's first look and its lock must not be recreated by the append.
