@@ -8128,6 +8128,58 @@ def test_live_session_may_be_ours_degrades_an_unanswerable_listing_to_absent(
     assert capsys.readouterr().err == ""
 
 
+def test_live_session_may_be_ours_reports_a_listing_row_psmux_could_not_read(tmp_path, monkeypatch):
+    """psmux lists a server that did not answer as an empty row at exit 0 (#919).
+    The guard still answers False — the degrade #732 kept — but the row reaches
+    its warn sink as a failed listing instead of reading as silent absence.
+
+    Ablation: make `BaseTmuxBackend._warn_non_session_rows` a no-op and the
+    warning list comes back empty."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "psmux")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 0, stdout="\n", stderr=""),
+    )
+    monkeypatch.setattr(runs, "get_multiplexer", PsmuxMultiplexer)
+    monkeypatch.setattr(runs, "ctl_session_for", lambda project, mux=None: runs.CTL_SESSION)
+    warnings: list[str] = []
+    assert not runs.live_session_may_be_ours(tmp_path, "orphan1", warn=warnings.append)
+    assert warnings == [
+        "run orphan1: could not check for a live agent session — the session listing"
+        " failed: psmux list-sessions printed a row that cannot be a session name"
+        " without proving the session gone: ''; proceeding as if none is live"
+    ]
+
+
+def test_live_session_may_be_ours_keeps_a_session_a_partial_listing_still_names(
+    tmp_path, monkeypatch, capsys
+):
+    """psmux can list one unreadable server beside the run's own session (#919).
+    The session is present, so the guard goes on to its tag check and answers
+    True, and it does not say it is "proceeding as if none is live". The tag
+    read's stderr note says the names that answered were kept, not that the
+    listing was read as empty.
+
+    Ablation: warn every collected fault before the membership test and the
+    warning list is no longer empty."""
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: "psmux")
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: subprocess.CompletedProcess(
+            argv, 0, stdout="ERROR: Invalid session key\nbmad-loop-orphan1\n", stderr=""
+        ),
+    )
+    monkeypatch.setattr(runs, "get_multiplexer", PsmuxMultiplexer)
+    monkeypatch.setattr(runs, "ctl_session_for", lambda project, mux=None: runs.CTL_SESSION)
+    warnings: list[str] = []
+    assert runs.live_session_may_be_ours(tmp_path, "orphan1", warn=warnings.append)
+    assert warnings == []
+    err = capsys.readouterr().err
+    assert "keeping the names that answered" in err and "reading it as empty" not in err
+
+
 def test_live_session_may_be_ours_degrades_an_unselectable_backend_to_absent(
     tmp_path, monkeypatch, capsys
 ):

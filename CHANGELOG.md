@@ -152,6 +152,11 @@ breaking changes may land in a minor release.
   grows with its runtime (DW-549).
 - Make `bmad-loop probe-adapter` search for codex rollouts under `$CODEX_HOME/sessions`,
   as live sessions do, instead of always `~/.codex/sessions` (DW-546).
+- Report psmux's empty or `ERROR:` session-listing row, printed at exit 0 for a server it
+  could not read, as a listing fault instead of dropping it: the removal guard, `cleanup`
+  and the ownership-tag readers now warn rather than read a live session as silently
+  absent (#919). On a psmux that instead names an unread server on stderr and exits 1
+  (psmux/psmux#809), keep the names that answered and report the unread ones.
 - Name `opencode.db` and say to move it aside when an OpenCode 1.x server dies at
   startup on a database a 2.x server created, instead of reporting only `rc=1` (DW-544).
 - Save a dotted plugin name's settings from the TUI under `[plugins."<name>"]`, not in
