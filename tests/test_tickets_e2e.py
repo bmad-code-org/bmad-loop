@@ -48,10 +48,10 @@ from pathlib import Path
 
 import pytest
 from conftest import (
-    V7_GITIGNORE,
     EntrySpec,
     EpicSpec,
     V7Layout,
+    _store_repo,
     install_bmad_v7,
     install_build_auto_v7_skill,
     real_mux_e2e,
@@ -191,15 +191,8 @@ TWO_EPICS: tuple[EpicSpec, ...] = (
 )
 
 
-def _git_init(repo: Path) -> None:
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "e2e@test")
-    _git(repo, "config", "user.name", "e2e")
-    _git(repo, "config", "core.fsync", "none")
-
-
 def _scaffold(
-    root: Path,
+    sandbox: V7Layout,
     epics: tuple[EpicSpec, ...],
     *,
     mark_done: str = "auto",
@@ -208,20 +201,26 @@ def _scaffold(
     isolation: str = "none",
     store: str = "repo",
 ) -> V7Layout:
-    """A committed, clean v7 sandbox: the vendored `tickets.py` install with the
-    personal config layer gitignored (as `bmad setup` leaves it), ``epics`` as the
-    initiative's tree, the v7 build-auto stub, the fake's profile and a tickets-mode
-    policy. Review is off and the retrospective gate is ``retro`` (a `never` run has
+    """``sandbox`` (the `project_v7` fixture's copy of the per-worker v7 template)
+    turned into a committed, clean tickets-mode sandbox: ``epics`` replace the
+    template's tree, plus the v7 build-auto stub, the fake's profile and a tickets-mode
+    policy. The template already carries the vendored `tickets.py` install with the
+    personal config layer gitignored (as `bmad setup` leaves it). Review is off and the retrospective gate is ``retro`` (a `never` run has
     only dev sessions of the fake; `auto` also installs the retro skill stub).
 
     ``topology`` places the store: T1 tracked in the checkout (upstream's default),
     T2 in the checkout but gitignored and unversioned, T3 a gitignored repository
     nested in the checkout, T4 its own repository outside the project (beside
     ``root``, with an absolute `output_folder`)."""
-    root.mkdir(parents=True)
-    (root / "src.txt").write_text("original\n", encoding="utf-8")
-    ignored_store = "/_bmad-output/\n" if topology in ("T2", "T3") else ""
-    (root / ".gitignore").write_text(V7_GITIGNORE + ignored_store, encoding="utf-8")
+    root = sandbox.project
+    # The template's tracked store goes wholesale, index included (a tracked path
+    # stays tracked under a new ignore rule); the commit below records its deletion
+    # and, for T1, the replacement tree.
+    _git(root, "rm", "-r", "-q", "--cached", "_bmad-output")
+    remove_tree(sandbox.output_folder)
+    if topology in ("T2", "T3"):
+        with (root / ".gitignore").open("a", encoding="utf-8") as f:
+            f.write("/_bmad-output/\n")
     out = str(root.parent / "store") if topology == "T4" else "_bmad-output"
     layout = install_bmad_v7(root, output_folder=out, store=store)
     write_ticket_tree(layout, epics)
@@ -262,13 +261,10 @@ def _scaffold(
         encoding="utf-8",
     )
 
-    _git_init(root)
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "sandbox")
     if topology in ("T3", "T4"):
-        _git_init(layout.output_folder)
-        _git(layout.output_folder, "add", "-A")
-        _git(layout.output_folder, "commit", "-q", "-m", "store")
+        _store_repo(layout.output_folder)
     return layout
 
 
@@ -359,12 +355,13 @@ def _status_doc(root: Path) -> dict:
 
 
 def _prompts(root: Path) -> list[str]:
-    """Every dispatch the fake received, in launch order (the fake writes its
-    prompt file once, on start)."""
-    recorded = (_run_dir(root) / "tasks").glob("*/fake-prompt.txt")
-    return [
-        p.read_text(encoding="utf-8") for p in sorted(recorded, key=lambda p: p.stat().st_mtime_ns)
-    ]
+    """Every dispatch the fake received, in launch order: the journal's
+    `session-start` rows name the tasks, and each task's prompt file is what reached
+    the binary (the fake writes it once, on start)."""
+    tasks = _run_dir(root) / "tasks"
+    order = dict.fromkeys(row["task_id"] for row in _journal(root, "session-start"))
+    recorded = [tasks / tid / "fake-prompt.txt" for tid in order]
+    return [p.read_text(encoding="utf-8") for p in recorded if p.is_file()]
 
 
 def _journal(root: Path, kind: str) -> list[dict]:
@@ -380,14 +377,14 @@ def _assert_ended_at_epic_boundary(doc: dict) -> None:
     assert doc["tickets"]["epic_closures"] == {EPIC: "unknown"}, doc["tickets"]
 
 
-def test_e2e_tickets_happy_path_marks_done(tmp_path):
+def test_e2e_tickets_happy_path_marks_done(project_v7):
     """Two tickets, `mark_done = "auto"`: the fake leaves each plan `built`, bmad-loop
     marks it `done` inside the unit's commit window, so each squashed unit commit
     carries its own plan at `done` with the ticket trailers. Ablation: make the
     commit window skip the mark (`_terminal_plan_write` returning early) and the
     plans stay `built`."""
     layout = _scaffold(
-        tmp_path / "sbx", _epic(EntrySpec(1, "Cart model"), EntrySpec(2, "Cart rules", after=(1,)))
+        project_v7, _epic(EntrySpec(1, "Cart model"), EntrySpec(2, "Cart rules", after=(1,)))
     )
     root = layout.project
     base = _commit_count(root)
@@ -415,13 +412,13 @@ def test_e2e_tickets_happy_path_marks_done(tmp_path):
     _assert_ended_at_epic_boundary(doc)
 
 
-def test_e2e_tickets_mark_done_never_leaves_built(tmp_path):
+def test_e2e_tickets_mark_done_never_leaves_built(project_v7):
     """`mark_done = "never"`: both plans stay `built`, the unit commits carry them at
     `built`, and 1.2 still runs, because `next` counts a ticket in review state
     (`built`) as meeting `after`. Ablation: drop the `mark_done != "auto"` early
     return and both plans end `done`."""
     layout = _scaffold(
-        tmp_path / "sbx",
+        project_v7,
         _epic(EntrySpec(1, "Cart model"), EntrySpec(2, "Cart rules", after=(1,))),
         mark_done="never",
     )
@@ -439,13 +436,13 @@ def test_e2e_tickets_mark_done_never_leaves_built(tmp_path):
     assert _journal(root, "ticket-mark") == []  # bmad-loop wrote no plan at all
 
 
-def test_e2e_tickets_hitl_pauses_then_resumes(tmp_path):
+def test_e2e_tickets_hitl_pauses_then_resumes(project_v7):
     """A hitl ticket is never dispatched: the run builds 1.1, then pauses at
     `ticket-hitl` naming 1.2 with no session for it. The person builds it (here: marks
     it done and commits), and the resumed run spawns nothing more. Ablation: drop
     `decide_pick`'s hitl arm and 1.2 is dispatched."""
     layout = _scaffold(
-        tmp_path / "sbx",
+        project_v7,
         _epic(EntrySpec(1, "Cart model"), EntrySpec(2, "Cart rules", after=(1,), hitl=True)),
     )
     root = layout.project
@@ -470,13 +467,13 @@ def test_e2e_tickets_hitl_pauses_then_resumes(tmp_path):
     _assert_ended_at_epic_boundary(_status_doc(root))
 
 
-def test_e2e_tickets_refine_pauses_before_any_session(tmp_path):
+def test_e2e_tickets_refine_pauses_before_any_session(project_v7):
     """A bug needs refining before it starts, so a tree whose first ticket is a bug
     pauses at `ticket-refine` before any session exists. The person pulls the leaf
     and marks it refined; the resumed run builds both tickets. Ablation: drop
     `decide_pick`'s refine arm and the bug is dispatched at once."""
     layout = _scaffold(
-        tmp_path / "sbx",
+        project_v7,
         _epic(EntrySpec(1, "Cart crash", type="bug"), EntrySpec(2, "Cart rules", after=(1,))),
     )
     root = layout.project
@@ -507,7 +504,7 @@ def test_e2e_tickets_refine_pauses_before_any_session(tmp_path):
     _assert_ended_at_epic_boundary(_status_doc(root))
 
 
-def test_e2e_tickets_plan_checkpoint_refined_and_unrefined(tmp_path):
+def test_e2e_tickets_plan_checkpoint_refined_and_unrefined(project_v7):
     """Both upstream `plan_checkpoint` shapes in one run.
 
     Unrefined 1.1: leg 1 is dispatched with `Halt after planning.` and
@@ -519,7 +516,7 @@ def test_e2e_tickets_plan_checkpoint_refined_and_unrefined(tmp_path):
     1), and `decide_pick`'s refined plan-checkpoint arm dropped (1.2 dispatched
     unapproved), each turn this red."""
     layout = _scaffold(
-        tmp_path / "sbx",
+        project_v7,
         _epic(
             EntrySpec(1, "Cart model", plan_checkpoint=True),
             EntrySpec(2, "Cart rules", after=(1,), plan_checkpoint=True, refined=True),
@@ -566,12 +563,12 @@ def test_e2e_tickets_plan_checkpoint_refined_and_unrefined(tmp_path):
     _assert_ended_at_epic_boundary(_status_doc(root))
 
 
-def test_e2e_tickets_done_checkpoint_pauses_after_commit(tmp_path):
+def test_e2e_tickets_done_checkpoint_pauses_after_commit(project_v7):
     """`done_checkpoint` on 1.1: the run commits 1.1 (marked `done`), then pauses at
     `story-checkpoint` before 1.2 has a session; the resume builds 1.2. Ablation:
     the binding's `done_checkpoint` forced False and 1.2 runs straight on."""
     layout = _scaffold(
-        tmp_path / "sbx",
+        project_v7,
         _epic(
             EntrySpec(1, "Cart model", done_checkpoint=True),
             EntrySpec(2, "Cart rules", after=(1,)),
@@ -628,7 +625,7 @@ def _clean(repo: Path) -> bool:
 
 
 @pytest.mark.parametrize("topology", ["T1", "T3"])
-def test_e2e_tickets_epic_boundary_retro_then_closure_pause(tmp_path, topology):
+def test_e2e_tickets_epic_boundary_retro_then_closure_pause(project_v7, topology):
     """`[gates] retrospective = "auto"`: once 1.1 (epic-cart's only ticket) lands, the
     run launches `/bmad-retrospective -H epic-cart`, commits the document alone (in
     the code checkout for T1, in the store repository for T3) and pauses at
@@ -637,7 +634,7 @@ def test_e2e_tickets_epic_boundary_retro_then_closure_pause(tmp_path, topology):
     epic-checkout's retrospective and pauses for that closure. Ablation: drop the
     settle call and the retro document stays uncommitted (the store or the checkout
     is left dirty)."""
-    layout = _scaffold(tmp_path / "sbx", TWO_EPICS, topology=topology, retro="auto")
+    layout = _scaffold(project_v7, TWO_EPICS, topology=topology, retro="auto")
     root = layout.project
     tree = _tree_repo(layout, topology)
     epic_rel = (layout.initiative_folder / EPIC / f"{EPIC}.md").relative_to(tree).as_posix()
@@ -679,13 +676,13 @@ def test_e2e_tickets_epic_boundary_retro_then_closure_pause(tmp_path, topology):
 
 
 @pytest.mark.parametrize("topology", ["T1", "T3"])
-def test_e2e_tickets_retro_rejected_blocks_next_epic(tmp_path, topology):
+def test_e2e_tickets_retro_rejected_blocks_next_epic(project_v7, topology):
     """A `rejected` retrospective verdict holds the run while epic-cart stays open: the
     first pause names the rejection, and a resume without closing the epic pauses
     again (`epic-rejected`) with no session for epic-checkout. Ablation: drop the
     tickets engine's `BOUNDARY_REJECTED` arm and the resume only acknowledges the
     closure (an `awaiting-closure` halt whose reason never says `rejected`)."""
-    layout = _scaffold(tmp_path / "sbx", TWO_EPICS, topology=topology, retro="auto")
+    layout = _scaffold(project_v7, TWO_EPICS, topology=topology, retro="auto")
     root = layout.project
     _commit_marker(root, f".retro-verdict-{EPIC}", "rejected\n")
 
@@ -710,7 +707,7 @@ def test_e2e_tickets_retro_rejected_blocks_next_epic(tmp_path, topology):
 
 
 @pytest.mark.parametrize("topology", ["T1", "T3"])
-def test_e2e_tickets_blocked_resolve_rearms_via_mark(tmp_path, topology):
+def test_e2e_tickets_blocked_resolve_rearms_via_mark(project_v7, topology):
     """The session blocks its own ticket (`tickets.py mark 1.1 blocked`), so the run
     pauses at `escalation` with nothing committed. `resolve --no-interactive` spawns no
     session: it re-arms the plan through the chokepoint (`mark` reason `rearm`,
@@ -718,7 +715,7 @@ def test_e2e_tickets_blocked_resolve_rearms_via_mark(tmp_path, topology):
     resumed run re-dispatches 1.1, which builds and is marked `done`. Ablation: skip
     the re-arm mark (`runs._rearm_ticket_plan` returning False) and resolve refuses
     the plan, exiting 1 with the ticket still escalated."""
-    layout = _scaffold(tmp_path / "sbx", _epic(EntrySpec(1, "Cart model")), topology=topology)
+    layout = _scaffold(project_v7, _epic(EntrySpec(1, "Cart model")), topology=topology)
     root = layout.project
     _commit_marker(root, ".block-1.1", "block\n")
     base = _commit_count(root)
@@ -757,7 +754,7 @@ def test_e2e_tickets_blocked_resolve_rearms_via_mark(tmp_path, topology):
 
 
 @pytest.mark.parametrize("topology", ["T1", "T2"])
-def test_e2e_tickets_worktree_isolation_finds_tree(tmp_path, topology):
+def test_e2e_tickets_worktree_isolation_finds_tree(project_v7, topology):
     """`isolation = "worktree"`: the session runs in the unit's mount, where the
     gitignored `config.user.toml` (seeded, never committed) lets the fake's
     `tickets.py find` resolve the tree. T1: the mark rides the squashed unit commit,
@@ -767,7 +764,7 @@ def test_e2e_tickets_worktree_isolation_finds_tree(tmp_path, topology):
     Ablation: drop the redirect (`redirect_mount_store`) and T2's fake writes a plan
     the main store never sees."""
     layout = _scaffold(
-        tmp_path / "sbx",
+        project_v7,
         _epic(EntrySpec(1, "Cart model")),
         topology=topology,
         isolation="worktree",
@@ -803,7 +800,7 @@ def test_e2e_tickets_worktree_isolation_finds_tree(tmp_path, topology):
 
 
 @pytest.mark.parametrize("topology", ["T3", "T4"])
-def test_e2e_tickets_multirepo_store_commits(tmp_path, topology):
+def test_e2e_tickets_multirepo_store_commits(project_v7, topology):
     """A store that is its own repository (T3 nested and ignored, T4 outside the
     project), `isolation = "none"`: the code repository gets one squashed commit per
     ticket and no plan; after each lands, bmad-loop marks the plan `done` and commits
@@ -813,7 +810,7 @@ def test_e2e_tickets_multirepo_store_commits(tmp_path, topology):
     commit (`_commit_marked_plan`) and the store is left dirty with no
     `chore(tickets)` commits."""
     layout = _scaffold(
-        tmp_path / "sbx",
+        project_v7,
         _epic(EntrySpec(1, "Cart model"), EntrySpec(2, "Cart rules", after=(1,))),
         topology=topology,
         retro="auto",
@@ -860,12 +857,12 @@ def _validate_problems(root: Path) -> set[str]:
     return {f["check"] for f in doc["findings"] if f["severity"] == "problem"}
 
 
-def test_e2e_tickets_tracker_store_refused(tmp_path):
+def test_e2e_tickets_tracker_store_refused(project_v7):
     """A tracker store (`store = "jira"`) is refused at `run` preflight, before any
     run dir or session exists, and `validate` reports it as `tickets.store-not-repo`.
     Ablation: drop the store finding in `install.tickets_preflight` and the run
     composes (a run dir appears)."""
-    layout = _scaffold(tmp_path / "sbx", _epic(EntrySpec(1, "Cart model")), store="jira")
+    layout = _scaffold(project_v7, _epic(EntrySpec(1, "Cart model")), store="jira")
     root = layout.project
 
     proc = _run(root, "run")
@@ -876,21 +873,19 @@ def test_e2e_tickets_tracker_store_refused(tmp_path):
     assert "tickets.store-not-repo" in _validate_problems(root)
 
 
-def test_e2e_tickets_workspace_layout_refused(tmp_path):
+def test_e2e_tickets_workspace_layout_refused(project_v7):
     """A BMAD workspace (layout T5: the project root holds the install and the store
     but is no repository; the code lives in repositories beneath it) is refused by
     `run` before anything is composed, and `validate` reports
     `tickets.workspace-unsupported`. Ablation: drop the classifier's not-a-repo arm
     and `run` gets past the topology gate."""
-    layout = _scaffold(tmp_path / "sbx", _epic(EntrySpec(1, "Cart model")))
+    layout = _scaffold(project_v7, _epic(EntrySpec(1, "Cart model")))
     root = layout.project
     remove_tree(root / ".git")
     for name in ("app", "lib"):
         (root / name).mkdir()
         (root / name / "README").write_text(f"{name}\n", encoding="utf-8")
-        _git_init(root / name)
-        _git(root / name, "add", "-A")
-        _git(root / name, "commit", "-q", "-m", name)
+        _store_repo(root / name)
     probe = subprocess.run(["git", "-C", str(root), "rev-parse"], capture_output=True)
     assert probe.returncode != 0, "the sandbox must not sit inside a repository"
 
