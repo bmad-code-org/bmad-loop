@@ -409,9 +409,13 @@ class BmadLoopApp(App[None]):
             return
         # `run` takes tickets mode from policy alone (no flag selects it, as
         # `--spec` selects stories), so a pick that disagrees with `[stories]
-        # source` would launch the other mode.
+        # source` would launch the other mode — unless it is stories, whose
+        # `--spec` overrides a tickets policy.
         tickets = worksource.SOURCE_TICKETS
-        if (result["source"] == tickets) != (self._stories_defaults()[0] == tickets):
+        policy_tickets = self._stories_defaults()[0] == tickets
+        if (result["source"] == tickets) != policy_tickets and not (
+            policy_tickets and has_spec_folder
+        ):
             self.notify(
                 'tickets mode is chosen in policy: set [stories] source = "tickets" in '
                 ".bmad-loop/policy.toml to run it, or another source to leave it",

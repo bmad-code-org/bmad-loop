@@ -2819,6 +2819,49 @@ async def test_start_run_modal_refuses_tickets_against_the_policy_source(project
         assert not calls
 
 
+async def test_start_run_modal_stories_overrides_a_tickets_policy(project, monkeypatch):
+    """`run --spec` forces stories mode over `[stories] source = "tickets"`, so
+    picking stories with a spec folder launches it; sprint, which no flag can
+    select, is still refused. Ablation (performed): drop the `has_spec_folder`
+    exemption in `_start_run_result` and the stories launch never fires — this
+    FAILS."""
+    from textual.widgets import Select
+
+    calls: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(BmadLoopApp, "_stories_defaults", lambda self: ("tickets", ""))
+    monkeypatch.setattr(
+        data, "project_tickets_overview", lambda proj: data.TicketsBoard((), None, "init-a")
+    )
+
+    def fake_start(proj, run_id, *, spec=None, epic, story, max_stories):
+        calls.append(spec)
+
+    monkeypatch.setattr(launch, "start_run_detached", fake_start)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        app.screen.query_one("#source", Select).value = "sprint-status"
+        await pilot.click("#ok")
+        await until(
+            pilot, lambda: any("tickets mode is chosen in policy" in m for m in notifications(app))
+        )
+        assert not calls
+
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        app.screen.query_one("#source", Select).value = "stories"
+        await pilot.pause()
+        app.screen.query_one("#spec-folder", Input).value = "specs/epic-1"
+        await pilot.click("#ok")
+        await until(pilot, lambda: bool(calls))
+        assert calls == ["specs/epic-1"]
+
+
 async def test_start_run_modal_tickets_option(project, monkeypatch):
     """With `[stories] source = "tickets"` the modal opens on tickets mode, its
     preview is the active initiative's board read off the UI thread, and start
