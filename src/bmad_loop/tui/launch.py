@@ -1197,6 +1197,11 @@ def _ensure_ctl_session(project: Path) -> str:
                 # create session" on psmux) by a session that now exists (#952).
                 if not mux.has_session(name):
                     raise
+            # A setup step the backend could not finish is printed, not raised,
+            # and Textual swallows stderr, so it goes through the sink too.
+            take = getattr(mux, "take_setup_notes", None)
+            for note in take() if take is not None else []:
+                _warn_once(f"ctl-session-setup:{name}:{note}", note)
     except MultiplexerError as e:
         raise LaunchError(f"multiplexer ctl-session setup failed: {e}") from e
     # After both arms: a session created just now on a stale server inherits

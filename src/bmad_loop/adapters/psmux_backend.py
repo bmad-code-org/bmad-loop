@@ -696,6 +696,31 @@ class PsmuxMultiplexer(BaseTmuxBackend):
                 f"{self._BINARY} new-session exited 0 but session {name!r} was not "
                 "created (nesting guard no-op?)"
             )
+        # A user config with `destroy-unattached on` would tear this session
+        # down when its last client detaches (psmux reaps only on that edge, not
+        # at a detached create as tmux does), so turn it off for this session
+        # (#951). psmux 3.4.0 keeps session options in the server's one store
+        # (psmux/psmux#803, fixed only on master), so there the write lands in
+        # the server-wide value: harmless while this server holds only this
+        # session, but a later runtime `set -g destroy-unattached on` (a config
+        # reload) re-arms the reap. A release with that fix keeps the session's
+        # own value and leaves the user's global alone. Best-effort: the session
+        # exists, and raising here would leave it untagged (the caller's tag
+        # write never runs), which a shared registry's cleanup refuses to own.
+        # psmux reaps only on a last-client detach, so a failed write is said,
+        # not fatal. Printed unconditionally, and kept for take_setup_notes so
+        # a caller whose stderr reaches nobody (the TUI) can show it too.
+        try:
+            self.set_session_option(name, "destroy-unattached", "off")
+        except TmuxError as exc:
+            note = f"could not set destroy-unattached off on {name}: {exc}"
+            print(f"warning: {note}", file=sys.stderr)
+            vars(self).setdefault("_setup_notes", []).append(note)
+
+    def take_setup_notes(self) -> list[str]:
+        """The setup degradations new_session said since the last call, oldest
+        first; the instance is process-wide, so each is handed out once."""
+        return vars(self).pop("_setup_notes", [])
 
     @staticmethod
     def _qualified_window_id(session: str, window_id: str) -> str:
@@ -1604,7 +1629,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             "$out.Dispose()\n"
         )
         try:
-            self._tmux("pipe-pane", "-t", window_id, "-o", *self._shell_wrap(sink))
+            # No `-o`, as the base: replace a user-opened pipe, never toggle it
+            # off (#947).
+            self._tmux("pipe-pane", "-t", window_id, *self._shell_wrap(sink))
         except (TmuxError, UnicodeEncodeError) as exc:
             # Best-effort, as the base: a window that died on launch (or psmux's
             # first-pipe-after-new-window spawn race, noted in psmux/psmux#482)

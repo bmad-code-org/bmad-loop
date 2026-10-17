@@ -170,6 +170,13 @@ def test_start_run_detached_argv(fake_run, tmp_path: Path):
         # no `-e` pairs: session env is not part of the released verb, and on
         # tmux this ONE ctl session is shared by every project on the machine,
         # so no single project's value could be right for its window 0 anyway.
+        # The same invocation turns a user's destroy-unattached off (#951).
+        ";",
+        "set-option",
+        "-t",
+        "bmad-loop-ctl",
+        "destroy-unattached",
+        "off",
     ]
     # window 0 of the shared ctl session must never list as a run window
     assert launch._CTL_WINDOW_RE.match(ns[ns.index("-n") + 1]) is None
@@ -3365,6 +3372,34 @@ def test_an_underivable_launcher_root_is_reported_by_the_check(monkeypatch, tmp_
 
     launch._ensure_ctl_session(tmp_path)
     assert len(warned) == 1 and envvars.STATE_DIR in warned[0]
+
+
+def test_a_ctl_session_setup_warning_reaches_the_sink(monkeypatch, tmp_path: Path):
+    """Textual captures stderr for the whole TUI run, so a step the backend
+    could not finish at create (psmux turning a user's destroy-unattached off)
+    is routed to the sink as well. Ablation: drop the take_setup_notes read
+    and the sink is empty."""
+
+    class _Mux:
+        notes: list[str] = []
+
+        def has_session(self, name):
+            return False
+
+        def new_session(self, name, project):
+            self.notes = [f"could not set destroy-unattached off on {name}"]
+
+        def take_setup_notes(self):
+            notes, self.notes = self.notes, []
+            return notes
+
+    warned: list[str] = []
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: _Mux())
+    monkeypatch.setattr(launch.runs, "ctl_session_for", lambda project, mux: "ctl")
+    monkeypatch.setattr(launch, "_warn_if_stale_state_root", lambda mux, name: None)
+    monkeypatch.setattr(launch, "warn_sink", warned.append)
+    assert launch._ensure_ctl_session(tmp_path) == "ctl"
+    assert warned == ["could not set destroy-unattached off on ctl"]
 
 
 def test_an_underivable_launcher_root_refuses_the_launch(monkeypatch, tmp_path: Path):

@@ -76,7 +76,7 @@ Rules that span methods:
 - `new_parked_window(session, name, cwd, argv, return_opt)`: run `argv`, print `PARKED_BANNER`, park on a key, then return any attached client via `return_opt`.
 - `list_window_ids(session)`: same id form as `new_window`. Answer `[]` only for an empty listing or a proved-gone session; otherwise raise.
 - `list_windows(session, fields)`: one tuple per window in field order; best-effort `[]` on failure.
-- `window_alive(session, window_id)`: membership test over the listing. Raise when liveness cannot be known; never answer `False` for that.
+- `window_alive(session, window_id)`: `True` while the window is listed AND its pane is alive; a window the multiplexer keeps listed after its pane exited (`remain-on-exit on`) is not alive. Membership alone is `list_window_ids`. Raise when liveness cannot be known; never answer `False` for that.
 - `kill_window(target)`: tolerate the window already being gone; no-op on a transport failure.
 - `select_window(target)`: make the window current; best-effort.
 - `set_window_option(target, option, value)` / `unset_window_option(target, option)`: best-effort. An unset option must read back as unset, not empty.

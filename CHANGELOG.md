@@ -147,6 +147,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Replace a pane's existing pipe instead of toggling it, so a tmux or psmux config hook that
+  already logs the pane no longer leaves the run log empty (#947).
+- Read a window whose pane exited as dead even when a `remain-on-exit on` config keeps it
+  listed, so the session ends `crashed` instead of `stalled` (#950).
+- Turn `destroy-unattached` off on each session bmad-loop creates, so a config that sets it
+  globally no longer destroys the detached session (#951).
 - TUI: record a resume or resolve window as the run's control window only once its child
   accepts the run, so a resume refused as "still live" no longer sends attach and `x` to
   its own window while the engine runs in another (#920).

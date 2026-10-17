@@ -2291,6 +2291,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 idle.open_since = idle.last_change_wall
 
     def _window_alive(self, handle: SessionHandle) -> bool:
+        return self.mux.window_alive(self.session_name, handle.native_id)
+
+    def _window_listed(self, handle: SessionHandle) -> bool:
+        # Teardown verification asks whether the window is GONE, not whether its
+        # CLI runs: under `remain-on-exit on` a dead pane is still a window to
+        # kill, so a kill that missed it must not read as done (#950).
         return handle.native_id in self.mux.list_window_ids(self.session_name)
 
     def _probe_liveness(self, handle: SessionHandle, site: str) -> bool | None:
@@ -2490,7 +2496,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         liveness_unknown = False
         while True:
             try:
-                dead = not self._window_alive(handle)
+                dead = not self._window_listed(handle)
                 liveness_unknown = False
             except MultiplexerError:
                 dead = False  # transport hiccup — liveness unknown this tick, keep polling
@@ -2528,7 +2534,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     pass
         self.mux.kill_window(handle.native_id)
         try:
-            alive: bool | None = self._window_alive(handle)
+            alive: bool | None = self._window_listed(handle)
         except MultiplexerError:
             alive = None  # unknown is not dead — record it honestly
         self._note_lifecycle(handle.task_id, "kill-outcome", alive=alive, escalated=True)
