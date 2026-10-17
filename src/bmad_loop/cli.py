@@ -4125,7 +4125,10 @@ def _ticket_badge(row: ticketmodel.TicketRow) -> str:
 def _predicted_pause(decision: tickets_source.PickDecision, max_stories: int | None) -> str:
     """The first pause a fresh tickets run would reach, as one line. A
     ``--max-stories 1`` run skips the first ticket's done checkpoint, as the
-    engine's skip-if-last does once the cap is spent."""
+    engine's skip-if-last does once the cap is spent. A cap of 0 or less stops
+    the run before its first pick, so it predicts no ticket at all."""
+    if max_stories is not None and max_stories <= 0:
+        return f"run would stop: --max-stories {max_stories} dispatches no ticket"
     if isinstance(decision, tickets_source.Halt):
         where = f" before {decision.key}" if decision.key else ""
         return f"run would pause{where} ({decision.stage}): {decision.detail}"

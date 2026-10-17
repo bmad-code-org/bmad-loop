@@ -13368,6 +13368,8 @@ def test_dry_run_tickets_prints_dispatch_and_predicted_pause(project, capsys, mo
         ([], "run would pause after 1.1 (story-checkpoint): done checkpoint"),
         (["--max-stories", "1"], "no pause predicted before 1.1 finishes"),
         (["--max-stories", "2"], "run would pause after 1.1 (story-checkpoint): done checkpoint"),
+        (["--max-stories", "0"], "run would stop: --max-stories 0 dispatches no ticket"),
+        (["--max-stories", "-1"], "run would stop: --max-stories -1 dispatches no ticket"),
     ],
 )
 def test_dry_run_tickets_done_checkpoint_honors_max_stories(
@@ -13375,8 +13377,10 @@ def test_dry_run_tickets_done_checkpoint_honors_max_stories(
 ):
     """A first ticket with `done_checkpoint` predicts its story-checkpoint pause,
     except under `--max-stories 1`: the run's skip-if-last drops that pause once
-    the cap is spent, so the preview must not advertise it. Ablation
-    (performed): ignore the cap in `_predicted_pause` and the `1` row FAILS."""
+    the cap is spent, so the preview must not advertise it. A cap of 0 or less
+    stops the run before its first pick, so it predicts no ticket. Ablation
+    (performed): ignore the cap in `_predicted_pause` and the `1`, `0` and `-1`
+    rows FAIL."""
     _make_tickets_validate_pass(project, monkeypatch, capsys)
     first = ticket_row("1.1", done_checkpoint=True, title="Cart model")
     second = ticket_row("1.2", title="Cart rules")
