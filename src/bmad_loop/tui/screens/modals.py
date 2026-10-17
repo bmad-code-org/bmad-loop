@@ -221,6 +221,9 @@ class StartRunModal(BaseDialog):
         self._project = project
         self._default_source = default_source
         self._default_spec_folder = default_spec_folder
+        # bumped by every preview refresh: a tickets read shows only while its
+        # request is still the latest, so a slow read cannot land over a newer one
+        self._preview_seq = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -271,6 +274,7 @@ class StartRunModal(BaseDialog):
             self._refresh_preview()
 
     def _refresh_preview(self) -> None:
+        self._preview_seq += 1
         try:
             body = self.query_one("#preview-body", Static)
             source = self.query_one("#source", Select).value
@@ -280,7 +284,7 @@ class StartRunModal(BaseDialog):
         traits = worksource.TRAITS.get(source) if isinstance(source, str) else None
         if traits is not None and traits.name == worksource.SOURCE_TICKETS:
             body.update(Text("tickets mode — reading the active initiative…", style="dim"))
-            self._load_tickets_preview()
+            self._load_tickets_preview(self._preview_seq)
             return
         if traits is None or not traits.has_spec_folder:
             body.update(Text("sprint mode — walks sprint-status.yaml", style="dim"))
@@ -311,12 +315,14 @@ class StartRunModal(BaseDialog):
         body.update(text)
 
     @work(thread=True, exclusive=True, group="tickets-preview")
-    def _load_tickets_preview(self) -> None:
+    def _load_tickets_preview(self, seq: int) -> None:
         # tickets.py is project code and may take seconds: never on the UI thread.
         board = data.project_tickets_overview(self._project)
-        self.app.call_from_thread(self._show_tickets_preview, board)
+        self.app.call_from_thread(self._show_tickets_preview, board, seq)
 
-    def _show_tickets_preview(self, board: data.TicketsBoard) -> None:
+    def _show_tickets_preview(self, board: data.TicketsBoard, seq: int) -> None:
+        if seq != self._preview_seq:
+            return  # superseded: a later refresh owns the preview
         try:
             body = self.query_one("#preview-body", Static)
             source = self.query_one("#source", Select).value

@@ -2866,6 +2866,48 @@ async def test_start_run_modal_tickets_option(project, monkeypatch):
         assert calls == {"spec": None, "epic": "cart", "story": "1.2"}
 
 
+async def test_start_run_modal_drops_a_superseded_tickets_preview(project, monkeypatch):
+    """A tickets read that finishes after a newer one (the operator switched away
+    and back while it ran) never replaces the newer preview.
+
+    Ablation (performed): drop the sequence check in `_show_tickets_preview` and
+    the slow first read's board lands last — this FAILS."""
+    release = threading.Event()
+    slow = {"on": True}
+    stale: dict[str, int] = {"started": 0, "finished": 0}
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(BmadLoopApp, "_stories_defaults", lambda self: ("tickets", ""))
+
+    def preview(proj):
+        if not slow["on"]:
+            return data.TicketsBoard((ticket_row("1.2"),), None, "init-fresh")
+        stale["started"] += 1
+        release.wait(10)
+        stale["finished"] += 1
+        return data.TicketsBoard((ticket_row("1.1"),), None, "init-stale")
+
+    monkeypatch.setattr(data, "project_tickets_overview", preview)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        modal = app.screen
+        body = modal.query_one("#preview-body", Static)
+        await until(pilot, lambda: stale["started"] >= 1)
+        modal.query_one("#source", Select).value = "sprint-status"
+        await until(pilot, lambda: "sprint mode" in str(body.render()))
+        slow["on"] = False
+        modal.query_one("#source", Select).value = "tickets"
+        await until(pilot, lambda: "initiative init-fresh" in str(body.render()))
+        release.set()
+        await until(pilot, lambda: stale["finished"] == stale["started"])
+        await pilot.pause(0.2)
+        assert "initiative init-fresh" in str(body.render())
+        assert "init-stale" not in str(body.render())
+
+
 async def test_start_run_modal_epic_text_validation_per_mode(project, monkeypatch):
     """The epic input is text: outside tickets mode it must still be a number
     (`run --epic` exits 2 on anything else there), so a slug keeps the modal open
