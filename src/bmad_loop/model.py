@@ -18,7 +18,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .mountpaths import project_offset, rebased_project
 
@@ -69,6 +69,17 @@ PAUSE_STORY_CHECKPOINT = "story-checkpoint"
 # environment, not the story, blocks the run, so nothing was charged or rolled
 # back and resume re-probes before dispatching. Reserved for the dispatch gate.
 PAUSE_ENVIRONMENT = "environment"
+# tickets-mode pick-time pauses (BMAD v7 ticket tree). HITL: the next ticket in
+# build order is a human-in-the-loop ticket; REFINE: it needs refining (a bug, an
+# unrefined backlog leaf, or an open `unknown`) before a build can start; TREE: the
+# tree itself blocks the run — the pinned initiative changed, `tickets.py` faulted,
+# or only tickets this run did not start stand in the way. All three are raised
+# before the ticket is recorded in state.tasks, so a resume re-picks and re-reads
+# the tree. A refined `plan_checkpoint`, an epic awaiting closure and a blocked
+# plan reuse PLAN_CHECKPOINT, EPIC_BOUNDARY and ESCALATION.
+PAUSE_TICKET_HITL = "ticket-hitl"
+PAUSE_TICKET_REFINE = "ticket-refine"
+PAUSE_TICKET_TREE = "ticket-tree"
 
 # Where an environment fault was detected (DW-523), as recorded in
 # `StoryTask.env_fault_site`. A CLOSED vocabulary: `verify:<role>` — a verify
@@ -289,6 +300,26 @@ def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
     return out
 
 
+def _store_topology_from(raw: object) -> dict[str, str | None]:
+    """Rehydrate `RunState.store_topology`: string keys to string-or-null values,
+    copied exactly. Absent or null reads as `{}` (nothing recorded). Any other shape
+    never raises out of `from_dict`, and never reads as "nothing recorded" either:
+    it becomes ``{"unreadable": <type>}``, which no classified topology equals, so
+    resume refuses it as a changed store instead of skipping the check."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        items = cast("dict[object, object]", raw)
+        out: dict[str, str | None] = {}
+        for key, value in items.items():
+            if not isinstance(key, str) or not (value is None or isinstance(value, str)):
+                break
+            out[key] = value
+        else:
+            return out
+    return {"unreadable": type(raw).__name__}
+
+
 def _identity_record_from(raw: object) -> tuple[int, int] | None:
     """Rehydrate a mint-time root identity record (DW-446) from state.json: a
     two-int ``[st_dev, st_ino]`` list. A pre-upgrade absent key, ``null``, or any
@@ -306,6 +337,72 @@ def _identity_record_from(raw: object) -> tuple[int, int] | None:
 
 def _identity_record_to(record: tuple[int, int] | None) -> list[int] | None:
     return None if record is None else [record[0], record[1]]
+
+
+@dataclass(frozen=True)
+class TicketBinding:
+    """tickets mode only: the ticket-tree identity a unit was dispatched for,
+    captured from ``tickets.py find`` when the ticket is picked and persisted on
+    its :class:`StoryTask` so a resume never re-resolves it.
+
+    ``ref`` is the unit key (``E.M``); ``id`` the entry id as text; ``epic_slug``
+    the epic folder (``epic-<x>``) and ``epic_id`` its id in the initiative table
+    (``""`` when the initiative does not list it). ``plan`` is the absolute plan
+    path ``find`` names, which may not exist before the first build. The
+    checkpoint flags and ``hitl`` are the entry's, as picked."""
+
+    ref: str
+    id: str
+    epic_slug: str
+    epic_id: str
+    title: str
+    plan: str
+    risk: str
+    refined: bool
+    plan_checkpoint: bool
+    done_checkpoint: bool
+    hitl: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ref": self.ref,
+            "id": self.id,
+            "epic_slug": self.epic_slug,
+            "epic_id": self.epic_id,
+            "title": self.title,
+            "plan": self.plan,
+            "risk": self.risk,
+            "refined": self.refined,
+            "plan_checkpoint": self.plan_checkpoint,
+            "done_checkpoint": self.done_checkpoint,
+            "hitl": self.hitl,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "TicketBinding":
+        return cls(
+            ref=str(d["ref"]),
+            id=str(d.get("id", "")),
+            epic_slug=str(d.get("epic_slug", "")),
+            epic_id=str(d.get("epic_id", "")),
+            title=str(d.get("title", "")),
+            plan=str(d.get("plan", "")),
+            risk=str(d.get("risk", "")),
+            refined=bool(d.get("refined", False)),
+            plan_checkpoint=bool(d.get("plan_checkpoint", False)),
+            done_checkpoint=bool(d.get("done_checkpoint", False)),
+            hitl=bool(d.get("hitl", False)),
+        )
+
+
+def _ticket_binding_from(raw: object) -> TicketBinding | None:
+    """A persisted binding, or None for an absent one. A present value that is not
+    a mapping is a corrupt state file: refuse it rather than drop the binding."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"ticket binding must be an object, got {type(raw).__name__}")
+    return TicketBinding.from_dict(cast("dict[str, Any]", raw))
 
 
 @dataclass
@@ -691,6 +788,25 @@ class StoryTask:
     # counts it was computed from stay in `tokens`. Persisted precisely so a
     # resumed run does not re-notify what the pre-pause process already did.
     token_budget_warned: bool = False
+    # tickets mode only: the ticket this unit was picked for (TicketsEngine binds it
+    # right after registration). None for sprint, stories and sweep units.
+    # `status --json` projects it as the task's `ticket` object (additive, schema 1).
+    ticket: TicketBinding | None = None
+    # tickets mode, shared ticket store only (T2–T4: a store no code checkout
+    # carries): the ticket's terminal mark, owed once the unit's code has LANDED on
+    # the target — after `finalize_commit` in place, after the merge-back under
+    # worktree isolation — because a plan the unit's commit does not carry would
+    # otherwise unblock `next`'s dependents of code that is not there yet. Set in
+    # `_commit` before the COMMITTING save, so every crash window past it replays
+    # the mark on resume; cleared (and saved) only once the mark is made.
+    # `ticket_done_pending`: accept (`mark <ref> done`); `ticket_park_pending`: the
+    # park's `blocked_reason` (`mark <ref> blocked --blocked <reason>`), "" for none;
+    # `ticket_commit_pending`: no mark (`mark_done = "never"`), but a store with its
+    # own repository (T3/T4) still owes the commit of the `built` plan the session
+    # wrote there, which a T1 unit's own commit would have carried.
+    ticket_done_pending: bool = False
+    ticket_park_pending: str = ""
+    ticket_commit_pending: bool = False
 
     @property
     def terminal(self) -> bool:
@@ -802,6 +918,10 @@ class StoryTask:
             "sessions": [s.to_dict() for s in self.sessions],
             "tokens": self.tokens.to_dict(),
             "token_budget_warned": self.token_budget_warned,
+            "ticket": self.ticket.to_dict() if self.ticket is not None else None,
+            "ticket_done_pending": self.ticket_done_pending,
+            "ticket_park_pending": self.ticket_park_pending,
+            "ticket_commit_pending": self.ticket_commit_pending,
         }
 
     def _serialized_worktree_path(
@@ -1086,6 +1206,10 @@ class StoryTask:
             sessions=[SessionRecord.from_dict(s) for s in d.get("sessions", [])],
             tokens=TokenUsage.from_dict(d.get("tokens", {})),
             token_budget_warned=bool(d.get("token_budget_warned", False)),
+            ticket=_ticket_binding_from(d.get("ticket")),
+            ticket_done_pending=bool(d.get("ticket_done_pending", False)),
+            ticket_park_pending=str(d.get("ticket_park_pending", "") or ""),
+            ticket_commit_pending=bool(d.get("ticket_commit_pending", False)),
         )
 
 
@@ -1212,7 +1336,9 @@ class RunState:
     # the run's story scope + cap, as passed on the launching CLI (`--epic`,
     # `--story`, `--max-stories`). Persisted so `resume` rebuilds the Engine with
     # the SAME selector — otherwise a resumed `--epic N` run silently widens to
-    # every epic and can jump out of its scope at the next pick.
+    # every epic and can jump out of its scope at the next pick. A tickets run
+    # stores its resolved `--story` ticket ref here and its `--epic` slug in
+    # `ticket_epic_filter` (`epic_filter` stays None).
     epic_filter: int | None = None
     story_filter: str | None = None
     max_stories: int | None = None
@@ -1255,6 +1381,37 @@ class RunState:
     # stories mode only: the project-relative (or absolute) spec folder holding
     # stories.yaml + SPEC.md. Empty under sprint-status.
     spec_folder: str = ""
+    # BMAD v7 only: the `[core] active_initiative` the run picked from, and its
+    # canonical folder, pinned at run start (bmadconfig.ProjectPaths). The live
+    # value can change under a paused run; tickets mode compares the two so a
+    # resume never builds another initiative's ticket, and a v7 sweep's resume
+    # refuses a change (`runsetup.sweep_initiative_conflict`) so it never sweeps
+    # another initiative's ledger. Empty on v6 runs and on state written before
+    # the pin existed.
+    initiative: str = ""
+    initiative_folder: str = ""
+    # tickets mode only. `ticket_epic_filter`: the `--epic` selector as an epic
+    # slug ("" = every epic). `ticket_story_approvals`: refs whose refined
+    # `plan_checkpoint` story file an operator approved this run, so the pick
+    # dispatches them instead of pausing again. `ticket_epic_closures`: epic slug ->
+    # the closure disposition this run recorded at its epic boundary (a retro
+    # verdict, e.g. "rejected", holds every later epic until the epic is closed;
+    # "unknown" when no verdict was read). `ticket_epic_closure_resumed`: epic slugs
+    # whose closure pause a resume answered (recorded by the resume prologue), so a
+    # closure recorded without its pause reaching the operator pauses again.
+    # `ticket_epic_closure_acked`: epic slugs whose non-rejected closure pause an
+    # operator resumed past, so it pauses once.
+    ticket_epic_filter: str = ""
+    ticket_story_approvals: list[str] = field(default_factory=list)
+    ticket_epic_closures: dict[str, str] = field(default_factory=dict)
+    ticket_epic_closure_resumed: list[str] = field(default_factory=list)
+    ticket_epic_closure_acked: list[str] = field(default_factory=list)
+    # tickets mode and v7 sweeps: the ticket-store topology classified at run start
+    # (`ticketstore.StoreTopology.to_dict`: layout, placement, versioning,
+    # store_root, store_repo). Resume re-classifies the store and refuses on any
+    # difference; a shared store sets `ProjectPaths.shared_store` for the engine.
+    # Empty on other runs and on state written before it existed.
+    store_topology: dict[str, str | None] = field(default_factory=dict)
     # sweep runs only: the triage->bundles cycle in progress; 1 maps to the
     # legacy (unsuffixed) artifact names so old paused runs resume unchanged
     sweep_cycle: int = 1
@@ -1431,6 +1588,14 @@ class RunState:
             "sweep_options_digest": self.sweep_options_digest,
             "source": self.source,
             "spec_folder": self.spec_folder,
+            "initiative": self.initiative,
+            "initiative_folder": self.initiative_folder,
+            "ticket_epic_filter": self.ticket_epic_filter,
+            "ticket_story_approvals": list(self.ticket_story_approvals),
+            "ticket_epic_closures": dict(self.ticket_epic_closures),
+            "ticket_epic_closure_resumed": list(self.ticket_epic_closure_resumed),
+            "ticket_epic_closure_acked": list(self.ticket_epic_closure_acked),
+            "store_topology": dict(self.store_topology),
             "sweep_cycle": self.sweep_cycle,
             "sweep_skipped_decisions": self.sweep_skipped_decisions,
             "sweep_dropped_decisions": self.sweep_dropped_decisions,
@@ -1473,6 +1638,16 @@ class RunState:
             sweep_options_digest=str(d.get("sweep_options_digest", "")),
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
+            initiative=str(d.get("initiative", "")),
+            initiative_folder=str(d.get("initiative_folder", "")),
+            ticket_epic_filter=str(d.get("ticket_epic_filter", "")),
+            ticket_story_approvals=[str(r) for r in d.get("ticket_story_approvals", [])],
+            ticket_epic_closures={
+                str(k): str(v) for k, v in d.get("ticket_epic_closures", {}).items()
+            },
+            ticket_epic_closure_resumed=[str(s) for s in d.get("ticket_epic_closure_resumed", [])],
+            ticket_epic_closure_acked=[str(s) for s in d.get("ticket_epic_closure_acked", [])],
+            store_topology=_store_topology_from(d.get("store_topology")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),
             sweep_skipped_decisions=[str(s) for s in d.get("sweep_skipped_decisions", [])],
             sweep_dropped_decisions=[str(s) for s in d.get("sweep_dropped_decisions", [])],

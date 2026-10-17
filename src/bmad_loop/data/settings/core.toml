@@ -74,13 +74,31 @@ kind = "select"
 options_ref = "STORIES_SOURCES"
 default_ref = "StoriesPolicy.source"
 label = "story source"
-description = "sprint-status: walk sprint-status.yaml · stories: folder+id dispatch off a typed stories.yaml (needs spec_folder)"
+description = "sprint-status: walk sprint-status.yaml · stories: folder+id dispatch off a typed stories.yaml (needs spec_folder) · tickets: the BMAD v7 ticket tree of core.active_initiative, via _bmad/method/scripts/tickets.py (experimental)"
 [[section.field]]
 key = "spec_folder"
 kind = "str"
 default_ref = "StoriesPolicy.spec_folder"
 label = "spec folder"
 description = "stories mode only: project-relative path to the epic spec folder (holds stories.yaml + SPEC.md)"
+
+[[section]]
+name = "tickets"
+description = "BMAD v7 ticket-tree runs (stories.source = tickets)"
+[[section.field]]
+key = "mark_done"
+kind = "select"
+options_ref = "TICKETS_MARK_DONE_MODES"
+default_ref = "TicketsPolicy.mark_done"
+label = "mark done"
+description = "auto: bmad-loop marks a ticket done once its build passes verify and review · never: leave the plan at built for a human"
+[[section.field]]
+key = "thorough_review"
+kind = "select"
+options_ref = "TICKETS_THOROUGH_REVIEW_MODES"
+default_ref = "TicketsPolicy.thorough_review"
+label = "thorough review"
+description = "when a ticket gets the thorough review: high-risk (its risk is high), always, or never"
 
 [[section]]
 name = "limits"

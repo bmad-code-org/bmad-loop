@@ -7,6 +7,7 @@ guides below go deeper, roughly in the order you'll need them.
 
 - **[Setup guide](setup-guide.md)** — install the tools, pick a CLI, initialize a project, pass preflight, and uninstall.
 - **[TUI guide](tui-guide.md)** — the dashboard: layout, key bindings, the settings editor, and troubleshooting.
+- **[Ticket-tree mode](tickets-guide.md)** — driving a BMAD v7 initiative ticket tree: prerequisites, store layouts, pick order, every pause and how to clear it, marking done, checkpoints, the epic retrospective and closure, parking and resolve, and the v7 ledger and sweep.
 - **[Deferred-work sweeps](sweep-guide.md)** — running a sweep, answering decisions, closing entries from stories, hard gates, and recovering from stale answers, publication refusals and an unreadable ledger.
 - **[Recovering paused runs](escalations-guide.md)** — escalations and `resolve` (re-arm, `--adopt-branch`, `--reverify`, `--abandon`), preserved attempts, plateau-defer, `confirm` for human-only actions, environment faults, and worktree merge-back failures.
 - **[Features](FEATURES.md)** — what the tool does: the feature catalog, with each feature's stability, guarantees, tests and docs.

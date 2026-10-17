@@ -32,14 +32,12 @@ Steps 1–4 below.
 Run: `echo "${BMAD_LOOP_LEDGER:-}"`
 
 The printed path is the ledger — the orchestrator resolved it from the project's
-BMAD config (the central `_bmad/config.toml` layers over the legacy
-`_bmad/bmm/config.yaml`), so read that file and never re-derive it; its directory
-is `{implementation_artifacts}`. Only if the output is empty, read
-`{project-root}/_bmad/bmm/config.yaml` to resolve `implementation_artifacts` and
-use `{implementation_artifacts}/deferred-work.md`. Read the ledger in full. Open entries
-are `### DW-<n>:` blocks whose `status:` line is `open`. If the ledger is
-missing or unreadable, escalate `CRITICAL` (`type: missing-ledger`) per
-automation-mode.md and end your turn.
+BMAD config (on v6 `{implementation_artifacts}`, on v7 the active initiative
+folder), so read that file and never re-derive it; its directory is
+`{implementation_artifacts}`. Read the ledger in full. Open entries are
+`### DW-<n>:` blocks whose `status:` line is `open`. If the output is empty, or
+the ledger is missing or unreadable, escalate `CRITICAL`
+(`type: missing-ledger`) per automation-mode.md and end your turn.
 
 An entry carrying an `archived:` line keeps only a stub here — its full body
 lives in the sibling `deferred-work-archive.md`, keyed by the same DW- id; read

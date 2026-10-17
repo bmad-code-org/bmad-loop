@@ -71,7 +71,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import runs, runsetup, verify
+from . import runs, runsetup, verify, worksource
 from .bmadconfig import ProjectPaths
 from .journal import Journal, load_state, save_state, state_lock
 from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
@@ -234,7 +234,7 @@ def _replay_state(
         epic_filter=None,
         story_filter=story_key,
         max_stories=1,
-        stories_on=False,
+        source=worksource.SOURCE_SPRINT,
         spec_folder="",
         trusted_config_digest=trusted_config_digest,
         run_dir_identity=run_dir_identity,

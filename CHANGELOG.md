@@ -9,6 +9,66 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add the experimental `tickets` work source for BMAD v7 initiative ticket trees
+  (`[stories] source = "tickets"`): dispatch `bmad-build-auto ticket <ref>` in initiative
+  build order, verify each plan at `built`, and mark it `done` through `tickets.py mark`
+  (`[tickets] mark_done`, `thorough_review`). See `docs/tickets-guide.md`.
+- Support BMAD-METHOD v7 as of upstream main `8f0d50e1` (`6.13.0-next`; v7 is not yet
+  tagged). The contract tests run against `tickets.py` vendored at that commit.
+- Resolve BMAD v7 config (`[core] output_folder`, `active_initiative`): a project with
+  `_bmad/method/scripts/tickets.py` resolves its artifacts to the active initiative
+  folder. New validate warnings `bmad-config.initiative-unset` and
+  `bmad-config.v6-keys-ignored`.
+- Validate tickets projects: the `tickets.*` preflight (script, config reader, uv, active
+  initiative, repo store, store topology; tracker stores and the multi-repo workspace
+  layout are refused), the dev skill's ticket route (`skills.tickets-dispatch*`), and
+  `tickets.py` under `--probes`. `validate --json` gains `initiative`, `era` and
+  `ticket_store`; `mode` gains `tickets`.
+- Pause tickets runs for a person: hitl tickets (`ticket-hitl`), tickets needing
+  refinement (`ticket-refine`), tree faults, foreign in-progress rows and a dirty
+  initiative folder (`ticket-tree`), plan and done checkpoints, and epic closure.
+- Follow upstream checkpoints: a refined `plan_checkpoint` waits for story-file approval
+  before dispatch, an unrefined one runs a `Halt after planning.` leg and pauses for plan
+  review, and `done_checkpoint` pauses after the ticket commits.
+- Run the epic retrospective (`/bmad-retrospective -H <epic-slug>`) when a run finishes
+  an epic, record its verdict, and pause at `epic-boundary` for a person to close the
+  epic with bmad-ticket. A `rejected` verdict pauses every later pick while the epic
+  stays open; any other pauses once. A retrospective refused for a dirty tree, a git fault or a stop request
+  records no closure, so the resume runs it.
+- Park a ticket as `blocked` ("awaiting operator: …"), never `done`.
+  `bmad-loop confirm <ref>` marks it `done` through `tickets.py mark` once the actions
+  are done; `bmad-loop resolve <run-id>` re-arms an escalated ticket. A code rollback
+  re-arms its plan, and a timed-out review lands it at `built`.
+- Drive every repo-store layout: a store tracked in the code checkout is marked inside
+  the unit's commit; an ignored folder or a store in its own repository is marked after
+  the code lands (latched and replayed on resume), and a store repository gets plan-only
+  commits with `Bmad-Code-*` trailers, the `built` plan too under `mark_done = "never"`.
+  A store commit never overwrites a person's staged version of a path, even one deleted
+  from disk. A failed store commit is retried before the run finishes and pauses at
+  `ticket-tree` if still owed; a failed retrospective commit pauses at the epic boundary
+  before its closure, and the resume commits it. A store
+  inside a renamed project moves with it. `confirm` commits a store plan in the store's
+  own repository.
+- Add a `Bmad-Ticket:` trailer to tickets unit commits, plus `Bmad-Plan:` when the plan lies
+  inside the code checkout, and name worktree unit branches `bmad-loop/<run>/<epic-slug>/<ref>`.
+- Add tickets mode to `run --dry-run` (build order, dispatches, the first pause) and the
+  `run --epic` / `--story` selectors (an epic id or slug, a ticket ref).
+- Harvest a ticket plan's `deferred:` findings into the initiative's `deferred-work.md`,
+  accept v7 `source_plan:` ledger blocks, and gate tickets by ledger `gate:` refs (a
+  ticket, an epic id or folder). A v6 story-key gate pauses at
+  `story-gate` until it is rewritten.
+- Run deferred-work sweeps on v7 initiatives: no sprint board, bundle plans in the
+  initiative folder closed at `built`, the sweep pinned to its initiative, and
+  pre-answers kept per initiative in `.bmad-loop/decisions-<initiative>.json`. An answer
+  is refused once another initiative is active than the one its decision was listed
+  from.
+- Show tickets in `status` (a board grouped by epic) and `status --json` (`ticket` and
+  `tickets` objects; schema 1), and in the TUI: a tickets board, `hitl`/`refine`/`tree`
+  badges, pause-reason and epic-closure viewers, a start-run preview, and **Request
+  replan** through `tickets.py mark`.
+- Ship a `bmod.toml` module record (`bmod-bmad-loop`) so BMAD v7 `bmad setup` can
+  discover, install and update-check bmad-loop; each bundled skill carries its own
+  `[skill]` record.
 - Add every TUI command to the command palette (`ctrl+p`): run control, dashboard,
   settings-editor, and dialog commands, each listed only where its key is live.
 - Add `bmad-loop plugins [list|enable|accept|revoke] [name]`: list plugins with origin,
@@ -46,6 +106,11 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Refuse release versions `bmad setup` cannot order: `scripts/sync_version.py` accepts
+  SemVer `X.Y.Z` with an optional `-` pre-release only (no `.devN`, no `-dev`).
+- Make the setup greeting era-neutral: it names the BMAD v6 and v7 requirements.
+- Refuse to resume a story run whose recorded work source this bmad-loop does not
+  know (a run started by a newer version) instead of resuming it as a sprint run.
 - Start bmad-loop's psmux servers with `PSMUX_NO_WARM=1`: their warm pool and hidden
   `__warm__` standby were never used, and dropping them cuts an idle project from 16 psmux
   processes and about 935 MiB of summed working sets to 4 and about 175 MiB. The operator's
@@ -85,11 +150,20 @@ breaking changes may land in a minor release.
 - TUI: record a resume or resolve window as the run's control window only once its child
   accepts the run, so a resume refused as "still live" no longer sends attach and `x` to
   its own window while the engine runs in another (#920).
+- Report a pre-upgrade control session in this project's own registry at
+  `cleanup --json` `sessions.superseded_ctl_sessions` and in its own TUI toast, not in
+  `sessions.legacy_leftovers` or the `not migrated` line, which again name only what a
+  legacy registry still holds (#917).
 - Cap verify-command and `[environment]`-probe output at 32 MiB per stream while it is
   captured, not only after the command exits, so a chatty command's memory no longer
   grows with its runtime (DW-549).
 - Make `bmad-loop probe-adapter` search for codex rollouts under `$CODEX_HOME/sessions`,
   as live sessions do, instead of always `~/.codex/sessions` (DW-546).
+- Report psmux's empty or `ERROR:` session-listing row, printed at exit 0 for a server it
+  could not read, as a listing fault instead of dropping it: the removal guard, `cleanup`
+  and the ownership-tag readers now warn rather than read a live session as silently
+  absent (#919). On a psmux that instead names an unread server on stderr and exits 1
+  (psmux/psmux#809), keep the names that answered and report the unread ones.
 - Name `opencode.db` and say to move it aside when an OpenCode 1.x server dies at
   startup on a database a 2.x server created, instead of reporting only `rc=1` (DW-544).
 - Save a dotted plugin name's settings from the TUI under `[plugins."<name>"]`, not in
@@ -111,9 +185,9 @@ breaking changes may land in a minor release.
   running; the stderr
   note names it too (#906).
 - Report a pre-upgrade `bmad-loop-ctl-<16 hex>` control session left in the project's own
-  psmux registry: `cleanup` names it on stderr and in `sessions.legacy_leftovers` with the
-  command that ends it (`sessions.legacy_kill_commands`), and `attach` names it when it finds
-  nothing to attach (#733).
+  psmux registry: `cleanup` names it on stderr and in `sessions.superseded_ctl_sessions`
+  with the command that ends it (`sessions.legacy_kill_commands`), and `attach` names it
+  when it finds nothing to attach (#733).
 - Print no kill or attach command for a pre-upgrade control-session name that may be a run's
   own session (a run of this project has that id, or the session carries a run's project tag,
   as a neighbour's run can in a shared registry), still check the project's own registry

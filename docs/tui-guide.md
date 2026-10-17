@@ -155,6 +155,34 @@ dim `·` when unset), and the title. The board re-derives on each poll.
 | `✖`   | blocked                                  | bold red |
 | `⚠`   | ambiguous / sentinel (`sentinel:<kind>`) | bold red |
 
+#### Tickets board (middle, tickets mode)
+
+When the selected run is in tickets mode, the slot shows the run's pinned
+initiative as `tickets.py status` prints it, titled `Tickets`. One row per
+ticket: state glyph and label, the ref, the epic folder, a three-slot flags cell
+(`H` = hitl, `P` = plan checkpoint, `D` = done checkpoint, dim `·` when unset),
+and the title. The state is the plan's status when the ticket has a plan, else
+`planned` (or `refine` when it must be refined first).
+
+`tickets.py` is the project's own code, so the board reads it on the poll worker,
+never the UI thread. It runs again only when `tickets.toml`, a `.md` file in the
+initiative or one of its epic folders, the config, the script, or the
+`config_utils.py` it loads changes. A tree that cannot be read shows
+`tickets board unavailable:` and the reason, and is retried after 30 seconds.
+
+| Glyph | State                       | Color    |
+| ----- | --------------------------- | -------- |
+| `✓`   | done                        | green    |
+| `●`   | built                       | green    |
+| `▶`   | in-progress                 | cyan     |
+| `◆`   | in-review / review          | magenta  |
+| `○`   | ready-for-dev               | cyan     |
+| `◦`   | draft                       | dim      |
+| `✎`   | refine (no plan yet)        | yellow   |
+| `·`   | planned / backlog (no plan) | dim      |
+| `✖`   | blocked                     | bold red |
+| `–`   | dropped                     | dim      |
+
 #### Deferred work (bottom)
 
 Every entry in the `deferred-work.md` ledger, in file order: its id and title.
@@ -187,7 +215,9 @@ Situational banners below that:
 - `⏸ paused [<stage>] — <reason>`, then `press p to review · e to resume`: the
   run stopped at a checkpoint, gate or escalation. Stage labels are
   `plan checkpoint`, `story checkpoint`, `spec-approval gate`, `epic gate`,
-  `story gate`, `escalation` and `environment fault`. At an escalation, `e`
+  `story gate`, `escalation` and `environment fault`, plus the tickets-mode
+  `hitl ticket`, `ticket needs refining`, `ticket tree` and `epic closure`
+  (see [Tickets mode](#tickets-mode)). At an escalation, `e`
   skips the escalated story; press `R` to resolve it instead. At an environment
   fault an `[environment]` probe failed; fix the environment and press `e` to
   re-probe and continue.
@@ -345,14 +375,21 @@ To return to the default proportions, delete the `[tui]` size keys from
 
 `r` opens the **start run** modal. Every field is optional:
 
-- **source**: `sprint mode` (walks `sprint-status.yaml`) or `stories mode`
-  (folder-and-id dispatch), prefilled from `[stories]`.
+- **source**: `sprint mode` (walks `sprint-status.yaml`), `stories mode`
+  (folder-and-id dispatch) or `tickets mode` (the BMAD v7 ticket tree),
+  prefilled from `[stories]`. Tickets mode previews the active initiative: its
+  ticket counts and the refs that pause on hitl or a checkpoint. A tickets pick
+  launches only while `[stories] source = "tickets"`. Under that policy a
+  stories pick still launches (its `--spec` overrides the policy source); a
+  sprint pick does not.
 - **spec folder**: stories mode only. The epic spec folder holding
   `stories.yaml` and `SPEC.md`; it drives a live schedule preview that validates
   the manifest and lists the schedule with `[spec/done]` checkpoint markers and
   each story's state. Stories mode with an empty spec folder is refused.
-- **epic**: restrict to one epic (sprint mode).
-- **story key**: restrict to one story (a story id in stories mode).
+- **epic**: restrict to one epic: a number, or in tickets mode an epic id or
+  slug. Any other text outside tickets mode keeps the modal open.
+- **story key**: restrict to one story (a story id in stories mode, a ticket ref
+  in tickets mode).
 - **max stories**: stop after N stories.
 - **dry run**: print the plan without spawning anything; output shows in a modal.
 
@@ -482,6 +519,25 @@ which viewer `p` opens.
 
 A viewer whose spec cannot be read says so and disables the actions that would
 act on it. Every action that resumes refuses a still-live engine.
+
+### Tickets mode
+
+A tickets run (the BMAD v7 ticket tree) reuses most viewers. The pause viewers
+read `state.json` and plan frontmatter only. The
+[tickets board](#tickets-board-middle-tickets-mode) and the start-run preview
+run `tickets.py`, always off the UI thread.
+
+| Stage             | Badge    | What `p` shows                                                                                                                                                                                                                                                                                                                                               |
+| ----------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ticket-hitl`     | `hitl`   | The pause reason: the next ticket needs a person in the loop. Build it, then **Resume**.                                                                                                                                                                                                                                                                     |
+| `ticket-refine`   | `refine` | The pause reason: the next ticket needs refining with `bmad-ticket`. Refine it, then **Resume**.                                                                                                                                                                                                                                                             |
+| `ticket-tree`     | `tree`   | The pause reason: the pinned initiative changed, `tickets.py` failed, the initiative folder is dirty, or only other tickets block progress.                                                                                                                                                                                                                  |
+| `epic-boundary`   | `epic`   | The epic-closure viewer: the retrospective verdict the run recorded, the retrospective's path, and the closure steer.                                                                                                                                                                                                                                        |
+| `plan-checkpoint` | `plan`   | The plan viewer. **Request replan** marks the plan `draft` through `tickets.py mark` (reason `replan`), never by editing frontmatter, then resumes. The run stays paused on a refused or no-op mark, a changed ticket store, an isolation layout resume would refuse, a swapped worktree mount, or a run another controller moved to a different checkpoint. |
+
+The run header labels an `epic-boundary` pause `epic closure` in tickets mode.
+A ticket's title and description come from the task the run recorded, so a
+pick-time pause shows only the ref.
 
 ## Attaching (`a`) and the sweep decision flow
 

@@ -21,8 +21,11 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import os
 import re
+import time
 from collections import deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,7 +35,16 @@ from rich.color import ColorParseError
 from rich.style import Style
 from rich.text import Text
 
-from .. import bmadconfig, deferredwork, policy, sprintstatus, stories
+from .. import (
+    bmadconfig,
+    deferredwork,
+    policy,
+    sprintstatus,
+    stories,
+    ticketmodel,
+    tickettree,
+    worksource,
+)
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state, unreadable_line_entry
 from ..model import RunState
@@ -60,6 +72,7 @@ from ..runs import (
     _StatSig,
     list_run_dirs,
     liveness,
+    rebase_recorded_project_path,
 )
 
 # ------------------------------------------------------------- run watching
@@ -918,6 +931,10 @@ _deferred_cache: dict[Path, tuple[_StatSig | None, list[DeferredItem] | None]] =
 _missed_cache: dict[Path, tuple[Any, MissedDecisions]] = {}
 # project spelling as asked -> why `_project_paths` last answered None for it
 _paths_fault: dict[Path, str] = {}
+# the same two, for the tickets-mode resolution (`want_tickets`): a mixed v6/v7
+# install answers v6 paths without it and v7 paths with it
+_tickets_paths_cache: dict[Path, tuple[tuple[object, ...], bmadconfig.ProjectPaths]] = {}
+_tickets_paths_fault: dict[Path, str] = {}
 
 
 def _config_source_sig(path: Path) -> object:
@@ -934,27 +951,38 @@ def _config_source_sig(path: Path) -> object:
     return ((st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode), _stat_sig(path))
 
 
-def _project_paths(project: Path) -> bmadconfig.ProjectPaths | None:
+def _project_paths(project: Path, *, want_tickets: bool = False) -> bmadconfig.ProjectPaths | None:
     """BMAD artifact paths, stat-gated on every config source `load_paths` reads
-    (the four central TOML layers and the legacy config.yaml), so an edit to any
-    of them is seen on the next call; None when the project is not initialized
-    (or the config is unreadable) — why is left in ``_paths_fault`` under the
-    spelling asked, for a caller that must say so rather than answer empty."""
+    (the four central TOML layers, the legacy config.yaml and the v7 marker that
+    picks the era), so an edit to any of them is seen on the next call; None when
+    the project is not initialized (or the config is unreadable) — why is left in
+    ``_paths_fault`` (``_tickets_paths_fault`` under ``want_tickets``) under the
+    spelling asked, for a caller that must say so rather than answer empty.
+    ``want_tickets`` resolves as a tickets run does, so a mixed install answers v7."""
     asked = project
     project = resolve_or_lexical(project)
-    sources = (*bmadconfig.CENTRAL_LAYERS_REL, bmadconfig.LEGACY_CONFIG_REL)
+    cache, faults = (
+        (_tickets_paths_cache, _tickets_paths_fault)
+        if want_tickets
+        else (_paths_cache, _paths_fault)
+    )
+    sources = (
+        *bmadconfig.CENTRAL_LAYERS_REL,
+        bmadconfig.LEGACY_CONFIG_REL,
+        bmadconfig.V7_MARKER_REL,
+    )
     config_sigs = tuple(_config_source_sig(project / rel) for rel in sources)
-    cached_paths = _paths_cache.get(project)
+    cached_paths = cache.get(project)
     if cached_paths is not None and cached_paths[0] == config_sigs:
-        _paths_fault.pop(asked, None)
+        faults.pop(asked, None)
         return cached_paths[1]
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = bmadconfig.load_paths(project, want_tickets=want_tickets)
     except (bmadconfig.BmadConfigError, OSError) as e:
-        _paths_fault[asked] = _describe(e)
+        faults[asked] = _describe(e)
         return None
-    _paths_fault.pop(asked, None)
-    _paths_cache[project] = (config_sigs, paths)
+    faults.pop(asked, None)
+    cache[project] = (config_sigs, paths)
     return paths
 
 
@@ -998,6 +1026,156 @@ def stories_overview(project: Path, spec_folder: str) -> list[stories.StoryRow] 
         return stories.story_rows(folder)
     except stories.StoriesError:
         return None
+
+
+def _stories_board(project: Path, state: RunState) -> list[stories.StoryRow] | None:
+    return stories_overview(project, state.spec_folder)
+
+
+@dataclass(frozen=True)
+class TicketsBoard:
+    """The tickets-mode board for one initiative: ``tickets.py status``'s rows in
+    the script's order, or why the tree could not be read. A read that failed
+    carries ``fault`` (and no rows), never an empty board that would read as "no
+    tickets". ``initiative`` is the one the board was read for (``""`` when there
+    was none to read)."""
+
+    rows: tuple[ticketmodel.TicketRow, ...]
+    fault: str | None
+    initiative: str
+
+
+# A board read that failed is retried after this long even when no file changed:
+# a timeout or a busy store lock clears on its own, so a fault kept until the
+# next edit could outlive its cause. An answer is kept until a file changes.
+TICKETS_FAULT_RETRY_S = 30.0
+
+# (project, initiative, initiative folder) -> (tree signature, board, monotonic
+# time of the read)
+_tickets_cache: dict[tuple[Path, str, Path], tuple[object, TicketsBoard, float]] = {}
+
+
+def _tickets_tree_sig(project: Path, folder: Path) -> object:
+    """What a ``tickets.py status`` answer depends on, as one comparable value:
+    the ``(path, mtime_ns, size)`` of ``tickets.toml`` and every ``*.md`` in the
+    initiative folder and its subfolders (two levels — epic folders hold their
+    leaves and plans flat), plus the config layers ``active_initiative`` is read
+    from, the script itself and the ``config_utils.py`` it execs. Read with
+    ``scandir``; a folder that cannot be listed or a file that cannot be stat'ed
+    is part of the signature too."""
+    files: list[tuple[str, object, object]] = []
+    pending: list[tuple[Path, int]] = [(folder, 1)]
+    while pending:
+        here, depth = pending.pop()
+        try:
+            with os.scandir(here) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir():
+                            if depth < 2:
+                                pending.append((Path(entry.path), depth + 1))
+                            continue
+                        if entry.name != "tickets.toml" and not entry.name.endswith(".md"):
+                            continue
+                        st = entry.stat()
+                    except OSError as e:
+                        files.append((entry.path, "error", e.errno))
+                        continue
+                    files.append((entry.path, st.st_mtime_ns, st.st_size))
+        except OSError as e:
+            files.append((str(here), "unlistable", e.errno))
+    sources = (
+        *bmadconfig.V7_CENTRAL_LAYERS_REL,
+        bmadconfig.V7_MARKER_REL,
+        bmadconfig.V7_CONFIG_UTILS_REL,
+    )
+    return (
+        tuple(sorted(files, key=lambda f: f[0])),
+        tuple(_config_source_sig(project / rel) for rel in sources),
+    )
+
+
+def _board_ticket_tree(project: Path, initiative: str) -> tickettree.TicketTreeLike:
+    """The tree the board reads: the project's installed ``tickets.py``, pinned
+    to ``initiative`` so a switched ``active_initiative`` reads as a fault, not
+    as another initiative's board. A seam: tests swap in a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project, pinned_initiative=initiative)
+
+
+def initiative_board(project: Path, initiative: str, folder: Path) -> TicketsBoard:
+    """``initiative``'s board, stat-gated on :func:`_tickets_tree_sig`: the
+    script is spawned only when that signature changes (or a cached fault is
+    older than :data:`TICKETS_FAULT_RETRY_S`). ``tickets.py`` is project code (it
+    imports the project's ``config_utils``) and may run for seconds, so call this
+    from a worker thread, never the UI thread."""
+    key = (project, initiative, folder)
+    sig = _tickets_tree_sig(project, folder)  # before the read: an edit mid-read re-reads
+    cached = _tickets_cache.get(key)
+    if cached is not None and cached[0] == sig:
+        board = cached[1]
+        if board.fault is None or time.monotonic() - cached[2] < TICKETS_FAULT_RETRY_S:
+            return board
+    try:
+        view = _board_ticket_tree(project, initiative).status()
+    except tickettree.TicketsError as e:
+        board = TicketsBoard((), f"tickets.py {e.kind}: {e}", initiative)
+    else:
+        board = TicketsBoard(view.tickets, None, initiative)
+    _tickets_cache[key] = (sig, board, time.monotonic())
+    return board
+
+
+def tickets_overview(project: Path, state: RunState) -> TicketsBoard:
+    """The tickets-mode board for a run: the tree of the initiative it pinned
+    (``RunState.initiative`` and ``initiative_folder``), read as
+    :func:`initiative_board` reads it — off the UI thread. The recorded folder
+    moves with a renamed project (:func:`~bmad_loop.runs.rebase_recorded_project_path`),
+    so the signature watches the tree the script reads. A run with no pinned
+    initiative has no tree to read and says so in ``fault``."""
+    if not state.initiative or not state.initiative_folder:
+        return TicketsBoard((), "this run pinned no initiative", state.initiative)
+    folder = Path(state.initiative_folder)
+    if not folder.is_absolute():
+        folder = project / folder
+    folder = rebase_recorded_project_path(folder, state, project)
+    return initiative_board(project, state.initiative, folder)
+
+
+def project_tickets_overview(project: Path) -> TicketsBoard:
+    """The board a new tickets run would start from: the project's live ``[core]
+    active_initiative``. A project that is not v7, or names no initiative, says
+    so in ``fault``. Resolves as ``bmad-loop run`` does in tickets mode, so a mixed
+    v6/v7 install previews its v7 initiative. Spawns like :func:`initiative_board`
+    — off the UI thread."""
+    paths = _project_paths(project, want_tickets=True)
+    if paths is None:
+        why = _tickets_paths_fault.get(project, "the project is not initialized")
+        return TicketsBoard((), f"BMAD config unreadable: {why}", "")
+    if paths.era != "v7" or paths.initiative_folder is None or not paths.active_initiative:
+        return TicketsBoard((), "no v7 active initiative ([core] active_initiative)", "")
+    return initiative_board(project, paths.active_initiative, paths.initiative_folder)
+
+
+def _tickets_board(project: Path, state: RunState) -> TicketsBoard:
+    return tickets_overview(project, state)
+
+
+BoardLoader = Callable[[Path, RunState], "list[stories.StoryRow] | TicketsBoard | None"]
+
+
+BOARD_LOADERS: Mapping[str, BoardLoader | None] = {
+    worksource.SOURCE_SPRINT: None,
+    worksource.SOURCE_STORIES: _stories_board,
+    worksource.SOURCE_TICKETS: _tickets_board,
+}
+"""The per-run board each work source shows in the dashboard's board slot, keyed
+by ``RunState.source``. ``None`` means the source has no per-run board: the slot
+shows the project-level sprint tree (:func:`sprint_overview`, painted on rescan).
+A source this table does not carry is shown as sprint, as before the registry.
+A loader returns stories rows (the stories board) or a :class:`TicketsBoard`
+(the tickets board); the dashboard picks the widget by that type.
+One row per ``worksource.SOURCES`` (``tests/test_worksource.py`` holds it
+exhaustive)."""
 
 
 @dataclass(frozen=True)
@@ -1078,10 +1256,13 @@ class MissedDecisions:
     """:func:`pending_missed_decisions`' answer. ``fault`` is None for a real
     answer (``items`` may then be empty: nothing is pending); otherwise it names
     why nothing could be read, and ``items`` is empty because nothing was — not
-    because nothing is pending (DW-473)."""
+    because nothing is pending (DW-473). ``ledger`` is the deferred-work ledger
+    ``items`` were listed from, for :func:`decisions.apply_pre_answer`'s
+    ``listed_ledger``."""
 
     items: list[Any]
     fault: str | None = None
+    ledger: Path | None = None
 
 
 def pending_missed_decisions(project: Path) -> MissedDecisions:
@@ -1108,20 +1289,21 @@ def pending_missed_decisions(project: Path) -> MissedDecisions:
     if listing_fault is not None:
         return MissedDecisions([], fault=f"run listing incomplete ({listing_fault})")
     sig = (
+        paths.deferred_work,
         _stat_sig(paths.deferred_work),
-        _stat_sig(decisions.store_path(project)),
+        _stat_sig(decisions.store_path(project, decisions.store_scope(paths))),
         tuple(d.name for d in run_dirs),
     )
     cached = _missed_cache.get(project)
     if cached is not None and cached[0] == sig:
         return cached[1]
     try:
-        items = decisions.pending_missed_decisions(project)
+        items = decisions.pending_missed_decisions(project, paths)
     except (bmadconfig.BmadConfigError, OSError) as e:
         return MissedDecisions([], fault=_describe(e))
     _, ledger_fault = deferredwork.read_for_observation(paths.deferred_work)
     if ledger_fault is not None:
         return MissedDecisions([], fault=f"deferred-work ledger unreadable ({ledger_fault})")
-    result = MissedDecisions(items)
+    result = MissedDecisions(items, ledger=paths.deferred_work)
     _missed_cache[project] = (sig, result)
     return result

@@ -223,6 +223,20 @@ class SessionSpec:
     # (`bmad-loop validate` warns). Never reaches argv, so `config_digest` is
     # untouched. Kept LAST so positional SessionSpec constructions stay valid.
     effort: str = ""
+    # The frontmatter statuses that END this session successfully, handed to the
+    # generic read-back (`devcontract.synthesize_result`, the candidate scans, the
+    # mid-session transition sampler and the post-kill rescue). The default is the
+    # v6 contract: a spec finishes at `done`. A BMAD v7 ticket session finishes its
+    # plan at `built` (dev) or `built`/`done` (review), so the tickets engine
+    # sets it; nothing else ever does.
+    success_statuses: tuple[str, ...] = ("done",)
+    # Extra directories the read-back probes for the skill's no-spec fallback
+    # result (`devcontract.FALLBACK_RESULT_PREFIXES`) when the spec the session
+    # owed (`expected_spec`) yields nothing: a v7 build that cannot resolve its
+    # ticket HALTs into the initiative folder, never into the plan. Prefixed files
+    # only, never a scan for other specs (#261). A relative entry is rebased on
+    # `cwd`. Empty for every v6 session. Both kept LAST, after `effort`.
+    fallback_result_dirs: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)

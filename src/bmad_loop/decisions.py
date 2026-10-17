@@ -11,7 +11,9 @@ decision.
 This module is the durable carrier. A human answers missed decisions out of band
 (`bmad-loop decisions`, or the TUI), the answer is recorded both as a ledger
 `decision:` line and — for build/keep-open — in a project-level
-`.bmad-loop/decisions.json` keyed by DW id, and the next sweep consumes it
+`.bmad-loop/decisions.json` keyed by DW id (on BMAD v7, one
+`.bmad-loop/decisions-<initiative>.json` per initiative — see `store_scope`),
+and the next sweep consumes it
 instead of asking again (see SweepEngine._decisions_phase). `close` answers need
 no store entry: they are applied to the ledger immediately (status -> done), so
 the entry simply leaves the open set.
@@ -59,7 +61,7 @@ from stat import S_ISREG
 from typing import Literal
 
 from . import bmadconfig, deferredwork, runs, verify
-from .platform_util import atomic_write_text_confined
+from .platform_util import atomic_write_text_confined, safe_segment
 from .sweep import Decision, DecisionOption, unusable_answer_reason, validate_triage
 
 STORE_REL = Path(".bmad-loop") / "decisions.json"
@@ -72,15 +74,35 @@ _TRIAGE_RE = re.compile(r"^triage(?:-(\d+))?\.json$")
 PUBLISH_ERROR_MAX = 200
 
 
-def store_path(project: Path) -> Path:
-    return project / STORE_REL
+def store_scope(paths: bmadconfig.ProjectPaths) -> str | None:
+    """The pre-answer store scope for ``paths``: on BMAD v7 the active
+    initiative, else None. A store answers one ledger, and on v7 each initiative
+    folder holds its own ledger with its own DW numbering, so two initiatives'
+    ``DW-3`` are different entries and must not share an answer. v6, and v7 with
+    no initiative active (one ledger under ``output_folder``), keep the single
+    store. Derived from the same ``paths`` the ledger is read from, so the store
+    and the ledger it answers cannot disagree."""
+    if paths.era != "v7":
+        return None
+    return paths.active_initiative or None
+
+
+def store_path(project: Path, scope: str | None = None) -> Path:
+    """The pre-answer store for ``scope`` (:func:`store_scope`):
+    ``.bmad-loop/decisions.json`` unscoped, and
+    ``.bmad-loop/decisions-<initiative>.json`` (one safe path segment) for a v7
+    initiative."""
+    if scope is None:
+        return project / STORE_REL
+    return project / STORE_REL.parent / f"decisions-{safe_segment(scope)}.json"
 
 
 # --------------------------------------------------------------- store I/O
 
 
-def load_pre_answers(project: Path) -> dict[str, dict]:
-    """The project-level pre-answer store, {DW-id: {effect,label,intent,...}}.
+def load_pre_answers(project: Path, scope: str | None = None) -> dict[str, dict]:
+    """The project-level pre-answer store for ``scope`` (:func:`store_path`),
+    {DW-id: {effect,label,intent,...}}.
     Tolerant of a missing or malformed file (returns {}): an absent file, an
     unreadable one, JSON that will not parse, bytes that are not UTF-8 at all
     (DW-140) and a non-object top level all degrade to an empty store rather than
@@ -93,7 +115,7 @@ def load_pre_answers(project: Path) -> dict[str, dict]:
     write silently DELETE a human's corrupt entries — the file repair this
     codebase refuses. Readers that consume a value screen it themselves with
     `sweep.unusable_answer_reason`."""
-    path = store_path(project)
+    path = store_path(project, scope)
     try:
         # `stat()` + `S_ISREG` INSIDE the `try`, never a bare `is_file()` outside
         # it (DW-261): on Python 3.11–3.13 `is_file()` re-raises a metadata
@@ -115,7 +137,7 @@ def load_pre_answers(project: Path) -> dict[str, dict]:
     return data if isinstance(data, dict) else {}
 
 
-def _write_store(project: Path, data: dict) -> None:
+def _write_store(project: Path, data: dict, scope: str | None = None) -> None:
     """#363: via the helper, not a hand-rolled tmp+replace. The store lives at a
     path nothing gitignores, so a failed replace used to strand
     `.bmad-loop/decisions.tmp` as an untracked file and hold `worktree_clean`
@@ -138,7 +160,7 @@ def _write_store(project: Path, data: dict) -> None:
     `Path.write_text` raised here before #363 made the write atomic. The store is
     operator-curated — an operator who marks it read-only is answered rather than
     quietly overwritten and left with the `0444` still showing."""
-    path = store_path(project)
+    path = store_path(project, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text_confined(
         path,
@@ -148,7 +170,9 @@ def _write_store(project: Path, data: dict) -> None:
     )
 
 
-def record_pre_answer(project: Path, dw_id: str, option: DecisionOption, *, date: str) -> None:
+def record_pre_answer(
+    project: Path, dw_id: str, option: DecisionOption, *, date: str, scope: str | None = None
+) -> None:
     """Persist a chosen option so a future sweep applies it without asking. The
     option's full semantics are stored (not just its key): a later triage may
     renumber options, so the sweep reads effect/intent from here directly.
@@ -163,9 +187,9 @@ def record_pre_answer(project: Path, dw_id: str, option: DecisionOption, *, date
     `deferredwork` entry point it uses: the lock lives next to the ledger it was
     written for, and calling it through its home module keeps that ownership
     legible at the call site instead of aliasing it in here."""
-    path = store_path(project)
+    path = store_path(project, scope)
     with deferredwork.ledger_lock(path):
-        data = load_pre_answers(project)
+        data = load_pre_answers(project, scope)
         data[dw_id] = {
             "key": option.key,
             "label": option.label,
@@ -175,7 +199,7 @@ def record_pre_answer(project: Path, dw_id: str, option: DecisionOption, *, date
             "bundle_name": option.bundle_name,
             "answered_at": date,
         }
-        _write_store(project, data)
+        _write_store(project, data, scope)
 
 
 def _prunable_ids(data: dict[str, dict], open_ids: set[str]) -> list[str]:
@@ -197,7 +221,7 @@ def _droppable(data: dict[str, dict], dw_id: str, answer: object) -> bool:
     return dw_id in data and data[dw_id] == answer
 
 
-def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
+def prune_pre_answers(project: Path, open_ids: set[str], *, scope: str | None = None) -> list[str]:
     """Drop store entries whose DW id is no longer open (built or closed). No-op
     write when nothing is dropped. Returns the dropped ids.
 
@@ -223,20 +247,20 @@ def prune_pre_answers(project: Path, open_ids: set[str]) -> list[str]:
     before DW-161, when this function was unlocked and read through the same
     total helper, so it is PRESERVED behavior rather than a new degradation — and
     it is the tolerant reader this module refuses to turn into a repair site."""
-    path = store_path(project)
-    if not _prunable_ids(load_pre_answers(project), open_ids):
+    path = store_path(project, scope)
+    if not _prunable_ids(load_pre_answers(project, scope), open_ids):
         return []  # ADVISORY probe (#736): nothing to write, so nothing to serialize
     with deferredwork.ledger_lock(path):
-        data = load_pre_answers(project)
+        data = load_pre_answers(project, scope)
         dropped = _prunable_ids(data, open_ids)
         if dropped:
             for k in dropped:
                 del data[k]
-            _write_store(project, data)
+            _write_store(project, data, scope)
         return dropped
 
 
-def drop_pre_answer(project: Path, dw_id: str, *, answer: object) -> bool:
+def drop_pre_answer(project: Path, dw_id: str, *, answer: object, scope: str | None = None) -> bool:
     """Remove ONE id's entry — but only while it still IS `answer` — returning
     whether an entry was removed. The single-id sibling of `prune_pre_answers`
     above, and public for the same reason that one is: a sweep that has just
@@ -300,29 +324,46 @@ def drop_pre_answer(project: Path, dw_id: str, *, answer: object) -> bool:
     did before DW-161 too, when this read was unlocked and used the same total
     helper: PRESERVED behavior, not a new degradation, and consistent with this
     module's refusal to repair the store on the way past."""
-    path = store_path(project)
-    if not _droppable(load_pre_answers(project), dw_id, answer):
+    path = store_path(project, scope)
+    if not _droppable(load_pre_answers(project, scope), dw_id, answer):
         return False  # ADVISORY probe (#736): nothing to write, so nothing to serialize
     with deferredwork.ledger_lock(path):
-        data = load_pre_answers(project)
+        data = load_pre_answers(project, scope)
         if not _droppable(data, dw_id, answer):
             return False
         del data[dw_id]
-        _write_store(project, data)
+        _write_store(project, data, scope)
         return True
 
 
 # ------------------------------------------------------- discovery + apply
 
 
-def pending_missed_decisions(project: Path) -> list[Decision]:
+def pending_missed_decisions(
+    project: Path, paths: bmadconfig.ProjectPaths | None = None
+) -> list[Decision]:
     """Decisions earlier sweeps surfaced but no one answered: reconstructed from
     every run's persisted triage*.json, kept only when the DW id is still open
     and not already usably answered in the store — the value has to be one a sweep
     would actually consume, not merely a key that is present (see `answered`
     below). The most recent triage's wording of each id wins. Sorted by DW
-    number."""
-    paths = bmadconfig.load_paths(project)
+    number.
+
+    On BMAD v7 the store is the active initiative's (:func:`store_scope`) and
+    only that initiative's sweeps are read: DW ids are numbered per initiative
+    ledger, so another initiative's triage names different entries under the
+    same ids. With no initiative active only runs that recorded none are read,
+    since the ``output_folder`` ledger numbers its ids independently too.
+
+    ``paths`` is the caller's own load of the config, when it has one: the ledger
+    it names is then the one these decisions were listed from, which a caller
+    hands back to :func:`apply_pre_answer` as ``listed_ledger``."""
+    if paths is None:
+        paths = bmadconfig.load_paths(project)
+    scope = store_scope(paths)
+    # The initiative a run must have recorded for its triage to be read: v7
+    # filters every run, including the no-initiative case (""); v6 reads all.
+    run_scope = (scope or "") if paths.era == "v7" else None
     ledger = paths.deferred_work
     # OBSERVATION arm of the ledger-read contract (DW-146). This helper writes
     # nothing: every caller is a read-only surface (`cmd_decisions`, `cmd_status`,
@@ -362,7 +403,7 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     # be re-offered rather than counted answered.
     answered = {
         k
-        for k, v in load_pre_answers(project).items()
+        for k, v in load_pre_answers(project, scope).items()
         if unusable_answer_reason(v, allow_close=False) is None
     }
 
@@ -371,6 +412,8 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     # A listing fault (DW-468) is surfaced by the callers, as the ledger fault
     # above is: `cmd_decisions` notes it on stderr, the TUI reports it as its fault.
     for run_dir in runs.list_run_dirs(project)[0]:
+        if run_scope is not None and _run_initiative(run_dir) != run_scope:
+            continue
         for tp in run_dir.glob("triage*.json"):
             m = _TRIAGE_RE.match(tp.name)
             if m:
@@ -413,14 +456,32 @@ def pending_missed_decisions(project: Path) -> list[Decision]:
     return sorted(pending, key=lambda d: int(d.id.split("-")[1]))
 
 
+def _run_initiative(run_dir: Path) -> str | None:
+    """The v7 initiative a run recorded at launch (``RunState.initiative``),
+    ``""`` when its state names none, or None when the state cannot be read or
+    is not an object. Read tolerantly, like the triage caches beside it: an
+    unreadable run's decisions are left out, the same way an unreadable triage
+    cache is — None matches no scope, the no-initiative ``""`` included."""
+    try:
+        data = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("initiative")
+    return value if isinstance(value, str) else ""
+
+
 @dataclass(frozen=True)
 class PublishRefusal:
     """One operand `apply_pre_answer` WROTE but could not publish.
 
     `file` is the LEXICAL basename of the operand — `deferred-work.md`
-    (`ProjectPaths.deferred_work`) or `decisions.json` (`STORE_REL`), a code
-    constant at both operands and never operator-controlled prose, which is what
-    makes it safe for both surfaces to print verbatim. `cause` is
+    (`ProjectPaths.deferred_work`) or `decisions.json` (`STORE_REL`, or
+    `decisions-<initiative>.json` on BMAD v7, the initiative reduced to one safe
+    path segment) — a code constant or the operator's own initiative name, never
+    a symlink target's tail, which is what makes it safe for both surfaces to
+    print verbatim. `cause` is
     `verify.unpublishable_target`'s closed four-token enum, spelled here
     IDENTICALLY to its return type — the two are one contract. Pyright rejects
     producer tokens this receiving union does not accept; it does not enforce
@@ -453,8 +514,9 @@ class PublishFailure:
 
     `file` is the LEXICAL basename under the same rule `PublishRefusal.file` is
     held to: a code constant at both operands (`deferred-work.md`,
-    `decisions.json`) and never operator-controlled prose, which is what lets
-    both surfaces print it verbatim. `error` is git's own message with
+    `decisions.json`, or a v7 initiative's `decisions-<initiative>.json`) and
+    never a symlink target's tail, which is what lets both surfaces print it
+    verbatim. `error` is git's own message with
     whitespace COLLAPSED and then CLIPPED to `PUBLISH_ERROR_MAX` — git stderr is
     multi-line and its ignored-path refusal is a multi-sentence hint block, while
     both surfaces render this note inline on one line."""
@@ -517,7 +579,13 @@ class PreAnswerResult:
 
 
 def apply_pre_answer(
-    project: Path, decision: Decision, option: DecisionOption, *, date: str, commit: bool = True
+    project: Path,
+    decision: Decision,
+    option: DecisionOption,
+    *,
+    date: str,
+    commit: bool = True,
+    listed_ledger: Path | None = None,
 ) -> PreAnswerResult:
     """Record a human's out-of-band answer durably, answering whether a ledger
     `decision:` audit line actually landed. `close` also flips the entry to done
@@ -634,8 +702,24 @@ def apply_pre_answer(
     `ValueError` on anything else (it would otherwise land a `status:` line that
     reads as neither open nor done), so a caller building the date itself must
     either guarantee the format or catch it. The option's own free text carries
-    no such precondition — it is sanitized, never refused."""
+    no such precondition — it is sanitized, never refused.
+
+    The store written is the one for the ledger written (:func:`store_scope` of
+    the same ``paths``): on BMAD v7 that is the active initiative's.
+
+    ``listed_ledger`` is the ledger the decision was listed from
+    (:func:`pending_missed_decisions`' ``paths``). The caller blocks on a human
+    between listing and this call, so a config edit in between — another
+    initiative made active — would land the answer on an unrelated entry of the
+    same DW id in another ledger. A ledger other than ``listed_ledger`` raises
+    :class:`~bmad_loop.bmadconfig.BmadConfigError` before anything is written."""
     paths = bmadconfig.load_paths(project)
+    if listed_ledger is not None and paths.deferred_work != listed_ledger:
+        raise bmadconfig.BmadConfigError(
+            f"the deferred-work ledger is now {paths.deferred_work}, not the "
+            f"{listed_ledger} {decision.id} was listed from — list the decisions again"
+        )
+    scope = store_scope(paths)
     ledger = paths.deferred_work
     detail = option.resolution or option.intent
     close_note = None
@@ -653,7 +737,7 @@ def apply_pre_answer(
         ledger, decision.id, date, option.label, detail, close_note=close_note
     )
     if option.effect != "close":
-        record_pre_answer(project, decision.id, option, date=date)
+        record_pre_answer(project, decision.id, option, date=date, scope=scope)
     if not commit:
         return PreAnswerResult(recorded=recorded)
     # GATE ONE — only what THIS call wrote, each paired with the family it
@@ -662,7 +746,7 @@ def apply_pre_answer(
     if recorded:
         wrote.append((ledger, "ledger"))
     if option.effect != "close":
-        wrote.append((store_path(project), "store"))
+        wrote.append((store_path(project, scope), "store"))
     # GATE TWO — the shared publishable-target guard, on the RESOLVED operand
     # because that is the file git would publish, and before any git runs because
     # a refused publish must spawn none.
@@ -690,7 +774,8 @@ def apply_pre_answer(
         # `path.name`, never `target.name`, and here is where that is a CHOICE: a
         # resolved target is reached through a symlink an OPERATOR named, so its
         # tail is arbitrary operator text, while the lexical tail is a code
-        # constant at both operands (`deferred-work.md`, `decisions.json`). That is
+        # constant at both operands (`deferred-work.md`, `decisions.json` or its
+        # v7 `decisions-<initiative>.json`). That is
         # what lets both surfaces print it verbatim — the same rule
         # `sweep._commit_ledger`'s `file` journal field is held to.
         refusals.append(PublishRefusal(file=path.name, cause=cause, error=error))

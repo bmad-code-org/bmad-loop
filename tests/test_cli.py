@@ -1,6 +1,7 @@
 """CLI command tests — init policy-derived profiles and per-stage dry-run."""
 
 import argparse
+import dataclasses
 import hashlib
 import io
 import json
@@ -18,6 +19,7 @@ import yaml
 from conftest import (
     _OK,
     _REVERIFY_KEY,
+    DEFAULT_TREE,
     MISSING_TOOL_CMD,
     NUL_PATH_RESOLVE_FAULTS,
     PROJECT_MARKER_CMD,
@@ -25,16 +27,23 @@ from conftest import (
     REPO_ROOT_MARKER_CMD,
     UNDECODABLE_LEDGER,
     UNRESOLVABLE,
+    V7_DEFAULT_INITIATIVE,
+    FakeTicketTree,
     _reverify_run,
     assert_run_state_lock_held,
     escalated_run,
+    fake_find,
+    fake_next_view,
+    fake_status_view,
     fault_metadata_probe,
     fault_read_text,
     git,
     ignore_before_commit,
     install_bmad_central_config,
     install_bmad_config,
+    install_bmad_v7,
     install_build_auto_skill,
+    install_build_auto_v7_skill,
     install_dev_base_skills,
     install_dev_shim,
     install_render_probe_fixture,
@@ -45,12 +54,14 @@ from conftest import (
     plant_root_markers,
     refuse_to_resolve,
     spec_path,
+    ticket_row,
     write_gated_ledger,
     write_ledger,
     write_repo_root_override,
     write_script_launcher,
     write_spec,
     write_sprint,
+    write_ticket_tree,
 )
 
 from bmad_loop import bmadconfig
@@ -212,7 +223,7 @@ def test_dry_run_stories_warns_when_preflight_would_abort(project, capsys):
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
 
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 0
     out, err = capsys.readouterr()
     assert "NOT runnable" in err and "bmad-build-auto" in err
     assert "Story id: 1." in out
@@ -229,6 +240,48 @@ def test_sweep_dry_run_warns_when_preflight_would_abort(project, capsys):
     assert not project.deferred_work.is_file()  # the early-return leg
     assert cli._sweep_dry_run(project, pol) == 0
     assert "NOT runnable" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source", ["tickets", "sprint-status"])
+def test_sweep_dry_run_banner_mirrors_the_store_refusal(project, capsys, monkeypatch, source):
+    """`cmd_sweep` refuses the ticket store of the source it works before the
+    dry-run's early return could, so the banner mirrors it: a tickets-source sweep
+    names the store's refusal, a sprint-status one is not judged as tickets.
+    Ablation (performed): gate the store check on `require_tickets` alone and the
+    tickets row FAILS."""
+    from bmad_loop import ticketstore
+
+    _write_policy(project.project, f'[stories]\nsource = "{source}"\n')
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+
+    assert cli._sweep_dry_run(project, pol) == 0
+    err = capsys.readouterr().err
+    assert ("FAIL: the ticket store is not supported" in err) == (source == "tickets")
+
+
+def test_sweep_dry_run_judges_a_v7_ledger_store_as_tickets(project_v7, capsys, monkeypatch):
+    """On v7 the ledger lives in the ticket store whatever `[stories] source` says,
+    so the banner judges the store as tickets, as `cmd_sweep` does
+    (`_sweep_store_source`). Ablation (performed): judge `pol.stories.source`
+    instead and this FAILS."""
+    from bmad_loop import ticketstore
+
+    _write_policy(project_v7.project, '[stories]\nsource = "sprint-status"\n')
+    pol = policy_mod.load(project_v7.project / ".bmad-loop" / "policy.toml")
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+
+    paths = bmadconfig.load_paths(project_v7.project)
+    assert cli._sweep_dry_run(paths, pol) == 0
+    assert "FAIL: the ticket store is not supported" in capsys.readouterr().err
 
 
 def _break_sweep_skill(root: Path, tree: str, how: str) -> None:
@@ -506,6 +559,64 @@ def test_dry_run_reports_targeted_not_actionable(project, capsys):
     assert "3-2 matched 3-2-foo" in err and "not actionable" in err
 
 
+def _cli_project_root(project) -> Path:
+    """The canonical project root `main` hands every handler (`cli._project`), so
+    pinned output that embeds a path or a path-derived digest compares like with
+    like on a host whose tmp dir is reached through a symlink."""
+    return cli._project(argparse.Namespace(project=str(project.project)))
+
+
+def test_dry_run_sprint_output_is_pinned(project, capsys):
+    """Characterization pin for the WorkSource refactor: the WHOLE sprint-mode
+    `run --dry-run` stdout, byte for byte, driven through `main` so the pin does
+    not depend on `_dry_run`'s signature. Only actionable stories (backlog +
+    ready-for-dev) are listed, in file order; `done`, `in-progress` and epic keys
+    are not. A complete install keeps stderr empty."""
+    from conftest import install_base_skills
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "1-2-b": "backlog",
+            "1-3-c": "done",
+            "epic-2": "backlog",
+            "2-1-d": "in-progress",
+        },
+    )
+    _write_policy(project.project)
+    events_dir = runs.events_dir_for(_cli_project_root(project), "<run-id>")
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run"])
+
+    out, err = capsys.readouterr()
+    review = (
+        'codex "Use the $bmad-build-auto skill now, and use subagents as needed: '
+        '<done spec from dev>" --dangerously-bypass-approvals-and-sandbox --model gpt-5-codex'
+    )
+    assert rc == 0
+    assert out == (
+        "would process 2 stories (gates=per-epic):\n"
+        f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}\n"
+        "\n"
+        "  1-1-a (epic 1, status ready-for-dev)\n"
+        '    dev:    claude "/bmad-build-auto 1-1-a" --permission-mode bypassPermissions'
+        " --model opus --session-id <auto>\n"
+        f"    review: {review}\n"
+        "    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1-1-a\n"
+        "\n"
+        "  1-2-b (epic 1, status backlog)\n"
+        '    dev:    claude "/bmad-build-auto 1-2-b" --permission-mode bypassPermissions'
+        " --model opus --session-id <auto>\n"
+        f"    review: {review}\n"
+        "    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1-2-b\n"
+    )
+    assert err == ""
+
+
 # ------------------------------------------------------------ stories mode
 
 
@@ -565,7 +676,7 @@ def test_dry_run_stories_prints_linear_schedule(project, capsys):
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
 
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 0
     out = capsys.readouterr().out
     assert "linear schedule" in out
     assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
@@ -580,9 +691,54 @@ def test_dry_run_stories_filters_by_story_id(project, capsys):
     _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story="2", max_stories=None)
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 0
     out = capsys.readouterr().out
     assert "Story id: 2." in out and "Story id: 1." not in out
+
+
+def test_dry_run_stories_output_is_pinned(project, capsys):
+    """Characterization pin for the WorkSource refactor: the WHOLE stories-mode
+    `run --spec ... --dry-run` stdout, byte for byte, driven through `main` so the
+    pin does not depend on `_dry_run`'s signature. A spec_checkpoint story with no
+    plan on disk previews its leg-1 dispatch (`Halt after planning.` +
+    `BMAD_LOOP_PLAN_HALT=1`). A claude-only policy over a folder+id-capable install
+    keeps stderr empty."""
+    install_bmad_config(project)
+    install_dev_base_skills(project.project, folder_id=True)
+    _setup_stories_fixture(
+        project,
+        [_stories_entry("1", spec_checkpoint=True, done_checkpoint=True), _stories_entry("2")],
+    )
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    root = _cli_project_root(project)
+    events_dir = runs.events_dir_for(root, "<run-id>")
+    folder = root / STORIES_SPEC_FOLDER
+
+    rc = cli.main(
+        ["run", "--project", str(project.project), "--spec", STORIES_SPEC_FOLDER, "--dry-run"]
+    )
+
+    out, err = capsys.readouterr()
+    assert rc == 0
+    assert out == (
+        f"stories mode: 2 stories from {folder}/stories.yaml (gates=per-epic)\n"
+        f"  env (every session): BMAD_LOOP_EVENTS_DIR={events_dir}\n"
+        "linear schedule (list order — no depends_on, strictly serial):\n"
+        "\n"
+        "  1. 1  (pending) [spec-checkpoint, done-checkpoint]  Story 1\n"
+        '    dev:    claude "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 1.'
+        ' Halt after planning." --permission-mode bypassPermissions --model opus'
+        " --session-id <auto>\n"
+        "    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1"
+        " BMAD_LOOP_SPEC_FOLDER=_bmad-output/epic-1 BMAD_LOOP_PLAN_HALT=1\n"
+        "\n"
+        "  2. 2  (pending)  Story 2\n"
+        '    dev:    claude "/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2."'
+        " --permission-mode bypassPermissions --model opus --session-id <auto>\n"
+        "    env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=2"
+        " BMAD_LOOP_SPEC_FOLDER=_bmad-output/epic-1\n"
+    )
+    assert err == ""
 
 
 def test_run_warns_when_epic_passed_with_spec(project, capsys):
@@ -612,7 +768,7 @@ def test_run_warns_when_epic_passed_with_spec(project, capsys):
 def test_dry_run_stories_bad_folder_errors(project, capsys):
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 1
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 1
     assert "no stories.yaml found" in capsys.readouterr().err
 
 
@@ -629,7 +785,7 @@ def test_stories_non_utf8_manifest_clean_error_not_crash(project, capsys):
 
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 1
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 1
     err = capsys.readouterr().err
     assert "stories mode:" in err and "not valid UTF-8" in err
 
@@ -1776,6 +1932,76 @@ def test_status_stories_mode_bad_manifest_is_soft(project, capsys):
     assert "no stories.yaml found" in capsys.readouterr().out
 
 
+def test_status_sprint_prints_backlog_remaining(project, capsys):
+    """Characterization pin for the WorkSource refactor: a sprint run's `status`
+    ends with the `sprint backlog remaining: N` line, where N counts every
+    actionable (backlog / ready-for-dev) board story — including one this run
+    already touched (unlike `Engine._remaining_estimate`), and excluding done,
+    in-progress and epic keys. The whole stdout is pinned."""
+    from bmad_loop.model import Phase, StoryTask
+
+    install_bmad_config(project)
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "1-2-b": "backlog",
+            "1-3-c": "done",
+            "2-1-d": "in-progress",
+        },
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING)
+    _make_run_with_tokens(project, {"1-1-a": task}, weight=0.1, run_id="20260101-000000-sp01")
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out, err = capsys.readouterr()
+    assert out == (
+        "run 20260101-000000-sp01  started 2026-01-01T00:00:00\n"
+        "status: finished\n"
+        f"  {'1-1-a':40s} {'dev-running':17s} dev×0 review×0 - \n"
+        "sprint backlog remaining: 2\n"
+    )
+    assert err == ""
+
+
+def test_status_stories_output_is_pinned(project, capsys):
+    """Characterization pin for the WorkSource refactor: a stories run's `status`
+    prints the stories board (done count, manifest path, one row per entry with
+    live on-disk state + checkpoint badges) in place of the sprint backlog line.
+    The whole stdout is pinned."""
+    from bmad_loop.stories import STORIES_SUBDIR
+
+    install_bmad_config(project)
+    _setup_stories_fixture(
+        project,
+        [
+            _stories_entry("1", spec_checkpoint=True),
+            _stories_entry("2"),
+            _stories_entry("3", done_checkpoint=True),
+        ],
+    )
+    (project.project / STORIES_SPEC_FOLDER / STORIES_SUBDIR / "1-slug.md").write_text(
+        "---\nstatus: done\n---\n", encoding="utf-8"
+    )
+    _make_stories_run(project)
+    folder = _cli_project_root(project) / STORIES_SPEC_FOLDER
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out, err = capsys.readouterr()
+    assert out == (
+        "run 20260101-000000-st01  started now\n"
+        "status: in progress (or interrupted)\n"
+        f"stories: 1/3 done  ({folder}/stories.yaml)\n"
+        "   1. 1            done             [spec-checkpoint]  Story 1\n"
+        "   2. 2            pending           Story 2\n"
+        "   3. 3            pending          [done-checkpoint]  Story 3\n"
+    )
+    assert err == ""
+
+
 # ------------------------------------------- status: a sweep's effective options
 
 # `sweep.json` holds a sweep run's nullable launch overrides; `policy_snapshot`
@@ -1985,8 +2211,11 @@ def test_status_json_for_a_sweep_run_is_unchanged(project, capsys):
         "tokens",
         "adapters",
         "sweeps_refused",
+        "tickets",
         "tasks",
     }
+    # the tickets-mode object is additive and null outside a tickets run
+    assert document["tickets"] is None
 
 
 def test_status_story_run_prints_no_sweep_options(project, capsys):
@@ -2770,21 +2999,266 @@ def test_list_json_paused_run_carries_stage(project, capsys):
 # where a list belongs is a real defect the round-trip would hide.
 
 
-def test_status_document_library_call_matches_the_cli(project, capsys):
+@pytest.mark.parametrize("source", ["sprint-status", "tickets"])
+def test_status_document_library_call_matches_the_cli(project, capsys, source):
+    """The library builder and `status --json` agree — for a tickets run too, whose
+    `ticket`/`tickets` objects are projected from state.json alone."""
     from bmad_loop.documents import status_document
     from bmad_loop.journal import load_state
     from bmad_loop.model import Phase, StoryTask, TokenUsage
 
-    task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
-    task.tokens = TokenUsage(
-        input_tokens=100, output_tokens=50, cache_creation_tokens=10, cache_read_tokens=1000
-    )
-    run_dir = _make_run_with_tokens(project, {"1-1-login": task}, weight=0.5)
+    if source == "tickets":
+        run_dir = _make_tickets_status_run(project.project)
+    else:
+        task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+        task.tokens = TokenUsage(
+            input_tokens=100, output_tokens=50, cache_creation_tokens=10, cache_read_tokens=1000
+        )
+        run_dir = _make_run_with_tokens(project, {"1-1-login": task}, weight=0.5)
 
     from_cli = _status_json(project, capsys)
     from_library = status_document(load_state(run_dir))
 
     assert from_library == from_cli
+    assert from_cli["source"] == source
+
+
+_TICKETS_TOPOLOGY = {
+    "layout": "T1",
+    "placement": "in-checkout",
+    "versioning": "tracked",
+    "store_root": "/p/_bmad-output",
+    "store_repo": None,
+}
+
+
+def _binding(ref: str, epic_slug: str = "epic-cart", **fields):
+    from bmad_loop.model import TicketBinding
+
+    base = dict(
+        ref=ref,
+        id=ref.rpartition(".")[2],
+        epic_slug=epic_slug,
+        epic_id=ref.rpartition(".")[0],
+        title=f"Ticket {ref}",
+        plan=f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}/{epic_slug}/story-{ref}-plan.md",
+        risk="",
+        refined=False,
+        plan_checkpoint=False,
+        done_checkpoint=False,
+        hitl=False,
+    )
+    return TicketBinding(**{**base, **fields})
+
+
+def _make_tickets_status_run(project_dir, run_id="20990101-000000-0001", **state_kwargs):
+    """A tickets run on disk: 1.1 committed with its shared-store mark still owed,
+    1.2 parked with the park owed, and an epic closure recorded."""
+    from bmad_loop.model import Phase, StoryTask
+
+    done = StoryTask(story_key="1.1", epic=0, phase=Phase.DONE, ticket=_binding("1.1"))
+    done.ticket_done_pending = True
+    parked = StoryTask(
+        story_key="1.2",
+        epic=0,
+        phase=Phase.AWAITING_OPERATOR,
+        ticket=_binding("1.2", hitl=True),
+        ticket_park_pending="awaiting operator: needs a decision",
+    )
+    kwargs = dict(
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        initiative_folder=f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}",
+        ticket_epic_filter="epic-cart",
+        store_topology=dict(_TICKETS_TOPOLOGY),
+        ticket_epic_closures={"epic-cart": "accepted"},
+        ticket_epic_closure_acked=["epic-cart"],
+        tasks={"1.1": done, "1.2": parked},
+    )
+    return _make_run_with_state(project_dir, run_id, **{**kwargs, **state_kwargs})
+
+
+def test_status_json_tickets_run_is_additive(project, capsys):
+    """A tickets run's document keeps every key a sprint run's has, at schema 1,
+    and adds per-task `ticket` and run-level `tickets` objects read from state.json.
+    `epic` stays an int (0): a type change would have to bump the schema.
+    Ablation (performed): drop the `ticket` key from the task entries and this
+    FAILS; emit the binding's `epic_id` as `epic` and the int assertion FAILS."""
+    from bmad_loop.model import Phase, StoryTask
+
+    sprint_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-0000",
+        tasks={"1-1-login": StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)},
+    )
+    sprint = _status_json(project, capsys, sprint_dir.name)
+    _make_tickets_status_run(project.project)
+
+    doc = _status_json(project, capsys)
+
+    assert doc["schema_version"] == cli.STATUS_SCHEMA_VERSION == 1
+    assert set(sprint) <= set(doc) and set(sprint["tasks"][0]) <= set(doc["tasks"][0])
+    assert doc["source"] == "tickets"
+    assert doc["tickets"] == {
+        "initiative": V7_DEFAULT_INITIATIVE,
+        "initiative_folder": f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}",
+        "epic_filter": "epic-cart",
+        "store_topology": _TICKETS_TOPOLOGY,
+        "epic_closures": {"epic-cart": "accepted"},
+        "epic_closures_acked": ["epic-cart"],
+    }
+    first, second = doc["tasks"]
+    assert first["epic"] == 0 and isinstance(first["epic"], int)
+    assert first["ticket"] == {
+        "ref": "1.1",
+        "id": "1",
+        "epic_slug": "epic-cart",
+        "epic_id": "1",
+        "title": "Ticket 1.1",
+        "plan": f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}/epic-cart/story-1.1-plan.md",
+        "done_pending": True,
+        "park_pending": None,
+        "commit_pending": False,
+    }
+    assert second["ticket"]["done_pending"] is False
+    assert second["ticket"]["park_pending"] == "awaiting operator: needs a decision"
+
+
+@pytest.mark.parametrize("source", ["sprint-status", "stories"])
+def test_status_json_ticket_keys_null_outside_tickets(project, capsys, source):
+    """Outside a tickets run both keys are present and null — even when the state
+    carries leftover ticket fields — so "absent" never has to be told apart from
+    "old state.json". Ablation (performed): drop the source gate in
+    `_tickets_projection` and this FAILS on the run-level `tickets` object."""
+    from bmad_loop.model import Phase, StoryTask
+
+    _make_run_with_state(
+        project.project,
+        "20990101-000000-0002",
+        source=source,
+        initiative="leftover",
+        store_topology=dict(_TICKETS_TOPOLOGY),
+        tasks={"1-1-login": StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)},
+    )
+
+    doc = _status_json(project, capsys)
+
+    assert "tickets" in doc and doc["tickets"] is None
+    (task,) = doc["tasks"]
+    assert "ticket" in task and task["ticket"] is None
+
+
+@pytest.mark.parametrize(
+    ("stage", "key"),
+    [
+        ("ticket-hitl", "1.2"),
+        ("ticket-refine", "2.2"),
+        ("ticket-tree", ""),
+        ("plan-checkpoint", "2.1"),
+        ("epic-boundary", "epic-cart"),
+    ],
+)
+def test_status_json_paused_at_ticket_stages(project, capsys, stage, key):
+    """A tickets run paused at any of its stages reports the stage verbatim (an
+    open string, no schema bump) with the key it paused on — a ticket ref, or an
+    epic slug for the epic boundary — and its `tickets` object."""
+    _make_tickets_status_run(
+        project.project,
+        paused_stage=stage,
+        paused_reason=f"paused at {stage}",
+        paused_story_key=key,
+    )
+
+    doc = _status_json(project, capsys)
+
+    assert doc["schema_version"] == 1
+    assert (doc["status"], doc["paused_stage"], doc["paused_story_key"]) == ("paused", stage, key)
+    assert doc["paused_reason"] == f"paused at {stage}"
+    assert doc["tickets"]["initiative"] == V7_DEFAULT_INITIATIVE
+
+
+def _board_tree(monkeypatch, tree):
+    """Point `status`'s tickets board at ``tree``; returns the pins it was built with."""
+    pins: list[str | None] = []
+
+    def build(state, _project):
+        pins.append(state.initiative or None)
+        return tree
+
+    monkeypatch.setattr(cli, "_status_ticket_tree", build)
+    return pins
+
+
+def test_status_text_tickets_board_groups_by_epic(project, capsys, monkeypatch):
+    """The text board reads the tree pinned to the run's initiative and prints the
+    state counts, then one block per epic in the initiative's build order, each
+    ticket under its own epic with its plan status, flags and this run's phase —
+    whatever order `status` listed the rows in; a ticket of no listed epic comes
+    last. No real spawn. Ablation (performed): print the rows in `status` order
+    instead of grouping them and this FAILS."""
+    from bmad_loop.ticketmodel import EpicRow
+
+    def epic(slug, eid, status="in-progress"):
+        return EpicRow(
+            slug=slug, id=eid, status=status, after=(), gated_by=(), blocks=(), next_id=3
+        )
+
+    rows = (
+        ticket_row("1.1", status="built", title="Cart model"),
+        ticket_row("2.1", epic="epic-checkout", title="Checkout form", hitl=True),
+        ticket_row("1.2", status="blocked", title="Cart rules"),
+        ticket_row("3.1", epic="epic-loose", status="done", title="Loose end"),
+    )
+    tree = FakeTicketTree(
+        project.project,
+        status_view=fake_status_view(
+            rows, epics=(epic("epic-cart", "1"), epic("epic-checkout", "2"))
+        ),
+    )
+    pins = _board_tree(monkeypatch, tree)
+    _make_tickets_status_run(project.project)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert pins == [V7_DEFAULT_INITIATIVE]
+    board = out[out.index("tickets: initiative") :].splitlines()
+    assert board[1] == "tickets: this run is limited to --epic epic-cart"
+    assert board[2] == "tickets: 1 review · 1 planned · 1 in-progress · 1 done  (4 total)"
+    body = [line.split() for line in board[3:9]]
+    assert [line[0] for line in body] == [
+        "epic-cart",
+        "1.1",
+        "1.2",
+        "epic-checkout",
+        "2.1",
+        "epic-loose",
+    ]
+    assert board[3] == "  epic-cart  0/2 done  (in-progress, closure accepted)"
+    assert body[1][:3] == ["1.1", "review", "built"] and body[1][-2:] == ["[run:", "done]"]
+    assert body[2][-2:] == ["[run:", "awaiting-operator]"]
+    assert "[hitl]" in board[7] and "[run:" not in board[7]
+    assert board[8] == "  epic-loose  1/1 done  (not in the initiative table)"
+    assert "mark or store commit owed after landing: 1.1 (done), 1.2 (blocked)" in out
+
+
+def test_status_text_tickets_board_reports_wrapper_fault(project, capsys, monkeypatch):
+    """A tree the board cannot read is printed as such — the wrapper's kind and
+    message — never dropped, and `status` still exits 0 with the rest of its
+    report. Ablation (performed): swallow `TicketsError` without printing and
+    this FAILS."""
+    from bmad_loop.tickettree import TicketsCrashed
+
+    tree = FakeTicketTree(project.project)
+    tree.faults["status"] = TicketsCrashed("exit 3: boom")
+    _board_tree(monkeypatch, tree)
+    _make_tickets_status_run(project.project)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "tickets board unavailable: tickets.py crashed: exit 3: boom\n" in out
+    assert "mark or store commit owed after landing" in out
 
 
 def test_list_document_library_call_matches_the_cli(project, capsys):
@@ -4775,6 +5249,43 @@ def test_resolve_adopt_branch_refusals_leave_state_untouched(
     assert _state_bytes(run_dir) == before
 
 
+@pytest.mark.parametrize("flag", ["--adopt-branch", "--reverify"])
+def test_resolve_early_dispatch_refuses_a_changed_ticket_store_first(
+    tmp_path, monkeypatch, capsys, flag
+):
+    """A tickets run's `--adopt-branch` / `--reverify` each persist a transition
+    before the resume that refuses a changed ticket store, so the store is judged
+    ahead of both: rc 1 with the store's refusal, the state untouched. Ablation
+    (performed): drop the early `_reject_store_topology` gate in `cmd_resolve` and
+    both rows FAIL (adopt persists COMMITTING; reverify refuses for another reason)."""
+    from bmad_loop import ticketstore
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _adoptable_run(tmp_path)
+    state = load_state(run_dir)
+    state.source = "tickets"
+    state.store_topology = {"layout": "T3", "store_root": str(tmp_path / "store")}
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+    seen: list[object] = []
+
+    def conflict(_project, source, _isolation, *, recorded=None):
+        seen.append(recorded)
+        return "the ticket store changed since this run started" if source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("a refusal must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", flag, "--resume"])
+
+    assert rc == 1
+    assert "the ticket store changed since this run started" in capsys.readouterr().err
+    assert seen and seen[0] == state.store_topology
+    assert _state_bytes(run_dir) == before
+
+
 def test_resolve_adopt_branch_refuses_a_task_with_no_recorded_worktree(tmp_path, capsys):
     from bmad_loop.journal import load_state, save_state
 
@@ -5095,6 +5606,48 @@ def test_resolve_refuses_an_untrusted_plugin_before_it_rearms(project, monkeypat
     else:
         assert rc == 0
         assert phase != Phase.ESCALATED
+
+
+@pytest.mark.parametrize("source", ["tickets", "sprint-status"])
+@pytest.mark.parametrize("mode", ["interactive", "--no-interactive"])
+def test_resolve_judges_a_sweeps_store_under_the_configured_source(
+    project, monkeypatch, capsys, mode, source
+):
+    """A sweep persists no source (its `RunState.source` is the launch default), so
+    the re-arm's store refusals — before the interactive session and after the
+    confirm — judge `[stories] source`, as the resume they precede does: a
+    tickets-source sweep with a refused store is refused before anything is spent,
+    a sprint-status one is not judged as tickets. Ablation (performed): pass
+    `state.source` at either site and its tickets row FAILS (the action runs)."""
+    from bmad_loop import resolve, ticketstore
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    install_bmad_config(project)
+    run_dir = _escalated_run(project.project, "r1", run_type="sweep")
+    _write_policy(project.project, f'[stories]\nsource = "{source}"\n')
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: pytest.fail("conversed"))
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--resume"]
+    if mode == "--no-interactive":
+        argv.append(mode)
+    if source == "tickets":
+        assert cli.main(argv) == 1
+        assert "error: the ticket store is not supported" in capsys.readouterr().err
+        assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+    elif mode == "interactive":
+        with pytest.raises(pytest.fail.Exception, match="built adapters"):
+            cli.main(argv)  # past both store gates, into the session
+    else:
+        assert cli.main(argv) == 0
+        assert load_state(run_dir).tasks["s1"].phase != Phase.ESCALATED
 
 
 @pytest.mark.parametrize("mode", ["interactive", "--adopt-branch", "--reverify"])
@@ -7429,6 +7982,7 @@ def test_cleanup_json_dry_run_plans_without_pruning(tmp_path, monkeypatch, capsy
         "legacy_leftovers": [],
         "legacy_kill_commands": {},
         "legacy_unverified": [],
+        "superseded_ctl_sessions": [],
         "superseded_ctl_unverified": [],
     }
     assert doc["ctl_windows"] == {
@@ -7489,6 +8043,7 @@ def test_cleanup_json_nothing_to_clean_up_is_a_valid_empty_document(tmp_path, mo
         "legacy_leftovers": [],
         "legacy_kill_commands": {},
         "legacy_unverified": [],
+        "superseded_ctl_sessions": [],
         "superseded_ctl_unverified": [],
     }
     assert doc["ctl_windows"] == {
@@ -8247,6 +8802,33 @@ def test_resume_restamps_policy_snapshot_for_sweep_runs(project, monkeypatch):
     assert load_state(run_dir).cache_read_weight() == 0.5
 
 
+@pytest.mark.parametrize("source", ["tickets", "sprint-status"])
+def test_sweep_resume_judges_the_store_of_the_configured_source(
+    project, monkeypatch, capsys, source
+):
+    """A sweep persists no source (its `RunState.source` is the launch default),
+    so resume judges the store under `[stories] source`, as `cmd_sweep` does: a
+    tickets-source sweep is refused by its store, a sprint-status one is not judged
+    as tickets. Ablation (performed): pass `state.source` to the gate and the
+    tickets row FAILS (the stub engine runs)."""
+    from bmad_loop import ticketstore
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    _write_policy(project.project, RESUME_POLICY + f'\n[stories]\nsource = "{source}"\n')
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(cli, "SweepEngine", _StubEngine)
+
+    rc = cli._resume_paused_run(project.project, run_dir)
+    assert rc == (1 if source == "tickets" else 0)
+    err = capsys.readouterr().err
+    assert ("error: the ticket store is not supported" in err) == (source == "tickets")
+    assert (_resume_entries(run_dir) == []) == (source == "tickets")
+
+
 @pytest.mark.parametrize("how", ["deleted", "partial"])
 def test_sweep_resume_refuses_a_broken_sweep_skill_before_any_write(
     project, monkeypatch, capsys, how
@@ -8275,6 +8857,34 @@ def test_sweep_resume_refuses_a_broken_sweep_skill_before_any_write(
     assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
 
 
+def test_sweep_resume_refuses_an_initiative_change_before_any_write(project, monkeypatch, capsys):
+    """A v7 sweep resumed under another active initiative is refused with the
+    pin's fix text before the journal row, the pin re-stamp and the engine arm.
+    `compose_resume` raises the same text, but only after those side effects; the
+    gate here is what keeps them from happening. The judgment itself is pinned
+    in tests/test_runsetup.py; here it is stubbed to a refusal.
+
+    ABLATION (performed): delete the `sweep_initiative_conflict` gate in
+    `_prepare_resume_locked` and the resume journals `run-resume` and re-stamps
+    the pin before `compose_resume` refuses."""
+    import contextlib
+
+    from bmad_loop import runs, runsetup
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
+    runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
+    monkeypatch.setattr(
+        runsetup, "sweep_initiative_conflict", lambda state, paths: "initiative switched"
+    )
+    monkeypatch.setattr(cli, "SweepEngine", _StubEngine)
+
+    with contextlib.suppress(runsetup.SweepPinError):
+        assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert f"cannot resume {run_dir.name}: initiative switched" in capsys.readouterr().err
+    assert _resume_entries(run_dir) == []
+    assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
+
+
 def test_story_resume_is_not_gated_on_the_sweep_skill(project, monkeypatch):
     """A story run never dispatches `/bmad-loop-sweep`, so its resume ignores the
     skill. Ablation: drop the `run_type` guard on the resume gate and this reddens."""
@@ -8284,6 +8894,35 @@ def test_story_resume_is_not_gated_on_the_sweep_skill(project, monkeypatch):
     monkeypatch.setattr(cli, "Engine", _StubEngine)
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
+
+
+@pytest.mark.parametrize("source", ["tickets", "sprint-status"])
+def test_tickets_resume_runs_the_tickets_preflight_and_skill_probe(project, monkeypatch, source):
+    """A resumed tickets run re-reads the tree it dispatches from, so resume
+    applies `run`'s tickets refusals — the tree preflight and the skill's
+    ticket-route probe — ahead of every side effect; other sources get neither.
+    Ablation (performed): drop either the `_check_tickets_preflight` call or
+    `require_tickets=` in `_prepare_resume_locked` and the tickets row FAILS."""
+    run_dir = _paused_run_for_resume(project, monkeypatch, source=source)
+    preflights: list[str] = []
+    skill_kwargs: list[dict] = []
+
+    def preflight(paths, pol):
+        preflights.append(str(paths.project))
+        return None
+
+    def skills(*a, **kw):
+        skill_kwargs.append(kw)
+        return False
+
+    monkeypatch.setattr(cli, "_check_tickets_preflight", preflight)
+    monkeypatch.setattr(cli, "_require_base_skills", skills)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    tickets = source == "tickets"
+    assert preflights == ([str(project.project)] if tickets else [])
+    assert [kw["require_tickets"] for kw in skill_kwargs] == [tickets]
+    assert _resume_entries(run_dir) == []
 
 
 # ------------------------------------------- resume re-stamps the code root
@@ -9554,6 +10193,92 @@ def test_resolve_sweep_run_proceeds_on_a_readable_ledger(project, monkeypatch, c
     assert cli.main(argv) == 0
     assert rearms == ["s1"]
     assert "`bmad-loop sweep`" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        [],
+        ["--no-interactive", "--resume"],
+        ["--no-interactive", "--no-resume"],
+        ["--adopt-branch"],
+        ["--reverify"],
+    ],
+    ids=["interactive", "resume", "no-resume", "adopt", "reverify"],
+)
+def test_resolve_refuses_a_sweep_on_a_switched_initiative_before_any_write(
+    project, monkeypatch, capsys, flags
+):
+    """A v7 sweep resolved under another active initiative is refused with the
+    pin's fix text ahead of every dispatch: the interactive session, the re-arm
+    (`--no-resume` included) and the reverify/adopt transitions all precede the
+    resume's own refusal. The judgment itself is pinned in
+    tests/test_runsetup.py; here it is stubbed to a refusal.
+
+    ABLATION (performed): delete the entry gate in `cmd_resolve` and the
+    interactive, adopt and reverify rows reach their side-effect recorders (the
+    non-interactive re-arm rows fall to the post-confirm check instead)."""
+    from bmad_loop import resolve as resolve_mod
+    from bmad_loop import runsetup
+    from bmad_loop.journal import load_state
+
+    run_dir, rearms = _resolve_gate_run(
+        project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER
+    )
+    before = load_state(run_dir)
+    monkeypatch.setattr(
+        runsetup, "sweep_initiative_conflict", lambda state, paths: "initiative switched"
+    )
+    effects: list = []
+    monkeypatch.setattr(
+        cli, "_make_adapters", lambda *a, **k: effects.append("adapters") or {"dev": object()}
+    )
+    monkeypatch.setattr(resolve_mod, "build_context", lambda *a, **k: (None, [], []))
+    monkeypatch.setattr(resolve_mod, "run_session", lambda *a, **k: effects.append("session"))
+    monkeypatch.setattr(cli, "_resolve_adopt", lambda *a, **k: effects.append("adopt") or 0)
+    monkeypatch.setattr(cli, "_resolve_reverify", lambda *a, **k: effects.append("reverify") or 0)
+
+    rc = cli.main(["resolve", "--project", str(project.project), "r1", *flags])
+
+    assert rc == 1
+    assert "cannot resolve r1: initiative switched" in capsys.readouterr().err
+    assert effects == []
+    assert rearms == []
+    _assert_escalation_intact(run_dir, before)
+
+
+def test_resolve_rejudges_a_sweeps_initiative_after_the_session(project, monkeypatch, capsys):
+    """The active initiative can change while the interactive resolve session is
+    open, and the re-arm precedes the resume that would refuse it: the pin is
+    judged again after the confirm, with the config the re-arm reads.
+
+    ABLATION (performed): delete the post-confirm `sweep_initiative_conflict`
+    check in `cmd_resolve` and the escalation is re-armed."""
+    from bmad_loop import resolve as resolve_mod
+    from bmad_loop import runsetup
+    from bmad_loop.journal import load_state
+
+    run_dir, rearms = _resolve_gate_run(
+        project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER
+    )
+    before = load_state(run_dir)
+    sessions: list = []
+
+    def judge(state, paths):
+        return "initiative switched" if sessions else None
+
+    monkeypatch.setattr(runsetup, "sweep_initiative_conflict", judge)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": object()})
+    monkeypatch.setattr(resolve_mod, "build_context", lambda *a, **k: (None, [], []))
+    monkeypatch.setattr(resolve_mod, "run_session", lambda *a, **k: sessions.append(1) or True)
+
+    rc = cli.main(["resolve", "--project", str(project.project), "r1", "--resume"])
+
+    assert rc == 1
+    assert sessions == [1]
+    assert "cannot resolve r1: initiative switched" in capsys.readouterr().err
+    assert rearms == []
+    _assert_escalation_intact(run_dir, before)
 
 
 def test_resolve_live_refusal_wins_over_the_ledger_gate(project, monkeypatch, capsys):
@@ -12431,6 +13156,986 @@ def test_validate_passes_bmad_config_on_a_toml_only_project(project, capsys, mon
     assert doc["ok"] is True
 
 
+def _validate_v7_findings(project, capsys, *, policy=CLAUDE_ONLY_POLICY) -> dict[str, dict]:
+    """`validate --json` findings keyed by check id (first of each), on the `project`
+    sandbox after the test laid down its BMAD v7 install. rc 1: the sprint queue gate
+    has no board on a v7 config (and nothing else is set up to pass)."""
+    _write_policy(project.project, policy)
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    findings: dict[str, dict] = {}
+    for f in doc["findings"]:
+        findings.setdefault(f["check"], f)
+    return findings
+
+
+def test_validate_v7_config_is_ok_without_v6_keys(project, capsys):
+    """A fresh v7 install (no `[modules.bmm]` artifact keys) passes `bmad-config`,
+    naming the era and the initiative, with no v7 warning."""
+    install_bmad_v7(project.project)
+    by_check = _validate_v7_findings(project, capsys)
+    finding = by_check["bmad-config"]
+    assert finding["severity"] == "ok"
+    assert "BMAD v7" in finding["message"] and "initiative-demo" in finding["message"]
+    assert finding["detail"]["era"] == "v7"
+    assert finding["detail"]["initiative"] == "initiative-demo"
+    expected = project.project.resolve() / "_bmad-output" / "initiative-demo"
+    assert finding["detail"]["implementation_artifacts"] == str(expected)
+    assert "bmad-config.initiative-unset" not in by_check
+    assert "bmad-config.v6-keys-ignored" not in by_check
+
+
+def test_validate_warns_v7_initiative_unset(project, capsys):
+    """No active initiative is visible, not folded into a healthy-looking ok: the
+    artifact home fell back to `output_folder`. Ablation: drop the warn and this
+    FAILS."""
+    install_bmad_v7(project.project)
+    (project.project / "_bmad" / "custom" / "config.user.toml").write_text(
+        "# no initiative\n", encoding="utf-8"
+    )
+    by_check = _validate_v7_findings(project, capsys)
+    assert by_check["bmad-config"]["severity"] == "ok"
+    assert by_check["bmad-config"]["detail"]["initiative"] == ""
+    finding = by_check["bmad-config.initiative-unset"]
+    assert finding["severity"] == "warning"
+    assert "active_initiative" in finding["message"]
+
+
+def test_validate_warns_v6_keys_ignored_on_a_mixed_install(project, capsys):
+    """Decision 8: a mixed install resolved as v7 for tickets mode (the policy's
+    source, nothing pinned) names each leftover v6 key. Ablation: drop the warn and
+    this FAILS; load the config without `want_tickets` and it resolves as v6."""
+    install_bmad_v7(project.project)
+    (project.project / "_bmad" / "custom" / "config.toml").write_text(
+        "[modules.bmm]\n"
+        'planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"\n'
+        'implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n',
+        encoding="utf-8",
+    )
+    by_check = _validate_v7_findings(project, capsys, policy=TICKETS_POLICY)
+    assert by_check["bmad-config"]["detail"]["era"] == "v7"
+    finding = by_check["bmad-config.v6-keys-ignored"]
+    assert finding["severity"] == "warning"
+    assert len(finding["detail"]["keys"]) == 2
+    assert "modules.bmm.implementation_artifacts" in finding["message"]
+
+
+TICKETS_POLICY = CLAUDE_ONLY_POLICY + '[stories]\nsource = "tickets"\n'
+
+
+def _make_tickets_validate_pass(project, monkeypatch, capsys):
+    """`_make_validate_pass` for tickets mode: a BMAD v7 install with the default
+    ticket tree, the v7 build-auto, and `[stories] source = "tickets"`."""
+
+    def v7_config(sandbox):
+        write_ticket_tree(install_bmad_v7(sandbox.project), DEFAULT_TREE)
+
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=TICKETS_POLICY,
+        skills=install_build_auto_v7_skill,
+        bmad_config=v7_config,
+    )
+
+
+def test_validate_json_tickets_mode_document(project, capsys, monkeypatch):
+    """A tickets project bmad-loop can drive validates ok: `mode` is `tickets`, the
+    document names the active initiative and the v7 era, and the tickets checks ran
+    (the script's capability probe only as a not-run note — plain validate executes
+    no project script). Ablation: route tickets to the sprint queue validator and
+    the tickets findings vanish (and the missing board fails it)."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    assert doc["ok"] is True
+    assert (doc["mode"], doc["initiative"], doc["era"]) == ("tickets", V7_DEFAULT_INITIATIVE, "v7")
+    assert doc["spec_folder"] == ""
+    by_check = {f["check"]: f for f in doc["findings"]}
+    assert by_check["tickets.era"]["severity"] == "ok"
+    assert by_check["tickets.capability-not-run"]["detail"] == {"run": False}
+    assert by_check["skills.tickets-dispatch"]["severity"] == "ok"
+    assert "queue.sprint-status" not in by_check
+    assert not any(f["check"].startswith("deferred.") for f in doc["findings"])
+    # the classified store, additively: the tracked in-checkout default (T1)
+    assert by_check["tickets.store-topology"]["severity"] == "ok"
+    assert doc["ticket_store"]["layout"] == "T1"
+    assert doc["ticket_store"] == by_check["tickets.store-topology"]["detail"]["topology"]
+
+
+def test_validate_probes_runs_the_tickets_capability_probe(project, capsys, monkeypatch):
+    """`--probes` is the opt-in that executes project-controlled commands, so it is
+    what runs the script's capability probe (stubbed here: the real probe's contract
+    is tests/test_install.py's)."""
+    from bmad_loop import ticketmodel, tickettree
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    calls: list[str] = []
+
+    def capability(self):
+        calls.append("probed")
+        return ticketmodel.Capability(
+            verbs=frozenset(ticketmodel.REQUIRED_VERBS),
+            statuses=frozenset(ticketmodel.REQUIRED_STATUSES),
+        )
+
+    monkeypatch.setattr(tickettree.TicketTree, "capability", capability)
+    doc = machine_json(
+        ["validate", "--project", str(project.project), "--probes", "--json"], capsys
+    )
+    assert calls == ["probed"]
+    by_check = {f["check"]: f for f in doc["findings"]}
+    assert by_check["tickets.capability"]["severity"] == "ok"
+    assert "tickets.capability-not-run" not in by_check
+
+
+def test_validate_json_sprint_mode_initiative_is_empty_string(project, capsys, monkeypatch):
+    """`initiative` is a tickets-mode field: a sprint-mode validate reports "" even on
+    a v7 project whose config names an active initiative (as `spec_folder` is ""
+    outside stories mode), while `era` still says which config shape resolved."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert (doc["mode"], doc["initiative"], doc["era"]) == ("sprint", "", "v6")
+
+    install_bmad_v7(project.project)
+    (project.project / "_bmad" / "bmm" / "config.yaml").unlink()  # v7 only: no v6 keys
+    by_check = _validate_v7_findings(project, capsys)
+    assert by_check["bmad-config"]["detail"]["initiative"] == V7_DEFAULT_INITIATIVE
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    assert (doc["mode"], doc["initiative"], doc["era"]) == ("sprint", "", "v7")
+
+
+def _validate_ticket_gates(project, monkeypatch, capsys, gate_line, *, rc, rows=None):
+    """Validate a tickets project whose initiative ledger holds one open entry,
+    DW-1, carrying ``gate_line``, against a FakeTicketTree whose `next` lists
+    ``rows`` as ready to start; returns the parsed findings."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    if rows is None:
+        rows = (ticket_row("1.1"), ticket_row("2.1", epic="epic-checkout"))
+    tree = FakeTicketTree(project.project, next_view=fake_next_view(ready_to_start=rows))
+    _fake_dry_run_tree(monkeypatch, tree)
+    paths = bmadconfig.load_paths(project.project, want_tickets=True)
+    # committed, so `git.worktree-clean` stays green and the exit code is the gate's
+    write_gated_ledger(paths, {"DW-1": ("open", [gate_line])})
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=rc)
+    return doc["findings"]
+
+
+def _gate_findings(findings, check="deferred.hard-gate"):
+    return [f for f in findings if f["check"] == check]
+
+
+@pytest.mark.parametrize(
+    ("gate_line", "gated"),
+    [
+        ("gate: 1.1", ["1.1"]),  # the ticket by ref
+        ("gate: epic-checkout", ["2.1"]),  # an epic by its folder
+        ("gate: 1", ["1.1"]),  # an epic by its initiative id
+        ("gate: 1.2", []),  # a ref no startable ticket carries
+    ],
+)
+def test_validate_hard_gate_ticket_mode(project, capsys, monkeypatch, gate_line, gated):
+    """In tickets mode `validate` reads the initiative's ledger and matches `gate:`
+    tokens as ticket refs against `next`'s startable tickets: a gated ticket fails
+    `deferred.hard-gate` with its ref in `story_key`, an ungated queue reports the
+    `ok`, and no ref token reads as malformed. Ablation (performed): read the
+    ledger under the story grammar and the refs land in `malformed`, so every
+    gated row FAILS."""
+    findings = _validate_ticket_gates(project, monkeypatch, capsys, gate_line, rc=1 if gated else 0)
+
+    hard = _gate_findings(findings)
+    failed = [f["detail"]["story_key"] for f in hard if f["severity"] == "problem"]
+    assert failed == gated
+    if not gated:
+        assert [f["severity"] for f in hard] == ["ok"]
+        assert hard[0]["detail"]["actionable"] == ["1.1", "2.1"]
+        assert "no actionable ticket is gated" in hard[0]["message"]
+    assert _gate_findings(findings, "deferred.hard-gate-unstructured") == []
+
+
+def test_validate_hard_gate_ticket_mode_fails_a_v6_token(project, capsys, monkeypatch):
+    """A migrated ledger's v6 `gate: 3-2` names no ticket, and the run pauses
+    before every ticket while it stands, so `validate` fails it as a hard gate
+    (naming the `v6_key` the migration left) rather than warning it as
+    unstructured: preflight and dispatch agree. Ablation (performed): drop the
+    `legacy` arm in `_validate_hard_gates` and the problem vanishes — this
+    FAILS."""
+    findings = _validate_ticket_gates(project, monkeypatch, capsys, "gate: 3-2", rc=1)
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "problem"
+    assert hard["detail"] == {
+        "dw_id": "DW-1",
+        "title": "item DW-1",
+        "story_key": "1.1",
+        "tokens": ["3-2"],
+    }
+    assert "`v6_key`" in hard["message"]
+    assert _gate_findings(findings, "deferred.hard-gate-unstructured") == []
+
+
+def test_validate_hard_gate_ticket_mode_warns_an_unmatchable_token(project, capsys, monkeypatch):
+    """A token neither grammar reads (`1.2.3`) is the field's silent no-op, warned
+    `deferred.hard-gate-unstructured` in ticket wording."""
+    findings = _validate_ticket_gates(project, monkeypatch, capsys, "gate: 1.2.3", rc=0)
+
+    (warn,) = _gate_findings(findings, "deferred.hard-gate-unstructured")
+    assert warn["detail"]["malformed"] == ["1.2.3"]
+    assert "cannot name a ticket ref (`E.M`): 1.2.3" in warn["message"]
+    assert "name the blocked ticket refs" in warn["message"]
+
+
+def test_validate_hard_gate_ticket_mode_landed_gates_read_no_queue(project, capsys, monkeypatch):
+    """Plain `validate` executes no project code, and the one exception — running
+    `tickets.py next` to compare a gate — applies only while an unlanded entry
+    declares one. A ledger whose gates have all landed still reports its `ok`,
+    without the spawn. Ablation (performed): drop the tickets-mode unlanded guard
+    in `_validate_hard_gates` and `next` is called — this FAILS."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    tree = FakeTicketTree(
+        project.project, next_view=fake_next_view(ready_to_start=(ticket_row("1.1"),))
+    )
+    _fake_dry_run_tree(monkeypatch, tree)
+    paths = bmadconfig.load_paths(project.project, want_tickets=True)
+    write_gated_ledger(paths, {"DW-1": ("done 2026-10-02", ["gate: 1.1", "gate: 3-2"])})
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+
+    (hard,) = _gate_findings(doc["findings"])
+    assert hard["severity"] == "ok" and hard["detail"] == {"gating_ids": []}
+    assert [c for c in tree.calls if c[0] == "next"] == []
+
+
+def test_validate_hard_gate_ticket_mode_reports_an_unreadable_tree(project, capsys, monkeypatch):
+    """No `queue.*` check runs `tickets.py next` in plain validate, so a gated
+    ledger whose tree cannot be read fails `deferred.hard-gate` with the fault
+    instead of saying nothing about gates it never compared."""
+    from bmad_loop import tickettree
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    tree = FakeTicketTree(project.project)
+    tree.faults["next"] = tickettree.TicketsTimeout("slow")
+    _fake_dry_run_tree(monkeypatch, tree)
+    paths = bmadconfig.load_paths(project.project, want_tickets=True)
+    write_gated_ledger(paths, {"DW-1": ("open", ["gate: 1.1"])}, commit=False)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+
+    (hard,) = _gate_findings(doc["findings"])
+    assert hard["severity"] == "problem"
+    assert hard["detail"]["kind"] == "timeout"
+
+
+# Tickets dry-run. Real-spawn budget: 4 vendored `tickets.py` spawns (two tests
+# x `next` + `status`); every other tickets dry-run test injects a FakeTicketTree.
+
+
+def _fake_dry_run_tree(monkeypatch, tree):
+    """Point the dry-run's `TicketTree(project)` at ``tree``."""
+    from bmad_loop import tickettree
+
+    monkeypatch.setattr(tickettree, "TicketTree", lambda *_a, **_k: tree)
+
+
+def test_dry_run_tickets_prints_dispatch_and_predicted_pause(project, capsys, monkeypatch):
+    """The dry-run lists the startable tickets in build order — the `status` order,
+    not `next`'s — each with its badges and the `/bmad-build-auto ticket <ref>`
+    dispatch, then the pause a fresh run would reach first (here: before the hitl
+    ticket that leads the build order) and the group counts. Ablation (performed):
+    drop the build-order sort and the order assertion FAILS; predict from the
+    second ticket instead of `decide_pick` and the predicted line FAILS."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    first = ticket_row("1.1", hitl=True, done_checkpoint=True, title="Cart model")
+    second = ticket_row("1.2", title="Cart rules")
+    folder = project.project / "_bmad-output" / V7_DEFAULT_INITIATIVE / "epic-cart"
+    tree = FakeTicketTree(
+        project.project,
+        next_view=fake_next_view(ready_to_start=(second, first)),
+        status_view=fake_status_view((first, second)),
+        finds={r.ref: fake_find(r, folder) for r in (first, second)},
+    )
+    _fake_dry_run_tree(monkeypatch, tree)
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run"])
+
+    out, _ = capsys.readouterr()
+    assert rc == 0
+    assert out.index("1. 1.1  (no plan) [hitl, done-checkpoint]  Cart model") < out.index(
+        "2. 1.2  (no plan)  Cart rules"
+    )
+    assert '"/bmad-build-auto ticket 1.1"' in out
+    assert '"/bmad-build-auto ticket 1.2"' in out
+    assert "env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1.2\n" in out
+    assert "Halt after planning." not in out
+    assert "predicted: run would pause before 1.1 (ticket-hitl): 1.1 is a hitl ticket\n" in out
+    assert "groups: ready_to_refine=0 ready_to_start=2 in_progress=0 blocked=0 backlog=0\n" in out
+    assert tree.marks == [] and [c[0] for c in tree.calls] == ["next", "status"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "predicted"),
+    [
+        ([], "run would pause after 1.1 (story-checkpoint): done checkpoint"),
+        (["--max-stories", "1"], "no pause predicted before 1.1 finishes"),
+        (["--max-stories", "2"], "run would pause after 1.1 (story-checkpoint): done checkpoint"),
+        (["--max-stories", "0"], "run would stop: --max-stories 0 dispatches no ticket"),
+        (["--max-stories", "-1"], "run would stop: --max-stories -1 dispatches no ticket"),
+    ],
+)
+def test_dry_run_tickets_done_checkpoint_honors_max_stories(
+    project, capsys, monkeypatch, argv, predicted
+):
+    """A first ticket with `done_checkpoint` predicts its story-checkpoint pause,
+    except under `--max-stories 1`: the run's skip-if-last drops that pause once
+    the cap is spent, so the preview must not advertise it. A cap of 0 or less
+    stops the run before its first pick, so it predicts no ticket. Ablation
+    (performed): ignore the cap in `_predicted_pause` and the `1`, `0` and `-1`
+    rows FAIL."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    first = ticket_row("1.1", done_checkpoint=True, title="Cart model")
+    second = ticket_row("1.2", title="Cart rules")
+    folder = project.project / "_bmad-output" / V7_DEFAULT_INITIATIVE / "epic-cart"
+    tree = FakeTicketTree(
+        project.project,
+        next_view=fake_next_view(ready_to_start=(first, second)),
+        status_view=fake_status_view((first, second)),
+        finds={r.ref: fake_find(r, folder) for r in (first, second)},
+    )
+    _fake_dry_run_tree(monkeypatch, tree)
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run", *argv])
+
+    out, _ = capsys.readouterr()
+    assert rc == 0
+    assert f"predicted: {predicted}\n" in out
+
+
+def test_dry_run_tickets_unrefined_plan_checkpoint_adds_halt_marker(project, capsys, monkeypatch):
+    """On the default tree (real `tickets.py`, 2 spawns) the only startable ticket,
+    1.1, is an unrefined `plan_checkpoint`: its dispatch is leg 1 —
+    `ticket 1.1 Halt after planning.` with `BMAD_LOOP_PLAN_HALT=1` — and the run
+    would pause after planning it. Ablation (performed): drop the dry-run's
+    `Halt after planning.` branch and this test FAILS."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run"])
+
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert "1. 1.1  (no plan) [plan-checkpoint, done-checkpoint]  Cart model" in out
+    assert '"/bmad-build-auto ticket 1.1 Halt after planning."' in out
+    assert "env:    BMAD_LOOP_MODE=1 BMAD_LOOP_STORY_KEY=1.1 BMAD_LOOP_PLAN_HALT=1\n" in out
+    assert "predicted: run would pause after planning 1.1 (plan-checkpoint)" in out
+    assert "ready_to_start=1" in out and "blocked=3" in out
+
+
+def test_dry_run_tickets_never_writes(project, capsys, monkeypatch):
+    """A dry-run reads the tree and writes nothing: every byte of the sandbox is
+    unchanged, no run directory appears, and no write verb of the tree is ever
+    reached (real `tickets.py`, 2 spawns). Ablation (performed): mark the first
+    ticket `built` from the dry-run and this test FAILS on the write guard."""
+    from bmad_loop import tickettree
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+
+    def refuse(*_a, **_k):
+        raise AssertionError("dry-run reached a tree write")
+
+    for verb in ("mark", "discard_unbuilt_plan", "restore_preimage"):
+        monkeypatch.setattr(tickettree.TicketTree, verb, refuse)
+
+    def snapshot():
+        return {
+            p.relative_to(project.project).as_posix(): p.read_bytes()
+            for p in sorted(project.project.rglob("*"))
+            if p.is_file() and ".git" not in p.relative_to(project.project).parts
+        }
+
+    before = snapshot()
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run"])
+
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert "ticket 1.1" in out
+    assert snapshot() == before
+    runs_dir = project.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+def test_run_tickets_launches_tickets_engine(project, capsys, monkeypatch):
+    """A tickets project that validates runs: the tickets preflight passes (its
+    capability probe executes the vendored script — 2 real spawns), and `run`
+    builds `cli.TicketsEngine` on a state pinned to the active initiative.
+    Ablation (performed): drop `tickets_engine_cls=TicketsEngine` from
+    `cmd_run`'s `compose_run` call and the real engine is built instead of the
+    stub — this FAILS."""
+    from bmad_loop.journal import load_state
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    built: list[dict] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    run_id = "20990101-000000-cafe"
+
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+
+    assert len(built) == 1
+    state = load_state(project.project / ".bmad-loop" / "runs" / run_id)
+    assert (state.source, state.initiative) == ("tickets", V7_DEFAULT_INITIATIVE)
+    # the store topology recorded at run start, for resume to re-validate
+    assert state.store_topology["layout"] == "T1"
+    assert built[0]["state"].store_topology == state.store_topology
+    assert "stub summary" in capsys.readouterr().out
+
+
+def test_epic_selector_keeps_ints_and_passes_text():
+    """`--epic`'s argparse type returns what `int()` reads (sprint mode unchanged,
+    signs and padding included) and the text otherwise."""
+    assert [cli._epic_selector(t) for t in ("3", "03", "-1", "cart", "epic-cart")] == [
+        3,
+        3,
+        -1,
+        "cart",
+        "epic-cart",
+    ]
+
+
+@pytest.mark.parametrize("stories", [False, True], ids=["sprint", "stories"])
+def test_run_epic_non_integer_sprint_mode_is_usage_error(project, capsys, stories):
+    """Outside tickets mode a non-integer `--epic` is still a usage error (exit 2,
+    as argparse's `type=int` gave), refused before any run directory exists.
+    Ablation (performed): drop the `isinstance(args.epic, str)` refusal and the
+    run goes on to fail elsewhere with exit 1 — this FAILS."""
+    argv = ["run", "--project", str(project.project), "--epic", "cart", "--dry-run"]
+    if stories:
+        argv += ["--spec", "specs/demo"]
+
+    assert cli.main(argv) == cli.ExitCode.USAGE
+
+    err = capsys.readouterr().err
+    assert "argument --epic: invalid int value: 'cart'" in err
+    assert not (project.project / runs.RUNS_DIR).exists()
+
+
+def _selector_tree(epics=("epic-cart", "epic-checkout")):
+    """A fake tree for the selector resolver: two epics (ids 1, 2); 1.1 ready to
+    start, 1.2 in progress, 2.1 ready to refine, a backlog row without a ref."""
+    from dataclasses import replace
+
+    from bmad_loop.ticketmodel import EpicRow
+
+    start = ticket_row("1.1")
+    active = ticket_row("1.2", status="in-progress")
+    refine = ticket_row("2.1", epic="epic-checkout", refine=True)
+    backlog = replace(ticket_row("x", epic="backlog", file="story-x.md"), ref=None)
+    folder = Path("/p/_bmad-output") / V7_DEFAULT_INITIATIVE
+    tree = FakeTicketTree(
+        next_view=fake_next_view(
+            ready_to_start=(start,), ready_to_refine=(refine,), in_progress=(active,)
+        ),
+        status_view=fake_status_view(
+            (start, active, refine),
+            epics=tuple(
+                EpicRow(
+                    slug=slug,
+                    id=str(i),
+                    status="in-progress",
+                    after=(),
+                    gated_by=(),
+                    blocks=(),
+                    next_id=3,
+                )
+                for i, slug in enumerate(epics, 1)
+            ),
+        ),
+        finds={
+            **{r.ref: fake_find(r, folder / r.epic) for r in (start, active, refine)},
+            "story-x": fake_find(backlog, folder),
+        },
+    )
+    return tree
+
+
+@pytest.mark.parametrize(
+    ("epic", "story", "want"),
+    [
+        (2, None, ("epic-checkout", "")),
+        ("02", None, ("epic-checkout", "")),
+        ("checkout", None, ("epic-checkout", "")),
+        ("epic-checkout", None, ("epic-checkout", "")),
+        (None, "1.1", ("", "1.1")),
+        (None, "2.1", ("", "2.1")),
+        ("cart", "1.1", ("epic-cart", "1.1")),
+    ],
+)
+def test_resolve_ticket_scope_accepts(epic, story, want, capsys):
+    """`--epic` resolves an epic id, slug or `epic-<slug>` to the slug; `--story`
+    resolves a ticket ref through `find` to a startable ticket's ref (ready to
+    start or to refine). No real spawn."""
+    args = argparse.Namespace(epic=epic, story=story)
+
+    scope = cli._resolve_ticket_scope(_selector_tree(), args)
+
+    assert (scope.epic, scope.ref) == want, capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("epic", "story", "said"),
+    [
+        ("shipping", None, "--epic 'shipping' names no epic of the initiative"),
+        (None, "9.9", "tickets.py no-match: no ticket matches '9.9'"),
+        (None, "1.2", "names 1.2, which is not startable (state in-progress"),
+        (None, "story-x", "which has no ref: a tickets run never dispatches a backlog"),
+        ("checkout", "1.1", "names 1.1, which is not in epic-checkout"),
+    ],
+)
+def test_resolve_ticket_scope_refuses(epic, story, said, capsys):
+    """An unknown epic, a ref `find` cannot match, a ticket that is not startable,
+    a backlog ticket, and a ticket outside the selected epic each exit 1 with the
+    reason. Ablation (performed): drop the startable check and the `1.2` row
+    FAILS (it resolves)."""
+    args = argparse.Namespace(epic=epic, story=story)
+
+    assert cli._resolve_ticket_scope(_selector_tree(), args) == 1
+
+    assert said in capsys.readouterr().err
+
+
+def test_resolve_ticket_scope_refuses_an_ambiguous_ref(capsys):
+    """`find`'s own ambiguity fault (exit 1 with JSON, "matches more than one")
+    refuses the run."""
+    from bmad_loop.tickettree import TicketsFault
+
+    tree = _selector_tree()
+    tree.faults["find"] = TicketsFault("'cart' matches more than one ticket: 1.1, 1.2")
+
+    assert cli._resolve_ticket_scope(tree, argparse.Namespace(epic=None, story="cart")) == 1
+
+    assert "matches more than one ticket" in capsys.readouterr().err
+
+
+def test_resolve_ticket_scope_refuses_two_epics_one_selector(capsys):
+    """A selector that names one epic by id and another by slug is ambiguous."""
+    tree = _selector_tree(epics=("epic-2", "epic-cart"))
+    tree.status_view = dataclasses.replace(
+        tree.status_view,
+        epics=(
+            dataclasses.replace(tree.status_view.epics[0], id="7"),
+            dataclasses.replace(tree.status_view.epics[1], id="2"),
+        ),
+    )
+
+    assert cli._resolve_ticket_scope(tree, argparse.Namespace(epic=2, story=None)) == 1
+
+    assert "names more than one epic: epic-2, epic-cart" in capsys.readouterr().err
+
+
+def test_run_epic_slug_tickets_mode_filters(project, capsys, monkeypatch):
+    """`run --epic cart` in tickets mode resolves the slug against the initiative
+    and persists it as `ticket_epic_filter` (the int `epic_filter` stays None), and
+    the engine's source picks within it: the run's first dispatch is epic 2's
+    ticket though epic 1's leads the build order. 2 real spawns (the preflight's
+    capability probe); the selector reads a fake tree. Ablation (performed): drop
+    `ticket_epic_filter=scope.epic` from `compose_run` and this FAILS."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.tickets_engine import TicketsEngine
+    from bmad_loop.tickets_source import TicketsWorkSource
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    tree = _selector_tree()
+    monkeypatch.setattr(cli, "_selector_ticket_tree", lambda _project: tree)
+    picked: list[object] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            engine = types.SimpleNamespace(
+                state=kw["state"], ticket_tree=tree, _ticket_tree_factory=None
+            )
+            source = TicketsEngine._make_work_source(engine)
+            assert isinstance(source, TicketsWorkSource)
+            picked.append(source.decide({}))
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    run_id = "20990101-000000-beef"
+
+    argv = ["run", "--project", str(project.project), "--run-id", run_id, "--epic", "checkout"]
+    assert cli.main(argv) == 0, capsys.readouterr().err
+
+    state = load_state(project.project / ".bmad-loop" / "runs" / run_id)
+    assert (state.ticket_epic_filter, state.epic_filter, state.story_filter) == (
+        "epic-checkout",
+        None,
+        None,
+    )
+    (decision,) = picked
+    assert decision.key == "2.1"  # a refine halt on epic 2's ticket, not 1.1's dispatch
+    assert "ignored in tickets mode" not in capsys.readouterr().err
+
+
+def test_run_story_unknown_ticket_ref_exits_1(project, capsys, monkeypatch):
+    """`run --story` in tickets mode names a ticket through `find`; a ref that
+    matches nothing exits 1 before any run directory exists. 2 real spawns (the
+    preflight's capability probe). Ablation (performed): skip the selector
+    resolution in `cmd_run` and the run starts — this FAILS."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    monkeypatch.setattr(cli, "_selector_ticket_tree", lambda _project: _selector_tree())
+    monkeypatch.setattr(cli, "TicketsEngine", _StubEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+
+    assert cli.main(["run", "--project", str(project.project), "--story", "9.9"]) == 1
+
+    assert "no ticket matches '9.9'" in capsys.readouterr().err
+    runs_dir = project.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+def test_dry_run_tickets_epic_filter_lists_only_that_epic(project, capsys, monkeypatch):
+    """The dry-run honors `--epic`: only that epic's startable tickets are listed
+    and the predicted pause is the scoped pick's. No real spawn."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    _fake_dry_run_tree(monkeypatch, _selector_tree())
+
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run", "--epic", "2"])
+
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert "ticket 2.1" in out and "ticket 1.1" not in out
+    assert "predicted: run would pause before 2.1 (ticket-refine)" in out
+
+
+@pytest.mark.parametrize("registered", [False, True], ids=["refined-pick-pause", "unit-pause"])
+def test_resume_records_a_refined_story_file_approval(project, capsys, monkeypatch, registered):
+    """Resuming a tickets run paused at the pick's `plan-checkpoint` (a refined
+    ticket, no task recorded) is the operator's approval of its story file: the
+    ref joins `ticket_story_approvals`, persisted before the engine starts, and
+    `ticket-story-approved` is journaled. A registered unit's `plan-checkpoint`
+    pause (the two-leg flow) approves nothing. No real spawn: the resume path
+    runs no `tickets.py`. Ablation (performed): drop the
+    `approve_paused_story_file` call from `_prepare_resume_locked` and the refined
+    row FAILS."""
+    from bmad_loop import runs
+    from bmad_loop.journal import Journal, load_state
+    from bmad_loop.model import StoryTask
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    tasks = {"1.1": StoryTask(story_key="1.1", epic=0)} if registered else {}
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-f00d",
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        paused_reason="approve story file",
+        paused_stage="plan-checkpoint",
+        paused_story_key="1.1",
+        policy_snapshot=LAUNCH_SNAPSHOT,
+        tasks=tasks,
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    seen: list[list[str]] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            seen.append(list(kw["state"].ticket_story_approvals))
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0, capsys.readouterr().err
+
+    want = [] if registered else ["1.1"]
+    assert seen == [want]
+    assert load_state(run_dir).ticket_story_approvals == want
+    approved = [e for e in Journal(run_dir).entries() if e.get("kind") == "ticket-story-approved"]
+    assert [e["ref"] for e in approved] == want
+
+
+def test_resume_records_an_answered_epic_closure_pause(project, capsys, monkeypatch):
+    """Resuming a tickets run paused at `epic-boundary` on a recorded closure
+    answers that pause: the slug joins `ticket_epic_closure_resumed`, persisted
+    before the engine starts, so the engine acknowledges the closure instead of
+    pausing for it again. Ablation (performed): drop the `resume_epic_closure`
+    call from `_prepare_resume_locked` and this FAILS."""
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-f00e",
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        paused_reason="close epic-cart with bmad-ticket",
+        paused_stage="epic-boundary",
+        paused_story_key="epic-cart",
+        ticket_epic_closures={"epic-cart": "accepted"},
+        policy_snapshot=LAUNCH_SNAPSHOT,
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    seen: list[list[str]] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            seen.append(list(kw["state"].ticket_epic_closure_resumed))
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0, capsys.readouterr().err
+
+    assert seen == [["epic-cart"]]
+    assert load_state(run_dir).ticket_epic_closure_resumed == ["epic-cart"]
+
+
+@pytest.mark.parametrize("recorded", ["moved", "unreadable"])
+def test_resume_tickets_refuses_a_changed_store_topology(project, capsys, monkeypatch, recorded):
+    """Resume re-classifies the ticket store and refuses when it differs from the
+    topology the run recorded at its start — a store that moved under a paused
+    run, or a recorded topology a hand edit mangled — before any engine is built.
+    No real spawn. Ablation (performed): drop the `_reject_store_topology` call in
+    `_prepare_resume_locked` and both rows FAIL (the engine is built)."""
+    from bmad_loop import bmadconfig, runs
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    store = bmadconfig.load_paths(project.project, want_tickets=True).output_folder
+    topology = {
+        "layout": "T1",
+        "placement": "checkout",
+        "versioning": "code-repo",
+        "store_root": str(store.parent / "elsewhere") if recorded == "moved" else str(store),
+        "store_repo": None,
+    }
+    if recorded == "unreadable":
+        topology = {"unreadable": "list"}
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-5707",
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        store_topology=topology,
+        paused_reason="operator stop",
+        paused_stage="escalation",
+        policy_snapshot=LAUNCH_SNAPSHOT,
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    built: list[dict] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "the ticket store changed since this run started" in capsys.readouterr().err
+    assert built == []
+
+
+def test_resume_tickets_accepts_a_store_moved_with_the_project(project, capsys, monkeypatch):
+    """A project renamed while its tickets run was paused moves its in-project
+    store too: the topology recorded under the launch-time project is rebased onto
+    the live one (`runs.live_store_topology`) before it is compared, so the resume
+    is not refused as a changed store. Ablation (performed): compare the raw
+    `state.store_topology` in `_prepare_resume_locked` and this FAILS (rc 1)."""
+    from bmad_loop import bmadconfig, runs
+    from bmad_loop.journal import load_state, save_state
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    store = bmadconfig.load_paths(project.project, want_tickets=True).output_folder
+    launched = project.project.parent / "launched-here"
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-5708",
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        store_topology={
+            "layout": "T1",
+            "placement": "checkout",
+            "versioning": "code-repo",
+            "store_root": str(launched / store.relative_to(project.project)),
+            "store_repo": None,
+        },
+        paused_reason="operator stop",
+        paused_stage="escalation",
+        policy_snapshot=LAUNCH_SNAPSHOT,
+    )
+    state = load_state(run_dir)
+    state.project = str(launched)
+    save_state(run_dir, state)
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    built: list[dict] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(cli, "TicketsEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0, capsys.readouterr().err
+    assert len(built) == 1
+
+
+def test_sweep_resume_refuses_a_recorded_store_whose_initiative_is_gone(
+    project, capsys, monkeypatch
+):
+    """A v7 sweep paused on its initiative, whose folder is then deleted, keeps the
+    same `active_initiative`, so the initiative pin passes, and no tickets preflight
+    covers a sweep — resume refuses on the store it recorded instead, before any
+    engine is built, rather than reading the ledger as absent. No real spawn.
+    Ablation (performed): return None for an unclassified store in
+    `ticketstore.store_topology_conflict` and this FAILS (the engine is built)."""
+    from conftest import remove_tree
+
+    from bmad_loop import bmadconfig, runs, ticketstore
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    paths = bmadconfig.load_paths(project.project, want_tickets=True)
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-5709",
+        run_type="sweep",
+        initiative=V7_DEFAULT_INITIATIVE,
+        store_topology=topology.to_dict(),
+        paused_reason="operator stop",
+        paused_stage="escalation",
+        policy_snapshot=LAUNCH_SNAPSHOT,
+    )
+    assert paths.initiative_folder is not None
+    remove_tree(paths.initiative_folder)
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    monkeypatch.setattr(runs, "write_pid", lambda _run_dir: None)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    built: list[dict] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, **kw):
+            built.append(kw)
+
+    monkeypatch.setattr(cli, "SweepEngine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    assert "no initiative folder to classify" in capsys.readouterr().err
+    assert built == []
+
+
+def test_run_tickets_refuses_an_untracked_store(project, capsys, monkeypatch):
+    """`run` refuses a store layout tickets runs cannot drive — here an initiative
+    folder the code repository neither tracks nor ignores — through
+    `_reject_store_topology`, ahead of the queue preflight, with no run left
+    behind. Ablation (performed): delete the `_reject_store_topology` call in
+    `cmd_run` and only the preflight's FAIL line refuses — this FAILS."""
+    from conftest import git
+
+    from bmad_loop import bmadconfig, runs
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    folder = bmadconfig.load_paths(project.project, want_tickets=True).initiative_folder
+    rel = folder.relative_to(project.project).as_posix()
+    git(project.project, "rm", "-r", "-q", "--cached", rel)
+    git(project.project, "commit", "-q", "-m", "untrack the initiative")
+    monkeypatch.setattr(cli, "TicketsEngine", _StubEngine)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 1
+
+    err = capsys.readouterr().err
+    assert "error: the initiative folder" in err and "neither tracks nor ignores" in err
+    assert "FAIL:" not in err
+    runs_dir = project.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+def test_tickets_status_lists_owed_post_landing_writes(tmp_path, capsys):
+    """A shared-store mark or store commit still owed after its code landed (the
+    latch kept) is listed under the tickets footer, so a failed store commit is
+    visible without reading the journal. Ablation (performed): drop the owed
+    line and this FAILS."""
+    from bmad_loop.model import RunState, StoryTask
+
+    state = RunState(run_id="r", project=str(tmp_path), started_at="now", source="tickets")
+    state.tasks["1.1"] = StoryTask(story_key="1.1", epic=0, ticket_done_pending=True)
+    state.tasks["1.2"] = StoryTask(
+        story_key="1.2", epic=0, ticket_park_pending="awaiting operator: x"
+    )
+    state.tasks["1.3"] = StoryTask(story_key="1.3", epic=0)
+
+    cli._print_tickets_status(state, tmp_path)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "tickets: initiative (none)"
+    assert lines[1].startswith("tickets board unavailable:")
+    assert lines[2].startswith(
+        "tickets: mark or store commit owed after landing: 1.1 (done), 1.2 (blocked)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "said"),
+    [("bogus", "unknown to this bmad-loop")],
+)
+def test_resume_unknown_source_refused(project, monkeypatch, capsys, source, said):
+    """R16: a paused story run whose persisted source this version cannot drive is
+    refused before any side effect — no engine, no `run-resume` row, the pause left
+    standing — instead of being resumed as a sprint run. Ablation (performed): drop
+    the source check in `_prepare_resume_locked` and the `bogus` row FAILS (the stub
+    engine runs it as sprint)."""
+    from bmad_loop.journal import load_state
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, source=source)
+    built: list[str] = []
+
+    class _Recording(_StubEngine):
+        def __init__(self, *a, **kw):
+            built.append("built")
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(cli, "Engine", _Recording)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert f"cannot resume {run_dir.name}:" in err and said in err
+    assert built == []
+    assert _resume_entries(run_dir) == []
+    assert load_state(run_dir).paused_reason == "escalation"
+
+
+@pytest.mark.parametrize("resume", ["--resume", "--no-resume"])
+@pytest.mark.parametrize(
+    ("source", "said"),
+    [("bogus", "unknown to this bmad-loop")],
+)
+def test_resolve_unknown_source_refused_at_entry(
+    tmp_path, monkeypatch, capsys, source, said, resume
+):
+    """`resolve` refuses a run whose persisted source this version cannot drive
+    before the interactive session or the re-arm — `--no-resume` never reaches the
+    resume's own gate. Ablation: drop the entry check in `cmd_resolve` and the
+    re-arm stub fails the test."""
+    from bmad_loop import runs
+
+    escalated_run(tmp_path, "r1", source=source)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("launched a session"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *a, **k: pytest.fail("re-armed"))
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", resume, "--no-interactive"]) == 1
+    err = capsys.readouterr().err
+    assert "cannot resolve r1:" in err and said in err
+
+
 def test_validate_fails_bmad_config_on_an_ambiguous_toml_key(project, capsys):
     """The renderer's refusal, surfaced where validate reports config faults: the
     same short key under two tables is a `bmad-config` problem naming both, not a
@@ -12572,7 +14277,7 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
     report.ok("git.worktree-clean", "clean")  # the detail=None leg
 
     # the exact production path: cli.py does `machine.emit(validate_document(...))`.
-    machine.emit(cli.validate_document(report, stories_on=False, spec_folder=""))
+    machine.emit(cli.validate_document(report, mode="sprint", spec_folder=""))
     parsed = json.loads(capsys.readouterr().out)  # whole stdout parses => a pure document
 
     by_check = {f["check"]: f for f in parsed["findings"]}
@@ -12611,6 +14316,82 @@ def test_validate_json_mode_and_spec_folder_reflect_the_flag(project, capsys, sp
     assert gate in {f["check"] for f in doc["findings"]}
 
 
+# The check-id families `cmd_validate`'s per-source queue block can emit: the
+# sprint branch (deferred ledger, operator registry, sprint-status, nested specs)
+# vs the stories branch (manifest, folder+id dispatch probe, deferred ledger).
+_QUEUE_BLOCK_PREFIXES = ("queue.", "operator.", "deferred.", "skills.stories-dispatch")
+
+
+def test_validate_queue_check_per_source_is_pinned(project, capsys, monkeypatch):
+    """Characterization pin for the WorkSource refactor: on one project carrying
+    BOTH a sprint board and a stories manifest, the queue block of
+    `validate --json` emits exactly these findings, in this order, per source.
+
+    The board deliberately carries an unparseable key and an `awaiting-operator`
+    story no park record claims, so the sprint-only gates (unknown-keys warning,
+    operator registry) are observable — and observably ABSENT under `--spec`,
+    where only the manifest + dispatch probe run. Both legs exit 0 (warnings only).
+    """
+    _make_validate_pass(project, monkeypatch, capsys)
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",
+            "1-2-b": "awaiting-operator",
+            "totally-weird": "huh",
+        },
+    )
+    _setup_stories_fixture(project, [_stories_entry("1"), _stories_entry("2")])
+    git(project.project, "add", "-A")  # keep git.worktree-clean green: rc stays the verdict
+    git(project.project, "commit", "-q", "-m", "per-source queue fixture")
+    folder = bmadconfig.load_paths(project.project).project / STORIES_SPEC_FOLDER
+
+    def queue_block(*extra):
+        argv = ["validate", "--project", str(project.project), "--json", *extra]
+        doc = machine_json(argv, capsys)
+        rows = [
+            (f["check"], f["severity"], f["message"], f["detail"])
+            for f in doc["findings"]
+            if f["check"].startswith(_QUEUE_BLOCK_PREFIXES)
+        ]
+        return doc["mode"], doc["spec_folder"], rows
+
+    mode, spec_folder, rows = queue_block()
+    assert (mode, spec_folder) == ("sprint", "")
+    assert [(check, severity) for check, severity, _m, _d in rows] == [
+        ("operator.park-record-missing", "warning"),
+        ("queue.sprint-status", "ok"),
+        ("queue.sprint-status-unknown-keys", "warning"),
+    ]
+    assert rows[0][3] == {"story_keys": ["1-2-b"]}
+    assert rows[1][2:] == (
+        "sprint-status OK: 2 stories, 1 actionable",
+        {"stories": 2, "actionable": 1},
+    )
+    assert rows[2][2:] == (
+        "unknown keys ignored: totally-weird",
+        {"unknown_keys": ["totally-weird"]},
+    )
+
+    mode, spec_folder, rows = queue_block("--spec", STORIES_SPEC_FOLDER)
+    assert (mode, spec_folder) == ("stories", STORIES_SPEC_FOLDER)
+    assert rows == [
+        (
+            "queue.stories-manifest",
+            "ok",
+            f"stories mode OK: 2 stories in {folder}/stories.yaml, SPEC.md present",
+            {"spec_folder": str(folder), "stories": 2},
+        ),
+        (
+            "skills.stories-dispatch",
+            "ok",
+            "bmad-dev-auto supports folder+id dispatch (stories mode)",
+            {"trees": [".claude/skills"], "dev_primitive": ["bmad-dev-auto"]},
+        ),
+    ]
+
+
 def test_validate_json_every_emitted_check_is_registered(project, capsys, monkeypatch):
     """The `add` assert enforces registration per executed call site; this unions the
     ids a real passing and failing run emit and asserts them registered. Exercised
@@ -12623,6 +14404,34 @@ def test_validate_json_every_emitted_check_is_registered(project, capsys, monkey
     failing = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
     emitted = {f["check"] for f in (*passing["findings"], *failing["findings"])}
     assert emitted, "the run emitted findings"
+    assert emitted <= VALIDATE_CHECKS
+
+
+def test_validate_json_every_emitted_tickets_check_is_registered(project, capsys, monkeypatch):
+    """The registry test's tickets-mode legs: a passing tickets project, then one
+    with every static tickets check failing (no initiative folder, a tracker store,
+    no uv, a pre-v7 build-auto). Exercised paths only, as above."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    passing = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    shutil.rmtree(project.project / "_bmad-output" / V7_DEFAULT_INITIATIVE)
+    (project.project / "_bmad" / "custom" / "ticketing-store-config.toml").write_text(
+        '[tickets]\nstore = "jira"\n', encoding="utf-8"
+    )
+    install_build_auto_v7_skill(project.project, tickets_route=False)
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda tool: None if tool == "uv" else f"/usr/bin/{tool}"
+    )
+    failing = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    failed = {f["check"] for f in failing["findings"] if f["severity"] == "problem"}
+    assert {
+        "tickets.initiative-missing",
+        "tickets.store-not-repo",
+        "tickets.uv-missing",
+        "skills.tickets-dispatch-stale",
+    } <= failed
+    emitted = {f["check"] for f in (*passing["findings"], *failing["findings"])}
     assert emitted <= VALIDATE_CHECKS
 
 
@@ -13458,7 +15267,7 @@ def test_dry_run_stories_shows_plan_halt_markers(project, capsys):
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
 
-    assert cli._dry_run(project, pol, args, True, STORIES_SPEC_FOLDER) == 0
+    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 0
     out = capsys.readouterr().out
     assert "Halt after planning." in out
     assert "BMAD_LOOP_PLAN_HALT=1" in out
@@ -13472,7 +15281,7 @@ def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
     pol = policy_mod.loads("")
     args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
 
-    assert cli._dry_run(project, pol, args, True, abs_folder) == 0
+    assert cli._dry_run(project, pol, args, "stories", abs_folder) == 0
     out = capsys.readouterr().out
     assert "Spec folder: _bmad-output/epic-1. Story id: 1." in out
     assert f"Spec folder: {abs_folder}" not in out  # not the raw absolute path
@@ -13491,7 +15300,7 @@ def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypat
     Measured ablations:
     - B3 (delete the `try`/`except stories_mod.StoriesError` around the
       `relativize_spec_folder` call in `cli._dry_run_stories`): FAILS at `assert
-      cli._dry_run(project, pol, args, True, abs_folder) == 1` — the
+      cli._dry_run(project, pol, args, "stories", abs_folder) == 1` — the
       `StoriesError` propagates out of `_dry_run` uncaught, so the row errors on
       that line and the two stderr assertions are never reached. That line alone
       carries this row.
@@ -13507,7 +15316,7 @@ def test_dry_run_stories_unresolvable_absolute_folder_refused(project, monkeypat
     args = argparse.Namespace(spec=abs_folder, epic=None, story=None, max_stories=None)
     refuse_to_resolve(monkeypatch, Path(abs_folder))
 
-    assert cli._dry_run(project, pol, args, True, abs_folder) == 1
+    assert cli._dry_run(project, pol, args, "stories", abs_folder) == 1
 
     cap = capsys.readouterr()
     assert f"stories mode: cannot canonicalize the spec folder {abs_folder!r}" in cap.err
@@ -14131,7 +15940,7 @@ def test_win32_on_wsl_path_survives_the_render_and_the_json_projection(mux_regis
 
     report = cli.ValidationReport()
     report.extend(cli._platform_preflight(WSL_UNC_PROJECT))  # asserts the id is registered
-    doc = cli.validate_document(report, False, "")
+    doc = cli.validate_document(report, "sprint", "")
 
     rows = [f for f in doc["findings"] if f["check"] == "host.win32-on-wsl-path"]
     assert len(rows) == 1
@@ -14189,6 +15998,32 @@ def _park_story(paths, key="1-1-a", *, actions=None, spec_status="awaiting-opera
 
 def _confirm_argv(paths, *extra):
     return ["confirm", "--project", str(paths.project), *extra]
+
+
+@pytest.mark.parametrize(
+    "policy_text",
+    [
+        pytest.param(None, id="no-policy"),
+        pytest.param('[stories]\nsource = "sprint-status"\n', id="sprint"),
+        pytest.param('[stories]\nsource = "tickets"\n', id="tickets"),
+    ],
+)
+def test_confirm_joins_a_board_park_whatever_the_current_source(project, capsys, policy_text):
+    """A park record belongs to the source of the run that wrote it, not to the
+    project's current `[stories] source`: a story parked on the sprint board stays
+    confirmable there after the project switches to tickets. Ablation
+    (performed): skip the board read under a tickets policy and the tickets row
+    reads "not on the sprint board" — this FAILS."""
+    install_bmad_config(project)
+    if policy_text is not None:
+        (project.project / cli.POLICY_FILE).parent.mkdir(parents=True, exist_ok=True)
+        (project.project / cli.POLICY_FILE).write_text(policy_text, encoding="utf-8")
+    _park_story(project)
+
+    doc = machine_json(_confirm_argv(project, "--json"), capsys)
+    (entry,) = doc["parked"]
+    assert entry["board_status"] == "awaiting-operator"
+    assert entry["confirmable"] is True and entry["drift"] is None
 
 
 def test_confirm_flips_spec_board_record_and_commits(project, capsys, monkeypatch):
@@ -20003,6 +21838,7 @@ def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypat
         lambda _p, announced=(), **_kw: (
             {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-1"]},
             [],
+            [],
         ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
@@ -20023,7 +21859,11 @@ def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
+        lambda _p, announced=(), **_kw: (
+            {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+            [],
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p: ([], []))
 
@@ -20052,7 +21892,7 @@ def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys
 
     def _leftovers(_p, announced=(), **_kw):
         seen.append(sorted(announced))
-        return {}, []
+        return {}, [], []
 
     monkeypatch.setattr(runs, "legacy_registry_leftovers", _leftovers)
     monkeypatch.setattr(launch, "prunable_ctl_windows", lambda _p, **_kw: ([], []))
@@ -20075,7 +21915,11 @@ def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, cap
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}, []),
+        lambda _p, announced=(), **_kw: (
+            {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
+            [],
+            [],
+        ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
@@ -20114,6 +21958,7 @@ def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys
                 theirs: ["bmad-loop-old-1"],
             },
             [],
+            [],
         ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
@@ -20149,6 +21994,7 @@ def test_cleanup_says_a_derived_registry_of_another_project_path_is_not_a_remain
         "legacy_registry_leftovers",
         lambda _p, announced=(), **_kw: (
             {theirs: ["bmad-loop-bare-1", "bmad-loop-ctl"], plain: ["bmad-loop-old-1"]},
+            [],
             [],
         ),
     )
@@ -20190,6 +22036,7 @@ def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, cap
                 r"D:\theirs": ["bmad-loop-old-1"],
             },
             [],
+            [],
         ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
@@ -20205,7 +22052,9 @@ def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys
     from bmad_loop.tui import launch
 
     monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(runs, "legacy_registry_leftovers", lambda _p, announced=(), **_kw: ({}, []))
+    monkeypatch.setattr(
+        runs, "legacy_registry_leftovers", lambda _p, announced=(), **_kw: ({}, [], [])
+    )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
 
     assert cli.main(["cleanup", "--project", str(project.project)]) == 0
@@ -20225,7 +22074,7 @@ def test_cleanup_names_a_pre_upgrade_control_session_without_a_command_off_psmux
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({_OWN_REG: [_DIGEST_CTL]}, []),
+        lambda _p, announced=(), **_kw: ({}, [], [_DIGEST_CTL]),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OtherRegistryMux())
@@ -20260,13 +22109,11 @@ def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(
         runs,
         "legacy_registry_leftovers",
         lambda _p, announced=(), **_kw: (
-            {
-                # A run's agent session for run id `ctl-<16 hex>` shares the
-                # digest shape; it is not the old control session.
-                _OWN_REG: [runs.CTL_SESSION, _DIGEST_CTL, runs.CTL_SESSION + "-fedcba9876543210"],
-                "/reg/default": ["bmad-loop-old-1"],
-            },
+            {"/reg/default": ["bmad-loop-old-1"]},
             [],
+            # A run's agent session for run id `ctl-<16 hex>` shares the
+            # digest shape; it is not the old control session.
+            [runs.CTL_SESSION, _DIGEST_CTL, runs.CTL_SESSION + "-fedcba9876543210"],
         ),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
@@ -20278,13 +22125,107 @@ def test_cleanup_prints_the_kill_command_for_a_pre_upgrade_control_session(
     err = capsys.readouterr().err
     assert f"pre-upgrade control session {_DIGEST_CTL}" in err and command in err
     assert err.count("kill-session") == 1
+    # The mismatched name is withheld for a fault, not a possible owner: its
+    # line makes no run-ownership claim. Route it back into `ambiguous` and
+    # this fails.
+    other = runs.CTL_SESSION + "-fedcba9876543210"
+    (mismatch,) = [
+        ln for ln in err.splitlines() if ln.startswith(f"pre-upgrade control session {other}")
+    ]
+    assert "could not be confirmed" in mismatch and "may own it" not in mismatch
 
     assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
     captured = capsys.readouterr()
     doc = json.loads(captured.out)
     assert doc["sessions"]["legacy_kill_commands"] == {_DIGEST_CTL: command}
-    assert _DIGEST_CTL in doc["sessions"]["legacy_leftovers"]
+    assert _DIGEST_CTL in doc["sessions"]["superseded_ctl_sessions"]
+    assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-old-1"]
+    # #917: a listed name that does not match gets no command but is not
+    # dropped either: the mismatch is said. Ablate that report and this fails.
+    assert (
+        f"{_OWN_REG}: {other} no longer matches the pre-upgrade control-session name"
+        in doc["sessions"]["superseded_ctl_unverified"]
+    )
     assert captured.err == ""
+
+
+def test_cleanup_keeps_a_pre_upgrade_control_session_out_of_the_legacy_leftovers(
+    project, capsys, monkeypatch
+):
+    """#917: the session stands in this project's own registry, which is no
+    legacy one, so it is reported at `sessions.superseded_ctl_sessions` and
+    never in `legacy_leftovers` or a `not migrated` line; text mode names it
+    exactly once, with its command. Drives the real reader. Merge it back into
+    the legacy grouping in `runs.legacy_registry_leftovers`, or drop the
+    document field, and this fails."""
+    from bmad_loop.tui import launch
+
+    class _Holding(_OwnRegistryMux):
+        def list_sessions_reporting(self, *, on_fault=None):
+            return [_DIGEST_CTL]
+
+    own = _Holding()
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
+    monkeypatch.setattr(runs, "_legacy_registries", lambda: [])
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: own)
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: own)
+    monkeypatch.setattr(runs, "superseded_ctl_name", lambda _p, _r=None: _DIGEST_CTL)
+    monkeypatch.setattr(runs, "superseded_ctl_may_be_run", lambda *_a, **_kw: False)
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    sessions = json.loads(capsys.readouterr().out)["sessions"]
+    assert sessions["superseded_ctl_sessions"] == [_DIGEST_CTL]
+    assert sessions["legacy_leftovers"] == []
+    assert list(sessions["legacy_kill_commands"]) == [_DIGEST_CTL]
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    (line,) = [ln for ln in err.splitlines() if _DIGEST_CTL in ln]
+    assert line.startswith(f"pre-upgrade control session {_DIGEST_CTL}")
+    assert "kill-session" in line
+    assert "not migrated" not in err
+
+
+def test_cleanup_still_names_a_pre_upgrade_control_session_whose_name_cannot_be_rederived(
+    project, capsys, monkeypatch
+):
+    """#917: the listing matched the session, but deriving its name again for
+    the command lookup faults. The session is no longer in the legacy grouping
+    to fall back on, so it must still be named once, with no command, and the
+    fault said, with no claim that a run may own it: nothing suggests one does.
+    Ablate the `withheld` fallback in the `except` of
+    `_superseded_ctl_kill_commands`, or route it into `ambiguous`, and this
+    fails."""
+    from bmad_loop.tui import launch
+
+    def _boom(_p, _r=None):
+        raise OSError("unresolvable")
+
+    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
+    monkeypatch.setattr(
+        runs,
+        "legacy_registry_leftovers",
+        lambda _p, announced=(), **_kw: ({}, [], [_DIGEST_CTL]),
+    )
+    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
+    monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
+    monkeypatch.setattr(runs, "superseded_ctl_name", _boom)
+
+    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
+    err = capsys.readouterr().err
+    (line,) = [ln for ln in err.splitlines() if _DIGEST_CTL in ln]
+    assert "no command is printed" in line
+    assert "could not be confirmed" in line and "may own it" not in line
+    assert "could not derive the pre-upgrade control-session name: unresolvable" in err
+
+    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
+    sessions = json.loads(capsys.readouterr().out)["sessions"]
+    assert sessions["legacy_kill_commands"] == {}
+    assert sessions["superseded_ctl_sessions"] == [_DIGEST_CTL]
+    assert sessions["superseded_ctl_unverified"] == [
+        "could not derive the pre-upgrade control-session name: unresolvable"
+    ]
 
 
 def test_cleanup_prints_no_kill_command_for_a_name_a_run_of_this_project_has(
@@ -20303,7 +22244,7 @@ def test_cleanup_prints_no_kill_command_for_a_name_a_run_of_this_project_has(
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({_OWN_REG: [_DIGEST_CTL]}, []),
+        lambda _p, announced=(), **_kw: ({}, [], [_DIGEST_CTL]),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
@@ -20319,7 +22260,8 @@ def test_cleanup_prints_no_kill_command_for_a_name_a_run_of_this_project_has(
     captured = capsys.readouterr()
     doc = json.loads(captured.out)
     assert doc["sessions"]["legacy_kill_commands"] == {}
-    assert doc["sessions"]["legacy_leftovers"] == [_DIGEST_CTL]
+    assert doc["sessions"]["superseded_ctl_sessions"] == [_DIGEST_CTL]
+    assert doc["sessions"]["legacy_leftovers"] == []
     assert captured.err == ""
 
 
@@ -20342,7 +22284,7 @@ def test_cleanup_reports_a_runs_dir_it_could_not_check_for_that_id(project, caps
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({_OWN_REG: [_DIGEST_CTL]}, []),
+        lambda _p, announced=(), **_kw: ({}, [], [_DIGEST_CTL]),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p, **_kw: ([], [], [], []))
     monkeypatch.setattr(mux_mod, "get_multiplexer", lambda: _OwnRegistryMux())
@@ -20372,7 +22314,7 @@ def test_cleanup_names_a_legacy_registry_that_could_not_be_asked(project, capsys
     monkeypatch.setattr(
         runs,
         "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: ({}, ["/reg/broken: could not be listed: no server"]),
+        lambda _p, announced=(), **_kw: ({}, ["/reg/broken: could not be listed: no server"], []),
     )
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
@@ -21040,6 +22982,7 @@ def test_cleanup_json_unavailable_backend_without_evidence_is_unchanged(
         "legacy_leftovers": [],
         "legacy_kill_commands": {},
         "legacy_unverified": [],
+        "superseded_ctl_sessions": [],
         "superseded_ctl_unverified": [],
     }
     assert doc["ctl_windows"]["scan_error"] is None
@@ -21667,3 +23610,242 @@ def test_validate_trust_reads_the_configured_repo_root(project, capsys, monkeypa
     cli.main(argv)
     [finding] = _trust_findings(json.loads(capsys.readouterr().out))
     assert (finding["severity"], finding["detail"]) == ("ok", {"plugins": ["hooky"]})
+
+
+# ---- `confirm` in tickets mode: the plan is the park's whole committed truth.
+# Real-spawn budget: 2 vendored `tickets.py` spawns (`find` + `mark`, the
+# done/clears-blocked test); the `mark_done = "never"` test injects a FakeTicketTree.
+
+TICKET_PARK_ACTIONS = ["buy example.com at the registrar", "publish the acme TXT record"]
+
+
+def _park_ticket(layout, *, policy_text: str):
+    """Leave ticket 1.1 as a tickets run's park commits it: the plan `blocked`
+    with an operator-park reason and its owed actions, and a park record naming
+    source and ref — all committed, under a tickets policy."""
+    from conftest import write_plan
+
+    from bmad_loop import operatoractions
+
+    policy = layout.project / cli.POLICY_FILE
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(policy_text, encoding="utf-8")
+    plan = write_plan(
+        layout,
+        "epic-cart",
+        "story-cart-model-plan",
+        1,
+        "blocked",
+        # double-quoted, as upstream `mark --blocked` writes them
+        blocked_at='"2026-10-15"',
+        blocked_reason='"awaiting operator: ' + "; ".join(TICKET_PARK_ACTIONS) + '"',
+        operator_actions=TICKET_PARK_ACTIONS,
+    )
+    operatoractions.record_park(
+        layout.project,
+        "1.1",
+        actions=list(TICKET_PARK_ACTIONS),
+        spec_file=(
+            plan.relative_to(layout.project).as_posix()
+            if plan.is_relative_to(layout.project)
+            else str(plan)  # a T4 store, outside the project
+        ),
+        run_id="run-1",
+        parked_at="2026-10-15",
+        source="tickets",
+        ref="1.1",
+    )
+    git(layout.project, "add", "-A")
+    git(layout.project, "commit", "-q", "-m", "park 1.1")
+    return plan
+
+
+def test_confirm_tickets_marks_done_and_clears_blocked(project_v7, capsys, monkeypatch):
+    """A ticket park has no board: `confirm 1.1` appends the audit section, then
+    marks the plan through the ticket chokepoint — the real `tickets.py mark`,
+    reason `confirm`, to `done` under `mark_done = "auto"` — which clears the
+    plan's `blocked_*` fields; the record is dropped and the plan and the
+    record's deletion are committed together, leaving a clean tree. Ablation
+    (performed): drop the tickets branch from `_land_confirmation` and the board
+    advance answers nothing for a v7 project, so `confirm` exits 1 with the plan
+    still blocked — this FAILS."""
+    from bmad_loop import devcontract, frontmatter, operatoractions, verify
+
+    plan = _park_ticket(project_v7, policy_text='[stories]\nsource = "tickets"\n')
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(["confirm", "--project", str(project_v7.project), "1.1"]) == 0
+
+    fm = frontmatter.read_frontmatter(plan)
+    assert frontmatter.status_of(fm) == "done"
+    assert not fm.get("blocked_reason") and not fm.get("blocked_at")
+    text = plan.read_text(encoding="utf-8")
+    assert "## Operator Confirmation" in text and devcontract.OPERATOR_CONFIRM_NOTE in text
+    assert operatoractions.load(project_v7.project) == {}
+    assert "confirm 1.1" in git(project_v7.project, "log", "-1", "--format=%s")
+    changed = git(project_v7.project, "show", "--name-only", "--format=", "HEAD")
+    assert ".bmad-loop/operator/1.1.json" in changed
+    assert plan.relative_to(project_v7.project).as_posix() in changed
+    assert verify.worktree_clean(project_v7.project)
+    assert "✓ 1.1 confirmed — plan is done" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("layout", ["project_v7_store_repo", "project_v7_external_store"])
+def test_confirm_tickets_commits_the_plan_in_its_store_repository(
+    layout, request, capsys, monkeypatch
+):
+    """With the store in its own repository — nested and ignored (T3) or outside
+    the checkout (T4) — the confirmed plan is committed THERE and the code
+    repository's confirm commit carries only the record's deletion: both trees end
+    clean. Ablation (performed): hand `[spec]` to the code commit again and T3's
+    `git add` refuses the ignored plan, the swallowed fault leaving the record's
+    deletion uncommitted, while T4 drops the plan as outside the repository —
+    leaving the store repository dirty; this FAILS for both."""
+    import dataclasses
+
+    from conftest import FakeTicketTree, fake_find, ticket_row
+
+    from bmad_loop import frontmatter, verify
+
+    v7 = request.getfixturevalue(layout)
+    plan = _park_ticket(v7, policy_text='[stories]\nsource = "tickets"\n')
+    store = v7.output_folder
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "park 1.1 plan")
+    reason = "awaiting operator: " + "; ".join(TICKET_PARK_ACTIONS)
+    row = ticket_row("1.1", status="blocked", blocked_reason=reason)
+    tree = FakeTicketTree(v7.project, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    monkeypatch.setattr(cli, "_confirm_ticket_tree", lambda _project: tree)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(["confirm", "--project", str(v7.project), "1.1"]) == 0
+
+    assert [m.target for m in tree.marks] == ["done"]
+    out, err = capsys.readouterr()
+    assert "✓ 1.1 confirmed — plan is done" in out and "warning" not in err
+    code = git(v7.project, "show", "--name-only", "--format=%s", "HEAD").split()
+    assert code[:3] == ["chore(operator):", "confirm", "1.1"]
+    assert code[3:] == [".bmad-loop/operator/1.1.json"]
+    stored = git(store, "show", "--name-only", "--format=%s%n%b", "HEAD")
+    assert "chore(operator): confirm 1.1" in stored
+    assert plan.relative_to(store).as_posix() in stored
+    assert "## Operator Confirmation" in git(store, "show", "HEAD")
+    assert frontmatter.status_of(frontmatter.read_frontmatter(plan)) == "blocked"  # fake mark
+    assert verify.worktree_clean(v7.project) and verify.worktree_clean(store)
+
+
+def test_confirm_tickets_never_policy_marks_built(project_v7, capsys, monkeypatch):
+    """Under `[tickets] mark_done = "never"` a confirmed park lands `built`, for a
+    person to accept, through the same chokepoint (reason `confirm`, the
+    record's plan as the cross-check). A refused mark keeps the park entry so a
+    re-run can finish. Ablation (performed): always target `done` in
+    `_mark_ticket_confirmed` and the mark is `done` — this FAILS."""
+    import dataclasses
+
+    from conftest import FakeTicketTree, fake_find, ticket_row
+
+    from bmad_loop import operatoractions, tickettree
+
+    plan = _park_ticket(
+        project_v7,
+        policy_text='[stories]\nsource = "tickets"\n\n[tickets]\nmark_done = "never"\n',
+    )
+    reason = "awaiting operator: " + "; ".join(TICKET_PARK_ACTIONS)
+    row = ticket_row("1.1", status="blocked", blocked_reason=reason)
+    tree = FakeTicketTree(project_v7.project, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    monkeypatch.setattr(cli, "_confirm_ticket_tree", lambda _project: tree)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(["confirm", "--project", str(project_v7.project), "1.1"]) == 0
+
+    assert [(m.ref, m.target, m.reason, m.expected_plan) for m in tree.marks] == [
+        ("1.1", "built", "confirm", plan)
+    ]
+    assert operatoractions.load(project_v7.project) == {}
+    assert "✓ 1.1 confirmed — plan is built" in capsys.readouterr().out
+
+    # a mark the chokepoint refuses changes nothing and keeps the entry
+    plan = _park_ticket(
+        project_v7,
+        policy_text='[stories]\nsource = "tickets"\n\n[tickets]\nmark_done = "never"\n',
+    )
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], row=row)
+    tree.faults["mark"] = tickettree.TicketsCrashed("boom")
+    assert cli.main(["confirm", "--project", str(project_v7.project), "1.1"]) == 1
+    assert "1.1" in operatoractions.load(project_v7.project)
+    assert "NOT confirmed" in capsys.readouterr().err
+
+
+def test_resolve_restore_patch_latches_the_evacuated_copy(project_v7):
+    """A tickets re-arm moves the plan's intent-gap patch to
+    `runs.evacuated_patch_path`, so a later resolve cycle naming the original path
+    latches the moved copy, and naming the copy itself is trusted by its location.
+    Ablation (performed): drop the fallback in `_resolve_restore_patch` and the
+    original's path is refused as not a file — this FAILS."""
+    import types
+
+    from conftest import write_plan
+
+    plan = write_plan(project_v7, "epic-cart", "story-cart-model-plan", 1, "blocked")
+    run = escalated_run(project_v7.project, "r1", spec_file=str(plan), source="tickets")
+    copy = runs.evacuated_patch_path(run.run_dir, "s1")
+    copy.parent.mkdir(parents=True)
+    copy.write_text("diff\n", encoding="utf-8")
+    pol = types.SimpleNamespace(scm=types.SimpleNamespace(isolation="none"))
+
+    for raw in (str(plan.with_suffix(".patch")), str(copy)):
+        args = argparse.Namespace(restore_patch=raw, interactive=False)
+        assert cli._resolve_restore_patch(
+            project_v7.project, run.run_dir, "s1", args, pol, run.state, run.task
+        ) == (str(copy.resolve()), None)
+
+
+@pytest.mark.parametrize("mode", ["interactive", "--no-interactive"])
+def test_resolve_judges_a_v7_sweeps_store_as_a_tickets_run(project_v7, monkeypatch, capsys, mode):
+    """The v7 leg of the re-arm's sweep-store gates: on v7 a sweep's ledger lives in
+    the ticket store whatever `[stories] source` says (`_sweep_store_source`), so
+    a refused store is refused before the session and before the re-arm under the
+    sprint default too. Ablation (performed): judge `pol.stories.source` at either
+    site and its row FAILS (the action runs)."""
+    from bmad_loop import resolve, ticketstore
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase
+
+    run_dir = _escalated_run(project_v7.project, "r1", run_type="sweep")
+    state = load_state(run_dir)
+    state.initiative = project_v7.initiative  # pinned at launch, as `compose_sweep` does
+    save_state(run_dir, state)
+    assert policy_mod.load(cli._policy_path(project_v7.project)).stories.source == "sprint-status"
+
+    def conflict(_project, store_source, _isolation, *, recorded=None):
+        return "the ticket store is not supported" if store_source == "tickets" else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: pytest.fail("conversed"))
+
+    argv = ["resolve", "--project", str(project_v7.project), "r1", "--resume"]
+    if mode == "--no-interactive":
+        argv.append(mode)
+    assert cli.main(argv) == 1
+    assert "error: the ticket store is not supported" in capsys.readouterr().err
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_sweep_store_source_judges_a_v7_sweep_as_a_tickets_run(project_v7):
+    """A sweep persists no source of its own, and on v7 its ledger lives in the
+    ticket store, so the store-topology refusal must classify that store even
+    when `[stories] source` is the sprint default. A v6 sweep keeps the
+    configured source.
+
+    ABLATION: return `pol.stories.source` unconditionally and the v7 row reads
+    `sprint-status`, which `store_conflict` answers None for any store."""
+    pol = policy_mod.Policy()
+    assert pol.stories.source == "sprint-status"
+    v7 = bmadconfig.load_paths(project_v7.project)
+    assert cli._sweep_store_source(v7, pol) == "tickets"
+    v6 = dataclasses.replace(v7, era="v6", active_initiative="", initiative_folder=None)
+    assert cli._sweep_store_source(v6, pol) == "sprint-status"
