@@ -6804,6 +6804,10 @@ def _resolve_reverify_finished(
         f"minted replay run {replay_id} for {story_key} (replay of {args.run_id}) — "
         "verify replays on resume"
     )
+    # From here the command drives the replay run, so a TUI-launched child refused
+    # before accepting it journals there (`_journal_unaccepted_launch`), not into
+    # the finished run.
+    args.run_id = replay_id
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {replay_id}")
         return 0

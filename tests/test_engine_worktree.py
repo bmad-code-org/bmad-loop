@@ -11866,6 +11866,39 @@ def test_resolve_finished_run_replays_the_kept_unit_in_a_new_run(
     assert _state_bytes(engine.run_dir) == finished_before
 
 
+def test_a_launched_replay_refused_after_the_mint_journals_into_the_replay_run(
+    project, tmp_path, monkeypatch, capsys
+):
+    """#925: a TUI-launched replay whose resume refuses before accepting the minted
+    run journals that refusal into the replay run — the one left paused — not the
+    finished run it was minted from.
+
+    Ablation: drop `args.run_id = replay_id` and the entry lands in the finished
+    run."""
+    from bmad_loop import cli
+
+    engine, marker = _finished_kept_unit(project, tmp_path)
+    marker.write_text("up\n")
+
+    def drifted(_project, _run_dir, **_k):
+        print("a skill changed since the preflight", file=sys.stderr)
+        return 1
+
+    monkeypatch.setattr(cli, "_prepare_resume_locked", drifted)
+    argv = ["resolve", "--project", str(project.project), engine.run_dir.name, "--reverify"]
+    assert cli.main(["--ctl-launch", *argv, "--story", "1-1-a", "--resume"]) == 1
+    capsys.readouterr()
+
+    [replay_dir] = _replay_dirs(engine)
+
+    def refusals(run_dir):
+        return [e for e in Journal(run_dir).entries() if e["kind"] == "ctl-window-claim-failed"]
+
+    [entry] = refusals(replay_dir)
+    assert "a skill changed since the preflight" in entry["error"]
+    assert refusals(engine.run_dir) == []
+
+
 def test_resolve_finished_run_replays_the_kept_unit_of_a_moved_project(
     project, tmp_path, monkeypatch, capsys
 ):
