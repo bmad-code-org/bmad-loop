@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,15 +33,21 @@ from contextlib import ExitStack
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
-from . import childrun
+from . import bmadconfig, childrun, ticketmodel, ticketstore, tickettree
 from .adapters.profile import ALIASES, CANONICAL_EVENTS, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
 from .process_host import ProcessHostError, get_process_host
-from .verify import GitError, git_below_floor, git_bytes, git_floor_text, git_version_at_least
+from .verify import (
+    GitError,
+    git_below_floor,
+    git_bytes,
+    git_floor_text,
+    git_version_at_least,
+)
 
 # The probe-adapter capture hook participates in merge_hooks' dedup only (a
 # probe re-merge must stay idempotent) and never counts as a relay
@@ -57,11 +64,21 @@ ANTIGRAVITY_HOOK_GROUP = "bmad-loop"
 # `bmad-loop init` lays down. The inner dev primitive (`bmad-build-auto`, formerly
 # `bmad-dev-auto`) is upstream (not bundled here): the orchestrator drives it as an
 # already-installed skill. These dirs are the only skills init writes: the
-# BMAD-installed skills and `_bmad/` are read, never modified.
+# BMAD-installed skills and `_bmad/` are read, never modified. `bmod-bmad-loop` is
+# the module record BMAD v7 `bmad setup` discovers (its `bmod.toml`); it is never
+# invoked, so on v6 it is an inert skill folder.
 MODULE_SKILLS = (
     "bmad-loop-resolve",
     "bmad-loop-sweep",
     "bmad-loop-setup",
+    "bmod-bmad-loop",
+)
+
+# Which upstream install ships the skills the base-skill findings require, in both
+# BMAD config eras (bmadconfig.ProjectPaths.era): v6 installs them with the bmm
+# module, v7 with the method module (`_bmad/method`, the bmod-method record).
+BMAD_FLOOR_TEXT = (
+    "the bmm module (BMAD-METHOD >= 6.10.0) or, on BMAD v7, the method module (bmod-method >= 6.13)"
 )
 
 # The inner dev primitive, in both upstream eras. BMAD-METHOD PR #2651 (shipped in
@@ -663,6 +680,378 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
     return problems
 
 
+# BMAD v7 ticket-tree mode. The project's ticket-tree script, which bmad-loop and
+# bmad-build-auto both run; it is also the v7 era marker (bmadconfig.V7_MARKER_REL).
+TICKETS_SCRIPT_REL = bmadconfig.V7_MARKER_REL.as_posix()
+# The repo-vs-tracker store choice the script reads (`[tickets] store`, default repo).
+TICKETS_STORE_CONFIG_REL = f"{CUSTOMIZE_DIR.as_posix()}/ticketing-store-config.toml"
+# The method module's install record, relative to a skill tree: `[bmod] version`
+# names the installed BMAD-METHOD release. Display only.
+BMOD_METHOD_MANIFEST = "bmod-method/bmod.toml"
+# A dev primitive that dispatches `ticket <ref>` from the tree resolves it with
+# `uv run {project-root}/_bmad/method/scripts/tickets.py ... find <ref>` in its
+# step-01; an older one has no ticket route. The marker is that script path,
+# stable across the step's prose.
+TICKETS_PROBE_FILE = STORIES_PROBE_FILE
+TICKETS_PROBE_TEXT = "method/scripts/tickets.py"
+
+
+def bmod_method_version(project: Path, trees: Sequence[str]) -> str | None:
+    """``[bmod] version`` of the first ``<tree>/bmod-method/bmod.toml`` that has
+    one, or None. Display only: nothing gates on it."""
+    for tree in dict.fromkeys(trees):
+        data = _read_toml(project / tree / BMOD_METHOD_MANIFEST)
+        bmod = data.get("bmod") if data is not None else None
+        version = bmod.get("version") if isinstance(bmod, dict) else None
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+    return None
+
+
+def missing_tickets_support(project: Path, trees: Sequence[str]) -> list[Finding]:
+    """Problems for tickets mode's dev-primitive requirement: the resolved
+    primitive's ``step-01-clarify-and-route.md`` must route a ticket from the tree
+    (it carries :data:`TICKETS_PROBE_TEXT`). One problem :class:`Finding` per
+    ``trees`` entry lacking it; callers gate this on tickets mode only.
+
+    ``-missing`` (the step file is absent or unreadable: a half install) and
+    ``-stale`` (an install too old to know the ticket tree) are separate ids, as
+    in :func:`missing_stories_support`."""
+    problems: list[Finding] = []
+    for tree in dict.fromkeys(trees):
+        skill = dev_primitive_or_default(project, tree)
+        probe = project / tree / skill / TICKETS_PROBE_FILE
+        detail = {"tree": tree, "skill": skill, "file": TICKETS_PROBE_FILE}
+        try:
+            text = probe.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            problems.append(
+                Finding(
+                    "skills.tickets-dispatch-missing",
+                    "problem",
+                    f"{tree}/{skill}/{TICKETS_PROBE_FILE} not found — tickets mode "
+                    f"needs a dev primitive that dispatches from the ticket tree; "
+                    f"update the BMad Method module",
+                    detail,
+                )
+            )
+            continue
+        if TICKETS_PROBE_TEXT not in text:
+            problems.append(
+                Finding(
+                    "skills.tickets-dispatch-stale",
+                    "problem",
+                    f"{tree}/{skill} cannot dispatch from the ticket tree (no "
+                    f"{TICKETS_PROBE_TEXT!r} in {TICKETS_PROBE_FILE}) — tickets mode needs "
+                    f"a newer {skill}; update the BMad Method module",
+                    {**detail, "marker": TICKETS_PROBE_TEXT},
+                )
+            )
+    return problems
+
+
+def _ticket_store(project: Path) -> tuple[str | None, str]:
+    """The ticket store ``tickets.py`` would use — ``[tickets] store`` of
+    :data:`TICKETS_STORE_CONFIG_REL`, ``"repo"`` when the file, the table or the
+    value is absent or blank, as upstream reads it — and "" or the reason the file
+    could not be read (then the store is None)."""
+    path = project / TICKETS_STORE_CONFIG_REL
+    try:
+        # utf-8-sig: upstream's `read_text` strips a byte-order mark before parsing
+        data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return "repo", ""
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        return None, f"{type(e).__name__}: {e}"
+    table = data.get("tickets", {})
+    store = table.get("store", "repo") if isinstance(table, dict) else "repo"
+    return (store if isinstance(store, str) and store else "repo"), ""
+
+
+def _probe_fault(path: Path, kind: Literal["file", "dir"]) -> tuple[bool, str]:
+    """Whether ``path`` is a ``kind`` entry, and "" or the stat fault that kept the
+    probe from finding out. Absence (ENOENT/ENOTDIR and kin) is a plain false; any
+    other OSError is reported, never raised and never folded into absence:
+    ``Path.is_file``/``is_dir`` raise it on 3.11–3.13 and answer false on 3.14."""
+    try:
+        mode = path.stat().st_mode
+    except OSError as e:
+        if e.errno in _ABSENCE_ERRNOS or getattr(e, "winerror", None) in _ABSENCE_WINERRORS:
+            return False, ""
+        return False, f"{type(e).__name__}: {e}"
+    except ValueError:
+        return False, ""
+    return (stat.S_ISREG(mode) if kind == "file" else stat.S_ISDIR(mode)), ""
+
+
+def _probe_unreadable(check: str, rel: str, fault: str) -> Finding:
+    return Finding(
+        check,
+        "problem",
+        f"{rel} could not be checked ({fault}) — fix its permissions or the filesystem "
+        "and re-run",
+        {"path": rel, "error": fault},
+    )
+
+
+def _tickets_store_findings(
+    paths: bmadconfig.ProjectPaths, isolation: str, extra_args_roles: Sequence[str]
+) -> list[Finding]:
+    """The store-topology findings for the active initiative's folder (it exists):
+    the classified layout (``tickets.store-topology``), or the refusal under the
+    check :attr:`ticketstore.StoreRefusal.check` names, plus the
+    ``tickets.store-sandbox`` warning when sessions write a shared store outside
+    their cwd while a role's ``extra_args`` replace the profile's bypass flags."""
+    result = ticketstore.assess_store(paths, isolation)
+    if result is None:
+        return []
+    conflict = ticketstore.store_topology_conflict(result)
+    detail: dict[str, object] = {
+        "path": str(paths.initiative_folder),
+        "repo_root": str(paths.repo_root),
+        "isolation": isolation,
+    }
+    if isinstance(result, ticketstore.StoreRefusal):
+        assert conflict is not None
+        return [Finding(result.check, "problem", conflict, {**detail, "refusal": result.code})]
+    findings = [
+        Finding(
+            "tickets.store-topology",
+            "ok" if conflict is None else "problem",
+            conflict or f"ticket store {ticketstore.describe_topology(result)}",
+            {**detail, "topology": result.to_dict()},
+        )
+    ]
+    outside_cwd = result.needs_redirect(isolation) or result.placement == "shared-outside"
+    if outside_cwd and extra_args_roles:
+        roles = ", ".join(extra_args_roles)
+        findings.append(
+            Finding(
+                "tickets.store-sandbox",
+                "warning",
+                f"sessions write the shared ticket store {result.store_root} outside their "
+                f"working directory, and `extra_args` for {roles} replace the profile's "
+                "sandbox-bypass flags — a sandboxed CLI may refuse those writes; keep the "
+                "bypass flags in `extra_args`",
+                {"store_root": str(result.store_root), "roles": list(extra_args_roles)},
+            )
+        )
+    return findings
+
+
+def tickets_preflight(
+    paths: bmadconfig.ProjectPaths,
+    trees: Sequence[str],
+    *,
+    probe_capability: bool,
+    branch_per: str | None = None,
+    isolation: str = "none",
+    extra_args_roles: Sequence[str] = (),
+) -> list[Finding]:
+    """Tickets mode's project checks, as :class:`Finding` s (``paths`` is the
+    paths loaded for tickets mode, ``trees`` the dev skill trees, ``branch_per``
+    the policy's ``[scm] branch_per``; None skips its check; ``isolation`` the
+    policy's ``[scm] isolation``; ``extra_args_roles`` the launch roles whose
+    resolved adapter sets ``extra_args``).
+
+    Static checks, in order: the script (``tickets.script-missing``), the BMad
+    config reader it imports (``tickets.config-utils-missing``), ``uv`` on PATH
+    (``tickets.uv-missing``: bmad-build-auto runs the script through uv even when
+    bmad-loop runs it directly), the active initiative (``tickets.initiative-unset``
+    / ``tickets.initiative-missing``), the store topology
+    (:func:`_tickets_store_findings`: ``tickets.store-topology``,
+    ``tickets.tree-untracked``, ``tickets.own-repo-isolation``,
+    ``tickets.workspace-unsupported``, and the ``tickets.store-sandbox`` warning),
+    a repo store (``tickets.store-not-repo``: tracker stores
+    are refused), and a warning for ``branch_per = "run"``
+    (``tickets.branch-per-run``: build-auto checks that the checked-out branch
+    fits the ticket, and one branch for the whole run may not). ``tickets.era`` is
+    the ok line that names what was found once the script is present.
+
+    ``probe_capability`` runs the script's ``--help`` and checks every verb and
+    ``mark`` status bmad-loop needs (``tickets.capability``). It executes the
+    project's script, so ``validate`` passes it only under ``--probes``; without
+    it ``tickets.capability-not-run`` says so. (``validate``'s ledger gate check,
+    not this preflight, runs ``tickets.py next`` without ``--probes``, and only
+    when an unlanded ledger entry declares a gate: ``cli._validate_hard_gates``.)"""
+    project = paths.project
+    findings: list[Finding] = []
+    script_ok, script_fault = _probe_fault(project / TICKETS_SCRIPT_REL, "file")
+    if script_fault:
+        findings.append(
+            _probe_unreadable("tickets.script-missing", TICKETS_SCRIPT_REL, script_fault)
+        )
+    elif not script_ok:
+        findings.append(
+            Finding(
+                "tickets.script-missing",
+                "problem",
+                f"{TICKETS_SCRIPT_REL} not found — tickets mode drives the BMAD v7 ticket "
+                "tree through it; install or update the BMad Method module (BMAD v7) "
+                "with `bmad setup`",
+                {"path": TICKETS_SCRIPT_REL},
+            )
+        )
+    utils_ok, utils_fault = _probe_fault(project / RENDERER_CONFIG_UTILS_REL, "file")
+    if utils_fault:
+        findings.append(
+            _probe_unreadable(
+                "tickets.config-utils-missing", RENDERER_CONFIG_UTILS_REL, utils_fault
+            )
+        )
+    elif not utils_ok:
+        findings.append(
+            Finding(
+                "tickets.config-utils-missing",
+                "problem",
+                f"{RENDERER_CONFIG_UTILS_REL} not found — tickets.py reads the BMad config "
+                "through it and exits with `cannot read the BMad config`; re-run "
+                "`bmad setup`",
+                {"path": RENDERER_CONFIG_UTILS_REL},
+            )
+        )
+    if shutil.which("uv") is None:
+        findings.append(
+            Finding(
+                "tickets.uv-missing",
+                "problem",
+                "uv not found on PATH — bmad-build-auto runs tickets.py with `uv run`; "
+                "install uv (https://docs.astral.sh/uv/)",
+                None,
+            )
+        )
+    if paths.era == "v7":
+        if not paths.active_initiative:
+            findings.append(
+                Finding(
+                    "tickets.initiative-unset",
+                    "problem",
+                    "no `[core] active_initiative` is set — tickets mode runs the active "
+                    "initiative's ticket tree; set one in "
+                    f"{bmadconfig.V7_CENTRAL_LAYERS_REL[-1].as_posix()} (or ask the `bmad` "
+                    "skill to switch it)",
+                    {"output_folder": str(paths.output_folder)},
+                )
+            )
+        else:
+            folder = paths.initiative_folder
+            folder_ok, folder_fault = (
+                _probe_fault(folder, "dir") if folder is not None else (False, "")
+            )
+            if folder_fault:
+                findings.append(
+                    _probe_unreadable("tickets.initiative-missing", str(folder), folder_fault)
+                )
+            elif not folder_ok:
+                findings.append(
+                    Finding(
+                        "tickets.initiative-missing",
+                        "problem",
+                        f"active initiative {paths.active_initiative!r} has no folder at "
+                        f"{paths.initiative_folder} — create it with the `bmad-ticket` "
+                        "skill, or switch `[core] active_initiative`",
+                        {
+                            "initiative": paths.active_initiative,
+                            "path": str(paths.initiative_folder),
+                        },
+                    )
+                )
+            else:
+                findings.extend(_tickets_store_findings(paths, isolation, extra_args_roles))
+    store, store_error = _ticket_store(project)
+    if store != "repo":
+        findings.append(
+            Finding(
+                "tickets.store-not-repo",
+                "problem",
+                (
+                    f"{TICKETS_STORE_CONFIG_REL} cannot be read ({store_error}), so the "
+                    "ticket store is unknown — bmad-loop drives only a repo store"
+                    if store is None
+                    else f"the ticket store is {store!r} ({TICKETS_STORE_CONFIG_REL}): "
+                    "tracker stores are not supported by bmad-loop — tickets mode needs "
+                    '`store = "repo"`'
+                ),
+                {"path": TICKETS_STORE_CONFIG_REL, "store": store},
+            )
+        )
+    if branch_per == "run":
+        findings.append(
+            Finding(
+                "tickets.branch-per-run",
+                "warning",
+                '`[scm] branch_per = "run"` runs every ticket on one branch — '
+                "bmad-build-auto checks that the checked-out branch fits the ticket "
+                "it builds and HALTs when it judges it does not; "
+                '`branch_per = "story"` gives each ticket its own branch',
+                {"branch_per": branch_per},
+            )
+        )
+    if not script_ok:
+        return findings
+    version = bmod_method_version(project, trees)
+    findings.insert(
+        0,
+        Finding(
+            "tickets.era",
+            "ok",
+            f"BMAD v7 ticket tree: {TICKETS_SCRIPT_REL} (method module "
+            f"{version or 'version unknown'}), initiative "
+            f"{paths.active_initiative or '(none)'}",
+            {
+                "era": paths.era,
+                "script": TICKETS_SCRIPT_REL,
+                "bmod_method_version": version,
+                "initiative": paths.active_initiative,
+            },
+        ),
+    )
+    if not probe_capability:
+        findings.append(
+            Finding(
+                "tickets.capability-not-run",
+                "ok",
+                "tickets.py capability not probed — it executes the project's script; "
+                "pass --probes to run it",
+                {"run": False},
+            )
+        )
+        return findings
+    try:
+        cap = tickettree.TicketTree(project).capability()
+    except tickettree.TicketsError as e:
+        findings.append(
+            Finding(
+                "tickets.capability",
+                "problem",
+                f"tickets.py could not be probed: {e}",
+                {"kind": e.kind},
+            )
+        )
+        return findings
+    missing = ticketmodel.capability_problems(cap)
+    if missing:
+        findings.append(
+            Finding(
+                "tickets.capability",
+                "problem",
+                f"{'; '.join(missing)} — update the BMad Method module",
+                {"problems": missing},
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "tickets.capability",
+                "ok",
+                f"tickets.py offers every command and status tickets mode needs "
+                f"({', '.join(sorted(cap.verbs))})",
+                {"verbs": sorted(cap.verbs), "statuses": sorted(cap.statuses)},
+            )
+        )
+    return findings
+
+
 # The one bundled skill a triage session dispatches (`/bmad-loop-sweep`). Named
 # here so the triage-tree preflight (:func:`missing_sweep_skill`) and its callers
 # spell it once; it is also a MODULE_SKILLS member, which is how `init` lays it down.
@@ -827,8 +1216,8 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                     "skills.base-missing",
                     "problem",
                     f"{tree}/{DEV_PRIMITIVE_NEW} not found — the orchestrator drives this "
-                    f"upstream dev primitive directly; it ships with the bmm module "
-                    f"(BMAD-METHOD >= 6.10.0); install or update bmm in this project "
+                    f"upstream dev primitive directly; it ships with {BMAD_FLOOR_TEXT}; "
+                    f"install or update bmm (on v7, method) in this project "
                     f"(older installs name it {DEV_PRIMITIVE_LEGACY})",
                     {"tree": tree, "skill": DEV_PRIMITIVE_NEW},
                 )
@@ -1300,10 +1689,10 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
             Finding(
                 "skills.base-missing",
                 "problem",
-                f"{tree}/{skill} not found — this review layer ships with the bmm module "
-                f"(BMAD-METHOD >= 6.10.0), as does the consolidated {MERGED_REVIEW_SKILL} "
-                f"skill that supersedes it in newer releases; install or update bmm in "
-                f"this project",
+                f"{tree}/{skill} not found — this review layer ships with "
+                f"{BMAD_FLOOR_TEXT}, as does the consolidated {MERGED_REVIEW_SKILL} "
+                f"skill that supersedes it in newer releases; install or update bmm "
+                f"(on v7, method) in this project",
                 {"tree": tree, "skill": skill},
             )
             for skill in sorted(_REVIEW_LAYER_SKILLS)

@@ -4,9 +4,11 @@ that simulate the side effects skill sessions would have on disk."""
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -22,13 +24,29 @@ import perf_report
 import pytest
 import yaml
 
-from bmad_loop import cli, documents, envvars, platform_util, runs, win32_at
+from bmad_loop import cli, documents, envvars, platform_util, runs, ticketmodel, win32_at
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
-from bmad_loop.journal import STATE_FILE, save_state
+from bmad_loop.journal import STATE_FILE, Journal, save_state
 from bmad_loop.model import PAUSE_ESCALATION, Phase, RunState, SessionRecord, StoryTask
 from bmad_loop.plugins.grants import GrantSet
+from bmad_loop.statemachine import PlanTransitionRefused, check_plan_transition
+from bmad_loop.ticketmodel import (
+    Capability,
+    EpicRow,
+    FindResult,
+    NextView,
+    StatusView,
+    TicketRow,
+)
+from bmad_loop.tickettree import (
+    PlanMark,
+    TicketsNoMatch,
+    TicketsPinMismatch,
+    TicketsPlanMismatch,
+    TicketsTransitionRefused,
+)
 from bmad_loop.verify import finalize_commit, rev_parse_head
 
 # The suite reads/writes UTF-8 files (specs, journals, JSON, reports). Windows'
@@ -850,7 +868,7 @@ def machine_json(argv, capsys, *, rc: int = 0, err_contains: str | None = None):
     return json.loads(out)
 
 
-def make_validate_document(findings, *, stories_on: bool = False, spec_folder: str = ""):
+def make_validate_document(findings, *, mode: str = "sprint", spec_folder: str = ""):
     """Build a REAL `validate --json` document from (check, severity, message,
     detail) tuples, for tests that need to *stub* one rather than run validate.
 
@@ -869,7 +887,7 @@ def make_validate_document(findings, *, stories_on: bool = False, spec_folder: s
     report = ValidationReport()
     for check, severity, message, detail in findings:
         report.add(check, severity, message, detail)
-    return documents.validate_document(report, stories_on, spec_folder)
+    return documents.validate_document(report, mode, spec_folder)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1078,6 +1096,13 @@ def _project_template(
     disposable copies via `project`. (Do not chmod it read-only either: copytree
     preserves modes, so the copies would inherit it and break every write.)"""
     root = seed_project_files(tmp_path_factory.mktemp("project-template") / "sandbox").project
+    _commit_template(root)
+    return root
+
+
+def _commit_template(root: Path) -> None:
+    """Turn a seeded template tree into its one-commit `main` repo: the setup every
+    session template shares, so the v7 template cannot drift from `_project_template`."""
     git(root, "init", "-q", "-b", "main")
     # `git init` seeds 14 dead `*.sample` hooks nothing here reads, and every test
     # replicated all 14 through `project`'s copytree. Drop the files only — NOT via
@@ -1102,7 +1127,6 @@ def _project_template(
     git(root, "config", "maintenance.auto", "false")
     git(root, "add", "-A")
     git(root, "commit", "-q", "-m", "initial")
-    return root
 
 
 def copy_project(template: Path, root: Path) -> ProjectPaths:
@@ -1145,6 +1169,83 @@ def project(tmp_path: Path, _project_template: Path) -> ProjectPaths:
     clone of the per-worker template, so no git subprocesses per test (git spawn
     plus fsync made this fixture ~3s per test on Windows CI)."""
     return copy_project(_project_template, tmp_path / "sandbox")
+
+
+V7_GITIGNORE = ".bmad-loop/runs/\n_bmad/custom/*.user.toml\n"
+
+
+@pytest.fixture(scope="session")
+def _project_template_v7(
+    tmp_path_factory: pytest.TempPathFactory, _isolate_ambient_git_ignores: None
+) -> Path:
+    """The v7 twin of `_project_template`, built once per xdist worker and never
+    handed to a test: a committed v7 install with `DEFAULT_TREE` as a tracked store
+    inside the checkout (layout T1, upstream's default). The personal config layer is
+    gitignored as `bmad setup` leaves it, so it exists in every copy but is never
+    committed — which is what makes a worktree miss `active_initiative`."""
+    root = tmp_path_factory.mktemp("project-template-v7") / "sandbox"
+    root.mkdir()
+    (root / "src.txt").write_text("original\n", encoding="utf-8")
+    (root / ".gitignore").write_text(V7_GITIGNORE, encoding="utf-8")
+    write_ticket_tree(install_bmad_v7(root), DEFAULT_TREE)
+    _commit_template(root)
+    return root
+
+
+@pytest.fixture
+def project_v7(tmp_path: Path, _project_template_v7: Path) -> V7Layout:
+    """A private copytree of the v7 template at `tmp_path / "sandbox"`, like `project`."""
+    root = tmp_path / "sandbox"
+    shutil.copytree(_project_template_v7, root)
+    return v7_layout(root)
+
+
+def _store_repo(store: Path) -> None:
+    """Make ``store`` its own git repository with its contents committed."""
+    git(store, "init", "-q", "-b", "main")
+    git(store, "config", "user.email", "store@example.invalid")
+    git(store, "config", "user.name", "store")
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "store")
+
+
+@pytest.fixture
+def project_v7_store_repo(project_v7: V7Layout) -> Iterator[V7Layout]:
+    """`project_v7` with the ticket store (`_bmad-output`) turned into its own git
+    repository NESTED in the code checkout and gitignored by it — layout T3. The
+    code repo stops tracking the store (one commit), the store repo commits it."""
+    root, rel = project_v7.project, project_v7.output_folder.relative_to(project_v7.project)
+    git(root, "rm", "-r", "-q", "--cached", rel.as_posix())
+    with (root / ".gitignore").open("a", encoding="utf-8") as f:
+        f.write(f"/{rel.as_posix()}/\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-q", "-m", "the store is its own repository")
+    _store_repo(project_v7.output_folder)
+    yield project_v7
+    remove_tree(project_v7.output_folder / ".git")
+
+
+@pytest.fixture
+def project_v7_external_store(project_v7: V7Layout, tmp_path: Path) -> Iterator[V7Layout]:
+    """`project_v7` with the ticket store moved OUTSIDE the project into its own git
+    repository and `output_folder` set to its absolute path — layout T4."""
+    root = project_v7.project
+    rel = project_v7.output_folder.relative_to(root).as_posix()
+    store = tmp_path / "store"
+    shutil.move(str(project_v7.output_folder), str(store))
+    config = root / "_bmad" / "config.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            '"{project-root}/_bmad-output"', json.dumps(str(store))
+        ),
+        encoding="utf-8",
+    )
+    git(root, "rm", "-r", "-q", "--cached", rel)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "the store moved out")
+    _store_repo(store)
+    yield v7_layout(root, initiative=project_v7.initiative, output_folder=str(store))
+    remove_tree(store / ".git")
 
 
 @pytest.fixture
@@ -1556,6 +1657,640 @@ def install_bmad_central_config(paths: ProjectPaths) -> None:
     (bmad / "custom" / "config.user.toml").write_text(CENTRAL_CUSTOM_USER_STUB, encoding="utf-8")
 
 
+# BMAD-METHOD v7: the initiative ticket tree. `tests/fixtures/bmad_v7` holds upstream's
+# `tickets.py` and `config_utils.py` byte-for-byte at the commit `PIN.toml` names, so
+# every v7 sandbox runs the real script with no network and no `uv`. The layout below
+# is what upstream's `bmad setup` writes (`skills/bmad/assets/config.template.toml`,
+# `skills/bmad/references/initiative.md`) and what `tickets.py` reads: the three
+# config layers via `_bmad/scripts/config_utils.py`, `[core] active_initiative` in the
+# personal (gitignored) layer, and `{output_folder}/{initiative}/` as the tree.
+V7_FIXTURE = Path(__file__).parent / "fixtures" / "bmad_v7"
+V7_TICKETS_REL = Path("_bmad") / "method" / "scripts" / "tickets.py"
+V7_CONFIG_UTILS_REL = Path("_bmad") / "scripts" / "config_utils.py"
+V7_USER_CONFIG_REL = Path("_bmad") / "custom" / "config.user.toml"
+V7_STORE_CONFIG_REL = Path("_bmad") / "custom" / "ticketing-store-config.toml"
+V7_DEFAULT_INITIATIVE = "initiative-demo"
+
+
+@dataclass(frozen=True)
+class EntrySpec:
+    """One `[[entry]]` of an epic's `tickets.toml`. ``after`` holds upstream refs: a
+    bare int is a sibling id, ``"E.M"`` another epic's entry, ``"epic-<x>"`` a whole
+    epic. ``refine=None`` leaves the key out (upstream then refines bugs only).
+    ``refined=True`` also writes the pulled leaf file with ``refined: true``, the only
+    way upstream ever reports a ticket as refined."""
+
+    id: int
+    title: str
+    type: str = "story"
+    after: tuple[int | str, ...] = ()
+    hitl: bool = False
+    refine: bool | None = None
+    refined: bool = False
+    plan_checkpoint: bool = False
+    done_checkpoint: bool = False
+
+
+@dataclass(frozen=True)
+class EpicSpec:
+    """One epic folder. ``slug`` is the folder name (``epic-<x>``), which is also
+    upstream's `[[epic]] slug`. ``gated_by`` names epic slugs that must be closed
+    (`status: done` in their epic file) first: it is written as the epic file's
+    `after:`, the only epic gate `next` enforces, plus the advisory initiative-level
+    `after` that keeps `unpinned_after` empty."""
+
+    id: int
+    slug: str
+    title: str
+    entries: tuple[EntrySpec, ...]
+    gated_by: tuple[str, ...] = ()
+    status: str = "in-progress"
+
+
+@dataclass(frozen=True)
+class V7Layout:
+    project: Path
+    initiative: str
+    output_folder: Path
+    initiative_folder: Path
+    tickets_script: Path
+    store: str
+
+
+# 2 epics x 2 entries, one of each kind a tickets run treats differently, in build
+# order: 1.1 is the only ready ticket (an unrefined plan_checkpoint, so two legs, and
+# a done_checkpoint); 1.2 waits on 1.1 and is hitl; epic 2 is gated on epic 1's
+# closure; 2.1 is a refined plan_checkpoint; 2.2 is a bug, so it needs refinement.
+DEFAULT_TREE: tuple[EpicSpec, ...] = (
+    EpicSpec(
+        1,
+        "epic-cart",
+        "Cart",
+        (
+            EntrySpec(1, "Cart model", plan_checkpoint=True, done_checkpoint=True),
+            EntrySpec(2, "Cart rules", after=(1,), hitl=True),
+        ),
+    ),
+    EpicSpec(
+        2,
+        "epic-checkout",
+        "Checkout",
+        (
+            EntrySpec(1, "Checkout form", plan_checkpoint=True, refined=True),
+            EntrySpec(2, "Checkout crash", type="bug", after=(1,)),
+        ),
+        gated_by=("epic-cart",),
+    ),
+)
+
+
+def v7_layout(
+    root: Path,
+    *,
+    initiative: str = V7_DEFAULT_INITIATIVE,
+    output_folder: str = "_bmad-output",
+    store: str = "repo",
+) -> V7Layout:
+    """The paths `install_bmad_v7` writes under ``root``, computed without touching disk."""
+    out = Path(output_folder) if Path(output_folder).is_absolute() else root / output_folder
+    return V7Layout(
+        project=root,
+        initiative=initiative,
+        output_folder=out,
+        initiative_folder=out / initiative,
+        tickets_script=root / V7_TICKETS_REL,
+        store=store,
+    )
+
+
+def install_bmad_v7(
+    root: Path,
+    *,
+    initiative: str = V7_DEFAULT_INITIATIVE,
+    output_folder: str = "_bmad-output",
+    store: str = "repo",
+    bmod_version: str = "7.0.0",
+    skill_tree: str = ".claude/skills",
+) -> V7Layout:
+    """Install a v7 project under ``root``: the config layers, the vendored scripts at
+    their installed paths, the `bmod-method` module record and the store config, plus
+    an empty initiative folder. No tree: `write_ticket_tree` writes that."""
+    layout = v7_layout(root, initiative=initiative, output_folder=output_folder, store=store)
+    bmad = root / "_bmad"
+    (bmad / "custom").mkdir(parents=True, exist_ok=True)
+    folder = (
+        output_folder if Path(output_folder).is_absolute() else f"{{project-root}}/{output_folder}"
+    )
+    (bmad / "config.toml").write_text(
+        f"[core]\nproject_name = {json.dumps(root.name)}\noutput_folder = {json.dumps(folder)}\n",
+        encoding="utf-8",
+    )
+    (bmad / "custom" / "config.toml").write_text(CENTRAL_CUSTOM_STUB, encoding="utf-8")
+    (root / V7_USER_CONFIG_REL).write_text(
+        f"[core]\nactive_initiative = {json.dumps(initiative)}\n", encoding="utf-8"
+    )
+    (root / V7_STORE_CONFIG_REL).write_text(
+        f"[tickets]\nstore = {json.dumps(store)}\n", encoding="utf-8"
+    )
+    for rel, name in ((V7_CONFIG_UTILS_REL, "config_utils.py"), (V7_TICKETS_REL, "tickets.py")):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(V7_FIXTURE / name, root / rel)
+    record = root / skill_tree / "bmod-method" / "bmod.toml"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(
+        "[bmod]\n"
+        'code = "method"\n'
+        f"version = {json.dumps(bmod_version)}\n"
+        'update_source = "github:bmad-code-org/BMAD-METHOD/skills"\n'
+        'skills = ["bmad-build-auto", "bmad-ticket"]\n',
+        encoding="utf-8",
+    )
+    layout.initiative_folder.mkdir(parents=True, exist_ok=True)
+    return layout
+
+
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    raise TypeError(f"no TOML rendering for {value!r}")
+
+
+def _frontmatter_value(value: object) -> str:
+    """A value as upstream's frontmatter parser reads it: inline lists, bare
+    true/false and ints, and plain text."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(str(v) for v in value) + "]"
+    return str(value)
+
+
+def _frontmatter(fields: dict[str, object], body: str) -> str:
+    lines = "".join(f"{k}: {_frontmatter_value(v)}\n" for k, v in fields.items())
+    return f"---\n{lines}---\n\n{body}"
+
+
+def ticket_slug(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+
+def write_ticket_tree(layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicSpec]) -> None:
+    """Hand-write the initiative's breakdown: its own frontmatter file, the
+    `[[epic]]` table in build order, and per epic its `epic-<x>.md` and `tickets.toml`
+    (plus a pulled leaf file for every ``refined`` entry). Plans are separate:
+    `write_plan`."""
+    folder = layout.initiative_folder
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{layout.initiative}.md").write_text(
+        _frontmatter(
+            {"type": "initiative", "title": layout.initiative, "parent": "none"},
+            f"# {layout.initiative}\n",
+        ),
+        encoding="utf-8",
+    )
+    ids = {epic.slug: epic.id for epic in epics}
+    table = []
+    for epic in epics:
+        block = f"[[epic]]\nid = {epic.id}\nslug = {json.dumps(epic.slug)}\n"
+        if epic.gated_by:
+            gates = ", ".join(
+                f"{{ epic = {ids[g]}, needs = {json.dumps(f'{g} closed')} }}" for g in epic.gated_by
+            )
+            block += f"after = [{gates}]\n"
+        table.append(block)
+    (folder / "tickets.toml").write_text("\n".join(table), encoding="utf-8")
+    for epic in epics:
+        epic_dir = folder / epic.slug
+        epic_dir.mkdir(exist_ok=True)
+        fields: dict[str, object] = {"type": "epic", "title": epic.title, "status": epic.status}
+        if epic.gated_by:
+            fields["after"] = list(epic.gated_by)
+        (epic_dir / f"{epic.slug}.md").write_text(
+            _frontmatter(fields, f"# {epic.title}\n"), encoding="utf-8"
+        )
+        entries = []
+        for e in epic.entries:
+            block = (
+                f"[[entry]]\nid = {e.id}\ntype = {json.dumps(e.type)}\n"
+                f"title = {json.dumps(e.title, ensure_ascii=False)}\n"
+            )
+            if e.after:
+                block += f"after = {_toml_value(e.after)}\n"
+            for key in ("hitl", "plan_checkpoint", "done_checkpoint"):
+                if getattr(e, key):
+                    block += f"{key} = true\n"
+            if e.refine is not None:
+                block += f"refine = {_toml_value(e.refine)}\n"
+            entries.append(block)
+            if e.refined:
+                (epic_dir / f"{e.type}-{ticket_slug(e.title)}.md").write_text(
+                    _frontmatter(
+                        {
+                            "id": e.id,
+                            "type": e.type,
+                            "title": json.dumps(e.title, ensure_ascii=False),
+                            "parent": epic.slug,
+                            "after": list(e.after),
+                            "refined": True,
+                            "hitl": e.hitl,
+                        },
+                        f"# {e.title}\n",
+                    ),
+                    encoding="utf-8",
+                )
+        (epic_dir / "tickets.toml").write_text("\n".join(entries), encoding="utf-8")
+
+
+def write_plan(
+    layout: V7Layout, epic_slug: str, stem: str, ticket: int | str, status: str, **fm: object
+) -> Path:
+    """Write ``<epic>/<stem>.md``, a build plan for entry ``ticket``, with frontmatter
+    `ticket` and `status` plus ``fm``. Upstream names plans
+    ``<type>-<title slug>-plan.md``; pass that stem to look like a real build."""
+    path = layout.initiative_folder / epic_slug / f"{stem}.md"
+    fields: dict[str, object] = {"ticket": ticket, "status": status, **fm}
+    path.write_text(_frontmatter(fields, f"# {stem}\n"), encoding="utf-8")
+    return path
+
+
+def run_tickets(layout: V7Layout, *argv: str, rc: int = 0) -> dict[str, object]:
+    """Run the sandbox's installed `tickets.py` the way bmad-loop will (isolated, no
+    bytecode, UTF-8 mode) and return its JSON document: stdout on rc 0, stderr
+    otherwise. Every call is a real spawn: count it against the calling file's
+    real-spawn budget."""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-X",
+            "utf8",
+            str(layout.tickets_script),
+            "--project-root",
+            str(layout.project),
+            *argv,
+        ],
+        cwd=layout.project,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert proc.returncode == rc, f"tickets.py {argv}: rc {proc.returncode}\n{proc.stderr}"
+    doc = json.loads(proc.stdout if rc == 0 else proc.stderr)
+    assert isinstance(doc, dict)
+    return doc
+
+
+# ---- FakeTicketTree: the in-memory `tickettree.TicketTreeLike` engine tests inject.
+
+_FAKE_STATE_OF = {
+    "": "planned",
+    "draft": "backlog",
+    "ready-for-dev": "backlog",
+    "in-progress": "in-progress",
+    "blocked": "in-progress",
+    "in-review": "review",
+    "built": "review",
+    "done": "done",
+    "dropped": "dropped",
+    # a build session's own park token: upstream reads it as an unknown status (a
+    # `problems` row) and forces the ticket to blocked, which `state` derives as
+    # in-progress. The fake's `mark` still decides on it natively, as the real
+    # chokepoint reads the plan's own `status`.
+    "awaiting-operator": "in-progress",
+}
+
+
+def ticket_row(
+    ref: str, *, epic: str = "epic-cart", status: str = "", **fields: object
+) -> TicketRow:
+    """A `TicketRow` with upstream-shaped defaults: ``ref`` ``"E.M"`` gives id
+    ``M``, the title is derived from the ref, and ``state`` follows ``status``
+    (``planned`` with no plan). Any field can be overridden."""
+    _, _, n = ref.rpartition(".")
+    base: dict[str, object] = {
+        "ref": ref,
+        "epic": epic,
+        "id": n or ref,
+        "file": None,
+        "type": "story",
+        "tracker_id": "",
+        "title": f"Ticket {ref}",
+        "status": status,
+        "tracker_status": "",
+        "state": _FAKE_STATE_OF[status],
+        "assignee": "",
+        "hitl": False,
+        "risk": "",
+        "refine": False,
+        "refined": False,
+        "blocked_at": "",
+        "blocked_reason": "",
+        "after": (),
+        "gated_by": (),
+        "waiting_on": (),
+        "unknown": "",
+        "plan_checkpoint": False,
+        "done_checkpoint": False,
+        "drift": False,
+        "blocks": (),
+    }
+    base.update(fields)
+    return TicketRow(**base)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class FakeMark:
+    """One `FakeTicketTree.mark` call the transition table let through, as
+    recorded (``outcome`` is ``written`` or ``noop``)."""
+
+    ref: str
+    target: str
+    reason: str
+    expected_plan: Path | None
+    blocked: str | None
+    outcome: str = "written"
+
+
+class FakeTicketTree:
+    """An in-memory `tickettree.TicketTreeLike`: canned views, find results keyed
+    by ref, recorded calls and marks, and configurable faults — so engine tests
+    never spawn `tickets.py`.
+
+    Build it with `from_rows` (groups as `next` would print them; `status` lists
+    every row; `find` answers each row's ref with a plan path under
+    ``project_root/_bmad-output/<initiative>/<epic>/``), or pass views directly.
+    ``faults[verb]`` (``"next"``, ``"status"``, ``"find"``, ``"capability"``,
+    ``"mark"``, ``"discard"``, ``"restore"``) is raised on every call of that
+    verb until removed. Writes run the real `statemachine.check_plan_transition`
+    on the row's status (a row with status ``""`` has no plan), so an engine test
+    sees the same refusals and no-ops as the real chokepoint. With a
+    ``pinned_initiative``, set ``live_initiative`` to simulate the operator
+    switching initiatives: every tree read then raises `TicketsPinMismatch`
+    before recording a call, as the real tree refuses before spawning."""
+
+    def __init__(
+        self,
+        project_root: Path = Path("."),
+        *,
+        next_view: NextView | None = None,
+        status_view: StatusView | None = None,
+        finds: dict[str, FindResult] | None = None,
+        capability: Capability | None = None,
+        pinned_initiative: str | None = None,
+    ) -> None:
+        self._project_root = Path(project_root)
+        self._pinned_initiative = pinned_initiative
+        self.live_initiative: str | None = pinned_initiative
+        self.next_view = next_view or fake_next_view()
+        self.status_view = status_view or fake_status_view(())
+        self.finds: dict[str, FindResult] = dict(finds or {})
+        self.cap = capability or Capability(
+            verbs=frozenset({"next", "status", "find", "pull", "mark", "mirror"}),
+            statuses=frozenset(ticketmodel.PLAN_STATUSES),
+            requires_python=">=3.11",
+        )
+        self.faults: dict[str, Exception] = {}
+        self.calls: list[tuple[str, ...]] = []
+        self.marks: list[FakeMark] = []
+        self.discards: list[str] = []
+        self.restores: list[tuple[Path, bytes | None]] = []
+
+    @classmethod
+    def from_rows(
+        cls,
+        project_root: Path = Path("."),
+        *,
+        initiative: str = V7_DEFAULT_INITIATIVE,
+        ready_to_refine: tuple[TicketRow, ...] = (),
+        ready_to_start: tuple[TicketRow, ...] = (),
+        in_progress: tuple[TicketRow, ...] = (),
+        blocked: tuple[TicketRow, ...] = (),
+        others: tuple[TicketRow, ...] = (),
+        pinned_initiative: str | None = None,
+    ) -> FakeTicketTree:
+        """``others`` are rows `next` does not list (done, dropped) but `status`
+        and `find` do."""
+        project_root = Path(project_root)
+        rows = (*ready_to_refine, *ready_to_start, *in_progress, *blocked, *others)
+        folder = project_root / "_bmad-output" / initiative
+        return cls(
+            project_root,
+            next_view=fake_next_view(
+                folder=initiative,
+                ready_to_refine=ready_to_refine,
+                ready_to_start=ready_to_start,
+                in_progress=in_progress,
+                blocked=blocked,
+            ),
+            status_view=fake_status_view(rows, folder=initiative),
+            finds={r.ref: fake_find(r, folder / r.epic) for r in rows if r.ref is not None},
+            pinned_initiative=pinned_initiative,
+        )
+
+    @property
+    def project_root(self) -> Path:
+        return self._project_root
+
+    @property
+    def pinned_initiative(self) -> str | None:
+        return self._pinned_initiative
+
+    def _enter(self, verb: str, *args: str, tree: bool = True) -> None:
+        if (
+            tree
+            and self._pinned_initiative is not None
+            and self.live_initiative != self._pinned_initiative
+        ):
+            raise TicketsPinMismatch(self._pinned_initiative, self.live_initiative)
+        self.calls.append((verb, *args))
+        fault = self.faults.get(verb)
+        if fault is not None:
+            raise fault
+
+    def capability(self) -> Capability:
+        self._enter("capability", tree=False)
+        return self.cap
+
+    def next(self) -> NextView:
+        self._enter("next")
+        return self.next_view
+
+    def status(self, folder: Path | None = None) -> StatusView:
+        self._enter("status", *(() if folder is None else (str(folder),)))
+        return self.status_view
+
+    def find(self, ref: str) -> FindResult:
+        self._enter("find", ref)
+        try:
+            return self.finds[ref]
+        except KeyError:
+            raise TicketsNoMatch(f"no ticket matches {ref!r}") from None
+
+    def _write_target(self, ref: str, expected_plan: Path | None) -> FindResult:
+        found = self.find(ref)
+        self.calls.pop()  # the inner find is not a call of its own
+        if expected_plan is not None and Path(found.plan) != Path(expected_plan):
+            raise TicketsPlanMismatch(
+                f"{ref}: find names plan {found.plan}, expected {expected_plan}"
+            )
+        return found
+
+    def mark(
+        self,
+        ref: str,
+        target: str,
+        *,
+        reason: str,
+        expected_plan: Path | None = None,
+        blocked: str | None = None,
+        journal: Journal | None = None,
+    ) -> PlanMark:
+        """Decide the mark with the real transition table, record it, and reflect
+        a write in `find` (status, blocked fields). ``expected_plan`` None skips
+        the cross-check; a ``journal`` gets the real chokepoint's ``ticket-mark``."""
+        self._enter("mark", ref, target)
+        found = self._write_target(ref, expected_plan)
+        row = found.row
+        try:
+            write = check_plan_transition(
+                ref,
+                row.status,
+                target,
+                reason,  # type: ignore[arg-type]
+                has_plan=row.status != "",
+                blocked_reason=row.blocked_reason,
+                blocked=blocked,
+                blocked_at=row.blocked_at,
+            )
+        except PlanTransitionRefused as e:
+            raise TicketsTransitionRefused(e.ref, e.current, e.target, e.reason, e.why) from e
+        outcome = "written" if write else "noop"
+        self.marks.append(FakeMark(ref, target, reason, expected_plan, blocked, outcome))
+        if write:
+            row = dataclasses.replace(
+                row,
+                status=target,
+                state=_FAKE_STATE_OF[target],
+                blocked_at="2026-01-01" if blocked is not None else "",
+                blocked_reason=blocked or "",
+            )
+            self.finds[ref] = dataclasses.replace(found, row=row)
+        if journal is not None:
+            journal.append(
+                "ticket-mark",
+                ref=ref,
+                reason=reason,
+                before=found.row.status,
+                after=row.status,
+                outcome=outcome,
+                created=False,
+                plan=found.plan,
+            )
+        return PlanMark(ref, Path(found.plan), found.row.status, row.status, outcome)
+
+    def discard_unbuilt_plan(
+        self, ref: str, expected_plan: Path | None = None, journal: Journal | None = None
+    ) -> PlanMark:
+        """Record the discard and reset the row to "no plan" (the fake has no
+        plan bodies, so every plan counts as frontmatter-only)."""
+        self._enter("discard", ref)
+        found = self._write_target(ref, expected_plan)
+        before = found.row.status
+        if before == "":
+            return PlanMark(ref, Path(found.plan), "", "", "noop")
+        try:
+            check_plan_transition(
+                ref,
+                before,
+                "ready-for-dev",
+                "rollback",
+                has_plan=True,
+                blocked_reason=found.row.blocked_reason,
+            )
+        except PlanTransitionRefused as e:
+            raise TicketsTransitionRefused(e.ref, e.current, "", e.reason, e.why) from e
+        self.discards.append(ref)
+        row = dataclasses.replace(found.row, status="", state="planned")
+        self.finds[ref] = dataclasses.replace(found, row=row)
+        return PlanMark(ref, Path(found.plan), before, "", "discarded")
+
+    def restore_preimage(
+        self, plan: Path, data: bytes | None, journal: Journal | None = None
+    ) -> None:
+        """Record the restore; the fake does not touch disk."""
+        self._enter("restore", str(plan), tree=False)
+        self.restores.append((Path(plan), data))
+
+
+def fake_next_view(
+    *,
+    store: str = "repo",
+    folder: str = V7_DEFAULT_INITIATIVE,
+    ready_to_refine: tuple[TicketRow, ...] = (),
+    ready_to_start: tuple[TicketRow, ...] = (),
+    in_progress: tuple[TicketRow, ...] = (),
+    blocked: tuple[TicketRow, ...] = (),
+) -> NextView:
+    return NextView(
+        store=store,
+        folder=folder,
+        ready_to_refine=ready_to_refine,
+        ready_to_start=ready_to_start,
+        in_progress=in_progress,
+        blocked=blocked,
+        problems=(),
+        unpinned_after=(),
+        undeclared_after=(),
+        order_conflict=(),
+    )
+
+
+def fake_status_view(
+    tickets: tuple[TicketRow, ...],
+    *,
+    store: str = "repo",
+    folder: str = V7_DEFAULT_INITIATIVE,
+    epics: tuple[EpicRow, ...] = (),
+) -> StatusView:
+    counts: dict[str, int] = {"total": len(tickets)}
+    for t in tickets:
+        counts[t.state] = counts.get(t.state, 0) + 1
+    return StatusView(
+        store=store,
+        folder=folder,
+        tickets=tickets,
+        counts=counts,
+        epics=epics,
+        next_id=None,
+        longest_remaining_chain=(),
+        problems=(),
+    )
+
+
+def fake_find(row: TicketRow, epic_dir: Path) -> FindResult:
+    """`find`'s answer for ``row``: the plan where a build would write it
+    (``<type>-<title slug>-plan.md`` in ``epic_dir``), the epic file beside it."""
+    return FindResult(
+        row=row,
+        folder=row.epic,
+        description="",
+        verify="",
+        references=(),
+        notes=(),
+        unknown=row.unknown,
+        epic_file=str(epic_dir / f"{row.epic}.md"),
+        story_file=str(epic_dir / row.file) if row.file else None,
+        plan=str(epic_dir / f"{row.type}-{ticket_slug(row.title)}-plan.md"),
+    )
+
+
 def _write_skill_stubs(skills: Path, catalog: dict) -> None:
     """Stub every skill in `catalog` (an install.py {skill: marker_files} map) under
     `skills`. Reading the catalog instead of restating it means a newly required
@@ -1709,6 +2444,31 @@ def install_build_auto_skill(
     if folder_id:
         (primitive / STORIES_PROBE_FILE).write_text(
             f"This is a **{STORIES_PROBE_TEXT}** router.\n", encoding="utf-8"
+        )
+    return skills
+
+
+def install_build_auto_v7_skill(
+    root: Path, tree: str = ".claude/skills", *, tickets_route: bool = True
+) -> Path:
+    """The BMAD v7 `bmad-build-auto`: :func:`install_build_auto_skill` (so the base
+    and stories probes pass too) with a step-01 that also resolves a ticket from the
+    tree, carrying the marker `install.missing_tickets_support` content-probes for.
+    ``tickets_route=False`` leaves the pre-v7 step-01, the stale install."""
+    from bmad_loop.install import (
+        DEV_PRIMITIVE_NEW,
+        STORIES_PROBE_TEXT,
+        TICKETS_PROBE_FILE,
+        TICKETS_PROBE_TEXT,
+    )
+
+    skills = install_build_auto_skill(root, tree, folder_id=True)
+    if tickets_route:
+        (skills / DEV_PRIMITIVE_NEW / TICKETS_PROBE_FILE).write_text(
+            f"This is a **{STORIES_PROBE_TEXT}** router.\n"
+            f"Resolve a ticket with `uv run {{project-root}}/_bmad/{TICKETS_PROBE_TEXT} "
+            "--project-root {project-root} find <ref>`.\n",
+            encoding="utf-8",
         )
     return skills
 

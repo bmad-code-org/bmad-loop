@@ -1,15 +1,17 @@
 """Deterministic reading and editing of the deferred-work ledger.
 
-The ledger (`{implementation_artifacts}/deferred-work.md`) is append-only
-markdown in the canonical form documented at
+The ledger (`{implementation_artifacts}/deferred-work.md`; on a BMAD v7 project
+that is the active initiative folder, or `output_folder` when none is active) is
+append-only markdown in the canonical form documented at
 bmad-loop-sweep/deferred-work-format.md: `### DW-<seq>: <title>` headings with
 `origin:`/`location:`/`reason:`/`status:` field lines. The one sanctioned
 rewrite is :func:`archive_closed`, which moves closed entries verbatim to a
 sibling archive file and leaves id-preserving stubs. Pre-#2651 dev primitives
-and the attended `bmad-build` append flatter entries here directly, which the
-orchestrator normalizes on sweep; the current unattended primitive records its
-findings in the spec's frontmatter instead and the engine harvests them into
-canonical entries. The
+and the attended `bmad-build` append flatter entries here directly (opened by
+`- source_spec:`, or `- source_plan:` on v7), which the orchestrator normalizes
+on sweep; the current unattended primitive records its findings in the spec's
+(on v7, the plan's) frontmatter instead and the engine harvests them into
+canonical entries, whose `source_spec:` field keeps its name in every era. The
 orchestrator never trusts an LLM to have edited it — status flips and decision
 records happen here, and gates re-read the file from disk.
 
@@ -176,6 +178,7 @@ from dataclasses import dataclass
 from datetime import date as calendar_date
 from pathlib import Path
 from stat import S_ISREG
+from typing import Literal
 
 from . import sprintstatus
 from .fences import fenced_spans
@@ -481,7 +484,11 @@ ANY_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?=[ \t]|$)", re.MULTILINE)
 # Keyed on the opening line alone, deliberately: also requiring the block's
 # `summary:`/`evidence:` lines would narrow the boundary below the parser's own
 # recognition, leaving the bug in place for every partial shape it accepts.
-_FLAT_SOURCE_BODY = r"source_spec:[ \t]"
+# Two keys open the block: v6's `source_spec:` and the v7 attended `bmad-build`'s
+# `source_plan:`. Matching only the first absorbed a v7 append into the canonical
+# entry above it, its `status:` and `gate:` lines included. The canonical field
+# stays `source_spec:` in every era; only the flat opener has two spellings.
+_FLAT_SOURCE_BODY = r"source_(?:spec|plan):[ \t]"
 FLAT_ENTRY_RE = re.compile(rf"^[-*][ \t]+{_FLAT_SOURCE_BODY}", re.IGNORECASE | re.MULTILINE)
 STATUS_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
 # The mechanical half of a hard gate. An entry could always *say* it blocked a
@@ -537,6 +544,25 @@ _SPLITTABLE_TOKEN_RE = re.compile(r"^\d+-\d+$")
 # rather than *accepted*, because accepting an indented line would read a fenced
 # example inside an entry as a live gate and refuse a story nobody meant to block.
 _GATE_NEAR_RE = re.compile(r"^[ \t]*gate[ \t]*:", re.IGNORECASE | re.MULTILINE)
+# Which key grammar a `gate:` token is read under. A parameter, not a union of the
+# two: a ticket ref accepted on a sprint project (`gate: 1.2`) would be a "valid"
+# token no story key can ever match — the field's own silent no-op — so each queue
+# admits only the shapes its own keys can take.
+GateGrammar = Literal["story", "ticket"]
+# The three token shapes a dispatched BMAD v7 ticket answers to (`tickets.py`, whose
+# `<ref>` and `after` grammar these mirror). Copied rather than imported for the
+# same reason as `_STORIES_ID_RE`: the project's `tickets.py` is a script, not a
+# module, and the copies are pinned to the vendored upstream by a drift test.
+#
+# `E.M`: an entry of an epic the initiative lists (`CROSS_RE`) — the unit key.
+_TICKET_REF_RE = re.compile(r"^([0-9A-Za-z]+)\.([0-9A-Za-z]+)$")
+# A bare id (`ID_RE`): under a gate, the epic with that id in the initiative table.
+_TICKET_ID_RE = re.compile(r"^[0-9A-Za-z]+$")
+# An epic folder (`EPIC_RE`), `epic-<slug>`: that whole epic.
+_EPIC_FOLDER_RE = re.compile(r"^epic-[^/]+$")
+# Ids `ID_RE` admits but `tickets.py` `_id` refuses: frontmatter reads a bare
+# `true` / `false` as a boolean, so no epic or ticket can carry either id.
+_TICKET_BOOLEAN_IDS = frozenset({"true", "false"})
 # The prose convention `gate:` replaces, matched anywhere on a line rather than
 # at its start: real ledgers hard-wrap their `reason:` prose, so the declaration
 # routinely lands mid-line and a line-anchored pattern misses exactly the entries
@@ -821,7 +847,7 @@ def declares_prose_gate(entry: DWEntry) -> bool:
     return any(not _quoted(entry, m.start()) for m in HARD_GATE_PROSE_RE.finditer(entry.body))
 
 
-def gates(entry: DWEntry) -> EntryGates:
+def gates(entry: DWEntry, *, grammar: GateGrammar = "story") -> EntryGates:
     """Every ``gate:`` token in one entry's canonical span, order-preserving.
 
     Multiple ``gate:`` lines union: an entry blocking three stories may list them
@@ -840,6 +866,10 @@ def gates(entry: DWEntry) -> EntryGates:
     :data:`_GATE_NEAR_RE`). They are counted rather than parsed so the operator is
     told the spelling gated nothing — the same trade the space-separated token
     makes, one level up.
+
+    ``grammar`` decides which tokens are matchable (see :func:`_matchable_token`):
+    the story grammar of the sprint and stories queues, or the ticket grammar of
+    a tickets run. A token the chosen grammar cannot match is ``malformed``.
     """
     tokens: list[str] = []
     malformed: list[str] = []
@@ -859,7 +889,7 @@ def gates(entry: DWEntry) -> EntryGates:
             if not token:
                 continue
             named = True
-            bucket = tokens if _matchable_token(token) else malformed
+            bucket = tokens if _matchable_token(token, grammar) else malformed
             if token not in bucket:
                 bucket.append(token)
         if not named:
@@ -915,16 +945,32 @@ def field_values(entry: DWEntry, field: str) -> tuple[str, ...]:
     return tuple(values)
 
 
-def _matchable_token(token: str) -> bool:
-    """Whether ``token`` could gate any legal story key — the test that decides
-    :attr:`EntryGates.tokens` vs :attr:`EntryGates.malformed`.
+def _matchable_token(token: str, grammar: GateGrammar = "story") -> bool:
+    """Whether ``token`` could gate any legal key of ``grammar``'s queue — the
+    test that decides :attr:`EntryGates.tokens` vs :attr:`EntryGates.malformed`.
 
     Both halves are required and neither implies the other: ``GATE_TOKEN_RE``
     alone admits ``3.2``, which nothing can match, and the key shapes alone admit
     ``3-2 3-3`` via the sprint slug, which is one token pretending to be two.
+
+    Under ``"ticket"`` the key shapes are the three a dispatched ticket answers
+    to: an ``E.M`` ref, a bare epic id, and an ``epic-<slug>`` folder. Each is a
+    shape :func:`gates_ticket` can match, and nothing else is, so a v6 story key
+    (``3-2``, ``3-2-invite-link``) is ``malformed`` there — no ticket carries one.
+    So is a backlog leaf file name (``story-login.md``): a tickets run never
+    dispatches a backlog row, and one moved into an epic is dispatched by its new
+    ``E.M`` ref, so the file name would gate nothing in silence. So is an id of
+    ``true`` or ``false``, bare or as either half of a ref: ``tickets.py`` reads
+    neither as an id.
     """
     if not GATE_TOKEN_RE.match(token):
         return False
+    if grammar == "ticket":
+        if _EPIC_FOLDER_RE.match(token):
+            return True
+        pair = _TICKET_REF_RE.match(token)
+        ids = pair.groups() if pair else (token,) if _TICKET_ID_RE.match(token) else ()
+        return bool(ids) and not _TICKET_BOOLEAN_IDS.intersection(ids)
     return bool(_STORIES_ID_RE.match(token) or sprintstatus.STORY_RE.match(token))
 
 
@@ -965,6 +1011,57 @@ def gates_story(token: str, story_key: str) -> bool:
         return False
     rest = story_key[len(token) :]
     return len(rest) >= 2 and "a" <= rest[0] <= "z" and rest[1] == "-"
+
+
+def legacy_story_tokens(entry: DWEntry) -> tuple[str, ...]:
+    """``entry``'s v6 story-key tokens as a ticket queue sees them: matchable under
+    the story grammar and ``malformed`` under the ticket one (``3-2``,
+    ``3-2-invite-link``). A migrated ledger keeps its ``gate:`` lines verbatim and
+    no ticket carries a story key, so read under the ticket grammar alone these
+    would gate nothing in silence; the tickets run pauses on them instead and
+    ``validate`` fails them, both through this one reading."""
+    story_tokens = gates(entry).tokens
+    return tuple(t for t in gates(entry, grammar="ticket").malformed if t in story_tokens)
+
+
+def _ticket_id_text(text: str) -> str:
+    """An id as ``tickets.py`` compares it: digits alone are the number, so
+    ``06`` and ``6`` are one id; any other id is compared as written."""
+    return str(int(text)) if text.isdigit() else text
+
+
+def gates_ticket(token: str, ref: str, *, epic_id: str, epic_slug: str) -> bool:
+    """Whether ``token`` gates the ticket ``ref`` of epic ``epic_slug`` (its folder,
+    ``epic-<x>``) whose initiative id is ``epic_id`` (``""`` when unlisted).
+
+    Three arms, one per thing a ticket gate can name:
+
+    - **the ticket**: ``token`` is ``ref`` — an ``E.M`` ref compared id by id the
+      way ``tickets.py`` does (``1.06`` is ``1.6``);
+    - **its epic by id**: a bare id that is ``epic_id`` gates every ``E.M`` of it;
+    - **its epic by folder**: ``epic-<slug>`` that is ``epic_slug``.
+
+    No prefix and no split arm, unlike :func:`gates_story`: ticket ids are opaque
+    letters and digits, so ``2.6a`` is its own ticket and not a split of ``2.6``,
+    and ``1.2`` never reaches ``1.20``.
+    """
+    if token == ref:
+        return True
+    pair, ref_pair = _TICKET_REF_RE.match(token), _TICKET_REF_RE.match(ref)
+    if pair is not None:
+        return ref_pair is not None and all(
+            _ticket_id_text(a) == _ticket_id_text(b)
+            for a, b in zip(pair.groups(), ref_pair.groups())
+        )
+    if _TICKET_ID_RE.match(token):
+        # Only an `E.M` ref belongs to a listed epic.
+        return (
+            bool(epic_id)
+            and ref_pair is not None
+            and _ticket_id_text(token) == _ticket_id_text(epic_id)
+            and _ticket_id_text(ref_pair.group(1)) == _ticket_id_text(epic_id)
+        )
+    return bool(epic_slug) and token == epic_slug
 
 
 def parse_declaration(raw: object) -> tuple[tuple[str, ...], str | None]:
@@ -2883,7 +2980,8 @@ _LEAD_DONE_STRIP_RE = re.compile(
 #   - source_spec: `spec-foo.md`
 #     summary: <one sentence>
 #     evidence: <why this is real>
-# We recognize it so the `summary` becomes the title (not the source_spec path)
+# (on v7 the opener is `- source_plan: <plan>`, the same block otherwise).
+# We recognize it so the `summary` becomes the title (not the source path)
 # and the entry migrates cleanly into the canonical `### DW-<seq>` shape. The
 # opening line comes from the same `_FLAT_SOURCE_BODY` as FLAT_ENTRY_RE, which
 # bounds canonical spans on it — see that constant for why they must not drift.
@@ -2914,7 +3012,8 @@ def _clean_title(s: str) -> str:
 def _item_entry(first: str, body: str, section: str, section_done: bool) -> dict:
     """Interpret one bullet item; returns the pre-key entry fields."""
     if _FLAT_SOURCE_RE.match(first):
-        # flat appender block (legacy/attended era): title is the `summary`
+        # flat appender block (legacy/attended era, `source_spec:` or v7's
+        # `source_plan:` opener): title is the `summary`
         sm = _FLAT_SUMMARY_RE.search(body)
         summary = sm.group(1).strip() if sm else ""
         return {

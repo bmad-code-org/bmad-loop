@@ -195,6 +195,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # format-string output, and a stray byte must degrade visibly, not raise.
     _ENCODING = "utf-8"
     _ERRORS = "backslashreplace"
+    # list-sessions prints any server reply other than `ERROR: Authentication
+    # required` as a row, so a server whose key file does not match lists as a
+    # session named `ERROR: Invalid session key` (measured on 3.4.0, #919).
+    _NON_SESSION_ROW_PREFIXES = ("ERROR:",)
+    # Since psmux/psmux#809 a server that does not answer gets no row: it is
+    # named on stderr as `psmux: list-sessions: session <name>: <reason>` and
+    # the command exits 1 after printing the rows that did answer.
+    _PARTIAL_LISTING_STDERR_PREFIX = "psmux: list-sessions: session "
 
     def __init__(self, *, default_registry: bool = False, registry_root: str | None = None) -> None:
         """``default_registry=True`` binds this instance to psmux's OWN registry
@@ -743,7 +751,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # the base's return rather than reformatting `-F` so the argv stays
         # byte-identical to the base's.
         window_id = super().new_window(session, name, cwd, env, command)
-        return self._qualified_window_id(session, window_id)
+        qualified = self._qualified_window_id(session, window_id)
+        panes = self._launched_panes()
+        if window_id in panes:
+            # pane_target is asked with the qualified id this returns.
+            panes[qualified] = panes.pop(window_id)
+        else:
+            panes.pop(qualified, None)
+        return qualified
 
     def list_window_ids(self, session: str) -> list[str]:
         # psmux's list-windows emits bare `@N` lines; qualify them identically

@@ -37,7 +37,7 @@ class FakeRun:
     """Records argv; scripts the returncode of `tmux has-session` and the rows
     `list-windows` answers. The listing defaults to showing the window
     `new-window` just minted, which is what a real backend does — and what
-    ctl_window_recorded re-proves the record against.
+    ctl_window_reachable looks the minted id up in.
 
     Like a real backend, a PROJECT_OPTION tag a `set-option` stamps on a window
     shows up in its listed row — the only proof of ownership ctl_window_id
@@ -111,10 +111,18 @@ def fake_run(monkeypatch) -> FakeRun:
 
 
 def expected_cli(*tail: str) -> str:
-    """The parked command line: the launcher's state root rides ahead of the
-    subcommand (#731)."""
+    """The parked command line: the launch marker (#925) and the launcher's
+    state root (#731) ride ahead of the subcommand. Ablate the marker in
+    start_detached and every launch argv assertion through this fails."""
     return shlex.join(
-        [sys.executable, "-m", "bmad_loop.cli", f"--state-root={runs.state_root()}", *tail]
+        [
+            sys.executable,
+            "-m",
+            "bmad_loop.cli",
+            "--ctl-launch",
+            f"--state-root={runs.state_root()}",
+            *tail,
+        ]
     )
 
 
@@ -332,6 +340,34 @@ def test_ensure_ctl_session_probe_failure_raises_launch_error(monkeypatch, tmp_p
     monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
     with pytest.raises(launch.LaunchError, match="ctl-session setup failed"):
         launch.start_run_detached(tmp_path, "RID")
+
+
+@pytest.mark.parametrize("rival_created", [True, False])
+def test_a_ctl_session_create_that_lost_the_race_uses_the_session(
+    fake_run, monkeypatch, tmp_path: Path, rival_created: bool
+):
+    # #952: two launches both see no control session and both create it; the
+    # loser's create is refused ("duplicate session" on tmux 3.4) by a session
+    # that now exists, so it re-probes and uses it. A create that failed while
+    # the session is still absent stays a LaunchError. Ablation: drop the
+    # re-probe and the rival_created row raises.
+    probes = iter([1, 0 if rival_created else 1])
+
+    def racing(argv, **kwargs):
+        if argv[2] == "has-session":
+            return subprocess.CompletedProcess(argv, next(probes), stdout="", stderr="")
+        if argv[2] == "new-session":
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="duplicate session: bmad-loop-ctl"
+            )
+        return fake_run(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", racing)
+    if rival_created:
+        assert launch._ensure_ctl_session(tmp_path) == launch.ctl_session(tmp_path)
+    else:
+        with pytest.raises(launch.LaunchError, match="duplicate session"):
+            launch._ensure_ctl_session(tmp_path)
 
 
 def test_session_exists(monkeypatch):
@@ -666,9 +702,9 @@ def test_ctl_window_lookup_raises_when_the_backend_is_unavailable(monkeypatch, t
         launch.ctl_window_lookup(tmp_path, "RID")
     with pytest.raises(MultiplexerError, match="unavailable"):
         launch.kill_ctl_window(tmp_path, "RID")
-    # ctl_window_recorded turns it into "could not confirm", which its
+    # ctl_window_reachable turns it into "could not confirm", which its
     # launchers warn on — never a confirmed window.
-    assert launch.ctl_window_recorded(tmp_path, "RID", "@7") is False
+    assert launch.ctl_window_reachable(tmp_path, "RID", "@7") is False
 
 
 def test_attach_plan_carries_on_past_an_unavailable_backend(monkeypatch):
@@ -1077,35 +1113,279 @@ def _make_run(project: Path, run_id: str = "RID") -> Path:
     return run_dir
 
 
-def test_start_detached_records_the_window_it_minted(fake_run, tmp_path: Path):
+def _in_ctl_window(monkeypatch, win_id: str | None) -> None:
+    """Run this process as the child of a launch, inside control window `win_id`
+    (None: a control window that cannot name itself)."""
+    monkeypatch.setattr(launch, "in_ctl_session", lambda: True)
+    monkeypatch.setattr(type(get_multiplexer()), "current_window_id", lambda self: win_id)
+
+
+def test_a_launch_leaves_the_record_to_its_child(fake_run, tmp_path: Path):
+    # #920: the launcher cannot know whether its child will drive or refuse as
+    # "still live", so it must not record the window it minted. A refused child
+    # never claims, so the record keeps naming the window whose engine drives.
+    # Ablation: restore the launcher's record write and this reads "@7".
+    _make_run(tmp_path)
+    record = _write_record(tmp_path, "RID", "@3")  # the driving resume's window
+    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    assert record.read_text(encoding="utf-8") == "@3"
+
+
+def test_an_uncaptured_window_id_leaves_the_record_alone(monkeypatch, tmp_path: Path):
+    # No id came back, which says nothing about whether the child will drive:
+    # the record may name a live owner, so the launcher leaves it in place.
+    _make_run(tmp_path)
+    record = _write_record(tmp_path, "RID", "@3")
+
+    def fake(argv, **kwargs):
+        # rc 0 throughout, incl. has-session: the ctl session exists, and
+        # new-window succeeds but answers no id on stdout.
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert launch.start_resolve_detached(tmp_path, "RID") is None
+    assert record.read_text(encoding="utf-8") == "@3"
+
+
+def test_claim_records_the_window_the_child_runs_in(fake_run, tmp_path: Path, monkeypatch):
+    # The accepting child publishes its own window, over whatever an earlier
+    # launch left. Ablation: make claim_ctl_window return early and the
+    # record keeps "@2".
+    _make_run(tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+    _in_ctl_window(monkeypatch, "@7")
+    assert launch.claim_ctl_window(tmp_path, "RID") is None
+    assert record.read_text(encoding="utf-8") == "@7"
+
+
+def test_claim_outside_a_control_session_leaves_the_record(tmp_path: Path, monkeypatch):
+    # A resume typed in the operator's own shell owns no control window, so it
+    # neither records nor drops one.
+    _make_run(tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+    monkeypatch.setattr(launch, "in_ctl_session", lambda: False)
+    assert launch.claim_ctl_window(tmp_path, "RID") is None
+    assert record.read_text(encoding="utf-8") == "@2"
+
+
+def test_a_launched_claim_whose_session_probe_went_unanswered_drops_the_record(
+    tmp_path: Path, monkeypatch
+):
+    # #925: current_session() answers None when the display-message probe fails
+    # inside the multiplexer too, so a launched child reads as an operator's
+    # shell. Its launch marker says otherwise: the previous launch's record
+    # names a window this run no longer drives from, so it goes, and the
+    # operator hears. Ablation: drop the `launched` arm and the claim answers
+    # None with the record kept.
+    _make_run(tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+    monkeypatch.setattr(launch, "in_ctl_session", lambda: False)
+    assert "could not be recorded" in (
+        launch.claim_ctl_window(tmp_path, "RID", launched=True) or ""
+    )
+    assert not record.exists()
+
+
+def test_a_launched_claim_whose_probe_raised_drops_the_record(tmp_path: Path, monkeypatch):
+    # A probe that raises (an unregistered backend `_configure_mux` tolerated)
+    # went unanswered as surely as one answering None; unlaunched, the raise
+    # still propagates. Ablation: drop the `except` and the launched claim raises.
+    _make_run(tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+
+    def raises():
+        raise MultiplexerError("no such backend")
+
+    monkeypatch.setattr(launch, "in_ctl_session", raises)
+    with pytest.raises(MultiplexerError):
+        launch.claim_ctl_window(tmp_path, "RID")
+    assert record.exists()
+    assert "could not be recorded" in (
+        launch.claim_ctl_window(tmp_path, "RID", launched=True) or ""
+    )
+    assert not record.exists()
+
+
+def test_claim_without_a_window_id_drops_the_record_and_says_so(
+    fake_run, tmp_path: Path, monkeypatch
+):
+    # In a control window that cannot name itself: the previous record names a
+    # window this run no longer drives from, so it goes, and the operator hears.
+    _make_run(tmp_path)
+    record = _write_record(tmp_path, "RID", "@2")
+    _in_ctl_window(monkeypatch, None)
+    assert "could not be recorded" in (launch.claim_ctl_window(tmp_path, "RID") or "")
+    assert not record.exists()
+
+
+def test_claim_reports_a_record_that_did_not_land(fake_run, tmp_path: Path, monkeypatch):
+    # The write is best-effort and swallows its fault, so the claim re-reads
+    # the record and says when it does not name its own window.
+    _make_run(tmp_path)
+    _in_ctl_window(monkeypatch, "@7")
+    _fail_the_record(monkeypatch, OSError("read-only file system"))
+    assert "could not be recorded" in (launch.claim_ctl_window(tmp_path, "RID") or "")
+
+
+def test_a_claim_from_a_window_named_for_another_run_says_so(fake_run, tmp_path: Path, monkeypatch):
+    # #937: a finished run's reverify resumes a new replay run inside the
+    # `resolve-<finished>` window, which the lookup never answers for the replay
+    # run. The record lands, but the claim reports the window unreachable
+    # rather than success. Ablation: return None once the record lands and the
+    # claim answers None.
+    _make_run(tmp_path, "REPLAY")
+    fake_run.windows = "@7\tresume-FINISHED\n"
+    _in_ctl_window(monkeypatch, "@7")
+    warning = launch.claim_ctl_window(tmp_path, "REPLAY", launched=True) or ""
+    assert "not named for run REPLAY" in warning
+    assert launch.recorded_ctl_window(tmp_path, "REPLAY") == "@7"
+
+
+def test_a_claim_whose_window_listing_failed_cannot_confirm_it(
+    fake_run, tmp_path: Path, monkeypatch
+):
+    # The name check is a listing: one that cannot be read is no confirmation.
+    # Ablation: treat a listing fault as a pass and this answers None.
+    _make_run(tmp_path)
+    _in_ctl_window(monkeypatch, "@7")
+
+    def fails(*_a, **_k):
+        raise MultiplexerError("server gone")
+
+    monkeypatch.setattr(launch, "_list_ctl_windows", fails)
+    assert "could not confirm" in (launch.claim_ctl_window(tmp_path, "RID") or "")
+
+
+@pytest.mark.parametrize(
+    ("before", "now", "after"),
+    [
+        ("@2", "@7", "@2"),  # the predecessor is the run's window again
+        (None, "@7", None),  # no predecessor: the record goes, as before the claim
+        ("@2", "@9", "@9"),  # a claim accepted since keeps its own
+    ],
+)
+def test_restore_hands_the_record_back_only_from_the_claimed_window(
+    tmp_path: Path, before: str | None, now: str, after: str | None
+):
+    # #937: an interactive resolve claimed @7 and its session could not start.
+    # Ablation: drop the still-names-@7 check and the third row reads @2; drop
+    # the forget arm and the second reads @7.
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", now)
+    assert launch.restore_ctl_window(tmp_path, "RID", before, "@7") is None
+    assert launch.recorded_ctl_window(tmp_path, "RID") == after
+
+
+def test_a_restore_whose_write_failed_says_so(tmp_path: Path, monkeypatch):
+    # Both record writers swallow their faults, so the restore re-reads the
+    # record and reports when it does not name the predecessor. Ablation:
+    # answer None after the write and this reads None.
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@7")
+    _fail_the_record(monkeypatch, OSError("sharing violation"))
+    assert "could not be handed back" in (
+        launch.restore_ctl_window(tmp_path, "RID", "@2", "@7") or ""
+    )
+
+
+def test_a_restore_that_could_not_drop_an_unreadable_record_says_so(tmp_path: Path, monkeypatch):
+    # No predecessor, so the record must go. A delete that did not happen
+    # beside a record that cannot be read back must not read as gone.
+    # Ablation: compare the read-back with None and this answers None.
+    _make_run(tmp_path)
+    _write_record(tmp_path, "RID", "@7")
+    reads = iter(["@7", None])
+    monkeypatch.setattr(launch, "_read_ctl_window", lambda *_a: next(reads))
+    monkeypatch.setattr(launch, "_forget_ctl_window", lambda *_a: None)
+    assert "could not be handed back" in (
+        launch.restore_ctl_window(tmp_path, "RID", None, "@7") or ""
+    )
+
+
+@pytest.mark.parametrize("second_minted", ["before", "after"])
+def test_a_refused_resume_leaves_the_record_with_the_driving_window(
+    fake_run, tmp_path: Path, monkeypatch, second_minted: str
+):
+    """#920's two concurrent orders: two resumes of one run each mint a window,
+    the first one's child accepts and drives, the second one's child refuses as
+    "still live". Whether the second window is minted before or after the first
+    child accepted, the record names the driving window, and `a`/`x` resolve
+    to it.
+
+    The children run the real `cli._resume_paused_run` up to its engine build,
+    so acceptance, refusal and the claim keep their real order under the state
+    lock. Ablation: restore the launcher's record write and "after" reads @4;
+    drop the claim from `_resume_paused_run` and both read @2."""
+    from bmad_loop import cli
+
+    class Drove(Exception):
+        pass
+
+    tag = runs.project_tag(tmp_path)
+    fake_run.windows = f"@2\trun-RID\t{tag}\n@3\tresume-RID\t{tag}\n@4\tresume-RID\t{tag}\n"
+    minted = iter(["@3", "@4"])
+
+    def mint(argv, **kwargs):
+        res = fake_run(argv, **kwargs)
+        if argv[2] == "new-window":
+            res.stdout = next(minted) + "\n"
+        return res
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", mint)
     run_dir = _make_run(tmp_path)
-    launch.resume_detached(tmp_path, "RID")
-    assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7"
+    _write_record(tmp_path, "RID", "@2")  # the parked run window's
+    engine = {"live": False}
+
+    def prepare(_project, _run_dir, *, accept_baseline=False):
+        engine["live"] = True  # the pid this child publishes under the lock
+        return (None,) * 8
+
+    def compose(**_kwargs):
+        raise Drove
+
+    monkeypatch.setattr(
+        cli.runs, "engine_liveness", lambda _rd: "alive" if engine["live"] else "dead"
+    )
+    monkeypatch.setattr(cli, "_prepare_resume_locked", prepare)
+    monkeypatch.setattr(cli.runsetup, "compose_resume", compose)
+
+    first = launch.resume_detached(tmp_path, "RID")
+    second = launch.resume_detached(tmp_path, "RID") if second_minted == "before" else None
+    _in_ctl_window(monkeypatch, first)
+    with pytest.raises(Drove):
+        cli._resume_paused_run(tmp_path, run_dir)  # accepts, claims, drives
+    if second_minted == "after":
+        second = launch.resume_detached(tmp_path, "RID")
+    _in_ctl_window(monkeypatch, second)
+    assert cli._resume_paused_run(tmp_path, run_dir) == 1  # refused: still live
+
+    assert (first, second) == ("@3", "@4")
+    assert launch.ctl_window_id(tmp_path, "RID") == "@3"
 
 
-def test_start_detached_records_nothing_without_a_run(fake_run, tmp_path: Path):
-    # A fresh `run` mints the only window carrying its run id — nothing to
-    # disambiguate — and the record must never conjure a directory that
-    # runs.is_run would then report as not a run. The explicit skip keeps this
-    # expected case out of the OSError swallow; this test pins the outcome.
-    launch.start_run_detached(tmp_path, "RID")
+def test_record_conjures_no_run_dir(tmp_path: Path):
+    # The record must never conjure a directory that runs.is_run would then
+    # report as not a run. The explicit skip keeps this expected case out of
+    # the OSError swallow; this test pins the outcome.
+    launch._record_ctl_window(tmp_path, "RID", "@7")
     assert not runs.run_dir_for(tmp_path, "RID").exists()
 
 
-def test_no_record_into_a_dir_that_is_not_a_run(fake_run, tmp_path: Path):
+def test_no_record_into_a_dir_that_is_not_a_run(tmp_path: Path):
     # The case the is_run guard actually gates (the missing-dir sibling above is
     # also covered by the OSError swallow — deleting the guard leaves it green):
     # a run-dir-shaped directory without state.json (pruned, partial). Here the
     # write would *succeed*, so only the guard keeps the sidecar out.
     run_dir = runs.run_dir_for(tmp_path, "RID")
     run_dir.mkdir(parents=True)
-    launch.resume_detached(tmp_path, "RID")
+    launch._record_ctl_window(tmp_path, "RID", "@7")
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
 
 
-def test_start_detached_survives_an_unwritable_record(fake_run, tmp_path: Path, monkeypatch):
+def test_record_survives_an_unwritable_record(tmp_path: Path, monkeypatch):
     # The window is already running by the time the record is written, so a
-    # failed write degrades to the name scan rather than failing the launch.
+    # failed write degrades to the name scan rather than failing the run.
     from bmad_loop import platform_util
 
     run_dir = _make_run(tmp_path)
@@ -1113,11 +1393,11 @@ def test_start_detached_survives_an_unwritable_record(fake_run, tmp_path: Path, 
     # On win32 the replace-over-a-directory denial looks like the transient
     # sharing violation atomic_replace retries; skip the ~5s backoff.
     monkeypatch.setattr(platform_util, "_REPLACE_ATTEMPTS", 1)
-    assert launch.start_resolve_detached(tmp_path, "RID") == "@7"
+    launch._record_ctl_window(tmp_path, "RID", "@7")  # must not raise
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-def test_symlinked_run_dir_is_refused(fake_run, tmp_path: Path):
+def test_symlinked_run_dir_is_refused(tmp_path: Path):
     # follow_symlinks=False refuses a link at the FINAL component only. Swap an
     # ancestor — the run dir itself — for a link to an external directory that
     # holds a state.json, and runs.is_run follows it, then mkstemp/os.replace
@@ -1131,19 +1411,12 @@ def test_symlinked_run_dir_is_refused(fake_run, tmp_path: Path):
     run_dir.parent.mkdir(parents=True)
     run_dir.symlink_to(outside)
 
-    # The launch still succeeds, and the lookup is not warned about: only one
-    # window carries the run id, so the scan answers it correctly with no record.
-    # Tagged as start_detached leaves it, which FakeRun does not fold into its
-    # scripted listing: the record write is the thing refused here, so since #531
-    # the tag is the only proof of ownership left and an untagged row would
-    # answer None for that reason rather than for the confinement this is about.
-    fake_run.windows = f"@7\tresume-RID\t{runs.project_tag(tmp_path)}\n"
-    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    launch._record_ctl_window(tmp_path, "RID", "@7")
     assert not (outside / launch._CTL_WINDOW_FILE).exists()  # nothing escaped
 
 
 @pytest.mark.skipif(not launch.DIR_FD_ANCHORED_WRITES, reason="dir-fd anchoring is POSIX-only")
-def test_record_write_is_anchored_against_an_ancestor_swap(fake_run, tmp_path, monkeypatch):
+def test_record_write_is_anchored_against_an_ancestor_swap(tmp_path, monkeypatch):
     """The race a path check cannot close: the session re-plants the run dir as
     a link *after* confinement is established. A preflight check answers about a
     path and is stale the moment it returns, so the write follows the new link;
@@ -1168,7 +1441,7 @@ def test_record_write_is_anchored_against_an_ancestor_swap(fake_run, tmp_path, m
         return fd
 
     monkeypatch.setattr(launch, "open_dir_confined", swap_after_the_walk)
-    launch.resume_detached(tmp_path, "RID")
+    launch._record_ctl_window(tmp_path, "RID", "@7")
 
     assert not (outside / launch._CTL_WINDOW_FILE).exists()  # nothing escaped
     landed = tmp_path / "moved-aside" / launch._CTL_WINDOW_FILE
@@ -1177,7 +1450,7 @@ def test_record_write_is_anchored_against_an_ancestor_swap(fake_run, tmp_path, m
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-def test_record_falls_back_to_the_confinement_check_without_dir_fd(fake_run, tmp_path, monkeypatch):
+def test_record_falls_back_to_the_confinement_check_without_dir_fd(tmp_path, monkeypatch):
     # win32 has no *at() family to anchor against, so it keeps check-then-write.
     # Exercised here from POSIX so the fallback is not left to the Windows legs
     # alone: it still has to refuse an ancestor link, just with the weaker
@@ -1190,19 +1463,15 @@ def test_record_falls_back_to_the_confinement_check_without_dir_fd(fake_run, tmp
     run_dir.parent.mkdir(parents=True)
     run_dir.symlink_to(outside)
 
-    # Tagged for the same reason as the dir-fd sibling above: the refused write
-    # leaves the tag as the only ownership proof this listing can carry.
-    fake_run.windows = f"@7\tresume-RID\t{runs.project_tag(tmp_path)}\n"
-    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    launch._record_ctl_window(tmp_path, "RID", "@7")
     assert not (outside / launch._CTL_WINDOW_FILE).exists()
 
-    # Positive control: the `@7` above only says the lookup fell back to the one
-    # listed window, which it would do whether or not the write was attempted.
-    # With a regular run dir the same fallback branch really does write, so the
-    # refusal is a refusal rather than a write that never got as far as trying.
+    # Positive control: with a regular run dir the same fallback branch really
+    # does write, so the refusal is a refusal rather than a write that never got
+    # as far as trying.
     run_dir.unlink()
     _make_run(tmp_path)
-    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    launch._record_ctl_window(tmp_path, "RID", "@7")
     assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7"
 
 
@@ -1214,8 +1483,8 @@ def test_forget_refuses_a_linked_run_dir(tmp_path: Path):
     resolve normally: a run dir standing as a link to an external directory
     makes `run_dir / ctl-window` name a file over there, and dropping the hint
     drops that instead. Unlike the write's escape there is no window to win —
-    the link can be planted whenever and simply waits for the next launch that
-    fails to capture a window id.
+    the link can be planted whenever and simply waits for the next claim that
+    fails to name its window.
 
     What this pins is the *refusal*: the standing link is caught by the
     confinement walk (`open_dir_confined` answers None), so deleting the whole
@@ -1380,16 +1649,13 @@ def test_a_separator_in_the_project_path_does_not_admit_a_foreign_window(
 def test_a_skipped_record_forgets_the_previous_one(fake_run, tmp_path: Path):
     """Skipping the record because there is no run must still drop the old one.
 
-    `_record_ctl_window` returns early when `runs.is_run` says no, and the
-    rationale for that is a fresh `run`/`sweep`, where nothing shares the id yet.
-    But the same early return is reachable with a *superseded* window live: the
-    TUI reads state, shows a confirm modal, and launches from the callback, so
-    anything that removes `state.json` during that human-length window (an
-    external cleanup, a concurrent prune) lands here with a previous launch's
-    record still on disk. That record names a window this launch just
-    superseded, and `ctl_window_id` prefers a record that still resolves — so
-    `a` attaches to and `x` kills the parked predecessor while the orchestrator
-    this launch minted keeps running. #482's exact symptom.
+    `_record_ctl_window` returns early when `runs.is_run` says no. That early
+    return is reachable with a *superseded* window live: anything that removes
+    `state.json` before the claim (an external cleanup, a concurrent prune)
+    lands here with a previous launch's record still on disk. That record names
+    a window this one superseded, and `ctl_window_id` prefers a record that
+    still resolves — so `a` attaches to and `x` kills the parked predecessor
+    while this orchestrator keeps running. #482's exact symptom.
 
     The listing puts the live window first on purpose: the fix has to be visible
     as *the record no longer steering*, not as the record happening to agree
@@ -1399,7 +1665,7 @@ def test_a_skipped_record_forgets_the_previous_one(fake_run, tmp_path: Path):
     run_dir = _write_record(tmp_path, "RID", "@2")  # a previous launch's record
     assert not runs.is_run(run_dir)  # premise: no state.json, so recording skips
 
-    assert launch.resume_detached(tmp_path, "RID") == "@7"
+    launch._record_ctl_window(tmp_path, "RID", "@7")
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
     assert launch.ctl_window_id(tmp_path, "RID") == "@7"  # not the parked @2
 
@@ -1486,7 +1752,7 @@ def test_confinement_check_refuses_an_unprobeable_ancestor(tmp_path: Path, monke
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-def test_symlinked_record_is_replaced_not_followed(fake_run, tmp_path: Path):
+def test_symlinked_record_is_replaced_not_followed(tmp_path: Path):
     # `atomic_write_text` follows a symlink under its default contract, and the
     # run dir lives under the project root every coding session can write — so a
     # session that plants a link here would aim this *host-side* write at any
@@ -1498,7 +1764,7 @@ def test_symlinked_record_is_replaced_not_followed(fake_run, tmp_path: Path):
     record = run_dir / launch._CTL_WINDOW_FILE
     record.symlink_to(outside)
 
-    assert launch.resume_detached(tmp_path, "RID") == "@7"  # the launch still succeeds
+    launch._record_ctl_window(tmp_path, "RID", "@7")  # must not raise
     assert outside.read_text(encoding="utf-8") == "[project]\n"  # not redirected
     # Clobbered, not refused: the record self-heals into a plain file, so the
     # next launch does not trip over a link left in place.
@@ -1516,11 +1782,9 @@ def _fail_the_record(monkeypatch, exc: BaseException) -> None:
     The two forget tests write a record FIRST and assert it is gone afterwards,
     so a patch that reached neither writer would leave that record in place and
     fail — their assertions are not satisfiable by the write simply never
-    happening. `test_resume_reports_a_record_that_did_not_survive` does not use
-    that shape: its control is its sibling
-    `test_resume_returns_the_id_when_the_record_survives`, which runs the same
-    two-window listing unpatched and gets `@7`, so the `None` here can only come
-    from the record failing to land."""
+    happening. `test_claim_reports_a_record_that_did_not_land` does not use that
+    shape: its control is `test_claim_records_the_window_the_child_runs_in`,
+    which claims unpatched and reads its window back."""
 
     def boom(*_a, **_k):
         raise exc
@@ -1529,55 +1793,17 @@ def _fail_the_record(monkeypatch, exc: BaseException) -> None:
     monkeypatch.setattr(launch, "atomic_write_text_at", boom)
 
 
-def test_resume_reports_a_record_that_did_not_survive(fake_run, tmp_path: Path, monkeypatch):
-    # The window id was captured, so start_detached returns it — but the record
-    # did not land, which leaves ctl_window_id on the same ambiguous scan an
-    # uncaptured id does. One signal for both, or the rest of the degradation
-    # hides behind the success toast.
-    #
-    # #482's actual shape, not a bare fake: the parked `run-RID` is still listed
-    # in front of the live `resume-RID`, so without the record the scan answers
-    # the corpse (`@1`) and the degradation is real rather than notional.
-    #
-    # Both tagged, as two launches leave them (FakeRun folds in only the tag
-    # this launch stamps, on @7): an untagged row is never a candidate (#750),
-    # so an untagged @1 would leave nothing ambiguous to degrade to.
+def test_resume_returns_the_id_when_its_window_is_reachable(fake_run, tmp_path: Path):
+    # #482's shape: the parked `run-RID` is still listed in front of the new
+    # `resume-RID`. Both tagged, so the minted window is reachable and the
+    # launch is reported plainly; the record is the child's to write.
     tag = runs.project_tag(tmp_path)
     fake_run.windows = f"@1\trun-RID\t{tag}\n@7\tresume-RID\t{tag}\n"
     _make_run(tmp_path)
-
-    _fail_the_record(monkeypatch, OSError("read-only file system"))
-    assert launch.resume_detached(tmp_path, "RID") is None
-
-
-def test_resume_returns_the_id_when_the_record_survives(fake_run, tmp_path: Path):
-    # The other half of the signal: over the same two-window listing, a landed
-    # record makes the lookup answer the live window, so the launch is reported
-    # plainly and the warning stays specific to real degradation.
-    tag = runs.project_tag(tmp_path)  # the same listing, tagged for the same reason
-    fake_run.windows = f"@1\trun-RID\t{tag}\n@7\tresume-RID\t{tag}\n"
-    _make_run(tmp_path)
     assert launch.resume_detached(tmp_path, "RID") == "@7"
 
 
-def test_resume_does_not_warn_when_the_scan_is_unambiguous(fake_run, tmp_path: Path, monkeypatch):
-    # No record, but only one window carries the run id, so the scan answers the
-    # right one anyway. The question is whether targeting is sound, not whether
-    # a file was written — warning here would cry wolf on every launch that has
-    # nothing to disambiguate.
-    #
-    # Carrying the tag start_detached stamps, spelled out rather than left to
-    # FakeRun: the tag is the only proof of ownership (#750), and an untagged
-    # row would answer None for that reason rather than for the unambiguous
-    # scan this is about.
-    fake_run.windows = f"@7\tresume-RID\t{runs.project_tag(tmp_path)}\n"
-    _make_run(tmp_path)
-
-    _fail_the_record(monkeypatch, OSError("read-only file system"))
-    assert launch.resume_detached(tmp_path, "RID") == "@7"
-
-
-def test_recorded_probe_degrades_when_the_listing_is_unreachable(tmp_path: Path, monkeypatch):
+def test_reachable_probe_degrades_when_the_listing_is_unreachable(tmp_path: Path, monkeypatch):
     # The probe is observation, so it degrades rather than raising into the
     # launchers — neither _do_resume nor _launch_resolve handles a
     # MultiplexerError, so an uncaught one crashes the TUI after a launch that
@@ -1585,16 +1811,14 @@ def test_recorded_probe_degrades_when_the_listing_is_unreachable(tmp_path: Path,
     def boom(*_a, **_k):
         raise MultiplexerError("backend server not reachable")
 
-    monkeypatch.setattr(launch, "ctl_window_id", boom)
-    assert launch.ctl_window_recorded(tmp_path, "RID", "@7") is False
+    monkeypatch.setattr(launch, "_scan_ctl_windows", boom)
+    assert launch.ctl_window_reachable(tmp_path, "RID", "@7") is False
 
 
-def test_resume_reports_a_record_the_listing_does_not_carry(fake_run, tmp_path: Path):
+def test_resume_reports_a_window_id_the_listing_does_not_carry(fake_run, tmp_path: Path):
     # The divergence the seam tolerates: a backend whose new_parked_window id is
-    # shaped differently from its list_windows window_id column. The record
-    # round-trips intact, so file equality would call this sound — but
-    # ctl_window_id rejects it against the listing and falls through to the
-    # first match, which is the ambiguity the warning exists for.
+    # shaped differently from its list_windows window_id column. Such an id is
+    # no target the lookup can answer, which is what the warning exists for.
     # Tagged, so the fallthrough this is about has candidates: an untagged row
     # is never one (#750), so both rows would drop out and the None would be
     # about the empty bucket rather than about the shape.
@@ -1602,28 +1826,26 @@ def test_resume_reports_a_record_the_listing_does_not_carry(fake_run, tmp_path: 
     fake_run.windows = f"@1\trun-RID\t{tag}\nctl:@7\tresume-RID\t{tag}\n"
     _make_run(tmp_path)
     assert launch.resume_detached(tmp_path, "RID") is None
-    # The record itself landed — the divergence is in the id's shape, not the write.
-    assert (runs.run_dir_for(tmp_path, "RID") / launch._CTL_WINDOW_FILE).read_text() == "@7"
 
 
-def test_failed_record_forgets_the_previous_one(fake_run, tmp_path: Path, monkeypatch):
-    # A launch that cannot record the window it minted must not leave the
-    # *previous* launch's id authoritative — that id names a window this launch
-    # just superseded, so the honest state is no record at all.
+def test_failed_record_forgets_the_previous_one(tmp_path: Path, monkeypatch):
+    # A claim that cannot record its window must not leave the *previous* id
+    # authoritative — that id names a window this one just superseded, so the
+    # honest state is no record at all.
     run_dir = _make_run(tmp_path)
     _write_record(tmp_path, "RID", "@2")
 
     _fail_the_record(monkeypatch, OSError("disk full"))
-    launch.resume_detached(tmp_path, "RID")
+    launch._record_ctl_window(tmp_path, "RID", "@7")
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
 
 
-def test_failed_record_survives_a_non_oserror(fake_run, tmp_path: Path, monkeypatch):
+def test_failed_record_survives_a_non_oserror(tmp_path: Path, monkeypatch):
     """`OSError` was too narrow to keep the docstring's promise that a failed
-    write must not fail the launch. `atomic_write_text` resolves the path before
+    write must not fail the run. `atomic_write_text` resolves the path before
     its own try, and below 3.13 `Path.resolve` reports a symlink loop as
     `RuntimeError` — so a run dir reached through a looping link crashed the
-    launch of a window that is *already running*, on the 3.11/3.12 legs.
+    run in a window that is *already running*, on the 3.11/3.12 legs.
 
     The fault is injected rather than built from a real symlink loop on purpose:
     3.13+ resolves loops without raising, so a loop-based version would pass on
@@ -1635,38 +1857,7 @@ def test_failed_record_survives_a_non_oserror(fake_run, tmp_path: Path, monkeypa
     _write_record(tmp_path, "RID", "@2")
 
     _fail_the_record(monkeypatch, RuntimeError("Symlink loop from '/x'"))
-    launch.resume_detached(tmp_path, "RID")  # must not raise
-    assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
-
-
-def test_record_survives_a_raising_window_tag(fake_run, tmp_path: Path, monkeypatch):
-    # Record-before-tag ordering: the seam declares set_window_option
-    # best-effort, but a non-conforming backend raising from it must not cost
-    # the record — swap the two calls in start_detached and this fails.
-    run_dir = _make_run(tmp_path)
-
-    def boom(self, *_a, **_k):
-        raise MultiplexerError("tag failed")
-
-    monkeypatch.setattr(type(get_multiplexer()), "set_window_option", boom)
-    with pytest.raises(MultiplexerError):
-        launch.resume_detached(tmp_path, "RID")
-    assert (run_dir / launch._CTL_WINDOW_FILE).read_text(encoding="utf-8") == "@7"
-
-
-def test_uncaptured_window_id_forgets_the_previous_record(monkeypatch, tmp_path: Path):
-    # new-window answered no id: nothing to record, and the stale record must go.
-    run_dir = _make_run(tmp_path)
-    _write_record(tmp_path, "RID", "@2")
-
-    def fake(argv, **kwargs):
-        # rc 0 throughout, incl. has-session: the ctl session exists, and
-        # new-window succeeds but answers no id on stdout.
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda name: f"/usr/bin/{name}")
-    assert launch.start_resolve_detached(tmp_path, "RID") is None
+    launch._record_ctl_window(tmp_path, "RID", "@7")  # must not raise
     assert not (run_dir / launch._CTL_WINDOW_FILE).exists()
 
 
@@ -2841,6 +3032,7 @@ def test_start_detached_forwards_the_displaced_registry(monkeypatch, tmp_path):
     argv = _park(monkeypatch, tmp_path, _ParkingRegistry(derived))
 
     assert argv == launch.cli_argv(
+        "--ctl-launch",
         f"--state-root={runs.state_root()}",
         f"--registry-root={derived}",
         f"--displaced-registry-root={theirs}",
@@ -2868,7 +3060,12 @@ def test_start_detached_omits_it_without_a_displaced_root(monkeypatch, tmp_path,
 
     registry = [] if case == "namespace-less" else [f"--registry-root={in_force}"]
     assert argv == launch.cli_argv(
-        f"--state-root={runs.state_root()}", *registry, "resume", "--project", str(tmp_path)
+        "--ctl-launch",
+        f"--state-root={runs.state_root()}",
+        *registry,
+        "resume",
+        "--project",
+        str(tmp_path),
     )
 
 
@@ -2895,7 +3092,7 @@ def test_start_detached_skips_a_corruptible_displaced_root(monkeypatch, tmp_path
 
     monkeypatch.setattr(psmux_backend, "_DISPLACED_ROOT", below)
     argv = _park(monkeypatch, tmp_path, _ParkingRegistry(str(tmp_path / "derived")))
-    assert argv[5] == f"--displaced-registry-root={below}"
+    assert argv[6] == f"--displaced-registry-root={below}"
 
 
 def test_start_detached_hands_the_window_an_honoured_registry_root(monkeypatch, tmp_path):
@@ -2908,7 +3105,7 @@ def test_start_detached_hands_the_window_an_honoured_registry_root(monkeypatch, 
 
     argv = _park(monkeypatch, tmp_path, _ParkingRegistry(pinned))
 
-    assert argv[3:6] == [f"--state-root={runs.state_root()}", f"--registry-root={pinned}", "resume"]
+    assert argv[4:7] == [f"--state-root={runs.state_root()}", f"--registry-root={pinned}", "resume"]
 
 
 def test_start_detached_on_an_out_of_tree_backend_uses_the_released_verbs(monkeypatch, tmp_path):
@@ -2947,7 +3144,7 @@ def test_start_detached_on_an_out_of_tree_backend_uses_the_released_verbs(monkey
         launch.RETURN_OPTION,
     )
     assert argv == launch.cli_argv(
-        f"--state-root={runs.state_root()}", "run", "--project", str(tmp_path)
+        "--ctl-launch", f"--state-root={runs.state_root()}", "run", "--project", str(tmp_path)
     )
     assert stub.tagged == [("@9", runs.PROJECT_OPTION, runs.project_tag(tmp_path))]
 

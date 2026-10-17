@@ -82,8 +82,9 @@ Rules that span methods:
 - `set_window_option(target, option, value)` / `unset_window_option(target, option)`: best-effort. An unset option must read back as unset, not empty.
 - `show_window_option(target, option)`: the value, or `''` when unset or on failure.
 - `pipe_pane(window_id, log_file)`: tee the pane to `log_file`; tolerate a dead window.
-- `send_text(window_id, text)`: send `text` literally, then Enter.
+- `send_text(window_id, text)`: send `text` literally, then Enter. Raise `MultiplexerError` instead of typing when the pane is in a mode that would swallow the keys.
 - `capture_pane(window_id)` (default: raises `MultiplexerError`): the visible screen as text. Override it to enable `parked_prompt_patterns`.
+- `pane_target(window_id)` (default: the window id): a target that keeps naming the launched pane after a split makes another pane active. The generic adapter resolves it right after `new_window` and hands it to `pipe_pane`, `send_text` and `capture_pane` in place of the window id, so all three must accept it. Raise `MultiplexerError` when the pane cannot be resolved.
 
 **Client and attach**
 

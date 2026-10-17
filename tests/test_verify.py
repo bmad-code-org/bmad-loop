@@ -4488,6 +4488,519 @@ def test_verify_review_stories_non_utf8_spec_retries(project):
     assert not out.ok and "expected 'done'" in out.reason
 
 
+# --- verify_dev_tickets / verify_review_tickets (BMAD v7 ticket plans) ---------
+
+
+def make_ticket_task(paths, story_key="epic-a/7"):
+    task = StoryTask(story_key=story_key, epic=1)
+    task.baseline_commit = verify.rev_parse_head(paths.project)
+    return task
+
+
+_NO_TICKET = object()
+
+
+def write_ticket_plan(
+    paths,
+    status: str,
+    *,
+    ticket: object = "7",
+    baseline: str | None = None,
+    operator_actions: list[str] | None = None,
+    name: str = "story-login-plan.md",
+) -> Path:
+    """Write a v7 build plan under the initiative's epic folder. ``ticket`` is the
+    RAW YAML spelling of the `ticket:` value (``"7"``, ``"'7'"``, ``'"7"'``) so a
+    test controls whether it parses as an int or a string; ``_NO_TICKET`` omits
+    the key. Bytes, not text, so Windows writes the same LF frontmatter."""
+    folder = paths.planning_artifacts / "init-a" / "epic-a"
+    folder.mkdir(parents=True, exist_ok=True)
+    lines = ["---"]
+    if ticket is not _NO_TICKET:
+        lines.append(f"ticket: {ticket}")
+    lines.append(f"status: {status}")
+    if baseline is not None:
+        lines.append(f"baseline_revision: '{baseline}'")
+    if operator_actions is not None:
+        lines.append("operator_actions:" if operator_actions else "operator_actions: []")
+        lines.extend(f"  - {a}" for a in operator_actions)
+    lines += ["---", "", "# plan", ""]
+    plan = folder / name
+    plan.write_bytes("\n".join(lines).encode("utf-8"))
+    return plan
+
+
+def _real_work(paths) -> None:
+    (paths.project / "src.txt").write_bytes(b"changed\n")
+
+
+def test_verify_dev_tickets_accepts_built(project):
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", baseline=task.baseline_commit)
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert out.ok, out.reason
+    assert task.spec_file == str(plan)
+
+
+@pytest.mark.parametrize(
+    "rj_shape",
+    ["no spec_file", "relative spelling"],
+)
+def test_verify_dev_tickets_reads_the_binding_when_the_result_agrees(project, rj_shape):
+    """A result naming no file is read against the bound plan, and a relative
+    spelling that resolves to the plan is the same file, not "another file"."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    _real_work(project)
+    if rj_shape == "no spec_file":
+        rj: dict[str, object] = {"workflow": "auto-dev"}
+    else:
+        rj = {"workflow": "auto-dev", "spec_file": plan.relative_to(project.project).as_posix()}
+
+    out = verify.verify_dev_tickets(task, project, rj, plan=plan, ticket_id="7")
+
+    assert out.ok, out.reason
+    assert task.spec_file == str(plan)
+
+
+@pytest.mark.parametrize("status", ["done", "in-review"])
+def test_verify_dev_tickets_rejects_done_from_dev(project, status):
+    """A v7 build finishes at `built` and the orchestrator owns `done`: a dev
+    session that marked its own plan `done` (or stopped at `in-review`) is an
+    ordinary wrong-status retry, never an escalation."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, status)
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert not out.ok and out.retryable and not out.contradiction
+    assert f"spec status is '{status}', expected 'built'" in out.reason
+    assert task.spec_file is None
+
+
+@pytest.mark.parametrize(
+    "raw, ticket_id, passes",
+    [
+        ("7", "7", True),  # YAML int
+        ("'7'", "7", True),  # single-quoted string
+        ('"7"', "7", True),  # double-quoted string
+        ("7", " 7 ", True),  # the bound id is normalized the same way
+        ("8", "7", False),
+        (_NO_TICKET, "7", False),
+        ("", "7", False),  # bare `ticket:` is YAML null -> no id
+        ("true", "true", False),  # a boolean is no id, as upstream reads it
+        ("2a", "2a", True),
+        ("'bug-x'", "bug-x", True),
+        ("2a", "2b", False),
+    ],
+)
+def test_verify_dev_tickets_ticket_id_compared_as_upstream(project, raw, ticket_id, passes):
+    """The plan's `ticket:` binds by upstream's id key, not by `str()` spelling:
+    a bare `7` and a quoted `'7'` are the same ticket. A mismatch or a missing
+    id is a fixable retry (one frontmatter field)."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", ticket=raw)
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id=ticket_id)
+
+    if passes:
+        assert out.ok, out.reason
+    else:
+        assert not out.ok and out.retryable and out.fixable is True
+        assert "names ticket" in out.reason and f"expected {ticket_id!r}" in out.reason
+
+
+def test_verify_dev_tickets_non_ascii_digit_id_retries(project):
+    """`str.isdigit()` accepts Unicode digits `int()` rejects (superscript two):
+    the id key follows upstream's ASCII `ID_RE`, so `ticket: '²'` is a mismatched
+    stem that retries, never a ValueError out of the gate."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", ticket="'²'")
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert not out.ok and out.retryable
+
+
+def test_verify_dev_tickets_plan_halt_requires_marker(project):
+    """A plan-halt leg expects `ready-for-dev`, skips proof-of-work (only the plan
+    was written), and demands devcontract's `plan_halt` marker so a
+    died-mid-flight `ready-for-dev` cannot pass as a successful plan."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "ready-for-dev", baseline=task.baseline_commit)
+
+    no_marker = verify.verify_dev_tickets(
+        task, project, {"workflow": "auto-dev"}, plan=plan, ticket_id="7", plan_halt=True
+    )
+    assert not no_marker.ok and no_marker.retryable
+    assert "no plan_halt marker" in no_marker.reason
+    assert no_marker.plan_halt_zero_diff is None
+    assert task.spec_file is None
+
+    out = verify.verify_dev_tickets(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        plan=plan,
+        ticket_id="7",
+        plan_halt=True,
+    )
+    assert out.ok, out.reason  # no code change required for a plan
+    assert out.plan_halt_zero_diff is True
+    assert out.park_proof_skipped is False
+    assert task.spec_file == str(plan)
+
+
+def test_verify_dev_tickets_plan_halt_rejects_built(project):
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(
+        task,
+        project,
+        {"workflow": "auto-dev", "plan_halt": True},
+        plan=plan,
+        ticket_id="7",
+        plan_halt=True,
+    )
+
+    assert not out.ok and out.retryable
+    assert "expected 'ready-for-dev'" in out.reason
+
+
+def test_verify_dev_tickets_park_requires_actions(project):
+    """`awaiting-operator` is accepted only under the engine's park flag, and
+    only with a usable action list (fixable retry otherwise) — the same gate
+    `verify_dev` applies."""
+    task = make_ticket_task(project)
+    _real_work(project)
+
+    bare = write_ticket_plan(project, "awaiting-operator")
+    out = verify.verify_dev_tickets(
+        task, project, dev_result(bare), plan=bare, ticket_id="7", operator_park=True
+    )
+    assert not out.ok and out.retryable and out.fixable is True
+    assert "operator_actions" in out.reason
+
+    parked = write_ticket_plan(project, "awaiting-operator", operator_actions=["publish DNS"])
+    out = verify.verify_dev_tickets(
+        task, project, dev_result(parked), plan=parked, ticket_id="7", operator_park=True
+    )
+    assert out.ok, out.reason
+    assert out.park_proof_skipped is False  # park not asserted: proof-of-work still ran
+    assert task.spec_file == str(parked)
+
+    task.spec_file = None
+    off = verify.verify_dev_tickets(task, project, dev_result(parked), plan=parked, ticket_id="7")
+    assert not off.ok and off.retryable
+    assert "'awaiting-operator', expected 'built'" in off.reason
+    assert task.spec_file is None
+
+
+def test_verify_dev_tickets_asserted_park_waives_proof_of_work(project):
+    """An asserted park (the result's strict `park_asserted: True`) waives the
+    proof-of-work gate exactly as `verify_dev`'s does, and records the waiver."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "awaiting-operator", operator_actions=["publish DNS"])
+
+    unasserted = verify.verify_dev_tickets(
+        task, project, dev_result(plan), plan=plan, ticket_id="7", operator_park=True
+    )
+    assert not unasserted.ok and "no changes" in unasserted.reason
+
+    out = verify.verify_dev_tickets(
+        task,
+        project,
+        dev_result(plan, park_asserted=True),
+        plan=plan,
+        ticket_id="7",
+        operator_park=True,
+    )
+    assert out.ok, out.reason
+    assert out.park_proof_skipped is True and out.park_zero_diff is True
+
+
+@pytest.mark.parametrize("operator_park", [False, True])
+def test_verify_dev_tickets_dropped_escalates(project, operator_park):
+    """A plan a human `dropped` while its session ran is a CRITICAL contradiction:
+    no retry can build a dropped ticket.
+
+    Ablation: delete the `status == PLAN_DROPPED` arm in `verify_dev_tickets` and
+    the plan falls through to the ordinary status gate, which RETRIES
+    ("expected 'built'") — so this asserts `not out.retryable`, the CRITICAL
+    severity and `contradiction`, never merely `not out.ok`."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "dropped", operator_actions=["x"])
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(
+        task, project, dev_result(plan), plan=plan, ticket_id="7", operator_park=operator_park
+    )
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL" and out.contradiction is True
+    assert not out.fixable
+    assert "dropped" in out.reason and str(plan) in out.reason
+    assert task.spec_file is None
+
+
+def test_verify_dev_tickets_claimed_other_file_retries(project):
+    """The plan is the orchestrator's binding: a result naming another (existing)
+    plan retries rather than being read in its place."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    other = write_ticket_plan(project, "built", name="story-other-plan.md")
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(other), plan=plan, ticket_id="7")
+
+    assert not out.ok and out.retryable and not out.contradiction
+    assert "is bound to plan" in out.reason and str(other) in out.reason
+    assert task.spec_file is None
+
+
+@pytest.mark.parametrize("prefix", list(verify.FALLBACK_RESULT_PREFIXES))
+def test_verify_dev_tickets_fallback_result_escalates(project, prefix):
+    """A session that could not resolve its ticket writes a no-spec fallback
+    result; its block is already CRITICAL and re-dispatching cannot resolve it,
+    so the gate escalates instead of retrying. The fallback need not exist on
+    disk — the name alone selects the arm."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    fallback = project.implementation_artifacts / f"{prefix}x.md"
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(fallback), plan=plan, ticket_id="7")
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL"
+    assert "fallback result" in out.reason and fallback.name in out.reason
+
+
+def test_verify_dev_tickets_missing_plan_retries(project):
+    task = make_ticket_task(project)
+    plan = project.planning_artifacts / "init-a" / "epic-a" / "ghost-plan.md"
+
+    out = verify.verify_dev_tickets(
+        task, project, {"workflow": "auto-dev"}, plan=plan, ticket_id="7"
+    )
+
+    assert not out.ok and out.retryable
+    assert "bound ticket plan does not exist" in out.reason
+
+
+def test_verify_dev_tickets_no_proof_of_work_retries(project):
+    """The plan is excluded from proof-of-work as the gate's spec path, so a plan
+    at `built` with no other change since baseline is "no changes"."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", baseline=task.baseline_commit)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert not out.ok and out.retryable
+    assert "no changes" in out.reason
+    assert task.spec_file is None
+
+
+def test_verify_dev_tickets_still_faces_the_shared_gates(project):
+    """Workflow tag and baseline match are the shared gates, unchanged here."""
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built")
+    _real_work(project)
+    wrong = verify.verify_dev_tickets(
+        task,
+        project,
+        {"workflow": "quick-dev", "spec_file": str(plan)},
+        plan=plan,
+        ticket_id="7",
+    )
+    assert not wrong.ok and "auto-dev" in wrong.reason
+
+    lying = write_ticket_plan(project, "built", baseline="deadbeef" * 5)
+    out = verify.verify_dev_tickets(task, project, dev_result(lying), plan=lying, ticket_id="7")
+    assert not out.ok and "does not match" in out.reason
+
+
+@pytest.mark.parametrize("board", [None, "backlog"])
+def test_verify_dev_tickets_has_no_board_gate(project, board):
+    """Tickets mode has no sprint board: the plan's own status is the record, so
+    the gate passes whether the board is absent or holds a contradicting row for
+    the story key.
+
+    Ablation: add a `story_status(paths.sprint_status, task.story_key)` check
+    (as `verify_dev` makes) to `verify_dev_tickets` and both rows fail — absent
+    board reads `None`, the stale row reads `backlog`."""
+    if board is None:
+        assert not project.sprint_status.is_file()
+    else:
+        write_sprint(project, {"epic-a/7": board})
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, "built", baseline=task.baseline_commit)
+    _real_work(project)
+
+    out = verify.verify_dev_tickets(task, project, dev_result(plan), plan=plan, ticket_id="7")
+
+    assert out.ok, out.reason
+
+
+def _reviewed_ticket(project, status, **kw):
+    task = make_ticket_task(project)
+    plan = write_ticket_plan(project, status, **kw)
+    task.spec_file = str(plan)
+    return task, plan
+
+
+def test_verify_review_tickets_accepts_built(project):
+    """A ticket review leaves the plan where the build left it; `done` is the
+    orchestrator's, after this gate. A plan that ENTERED at `done` stays there."""
+    task, _ = _reviewed_ticket(project, "built")
+    assert verify.verify_review_tickets(task, project, Policy()).ok
+
+    task, _ = _reviewed_ticket(project, "done")
+    assert verify.verify_review_tickets(task, project, Policy(), entered_status="done").ok
+
+
+def test_verify_review_tickets_done_when_entered_built_retries(project):
+    """A review that marked the plan `done` itself moved it FORWARD — not a
+    regression, so an ordinary retry rather than a contradiction."""
+    task, plan = _reviewed_ticket(project, "done")
+
+    out = verify.verify_review_tickets(task, project, Policy())
+
+    assert not out.ok and out.retryable and not out.contradiction
+    assert out.reason == f"plan status is 'done', expected 'built': {plan}"
+
+
+def test_verify_review_tickets_needs_a_recorded_plan(project):
+    task = make_ticket_task(project)
+    out = verify.verify_review_tickets(task, project, Policy())
+    assert not out.ok and out.retryable and "no spec file recorded" in out.reason
+
+
+@pytest.mark.parametrize(
+    "entered, now",
+    [("built", "in-progress"), ("built", "in-review"), ("built", "draft"), ("done", "built")],
+)
+def test_verify_review_tickets_monotonic(project, entered, now):
+    """The board's sign-off-regression arm, rebuilt as a monotonic read-back of
+    the plan: a status strictly earlier in `PLAN_STATUS_ORDER` than the review's
+    entry status is the review walking the ticket backward. Escalates as a
+    contradiction under the default knob; `retry` restores the plain retry.
+
+    Ablation: delete the `_is_plan_regression` arm in `verify_review_tickets` (or
+    make `_is_plan_regression` return False) and the default-policy half retries
+    instead — so it asserts `not out.retryable` and `contradiction`."""
+    task, plan = _reviewed_ticket(project, now)
+
+    out = verify.verify_review_tickets(task, project, Policy(), entered_status=entered)
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL" and out.contradiction is True
+    assert f"back from {entered!r} to {now!r}" in out.reason
+    assert 'review.on_status_contradiction = "retry"' in out.reason
+
+    pol = Policy(review=ReviewPolicy(on_status_contradiction="retry"))
+    legacy = verify.verify_review_tickets(task, project, pol, entered_status=entered)
+    assert not legacy.ok and legacy.retryable and legacy.contradiction is False
+    assert legacy.reason == f"plan status is {now!r}, expected {entered!r}: {plan}"
+
+
+@pytest.mark.parametrize(
+    "entered, now",
+    [
+        ("built", "blocked"),  # outside the lifecycle order
+        ("built", "bogus"),  # an unknown token
+        ("bogus", "in-progress"),  # an unknown entry status
+    ],
+)
+def test_verify_review_tickets_outside_the_order_is_a_plain_retry(project, entered, now):
+    """Conservative like `_is_signoff_regression`: a token outside
+    `PLAN_STATUS_ORDER` on either side never escalates."""
+    task, _ = _reviewed_ticket(project, now)
+
+    out = verify.verify_review_tickets(task, project, Policy(), entered_status=entered)
+
+    assert not out.ok and out.retryable and out.contradiction is False
+
+
+@pytest.mark.parametrize("shape", ["blank status", "non-utf8"])
+def test_verify_review_tickets_unreadable_status_is_a_plain_retry(project, shape):
+    """`""` is `PLAN_STATUS_ORDER[0]`, so a plan read as no status (a blank
+    `status:`, bytes that do not decode) would rank below the entry status. It is
+    a read fault, not a review walking the ticket back: retry, never a CRITICAL
+    contradiction. Ablation: dropping the `not status` guard in
+    `_is_plan_regression` escalates both shapes."""
+    task, plan = _reviewed_ticket(project, "built")
+    if shape == "blank status":
+        write_ticket_plan(project, "''")
+    else:
+        plan.write_bytes(b"\xff\xfe\x00\x01 not utf-8 \x80\x81")
+
+    out = verify.verify_review_tickets(task, project, Policy())
+
+    assert not out.ok and out.retryable and out.contradiction is False
+
+
+@pytest.mark.parametrize("entered", ["built", "done"])
+@pytest.mark.parametrize("pol", ["escalate", "retry"])
+def test_verify_review_tickets_dropped_is_contradiction(project, entered, pol):
+    """A plan dropped during its review escalates under EITHER knob value — the
+    `retry` opt-out covers regressions, not a withdrawn ticket."""
+    task, plan = _reviewed_ticket(project, "dropped")
+    policy = Policy(review=ReviewPolicy(on_status_contradiction=pol))
+
+    out = verify.verify_review_tickets(task, project, policy, entered_status=entered)
+
+    assert not out.ok and not out.retryable
+    assert out.severity == "CRITICAL" and out.contradiction is True
+    assert "dropped" in out.reason and str(plan) in out.reason
+
+
+def test_verify_review_tickets_park(project):
+    """`awaiting-operator` under the engine's park flag clears the actions gate and
+    then reaches the verify commands (none configured -> pass); without the flag
+    it is an ordinary wrong-status retry."""
+    task, _ = _reviewed_ticket(project, "awaiting-operator", operator_actions=["publish DNS"])
+    assert verify.verify_review_tickets(task, project, Policy(), operator_park=True).ok
+
+    off = verify.verify_review_tickets(task, project, Policy())
+    assert not off.ok and off.retryable and off.contradiction is False
+    assert "'awaiting-operator', expected 'built'" in off.reason
+
+    task, _ = _reviewed_ticket(project, "awaiting-operator", operator_actions=[])
+    bare = verify.verify_review_tickets(task, project, Policy(), operator_park=True)
+    assert not bare.ok and bare.retryable and bare.fixable is True
+    assert "operator_actions" in bare.reason
+
+
+def test_verify_review_tickets_runs_the_verify_commands(project):
+    """A plan at the expected status is not the whole gate: the configured verify
+    commands still decide it."""
+    task, _ = _reviewed_ticket(project, "built")
+    pol = Policy(verify=VerifyPolicy(commands=(_FAIL,)))
+
+    out = verify.verify_review_tickets(task, project, pol)
+
+    assert not out.ok
+
+
+def test_ticket_gate_literals_mirror_devcontract():
+    # verify keeps these literal to avoid a verify<-devcontract import cycle;
+    # guard the copies from drifting (as test_plan_halt_status_matches_devcontract).
+    from bmad_loop import devcontract
+
+    assert verify.PLAN_BUILT == devcontract.BUILT
+    assert verify.PLAN_DONE == devcontract.DONE
+    assert verify.PLAN_DROPPED == devcontract.DROPPED
+    assert verify.FALLBACK_RESULT_PREFIXES == devcontract.FALLBACK_RESULT_PREFIXES
+
+
 def test_verify_review_bundle_ledger_gate(project):
     task = make_bundle_task(project)
     sp = project.implementation_artifacts / "spec-dw-test-bundle.md"

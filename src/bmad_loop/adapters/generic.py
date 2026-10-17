@@ -1145,15 +1145,31 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             runs.pin_state_root({**self.profile.env, **spec.env}),
             self.build_command(spec, session_id=pinned_session_id),
         )
+        # Pin the launched pane now, before anything else targets it: a split an
+        # operator or a hook makes becomes the ACTIVE pane, and a window target
+        # would type every nudge into it (#948) and tee its output instead. A
+        # failed pin degrades to the window target, crumbed; a window already
+        # dead fails here too, and the wait loop reports that crash. A
+        # duck-typed backend predating the method keeps the window target, as
+        # for capture_pane.
+        pin = getattr(self.mux, "pane_target", None)
+        try:
+            pane_target = pin(window_id) if pin is not None else None
+        except MultiplexerError as e:
+            pane_target = None
+            self._note_lifecycle(
+                spec.task_id, "pane-pin-failed", window=window_id, error=f"{type(e).__name__}: {e}"
+            )
         # pipe_pane tolerates the window having already died (a CLI that crashes on
         # launch can take it down before the tee attaches); the dead window is then
         # reported as a crash in wait_for_completion.
-        self.mux.pipe_pane(window_id, log_file)
+        self.mux.pipe_pane(pane_target or window_id, log_file)
         return SessionHandle(
             task_id=spec.task_id,
             native_id=window_id,
             launched_ns=launched_ns,
             pinned_session_id=pinned_session_id,
+            pane_target=pane_target,
         )
 
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
@@ -2350,7 +2366,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if capture is None:
             return None
         try:
-            screen = capture(handle.native_id)
+            screen = capture(handle.pane_target or handle.native_id)
         except MultiplexerError as e:
             self._note_lifecycle(
                 handle.task_id,
@@ -2430,7 +2446,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         )
 
     def send_text(self, handle: SessionHandle, text: str) -> None:
-        self.mux.send_text(handle.native_id, text)
+        self.mux.send_text(handle.pane_target or handle.native_id, text)
 
     def kill(self, handle: SessionHandle) -> None:
         grace = float(self.policy.limits.teardown_grace_s)
@@ -2967,11 +2983,27 @@ class _DevSynthesisMixin(_ResultFileMixin):
         yields nothing: a session that did not write the spec it owed produced no
         result, and any other qualifying file in that directory belongs to someone
         else. Returning None routes to the dev-stall grace / crashed verdict — the
-        safe direction, and the verdict the two control stories in #261 received."""
+        safe direction, and the verdict the two control stories in #261 received.
+
+        The one widening is ``spec.fallback_result_dirs`` (a v7 ticket session):
+        while the owed plan carries no terminal signal at all — no marker and no
+        terminal frontmatter — those directories are probed for the skill's
+        no-spec fallback result by NAME only
+        (`devcontract.find_fallback_result_artifact`). A build that could not
+        resolve its ticket HALTs there instead of into the plan, and would
+        otherwise ride stall-nudges to timeout. Any other spec in those
+        directories still belongs to someone else and is never read."""
         deadline = time.monotonic() + RESULT_GRACE_S
+        terminal = self._terminal_statuses(spec)
         while True:
             if devcontract.is_result_artifact(path, since_ns=handle.launched_ns):
                 return self._synthesize_from(path, spec)
+            if spec.fallback_result_dirs and not devcontract.is_frontmatter_candidate(
+                path, since_ns=handle.launched_ns, terminal=terminal
+            ):
+                fallback = self._fallback_result(handle, spec)
+                if fallback is not None:
+                    return self._synthesize_from(fallback, spec)
             if not wait or time.monotonic() >= deadline:
                 return self._frontmatter_fallback(
                     handle, spec, [], wait=wait, dead_window=dead_window, only=path
@@ -2983,7 +3015,10 @@ class _DevSynthesisMixin(_ResultFileMixin):
         fallback, so both stamp the session's story key and — for bundle dev
         sessions, where the orchestrator exports the bundle's owned dw ids (the
         generic skill never authors them) — the dw_ids verify_dev_bundle
-        cross-checks."""
+        cross-checks. It also hands over the session's terminal contract:
+        ``spec.success_statuses`` and the plan-halt leg (``BMAD_LOOP_PLAN_HALT``,
+        the same signal the stories read-back reads), both inert at their v6
+        defaults on this path."""
         story_key = spec.env.get("BMAD_LOOP_STORY_KEY") or None
         raw_dw_ids = (spec.env.get("BMAD_LOOP_DW_IDS") or "").split(",")
         dw_ids = [tok for tok in (i.strip() for i in raw_dw_ids) if tok]
@@ -2991,8 +3026,39 @@ class _DevSynthesisMixin(_ResultFileMixin):
             spec_path,
             story_key=story_key,
             dw_ids=dw_ids or None,
+            plan_halt=bool(spec.env.get("BMAD_LOOP_PLAN_HALT")),
             park_marker_session_authored=self._park_marker_session_authored(spec_path, spec),
+            success_statuses=spec.success_statuses,
         )
+
+    @staticmethod
+    def _terminal_statuses(spec: SessionSpec) -> frozenset[str]:
+        """The frontmatter statuses that end ``spec``'s session — the set
+        `_synthesize_from` will accept, so the candidate scans never qualify a
+        file synthesis would then call non-terminal (or miss one it would take).
+        ``devcontract.DEFAULT_TERMINAL`` for every v6 session."""
+        return devcontract.terminal_statuses(
+            spec.success_statuses, plan_halt=bool(spec.env.get("BMAD_LOOP_PLAN_HALT"))
+        )
+
+    @staticmethod
+    def _fallback_result(handle: SessionHandle, spec: SessionSpec) -> Path | None:
+        """The newest no-spec fallback result this session may have written under
+        ``spec.fallback_result_dirs`` (relative entries rebased on ``spec.cwd``,
+        as `expected_spec` is), or None."""
+        best: tuple[int, Path] | None = None
+        for directory in spec.fallback_result_dirs:
+            base = directory if directory.is_absolute() else Path(spec.cwd) / directory
+            found = devcontract.find_fallback_result_artifact(base, since_ns=handle.launched_ns)
+            if found is None:
+                continue
+            try:
+                mtime_ns = found.stat().st_mtime_ns
+            except OSError:
+                continue
+            if best is None or mtime_ns > best[0]:
+                best = (mtime_ns, found)
+        return best[1] if best else None
 
     def _observe_tick(self, handle: SessionHandle, spec: SessionSpec) -> None:
         """Mid-session status-transition observation (#276 M2), called each
@@ -3010,7 +3076,8 @@ class _DevSynthesisMixin(_ResultFileMixin):
         the entry is never cleared within the session — ``run()``'s ``finally``
         evicts it afterwards), and any unreadable/torn read is a skipped
         sample (silent OSError return), never evidence. Blank/torn parses (``s ==
-        ""``) and terminal states (``done``/``blocked``) are NOT recorded — a
+        ""``) and terminal states (``blocked`` and the session's
+        ``success_statuses``: ``done``, or a ticket's ``built``) are NOT recorded — a
         terminal frontmatter is the Stop harvest's business, and the launch status
         itself (the ``done`` a review re-opens) is not a transition. A transition
         that flips entirely between two ticks is simply missed, and the fallback
@@ -3035,7 +3102,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
             s = status_of(read_frontmatter(Path(snap.path)))
         except OSError:
             return
-        if s != "" and s not in (devcontract.DONE, devcontract.BLOCKED) and s != snap.fm_status:
+        if (
+            s != ""
+            and s not in (*spec.success_statuses, devcontract.BLOCKED)
+            and s != snap.fm_status
+        ):
             self._fm_transition_obs[task_id] = s
             self._note_lifecycle(
                 task_id, "spec-status-transition-observed", spec=snap.path, status=s
@@ -3230,6 +3301,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
         """
         task_id = handle.task_id
         candidates: list[Path] = []
+        terminal = self._terminal_statuses(spec)
         if only is not None:
             # Authoritative-path mode (#261): the caller knows the ONE spec this
             # session owed, so the candidate set is that file if it qualifies and
@@ -3237,13 +3309,17 @@ class _DevSynthesisMixin(_ResultFileMixin):
             # "refuse to guess" branch exists for the scan, which cannot know which
             # of several specs is this session's; with a known path there is nothing
             # to guess between.
-            if devcontract.is_frontmatter_candidate(only, since_ns=handle.launched_ns):
+            if devcontract.is_frontmatter_candidate(
+                only, since_ns=handle.launched_ns, terminal=terminal
+            ):
                 candidates.append(only)
             where = str(only)
         else:
             for artifacts in search_dirs:
                 candidates.extend(
-                    devcontract.find_frontmatter_candidates(artifacts, since_ns=handle.launched_ns)
+                    devcontract.find_frontmatter_candidates(
+                        artifacts, since_ns=handle.launched_ns, terminal=terminal
+                    )
                 )
             where = ", ".join(str(d) for d in search_dirs)
         if not candidates:
@@ -3603,7 +3679,8 @@ class _DevSynthesisMixin(_ResultFileMixin):
         (``status_consistent`` — "no active disagreement"; a blank frontmatter
         with prose ``done`` passes, exactly what a delivered Stop would have
         synthesized, and the engine's reconcile repairs the lag) and a
-        *successful* terminal — ``done``, or the stories plan-halt leg (a
+        *successful* terminal — ``done`` (or another of ``spec.success_statuses``,
+        a ticket's ``built``), or the stories plan-halt leg (a
         deliberate widening of #61's literal done-only wording). A ``blocked``
         terminal is never rescued: it carries no finished work, and
         blocked-plus-nudge-unresponsive is weak evidence of anything. Every
@@ -3672,7 +3749,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
             return result
         rj = sr.result_json
         if rj.get("escalations") or not (
-            rj.get("status") == devcontract.DONE or rj.get("plan_halt") is True
+            rj.get("status") in spec.success_statuses or rj.get("plan_halt") is True
         ):
             return result
         # Proof-of-work gate (#261), the same one the crash path applies in `_final`:

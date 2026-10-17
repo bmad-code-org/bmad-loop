@@ -68,6 +68,7 @@ STAMPED_PATHS = [
     "module.yaml",
     "src/bmad_loop/data/skills/bmad-loop-setup/assets/module.yaml",
     ".claude-plugin/marketplace.json",
+    "src/bmad_loop/data/skills/bmod-bmad-loop/bmod.toml",
     "uv.lock",
     "CHANGELOG.md",
 ]
@@ -105,7 +106,7 @@ def parse_version(v: str) -> tuple[tuple[int, int, int], str]:
     release or e.g. 'rc1' for a pre-release. Raises ValueError on bad input."""
     if not sync_version._VERSION_RE.match(v):
         raise ValueError(f"{v!r} is not a valid X.Y.Z version")
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:[.-]([0-9A-Za-z.-]+))?$", v)
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$", v)
     assert m  # guaranteed by the regex above
     major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
     suffix = m.group(4) or ""

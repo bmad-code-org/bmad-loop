@@ -189,6 +189,27 @@ def resume_engine(project, engine, script, policy=None) -> tuple[Engine, MockAda
     return new_engine, adapter
 
 
+def test_make_engine_selects_sprint_engine(project):
+    """Characterization pin for the WorkSource refactor: the default story engine
+    is the sprint `Engine` (not a subclass), and a sprint run's state carries
+    `source == "sprint-status"` with no spec folder — in memory and as persisted
+    after a run."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project, [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)]
+    )
+
+    assert type(engine) is Engine
+    assert (engine.state.source, engine.state.spec_folder) == ("sprint-status", "")
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    persisted = load_state(engine.run_dir)
+    assert (persisted.source, persisted.spec_folder) == ("sprint-status", "")
+    assert persisted.current_epic == 1
+
+
 def test_the_resumed_engine_reopens_the_journal_off_disk(project):
     """The harness's own fidelity: `resume_engine` builds the journal a REAL resume
     builds rather than handing the pre-pause engine's object back (DW-241), the
@@ -8186,6 +8207,78 @@ def test_expected_spec_pinned_only_when_the_prompt_names_the_spec(project):
     assert _pin_probe(project, redrive, spec_file=owed) == owed
 
 
+_PIN_BOARD = (
+    "sprint-status.yaml is owned by the orchestrator: never write it, and never revert a "
+    "change to it. A row at done or awaiting-operator is the orchestrator's own bookkeeping "
+    "— not a defect to fix, and not proof that the work is verified."
+)
+_PIN_PARK = (
+    "If this story's acceptance criteria include actions only a HUMAN can perform outside "
+    "the repo (buy a domain, publish a DNS record, grant an API key, click through a vendor "
+    "console): complete every part an agent CAN do, commit it, then finalize the spec "
+    "frontmatter to status: awaiting-operator and enumerate what is owed under an "
+    "operator_actions: key — a YAML list of strings, one imperative instruction each, "
+    "non-empty. The final Auto Run Result must also report the matching status: "
+    "awaiting-operator. Never use the blocked status for this: blocked halts the whole run, "
+    "and this story is finished as far as you can take it."
+)
+
+
+def test_base_seams_preserve_sprint_prompts_byte_identical(project):
+    """Characterization pin for the tickets-mode engine seams (`_expected_spec_for`,
+    `_session_success_statuses`, `_session_fallback_dirs`, `_dev_success_status`):
+    every sprint dev leg and the review prompt keep their exact bytes (captured from
+    the pre-seam engine), and a sprint session still reaches the adapter with the
+    v6 read-back contract — the recorded spec pinned, `done` the only success,
+    no fallback-result dirs.
+
+    Ablation (performed): make the base `_session_success_statuses` answer
+    `("built",)`, or `_dev_success_status` answer `"built"`, and this test FAILS."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    owed_path = spec_path(project, "1-1-a")
+    write_spec(owed_path, "done", "abc123")
+    owed = str(owed_path)
+    engine, adapter = make_engine(project, [SessionResult(status="crashed")] * 2)
+    bound = StoryTask(story_key="1-1-a", epic=1, spec_file=owed, dispatched_spec_file=owed)
+    feedback = project.project / "feedback.md"
+
+    assert engine._dev_prompt(StoryTask(story_key="1-1-a", epic=1), None) == (
+        f"/bmad-dev-auto 1-1-a — {_PIN_BOARD} {_PIN_PARK}"
+    )
+    assert engine._dev_prompt(bound, None) == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the ready-for-dev spec at "
+        f"`{owed}`. {_PIN_BOARD} {_PIN_PARK}"
+    )
+    assert engine._dev_prompt(dataclasses.replace(bound, restore_patch="/x.patch"), None) == (
+        f"/bmad-dev-auto Resume review of the in-review spec at `{owed}`. The attempted "
+        f"change was restored onto the working tree after an intent-gap resolution; review "
+        f"it against the amended spec. {_PIN_BOARD} {_PIN_PARK}"
+    )
+    assert engine._review_prompt(bound) == (
+        f"/bmad-dev-auto {owed} — do NOT modify, re-open, or rewrite existing deferred-work "
+        f"ledger entries; the orchestrator owns their status and resolution. {_PIN_BOARD} If "
+        f"the story cannot be finished without a human decision, finalize the spec to status: "
+        f"blocked and say why. That is the hand-back channel; the board is not."
+    )
+    repair = engine._dev_prompt(dataclasses.replace(bound), feedback)
+    assert repair == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the in-progress spec at "
+        f"`{owed}`. The previous session's work failed deterministic verification; repair "
+        f"the working tree so verification passes without changing the spec's frozen intent "
+        f"contract. Verification evidence is in `{feedback}`. {_PIN_BOARD} {_PIN_PARK}"
+    )
+    assert engine._dev_success_status() == "done"
+
+    for role in ("dev", "review"):
+        engine._run_session(bound, role=role, prompt=repair, seq=1)
+        spec = adapter.sessions[-1]
+        assert (spec.expected_spec, spec.success_statuses, spec.fallback_result_dirs) == (
+            owed,
+            ("done",),
+            (),
+        )
+
+
 def test_fresh_sprint_prompt_without_recorded_spec_stays_bare_and_unpinned(project):
     """T19: a fresh sprint task has no spec path to route or pin.
 
@@ -9116,6 +9209,36 @@ def test_budget_exhausted_unfinalized_defers(project):
     assert f'git -C "{project.project}" merge --ff-only {ref}' in attention
     deferred_entry = [e for e in engine.journal.entries() if e["kind"] == "story-deferred"][-1]
     assert deferred_entry["preserve_ref"] == ref
+
+
+def test_v6_review_ending_at_built_does_not_converge(project):
+    """`Engine._review_converged_statuses` stays the v6 `{"done"}`: a review pass
+    that leaves a v6 spec at `built` (a v7 plan status, which tickets mode
+    converges on) is a non-terminal pass, so the loop spends its budget and
+    defers naming the non-terminal status. Ablation (performed): add `built` to
+    the base set and the defer detail turns into "finalized but its verification
+    failed" — this FAILS."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+
+    def review_built(spec: SessionSpec) -> SessionResult:
+        sp = spec_path(project, "1-1-a")
+        baseline = _spec_baseline(sp)
+        write_spec(sp, "built", baseline)
+        result = {"workflow": "auto-dev", "story_key": "1-1-a", "spec_file": str(sp)}
+        result |= {"baseline_commit": baseline, "status": "built", "escalations": []}
+        return SessionResult(status="completed", result_json=result)
+
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a")] + [review_built] * 3)
+    summary = engine.run()
+
+    assert summary.deferred == 1 and summary.done == 0 and not summary.paused
+    assert len(adapter.sessions) == 4  # dev + max_review_cycles review passes
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.DEFERRED
+    assert task.defer_reason == (
+        "review did not converge within budget "
+        "(last review pass ended at non-terminal status 'built')"
+    )
 
 
 def test_defer_notification_stays_bare_when_nothing_was_parked(project):
@@ -17045,6 +17168,29 @@ def test_pick_next_prefers_current_epic_over_earlier_file_position(project):
     assert engine._pick_next().key == "5-1-e5"
 
 
+def test_pick_next_journals_unknown_sprint_keys_on_every_pick(project):
+    """Characterization pin for the WorkSource refactor: `Engine._pick_next`
+    re-reads the board on every pick and journals `sprint-status-unknown-keys`
+    each time it carries unparseable keys — not once per run. A board with none
+    journals nothing."""
+    write_sprint(
+        project,
+        {"1-1-a": "ready-for-dev", "totally-weird": "huh", "2-6.1-nested-split": "backlog"},
+    )
+    engine, _ = make_engine(project, [])
+
+    assert engine._pick_next().key == "1-1-a"
+    assert engine._pick_next().key == "1-1-a"
+
+    rows = [e for e in engine.journal.entries() if e["kind"] == "sprint-status-unknown-keys"]
+    assert [r["keys"] for r in rows] == [["totally-weird", "2-6.1-nested-split"]] * 2
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    assert engine._pick_next().key == "1-1-a"
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert kinds.count("sprint-status-unknown-keys") == 2  # clean board: no third row
+
+
 @requires_descriptor_restoration
 def test_resolved_redrive_reescalates_instead_of_deferring(project):
     """Fix C (Bug 1): a story from a human-resolved CRITICAL escalation whose
@@ -17144,6 +17290,48 @@ def test_graceful_stop_finishes_current_story_then_stops(project, monkeypatch):
     stops = [e for e in engine.journal.entries() if e["kind"] == "run-stop"]
     assert stops and stops[-1]["graceful"] is True
     assert stops[-1]["remaining"] == 1  # 1-2-b still actionable, never picked
+
+
+def test_remaining_estimate_counts_actionable_untouched_sprint_stories(project):
+    """Characterization pin for the WorkSource refactor: the sprint
+    `_remaining_estimate` counts board stories that are actionable (backlog /
+    ready-for-dev) AND absent from `state.tasks` — whatever phase a touched task
+    is in. done / in-progress / review stories and epic keys never count."""
+    write_sprint(
+        project,
+        {
+            "epic-1": "backlog",
+            "1-1-a": "ready-for-dev",  # touched below: excluded
+            "1-2-b": "backlog",
+            "1-3-c": "ready-for-dev",
+            "1-4-d": "done",
+            "epic-2": "backlog",
+            "2-1-e": "in-progress",
+            "2-2-f": "review",
+            "2-3-g": "backlog",  # touched below (deferred): excluded
+        },
+    )
+    engine, _ = make_engine(project, [])
+    assert engine._remaining_estimate() == 4
+
+    engine.state.tasks["1-1-a"] = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_RUNNING)
+    engine.state.tasks["2-3-g"] = StoryTask(story_key="2-3-g", epic=2, phase=Phase.DEFERRED)
+    assert engine._remaining_estimate() == 2  # 1-2-b, 1-3-c
+
+
+@pytest.mark.parametrize("fault", ["missing", "malformed"])
+def test_remaining_estimate_is_none_when_board_unreadable(project, fault):
+    """Characterization pin for the WorkSource refactor: a sprint board that
+    cannot be loaded makes `_remaining_estimate` return None (a hint, never a
+    raise) — not 0, which would read as "nothing left"."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    if fault == "missing":
+        project.sprint_status.unlink()
+    else:
+        project.sprint_status.write_text("development_status: [unclosed\n", encoding="utf-8")
+
+    assert engine._remaining_estimate() is None
 
 
 def test_boundary_consume_does_not_swallow_a_concurrent_escalation(project, monkeypatch):
@@ -18588,6 +18776,78 @@ def test_spec_frontmatter_deferrals_harvested_into_ledger(project):
     assert len(events) == 1
     assert events[0]["dw_ids"] == [entry.id]
     assert events[0]["deduped"] == 0 and events[0]["malformed"] == 0
+
+
+def _v7_paths(project):
+    """The sandbox project read as a v7 install: the artifact dir IS the
+    initiative folder (R8), so the ledger and plans share it."""
+    return dataclasses.replace(
+        project, era="v7", active_initiative="i", initiative_folder=project.implementation_artifacts
+    )
+
+
+def _built_plan(paths, rel: str = "epic-auth/story-login-plan.md") -> Path:
+    plan = paths.implementation_artifacts / rel
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(plan, "built", "abc123", deferred=[HARVEST_A])
+    return plan
+
+
+def test_harvest_files_built_plan_deferrals(project, monkeypatch):
+    """A mode whose builds finish at ``built`` (tickets: ``{"built", "done"}``)
+    harvests that plan's ``deferred:`` list; the base engine, whose dev success
+    status is ``done``, leaves a ``built`` spec alone.
+    Ablation: make the base ``_harvest_success_statuses`` include ``built`` and
+    the base half FAILS; drop the seam from the harvest test and the override
+    half FAILS."""
+    plan = _built_plan(project)
+    base, _ = make_engine(project, [], policy=_harvest_policy())
+    task = StoryTask(story_key="1-1-a", epic=1)
+
+    assert base._harvest_success_statuses() == frozenset({"done"})
+    assert base._harvest_spec_deferrals(task, {"spec_file": str(plan)}) is None
+    assert _harvest_entries(project) == []
+    assert not task.harvested_deferrals
+
+    built, _ = make_engine(project, [], policy=_harvest_policy())
+    monkeypatch.setattr(built, "_harvest_success_statuses", lambda: frozenset({"built", "done"}))
+
+    assert built._harvest_spec_deferrals(task, {"spec_file": str(plan)}) is None
+    (entry,) = _harvest_entries(project)
+    assert entry.title == HARVEST_A["summary"] and entry.open
+    assert [r["source_spec"] for r in task.harvested_deferrals] == ["story-login-plan.md"]
+
+
+def test_harvest_source_name_is_initiative_relative_on_v7(project, monkeypatch):
+    """Plan names repeat across epics, so on v7 ``source_spec:`` carries the plan's
+    path relative to the initiative folder — and the bare name for a plan outside
+    it. The persisted record carries the same value, so the isolated carry's
+    ``(origin, source_spec)`` dedupe stays stable."""
+    paths = _v7_paths(project)
+    plan = _built_plan(paths)
+    engine, _ = make_engine(paths, [], policy=_harvest_policy())
+    monkeypatch.setattr(engine, "_harvest_success_statuses", lambda: frozenset({"built", "done"}))
+    task = StoryTask(story_key="1.1", epic=0)
+
+    assert engine._harvest_source_name(plan) == "epic-auth/story-login-plan.md"
+    outside = project.project / "elsewhere" / "story-login-plan.md"
+    assert engine._harvest_source_name(outside) == "story-login-plan.md"
+
+    engine._harvest_spec_deferrals(task, {"spec_file": str(plan)})
+
+    (entry,) = _harvest_entries(paths)
+    assert "source_spec: `epic-auth/story-login-plan.md`" in entry.body
+    assert [r["source_spec"] for r in task.harvested_deferrals] == ["epic-auth/story-login-plan.md"]
+
+
+def test_harvest_source_name_unchanged_on_v6(project):
+    """v6 keeps the bare spec file name byte for byte, even for a spec nested
+    below the artifact dir."""
+    engine, _ = make_engine(project, [], policy=_harvest_policy())
+    nested = project.implementation_artifacts / "sub" / "spec-1-1-a.md"
+
+    assert engine._harvest_source_name(nested) == "spec-1-1-a.md"
+    assert engine._harvest_source_name(spec_path(project, "1-1-a")) == "spec-1-1-a.md"
 
 
 def test_spec_deferrals_use_na_when_no_location_was_recorded(project):
@@ -23885,6 +24145,25 @@ def _commit_of(project, subject: str) -> list[str]:
     return sorted(git(project.project, "show", "--name-only", "--format=", shas[0]).split())
 
 
+def test_retro_prompt_bytes_are_pinned():
+    """Characterization pin for the WorkSource refactor: the exact bytes of the
+    auto-retrospective prompt for an epic — the `/bmad-retrospective -H N` command
+    plus the result.json completion clause (escaped braces rendered literally)."""
+    from bmad_loop.engine import RETRO_AUTO_PROMPT, _retro_auto_prompt
+
+    expected = (
+        "/bmad-retrospective -H 7\n"
+        "\n"
+        "## Completion signal (required)\n"
+        "When the retrospective is finished — or blocked — write\n"
+        "$BMAD_LOOP_RUN_DIR/tasks/$BMAD_LOOP_TASK_ID/result.json as\n"
+        '{"workflow": "bmad-retrospective", "status": "done"} (or "blocked" plus "reason"), '
+        "then end your turn."
+    )
+    assert _retro_auto_prompt(7) == expected
+    assert RETRO_AUTO_PROMPT.format(epic=7) == expected
+
+
 def test_auto_retro_happy_path_runs_on_the_retro_adapter_and_commits_its_files(
     project, monkeypatch
 ):
@@ -24317,8 +24596,9 @@ def test_auto_retro_undecodable_board_is_a_failed_retro_not_a_crash(project):
     (`sprint-status unreadable`) and the tree is still settled — the undecodable
     board is left dirty, so the boundary pauses on it.
 
-    Ablation: drop `UnicodeDecodeError` from `_verify_retro`'s except tuple and
-    this reddens — the decode error escapes before the tree is settled."""
+    Ablation: drop `UnicodeDecodeError` from `SprintWorkSource.retro_artifact_errors`'s
+    except tuple and this reddens — the decode error escapes before the tree is
+    settled."""
     after = retro_effect(project)
 
     def effect(spec):
@@ -25866,3 +26146,96 @@ def test_defer_pause_notice_names_resolve_reverify(project, tmp_path):
     deferred_note = attention[attention.index("story deferred: 1-1-a") :]
     assert "bmad-loop resolve test-run --reverify" in deferred_note
     assert "bmad-loop resolve test-run --reverify" in engine.state.paused_reason
+
+
+# ---- tickets mode: a code rollback re-arms the bound plan through the chokepoint
+
+
+def _tickets_rollback_unit(project_v7, *, body: bool = True):
+    """A TicketsEngine (auto-rollback on) with ticket 1.1 bound and a failed
+    attempt's leftovers: code beside the baseline, and the plan the attempt
+    created and carried to `in-progress` (with a body, or frontmatter only)."""
+    from conftest import ticket_row
+    from test_tickets_engine import _bound, _policy, _tree, _write_plan, make_engine
+
+    tree = _tree(project_v7, in_progress=(ticket_row("1.1", status="in-progress"),))
+    pol = dataclasses.replace(_policy(), scm=ScmPolicy(rollback_on_failure=True))
+    engine, _ = make_engine(project_v7, tree, policy=pol)
+    task = _bound(engine, tree)
+    task.baseline_commit = rev_parse_head(project_v7.project)
+    task.baseline_untracked = sorted(verify.untracked_files(project_v7.project))
+    task.attempt = 1
+    plan = Path(tree.finds["1.1"].plan)
+    (project_v7.project / "src.txt").write_bytes(b"half a cart model\n")
+    if body:
+        _write_plan(plan, "in-progress")
+    else:
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_bytes(b"---\nticket: 1\nstatus: in-progress\n---\n")
+    return engine, tree, task, plan
+
+
+def test_store_never_reset_on_rollback(project_v7):
+    """The rollback resets the code, never the ticket store: the attempt's plan
+    survives the reset byte for byte (the store's folder is kept from the
+    untracked sweep), nothing is stashed, and the plan's only change is the
+    chokepoint's own re-arm — the fake's `mark` writes nothing to disk, so the
+    bytes prove no git reset, clean or stash reached it. Ablation (performed):
+    drop the protected artifact folders from `RecoveryFlow.safe_reset`'s `keep`
+    and the plan is swept with the attempt's residue — this FAILS."""
+    engine, tree, task, plan = _tickets_rollback_unit(project_v7)
+    before = plan.read_bytes()
+
+    engine._rollback_or_pause(task)
+
+    # the code is back at the baseline's bytes (src.txt is tracked there)
+    assert git(project_v7.project, "status", "--porcelain", "--", "src.txt") == ""
+    assert plan.read_bytes() == before
+    assert git(project_v7.project, "stash", "list") == ""
+    assert [(m.target, m.reason) for m in tree.marks] == [("ready-for-dev", "rollback")]
+
+
+def test_rollback_rearms_plan_to_ready_for_dev(project_v7):
+    """After the code rollback, a plan the attempt carried past `ready-for-dev`
+    is re-armed through the chokepoint — `mark 1.1 ready-for-dev` (reason
+    `rollback`) on the bound plan — so the next dispatch builds against the reset
+    code instead of resuming or reviewing work that is gone. A plan already at
+    `ready-for-dev` is left alone. Ablation (performed): drop the
+    `_after_code_rollback` call from `Engine._rollback_or_pause` and no mark is
+    made — this FAILS."""
+    engine, tree, task, plan = _tickets_rollback_unit(project_v7)
+
+    engine._rollback_or_pause(task)
+
+    assert [(m.ref, m.target, m.reason, m.expected_plan) for m in tree.marks] == [
+        ("1.1", "ready-for-dev", "rollback", plan)
+    ]
+    assert tree.discards == []
+    assert [e["outcome"] for e in engine.journal.entries() if e["kind"] == "ticket-mark"] == [
+        "written"
+    ]
+    # the row now reads ready-for-dev: a second rollback re-arms nothing
+    _write_plan_status(plan, "ready-for-dev")
+    engine._rollback_or_pause(task)
+    assert len(tree.marks) == 1
+
+
+def _write_plan_status(plan: Path, status: str) -> None:
+    from test_tickets_engine import _write_plan
+
+    _write_plan(plan, status)
+
+
+def test_rollback_discards_frontmatter_only_plan(project_v7):
+    """A plan that holds only frontmatter — the attempt never wrote its body — is
+    deleted through `discard_unbuilt_plan` instead of re-armed, per upstream's
+    unattended-builds contract, so the next dispatch plans the ticket afresh.
+    Ablation (performed): always take the `mark(..., reason="rollback")` arm in
+    `TicketsEngine._after_code_rollback` and the plan is re-armed, not discarded
+    — this FAILS."""
+    engine, tree, task, plan = _tickets_rollback_unit(project_v7, body=False)
+
+    engine._rollback_or_pause(task)
+
+    assert tree.discards == ["1.1"]
+    assert tree.marks == []

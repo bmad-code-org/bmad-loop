@@ -131,6 +131,31 @@ without hunting for it:
 The `sentinel` sub-block is present ONLY when the escalated story is a **sentinel**
 (see the stories-mode section below); an ordinary escalation omits it.
 
+In **tickets mode** (a BMAD v7 initiative ticket tree) `spec_file` is the ticket's
+**plan**, and the context also carries a `tickets` block — the ticket and its plan
+as they read now:
+
+```json
+{
+  "tickets": {
+    "ref": "1.2",
+    "ticket_id": "2",
+    "title": "List command",
+    "epic": "epic-cli",
+    "plan": "/abs/path/to/<initiative>/epic-cli/story-list-command-plan.md",
+    "plan_status": "blocked",
+    "blocked_reason": "intent gap",
+    "auto_run_result": "…excerpt of the plan's `## Auto Run Result`…"
+  }
+}
+```
+
+`plan_status`, `blocked_reason` and `auto_run_result` are `null` when the plan has
+no such value, is absent, or could not be read; `plan_status` and `blocked_reason`
+are `null` too when the plan's frontmatter is missing or malformed (the orchestrator
+journals an unreadable plan and a malformed frontmatter). The plan's `blocked_reason` is the condition build-auto halted on;
+the orchestrator clears it when it re-arms the ticket.
+
 Your **output marker** is the file at `resolution_path`. Writing it is the LAST
 action of a successful resolution. Schema:
 
@@ -150,8 +175,9 @@ case below — omit it entirely for an ordinary resolution.
 ## What you MUST do
 
 1. **Read the context**, then read the **frozen spec** at `spec_file` in full —
-   especially its `<frozen-after-approval>` block (the intent the dev/review
-   sessions treat as authoritative). The escalation is almost always that this
+   especially its `<intent-contract>` block (a v7 ticket plan;
+   `<frozen-after-approval>` in an older spec) — the intent the dev/review
+   sessions treat as authoritative. The escalation is almost always that this
    block is silent on, or contradicts, a case the implementation hit.
 2. **Present the current pause evidence plainly** to the human:
    - When the `escalations` array is non-empty, present its recorded entries in
@@ -173,8 +199,9 @@ case below — omit it entirely for an ordinary resolution.
 
 3. **Get the human's decision.** Ask follow-ups if the choice is unclear. Do not
    invent requirements; if the human is unsure, help them reason, don't guess.
-4. **Update the frozen spec** to encode the decision unambiguously: amend the
-   `<frozen-after-approval>` block and any affected acceptance criteria / test
+4. **Update the frozen spec** to encode the decision unambiguously: amend its
+   `<intent-contract>` block (v7 plan; `<frozen-after-approval>` in an older
+   spec) and any affected acceptance criteria / test
    matrix rows so a fresh dev session has exactly one correct reading. Make the
    smallest change that removes the ambiguity. You MAY use the `bmad-spec` or
    `bmad-correct-course` skills if a larger spec change is warranted. **If
@@ -196,7 +223,10 @@ dev session first **saved its attempted change as a patch file** (in the
 implementation-artifacts folder) before reverting the tree — the escalation
 `detail` and the spec's `## Review Triage Log` reference the patch path. That
 patch is concrete evidence: it shows exactly which reading of the intent the run
-implemented.
+implemented. In tickets mode the patch sits **beside the plan**, named after it
+with `.patch` for `.md`; name that path for `restore_patch`. The orchestrator moves
+it out of the tree into the run directory when it re-arms the ticket (it would
+otherwise fail the re-drive's clean-tree check) and latches the moved copy.
 
 **First check `restore_supported` in the context file.** When it is `false`
 (worktree-isolation runs: the re-drive discards and re-mounts the unit's
@@ -277,7 +307,9 @@ the session's prose, is the evidence. `paused_reason` quotes the claim on its
   artifact; this is not one of those sessions.
 - **Do NOT** change `sprint-status.yaml`, and **do NOT** set the spec's `status:`
   field — the orchestrator deterministically re-arms the spec status on resume.
-  Edit spec **content** only.
+  Edit spec **content** only. In tickets mode, **never run `tickets.py mark`** and
+  never set the plan's `status`, `blocked_at` or `blocked_reason` — the
+  orchestrator re-arms the ticket through its own `mark` and clears them.
 - **Do NOT** implement the story, write feature code, run tests, or commit. Your
   job ends at a corrected spec + the resolution marker. That holds when
   `spec_reaches_the_redrive` is `false` too: landing the corrected spec where the

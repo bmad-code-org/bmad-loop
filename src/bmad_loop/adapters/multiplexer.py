@@ -398,11 +398,29 @@ class TerminalMultiplexer(ABC):
     @abstractmethod
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
         """Tee the window's pane output to ``log_file`` (tolerant of the window
-        having already died)."""
+        having already died). ``window_id`` may also be a :meth:`pane_target`."""
 
     @abstractmethod
     def send_text(self, window_id: str, text: str) -> None:
-        """Send ``text`` literally to the window, then submit it (Enter)."""
+        """Send ``text`` literally to the window, then submit it (Enter).
+
+        ``window_id`` may also be a :meth:`pane_target`. Raises
+        :class:`MultiplexerError` instead of typing when the target pane is in a
+        mode (copy, clock, ...) that would swallow the keys (#949): an
+        undelivered nudge must not read as a delivered one."""
+
+    def pane_target(self, window_id: str) -> str:
+        """A ``-t`` target that keeps naming the pane ``window_id`` was launched
+        in, even after an operator splits the window and another pane becomes
+        active (#948). Resolve it right after :meth:`new_window`, while the
+        launched pane is the only one. Opaque like the window id; accepted by
+        :meth:`pipe_pane`, :meth:`send_text` and :meth:`capture_pane`.
+
+        NON-abstract so released out-of-tree backends keep working unchanged:
+        the default answers the window id itself, i.e. the window's active pane
+        as before. Raises :class:`MultiplexerError` when the pane cannot be
+        resolved."""
+        return window_id
 
     def capture_pane(self, window_id: str) -> str:
         """The window's VISIBLE screen as plain text, one line per row — what an

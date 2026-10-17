@@ -98,7 +98,7 @@ def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
         str(tmp_path),
         "-P",
         "-F",
-        "#{window_id}",
+        "#{window_id} #{pane_id}",
     ]
     assert len(rec.argv) == 12
     assert "-e" not in rec.argv
@@ -2856,3 +2856,46 @@ def test_legacy_registries_is_empty_under_a_root_psmux_would_panic_on(monkeypatc
     while the real registry was unreachable would read as "nothing to clean"."""
     monkeypatch.setenv("PSMUX_DATA_DIR", bad)
     assert PsmuxMultiplexer().legacy_registries() == []
+
+
+def test_pane_target_uses_the_pane_read_at_create(rec, tmp_path):
+    """#948: new_window reads the launched pane in the same create, so
+    pane_target needs no later listing that a split or swap could have
+    reordered. Ablation: drop the stash lookup and this lists panes."""
+    mux = PsmuxMultiplexer()
+    rec.stdout = "@2 %2\n"
+    assert mux.new_window("s", "n", tmp_path, {}, "cmd") == "s:@2"
+    rec.stdout = "0 %9\n"
+    assert mux.pane_target("s:@2") == "s:@2.%2"
+    assert rec.argv[1] == "new-window"
+
+
+def test_a_create_without_a_pane_id_drops_a_stale_one(rec, tmp_path):
+    """A restarted server can reuse a window id; when that create reports no
+    pane id, pane_target lists panes instead of trusting the old window's.
+    Ablation: keep the stale entry and this answers the old %2."""
+    mux = PsmuxMultiplexer()
+    rec.stdout = "@2 %2\n"
+    mux.new_window("s", "n", tmp_path, {}, "cmd")
+    rec.stdout = "@2\n"
+    mux.new_window("s", "n", tmp_path, {}, "cmd")
+    rec.stdout = "0 %9\n"
+    assert mux.pane_target("s:@2") == "s:@2.%9"
+
+
+def test_pane_target_keeps_the_session_qualified_window(rec):
+    """#948 on psmux: `session:@N.%M` — the session routes the client to the right
+    per-session server, the `%M` slot names the launched pane by id."""
+    rec.stdout = "0 %2\n1 %3\n"
+    assert PsmuxMultiplexer().pane_target("s:@2") == "s:@2.%2"
+    assert rec.argv[-5:] == ["list-panes", "-t", "s:@2", "-F", "#{pane_index} #{pane_id}"]
+
+
+def test_send_text_refuses_while_a_mode_is_open(rec):
+    """#949 on psmux: a mode takes the text as mode keys and passes only Enter, so
+    nothing is typed while `#{pane_in_mode}` is set (server-wide on psmux 3.4.0,
+    psmux/psmux#828)."""
+    rec.stdout = "1\n"
+    with pytest.raises(MultiplexerError, match="pane mode"):
+        PsmuxMultiplexer().send_text("s:@2.%2", "go on")
+    assert [argv for argv, _ in rec.calls if "send-keys" in argv] == []

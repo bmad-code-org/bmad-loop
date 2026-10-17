@@ -5607,3 +5607,370 @@ def test_build_context_absolutizes_a_nested_mount_spec_onto_the_mount_project(
     path = _context(state, run_dir, "6-4-cli-list-command", isolation="worktree")
     ctx = json.loads(path.read_text(encoding="utf-8"))
     assert ctx["spec_file"] == (wt / "app" / rel).as_posix()
+
+
+# ---- tickets mode: the resolve context's `tickets` block, and the re-arm through the
+# ticket chokepoint. Real-spawn budget: 4 vendored `tickets.py` spawns (`find` + `mark`
+# in each of the two real-tree re-arm rows); the patch rows inject a FakeTicketTree.
+
+TICKET_PLAN_BODY = """\
+# story-cart-model-plan
+
+<intent-contract>
+Model the cart.
+</intent-contract>
+
+## Auto Run Result
+
+Status: blocked
+intent gap: does a cart survive logout?
+"""
+
+
+def _ticket_binding(plan: Path):
+    from bmad_loop.model import TicketBinding
+
+    return TicketBinding(
+        ref="1.1",
+        id="1",
+        epic_slug="epic-cart",
+        epic_id="1",
+        title="Cart model",
+        plan=str(plan),
+        risk="",
+        refined=False,
+        plan_checkpoint=False,
+        done_checkpoint=False,
+        hitl=False,
+    )
+
+
+def _escalated_ticket_run(project: Path, plan: Path, *, initiative: str = ""):
+    """An escalation-paused tickets run whose task is bound to ticket 1.1 and whose
+    `spec_file` is that ticket's plan, as `TicketsEngine` records them."""
+    run_dir, state, task = _escalated_run(project, spec_file=str(plan), source="tickets")
+    task.ticket = _ticket_binding(plan)
+    state.initiative = initiative
+    save_state(run_dir, state)
+    return run_dir, state, task
+
+
+def _blocked_ticket_plan(layout, *, reason: str = "intent gap") -> Path:
+    from conftest import write_plan
+
+    plan = write_plan(
+        layout,
+        "epic-cart",
+        "story-cart-model-plan",
+        1,
+        "blocked",
+        blocked_at='"2026-10-15"',
+        blocked_reason=f'"{reason}"',
+        baseline_revision="abc123",
+    )
+    plan.write_text(
+        plan.read_text(encoding="utf-8").split("# story-cart-model-plan")[0] + TICKET_PLAN_BODY,
+        encoding="utf-8",
+    )
+    return plan
+
+
+def _fake_rearm_tree(monkeypatch, plan: Path, *, status: str = "blocked"):
+    """A FakeTicketTree whose `find` names ``plan`` for ticket 1.1, installed as the
+    re-arm's tree."""
+    import dataclasses
+
+    from conftest import FakeTicketTree, fake_find, ticket_row
+
+    row = ticket_row("1.1", status=status, blocked_reason="intent gap")
+    tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", lambda _root, _pin: tree)
+    return tree
+
+
+def test_tickets_context_block(tmp_path):
+    """A tickets run's resolve context carries the ticket binding and the plan as it
+    reads now: status, the blocked reason build-auto's HALT left, and an excerpt of
+    its `## Auto Run Result`. An unreadable plan reads as nulls and is journaled, so
+    the nulls are never an empty plan; a sprint run carries no `tickets` block.
+    Ablation (performed): drop the `tickets` assignment in `build_context` and the
+    block is missing — this FAILS; drop the journal append and the unreadable row
+    FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "---\nticket: 1\nstatus: blocked\nblocked_reason: intent gap\n---\n" + TICKET_PLAN_BODY,
+        encoding="utf-8",
+    )
+    run_dir, state, _ = _escalated_ticket_run(tmp_path, plan)
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    tk = ctx["tickets"]
+    assert tk["ref"] == "1.1" and tk["ticket_id"] == "1" and tk["epic"] == "epic-cart"
+    assert tk["title"] == "Cart model"
+    assert tk["plan"] == plan.as_posix() == ctx["spec_file"]
+    assert (tk["plan_status"], tk["blocked_reason"]) == ("blocked", "intent gap")
+    assert tk["auto_run_result"].startswith("Status: blocked")
+    assert "does a cart survive logout?" in tk["auto_run_result"]
+
+    plan.write_bytes(b"---\nstatus: \xff\n---\n")
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    tk = ctx["tickets"]
+    assert tk["ref"] == "1.1"
+    assert (tk["plan_status"], tk["blocked_reason"], tk["auto_run_result"]) == (None, None, None)
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "resolve-ticket-context-unreadable"]
+    assert rec["story_key"] == "6-4-cli-list-command" and rec["plan"] == str(plan)
+    assert rec["error"].startswith("UnicodeDecodeError")
+
+    state.source = "sprint-status"
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert "tickets" not in ctx
+
+
+@pytest.mark.parametrize(
+    "head, fault",
+    [
+        ("", "no frontmatter block"),
+        ("---\nstatus: [blocked\n---\n", "unparseable frontmatter YAML"),
+        ("---\n- blocked\n---\n", "frontmatter is not a mapping"),
+    ],
+)
+def test_tickets_context_malformed_plan_frontmatter_is_journaled(tmp_path, head, fault):
+    """A plan whose frontmatter is missing, unparseable or not a mapping reads as
+    null status fields, never a healthy-looking `""`, and the fault is journaled;
+    the body's `## Auto Run Result` still reaches the resolver. Ablation
+    (performed): drop the `frontmatter_fault` check and `plan_status` reads `""`
+    with no journal row — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(head + TICKET_PLAN_BODY, encoding="utf-8")
+    run_dir, state, _ = _escalated_ticket_run(tmp_path, plan)
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    tk = ctx["tickets"]
+    assert (tk["plan_status"], tk["blocked_reason"]) == (None, None)
+    assert tk["auto_run_result"].startswith("Status: blocked")
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "resolve-ticket-context-unreadable"]
+    assert rec["story_key"] == "6-4-cli-list-command" and rec["plan"] == str(plan)
+    assert rec["error"].startswith(fault)
+
+
+def test_tickets_context_plan_without_a_status_reads_null(tmp_path):
+    """A well-formed plan with no `status` key reads `plan_status` null, as the
+    skill documents, and journals nothing."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\n---\n" + TICKET_PLAN_BODY, encoding="utf-8")
+    run_dir, state, _ = _escalated_ticket_run(tmp_path, plan)
+
+    ctx = json.loads(
+        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
+    )
+    assert ctx["tickets"]["plan_status"] is None
+    journal = run_dir / "journal.jsonl"
+    assert not journal.exists() or "resolve-ticket-context-unreadable" not in journal.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_tickets_context_plan_moves_with_a_renamed_project(tmp_path):
+    """A tickets task with no recorded spec reads its plan from the binding, which
+    names it absolute under the launch-time project `state.project` keeps. After a
+    project move the context names, and reads, the plan under the live project.
+    Ablation (performed): pass `context_spec_path` alone and the context names the
+    old path with null fields — this FAILS."""
+    live = tmp_path / "live"
+    plan = live / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text(
+        "---\nticket: 1\nstatus: blocked\nblocked_reason: intent gap\n---\n" + TICKET_PLAN_BODY,
+        encoding="utf-8",
+    )
+    launched = tmp_path / "launched-here"
+    run_dir, state, task = _escalated_run(live, source="tickets")
+    task.spec_file = ""
+    task.ticket = _ticket_binding(launched / plan.relative_to(live))
+    state.project = str(launched)
+    save_state(run_dir, state)
+
+    path, _, _ = resolve.build_context(
+        state, run_dir, "6-4-cli-list-command", isolation="", project_root=live
+    )
+
+    tk = json.loads(path.read_text(encoding="utf-8"))["tickets"]
+    assert tk["plan"] == plan.as_posix()
+    assert (tk["plan_status"], tk["blocked_reason"]) == ("blocked", "intent gap")
+
+
+def test_rearm_tickets_uses_mark_and_clears_blocked_fields(project_v7):
+    """A tickets-mode re-arm moves the plan's status through the real chokepoint —
+    `tickets.py mark`, reason `rearm`, the plan as the cross-check — which also
+    clears the `blocked_at`/`blocked_reason` build-auto's HALT set; the stale result
+    section is still stripped. Ablation (performed): route the flip back through
+    `verify.set_frontmatter_status` and the plan keeps its `blocked_*` fields and no
+    `ticket-mark` is journaled — this FAILS."""
+    from bmad_loop import frontmatter
+
+    plan = _blocked_ticket_plan(project_v7)
+    run_dir, _, _ = _escalated_ticket_run(
+        project_v7.project, plan, initiative=project_v7.initiative
+    )
+
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    fm = frontmatter.read_frontmatter(plan)
+    assert frontmatter.status_of(fm) == "ready-for-dev"
+    assert not fm.get("blocked_reason") and not fm.get("blocked_at")
+    assert "Auto Run Result" not in plan.read_text(encoding="utf-8")
+    assert "<intent-contract>" in plan.read_text(encoding="utf-8")
+    (mark,) = [e for e in _kinds(run_dir) if e["kind"] == "ticket-mark"]
+    assert (mark["ref"], mark["reason"], mark["before"], mark["after"], mark["outcome"]) == (
+        "1.1",
+        "rearm",
+        "blocked",
+        "ready-for-dev",
+        "written",
+    )
+    assert load_state(run_dir).tasks[outcome.story_key].phase == Phase.PENDING
+
+
+def test_rearm_rollback_restores_plan_bytes_on_fault(project_v7, monkeypatch):
+    """A fault after the mark — here `save_state` itself — rolls the plan back to the
+    exact bytes the re-arm found, through the chokepoint's `restore_preimage` (journaled
+    `ticket-plan-restored`), and the story stays escalated. Ablation (performed): drop
+    the tickets branch of `_restore_rearmed_spec` and the confined byte write restores
+    the bytes with no `ticket-plan-restored` row — this FAILS."""
+    plan = _blocked_ticket_plan(project_v7)
+    before = plan.read_bytes()
+    run_dir, _, _ = _escalated_ticket_run(
+        project_v7.project, plan, initiative=project_v7.initiative
+    )
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+    with pytest.raises(OSError, match="disk full"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert plan.read_bytes() == before
+    kinds = _kinds(run_dir)
+    (restored,) = [e for e in kinds if e["kind"] == "ticket-plan-restored"]
+    assert (restored["before"], restored["after"], restored["outcome"]) == (
+        "ready-for-dev",
+        "blocked",
+        "restored",
+    )
+    (aborted,) = [e for e in kinds if e["kind"] == "rearm-aborted"]
+    assert aborted["rollback"] == "restored"
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+
+
+def test_patch_evacuated_and_latched_from_run_dir(tmp_path, monkeypatch):
+    """A patch-restore re-arm naming build-auto's intent-gap patch beside the plan
+    (`<plan>.patch`) moves it out of the tracked tree to `{run_dir}/restore/<key>.patch`
+    and latches that copy; the plan is re-armed to `in-review` through `mark`.
+    Ablation (performed): skip `_evacuate_plan_patch` and the patch stays beside the
+    plan with the latch on it — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\nstatus: blocked\n---\n" + TICKET_PLAN_BODY, encoding="utf-8")
+    patch = plan.with_suffix(".patch")
+    patch.write_bytes(b"diff --git a/x b/x\r\n")
+    tree = _fake_rearm_tree(monkeypatch, plan)
+    run_dir, _, _ = _escalated_ticket_run(tmp_path, plan)
+
+    outcome = runs.rearm_escalation(
+        run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
+    )
+
+    copy = runs.evacuated_patch_path(run_dir, outcome.story_key)
+    assert copy.parent == run_dir / "restore"
+    assert not patch.exists() and copy.read_bytes() == b"diff --git a/x b/x\r\n"
+    assert load_state(run_dir).tasks[outcome.story_key].restore_patch == str(copy)
+    assert [(m.ref, m.target, m.reason, m.expected_plan) for m in tree.marks] == [
+        ("1.1", "in-review", "rearm", plan)
+    ]
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "restore-patch-evacuated"]
+    assert (rec["patch"], rec["stashed_to"], rec["latched"]) == (str(patch), str(copy), True)
+
+
+def test_from_scratch_rearm_evacuates_stray_patch(tmp_path, monkeypatch):
+    """A from-scratch re-arm still moves a stray intent-gap patch out of the tree —
+    left there it fails the re-drive's clean-tree check and `finalize_commit` would
+    commit it — but latches nothing. Ablation (performed): gate the evacuation on a
+    restore latch and the patch stays beside the plan — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\nstatus: blocked\n---\n" + TICKET_PLAN_BODY, encoding="utf-8")
+    patch = plan.with_suffix(".patch")
+    patch.write_text("diff\n", encoding="utf-8")
+    tree = _fake_rearm_tree(monkeypatch, plan)
+    run_dir, _, _ = _escalated_ticket_run(tmp_path, plan)
+
+    outcome = runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert not patch.exists()
+    assert (
+        runs.evacuated_patch_path(run_dir, outcome.story_key).read_text(encoding="utf-8")
+        == "diff\n"
+    )
+    assert load_state(run_dir).tasks[outcome.story_key].restore_patch is None
+    assert [(m.target, m.reason) for m in tree.marks] == [("ready-for-dev", "rearm")]
+    (rec,) = [e for e in _kinds(run_dir) if e["kind"] == "restore-patch-evacuated"]
+    assert rec["latched"] is False
+
+
+def test_aborted_rearm_returns_the_evacuated_patch(tmp_path, monkeypatch):
+    """An aborted tickets re-arm puts the evacuated patch back beside the plan, so a
+    retried resolve finds the path the resolution names. Ablation (performed): drop
+    `_return_evacuated_patch` from the guard and the patch is gone — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\nstatus: blocked\n---\n" + TICKET_PLAN_BODY, encoding="utf-8")
+    patch = plan.with_suffix(".patch")
+    patch.write_bytes(b"diff\n")
+    _fake_rearm_tree(monkeypatch, plan)
+    run_dir, _, _ = _escalated_ticket_run(tmp_path, plan)
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runs, "save_state", boom)
+    with pytest.raises(OSError, match="disk full"):
+        runs.rearm_escalation(
+            run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
+        )
+
+    assert patch.read_bytes() == b"diff\n"
+
+
+def test_rearm_tickets_refused_transition_keeps_the_escalation(tmp_path, monkeypatch):
+    """A re-arm the plan table refuses — a restore to `in-review` from a plan that
+    never left `ready-for-dev` — aborts with the escalation still armed and the plan
+    untouched. Ablation (performed): swallow the `TicketsError` in
+    `_rearm_ticket_plan` and the re-arm completes — this FAILS."""
+    plan = tmp_path / "epic-cart" / "story-cart-model-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nticket: 1\nstatus: ready-for-dev\n---\n# plan\n", encoding="utf-8")
+    patch = tmp_path / "attempt.patch"
+    patch.write_text("diff\n", encoding="utf-8")
+    _fake_rearm_tree(monkeypatch, plan, status="ready-for-dev")
+    run_dir, _, _ = _escalated_ticket_run(tmp_path, plan)
+
+    with pytest.raises(runs.RearmError, match="tickets.py refused"):
+        runs.rearm_escalation(
+            run_dir, restore_patch=str(patch), isolated_redrive=False, resolution_recorded=True
+        )
+
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+    assert "status: ready-for-dev" in plan.read_text(encoding="utf-8")

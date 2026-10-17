@@ -68,6 +68,7 @@ from bmad_loop.policy import (
     OperatorPolicy,
     Policy,
     ScmPolicy,
+    TicketsPolicy,
     VerifyPolicy,
 )
 from bmad_loop.verify import (
@@ -2129,6 +2130,54 @@ def test_branch_per_run_naming(project):
     engine.run()
     assert engine.state.tasks["1-1-a"].branch == "bmad-loop/test-run"
     assert branch_exists(project.project, "bmad-loop/test-run")
+
+
+def test_unit_branch_embeds_epic_slug(project, monkeypatch):
+    """A work source that names the unit's epic (tickets mode: the epic slug,
+    through `Engine._unit_branch_epic`) gets `bmad-loop/<run>/<epic>/<unit>`, each
+    segment ref-sanitized on its own, and real git accepts it; the seam reaches
+    the mount through `WorktreeFlow`. Ablation (performed): drop the
+    `epic_segment` pass-through in `WorktreeFlow` and the run's branch has no
+    epic segment — this FAILS."""
+    from bmad_loop.workspace import open_unit_workspace, unit_branch_name
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    unit = open_unit_workspace(
+        project.project,
+        project,
+        "test-run",
+        "1.1",
+        "main",
+        "story",
+        run_dir,
+        epic_segment="epic cart",
+    )
+    assert unit.branch == unit_branch_name("test-run", "1.1", "story", epic_segment="epic cart")
+    assert unit.branch.startswith("bmad-loop/test-run/epic_cart-") and unit.branch.endswith("/1.1")
+    assert branch_exists(project.project, unit.branch)  # real git accepted the name
+
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(branch_per="story", delete_branch=False),
+    )
+    monkeypatch.setattr(engine, "_unit_branch_epic", lambda task: "epic-cart")
+    engine.run()
+    assert engine.state.tasks["1-1-a"].branch == "bmad-loop/test-run/epic-cart/1-1-a"
+    assert branch_exists(project.project, "bmad-loop/test-run/epic-cart/1-1-a")
+
+
+def test_unit_branch_unchanged_without_epic():
+    """No epic segment — every mode but tickets — keeps today's names byte for
+    byte, and `branch_per = "run"` ignores the segment: one branch per run."""
+    from bmad_loop.workspace import unit_branch_name
+
+    for epic in (None, ""):
+        assert unit_branch_name("r1", "1-1-a", "story", epic_segment=epic) == "bmad-loop/r1/1-1-a"
+    assert unit_branch_name("r1", "1-1-a", "story") == "bmad-loop/r1/1-1-a"
+    assert unit_branch_name("r1", "1.1", "run", epic_segment="epic-cart") == "bmad-loop/r1"
+    assert Engine._unit_branch_epic(object.__new__(Engine), StoryTask("1-1-a", 1)) is None
 
 
 def test_dirty_unit_key_branch_is_created_by_real_git(project):
@@ -11817,6 +11866,39 @@ def test_resolve_finished_run_replays_the_kept_unit_in_a_new_run(
     assert _state_bytes(engine.run_dir) == finished_before
 
 
+def test_a_launched_replay_refused_after_the_mint_journals_into_the_replay_run(
+    project, tmp_path, monkeypatch, capsys
+):
+    """#925: a TUI-launched replay whose resume refuses before accepting the minted
+    run journals that refusal into the replay run — the one left paused — not the
+    finished run it was minted from.
+
+    Ablation: drop `args.run_id = replay_id` and the entry lands in the finished
+    run."""
+    from bmad_loop import cli
+
+    engine, marker = _finished_kept_unit(project, tmp_path)
+    marker.write_text("up\n")
+
+    def drifted(_project, _run_dir, **_k):
+        print("a skill changed since the preflight", file=sys.stderr)
+        return 1
+
+    monkeypatch.setattr(cli, "_prepare_resume_locked", drifted)
+    argv = ["resolve", "--project", str(project.project), engine.run_dir.name, "--reverify"]
+    assert cli.main(["--ctl-launch", *argv, "--story", "1-1-a", "--resume"]) == 1
+    capsys.readouterr()
+
+    [replay_dir] = _replay_dirs(engine)
+
+    def refusals(run_dir):
+        return [e for e in Journal(run_dir).entries() if e["kind"] == "ctl-window-claim-failed"]
+
+    [entry] = refusals(replay_dir)
+    assert "a skill changed since the preflight" in entry["error"]
+    assert refusals(engine.run_dir) == []
+
+
 def test_resolve_finished_run_replays_the_kept_unit_of_a_moved_project(
     project, tmp_path, monkeypatch, capsys
 ):
@@ -12326,6 +12408,10 @@ def _escalated_replay(project, tmp_path, monkeypatch):
     )
     _assert_replay_merge_refused(project, replay_dir)
     monkeypatch.setattr(runs, "engine_liveness", lambda _run_dir: "dead")
+    # The removal guard's real `list-sessions` reports a failed query through
+    # `warn` — under a loaded xdist leg that note lands in the exact-notes
+    # assertions of the delete tests. No session is live here; answer so.
+    monkeypatch.setattr(runs, "mux_sessions", lambda *, on_fault=None: [])
     return engine, replay_dir
 
 
@@ -13214,3 +13300,355 @@ def test_abandon_refuses_while_the_moved_kept_unit_is_registered_under_the_run(
     assert (moved / "extra-notes.txt").is_file()
     assert _state_bytes(replay_dir) == before
     assert all(e["kind"] != "replay-abandoned" for e in Journal(replay_dir).entries())
+
+
+# --------------------------------------------- tickets: the dirty-initiative gate
+#
+# A tickets unit's commit stages the whole checkout, so a person's uncommitted edit
+# under the initiative folder would ride it; the gate pauses before the unit opens.
+# The run's own ledger writes there never trip it. Helpers from
+# tests/test_tickets_engine.py (FakeTicketTree; no real `tickets.py` spawn).
+
+
+def _mount_aware(engine, tree, main):
+    """Each unit mount reads the fake through its own tree (`_MountTree`), as
+    `tickets.py --project-root <mount>` would; the main checkout reads it as is."""
+    from test_tickets_engine import _MountTree
+
+    engine._ticket_tree_factory = lambda root, pin: (
+        tree if root == main else _MountTree(tree, main, root)
+    )
+    return engine
+
+
+def _tickets_worktree_engine(layout, tree, plan):
+    from test_tickets_engine import _builds, _policy, make_engine
+
+    pol = replace(_policy(), scm=ScmPolicy(isolation="worktree", delete_branch=False))
+    engine, adapter = make_engine(layout, tree, policy=pol, script=[_builds(layout, tree, plan)])
+    return _mount_aware(engine, tree, layout.project), adapter
+
+
+def test_dirty_initiative_pauses_before_unit_open(project_v7):
+    """An uncommitted file under the initiative folder that the run does not own
+    pauses the run at `ticket-tree` before the ticket's unit opens — no task, no
+    session, no worktree or unit branch — and the reason names the path. Once
+    the edit is committed, the resume re-picks the ticket and builds it.
+    Ablation (performed): drop the `_gate_dirty_initiative` call from
+    `_dispatch_ref` and the unit opens and builds — this FAILS."""
+    from conftest import ticket_row
+    from test_tickets_engine import _builds, _resumed, _tree
+
+    from bmad_loop.model import PAUSE_TICKET_TREE
+
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = _tickets_worktree_engine(project_v7, tree, plan)
+    note = project_v7.initiative_folder / "operator-notes.md"
+    note.write_bytes(b"draft the cart rules\n")
+    rel = note.relative_to(project_v7.project).as_posix()
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert rel in (state.paused_reason or "")
+    assert state.tasks == {} and adapter.sessions == []
+    assert git(project_v7.project, "worktree", "list", "--porcelain").count("worktree ") == 1
+    assert git(project_v7.project, "branch", "--list", "bmad-loop/*").strip() == ""
+    halts = [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]
+    assert [(e["ref"], e["cause"], e["stage"]) for e in halts] == [
+        ("1.1", "dirty-initiative", PAUSE_TICKET_TREE)
+    ]
+
+    git(project_v7.project, "add", rel)
+    git(project_v7.project, "commit", "-q", "-m", "operator notes")
+    resumed, adapter = _resumed(engine, tree, [_builds(project_v7, tree, plan)])
+    _mount_aware(resumed, tree, project_v7.project).run()
+
+    assert load_state(engine.run_dir).tasks["1.1"].phase == Phase.DONE
+    assert len(adapter.sessions) == 1
+
+
+def test_dirty_ledger_only_does_not_pause(project_v7):
+    """The deferred-work ledger lives in the initiative folder on v7 and the run
+    writes it outside a unit's commit, so an uncommitted ledger alone never trips
+    the dirty-initiative gate: the ticket builds and lands. Ablation (performed):
+    drop the `_run_owned_paths` exclusion and the run pauses at `ticket-tree` —
+    this FAILS."""
+    from conftest import ticket_row
+    from test_tickets_engine import _tree
+
+    from bmad_loop.bmadconfig import load_paths
+
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = _tickets_worktree_engine(project_v7, tree, plan)
+    ledger = load_paths(project_v7.project, want_tickets=True).deferred_work
+    assert ledger.is_relative_to(project_v7.initiative_folder), "premise: R8 ledger placement"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b"# Deferred Work\n")
+    rel = ledger.relative_to(project_v7.project).as_posix()
+    assert git(project_v7.project, "status", "--porcelain", "--", rel).strip(), "premise: dirty"
+
+    summary = engine.run()
+
+    state = load_state(engine.run_dir)
+    assert not summary.paused, state.paused_reason
+    assert state.tasks["1.1"].phase == Phase.DONE and len(adapter.sessions) == 1
+    assert not [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]
+
+
+def test_ignored_plan_in_a_tracked_store_pauses_before_unit_open(project_v7):
+    """Under worktree isolation a tracked store (T1) is marked in the mount inside
+    the commit window, so a plan the code repo ignores would be left out of the
+    unit's commit and deleted with the mount. The pick pauses at `ticket-tree`
+    before the unit opens — no task, no session — naming the plan; once it is no
+    longer ignored, the resume builds it. Ablation (performed): drop the
+    `_gate_ignored_plan` call from `_dispatch_ref` and the unit opens and builds
+    — this FAILS."""
+    from conftest import ticket_row
+    from test_tickets_engine import _builds, _resumed, _tree
+
+    from bmad_loop.model import PAUSE_TICKET_TREE
+
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = _tickets_worktree_engine(project_v7, tree, plan)
+    rel = plan.relative_to(project_v7.project).as_posix()
+    exclude = project_v7.project / ".git" / "info" / "exclude"
+    kept = exclude.read_bytes() if exclude.is_file() else b""
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_bytes(kept + f"/{rel}\n".encode())
+    assert verify.path_ignored(project_v7.project, plan), "premise: the plan is ignored"
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert str(plan) in (state.paused_reason or "")
+    assert state.tasks == {} and adapter.sessions == []
+    halts = [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]
+    assert [(e["ref"], e["cause"]) for e in halts] == [("1.1", "ignored-plan")]
+
+    exclude.write_bytes(kept)
+    resumed, adapter = _resumed(engine, tree, [_builds(project_v7, tree, plan)])
+    _mount_aware(resumed, tree, project_v7.project).run()
+
+    assert load_state(engine.run_dir).tasks["1.1"].phase == Phase.DONE
+    assert len(adapter.sessions) == 1
+
+
+def _ignore_plan(layout, plan):
+    exclude = layout.project / ".git" / "info" / "exclude"
+    kept = exclude.read_bytes() if exclude.is_file() else b""
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    rel = plan.relative_to(layout.project).as_posix()
+    exclude.write_bytes(kept + f"/{rel}\n".encode())
+    assert verify.path_ignored(layout.project, plan), "premise: the plan is ignored"
+
+
+@pytest.mark.parametrize("gate", ["ignored-plan", "dirty-initiative"])
+def test_rebinding_an_unbound_task_applies_the_pick_gates(project_v7, gate):
+    """A host that died between `_loop` saving the new task and the binding
+    attach leaves a registered, unbound task; the resume re-resolves it through
+    `_rebind`, which must refuse what a fresh pick would: an ignored T1 plan or
+    an unowned edit under the initiative folder pauses at `ticket-tree` before
+    the unit opens — the task stays unbound, no session, no worktree.
+    Ablation (performed): drop the gate's call from `_rebind` and the unit
+    opens and builds — this FAILS."""
+    from conftest import ticket_row
+    from test_tickets_engine import _tree
+
+    from bmad_loop.engine import RunPaused
+    from bmad_loop.model import PAUSE_TICKET_TREE
+
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = _tickets_worktree_engine(project_v7, tree, plan)
+    if gate == "ignored-plan":
+        _ignore_plan(project_v7, plan)
+    else:
+        (project_v7.initiative_folder / "operator-notes.md").write_bytes(b"draft\n")
+    task = StoryTask("1.1", 0)
+    engine.state.tasks["1.1"] = task
+
+    with pytest.raises(RunPaused) as paused:
+        engine._run_story(task)
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_TICKET_TREE, "1.1")
+    assert task.ticket is None and adapter.sessions == []
+    assert git(project_v7.project, "worktree", "list", "--porcelain").count("worktree ") == 1
+    halts = [e for e in engine.journal.entries() if e.get("kind") == "ticket-pick-halt"]
+    assert [(e["ref"], e["cause"]) for e in halts] == [("1.1", gate)]
+
+
+# ----------------------------------------- tickets: commits in a store repository
+#
+# A ticket store with its own repository (T3 nested, T4 external) gets a plan-only
+# commit there once the unit's code has merged back and the plan is marked; an
+# unversioned store (T2) has nothing to commit and says so once per run. Helpers
+# from tests/test_tickets_engine.py (FakeTicketTree; no real `tickets.py` spawn).
+
+
+def _store_engine(layout, tree, expect, *, merge_strategy="merge", mark_done="auto", **kw):
+    """`make_engine` under worktree isolation, the run's topology recorded from the
+    real probe as `runsetup` stamps it (asserted to be layout ``expect``)."""
+    from test_tickets_engine import _policy, make_engine
+
+    from bmad_loop import ticketstore
+    from bmad_loop.bmadconfig import load_paths
+
+    paths = load_paths(layout.project, want_tickets=True)
+    topology = ticketstore.assess_store(paths, "worktree")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == expect
+    scm = ScmPolicy(isolation="worktree", delete_branch=False, merge_strategy=merge_strategy)
+    pol = replace(_policy(), scm=scm, tickets=TicketsPolicy(mark_done=mark_done))
+    return make_engine(layout, tree, policy=pol, store_topology=topology.to_dict(), **kw)
+
+
+def _store_tree(layout, *refs):
+    """The fake tree offering ``refs``, every `find` plan under the layout's own
+    initiative folder (the fake spells it under the project's `_bmad-output`)."""
+    from conftest import ticket_row
+    from test_tickets_engine import _tree
+
+    tree = _tree(layout, ready_to_start=tuple(ticket_row(ref) for ref in refs))
+    default = layout.project / "_bmad-output" / layout.initiative
+    for ref, found in tree.finds.items():
+        rel = Path(found.plan).relative_to(default)
+        tree.finds[ref] = replace(found, plan=str(layout.initiative_folder / rel))
+    return tree
+
+
+def _store_run(layout, expect, monkeypatch, **kw):
+    """One ticket built and merged back over a shared store of layout ``expect``."""
+    from test_tickets_engine import _builds_shared, _marking_tree
+
+    tree = _store_tree(layout, "1.1")
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    engine, _ = _store_engine(
+        layout, tree, expect, script=[_builds_shared(layout, tree, plan)], max_stories=1, **kw
+    )
+    engine.run()
+    return engine, tree, plan
+
+
+def _assert_plan_committed(engine, store, plan):
+    from test_tickets_engine import _kinds, _plan_status
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.worktree_path and task.commit_sha
+    assert (task.ticket_done_pending, task.ticket_park_pending) == (False, "")
+    assert _plan_status(plan) == "done"
+    body = git(store, "log", "-1", "--format=%B")
+    assert body.splitlines()[0] == "chore(tickets): 1.1 done [bmad-loop test-run]"
+    assert f"Bmad-Code-Repo: {engine.paths.repo_root.as_posix()}" in body
+    assert f"Bmad-Code-Commit: {task.commit_sha}" in body
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{task.commit_sha}" in body
+    rel = plan.resolve().relative_to(store.resolve()).as_posix()
+    assert git(store, "show", "--name-only", "--format=", "HEAD").split() == [rel]
+    assert git(store, "status", "--porcelain") == ""
+    assert [e["commit"] for e in _kinds(engine, "store-committed")] == [
+        verify.rev_parse_head(store)
+    ]
+    assert git(engine.paths.project, "status", "--porcelain") == ""
+
+
+def test_t3_mark_done_commits_in_store_repo(project_v7_store_repo, monkeypatch):
+    """T3 (the store is its own repository nested in the code checkout): once the
+    unit's code has merged back and the plan is marked `done`, the store repository
+    gets one `chore(tickets)` commit holding the plan alone, its trailers naming
+    the code repository, the unit's commit and its range. Ablation (performed):
+    drop the `_commit_marked_plan` call in `_land_post_landing_writes` and the
+    plan stays uncommitted in the store — this FAILS."""
+    layout = project_v7_store_repo
+    engine, tree, plan = _store_run(layout, "T3", monkeypatch)
+
+    _assert_plan_committed(engine, layout.output_folder, plan)
+    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written")]
+
+
+def test_squash_merge_back_trailers_name_the_landed_commit(project_v7_store_repo, monkeypatch):
+    """A `squash` merge-back lands a different commit than the unit's, and the
+    unit branch's teardown leaves the unit's unreachable: the store trailers name
+    the target's head, which holds the unit's code. Ablation (performed): pass
+    `task.commit_sha` in `_commit_marked_plan` again and this FAILS."""
+    layout = project_v7_store_repo
+    engine, _, _ = _store_run(layout, "T3", monkeypatch, merge_strategy="squash")
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    repo = engine.paths.repo_root
+    landed = verify.rev_parse_head(repo)
+    assert landed != task.commit_sha and not verify.is_ancestor(repo, task.commit_sha, landed)
+    body = git(layout.output_folder, "log", "-1", "--format=%B")
+    assert f"Bmad-Code-Commit: {landed}" in body
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{landed}" in body
+
+
+def test_t4_external_store_commit(project_v7_external_store, monkeypatch):
+    """T4 (the store is its own repository outside the code checkout): the same
+    plan-only commit lands in the external store repository, the code checkout
+    untouched by it."""
+    layout = project_v7_external_store
+    engine, _, plan = _store_run(layout, "T4", monkeypatch)
+
+    _assert_plan_committed(engine, layout.output_folder, plan)
+
+
+def test_t2_unversioned_journals_once(project_v7, monkeypatch):
+    """T2 (an ignored plain folder): the plan is marked after the merge-back with
+    nothing to commit, and `store-unversioned` is journaled once per run — not
+    again for a later landing, nor by a resumed process over the same journal.
+    Ablation (performed): drop the journal read in `_note_store_unversioned` and
+    the resumed process journals it again — this FAILS."""
+    from test_tickets_engine import _kinds, _plan_status, _resume
+
+    rel = project_v7.output_folder.relative_to(project_v7.project).as_posix()
+    git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
+    with (project_v7.project / ".gitignore").open("a", encoding="utf-8") as f:
+        f.write(f"/{rel}/\n")
+    git(project_v7.project, "add", ".gitignore")
+    git(project_v7.project, "commit", "-q", "-m", "the store is ignored")
+    engine, tree, plan = _store_run(project_v7, "T2", monkeypatch)
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and not task.ticket_done_pending
+    assert _plan_status(plan) == "done"
+    assert [e["layout"] for e in _kinds(engine, "store-unversioned")] == ["T2"]
+    assert not _kinds(engine, "store-committed")
+
+    for again in (engine, _resume(engine, tree)):
+        landed = load_state(engine.run_dir).tasks["1.1"]
+        landed.ticket_done_pending = True
+        again.state.tasks["1.1"] = landed
+        again._land_post_landing_writes(landed)
+
+    assert len(_kinds(engine, "store-unversioned")) == 1
+    assert [m.outcome for m in tree.marks] == ["written", "noop", "noop"]
+
+
+def test_t2_unversioned_journals_under_mark_done_never(project_v7, monkeypatch):
+    """T2 under `mark_done = "never"`: no mark and no store repository to commit
+    in, so nothing latches — but the session's `built` plan lives on disk alone,
+    and `store-unversioned` is still journaled once. Ablation (performed): drop
+    the `_note_store_unversioned` call in `_latch_post_landing_writes` and nothing
+    is journaled — this FAILS."""
+    from test_tickets_engine import _kinds, _plan_status
+
+    rel = project_v7.output_folder.relative_to(project_v7.project).as_posix()
+    git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
+    with (project_v7.project / ".gitignore").open("a", encoding="utf-8") as f:
+        f.write(f"/{rel}/\n")
+    git(project_v7.project, "add", ".gitignore")
+    git(project_v7.project, "commit", "-q", "-m", "the store is ignored")
+    engine, tree, plan = _store_run(project_v7, "T2", monkeypatch, mark_done="never")
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE
+    assert not (task.ticket_done_pending or task.ticket_park_pending or task.ticket_commit_pending)
+    assert _plan_status(plan) == "built" and not tree.marks
+    assert not _kinds(engine, "ticket-mark-latched")
+    assert [e["layout"] for e in _kinds(engine, "store-unversioned")] == ["T2"]

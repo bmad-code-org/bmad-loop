@@ -141,12 +141,16 @@ the exit banner (see `capture-pane` below). Then, unless the name may be a run's
 
 `cleanup` names the one an earlier release started for this project in its registry
 (matched by that exact name, since a run id `ctl-<16 hex>` gives an agent session the same
-shape) on stderr and in `sessions.legacy_leftovers`, with that command ready to paste
+shape) on stderr, in a TUI cleanup toast and in `sessions.superseded_ctl_sessions`, never
+with the `not migrated` leftovers; the command is ready to paste
 (`sessions.legacy_kill_commands` in `--json`). `attach` names it when it finds no run or nothing to
 attach, with `switch-client` instead of `attach` when run inside a psmux pane. A name that
 may be a run's own session (a run of this project has that id, or the session carries a run's
 project tag, as a neighbour's run can in a shared registry) is named with no command; do not
 end it by hand until you know which it is.
+
+A name `cleanup` could not confirm (its derivation failed, or the listed name no longer
+matches it) is also named with no command, beside the fault that withheld it.
 
 **If the state root cannot be derived** (for example, `BMAD_LOOP_STATE_DIR` is a relative
 path), bmad-loop says so and leaves whatever `PSMUX_DATA_DIR` was in force. `cleanup` then

@@ -144,6 +144,16 @@ BLOCKED = "blocked"
 # failure the state exists to avoid.
 AWAITING_OPERATOR = "awaiting-operator"
 
+# BMAD v7 ticket-plan terminals. A v7 build session finishes a ticket at
+# `built`: `done` belongs to the orchestrator, which marks it after its own
+# verification. `dropped` is bmad-ticket's, a human withdrawing the ticket, so a
+# session that ends on it has nothing to land. Neither is terminal unless the
+# caller opts in through ``success_statuses`` (see `terminal_statuses`): the v6
+# vocabulary has no such tokens, and a sprint or stories spec reading either one
+# keeps today's not-terminal answer.
+BUILT = "built"
+DROPPED = "dropped"
+
 # The status a plan-halt dispatch leaves behind: under folder+id dispatch a
 # `Halt after planning.` directive makes the skill HALT right after the
 # Ready-for-Development gate, at `ready-for-dev`. This is a *successful* terminal
@@ -189,6 +199,30 @@ _FM_STATUS_RE = re.compile(
 # upstream upgrade, or a project mid-migration), so this must never be keyed on the
 # skill name resolved on disk today.
 FALLBACK_RESULT_PREFIXES = ("bmad-build-auto-result-", "bmad-dev-auto-result-")
+
+# The terminal frontmatter set every v6 caller has always used; the default of the
+# `terminal=` parameters below.
+DEFAULT_TERMINAL = frozenset({DONE, BLOCKED, AWAITING_OPERATOR})
+
+
+def terminal_statuses(
+    success_statuses: tuple[str, ...] = (DONE,), *, plan_halt: bool = False
+) -> frozenset[str]:
+    """The frontmatter statuses that end a session whose successful exits are
+    ``success_statuses``: those, plus ``blocked`` and ``awaiting-operator``, plus
+    ``ready-for-dev`` on a plan-halt leg.
+
+    The ticket contract (``BUILT`` among the successes) adds ``dropped``: a plan
+    a human withdrew mid-session is over, and `synthesize_result` renders it as a
+    CRITICAL escalation. The default arguments return exactly
+    ``DEFAULT_TERMINAL`` (plus ``ready-for-dev`` under ``plan_halt``), so a v6
+    caller that passes nothing gets today's set."""
+    out = set(success_statuses) | {BLOCKED, AWAITING_OPERATOR}
+    if plan_halt:
+        out.add(PLAN_HALT_STATUS)
+    if BUILT in success_statuses:
+        out.add(DROPPED)
+    return frozenset(out)
 
 
 @dataclass(frozen=True)
@@ -443,6 +477,7 @@ def synthesize_result(
     dw_ids: list[str] | None = None,
     plan_halt: bool = False,
     park_marker_session_authored: bool = False,
+    success_statuses: tuple[str, ...] = (DONE,),
 ) -> SynthResult:
     """Build the legacy result dict from the generic skill's on-disk spec.
 
@@ -476,6 +511,13 @@ def synthesize_result(
     DW-273). Both are attempt-ownership claims about the same marker, so one
     authorship proof is the right number — a second flag could only disagree
     with the first.
+
+    ``success_statuses`` names the session's successful exits; the default
+    ``(done,)`` is the v6 contract. A v7 ticket session passes ``(built,)`` (dev)
+    or ``(built, done)`` (review), which makes those statuses terminal (see
+    `terminal_statuses`), carries ``followup_review_recommended`` on them, and
+    renders a ``dropped`` plan as a CRITICAL escalation of type ``dropped``.
+    Under the default, ``built`` and ``dropped`` stay non-terminal tokens.
     """
     try:
         fm = read_frontmatter(spec_path)
@@ -498,11 +540,7 @@ def synthesize_result(
     fm_status = status_of(fm)
     arr = parse_auto_run_result(_read_text_or_empty(spec_path))
 
-    terminal = (
-        (DONE, BLOCKED, AWAITING_OPERATOR, PLAN_HALT_STATUS)
-        if plan_halt
-        else (DONE, BLOCKED, AWAITING_OPERATOR)
-    )
+    terminal = terminal_statuses(success_statuses, plan_halt=plan_halt)
     # Not terminal yet: no result section AND frontmatter not at a terminal state.
     if not arr.present and fm_status not in terminal:
         return SynthResult(result_json=None, status_consistent=True)
@@ -524,6 +562,18 @@ def synthesize_result(
                 "type": "blocked",
                 "severity": "CRITICAL",
                 "detail": detail,
+                "spec_file": str(spec_path),
+            }
+        )
+    elif DROPPED in terminal and (status == DROPPED or arr.status == DROPPED):
+        # Ticket contract only (`terminal_statuses` adds DROPPED beside BUILT): a
+        # plan withdrawn while its session ran has nothing to land, and only a
+        # human can say what happens to the work — the same PAUSE a block takes.
+        escalations.append(
+            {
+                "type": DROPPED,
+                "severity": "CRITICAL",
+                "detail": arr.detail or "the ticket plan was dropped while its session ran",
                 "spec_file": str(spec_path),
             }
         )
@@ -570,8 +620,9 @@ def synthesize_result(
     # bmad-build-auto (BMAD-METHOD PR #2505) self-reviews inline and, on a `done`
     # exit, sets `followup_review_recommended: true` when its review-driven
     # changes warrant an independent second-opinion pass. The skill never sets it
-    # on a blocked exit, so only carry it through on `done`.
-    if status == DONE:
+    # on a blocked exit, so only carry it through on a successful exit: `done`, or
+    # the caller's `success_statuses` (`built` for a v7 ticket).
+    if status in success_statuses:
         result["followup_review_recommended"] = bool(fm.get("followup_review_recommended", False))
     # A park's obligations travel with its result so the engine never has to
     # re-read the spec to learn them. Folded on the awaiting-operator status
@@ -650,7 +701,35 @@ def is_result_artifact(path: Path, *, since_ns: int) -> bool:
     return bool(_section_headings(text))
 
 
-def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[Path]:
+def find_fallback_result_artifact(directory: Path, *, since_ns: int) -> Path | None:
+    """The newest no-spec fallback result (`FALLBACK_RESULT_PREFIXES`) directly
+    under ``directory`` modified at/after ``since_ns``, or None.
+
+    Names only: unlike `find_result_artifact` a marker-carrying spec here never
+    qualifies. The caller probes a directory it did not hand the session as its
+    plan (a v7 initiative folder, where a session that could not resolve its
+    ticket writes the fallback), and every other spec in it belongs to someone
+    else (#261). Unreadable entries are skipped, as the scans above skip them."""
+    if not directory.is_dir():
+        return None
+    best: tuple[int, Path] | None = None
+    for path in directory.glob("*.md"):
+        if not path.name.startswith(FALLBACK_RESULT_PREFIXES):
+            continue
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        if mtime_ns < since_ns:
+            continue
+        if best is None or mtime_ns > best[0]:
+            best = (mtime_ns, path)
+    return best[1] if best else None
+
+
+def find_frontmatter_candidates(
+    impl_artifacts: Path, *, since_ns: int, terminal: frozenset[str] = DEFAULT_TERMINAL
+) -> list[Path]:
     """Missing-marker fallback scan (#224): specs this session finalized to a
     terminal frontmatter ``status:`` WITHOUT appending the ``## Auto Run Result``
     marker `find_result_artifact` keys on. The skill's HALT instructions make the
@@ -665,6 +744,7 @@ def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[
     ``awaiting-operator``). Returns ALL matches, most-recent first — the caller refuses to guess between several
     and must apply its own stability fingerprint before synthesizing, because a
     terminal frontmatter under a live window is weaker evidence than the marker.
+    ``terminal`` is the status set that qualifies, as for `is_frontmatter_candidate`.
     """
     if not impl_artifacts.is_dir():
         return []
@@ -674,7 +754,7 @@ def find_frontmatter_candidates(impl_artifacts: Path, *, since_ns: int) -> list[
             mtime_ns = path.stat().st_mtime_ns
         except OSError:
             continue
-        if not is_frontmatter_candidate(path, since_ns=since_ns):
+        if not is_frontmatter_candidate(path, since_ns=since_ns, terminal=terminal):
             continue
         found.append((mtime_ns, path))
     found.sort(key=lambda t: t[0], reverse=True)
@@ -754,7 +834,9 @@ def _unreadable(path: Path, *, since_ns: int) -> str | None:
     return None
 
 
-def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
+def is_frontmatter_candidate(
+    path: Path, *, since_ns: int, terminal: frozenset[str] = DEFAULT_TERMINAL
+) -> bool:
     """Whether ONE file qualifies for the missing-marker fallback — the per-path
     predicate `find_frontmatter_candidates` applies to each glob hit, factored out
     for the same reason as `is_result_artifact`: a caller holding the spec path the
@@ -765,7 +847,8 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
     fallback (already matched by name on the marker path), carries ZERO real
     (non-fenced) marker headings — one would put it in `find_result_artifact`'s
     territory — and has a terminal frontmatter ``status:`` (``done``,
-    ``blocked``, or ``awaiting-operator``). Any
+    ``blocked``, or ``awaiting-operator`` by default; ``terminal`` widens it, e.g.
+    to a ticket session's `terminal_statuses`). Any
     unreadable/undecodable read degrades to False, never an exception."""
     if path.name.startswith(FALLBACK_RESULT_PREFIXES):
         return False
@@ -784,7 +867,7 @@ def is_frontmatter_candidate(path: Path, *, since_ns: int) -> bool:
         fm = read_frontmatter(path)
     except OSError:
         return False
-    return status_of(fm) in (DONE, BLOCKED, AWAITING_OPERATOR)
+    return status_of(fm) in terminal
 
 
 def _atomic_write_spec(
