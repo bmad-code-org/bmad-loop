@@ -4800,8 +4800,16 @@ class WorktreeFlow:
             )
 
     def finish_publication(self, task: StoryTask, unit: UnitWorkspace | None) -> None:
-        """Publish and latch before successful teardown, including merge replay."""
-        if task.dw_ids:
+        """Publish and latch before successful teardown, including merge replay.
+        An artifacts dir in the shared ticket store has nothing to publish (the
+        mount wrote the main checkout's one copy in place, so
+        :meth:`prepare_publication` recorded no intent): the publication is
+        latched complete as is."""
+        if task.dw_ids and self.paths.in_shared_store(self.paths.implementation_artifacts):
+            if not task.artifact_publication_complete:
+                task.artifact_publication_complete = True
+                self._save()
+        elif task.dw_ids:
             try:
                 try:
                     artifact_publication.publish(task, self.paths)

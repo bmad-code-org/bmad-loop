@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -982,6 +983,34 @@ def test_payload_replay_drops_the_snapshot_once_the_worktree_is_gone(tmp_path):
     assert task.ledger_seed_text is None
     assert flow.calls.saves == 1
     assert flow.journal.entries == []
+
+
+def test_finish_publication_latches_a_shared_store_bundle_without_publishing(tmp_path, monkeypatch):
+    """An artifacts dir in the shared ticket store has nothing to publish: the
+    mount wrote the main checkout's one copy in place and `prepare_publication`
+    recorded no intent. `finish_publication` latches the bundle's publication
+    complete and saves, never calling `artifact_publication.publish` (which would
+    refuse the missing intent and pause the run after its merge).
+
+    Ablation (performed): drop the shared-store arm of `finish_publication` and
+    `publish` is called (this row's stub raises)."""
+    flow = _artifact_flow(tmp_path)
+    flow.paths = replace(flow.paths, shared_store=flow.paths.project / "_bmad-output")
+    assert flow.paths.in_shared_store(flow.paths.implementation_artifacts)  # premise
+
+    def no_publish(task, paths):
+        raise AssertionError("published a shared-store bundle")
+
+    monkeypatch.setattr(artifact_publication, "publish", no_publish)
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+    task.worktree_path = str(tmp_path / "wt")
+    assert task.artifact_payload is None and not task.artifact_publication_complete
+
+    flow.finish_publication(task, None)
+
+    assert task.artifact_publication_complete
+    assert flow.calls.saves == 1
+    assert flow.calls.pauses == [] and flow.journal.entries == []
 
 
 # --------------------------------------------------------------- pinned config edits
