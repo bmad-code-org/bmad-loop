@@ -152,6 +152,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Resolve a relative v6 config path (`implementation_artifacts`, `planning_artifacts`,
+  `output_folder`, `repo_root`) against the project root instead of the process cwd, as v7
+  does (DW-551).
 - Re-validate an ordinary unit's merge against the target on replay instead of trusting its
   `unit-merged` journal row; missing evidence pauses the run (`unit-merged-unverified`)
   (DW-558).

@@ -34,7 +34,10 @@ puts it. The legacy per-module `_bmad/bmm/config.yaml` may or may not be beside 
 - With no TOML layer at all the YAML is read exactly as it always was.
 
 `{project-root}` is substituted with the renderer's spelling (a literal replace
-with the canonical root) by `_resolve`, for both sources.
+with the canonical root) by `_resolve`, for both sources, and a value still relative
+after that is joined onto the project root, as v7 `tickets.py` joins it — not onto
+bmad-loop's own cwd. Upstream `render_skill` pastes a relative value into the skill as
+is, so a session reads it against its cwd, which is the project.
 
 **BMAD v7** drops the two `[modules.bmm]` keys: the artifact home is the initiative
 folder, ``{output_folder}/{active_initiative}``, both read strictly from ``[core]``
@@ -49,8 +52,7 @@ era (``ProjectPaths.era``):
   consumer of `implementation_artifacts` (the deferred-work ledger, artifact scans)
   follows without a per-site change. `output_folder` and `active_initiative` come
   from :func:`read_core_value` — upstream's three layers (:data:`V7_CENTRAL_LAYERS_REL`)
-  and the dotted ``[core]`` key, as `tickets.py` reads them; a relative
-  `output_folder` resolves against the project, as `tickets.py` joins it. `repo_root`
+  and the dotted ``[core]`` key, as `tickets.py` reads them. `repo_root`
   keeps the short-key lookup: it is bmad-loop's own key on either era. A v6 key left
   beside a v7 resolution is reported in ``ProjectPaths.ignored_v6_keys`` for
   `validate` to warn about, never silently honored.
@@ -311,8 +313,11 @@ def _resolve(raw: str, project: Path, origin: str) -> Path:
     junction carries it to a dead share outside — so any in-tree/external answer
     `rebased`'s `relative_to` reads off the spelling is a guess, and a wrong guess
     sends a worktree-isolated run's artifact writes into a worktree-local directory
-    instead of the configured destination. No member enters a snapshot unresolved."""
-    expanded = Path(raw.replace("{project-root}", str(project)))
+    instead of the configured destination. No member enters a snapshot unresolved.
+    A relative value is joined onto `project` first rather than read against the
+    process cwd; the join leaves an absolute one as is (on Windows, a drive-relative
+    value on another drive keeps that drive's cwd, as `pathlib` joins it)."""
+    expanded = project / raw.replace("{project-root}", str(project))
     return _canonical(expanded, f"configured path {raw!r} ({origin})")
 
 
@@ -696,12 +701,7 @@ def _assemble_v7(
     central = _load_central(project, V7_CENTRAL_LAYERS_REL) or {}
     out_hit = _core_value(central, "output_folder")
     output_folder = (
-        # `tickets.py` joins the raw value onto the project root, so a relative
-        # folder is project-relative here too, not cwd-relative.
-        _canonical(
-            project / out_hit[0].replace("{project-root}", str(project)),
-            f"configured path {out_hit[0]!r} ({out_hit[1]})",
-        )
+        _resolve(out_hit[0], project, out_hit[1])
         if out_hit
         # unset, `tickets.py` joins "" onto the project root: the tree lives there,
         # not under v6's `_bmad-output` default
