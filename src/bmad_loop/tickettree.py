@@ -71,23 +71,36 @@ that ticket is live. Two more errors belong to writes:
   hold what was written.
 - :class:`TicketsPlanIOError` — bmad-loop's own read, write or delete of the
   plan file raised ``OSError``.
+
+``v6_key`` claims. :func:`read_v6_key_claims` is a native read of a field
+``tickets.py`` ignores, not a reimplementation of the script: the v6→v7
+migration writes each story's old sprint key as ``v6_key`` into its
+``[[entry]]``, and the script's JSON drops it, so a ledger ``gate:`` token
+written as a v6 story key can be resolved to its ticket only by reading the
+epics' ``tickets.toml`` directly. It reads the way the script does (``utf-8-sig``,
+the ``epic-*`` folders, the initiative's ``[[epic]]`` table for the epic ids, the
+script's id rule) and spawns nothing. Every fault — an unreadable or mistyped
+file — raises :class:`TicketsV6KeyUnreadable` (``kind`` ``probe-failed``), never
+an empty answer that would read as "no ticket claims this token".
 """
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Protocol, TypeVar, runtime_checkable
 
-from . import bmadconfig, childrun, frontmatter, platform_util, ticketmodel
+from . import bmadconfig, childrun, deferredwork, frontmatter, platform_util, ticketmodel
 from .process_host import ProcessHostError
 from .statemachine import PlanTransitionRefused, PlanWriteReason, check_plan_transition
 from .ticketmodel import Capability, FindResult, NextView, StatusView
@@ -201,6 +214,19 @@ class TicketsPlanIOError(TicketsError):
     """bmad-loop's own native read, write or delete of a plan raised ``OSError``."""
 
     kind = "plan-io"
+
+
+class TicketsV6KeyUnreadable(TicketsError):
+    """A ``tickets.toml`` :func:`read_v6_key_claims` reads could not be read or
+    is mistyped, so no v6 story-key token can be resolved. ``path`` is the file
+    (or folder) and ``detail`` the fault."""
+
+    kind = "probe-failed"
+
+    def __init__(self, path: Path, detail: str) -> None:
+        super().__init__(f"{path} cannot be read for its `v6_key` claims: {detail}")
+        self.path = path
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -724,6 +750,122 @@ def _result(run: childrun.ChildRun, verb: str, *, json_out: bool) -> dict[str, o
         cls = TicketsNoMatch if message.startswith(_NO_MATCH_PREFIX) else TicketsFault
         raise cls(message, data)
     raise TicketsCrashed(f"tickets.py {verb}: exit {rc}: {_tail(run.stderr)}")
+
+
+# ---------------------------------------------------------------- v6_key claims
+
+_BREAKDOWN = "tickets.toml"
+
+
+def _breakdown_rows(folder: Path, table: str) -> list[dict[str, object]] | None:
+    """``folder``'s ``tickets.toml`` ``[[table]]`` rows, or None when the file is
+    absent (a missing or non-regular file, as the script's ``is_file`` reads it).
+    Every other fault raises :class:`TicketsV6KeyUnreadable`."""
+    path = folder / _BREAKDOWN
+    try:
+        try:
+            if not stat.S_ISREG(path.stat().st_mode):
+                return None
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        # `read_text` with `utf-8-sig`, as the script reads it: a BOM would hide the
+        # first table, and universal newlines turn a bare CR into a line break.
+        # `ValueError` covers a `UnicodeDecodeError` too.
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, ValueError) as e:
+        raise TicketsV6KeyUnreadable(path, str(e)) from e
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise TicketsV6KeyUnreadable(path, str(e)) from e
+    rows: object = data.get(table, [])
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise TicketsV6KeyUnreadable(path, f"write `[[{table}]]` tables, one per {table}")
+    return [dict(r) for r in rows]
+
+
+def _tree_id(value: object) -> str | None:
+    """An id as the script compares it, as text, else None: an int (not a bool),
+    or letters and digits other than ``true``/``false``; digits alone are the
+    number, so ``06`` is ``6``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if (
+        isinstance(value, str)
+        and deferredwork._TICKET_ID_RE.match(value)
+        and value not in deferredwork._TICKET_BOOLEAN_IDS
+    ):
+        return deferredwork._ticket_id_text(value)
+    return None
+
+
+def _epic_folders(initiative: Path) -> list[Path]:
+    """The initiative's ``epic-*`` folders, sorted; [] when the initiative folder
+    is absent. A listing or probe fault raises :class:`TicketsV6KeyUnreadable`
+    (``Path.glob`` would swallow it and answer "no epics")."""
+    folders: list[Path] = []
+    try:
+        with os.scandir(initiative) as listing:
+            for item in listing:
+                if fnmatch.fnmatch(item.name, "epic-*") and item.is_dir():
+                    folders.append(initiative / item.name)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except (OSError, ValueError) as e:
+        raise TicketsV6KeyUnreadable(initiative, str(e)) from e
+    return sorted(folders)
+
+
+def read_v6_key_claims(initiative: Path | None) -> tuple[tuple[str, str | None], ...]:
+    """Every ``(v6_key, ref)`` an epic ``[[entry]]`` of ``initiative`` claims.
+
+    ``ref`` is the entry's ``E.M`` (``f"{epic_id}.{entry_id}"``, both ids as the
+    script compares them), with the epic id taken from the initiative's
+    ``[[epic]]`` row whose ``slug`` is the folder name; None when the initiative
+    table lists no such epic, since that entry has no ``E.M`` ref. An entry with
+    no ``v6_key`` claims nothing; a missing ``tickets.toml`` holds no entries; a
+    None ``initiative`` yields ``()``.
+
+    Raises :class:`TicketsV6KeyUnreadable` on any fault: an unreadable or
+    non-TOML file, ``[[entry]]``/``[[epic]]`` that are not tables, an id the
+    script would refuse, an epic row without a string ``slug`` (or two rows with
+    one slug), or a ``v6_key`` that is not a string. Never spawns ``tickets.py``.
+    """
+    if initiative is None:
+        return ()
+    folders = _epic_folders(initiative)
+    if not folders:
+        return ()
+    epic_ids: dict[str, str] = {}
+    where = initiative / _BREAKDOWN
+    for row in _breakdown_rows(initiative, "epic") or []:
+        epic_id, slug = _tree_id(row.get("id")), row.get("slug")
+        if epic_id is None:
+            raise TicketsV6KeyUnreadable(where, f"epic id {row.get('id')!r} is not an id")
+        if not isinstance(slug, str) or not slug:
+            raise TicketsV6KeyUnreadable(where, f"epic {epic_id} needs a `slug`")
+        if slug in epic_ids:
+            raise TicketsV6KeyUnreadable(where, f"two epics with slug {slug}")
+        epic_ids[slug] = epic_id
+    claims: list[tuple[str, str | None]] = []
+    for folder in folders:
+        where = folder / _BREAKDOWN
+        for row in _breakdown_rows(folder, "entry") or []:
+            entry_id = _tree_id(row.get("id"))
+            if entry_id is None:
+                raise TicketsV6KeyUnreadable(where, f"entry id {row.get('id')!r} is not an id")
+            if "v6_key" not in row:
+                continue
+            key = row["v6_key"]
+            if not isinstance(key, str):
+                raise TicketsV6KeyUnreadable(
+                    where, f"entry {entry_id} `v6_key` is not a string: {key!r}"
+                )
+            epic_id = epic_ids.get(folder.name)
+            claims.append((key, None if epic_id is None else f"{epic_id}.{entry_id}"))
+    return tuple(claims)
 
 
 if TYPE_CHECKING:

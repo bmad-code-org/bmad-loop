@@ -1678,7 +1678,8 @@ class EntrySpec:
     bare int is a sibling id, ``"E.M"`` another epic's entry, ``"epic-<x>"`` a whole
     epic. ``refine=None`` leaves the key out (upstream then refines bugs only).
     ``refined=True`` also writes the pulled leaf file with ``refined: true``, the only
-    way upstream ever reports a ticket as refined."""
+    way upstream ever reports a ticket as refined. ``v6_key`` is the old sprint key
+    the v6→v7 migration records on the entry; None leaves the key out."""
 
     id: int
     title: str
@@ -1689,6 +1690,7 @@ class EntrySpec:
     refined: bool = False
     plan_checkpoint: bool = False
     done_checkpoint: bool = False
+    v6_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1887,6 +1889,8 @@ def write_ticket_tree(layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicS
                     block += f"{key} = true\n"
             if e.refine is not None:
                 block += f"refine = {_toml_value(e.refine)}\n"
+            if e.v6_key is not None:
+                block += f"v6_key = {json.dumps(e.v6_key)}\n"
             entries.append(block)
             if e.refined:
                 (epic_dir / f"{e.type}-{ticket_slug(e.title)}.md").write_text(

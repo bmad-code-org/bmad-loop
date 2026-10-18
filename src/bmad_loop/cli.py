@@ -3176,6 +3176,16 @@ def _validate_hard_gates(
     ``validate`` executing no project code, and it happens only when an unlanded
     entry carries a ticket-grammar or v6 story-key token; a ledger whose gates
     have all landed reports its ``ok`` without it.
+
+    A v6 story-key token (``3-2``, a migrated ledger's) is resolved first through
+    the ``v6_key`` the migration wrote into each ticket's ``tickets.toml`` entry,
+    with the same reader (``tickettree.read_v6_key_claims``) and resolver
+    (``deferredwork.partition_legacy_tokens``) the engine's gate check uses. One
+    that exactly one ticket claims gates that ticket as its ``E.M`` ref would,
+    reported under the token as written; any other fails as a legacy gate before
+    every ticket. The claims are read only when an unlanded entry carries such a
+    token and a ticket is actionable, and a tree that cannot be read for them
+    fails ``probe-failed``.
     """
     grammar: deferredwork.GateGrammar = "ticket" if source == worksource.SOURCE_TICKETS else "story"
     noun = "ticket" if grammar == "ticket" else "story"
@@ -3183,9 +3193,10 @@ def _validate_hard_gates(
         (entry, deferredwork.gates(entry, grammar=grammar))
         for entry in deferredwork.parse_ledger(text)
     ]
-    # v6 story keys in a ticket queue's ledger (a migrated ledger keeps them): no
-    # ticket carries one, and the run pauses before every ticket while one stands
-    # (`TicketsEngine._legacy_gate_tokens`), so they fail here rather than warn.
+    # v6 story keys in a ticket queue's ledger (a migrated ledger keeps them). One
+    # that a single ticket's `v6_key` claims resolves to that ticket below; any
+    # other pauses the run before every ticket while it stands
+    # (`TicketsEngine._legacy_gate_tokens`), so it fails here rather than warns.
     legacy = {
         entry.id: stale
         for entry, _ in declared
@@ -3238,6 +3249,25 @@ def _validate_hard_gates(
         # and `queue.stories-manifest` already fail for it; adding an `ok` here would
         # say "no story is gated" about a queue this check never saw.
         return
+    # v6 tokens one ticket's `v6_key` claims resolve to its ref; the rest stay legacy.
+    # Read only when a ticket is actionable: the run reads the claims only while
+    # gate-checking a picked ticket, and with no target the legacy fail is moot.
+    resolved: dict[str, tuple[tuple[str, str], ...]] = {}
+    unresolved: dict[str, tuple[str, ...]] = dict(legacy)
+    if legacy and targets:
+        try:
+            claims = tickettree.read_v6_key_claims(paths.initiative_folder)
+        except tickettree.TicketsV6KeyUnreadable as e:
+            report.fail(
+                "deferred.hard-gate",
+                f"{e.path} cannot be read ({e.detail}), so the v6 story-key `gate:` tokens "
+                f"in {paths.deferred_work.name} could not be resolved to tickets through "
+                f"their `v6_key` — fix the file, then re-run `bmad-loop validate`",
+                {"error": str(e), "kind": e.kind},
+            )
+            return
+        for dw_id, stale in legacy.items():
+            resolved[dw_id], unresolved[dw_id] = deferredwork.partition_legacy_tokens(stale, claims)
     gating = [e.id for e, g in declared if not e.done and (g.tokens or e.id in legacy)]
     gated = False
     for entry, entry_gates in declared:
@@ -3248,18 +3278,19 @@ def _validate_hard_gates(
         # retires a gate; everything else holds until someone writes that word.
         if entry.done:
             continue
-        stale = legacy.get(entry.id, ())
+        stale = unresolved.get(entry.id, ())
         if stale and targets:
             gated = True
             report.fail(
                 "deferred.hard-gate",
                 f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and declares v6 "
-                f"story-key gate tokens no ticket ref can match ({', '.join(stale)}) — a "
-                f"tickets run pauses before every ticket while it stands, starting with "
-                f"{targets[0].key}. The v7 migration keeps each story's old key as "
-                f"`v6_key` in its ticket file: rewrite the tokens as ticket refs (`E.M`, "
-                f"an epic id or `epic-<slug>`), or close the entry in "
-                f"{paths.deferred_work.name} (`status: done <date>`)",
+                f"story-key gate tokens that no single ticket's `v6_key` claims (none "
+                f"does, or more than one) ({', '.join(stale)}) — no ticket ref matches "
+                f"them, so a tickets run pauses before every ticket while it stands, "
+                f"starting with {targets[0].key}. Rewrite the tokens as ticket refs "
+                f"(`E.M`, an epic id or `epic-<slug>`) or as the full v6 key of one "
+                f"ticket, or close the entry in {paths.deferred_work.name} "
+                f"(`status: done <date>`)",
                 {
                     "dw_id": entry.id,
                     "title": entry.title,
@@ -3270,13 +3301,23 @@ def _validate_hard_gates(
         for target in targets:
             story_key = target.key
             hits = [t for t in entry_gates.tokens if _gate_matches(t, target, grammar)]
+            # A resolved v6 token matches through its ticket's ref, reported as written.
+            via = [
+                (token, ref)
+                for token, ref in resolved.get(entry.id, ())
+                if _gate_matches(ref, target, grammar)
+            ]
+            hits += [token for token, _ in via]
             if not hits:
                 continue
             gated = True
+            resolution = "".join(
+                f"; {token} resolves to {ref} through its `v6_key`" for token, ref in via
+            )
             report.fail(
                 "deferred.hard-gate",
                 f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and gates "
-                f"{story_key} (gate: {', '.join(hits)}) — that {noun} must not run until "
+                f"{story_key} (gate: {', '.join(hits)}{resolution}) — that {noun} must not run until "
                 f"the entry lands. Close it in {paths.deferred_work.name} "
                 f"(`status: done <date>`), or drop the token from its `gate:` line if it "
                 f"no longer blocks this work",

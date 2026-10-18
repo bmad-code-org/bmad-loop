@@ -112,6 +112,7 @@ from .frontmatter import frontmatter_fault, is_frontmatter_only, parse_frontmatt
 from .model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_SPEC_APPROVAL,
+    PAUSE_STORY_GATE,
     PAUSE_TICKET_TREE,
     Phase,
     RunState,
@@ -155,7 +156,13 @@ from .tickets_source import (
     ticket_binding,
     wants_thorough,
 )
-from .tickettree import TicketsError, TicketTree, TicketTreeLike
+from .tickettree import (
+    TicketsError,
+    TicketsV6KeyUnreadable,
+    TicketTree,
+    TicketTreeLike,
+    read_v6_key_claims,
+)
 from .worksource import SOURCE_TICKETS
 from .worksource import Halt as WorkHalt
 from .worksource import WorkRef, WorkSource
@@ -322,6 +329,11 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self._picked: dict[str, TicketBinding] = {}
         # story key -> plan status its last review launched on (`_verify_review`).
         self._review_entered: dict[str, str] = {}
+        # One gate check's `(v6_key, ref)` claims snapshot, read on the first v6
+        # story-key token the check meets and cleared around every check
+        # (`_refuse_gated_story`), so `_gate_hits` and `_legacy_gate_tokens` read
+        # one tree and a token cannot fall between them.
+        self._gate_claims: tuple[tuple[str, str | None], ...] | None = None
         # Whether this run has journaled `store-unversioned`; None until the
         # journal is first read for it (`_note_store_unversioned`).
         self._unversioned_noted: bool | None = None
@@ -1349,32 +1361,87 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             self._save()
         return self._picked.get(story_key) or (task.ticket if task is not None else None)
 
+    def _refuse_gated_story(self, story_key: str) -> None:
+        """The base gate check, with v6 story-key tokens resolved through the
+        tickets' ``v6_key`` claims (:meth:`_partition_legacy`).
+
+        The claims snapshot is cleared before and after every check, so each
+        check reads the tree at most once and never answers from a previous
+        check's tree. A tree that cannot be read for its claims pauses at
+        :data:`PAUSE_STORY_GATE` exactly as an unreadable ledger does: it is the
+        only evidence of which ticket a v6 token names, and degrading to "no
+        ticket claims it" would still pause (as legacy), but under the wrong
+        remedy. Raised from inside the base loop, before anything the caller
+        does mutates the run."""
+        self._gate_claims = None
+        try:
+            super()._refuse_gated_story(story_key)
+        except TicketsV6KeyUnreadable as e:
+            self.journal.append("story-gate-unreadable", story_key=story_key, error=str(e))
+            reason = (
+                f"{e.path} cannot be read ({e.detail}), so the v6 story-key `gate:` "
+                f"tokens in {self.paths.deferred_work.name} could not be resolved to "
+                f"tickets and the gates protecting {story_key} could not be evaluated — "
+                f"fix the file, then `bmad-loop resume {self.state.run_id}`"
+            )
+            gates.notify(self.policy, self.run_dir, f"story gated: {story_key}", reason)
+            raise RunPaused(reason, PAUSE_STORY_GATE, story_key) from e
+        finally:
+            self._gate_claims = None
+
+    def _partition_legacy(
+        self, entry: deferredwork.DWEntry
+    ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
+        """``entry``'s v6 story-key tokens split into ``(resolved, unresolved)`` by
+        :func:`deferredwork.partition_legacy_tokens` against this check's claims
+        snapshot. The tree is read only when the entry carries such a token, so a
+        ledger with none does no tree I/O."""
+        tokens = deferredwork.legacy_story_tokens(entry)
+        if not tokens:
+            return (), ()
+        if self._gate_claims is None:
+            self._gate_claims = read_v6_key_claims(self.paths.initiative_folder)
+        return deferredwork.partition_legacy_tokens(tokens, self._gate_claims)
+
     def _gate_hits(self, entry: deferredwork.DWEntry, story_key: str) -> list[str]:
         """Ticket-grammar tokens that gate ``story_key``: its ref, its epic's id or
         its epic's folder (:func:`deferredwork.gates_ticket`). With no binding only
-        the ref arm can match."""
+        the ref arm can match. Then the v6 story-key tokens one ticket's ``v6_key``
+        claims, when that ticket's ref gates ``story_key`` the same way — each the
+        token as the author wrote it, annotated with the ticket it resolved to
+        (``3-2 (`v6_key` of 1.1)``)."""
+        # Claims first: a fault reading them for THIS entry pauses before this
+        # entry's rebind below. An earlier entry's check may already have rebound.
+        resolved, _ = self._partition_legacy(entry)
         binding = self._gate_binding(story_key)
         epic_id = binding.epic_id if binding is not None else ""
         epic_slug = binding.epic_slug if binding is not None else ""
-        return [
+        hits = [
             token
             for token in deferredwork.gates(entry, grammar="ticket").tokens
             if deferredwork.gates_ticket(token, story_key, epic_id=epic_id, epic_slug=epic_slug)
         ]
+        hits += [
+            f"{token} (`v6_key` of {ref})"
+            for token, ref in resolved
+            if deferredwork.gates_ticket(ref, story_key, epic_id=epic_id, epic_slug=epic_slug)
+        ]
+        return hits
 
     def _legacy_gate_tokens(self, entry: deferredwork.DWEntry) -> tuple[str, ...]:
-        return deferredwork.legacy_story_tokens(entry)
+        """The v6 story-key tokens no single ticket's ``v6_key`` claims."""
+        return self._partition_legacy(entry)[1]
 
     def _legacy_gate_clause(
         self, story_key: str, legacy: list[tuple[str, tuple[str, ...]]], ledger_name: str
     ) -> str:
         named = ", ".join(f"{dw_id} (gate: {', '.join(tokens)})" for dw_id, tokens in legacy)
         return (
-            f"{named} in {ledger_name} declare v6 story-key gate tokens, which no ticket "
-            f"ref can match, so {story_key} cannot be shown free of them — the v7 "
-            f"migration keeps each story's old key as `v6_key` in its ticket file; "
-            f"rewrite the tokens as ticket refs (`E.M`, an epic id or `epic-<slug>`) or "
-            f"close the entry"
+            f"{named} in {ledger_name} declare v6 story-key gate tokens that no single "
+            f"ticket's `v6_key` claims (none does, or more than one), so no ticket ref "
+            f"matches them and {story_key} cannot be shown free of them — rewrite the "
+            f"tokens as ticket refs (`E.M`, an epic id or `epic-<slug>`), or as the "
+            f"full v6 key of one ticket, or close the entry"
         )
 
     def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:

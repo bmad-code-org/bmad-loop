@@ -172,7 +172,7 @@ import re
 import sys
 import threading
 from bisect import bisect_right
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date as calendar_date
@@ -1017,11 +1017,44 @@ def legacy_story_tokens(entry: DWEntry) -> tuple[str, ...]:
     """``entry``'s v6 story-key tokens as a ticket queue sees them: matchable under
     the story grammar and ``malformed`` under the ticket one (``3-2``,
     ``3-2-invite-link``). A migrated ledger keeps its ``gate:`` lines verbatim and
-    no ticket carries a story key, so read under the ticket grammar alone these
-    would gate nothing in silence; the tickets run pauses on them instead and
-    ``validate`` fails them, both through this one reading."""
+    no ticket *ref* is a story key — the old key survives only as the ticket's
+    ``v6_key`` — so read under the ticket grammar alone these would gate nothing in
+    silence. Both the tickets run and ``validate`` read them
+    through this one reading: a token one ticket's ``v6_key`` claims gates that
+    ticket (:func:`partition_legacy_tokens`), and any other pauses the run before
+    every ticket and fails ``validate``."""
     story_tokens = gates(entry).tokens
     return tuple(t for t in gates(entry, grammar="ticket").malformed if t in story_tokens)
+
+
+def partition_legacy_tokens(
+    tokens: Iterable[str], claims: Iterable[tuple[str, str | None]]
+) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
+    """Split v6 story-key ``tokens`` (:func:`legacy_story_tokens`) by whether one
+    ticket claims them: ``(resolved, unresolved)``, both order-preserving.
+
+    ``claims`` are ``(v6_key, ref)`` pairs, one per ticket-file entry that carries
+    a ``v6_key`` (``tickettree.read_v6_key_claims``); ``ref`` is that entry's
+    ``E.M``, or None when its epic is unlisted. A token is *claimed* by an entry
+    whose ``v6_key`` it would gate as a story key (:func:`gates_story`: the exact
+    key, or its ``N-M`` prefix or split arm), and *resolves* to ``(token, ref)``
+    when exactly one entry claims it and that entry has a ref. Unclaimed, claimed
+    by two or more entries, or claimed only by an entry with no ref, it stays
+    unresolved: no single ticket can be shown to be the one it names.
+
+    The one resolver the engine's gate check and ``validate`` share, so the two
+    cannot disagree about which ticket a v6 token gates.
+    """
+    pairs = tuple(claims)
+    resolved: list[tuple[str, str]] = []
+    unresolved: list[str] = []
+    for token in tokens:
+        refs = [ref for key, ref in pairs if gates_story(token, key)]
+        if len(refs) == 1 and refs[0] is not None:
+            resolved.append((token, refs[0]))
+        else:
+            unresolved.append(token)
+    return tuple(resolved), tuple(unresolved)
 
 
 def _ticket_id_text(text: str) -> str:
