@@ -7449,7 +7449,8 @@ class SweepEngine(Engine):
         it — DW-192) and `reason="ledger-in-doubt"`. `dw_ids` (DW-250) is the
         list of ids the declining publisher would otherwise have set out to prove,
         emitted ONLY when given: `_publish_stranded_close` names its cached plan's
-        already-resolved and decision ids, while the three DW-246 callers
+        already-resolved and decision ids, `_publish_bundle_close` (DW-556) the
+        landed bundle's `bundle_closes_intended`, while the three DW-246 callers
         deliberately pass none — `_close_resolved`'s arms have `closed` and `ids`
         in scope, but their DW-246 row shape stays unchanged. `diagnostics`
         already routes the field by name (`_JOURNAL_KEYLIST_FIELDS`).
@@ -8779,19 +8780,73 @@ class SweepEngine(Engine):
         return ticketstore.StoreTopology.from_dict(recorded) if recorded else None
 
     def _land_post_landing_writes(self, task: StoryTask) -> None:
-        """Once a bundle's code has landed, publish its accepted plan when the plan
-        lives in a ticket store with its own repository (T3/T4): the code commit
-        cannot carry a file in another repository. See
-        :meth:`_publish_bundle_plan`."""
+        """Once a bundle's code has landed, publish its accepted plan and its
+        ledger close when they live in a ticket store with its own repository
+        (T3/T4): the code commit cannot carry a file in another repository. See
+        :meth:`_publish_bundle_plan` and :meth:`_publish_bundle_close`."""
         super()._land_post_landing_writes(task)
         self._publish_bundle_plan(task)
+        self._publish_bundle_close(task)
+
+    def _publish_bundle_close(self, task: StoryTask) -> None:
+        """Commit the ledger close a landed bundle wrote when the ledger lives in a
+        store repository (T3/T4), through
+        :class:`~bmad_loop.ticketstore.StoreCommitter` as ``chore(sweep): close
+        resolved deferred-work entries`` with the ``Bmad-Code-*`` trailers.
+        Elsewhere the close rides the bundle's own code commit (``commit_story``'s
+        ``git add -A``, or the merge-back and ``_carry_isolated_ledger_writes``
+        under isolation); a store repository's ledger is in no tree that commit can
+        reach.
+
+        Keyed on ``task.bundle_closes_intended``, as the isolated carry is: a
+        bundle that wrote no close publishes nothing. Withheld while the run holds
+        its ledger in doubt (``sweep-ledger-commit-withheld``). Otherwise best
+        effort, like :meth:`_publish_bundle_plan`: it runs inside
+        ``integrate_unit`` after the merge, so a failed commit journals
+        ``store-commit-failed`` (a staged foreign version of the ledger
+        ``store-commit-foreign-dirt``) and the close stays uncommitted for a human
+        or a later publisher. A ledger already at the store's HEAD journals
+        nothing."""
+        topology = self.store_topology
+        if topology is None or topology.store_repo is None or not task.bundle_closes_intended:
+            return
+        ledger = self.workspace.paths.deferred_work
+        try:
+            inside = ledger.resolve().is_relative_to(topology.store_repo.resolve())
+        except (OSError, RuntimeError, ValueError):
+            inside = False
+        if not inside or not ledger.is_file():
+            return
+        message = "chore(sweep): close resolved deferred-work entries"
+        if self._ledger_unfit_to_publish():
+            self._withhold_ledger_publish(message, dw_ids=list(task.bundle_closes_intended))
+            return
+        committer = ticketstore.StoreCommitter(topology.store_repo, self.paths.repo_root)
+        try:
+            result = committer.commit(
+                task.story_key,
+                [ledger],
+                message,
+                code_commit=self._landed_code_commit(task),
+                code_baseline=task.baseline_commit,
+            )
+        except ticketstore.StoreCommitError as e:
+            self.journal.append("store-commit-failed", story_key=task.story_key, error=str(e))
+            return
+        if result.foreign:
+            self.journal.append(
+                "store-commit-foreign-dirt", story_key=task.story_key, count=len(result.foreign)
+            )
+            return
+        if result.sha is not None:
+            self.journal.append("store-committed", story_key=task.story_key, commit=result.sha)
 
     def _publish_bundle_plan(self, task: StoryTask) -> None:
         """Commit ``task``'s accepted bundle plan in the store's repository through
         :class:`~bmad_loop.ticketstore.StoreCommitter`, as ``chore(sweep): <bundle>
         plan [bmad-loop <run>]`` with the ``Bmad-Code-*`` trailers. The ledger is
-        not part of it: the sweep's ledger publishers already commit it in the
-        ledger's own repository. An unversioned store (T2/T6) journals
+        not part of it: :meth:`_publish_bundle_close` commits the bundle's ledger
+        close on its own. An unversioned store (T2/T6) journals
         ``store-unversioned`` once per run.
 
         Best effort, like a tickets run's retro commit, and never a pause: the plan

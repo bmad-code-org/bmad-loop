@@ -38160,7 +38160,14 @@ def test_v7_bundle_plan_committed_in_store_repo(request, fixture, layout):
     rel = plan.resolve().relative_to(store.resolve()).as_posix()
     commits = git(store, "log", "--format=%H", "--", rel).split()
     assert len(commits) == 1
-    assert [e["commit"] for e in _records(engine, "store-committed")] == commits
+    # the plan's row; the bundle's ledger close journals its own (DW-556)
+    plan_rows = [
+        e["commit"]
+        for e in _records(engine, "store-committed")
+        if rel in git(store, "show", "--name-only", "--format=", e["commit"]).split()
+    ]
+    assert plan_rows == commits
+    assert len(_records(engine, "store-committed")) == 2  # the plan's and the close's
     body = git(store, "log", "-1", "--format=%B", commits[0])
     assert body.splitlines()[0] == "chore(sweep): dw-fix-things plan [bmad-loop sweep-run]"
     assert f"Bmad-Code-Repo: {paths.repo_root.as_posix()}" in body
@@ -38171,15 +38178,224 @@ def test_v7_bundle_plan_committed_in_store_repo(request, fixture, layout):
     assert verify.status_of(verify.read_frontmatter(plan)) == "built"
 
 
-def test_v7_bundle_plan_trailers_name_the_landed_squash_commit(project_v7_store_repo):
+_V7_LEDGER_CLOSE = "chore(sweep): close resolved deferred-work entries"
+_V7_LEDGER_DECISIONS = "chore(sweep): record deferred-work decisions"
+
+
+_V7_DW2_CLOSE_DECISION = {
+    "id": "DW-2",
+    "question": "close as moot?",
+    "context": "",
+    "options": [
+        {"key": "1", "label": "Close it", "effect": "close", "resolution": "moot"},
+        {"key": "2", "label": "Keep open", "effect": "keep-open"},
+    ],
+    "recommendation": "1",
+}
+
+
+def _v7_store_ledger_sweep(
+    v7, layout, *, arm_doubt: bool = False, stage_foreign_ledger: bool = False
+):
+    """A v7 sweep over a store with its own repository (``layout`` T3/T4) whose
+    ledger, `{DW-1: open, DW-2: open}`, is committed in that store: triage bundles
+    DW-1 (`fix-things`) and asks DW-2's `close` decision, answered `1`.
+    ``arm_doubt`` arms the run's ledger doubt (the real `_record_ledger_doubt`
+    latch) from inside the bundle's dev session; ``stage_foreign_ledger`` has that
+    session stage a hand-edited ledger in the store and put the disk bytes back,
+    so the index holds a version that is neither HEAD's nor the bundle close's.
+    Returns the engine, its paths,
+    the store, the ledger's store-relative path and the code repo's head before
+    the run."""
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    code = paths.repo_root
+    write_ledger(paths, {"DW-1": "open", "DW-2": "open"}, commit=False)
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    ledger_rel = paths.deferred_work.resolve().relative_to(store.resolve()).as_posix()
+    # premise: the store repository versions the ledger, the code repository does not
+    assert git(store, "ls-files", "--", ledger_rel).strip() == ledger_rel
+    assert git(store, "status", "--porcelain") == ""
+    if paths.deferred_work.resolve().is_relative_to(code.resolve()):  # T3: nested, ignored
+        code_rel = paths.deferred_work.resolve().relative_to(code.resolve()).as_posix()
+        assert git(code, "ls-files", "--", code_rel) == ""
+    code_head = rev_parse_head(code)
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == layout
+    triage = triage_result(
+        ["DW-1", "DW-2"],
+        bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}],
+        decisions=[_V7_DW2_CLOSE_DECISION],
+    )
+    dev = _v7_bundle_dev_effect(paths, "fix-things", ["DW-1"], followup_review=False)
+    holder: list[SweepEngine] = []
+
+    def dev_effect(spec):
+        if arm_doubt:
+            holder[0]._record_ledger_doubt()
+        if stage_foreign_ledger:
+            ledger = paths.deferred_work
+            original = ledger.read_bytes()
+            ledger.write_bytes(original + b"\nhand-edited\n")
+            git(store, "add", "--", ledger_rel)
+            ledger.write_bytes(original)
+        return dev(spec)
+
+    engine, _ = make_sweep(
+        paths,
+        [triage_effect(triage), dev_effect],
+        policy=_v7_review_policy(enabled=False),
+        answers=["1"],
+        prompting=True,
+        store_topology=topology.to_dict(),
+    )
+    holder.append(engine)
+    return engine, paths, store, ledger_rel, code_head
+
+
+def _store_closes(store: Path, ledger_rel: str) -> list[str]:
+    """The bodies of the store's ledger-close commits, each asserted to touch the
+    ledger alone."""
+    log = [line.split(" ", 1) for line in git(store, "log", "--format=%H %s").splitlines()]
+    shas = [sha for sha, subject in log if subject == _V7_LEDGER_CLOSE]
+    for sha in shas:
+        assert git(store, "show", "--name-only", "--format=", sha).split() == [ledger_rel]
+    return [git(store, "log", "-1", "--format=%B", sha) for sha in shas]
+
+
+@pytest.mark.parametrize(
+    ("fixture", "layout"),
+    [("project_v7_store_repo", "T3"), ("project_v7_external_store", "T4")],
+)
+def test_v7_sweep_ledger_writes_committed_in_store_repo(request, fixture, layout):
+    """On v7 the ledger lives in the initiative folder, so a ticket store with its
+    own repository (T3 nested, T4 outside) versions it. The sweep's own ledger
+    writes are published there, each commit touching only the ledger: the recorded
+    `close` decision for DW-2 (`_commit_ledger` runs its git in the ledger's
+    resolved parent, so the enclosing repository is the store's), and the bundle's
+    close of DW-1, which `_publish_bundle_close` commits through `StoreCommitter`
+    with the `Bmad-Code-*` trailers naming the bundle's code commit (elsewhere the
+    close rides the bundle's code commit, which cannot reach the store). The code
+    repository receives no `chore(sweep)` commit.
+
+    ABLATIONS (performed): A1 run `_commit_ledger`'s git in `self.paths.repo_root`
+    instead of the ledger's resolved parent and both rows fail (no decisions
+    commit in the store); A2 drop the `_publish_bundle_close` call in
+    `_land_post_landing_writes` and both rows fail (no close commit carries the
+    bundle's `Bmad-Code-Commit` trailer)."""
+    engine, paths, store, ledger_rel, code_head = _v7_store_ledger_sweep(
+        request.getfixturevalue(fixture), layout
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    task = engine.state.tasks["dw-fix-things"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    entries = ledger_entries(paths)
+    assert entries["DW-1"].status.startswith("done")
+    assert entries["DW-2"].status.startswith("done")
+    assert "closed by human decision: moot" in entries["DW-2"].body
+    log = [line.split(" ", 1) for line in git(store, "log", "--format=%H %s").splitlines()]
+    decisions = [sha for sha, subject in log if subject == _V7_LEDGER_DECISIONS]
+    assert len(decisions) == 1, log
+    assert git(store, "show", "--name-only", "--format=", decisions[0]).split() == [ledger_rel]
+    bundle_closes = [
+        body
+        for body in _store_closes(store, ledger_rel)
+        if f"Bmad-Code-Commit: {task.commit_sha}" in body
+    ]
+    assert len(bundle_closes) == 1, _store_closes(store, ledger_rel)
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{task.commit_sha}" in bundle_closes[0]
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    code = paths.repo_root
+    code_new = git(code, "log", "--format=%s", f"{code_head}..HEAD").splitlines()
+    assert code_new and not [s for s in code_new if s.startswith("chore(sweep)")], code_new
+
+
+def test_v7_sweep_bundle_close_withheld_while_the_ledger_is_in_doubt(project_v7_store_repo):
+    """T3: a run that holds its ledger in doubt (armed here during the bundle's
+    dev session) does not publish the landed bundle's close to the store
+    repository. It journals `sweep-ledger-commit-withheld` naming the close
+    message and the bundle's ids, and no store commit carries the close.
+
+    ABLATION (performed): drop the `if self._ledger_unfit_to_publish():` gate in
+    `_publish_bundle_close` and this fails (no withheld row; a close commit with
+    the bundle's `Bmad-Code-Commit` trailer lands in the store)."""
+    engine, paths, store, ledger_rel, _ = _v7_store_ledger_sweep(
+        project_v7_store_repo, "T3", arm_doubt=True
+    )
+
+    engine.run()
+
+    task = engine.state.tasks["dw-fix-things"]
+    assert task.phase == Phase.DONE and task.commit_sha  # premise: the bundle landed
+    assert task.bundle_closes_intended == ["DW-1"]
+    assert ledger_entries(paths)["DW-1"].status.startswith("done")  # the close was written
+    withheld = [
+        r
+        for r in _records(engine, "sweep-ledger-commit-withheld")
+        if r["message"] == _V7_LEDGER_CLOSE and r.get("dw_ids") == ["DW-1"]
+    ]
+    assert len(withheld) == 1, _records(engine, "sweep-ledger-commit-withheld")
+    assert withheld[0]["reason"] == "ledger-in-doubt"
+    closes = _store_closes(store, ledger_rel)
+    assert not [b for b in closes if f"Bmad-Code-Commit: {task.commit_sha}" in b], closes
+    assert git(store, "status", "--porcelain", "--", ledger_rel) != ""  # still unpublished
+
+
+@pytest.mark.parametrize("fault", ["git", "foreign"])
+def test_v7_sweep_bundle_close_store_commit_failure_is_best_effort(
+    project_v7_store_repo, monkeypatch, fault
+):
+    """T3: the landed bundle's ledger close fails to commit in the store repository
+    (a git fault, or a staged foreign version of the ledger). The publisher runs
+    after the merge, so the run neither crashes nor pauses: it journals
+    `store-commit-failed` / `store-commit-foreign-dirt` for the bundle, and the
+    close stays uncommitted in the store.
+
+    ABLATIONS (performed): drop the `except ticketstore.StoreCommitError` clause
+    in `_publish_bundle_close` and `git` fails (the run crashes); drop its
+    `if result.foreign:` arm and `foreign` fails (no foreign-dirt row)."""
+    if fault == "git":
+        real = ticketstore.StoreCommitter.commit
+
+        def commit(self, unit_id, paths, message, **kwargs):
+            if message == _V7_LEDGER_CLOSE:
+                raise ticketstore.StoreCommitError(f"{unit_id}: index.lock exists")
+            return real(self, unit_id, paths, message, **kwargs)
+
+        monkeypatch.setattr(ticketstore.StoreCommitter, "commit", commit)
+    engine, paths, store, ledger_rel, _ = _v7_store_ledger_sweep(
+        project_v7_store_repo, "T3", stage_foreign_ledger=fault == "foreign"
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    task = engine.state.tasks["dw-fix-things"]
+    assert task.phase == Phase.DONE and task.bundle_closes_intended == ["DW-1"]
+    assert ledger_entries(paths)["DW-1"].status.startswith("done")  # the close was written
+    kind = "store-commit-failed" if fault == "git" else "store-commit-foreign-dirt"
+    assert [r["story_key"] for r in _records(engine, kind)] == ["dw-fix-things"]
+    closes = _store_closes(store, ledger_rel)
+    assert not [b for b in closes if f"Bmad-Code-Commit: {task.commit_sha}" in b], closes
+    assert git(store, "status", "--porcelain", "--", ledger_rel) != ""  # still unpublished
+
+
+@pytest.mark.parametrize("publisher", ["plan", "close"])
+def test_v7_bundle_store_trailers_name_the_landed_squash_commit(project_v7_store_repo, publisher):
     """Under worktree isolation a `squash` merge-back lands a different commit
     than the bundle's, and the unit branch's teardown leaves the bundle's
-    unreachable: the store trailers name the target's head, which holds the
-    code. Driven at the seam: a T3 bundle that landed in place, then re-published
-    as a merged-back unit whose own commit the target does not hold.
+    unreachable: the store trailers on the bundle's plan commit and on its ledger
+    close commit name the target's head, which holds the code. Driven at the
+    seam: a T3 bundle that landed in place, then re-published as a merged-back
+    unit whose own commit the target does not hold.
 
-    ABLATION (performed): pass `task.commit_sha` in `_publish_bundle_plan` again
-    and the trailers name the unreachable unit commit — this FAILS."""
+    ABLATIONS (performed): pass `task.commit_sha` in `_publish_bundle_plan`
+    again and `plan` fails; the same in `_publish_bundle_close` and `close`
+    fails — each naming the unreachable unit commit."""
     v7 = project_v7_store_repo
     store = v7.output_folder
     paths = _v7_paths(v7)
@@ -38205,13 +38421,19 @@ def test_v7_bundle_plan_trailers_name_the_landed_squash_commit(project_v7_store_
     landed = rev_parse_head(repo)
     unit = git(repo, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "squashed away").strip()
     assert not verify.is_ancestor(repo, unit, landed)
-    plan = _v7_plan(paths, "fix-things")
-    plan.write_text(plan.read_text(encoding="utf-8") + "\nreviewed\n", encoding="utf-8")
     task = replace(
         engine.state.tasks["dw-fix-things"], worktree_path=str(repo / "unit"), commit_sha=unit
     )
-
-    engine._publish_bundle_plan(task)
+    if publisher == "plan":
+        plan = _v7_plan(paths, "fix-things")
+        plan.write_text(plan.read_text(encoding="utf-8") + "\nreviewed\n", encoding="utf-8")
+        engine._publish_bundle_plan(task)
+    else:
+        assert task.bundle_closes_intended == ["DW-1"]
+        ledger = paths.deferred_work
+        ledger.write_text(ledger.read_text(encoding="utf-8") + "\nreviewed\n", encoding="utf-8")
+        engine._publish_bundle_close(task)
+        assert git(store, "log", "-1", "--format=%s").strip() == _V7_LEDGER_CLOSE
 
     body = git(store, "log", "-1", "--format=%B")
     assert f"Bmad-Code-Commit: {landed}" in body
