@@ -4221,6 +4221,9 @@ def _budget_adapter(tmp_path, monkeypatch, usage_parser="claude-jsonl"):
         profile=profile,
     )
     adapter._window_alive = lambda handle: True
+    # A crashed verdict asks the mux whether the session vanished (#489); without
+    # this stand-in that probe reaches the host tmux server (DW-568).
+    adapter.mux = _UnitMux()
     sent: list[str] = []
     adapter.send_text = lambda handle, text: sent.append(text)
     (adapter.tasks_dir / "b-1").mkdir()
@@ -4495,8 +4498,23 @@ def test_budget_enforce_probe_fault_flags_liveness_unknown(tmp_path, monkeypatch
 
 def test_budget_grace_expiry_reprobes_liveness_dead_window_is_crashed(tmp_path, monkeypatch):
     """Window death at grace expiry is authoritative: the existing crashed path
-    (artifact honored) wins over the over_budget verdict."""
+    (artifact honored) wins over the over_budget verdict.
+
+    DW-568: the crash path's session-vanished probe stays on the stand-in mux, so
+    no tmux/psmux argv is spawned. Ablation: drop `_budget_adapter`'s `_UnitMux` and
+    the recorder catches `has-session`."""
     adapter, clock, sent = _budget_adapter(tmp_path, monkeypatch)
+    real_run = subprocess.run
+    mux_argv: list[list[str]] = []
+
+    def recording_run(argv, *args, **kwargs):
+        # Both tmux-family binaries share this seam; psmux is the win32 default.
+        if Path(str(argv[0])).stem in {"tmux", "psmux"}:
+            mux_argv.append(list(argv))
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", recording_run)
     transcript = tmp_path / "t.jsonl"
     _write_claude_transcript(transcript, input_tokens=5000)
 
@@ -4514,6 +4532,7 @@ def test_budget_grace_expiry_reprobes_liveness_dead_window_is_crashed(tmp_path, 
 
     assert result.status == "crashed"
     assert result.budget_weighted == 5000
+    assert mux_argv == []
 
 
 def test_budget_timeout_after_trip_carries_weighted(tmp_path, monkeypatch):
