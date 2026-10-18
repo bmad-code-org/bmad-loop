@@ -10,6 +10,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
@@ -51,6 +52,7 @@ from conftest import (
 from bmad_loop import artifact_publication, deferredwork, platform_util, runs
 from bmad_loop import sweep as sweep_mod
 from bmad_loop import ticketstore, verify
+from bmad_loop import worktree_flow as worktree_flow_mod
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
@@ -67,7 +69,7 @@ from bmad_loop.model import (
     TokenUsage,
     VerifyOutcome,
 )
-from bmad_loop.plugins import Plugin, PluginManifest, PluginRegistry
+from bmad_loop.plugins import HookContext, Plugin, PluginManifest, PluginRegistry
 from bmad_loop.plugins.model import LoadedPlugin
 from bmad_loop.policy import (
     AdapterPolicy,
@@ -38755,6 +38757,375 @@ def test_v7_isolated_deferred_bundle_publishes_its_shared_store_ledger(project_v
     assert deferredwork.open_ids(head_ledger) == {"DW-1", "DW-2"}
     assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
     assert [r["commit"] for r in _records(engine, "store-committed")] == commits
+
+
+_V7_STORE_LAYOUTS = pytest.mark.parametrize(
+    ("fixture", "layout"),
+    [("project_v7_store_repo", "T3"), ("project_v7_external_store", "T4")],
+)
+
+
+def _v7_isolated_close_seam(
+    v7,
+    layout: str,
+    *,
+    phase: Phase = Phase.DEV_VERIFY,
+    worktree: bool = True,
+    intended: bool = True,
+    commit_close: bool = False,
+):
+    """DW-569 seam setup: a v7 sweep over a store with its own repository
+    (``layout`` T3/T4) whose ledger, `{DW-1: open}`, is committed in that store,
+    and a bundle task for DW-1 whose accepted-dev close is written straight into
+    that SHARED ledger (reopenable, under the bundle's own note and operation id),
+    as an isolated mount writes it. ``worktree`` records a ``worktree_path`` (the
+    isolated arm); ``intended`` records ``bundle_closes_intended``, which only the
+    accepted-dev close assigns. ``commit_close`` commits the close into the
+    store, so the store's HEAD holds DW-1 `done` and a reopen leaves a real
+    delta. Returns the engine, its paths, the store, the ledger's
+    store-relative path and the task."""
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    ledger_rel = paths.deferred_work.resolve().relative_to(store.resolve()).as_posix()
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == layout
+    engine, _ = make_sweep(paths, [], store_topology=topology.to_dict())
+    # premise: the ledger lives in the shared store every checkout reads
+    assert engine.paths.in_shared_store(engine.paths.deferred_work)
+    assert not engine._isolated  # premise: only `worktree_path` takes the isolated arm
+    task = StoryTask(
+        story_key="dw-fix-things",
+        epic=0,
+        dw_ids=["DW-1"],
+        phase=phase,
+        worktree_path=str(paths.repo_root.parent / "unit") if worktree else "",
+    )
+    if intended:
+        task.bundle_closes_intended = list(task.dw_ids)
+    engine.state.tasks[task.story_key] = task
+    deferredwork.mark_done_many_reopenable(
+        engine.paths.deferred_work,
+        task.dw_ids,
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    assert not ledger_entries(paths)["DW-1"].open  # premise: the close is in the shared ledger
+    assert git(store, "status", "--porcelain", "--", ledger_rel) != ""  # premise: uncommitted
+    if commit_close:
+        git(store, "add", "--", ledger_rel)
+        git(store, "commit", "-q", "-m", "close")
+        assert git(store, "status", "--porcelain", "--", ledger_rel) == ""  # premise
+        assert deferredwork.open_ids(git(store, "show", f"HEAD:{ledger_rel}")) == set()
+    return engine, paths, store, ledger_rel, task
+
+
+def _assert_close_reopened(engine, paths, store: Path, ledger_rel: str) -> None:
+    """The bundle's close is undone in the shared store: one reopen row, DW-1
+    open on disk and at the store's HEAD, and the store's ledger clean (the
+    reopen restores the committed bytes exactly, so the publish has nothing to
+    commit)."""
+    assert [r["dw_ids"] for r in _records(engine, "sweep-bundle-reopened")] == [["DW-1"]]
+    assert ledger_entries(paths)["DW-1"].open
+    assert deferredwork.open_ids(git(store, "show", f"HEAD:{ledger_rel}")) == {"DW-1"}
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    assert _records(engine, "sweep-bundle-reopen-failed") == []
+
+
+@_V7_STORE_LAYOUTS
+def test_v7_isolated_escalated_bundle_reopens_its_shared_store_close(request, fixture, layout):
+    """DW-569. T3/T4 under isolation, driven at the seam: a mounted bundle wrote
+    its accepted-dev close of DW-1 straight into the SHARED store's ledger, then
+    escalated. No code landed, so `SweepEngine._escalate` reopens the close
+    before the base's ESCALATED save (`sweep-bundle-reopened`): DW-1 is open on
+    disk and at the store's HEAD and the store's ledger is clean, so a later
+    sweep re-bundles it.
+
+    ABLATION (performed): drop the `_reopen_unlanded_close` call in
+    `SweepEngine._escalate` and both rows fail (no reopen row; DW-1 stays `done` in the shared ledger).
+    """
+    engine, paths, store, ledger_rel, task = _v7_isolated_close_seam(
+        request.getfixturevalue(fixture), layout
+    )
+
+    with pytest.raises(RunPaused):
+        engine._escalate(task, "verify failed")
+
+    assert task.phase == Phase.ESCALATED
+    assert task.bundle_closes_intended == ["DW-1"]  # kept, so a re-drive re-closes
+    _assert_close_reopened(engine, paths, store, ledger_rel)
+    assert load_state(engine.run_dir).tasks[task.story_key].phase == Phase.ESCALATED
+
+
+def test_v7_isolated_escalated_bundle_redrive_recloses(project_v7_store_repo):
+    """DW-569. T3: after an isolated escalation reopened the bundle's close,
+    the re-armed bundle lands and `_carry_isolated_ledger_writes` re-closes DW-1
+    from the kept `bundle_closes_intended`.
+
+    INVERSE ablation (performed): clear `task.bundle_closes_intended` at the end of
+    `_reopen_unlanded_close` and this fails (the carry finds no intended close;
+    DW-1 stays open)."""
+    engine, paths, _store, _ledger_rel, task = _v7_isolated_close_seam(project_v7_store_repo, "T3")
+    with pytest.raises(RunPaused):
+        engine._escalate(task, "verify failed")
+    assert ledger_entries(paths)["DW-1"].open  # premise: the escalation reopened it
+
+    engine._carry_isolated_ledger_writes(task)
+
+    assert not ledger_entries(paths)["DW-1"].open
+
+
+def test_v7_merge_back_escalation_reopens_its_shared_store_close(
+    project_v7_store_repo, monkeypatch
+):
+    """DW-569. T3: a DONE bundle whose merge-back failed reaches
+    `WorktreeFlow.keep_branch_and_escalate`. A DONE unit whose code did not land
+    is a non-landing end, so its close is reopened before the ESCALATED save,
+    although `escalate_unit` alone leaves a terminal task's close standing.
+
+    ABLATION (performed): drop the `_reopen_unlanded_close` call in
+    `WorktreeFlow.keep_branch_and_escalate` and this fails (no reopen row; DW-1
+    stays `done`)."""
+    engine, paths, store, ledger_rel, task = _v7_isolated_close_seam(
+        project_v7_store_repo, "T3", phase=Phase.DONE
+    )
+    closed: list[str] = []
+    monkeypatch.setattr(
+        worktree_flow_mod,
+        "close_unit_workspace",
+        lambda unit, **kwargs: closed.append(kwargs["unit_key"]),
+    )
+    unit = SimpleNamespace(path=Path(task.worktree_path))
+
+    with pytest.raises(RunPaused):
+        engine._worktree_flow.keep_branch_and_escalate(task, unit, "merge conflict")
+
+    assert closed == [task.story_key]  # premise: the merge-back failure path ran
+    assert task.phase == Phase.ESCALATED
+    _assert_close_reopened(engine, paths, store, ledger_rel)
+
+
+def test_v7_inflight_escalate_unit_reopens_its_shared_store_close(project_v7_store_repo):
+    """DW-569. T3: an in-flight isolated unit escalated by `WorktreeFlow` (a
+    pruned worktree on resume, a workspace-trust fault, the Codex hook-trust
+    gate) reaches `escalate_unit` with no landing. Its close is reopened before
+    the ESCALATED save.
+
+    ABLATION (performed): drop the `_reopen_unlanded_close` call in
+    `WorktreeFlow.escalate_unit` and this fails (no reopen row; DW-1 stays
+    `done`)."""
+    engine, paths, store, ledger_rel, task = _v7_isolated_close_seam(project_v7_store_repo, "T3")
+
+    with pytest.raises(RunPaused):
+        engine._worktree_flow.escalate_unit(task, "worktree is gone")
+
+    assert task.phase == Phase.ESCALATED
+    _assert_close_reopened(engine, paths, store, ledger_rel)
+
+
+def test_v7_terminal_escalate_unit_keeps_its_shared_store_close(project_v7_store_repo):
+    """DW-569. T3: a DONE unit reaching `escalate_unit` directly is the resume
+    replay's `reopen_unit` over a unit whose merge may already have landed;
+    its landing is unknown, so the close stands: no reopen row, DW-1 still
+    `done`.
+
+    ABLATION (performed): drop the `not task.terminal` gate in `WorktreeFlow.escalate_unit`
+    and this fails (the close is reopened)."""
+    engine, paths, _store, _ledger_rel, task = _v7_isolated_close_seam(
+        project_v7_store_repo, "T3", phase=Phase.DONE
+    )
+
+    with pytest.raises(RunPaused):
+        engine._worktree_flow.escalate_unit(task, "worktree is gone")
+
+    assert task.phase == Phase.ESCALATED  # premise: the escalation ran
+    assert _records(engine, "sweep-bundle-reopened") == []
+    assert not ledger_entries(paths)["DW-1"].open
+
+
+@pytest.mark.parametrize("end", ["escalate", "veto-defer"])
+def test_v7_unlanded_bundle_publishes_its_reopened_store_close(project_v7_store_repo, end):
+    """DW-569. T3 under isolation, with a real delta: the bundle's close of
+    DW-1 is already COMMITTED in the store, so the store's HEAD holds DW-1
+    `done`. When the bundle escalates (or a plugin defers it), the reopen
+    changes the ledger and `_reopen_unlanded_close` publishes it: exactly one
+    deferred-bundle store commit touching only the ledger, DW-1 open in it, the
+    store's ledger clean, and its `store-committed` row naming it.
+
+    ABLATION (performed): drop the `self._publish_deferred_ledger(task)` call at
+    the end of `SweepEngine._reopen_unlanded_close` and both rows fail (no
+    deferred-bundle commit; the reopen stays dirty in the store)."""
+    engine, paths, store, ledger_rel, task = _v7_isolated_close_seam(
+        project_v7_store_repo, "T3", commit_close=True
+    )
+
+    if end == "escalate":
+        with pytest.raises(RunPaused):
+            engine._escalate(task, "verify failed")
+    else:
+        ctx = HookContext("pre_review_phase", run_id=engine.state.run_id, story_key=task.story_key)
+        ctx.veto("defer", "policy says no")
+        assert engine._vetoed(ctx, task) is True
+
+    assert [r["dw_ids"] for r in _records(engine, "sweep-bundle-reopened")] == [["DW-1"]]
+    assert ledger_entries(paths)["DW-1"].open
+    commits = _store_deferred_commits(store)
+    assert len(commits) == 1, git(store, "log", "--format=%s")
+    assert git(store, "show", "--name-only", "--format=", commits[0]).split() == [ledger_rel]
+    assert deferredwork.open_ids(git(store, "show", f"{commits[0]}:{ledger_rel}")) == {"DW-1"}
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    assert [r["commit"] for r in _records(engine, "store-committed")] == commits
+
+
+@pytest.mark.parametrize("action", ["defer", "skip", "pause"])
+def test_v7_isolated_vetoed_bundle_reopens_its_shared_store_close(project_v7_store_repo, action):
+    """DW-569. T3 under isolation: a plugin vetoes the mounted bundle after its
+    accepted-dev close went into the shared store's ledger. Every veto action
+    is a non-landing end (`defer`/`skip` DEFERRED, `pause` ESCALATED), so
+    `SweepEngine._vetoed` reopens the close before the base's terminal save.
+
+    ABLATION (performed): drop the `_reopen_unlanded_close` call in `SweepEngine._vetoed`
+    and all three rows fail (no reopen row; DW-1 stays `done`)."""
+    engine, paths, store, ledger_rel, task = _v7_isolated_close_seam(project_v7_store_repo, "T3")
+    ctx = HookContext("pre_review_phase", run_id=engine.state.run_id, story_key=task.story_key)
+    ctx.veto(action, "policy says no")
+
+    if action == "pause":
+        with pytest.raises(RunPaused):
+            engine._vetoed(ctx, task)
+        assert task.phase == Phase.ESCALATED
+    else:
+        assert engine._vetoed(ctx, task) is True
+        assert task.phase == Phase.DEFERRED
+    assert [r["action"] for r in _records(engine, "plugin-veto")] == [action]  # premise
+    _assert_close_reopened(engine, paths, store, ledger_rel)
+
+
+def test_v7_unvetoed_bundle_keeps_its_shared_store_close(project_v7_store_repo):
+    """DW-569. T3 under isolation: a stage nobody vetoed is not an end, so
+    `_vetoed` returns False and the close stands.
+
+    ABLATION (performed): drop the `ctx.resolved_veto() is not None` gate in
+    `SweepEngine._vetoed` and this fails (the close is reopened)."""
+    engine, paths, _store, _ledger_rel, task = _v7_isolated_close_seam(project_v7_store_repo, "T3")
+    ctx = HookContext("pre_review_phase", run_id=engine.state.run_id, story_key=task.story_key)
+
+    assert engine._vetoed(ctx, task) is False
+    assert engine._vetoed(None, task) is False
+
+    journal = engine.run_dir / "journal.jsonl"
+    assert not journal.exists() or _records(engine, "sweep-bundle-reopened") == []
+    assert not ledger_entries(paths)["DW-1"].open
+
+
+@pytest.mark.parametrize("shape", ["no-close-intended", "in-place"])
+def test_v7_escalated_bundle_reopen_is_isolated_close_only(project_v7_store_repo, shape):
+    """DW-569. T3: the escalation reopen acts only on an isolated bundle that
+    recorded its close. With no `bundle_closes_intended` (no accepted-dev close
+    on record), or in place (no `worktree_path`, not isolated: the base's
+    rollback owns the ledger), the shared ledger is untouched: no reopen row
+    and DW-1 still `done` as planted.
+
+    Ablations (performed): drop the `bundle_closes_intended` guard in
+    `SweepEngine._reopen_unlanded_close` and `no-close-intended` fails; drop its
+    isolated-arm guard and `in-place` fails (each reopens the planted close)."""
+    engine, paths, _store, _ledger_rel, task = _v7_isolated_close_seam(
+        project_v7_store_repo,
+        "T3",
+        worktree=shape != "in-place",
+        intended=shape != "no-close-intended",
+    )
+
+    with pytest.raises(RunPaused):
+        engine._escalate(task, "verify failed")
+
+    assert task.phase == Phase.ESCALATED  # premise: the escalation ran
+    assert _records(engine, "sweep-bundle-reopened") == []
+    assert _records(engine, "sweep-bundle-reopen-failed") == []
+    assert not ledger_entries(paths)["DW-1"].open
+
+
+def test_v7_escalated_bundle_with_unshared_ledger_keeps_its_close(project_v7):
+    """DW-569. T1 (the store is tracked inside the code checkout): each checkout
+    carries its own ledger, so an isolated bundle's close lives in the unit
+    worktree's copy and dies with it. The escalation reopen leaves this
+    checkout's ledger alone even with a close on record and a `worktree_path`:
+    no reopen row, and the close planted here stands.
+
+    ABLATION (performed): drop the `in_shared_store` guard in
+    `SweepEngine._reopen_unlanded_close` and this fails (it reopens the close)."""
+    paths = _v7_paths(project_v7)
+    write_ledger(paths, {"DW-1": "open"})
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == "T1"
+    engine, _ = make_sweep(paths, [], store_topology=topology.to_dict())
+    assert not engine.paths.in_shared_store(engine.paths.deferred_work)  # premise
+    task = StoryTask(
+        story_key="dw-fix-things",
+        epic=0,
+        dw_ids=["DW-1"],
+        phase=Phase.DEV_VERIFY,
+        worktree_path=str(paths.repo_root.parent / "unit"),
+        bundle_closes_intended=["DW-1"],
+    )
+    engine.state.tasks[task.story_key] = task
+    deferredwork.mark_done_many_reopenable(
+        engine.paths.deferred_work,
+        task.dw_ids,
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    assert not ledger_entries(paths)["DW-1"].open  # premise: a close to undo
+
+    with pytest.raises(RunPaused):
+        engine._escalate(task, "verify failed")
+
+    assert task.phase == Phase.ESCALATED  # premise: the escalation ran
+    assert _records(engine, "sweep-bundle-reopened") == []
+    assert _records(engine, "sweep-bundle-reopen-failed") == []
+    assert not ledger_entries(paths)["DW-1"].open
+
+
+@pytest.mark.parametrize("fault", ["ledger-read", "os"])
+def test_v7_isolated_escalation_reopen_fault_is_journaled_degrade(
+    project_v7_store_repo, monkeypatch, fault
+):
+    """DW-569. T3: the escalation's reopen of the shared close faults
+    (`LedgerReadError`, or a raw `OSError` from the lock or write). The
+    escalation is the operator stop, so it still pauses with its own reason;
+    the fault is a visible degrade (`sweep-bundle-reopen-failed` naming the
+    bundle's ids and the error), the publish is skipped (no store commit), and
+    DW-1 stays `done`.
+
+    ABLATION (performed): drop the `except (deferredwork.LedgerReadError, OSError)` arm in
+    `SweepEngine._reopen_unlanded_close` and both rows fail (the fault escapes
+    in place of `RunPaused`)."""
+    engine, paths, store, ledger_rel, task = _v7_isolated_close_seam(project_v7_store_repo, "T3")
+    head = git(store, "rev-parse", "HEAD").strip()
+
+    def mark_open_many(*args, **kwargs):
+        if fault == "ledger-read":
+            raise deferredwork.LedgerReadError("injected reopen read fault")
+        raise OSError("injected reopen write fault")
+
+    monkeypatch.setattr(deferredwork, "mark_open_many", mark_open_many)
+
+    with pytest.raises(RunPaused) as exc:
+        engine._escalate(task, "verify failed")
+
+    assert exc.value.args[0] == "verify failed"
+    assert task.phase == Phase.ESCALATED
+    failed = _records(engine, "sweep-bundle-reopen-failed")
+    assert [(r["story_key"], r["dw_ids"]) for r in failed] == [(task.story_key, ["DW-1"])]
+    assert "injected reopen" in failed[0]["error"]
+    assert _records(engine, "sweep-bundle-reopened") == []
+    assert not ledger_entries(paths)["DW-1"].open
+    assert git(store, "rev-parse", "HEAD").strip() == head  # no publish
+    assert _records(engine, "store-committed") == []
 
 
 def _store_carry_commits(store: Path, story_key: str) -> list[str]:

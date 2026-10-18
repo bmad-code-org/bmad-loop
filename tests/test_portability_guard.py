@@ -1750,6 +1750,7 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundle-name-discarded",
         "sweep-bundle-name-normalized",
         "sweep-bundle-reclosed",
+        "sweep-bundle-reopen-failed",
         "sweep-bundle-reopened",
         "sweep-bundle-skipped",
         "sweep-bundles-truncated",

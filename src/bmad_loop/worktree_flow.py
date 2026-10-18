@@ -1784,7 +1784,9 @@ class WorktreeFlow:
     ``Engine._emit`` still wins), ``save`` persists run state, ``gate_unit`` runs
     the per-unit ready gate, ``carry_isolated_ledger_writes`` applies Engine-owned
     ledger bookkeeping after a successful merge, ``land_post_landing_writes`` makes
-    the writes the engine latched for after landing, ``workspace_get``/``workspace_set``
+    the writes the engine latched for after landing, ``reopen_unlanded_close`` undoes
+    the writes that assumed a landing before an escalation's terminal save,
+    ``workspace_get``/``workspace_set``
     read and swap the engine's active workspace, and ``escalation_pause`` raises the
     engine's ``RunPaused`` (injected so this module need not import ``engine`` — that
     would reintroduce a runtime<->engine import cycle)."""
@@ -1806,6 +1808,7 @@ class WorktreeFlow:
         carry_isolated_ledger_writes: Callable[[StoryTask], None],
         escalation_pause: Callable[..., NoReturn],
         land_post_landing_writes: Callable[[StoryTask], None] = lambda task: None,
+        reopen_unlanded_close: Callable[[StoryTask], None] = lambda task: None,
         workspace_get: Callable[[], Workspace],
         workspace_set: Callable[[Workspace], None],
         unit_branch_epic: Callable[[StoryTask], str | None] = lambda task: None,
@@ -1828,6 +1831,7 @@ class WorktreeFlow:
         self._gate_unit = gate_unit
         self._carry_isolated_ledger_writes = carry_isolated_ledger_writes
         self._land_post_landing_writes = land_post_landing_writes
+        self._reopen_unlanded_close = reopen_unlanded_close
         self._pause = escalation_pause
         self._workspace_get = workspace_get
         self._workspace_set = workspace_set
@@ -5099,6 +5103,9 @@ class WorktreeFlow:
             diff_max_file_bytes=self.failed_diff_max_bytes(),
             forensic_extra=self._pinned_config_forensic_extra(task, unit),
         )
+        # A DONE unit whose code did not land: undo its pre-landing writes here,
+        # since `escalate_unit` leaves a terminal task's alone (DW-569).
+        self._reopen_unlanded_close(task)
         self.escalate_unit(task, reason)  # always raises RunPaused
 
     def seed_workspace_trust(
@@ -5168,7 +5175,17 @@ class WorktreeFlow:
         rather than advanced: before dispatch, after a completed merge attempt, at a
         session launch (the Codex hook-trust gate, :meth:`gate_codex_hook_trust`,
         which can fire mid-drive), and from :meth:`reopen_unit` for in-flight units.
+
+        An in-flight unit's code has not landed, so ``reopen_unlanded_close`` undoes
+        the writes that assumed it would (a sweep bundle's close in a shared-store
+        ledger, DW-569) before the phase is set. A task already terminal is left
+        alone: the resume replay reaches :meth:`reopen_unit` for a DONE unit whose
+        merge may already have landed, so its landing is unknown here.
+        :meth:`keep_branch_and_escalate`, which knows its DONE unit did not land,
+        makes that call itself.
         """
+        if not task.terminal:
+            self._reopen_unlanded_close(task)
         task.phase = Phase.ESCALATED
         task.adopt_pending = False  # an escalation spends any adoption (DW-386)
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
