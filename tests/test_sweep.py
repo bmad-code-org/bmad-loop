@@ -32795,6 +32795,45 @@ def test_a_consumed_sources_recorded_completion_stands_on_the_target_alone(
     assert verify.rev_parse_head(project.repo_root) == expected_head
 
 
+def test_a_leftover_unregistered_worktree_dir_reads_as_a_consumed_source(project, monkeypatch):
+    """A degraded teardown can drop git's registration and leave the directory.
+    That leftover is no mount: replaying the merge there would reach
+    `_reopen_unit`, which escalates an unregistered path, so the completion
+    stands on the target as for any consumed source and the carry proceeds.
+
+    Ablation: probe `_source_mounted` with `is_dir()` alone and the resume
+    replays into `_reopen_unit` and pauses on the unregistered worktree."""
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    crash_at_merge_back(engine, after="merge")
+    assert engine.run().crashed
+
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    leftover = Path(durable.worktree_path)
+    leftover.mkdir(parents=True)
+    assert not verify.worktree_is_registered(project.repo_root, leftover)
+    merge = verify.merge_branch
+    replayed: list[str] = []
+
+    def merge_spy(*args, **kwargs):
+        replayed.append("merge")
+        return merge(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "merge_branch", merge_spy)
+    resumed, _ = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert replayed == []
+    assert load_state(resumed.run_dir).tasks["dw-fix"].isolated_ledger_carried
+    assert "resume-ledger-carry" in journal_kinds(resumed)
+
+
 @pytest.mark.parametrize(
     "refusal",
     [

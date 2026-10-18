@@ -2294,7 +2294,8 @@ class Engine:
         """Whether a modern bundle's recorded integration holds on the target now.
 
         Read only with no live receipt. ``False`` while the unit's worktree is
-        still mounted: the merge is replayed instead, the stronger reading. With
+        still mounted (``_source_mounted``: a directory git still registers):
+        the merge is replayed instead, the stronger reading. With
         the source consumed, the deterministic target validation the record
         would otherwise have stood in for (#796 review): the target head holds
         the unit's integration — ``task.commit_sha`` in its history, or, since
@@ -2309,7 +2310,7 @@ class Engine:
         the reason — there is no source left to replay and no receipt left to
         restore.
         """
-        if task.worktree_path and Path(task.worktree_path).is_dir():
+        if self._source_mounted(task):
             return False
         target = self.state.target_branch
         repo = self.paths.repo_root
@@ -2341,6 +2342,26 @@ class Engine:
                 task.story_key,
             ) from exc
         return True
+
+    def _source_mounted(self, task: StoryTask) -> bool:
+        """Whether the unit's recorded worktree is still its live, registered mount.
+
+        A directory alone is not a mount: a degraded teardown can drop git's
+        registration and leave the directory, and replaying the merge there
+        reaches ``_reopen_unit``, which escalates an unregistered path — so a
+        leftover reads as consumed and the target is read instead. A registration
+        probe that cannot answer reads as mounted, so the replay's
+        ``_reopen_unit`` takes the same probe and escalates with its fault.
+        """
+        if not task.worktree_path:
+            return False
+        path = Path(task.worktree_path)
+        if not path.is_dir():
+            return False
+        try:
+            return verify.worktree_is_registered(self.paths.repo_root, path)
+        except verify.GitError:
+            return True
 
     def _target_lacks_unit(self, task: StoryTask, head: str) -> str | None:
         """What the target ``head`` lacks of the unit's integration, or ``None``.
@@ -2376,15 +2397,15 @@ class Engine:
 
         The ordinary-story twin of ``_consumed_source_completion_holds``: the
         ``unit-merged`` row is the session's to append, so it never stands for
-        the merge alone. ``False`` while the unit's worktree is still mounted:
-        the replay re-runs the merge, which is a no-op over a landed merge/ff
+        the merge alone. ``False`` while the unit's worktree is still mounted
+        (``_source_mounted``): the replay re-runs the merge, which is a no-op over a landed merge/ff
         and takes squash's recovery arm. With the source consumed, the merge
         holds only when the target head holds the unit (``_target_lacks_unit``)
         — never ``validate_integrated``, which refuses a task with no artifact
         payload. Anything else journals ``unit-merged-unverified`` with the
         reason and pauses the run: there is no source left to replay.
         """
-        if task.worktree_path and Path(task.worktree_path).is_dir():
+        if self._source_mounted(task):
             return False
         target = self.state.target_branch
         head: str | None = None

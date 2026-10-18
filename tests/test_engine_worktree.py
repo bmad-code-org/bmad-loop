@@ -4144,6 +4144,30 @@ def test_ordinary_merged_row_with_consumed_source_carries_without_a_merge(projec
     assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
 
 
+def test_ordinary_merged_row_with_a_leftover_unregistered_dir_reads_the_target(project):
+    """A directory git no longer registers is no mount (a degraded teardown can
+    leave one): the replay reads the target, as for a consumed source, rather
+    than replay into `_reopen_unit`, which escalates an unregistered path.
+
+    Ablation: probe `_source_mounted` with `is_dir()` alone and the replay
+    escalates on the unregistered worktree."""
+    engine, task = _ordinary_unit_with_a_bare_merged_row(
+        project, commit_sha=lambda project: rev_parse_head(project.project)
+    )
+    leftover = Path(task.worktree_path)
+    leftover.mkdir(parents=True)
+    assert not verify.worktree_is_registered(project.project, leftover)
+
+    resumed, _ = resume_engine(project, engine)
+    resumed._replay_unlatched_ledger_carries()
+
+    kinds = journal_kinds(resumed)
+    assert "resume-unit-merge" not in kinds
+    assert "unit-merged-unverified" not in kinds
+    assert "resume-ledger-carry" in kinds
+    assert load_state(resumed.run_dir).tasks[task.story_key].isolated_ledger_carried is True
+
+
 def test_ordinary_merged_row_with_a_mounted_source_replays_the_merge(project, monkeypatch):
     """While the unit's worktree is still mounted and registered, the replay re-runs
     the merge rather than read the row: a no-op over the landed branch that
