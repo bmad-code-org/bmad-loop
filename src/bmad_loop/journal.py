@@ -1,4 +1,10 @@
-"""Append-only run journal and atomic run-state persistence."""
+"""Append-only run journal and atomic run-state persistence, written confined and
+pinned.
+
+``Journal.append`` and ``save_state`` write ``journal.jsonl`` and ``state.json``
+through a descriptor on the run dir pinned to ``RunState.run_dir_identity``, read
+live per write; ``write_verify_stream`` takes the same record as an argument. The
+reads (``Journal.entries``, ``load_state``) open their files by path."""
 
 from __future__ import annotations
 
@@ -362,7 +368,10 @@ class Journal:
         planted link there makes the ``mkdir`` answer ``FileExistsError`` and the
         ``O_NOFOLLOW`` open that follows refuses it.
 
-        win32 has no ``*at()`` family to anchor against, so it keeps a
+        This method still branches on :data:`DIR_FD_ANCHORED_WRITES`, not on
+        :data:`HANDLE_ANCHORED_WRITES` as ``append`` and ``save_state`` do, so it
+        is the one confined run-dir writer whose win32 arm does not use the
+        handle-anchored ``win32_at`` calls. That arm keeps a
         check-then-write, and the check is :func:`is_link_like` rather than
         ``is_symlink()`` — on Windows the redirect that matters is a DIRECTORY
         JUNCTION, which ``is_symlink()`` reports False for and which ``mklink /J``

@@ -1279,7 +1279,9 @@ def root_identity_record(root: Path) -> RootIdentityRecord | None:
     that is unchanged — a zero inode never matched — but the win32 verify-stream
     arm, which used to write through such a run dir, now refuses it: a refusal,
     not a degrade, journaled per stream as ``capture_error`` (DW-446, accepted
-    2026-09-27). ``st_dev`` is not stable across a reboot or remount, so
+    2026-09-27). The run journal and ``state.json`` are the exception: with no
+    record they write through the unpinned confined open and journal one
+    ``journal-unpinned`` row. ``st_dev`` is not stable across a reboot or remount, so
     ``runs.reconcile_root_identities`` re-binds a record's ``st_dev`` at a locked
     resume/re-arm when the root still ``lstat``s as a real directory with the
     same ``st_ino``; within a live engine the compare stays full ``(st_dev,
@@ -1519,9 +1521,15 @@ def open_dir_confined(
     (DW-498) — which confine to
     ``workspace.paths.project``/``workspace.root`` and, when that workspace is a
     unit mount, pin it through ``runs.mount_root_identity`` (DW-445). The run
-    journal and ``state.json`` join them as pinned run-dir writers in later
-    phases of DW-559, through :func:`append_line_confined` and
-    :func:`atomic_write_text_at`. A pinned
+    journal (``Journal.append``, through :func:`append_line_confined`) and
+    ``state.json`` (``journal.save_state``, through :func:`atomic_write_text_at`)
+    are pinned run-dir writers too, against ``RunState.run_dir_identity`` read
+    live on every write. Unlike the writers above, a missing record or one that
+    misses an intact run dir only by a renumbered ``st_dev``
+    (:func:`stale_device_record`) does not refuse there: the write degrades to an
+    unpinned open whose run dir is still the ``O_NOFOLLOW`` last component of the
+    walk, and the journal records one ``journal-unpinned`` row per writer object.
+    Any other pinned miss raises :class:`UnconfinedWriteError`. A pinned
     spec writer's EXTERNAL arm (a target outside ``confine_root``) pre-checks the
     pin with :func:`require_root_pinned` before writing, so a path resolved
     through a swapped mount refuses there too while the swap still stands

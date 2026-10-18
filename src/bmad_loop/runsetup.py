@@ -1146,7 +1146,9 @@ def _claim_identity(claim: os.stat_result) -> tuple[int, int] | None:
     mount writers that is no change (a zero inode never matched), but the win32
     verify-stream arm, which before DW-446 wrote through a zero-inode run dir, now
     REFUSES it (accepted 2026-09-27): each lost log tail is journaled as the
-    verify record's ``capture_error`` and verification proceeds without it."""
+    verify record's ``capture_error`` and verification proceeds without it. The
+    run journal and ``state.json`` do not refuse: they write unpinned and the
+    journal records one ``journal-unpinned`` row (``reason="no-record"``)."""
     if claim.st_ino == 0:
         return None
     return (claim.st_dev, claim.st_ino)
