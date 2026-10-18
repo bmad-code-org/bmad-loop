@@ -5013,7 +5013,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # test_resume_refuses_a_mismatched_plugin_before_any_side_effect.
     if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
         return rc
-    journal = Journal(run_dir)
+    journal = Journal(run_dir, pin=state)
     # Read the outgoing weight BEFORE the re-stamp below replaces it: the
     # session-end entries this run already wrote were weighted at it, so without
     # recording it here they stop being reconstructible from the (now newer)
@@ -5168,8 +5168,9 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # Discharge an OWED record FIRST — before the `run-resume` row, before the pin
     # re-baseline below, and before `state.repo_root` is overwritten. The twin of
     # `runs.restamp_code_root`'s own discharge, same shape and same field names, and
-    # the same at-least-once bargain: this is the FIRST fallible write of the resume,
-    # so an append that raises here leaves journal, pin and run state intact — no
+    # the same at-least-once bargain: this is the first fallible write of the resume
+    # past the identity reconcile above (whose rows are informational and re-recorded
+    # on a retry), so an append that raises here leaves pin and run state intact — no
     # resume row to duplicate, no re-baselined pin to silence the host-exec advisory
     # on the retry, and a root and marker still exactly as the retry needs them.
     # First also puts it in
@@ -5181,6 +5182,20 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # residual is the twin's: a `save_state` that fails after a successful append
     # costs a duplicate — but TRUE — record on the retry, and a duplicate is
     # recoverable from the journal where a missing or a false record is not.
+    # DW-446: reconcile the mint-time root identities — past every refusal above,
+    # and ahead of this resume's FIRST journal row, because `journal` is pinned to
+    # this `state` and reads `run_dir_identity` live per append: reconciled any
+    # later, the rows above it would be written through a missing record (one
+    # `journal-unpinned` notice) or a renumbered device. A state.json written before
+    # the records existed records them (one `root-identity-recorded` per record); a
+    # record whose root still lstats as a real directory with the same inode but a
+    # renumbered `st_dev` (a reboot or remount) is re-bound (one
+    # `root-identity-rebound`). An inode mismatch is never re-recorded — its pinned
+    # writes keep refusing. Persisted by the `save_state` below, so a resume that
+    # fails after this point can leave one informational `root-identity-*` row whose
+    # record lands only with a later `save_state`; the retry records it again. That
+    # is at-least-once, the same bargain the `run-resume` row already makes.
+    runs.reconcile_root_identities(state, run_dir, journal, project)
     if state.code_root_restamp_pending:
         journal.append(
             "rearm-code-root-restamped",
@@ -5267,14 +5282,6 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # and only here — past every refusal above — on the write that persists this
     # resume, so a refused resume cannot arm it and a plain one always clears it.
     state.accept_baseline = accept_baseline
-    # DW-446: reconcile the mint-time root identities — past every refusal above,
-    # before the engine's first pinned write, and persisted by the `save_state`
-    # below. A state.json written before they existed records them (one
-    # `root-identity-recorded` per record); a record whose root still lstats as a
-    # real directory with the same inode but a renumbered `st_dev` (a reboot or
-    # remount) is re-bound (one `root-identity-rebound`). An inode mismatch is never
-    # re-recorded — its pinned writes keep refusing.
-    runs.reconcile_root_identities(state, run_dir, journal, project)
     # A tickets run paused for a refined ticket's story-file approval: this resume
     # is that approval, recorded while the pause still names the ticket and past
     # every refusal above, so a refused resume approves nothing.
@@ -5336,14 +5343,15 @@ _ctl_launch: _CtlLaunch | None = None
 _CTL_REFUSAL_MAX_CHARS = 4000
 
 
-def _claim_ctl_window(project: Path, run_dir: Path) -> None:
+def _claim_ctl_window(project: Path, run_dir: Path, state: RunState) -> None:
     """Publish the control window this process runs in as the run's, once this
     process has accepted the run (`tui.launch.claim_ctl_window`). The caller holds
     the run's state lock and has just found no live engine under it (#920).
 
     A claim that did not land is journaled as well as printed: a TUI-launched
     resume prints into a detached window nobody is looking at, while the
-    journal is the run's durable record.
+    journal is the run's durable record, written through a journal pinned to the
+    run's ``state``.
 
     Never raises: the caller has already published this process's pid and the
     resumed state, so a fault here (a backend that cannot be selected, a record
@@ -5360,15 +5368,15 @@ def _claim_ctl_window(project: Path, run_dir: Path) -> None:
     except (MultiplexerError, OSError) as exc:
         warning = f"could not record this window as run {run_dir.name}'s control window: {exc}"
     if warning is not None:
-        _report_ctl_window_fault(run_dir, warning)
+        _report_ctl_window_fault(run_dir, warning, state)
 
 
-def _report_ctl_window_fault(run_dir: Path, warning: str) -> None:
+def _report_ctl_window_fault(run_dir: Path, warning: str, state: RunState) -> None:
     """Print a control-window record fault and journal it as
     `ctl-window-claim-failed`. Never raises."""
     print(f"warning: {warning}", file=sys.stderr)
     try:
-        Journal(run_dir).append("ctl-window-claim-failed", error=warning)
+        Journal(run_dir, pin=state).append("ctl-window-claim-failed", error=warning)
     except OSError as exc:
         print(f"warning: could not journal it: {exc}", file=sys.stderr)
 
@@ -5443,7 +5451,10 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
                     file=sys.stderr,
                 )
                 return
-            Journal(run_dir).append(
+            # Read under the same hold, for the pin; a state that cannot be read
+            # is said by the `except` below like any other fault.
+            state = load_state(run_dir)
+            Journal(run_dir, pin=state).append(
                 "ctl-window-claim-failed",
                 error=f"a TUI-launched {args.command} exited before driving the run: "
                 f"{reason} — the run's control-window record still names the window "
@@ -5491,8 +5502,8 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
         if isinstance(prepared, int):
             return prepared
-        _claim_ctl_window(project, run_dir)
-    paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants = prepared
+        paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants = prepared
+        _claim_ctl_window(project, run_dir, state)
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
@@ -5769,7 +5780,7 @@ def _echo_rearm_notices(notices: tuple[runs.RearmNotice, ...]) -> None:
 
 
 def _hand_back_ctl_window(
-    project: Path, run_dir: Path, predecessor: str | None, claimed: str | None
+    project: Path, run_dir: Path, state: RunState, predecessor: str | None, claimed: str | None
 ) -> None:
     """This window is about to exit without a usable session, so the window the
     record named before its claim is the run's again (#937)."""
@@ -5779,7 +5790,7 @@ def _hand_back_ctl_window(
         with state_lock(run_dir):
             fault = launch.restore_ctl_window(project, run_dir.name, predecessor, claimed)
             if fault is not None:
-                _report_ctl_window_fault(run_dir, fault)
+                _report_ctl_window_fault(run_dir, fault, state)
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
@@ -6070,7 +6081,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # Captured around the claim, so a session that cannot start can hand
             # the record back (#937).
             predecessor = launch.recorded_ctl_window(project, run_dir.name)
-            _claim_ctl_window(project, run_dir)
+            _claim_ctl_window(project, run_dir, state)
             claimed = launch.recorded_ctl_window(project, run_dir.name)
         # From the claim on, any exit without a usable session hands the record
         # back: adapter and context setup can fail too, not just the session.
@@ -6118,12 +6129,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     f"then: bmad-loop resolve {args.run_id} --no-interactive",
                     file=sys.stderr,
                 )
-                _hand_back_ctl_window(project, run_dir, predecessor, claimed)
+                _hand_back_ctl_window(project, run_dir, state, predecessor, claimed)
                 return 1
         except BaseException:
             # Setup failed, the dev CLI could not be spawned, or the session
             # died: the window exits all the same, so hand the record back first.
-            _hand_back_ctl_window(project, run_dir, predecessor, claimed)
+            _hand_back_ctl_window(project, run_dir, state, predecessor, claimed)
             raise
         # DW-11, second half. `produced` alone is not enough to record coverage,
         # because the watermark `rearm_escalation` stamps is `len(task.sessions)` — it

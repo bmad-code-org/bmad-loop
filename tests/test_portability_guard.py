@@ -60,6 +60,7 @@ from bmad_loop.journal import (
     JOURNAL_FILE,
     SELF_MINTED_FIELDS,
     TASK_CYCLE_ARTIFACTS,
+    UNPINNED_NOTICE_KIND,
     UNREADABLE_LINE_KIND,
     Journal,
 )
@@ -1575,6 +1576,12 @@ JOURNAL_KINDS = frozenset(
         "resume-restart",
         # engine.py + worktree_flow.py
         "story-escalated",
+        # journal.py — the one row `Journal.append` writes on its own behalf
+        # (`Journal._notice_once`, through the `self.append` receiver scoped by
+        # `JOURNAL_SELF_RECEIVER_FILES`): once per writer object whose pinned
+        # `RunState` has no recorded run-dir identity or a renumbered device. Its
+        # one field, `reason`, is a drop field.
+        "journal-unpinned",
         # plugins/bus.py
         "plugin-hook",
         "plugin-hook-error",
@@ -2164,6 +2171,27 @@ JOURNAL_KINDS = frozenset(
 # parameter kind), and resolving them would be `_call_aliases`' shape rather than a
 # new idea — but the guard does not do it, and a reader must not assume it does.
 JOURNAL_RECEIVERS = {"journal", "_journal"}
+
+# Files where a bare ``self.append(...)`` IS a journal write: inside ``journal.py``
+# ``self`` is the ``Journal`` itself, and ``_notice_once`` writes the
+# ``journal-unpinned`` row that way (through the public ``append``, so a subclass
+# that classifies rows sees it). Scoped by FILE, because ``self.append`` anywhere
+# else is a list, a deque or some other container.
+JOURNAL_SELF_RECEIVER_FILES = {"journal.py"}
+
+# ``(file, enclosing function)`` of every production ``Journal``/``_RearmJournal``
+# construction that may omit ``pin=``: the READ-ONLY sites, which only call
+# ``entries()``. Every writer passes the ``RunState`` it holds (``pin=state``), so
+# ``Journal.append`` reads the run's recorded identity live and writes through a
+# run dir held to it; a bare writer would append confined but unpinned, and
+# silently. ``test_journal_constructed_with_a_pin_outside_read_only_sites`` holds
+# the tree to this set.
+JOURNAL_PIN_ALLOW = {
+    ("diagnostics.py", "collect_run"),
+    ("tui/launch.py", "decision_pending"),
+    ("runs.py", "journal_entries_or_none"),
+    ("unitreplay.py", "_earlier_abandon_ref"),
+}
 
 # Files that may name a bare POSIX path, each on a line carrying a `# portability:`
 # ack. process_host.py's Linux identity reader walks `/proc/<pid>/stat` behind a
@@ -2931,7 +2959,8 @@ def _is_journal_write(node: ast.AST, rel: str) -> bool:
     """Whether this node writes a journal entry — a ``<journal>.append(...)`` call in
     each of the four receiver spellings the scan reads: the three named handles (see
     ``JOURNAL_RECEIVERS``) and the constructor-inline ``Journal(run_dir).append(...)``
-    — or a call to one of this file's declared ``JOURNAL_FORWARDERS``. The tree's
+    — plus a bare ``self.append(...)`` inside ``JOURNAL_SELF_RECEIVER_FILES``, or a
+    call to one of this file's declared ``JOURNAL_FORWARDERS``. The tree's
     fifth spelling, ``super().append(...)`` inside ``runs._RearmJournal``'s override,
     is a stated bound (``JOURNAL_RECEIVERS``), not a receiver.
 
@@ -2956,6 +2985,11 @@ def _is_journal_write(node: ast.AST, rel: str) -> bool:
     receiver = node.func.value
     if _called_name(receiver) in JOURNAL_RECEIVERS:
         return True
+    # `self.append(...)` inside a `JOURNAL_SELF_RECEIVER_FILES` file: the Journal
+    # writing on its own behalf. A bare `self` only — `self.x.append` is a container.
+    if rel in JOURNAL_SELF_RECEIVER_FILES and isinstance(receiver, ast.Name):
+        if receiver.id == "self":
+            return True
     # The constructor-inline spelling: `Journal(run_dir).append(...)`. The receiver
     # is an ast.Call, so the named-handle match above can never see it — runs.py's
     # stop/restamp records (and their kinds and fields) went unscanned exactly this
@@ -4207,6 +4241,26 @@ def _scan_source(src: str, rel: str):
         ):
             findings.append(("specanchor", rel, node.lineno, line_at(node.lineno)))
 
+    # A `Journal`/`_RearmJournal` construction with no `pin=` keyword: a writer that
+    # would append unpinned (and silently), unless its position is a read-only one
+    # in `JOURNAL_PIN_ALLOW`. Name-anchored like the journal receiver arm, so a
+    # lookalike constructor and a `class X(Journal):` base (no Call) stay silent.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and _called_name(node.func) in {"Journal", "_RearmJournal"}
+            and not any(kw.arg == "pin" for kw in node.keywords)
+        ):
+            findings.append(
+                (
+                    "journalpin",
+                    rel,
+                    node.lineno,
+                    line_at(node.lineno),
+                    enclosing_names.get(id(node)),
+                )
+            )
+
     # A session task id COMPOSED rather than obtained from `engine._session_task_id`.
     # Two value positions, because those are the two a fifth mint can occupy: a
     # binding (`task_id = …`, `SessionSpec(task_id=…)`) and a return from a function
@@ -5004,6 +5058,82 @@ def test_spec_anchor_detector_stays_silent_on_the_anchored_form():
         "from pathlib import Path\np = Path(state.project)\n",
     ):
         assert not [f for f in _scan_source(src, "tui/app.py") if f[0] == "specanchor"]
+
+
+def test_journal_constructed_with_a_pin_outside_read_only_sites():
+    """Every production journal WRITER is pinned to the run's state.
+
+    ``Journal.append`` reads ``pin.run_dir_identity`` live and writes through a run
+    dir held to it; a pinned state with no record degrades visibly (one
+    ``journal-unpinned`` row). A bare ``Journal(run_dir)`` takes neither path: it
+    appends confined but unpinned and says nothing, which is right only where
+    nothing is appended. Those read-only positions are ``JOURNAL_PIN_ALLOW``.
+
+    Ablation: drop ``pin=state`` from ``runs._stop_run_once``'s ``run-stop`` row and this
+    reddens naming ``runs.py``."""
+    offenders = [
+        (rel, ln, txt, fn)
+        for _, rel, ln, txt, fn in _of("journalpin")
+        if (rel, fn) not in JOURNAL_PIN_ALLOW
+    ]
+    assert not offenders, (
+        "a journal built without a pin — pass `pin=state` so `Journal.append` can hold "
+        "the run dir to its recorded identity, or add this read-only site to "
+        "JOURNAL_PIN_ALLOW:\n"
+        + "\n".join(f"  {rel}:{ln} ({fn}): {txt.strip()}" for rel, ln, txt, fn in offenders)
+    )
+    stale = JOURNAL_PIN_ALLOW - {(rel, fn) for _, rel, _, _, fn in _of("journalpin")}
+    assert not stale, f"JOURNAL_PIN_ALLOW rows that no longer build a bare journal: {stale}"
+
+
+def test_journal_pin_detector_flags_a_bare_writer_construction():
+    """The guard above asserts an ABSENCE; feed the bare shapes through the same
+    ``_scan_source`` the real scan uses, each in a function no allowlist row names."""
+    for src in (
+        "def stop(run_dir, state):\n    Journal(run_dir).append('run-stop')\n",
+        "def rearm(run_dir, state):\n    journal = _RearmJournal(run_dir)\n",
+        "def go(run_dir):\n    j = journal_mod.Journal(run_dir)\n",
+    ):
+        found = [f for f in _scan_source(src, "runs.py") if f[0] == "journalpin"]
+        assert [f[4] for f in found] in (["stop"], ["rearm"], ["go"]), src
+
+
+def test_journal_pin_detector_stays_silent_on_pinned_and_lookalike_forms():
+    """The pinned spelling, a lookalike constructor and a subclass base must not trip
+    it, or the guard becomes noise that gets allowlisted away."""
+    for src in (
+        "def stop(run_dir, state):\n    Journal(run_dir, pin=state).append('run-stop')\n",
+        "def rearm(run_dir, state):\n    journal = _RearmJournal(run_dir, pin=state)\n",
+        "def go(run_dir):\n    j = NotAJournal(run_dir)\n",
+        "class X(Journal):\n    pass\n",
+    ):
+        assert not [f for f in _scan_source(src, "runs.py") if f[0] == "journalpin"], src
+
+
+def test_journal_self_receiver_is_scoped_to_journal_py():
+    """``self.append(...)`` is a journal write inside ``journal.py`` and nowhere else:
+    the same source is flagged as a journal kind literal when scanned as
+    ``journal.py`` and is silent when scanned as ``runs.py``, where ``self.append`` is
+    an ordinary container method."""
+    src = (
+        "class Journal:\n"
+        "    def _notice_once(self, reason):\n"
+        "        self.append('journal-unpinned', reason=reason)\n"
+    )
+
+    def kinds(rel):
+        return [f[4] for f in _scan_source(src, rel) if f[0] == "journalkindliteral"]
+
+    assert kinds("journal.py") == ["journal-unpinned"]
+    assert kinds("runs.py") == []
+
+
+def test_unpinned_notice_kind_constant_is_an_inventoried_kind():
+    """``journal.UNPINNED_NOTICE_KIND`` names the row ``Journal._notice_once`` writes
+    with a LITERAL kind (the scan reads literals only). Holding the constant to the
+    literal-fed inventory is what keeps the two spellings from drifting: rename
+    either alone and this, or the inventory's staleness arm, reddens."""
+    assert UNPINNED_NOTICE_KIND in JOURNAL_KINDS
 
 
 def _task_artifact_offenders(findings) -> list[tuple[str, int, str, str]]:

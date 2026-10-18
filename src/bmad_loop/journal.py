@@ -288,11 +288,15 @@ class Journal:
         The flag is set BEFORE the write, which is what bounds the recursion: the notice
         goes through the public :meth:`append` — so a subclass that classifies its rows
         (``runs._RearmJournal``) sees it exactly once, and so the kind-inventory scan
-        reads it at an ``.append(`` receiver — and that append re-enters here."""
+        reads it at an ``.append(`` receiver — and that append re-enters here.
+
+        The kind is spelled as a literal, not as :data:`UNPINNED_NOTICE_KIND`: that
+        scan reads literal kinds only, and ``tests/test_portability_guard.py`` holds
+        the constant to the inventory so the two spellings cannot drift."""
         if reason is None or self._unpinned_noticed:
             return
         self._unpinned_noticed = True
-        self.append(UNPINNED_NOTICE_KIND, reason=reason)
+        self.append("journal-unpinned", reason=reason)
 
     def write_verify_stream(
         self, name: str, content: str, *, run_dir_identity: RootIdentityRecord | None

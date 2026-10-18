@@ -463,7 +463,9 @@ def build_context(
             ticket_plan = rebase_recorded_project_path(
                 Path(task.ticket.plan), state, current_project_root
             )
-        context["tickets"] = _tickets_context(run_dir, story_key, task, plan_path=ticket_plan)
+        context["tickets"] = _tickets_context(
+            state, run_dir, story_key, task, plan_path=ticket_plan
+        )
     path = context_path(run_dir, story_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(context, indent=2, allow_nan=False), encoding="utf-8")
@@ -530,7 +532,12 @@ TICKET_RESULT_EXCERPT_CHARS = 2000
 
 
 def _tickets_context(
-    run_dir: Path, story_key: str, task: StoryTask | None, *, plan_path: Path | None
+    state: RunState,
+    run_dir: Path,
+    story_key: str,
+    task: StoryTask | None,
+    *,
+    plan_path: Path | None,
 ) -> dict[str, Any]:
     """The tickets-mode extension of the resolve context: the ticket binding the run
     persisted (``ref``, ``ticket_id``, ``title``, ``epic``), the plan path, and what
@@ -539,8 +546,8 @@ def _tickets_context(
     ``tickets.py``. A plan that is absent reads as nulls; one that cannot be read
     reads as nulls too, and so do the frontmatter fields of a plan whose
     frontmatter is missing, unparseable or not a mapping. Either fault is
-    journaled as ``resolve-ticket-context-unreadable`` so the null is never
-    mistaken for an empty plan."""
+    journaled as ``resolve-ticket-context-unreadable`` — through a journal pinned
+    to ``state`` — so the null is never mistaken for an empty plan."""
     ticket = task.ticket if task is not None else None
     plan = plan_path if plan_path is not None else Path(ticket.plan) if ticket else None
     ctx: dict[str, Any] = {
@@ -558,7 +565,7 @@ def _tickets_context(
     try:
         text = plan.read_bytes().decode("utf-8-sig")
     except (OSError, UnicodeDecodeError) as e:
-        Journal(run_dir).append(
+        Journal(run_dir, pin=state).append(
             "resolve-ticket-context-unreadable",
             story_key=story_key,
             plan=str(plan),
@@ -569,7 +576,7 @@ def _tickets_context(
     ctx["auto_run_result"] = result.detail[:TICKET_RESULT_EXCERPT_CHARS] if result.present else None
     fault = frontmatter.frontmatter_fault(text)
     if fault is not None:
-        Journal(run_dir).append(
+        Journal(run_dir, pin=state).append(
             "resolve-ticket-context-unreadable", story_key=story_key, plan=str(plan), error=fault
         )
         return ctx

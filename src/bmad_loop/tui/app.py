@@ -1432,7 +1432,11 @@ class BmadLoopApp(App[None]):
                     return
                 require_root_pinned(tree_root, root_identity)
                 mark = _replan_ticket_tree(tree_root, initiative).mark(
-                    ref, "draft", reason="replan", expected_plan=plan, journal=Journal(run_dir)
+                    ref,
+                    "draft",
+                    reason="replan",
+                    expected_plan=plan,
+                    journal=Journal(run_dir, pin=fresh),
                 )
         except LockUnavailableError:
             self.call_from_thread(

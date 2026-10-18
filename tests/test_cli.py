@@ -4414,6 +4414,9 @@ def _make_run_with_state(project, run_id, **state_kwargs):
     from bmad_loop.model import RunState
 
     run_dir = project / ".bmad-loop" / "runs" / run_id
+    # the run dir's mint-time identity, so the stop path's pinned journal is silent
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_kwargs.setdefault("run_dir_identity", platform_util.root_identity_record(run_dir))
     save_state(
         run_dir,
         RunState(run_id=run_id, project=str(project), started_at="now", **state_kwargs),
@@ -7270,7 +7273,7 @@ def test_resolve_claims_its_control_window_under_the_state_lock(tmp_path, monkey
     run_dir = _escalated_run(tmp_path, "r1")
     claims: list[Path] = []
 
-    def claim(_project, target):
+    def claim(_project, target, _state):
         assert_run_state_lock_held(target)
         claims.append(target)
 
@@ -7290,7 +7293,7 @@ def test_a_claim_that_did_not_land_is_journaled(tmp_path, monkeypatch, capsys):
 
     run_dir = _escalated_run(tmp_path, "r1")
     monkeypatch.setattr(launch, "claim_ctl_window", lambda _p, _rid, **_k: "record not written")
-    cli._claim_ctl_window(tmp_path, run_dir)
+    cli._claim_ctl_window(tmp_path, run_dir, cli.load_state(run_dir))
     assert "warning: record not written" in capsys.readouterr().err
     entries = [e for e in Journal(run_dir).entries() if e["kind"] == "ctl-window-claim-failed"]
     assert [e["error"] for e in entries] == ["record not written"]
@@ -7311,7 +7314,7 @@ def test_a_claim_that_raises_does_not_abort_the_resume(tmp_path, monkeypatch, ca
         raise MultiplexerError("no such backend: gone")
 
     monkeypatch.setattr(launch, "claim_ctl_window", boom)
-    cli._claim_ctl_window(tmp_path, run_dir)
+    cli._claim_ctl_window(tmp_path, run_dir, cli.load_state(run_dir))
     assert "no such backend: gone" in capsys.readouterr().err
     kinds = [e["kind"] for e in Journal(run_dir).entries()]
     assert kinds.count("ctl-window-claim-failed") == 1
@@ -7320,7 +7323,7 @@ def test_a_claim_that_raises_does_not_abort_the_resume(tmp_path, monkeypatch, ca
         raise OSError("disk full")
 
     monkeypatch.setattr(Journal, "append", unwritable)
-    cli._claim_ctl_window(tmp_path, run_dir)
+    cli._claim_ctl_window(tmp_path, run_dir, cli.load_state(run_dir))
     assert "could not journal it: disk full" in capsys.readouterr().err
 
 
@@ -7404,7 +7407,7 @@ def test_a_launched_resume_that_accepted_then_failed_journals_no_refusal(tmp_pat
         heard.append(launched)
 
     def accept_then_fail(args):
-        cli._claim_ctl_window(tmp_path, run_dir)
+        cli._claim_ctl_window(tmp_path, run_dir, cli.load_state(run_dir))
         return 1
 
     monkeypatch.setattr(launch, "claim_ctl_window", claim)
@@ -9050,7 +9053,7 @@ def test_resume_retains_outer_lock_through_pid_publication(project, monkeypatch)
         publications.append("state")
         real_save(target, state)
 
-    def checked_claim(_project, target):
+    def checked_claim(_project, target, _state):
         # #920: the control-window record follows acceptance in lock order, so a
         # rival resume refused under this hold can never take it from this one.
         assert_run_state_lock_held(target)
@@ -22869,15 +22872,64 @@ def test_resume_rebinds_a_renumbered_st_dev_once(project, monkeypatch):
     assert len(rebound_rows()) == 2  # a second resume journals none
 
 
-def test_resume_never_rebinds_an_inode_mismatch(project, monkeypatch):
+def test_resume_of_a_legacy_run_records_its_identity_before_the_first_row(project, monkeypatch):
+    """A state.json written before the run-dir identity existed is reconciled ahead of
+    the resume's FIRST row: the resume journal is pinned to that state and reads the
+    record live, so `root-identity-recorded` precedes `run-resume` and no row is
+    written unpinned — no `journal-unpinned` notice.
+
+    Ablation: move `runs.reconcile_root_identities` back below `run-resume` in
+    `_prepare_resume_locked` (or journal before assigning inside it) and a
+    `no-record` notice leads the journal."""
+    from bmad_loop.journal import Journal
+
+    run_dir, _mount, argv = _resume_with_records(project, monkeypatch, lambda _path: None)
+
+    assert cli.main(argv) == 0
+
+    kinds = [e["kind"] for e in Journal(run_dir).entries()]
+    assert "journal-unpinned" not in kinds
+    assert kinds.index("root-identity-recorded") < kinds.index("run-resume")
+
+
+def test_resume_with_a_renumbered_device_rebinds_before_the_first_row(project, monkeypatch):
+    """A record whose `st_dev` a reboot renumbered (same inode, still a real
+    directory) is re-bound ahead of the resume's first row: the run dir's
+    `root-identity-rebound` is the first row, the resume neither refuses nor degrades
+    (no `journal-unpinned` notice).
+
+    Ablation: as for the legacy twin — a late reconcile, or journaling before
+    assigning, leads with a `stale-device` notice."""
+    from bmad_loop import platform_util
+    from bmad_loop.journal import Journal
+
+    def renumbered(path):
+        dev, ino = platform_util.root_identity_record(path)
+        return (dev + 1, ino)
+
+    run_dir, _mount, argv = _resume_with_records(project, monkeypatch, renumbered)
+
+    assert cli.main(argv) == 0
+
+    entries = Journal(run_dir).entries()
+    kinds = [e["kind"] for e in entries]
+    assert "journal-unpinned" not in kinds
+    assert (kinds[0], entries[0]["root"]) == ("root-identity-rebound", "run-dir")
+    assert kinds.index("root-identity-rebound") < kinds.index("run-resume")
+
+
+def test_resume_never_rebinds_an_inode_mismatch(project, monkeypatch, capsys):
     """The re-bind is inode-matched: a record whose inode differs from the root's
-    (the root was replaced while paused) is left as it is — the resume still
-    succeeds, nothing is journaled, and the pinned writes keep refusing.
+    (the root was replaced while paused) is left as it is, and the pinned writes
+    keep refusing — the resume's journal among them, since it is pinned to the run's
+    state. So the resume refuses at its first row, before anything is persisted:
+    nothing is journaled and the record stays.
 
     Ablation: accept an inode mismatch in `runs._reconcile_one_root` (drop the
-    ``info.st_ino != ino`` check) and the persisted-record and no-journal-row
-    assertions redden. The pinned writes still refuse: that re-bind keeps the
-    record's old inode, so the pin never matches either way."""
+    ``info.st_ino != ino`` check) and the direct reconcile at the end reddens (the
+    resume's own re-bind row would refuse under the pin too, so the CLI half alone
+    cannot see it). The pinned writes still refuse: that re-bind keeps the record's
+    old inode, so the pin never matches either way."""
     from bmad_loop import platform_util, runs
     from bmad_loop.journal import Journal, load_state
 
@@ -22886,14 +22938,19 @@ def test_resume_never_rebinds_an_inode_mismatch(project, monkeypatch):
         return (dev + 7, ino + 1)
 
     run_dir, mount, argv = _resume_with_records(project, monkeypatch, stale)
+    before = Journal(run_dir).entries()
 
-    assert cli.main(argv) == 0
+    assert cli.main(argv) == 1
+    assert "refusing to append journal.jsonl" in capsys.readouterr().err
 
     saved = load_state(run_dir)
     assert saved.run_dir_identity == stale(run_dir)
     assert saved.tasks["1-1-a"].worktree_identity == stale(mount)
-    kinds = {e["kind"] for e in Journal(run_dir).entries()}
-    assert not kinds & {"root-identity-rebound", "root-identity-recorded"}
+    assert Journal(run_dir).entries() == before
+    # The reconcile itself declines both records: through a bare journal (which
+    # does not refuse), nothing changes and nothing is journaled.
+    assert not runs.reconcile_root_identities(saved, run_dir, Journal(run_dir), project.project)
+    assert Journal(run_dir).entries() == before
     with pytest.raises(OSError):
         Journal(run_dir).write_verify_stream(
             "v.stdout.log", "out", run_dir_identity=saved.run_dir_identity

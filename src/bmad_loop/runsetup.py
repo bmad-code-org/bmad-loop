@@ -1361,13 +1361,14 @@ def compose_run(
     # The guard opens on the statement immediately after the claim, because the
     # claim is what publishes that first artifact — the run DIRECTORY itself, which
     # is what a later `--run-id` collides with. Neither statement below can
-    # realistically fail (`Journal` mkdirs `exist_ok=True` over a directory this
-    # frame just created, and `build_run_state` is a pure constructor), but a
+    # realistically fail (`build_run_state` is a pure constructor, and `Journal`
+    # mkdirs `exist_ok=True` over a directory this frame just created), but a
     # signal can land between any two statements, and the arm is `BaseException`
-    # exactly so that case unwinds instead of stranding an empty run dir.
+    # exactly so that case unwinds instead of stranding an empty run dir. The state
+    # is built FIRST so the journal can be pinned to it: the constructor writes no
+    # row, and `run-start` below stays the run's first.
     journal: Journal | None = None
     try:
-        journal = Journal(run_dir)
         state = build_run_state(
             run_id=run_id,
             project=project,
@@ -1387,12 +1388,13 @@ def compose_run(
             store_topology=store_topology,
             ticket_epic_filter=ticket_epic_filter,
         )
+        journal = Journal(run_dir, pin=state)
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering
         # between these writes and double-driving the freshly composed run.
         with state_lock(run_dir):
             save_state(run_dir, state)
-            # After the run dir exists (Journal mkdir'd it above) and before the pid
+            # After the run dir exists (the claim created it above) and before the pid
             # lands: the ordering `reconcile_orphan_state_dirs` reads runs in, and a
             # stamp that cannot be written fails the launch before an observer can
             # see a live run.
@@ -1557,7 +1559,6 @@ def compose_sweep(
     # artifact to unwind (`sweep.json`).
     journal: Journal | None = None
     try:
-        journal = Journal(run_dir)
         state = RunState(
             run_id=run_id,
             project=str(project),
@@ -1577,6 +1578,7 @@ def compose_sweep(
             ),
             store_topology=store_topology,
         )
+        journal = Journal(run_dir, pin=state)
         # Persist the sweep options atomically (tmp + os.replace), the way save_state
         # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
         # crash mid-write must not leave a torn file the recovery path then chokes on.

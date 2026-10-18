@@ -175,6 +175,10 @@ def make_run(
         spec_folder=spec_folder,
     )
     save_state(run_dir, state)
+    # the run dir's mint-time identity, as the composers record it: the TUI's pinned
+    # replan journal then appends without a `journal-unpinned` notice
+    state.run_dir_identity = platform_util.root_identity_record(run_dir)
+    save_state(run_dir, state)
     if alive:
         (run_dir / "engine.pid").write_text(str(os.getpid()), encoding="utf-8")
     return run_dir
