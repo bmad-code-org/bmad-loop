@@ -2954,6 +2954,328 @@ def test_atomic_write_bytes_at_does_not_verify_after_prepublication_failure(tmp_
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+# ------------------------------------------- confined append (run-dir records)
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_open_append_at_creates_the_file_with_a_private_mode(tmp_path):
+    """The append open states its mode rather than inheriting the umask's, as
+    the anchored atomic writers do; the umask is forced for the reason
+    `test_atomic_write_text_at_lands_a_private_mode` gives.
+
+    Ablation: open with mode 0o644 in `open_append_at` and this fails
+    reporting 0o644."""
+    previous = os.umask(0o022)
+    try:
+        with _dir_fd(tmp_path) as dir_fd:
+            os.close(platform_util.open_append_at(dir_fd, "journal.jsonl"))
+    finally:
+        os.umask(previous)
+
+    landed = tmp_path / "journal.jsonl"
+    assert landed.read_bytes() == b""
+    assert stat.S_IMODE(landed.stat().st_mode) == 0o600, oct(landed.stat().st_mode)
+
+
+@ANCHORED
+def test_open_append_at_appends_across_two_descriptors_regardless_of_offset(tmp_path):
+    """Every write lands at the end: after a seek to the start on the same
+    descriptor, and from a second descriptor opened on the existing file (no
+    truncation on re-open)."""
+    with _dir_fd(tmp_path) as dir_fd:
+        first = platform_util.open_append_at(dir_fd, "journal.jsonl")
+        try:
+            os.write(first, b"a\n")
+            second = platform_util.open_append_at(dir_fd, "journal.jsonl")
+            try:
+                os.lseek(second, 0, os.SEEK_SET)
+                os.write(second, b"b\n")
+            finally:
+                os.close(second)
+            os.lseek(first, 0, os.SEEK_SET)
+            os.write(first, b"c\n")
+        finally:
+            os.close(first)
+
+    assert (tmp_path / "journal.jsonl").read_bytes() == b"a\nb\nc\n"
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_open_append_at_refuses_a_link_at_the_name(tmp_path):
+    """`AT_NOFOLLOW` on the final component: a link planted at the record's name
+    fails the open with `ELOOP`, and the file it points at is untouched.
+
+    Ablation: drop `AT_NOFOLLOW` from `open_append_at` and the open follows the
+    link (no `ELOOP`)."""
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b"kept\n")
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "journal.jsonl").symlink_to(outside)
+
+    with _dir_fd(run) as dir_fd:
+        with pytest.raises(OSError) as refused:
+            platform_util.open_append_at(dir_fd, "journal.jsonl")
+    assert refused.value.errno == errno.ELOOP
+    assert outside.read_bytes() == b"kept\n"
+
+
+@ANCHORED
+@pytest.mark.parametrize(
+    ("content", "terminated"),
+    [(b"", True), (b"x", False), (b"x\n", True), (b"x\r\n", True)],
+    ids=["empty", "fragment", "lf", "crlf"],
+)
+def test_tail_is_terminated_fd_reads_each_tail_shape(tmp_path, content, terminated):
+    """An empty file has no fragment to close; otherwise the last byte decides,
+    so a legacy CRLF tail reads terminated too."""
+    (tmp_path / "journal.jsonl").write_bytes(content)
+    with _dir_fd(tmp_path) as dir_fd:
+        fd = platform_util.open_append_at(dir_fd, "journal.jsonl")
+        try:
+            assert platform_util.tail_is_terminated_fd(fd) is terminated
+        finally:
+            os.close(fd)
+
+
+@ANCHORED
+def test_tail_is_terminated_fd_fails_toward_the_heal_on_a_probe_error(tmp_path, monkeypatch):
+    """A terminated file whose probe faults answers "unterminated" and does not
+    raise: the cost of a wrong False is one blank line, of a wrong True two lost
+    records.
+
+    Ablation: answer True from the `except OSError` arm and this fails."""
+    (tmp_path / "journal.jsonl").write_bytes(b"x\n")
+
+    def faulting_lseek(fd, pos, how):
+        raise OSError(errno.EIO, "Input/output error")
+
+    with _dir_fd(tmp_path) as dir_fd:
+        fd = platform_util.open_append_at(dir_fd, "journal.jsonl")
+        try:
+            monkeypatch.setattr(platform_util.os, "lseek", faulting_lseek)
+            assert platform_util.tail_is_terminated_fd(fd) is False
+        finally:
+            monkeypatch.undo()
+            os.close(fd)
+
+
+@pytest.mark.parametrize(
+    ("observed", "record", "stale"),
+    [
+        ("dir", (7, 42), False),  # the recorded directory itself
+        ("dir", (8, 42), True),  # same inode on a renumbered device
+        ("dir", (8, 43), False),  # another directory
+        ("zero-inode", (8, 0), False),  # an identity that proves nothing
+        ("link", (8, 42), False),  # a link at the root is never stale, it is replaced
+        ("junction", (8, 42), False),  # nor a junction, whose lstat mode is a directory
+        ("missing", (8, 42), False),
+        ("dir", None, False),  # no record to compare
+    ],
+    ids=[
+        "same",
+        "renumbered",
+        "other-inode",
+        "zero-inode",
+        "link",
+        "junction",
+        "missing",
+        "no-record",
+    ],
+)
+def test_stale_device_record_matches_only_a_renumbered_device_on_the_same_directory(
+    tmp_path, monkeypatch, observed, record, stale
+):
+    """The degrade test a pinned writer runs after a refusal: True only for the
+    shape `runs.reconcile_root_identities` re-binds — an intact directory, the
+    recorded nonzero inode, another `st_dev`.
+
+    Ablation: drop the `st_ino == ino` compare and `other-inode` fails; drop the
+    `link_like_stat` test and `junction` fails."""
+
+    class _IdentifiedReparseStat(_ReparseStat):
+        st_dev = 7
+        st_ino = 42
+
+    root = tmp_path / "run"
+    real_lstat = os.lstat
+    monkeypatch.setattr(platform_util, "_LINK_REPARSE_TAGS", (_ReparseStat.st_reparse_tag,))
+
+    def fake_lstat(path, *args, **kwargs):
+        if Path(path) != root:
+            return real_lstat(path, *args, **kwargs)
+        if observed == "missing":
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+        if observed == "junction":
+            return _IdentifiedReparseStat()
+        mode = stat.S_IFLNK | 0o777 if observed == "link" else stat.S_IFDIR | 0o700
+        ino = 0 if observed == "zero-inode" else 42
+        # os.stat_result field order: mode, ino, dev, nlink, uid, gid, size, atime, mtime, ctime
+        return os.stat_result((mode, ino, 7, 1, 0, 0, 0, 0, 0, 0))
+
+    monkeypatch.setattr(platform_util.os, "lstat", fake_lstat)
+
+    assert platform_util.stale_device_record(root, record) is stale
+
+
+@ANCHORED
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
+def test_append_line_confined_heals_an_unterminated_tail_then_appends(tmp_path, pinned):
+    """A torn record (no trailing newline) gets a newline before the next line,
+    so one fault costs one record; a terminated tail gets nothing extra. A
+    fresh file starts without a blank line.
+
+    Ablation: write `line` without consulting `tail_is_terminated_fd` and the
+    fragment and the record fuse on one line."""
+    root = tmp_path / "run"
+    root.mkdir()
+    identity = platform_util.pinned_root_identity(root) if pinned else None
+
+    platform_util.append_line_confined(root, "fresh.jsonl", b'{"a": 1}\n', root_identity=identity)
+    (root / "journal.jsonl").write_bytes(b'{"torn"')
+    platform_util.append_line_confined(root, "journal.jsonl", b'{"b": 2}\n', root_identity=identity)
+    platform_util.append_line_confined(root, "journal.jsonl", b'{"c": 3}\n', root_identity=identity)
+
+    assert (root / "fresh.jsonl").read_bytes() == b'{"a": 1}\n'
+    assert (root / "journal.jsonl").read_bytes() == b'{"torn"\n{"b": 2}\n{"c": 3}\n'
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_append_line_confined_pinned_refuses_a_swapped_root(tmp_path):
+    """The pinned arm forwards `root_identity` to `open_dir_confined`, so a run
+    dir swapped for a link after its identity was taken raises and nothing
+    lands outside.
+
+    Ablation: open the pinned arm's root without `root_identity` and this fails
+    `DID NOT RAISE`, with the line landing in `outside/`."""
+    root = tmp_path / "runs" / "r1"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+
+    _swap_root_for_link(root, outside, "logs")
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.append_line_confined(root, "journal.jsonl", b"{}\n", root_identity=identity)
+    assert sorted(p.name for p in outside.iterdir()) == ["logs"]
+
+
+@DIR_FD
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_append_line_confined_unpinned_refuses_a_link_at_the_root_but_follows_a_linked_parent(
+    tmp_path,
+):
+    """Unpinned, the run dir is the last component of a walk from its parent, so
+    it is opened `O_NOFOLLOW`: a link AT the run dir refuses. Its ancestors are
+    followed, as `open_dir_confined` follows the root it is given — the control
+    lands through a linked `runs/`.
+
+    Ablation: open the unpinned arm as `open_dir_confined(root, root)` and the
+    first half fails `DID NOT RAISE`, with the line landing in `outside/`."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    runs = tmp_path / "project" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "r1").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.append_line_confined(
+            runs / "r1", "journal.jsonl", b"{}\n", root_identity=None
+        )
+    assert list(outside.iterdir()) == []
+
+    real = tmp_path / "real-runs"
+    (real / "r2").mkdir(parents=True)
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    platform_util.append_line_confined(linked / "r2", "journal.jsonl", b"{}\n", root_identity=None)
+    assert (real / "r2" / "journal.jsonl").read_bytes() == b"{}\n"
+
+
+@ANCHORED
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
+def test_append_line_confined_missing_root_raises_and_creates_nothing(tmp_path, pinned):
+    """An append never mkdirs: a run dir deleted under its writer raises (the
+    composition unwind relies on that) and is not recreated.
+
+    Ablation: `root.mkdir(parents=True, exist_ok=True)` before the confined
+    open and this fails `DID NOT RAISE`."""
+    root = tmp_path / "runs" / "r1"
+    root.mkdir(parents=True)
+    identity = platform_util.pinned_root_identity(root) if pinned else None
+    root.rmdir()
+
+    with pytest.raises(platform_util.UnconfinedWriteError) as refused:
+        platform_util.append_line_confined(root, "journal.jsonl", b"{}\n", root_identity=identity)
+    assert str(root) in str(refused.value)  # the message, not an OSError filename slot
+    assert not root.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("swap", ["link", "directory"])
+def test_append_line_confined_fallback_refuses_a_swapped_pinned_root(tmp_path, monkeypatch, swap):
+    """No-handle fallback (`HANDLE_ANCHORED_WRITES` False): a root swapped for a
+    link refuses at the link test and the pin; a root swapped for another real
+    directory passes the link test, so the pin's `lstat` compare refuses it —
+    before the open, so nothing is created in the replacement.
+
+    Ablation: delete the first `require_root_pinned` in the fallback arm and
+    `directory` fails with an empty `journal.jsonl` created in the
+    replacement; delete it and the `is_link_like` test and `link` fails with
+    the line landing in `outside/`."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "runs" / "r1"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    identity = platform_util.pinned_root_identity(root)
+    assert identity is not None
+
+    if swap == "link":
+        _swap_root_for_link(root, outside, "logs")
+        replacement = outside
+    else:
+        root.rename(root.with_name("r1-aside"))
+        root.mkdir()
+        replacement = root
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        platform_util.append_line_confined(root, "journal.jsonl", b"{}\n", root_identity=identity)
+    assert not (replacement / "journal.jsonl").exists()
+
+    # Positive control: the same fallback appends through the unswapped root.
+    if swap == "link":
+        root.unlink()
+    else:
+        root.rmdir()
+    root.with_name("r1-aside").rename(root)
+    platform_util.append_line_confined(root, "journal.jsonl", b"{}\n", root_identity=identity)
+    assert (root / "journal.jsonl").read_bytes() == b"{}\n"
+
+
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
+def test_append_line_confined_fallback_appends_through_a_plain_root(tmp_path, monkeypatch, pinned):
+    """The fallback arm keeps the anchored arm's contract: the tail heal, an
+    append that keeps existing bytes, and no mkdir for a missing root."""
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+    root = tmp_path / "run"
+    root.mkdir()
+    identity = platform_util.pinned_root_identity(root) if pinned else None
+    (root / "journal.jsonl").write_bytes(b'{"torn"')
+
+    platform_util.append_line_confined(root, "journal.jsonl", b'{"b": 2}\n', root_identity=identity)
+    platform_util.append_line_confined(root, "journal.jsonl", b'{"c": 3}\n', root_identity=identity)
+    assert (root / "journal.jsonl").read_bytes() == b'{"torn"\n{"b": 2}\n{"c": 3}\n'
+
+    gone = tmp_path / "gone"
+    with pytest.raises(FileNotFoundError):
+        platform_util.append_line_confined(gone, "journal.jsonl", b"{}\n", root_identity=None)
+    assert not gone.exists()
+
+
 # ------------------------------------------------------- path_is_confined (#593)
 
 

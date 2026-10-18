@@ -233,9 +233,14 @@ if sys.platform == "win32":
     def _handle_of(fd: int) -> int:
         return msvcrt.get_osfhandle(fd)
 
-    def _wrap(handle: int, *, writable: bool) -> int:
-        """Hand a raw handle to the CRT; from here on ``os.close`` owns it."""
+    def _wrap(handle: int, *, writable: bool, append: bool = False) -> int:
+        """Hand a raw handle to the CRT; from here on ``os.close`` owns it.
+        ``append`` also sets the CRT's ``O_APPEND``, so every ``os.write`` seeks
+        to the end first even where the handle's append-only access is not
+        enforced (an emulator or a redirector)."""
         flags = os.O_BINARY | os.O_NOINHERIT | (os.O_RDWR if writable else os.O_RDONLY)
+        if append:
+            flags |= os.O_APPEND
         try:
             return msvcrt.open_osfhandle(handle, flags)
         except OSError:
@@ -349,10 +354,13 @@ if sys.platform == "win32":
         ``flags`` is the POSIX vocabulary: ``O_RDONLY``/``O_WRONLY``/``O_RDWR``,
         ``O_CREAT``, ``O_EXCL``, plus :data:`AT_NOFOLLOW`, :data:`AT_DIRECTORY`
         and :data:`AT_NONBLOCK` (accepted and ignored — nothing in an NTFS
-        namespace blocks an open the way a reader-less FIFO does). ``O_TRUNC``
-        and ``O_APPEND`` are refused: no anchored caller uses them, and a silent
-        approximation is worse than a loud gap. ``mode`` has no Windows meaning
-        and is accepted for signature parity.
+        namespace blocks an open the way a reader-less FIFO does). ``O_APPEND``
+        opens with ``FILE_APPEND_DATA`` and without ``FILE_WRITE_DATA``, so a
+        write to a local file cannot overwrite existing data whatever the
+        offset; it needs ``O_WRONLY`` or ``O_RDWR``. ``O_TRUNC`` is refused: no
+        anchored caller uses it, and a silent approximation is worse than a loud
+        gap. ``mode`` has no Windows meaning and is accepted for signature
+        parity.
 
         A read-only open of a directory succeeds, as it does on POSIX, so a
         caller's ``S_ISREG`` check sees the directory; a write open refuses one
@@ -360,9 +368,12 @@ if sys.platform == "win32":
         del mode
         _single_component(name)
         accmode = flags & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)
-        if flags & (os.O_TRUNC | os.O_APPEND):
-            raise ValueError("O_TRUNC/O_APPEND are not supported relative to a handle")
+        if flags & os.O_TRUNC:
+            raise ValueError("O_TRUNC is not supported relative to a handle")
         writable = accmode in (os.O_WRONLY, os.O_RDWR)
+        append = bool(flags & os.O_APPEND)
+        if append and not writable:
+            raise ValueError("O_APPEND needs O_WRONLY or O_RDWR")
         # FILE_READ_ATTRIBUTES on every open, as CreateFileW grants implicitly:
         # `_refuse_link`'s GetFileInformationByHandleEx needs it, and a write-only
         # open (FILE_GENERIC_WRITE carries only WRITE_ATTRIBUTES) is otherwise
@@ -370,7 +381,11 @@ if sys.platform == "win32":
         access = _FILE_READ_ATTRIBUTES
         if accmode in (os.O_RDONLY, os.O_RDWR):
             access |= _FILE_GENERIC_READ
-        if writable:
+        if append:
+            # Never FILE_WRITE_DATA here: without it a write to a local file
+            # cannot overwrite existing data (File Access Rights Constants).
+            access |= _FILE_APPEND_DATA
+        elif writable:
             access |= _FILE_GENERIC_WRITE
         if flags & os.O_CREAT:
             disposition = _FILE_CREATE if flags & os.O_EXCL else _FILE_OPEN_IF
@@ -389,7 +404,7 @@ if sys.platform == "win32":
         )
         if flags & AT_NOFOLLOW:
             _refuse_link(handle, name)
-        return _wrap(handle, writable=writable)
+        return _wrap(handle, writable=writable, append=append)
 
     def stat_at(dir_fd: int, name: str) -> os.stat_result:
         """``os.stat(name, dir_fd=dir_fd, follow_symlinks=False)``: the entry's
