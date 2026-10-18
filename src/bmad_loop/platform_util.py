@@ -1275,10 +1275,10 @@ def root_identity_record(root: Path) -> RootIdentityRecord | None:
     is taken is what every later write is held to.
 
     A zero-inode root (some win32 filesystems) records None, so every write
-    pinned to it refuses. For the mount writers and the dir-fd verify-stream arm
-    that is unchanged — a zero inode never matched — but the win32 verify-stream
-    arm, which used to write through such a run dir, now refuses it: a refusal,
-    not a degrade, journaled per stream as ``capture_error`` (DW-446, accepted
+    pinned to it refuses. For the mount writers that is unchanged — a zero inode
+    never matched — and the verify-stream write, which on win32 used to write
+    through such a run dir, now refuses it on every arm: a refusal, not a
+    degrade, journaled per stream as ``capture_error`` (DW-446, accepted
     2026-09-27). The run journal and ``state.json`` are the exception: with no
     record they write through the unpinned confined open and journal one
     ``journal-unpinned`` row. ``st_dev`` is not stable across a reboot or remount, so
@@ -1997,8 +1997,9 @@ def create_exclusive_confined(
 
 def _open_subdir_at(dir_fd: int, name: str, *, create: bool) -> int:
     """One directory component below ``dir_fd``, opened without following a
-    link — created first when ``create`` — for :func:`make_dirs_confined` and
-    :func:`unlink_confined`. The caller owns the returned descriptor.
+    link — created first when ``create`` — for :func:`make_dirs_confined`,
+    :func:`unlink_confined` and ``journal.Journal.write_verify_stream`` (which
+    relies on the refusal shape below). The caller owns the returned descriptor.
 
     The arms of ``verify._make_candidate_parents``: POSIX ``mkdir``-s at the
     descriptor (which never dereferences the final component) and then opens

@@ -305,6 +305,10 @@ breaking changes may land in a minor release.
   `FILE_APPEND_DATA` without `FILE_WRITE_DATA`. Reads and the other run-dir files
   (`engine.pid`, `ATTENTION`, heartbeats, adapter records, `logs/`) stay path-based
   (DW-559, DW-560).
+- Write verify-stream logs on Windows through the same handle-anchored, pinned run-dir
+  open as the journal: `verify/` is created and opened handle-relative with junctions
+  refused, replacing a path check-then-write. Windows stream files no longer translate
+  `\n` to `\r\n` (DW-563).
 
 ## [0.13.2] — 2026-10-09
 
