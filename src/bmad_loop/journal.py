@@ -17,6 +17,8 @@ from .platform_util import (
     AT_NOFOLLOW,
     DIR_FD_ANCHORED_WRITES,
     RootIdentityRecord,
+    UnconfinedWriteError,
+    append_line_confined,
     atomic_replace,
     atomic_write_text,
     atomic_write_text_at,
@@ -26,6 +28,7 @@ from .platform_util import (
     open_dir_confined,
     recorded_root_identity,
     require_root_pinned,
+    stale_device_record,
 )
 
 STATE_FILE = "state.json"
@@ -103,6 +106,19 @@ SELF_MINTED_FIELDS: frozenset[str] = frozenset({"log_task", "log_pos"})
 # ``test_journal_kind_inventory_is_complete``'s staleness arm.
 UNREADABLE_LINE_KIND = "journal-line-unreadable"
 
+# The one row :meth:`Journal.append` writes on its own behalf: written once per
+# ``Journal`` object, on the first append whose run dir cannot be pinned, so a
+# confined-but-unpinned write is visible rather than indistinguishable from a pinned
+# one. ``reason`` is ``"no-record"`` (the pinned ``RunState`` carries no
+# ``run_dir_identity`` — a pre-upgrade run never resumed, or a zero-inode filesystem)
+# or ``"stale-device"`` (the record misses the intact run dir only by a renumbered
+# ``st_dev``, the shape ``runs.reconcile_root_identities`` re-binds).
+#
+# A journal built with no ``pin`` at all stays silent: outside tests that shape is a
+# read-only one (the writers pass their ``RunState``), so a notice there would be
+# noise on every reader that happens to append nothing.
+UNPINNED_NOTICE_KIND = "journal-unpinned"
+
 
 def unreadable_line_entry(byte_len: int) -> dict[str, Any]:
     """One unreadable journal line, reported in the stream position it occupied.
@@ -133,9 +149,15 @@ _STATE_LOCK_LOCAL = threading.local()
 
 
 class Journal:
-    def __init__(self, run_dir: Path):
+    # Class-level defaults, not just ``__init__`` state: ``cli._ConfirmMarkLog`` skips
+    # ``super().__init__`` (it writes nothing), and these keep it a complete Journal.
+    pin: RunState | None = None
+    _unpinned_noticed: bool = False
+
+    def __init__(self, run_dir: Path, *, pin: RunState | None = None):
         self.run_dir = run_dir
         self.path = run_dir / JOURNAL_FILE
+        self.pin = pin
         self._log_task: str | None = None
         self._log_path: Path | None = None
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -148,43 +170,54 @@ class Journal:
         self._log_task = task_id
         self._log_path = self.run_dir / LOGS_DIR / f"{task_id}.log"
 
-    def _tail_is_terminated(self) -> bool:
-        """Whether the journal's last byte is a newline — an absent or zero-length
-        file counts as terminated (there is no fragment to close).
+    def _pin_identity(self) -> tuple[os.stat_result | None, str | None]:
+        """The run dir identity this append is pinned to, or ``None`` with the notice
+        reason an unpinned write records (``None`` reason: silent).
 
-        Read in ``"rb"`` and closed before the append opens the file, mirroring
-        ``install.py``'s read-then-write: ``"ab+"`` would put a read and a write on
-        one handle, which CPython only defines with an intervening seek/flush.
-
-        The two error directions are deliberately NOT the same, because their costs
-        are not symmetric. ``FileNotFoundError`` is the only one that justifies
-        ``True``: no file means no fragment, and healing it would put a leading blank
-        line in every fresh journal. Every OTHER ``OSError`` — a transient EACCES or
-        EMFILE, or the Windows sharing violation ``atomic_replace`` already retries
-        for — leaves a file that EXISTS and whose tail is unknown. Answering "already
-        terminated" there skips the heal, and if that tail is a fragment the next
-        append concatenates onto it: the exact two-record loss this method exists to
-        prevent, reintroduced on the unlucky path. Answering "unterminated" costs at
-        worst one blank line, which both readers skip. So the unknown case fails
-        toward the heal. Neither arm raises: a writer that is only trying to record
-        must not be taken down by a probe.
-        """
-        try:
-            with self.path.open("rb") as f:
-                f.seek(0, os.SEEK_END)
-                if f.tell() == 0:
-                    return True
-                f.seek(-1, os.SEEK_END)
-                return f.read(1) == b"\n"
-        except FileNotFoundError:
-            return True
-        except OSError:
-            return False
+        Read from ``self.pin`` on EVERY call, never cached: resume and re-arm backfill
+        ``run_dir_identity`` on the very ``RunState`` this journal was built with, and a
+        snapshot taken at construction would keep writing unpinned after the record
+        landed."""
+        if self.pin is None:
+            return None, None
+        record = self.pin.run_dir_identity
+        if record is None:
+            return None, "no-record"
+        return recorded_root_identity(record), None
 
     def append(self, kind: str, **fields: Any) -> None:
-        """Append one record, healing an unterminated tail first.
+        """Append one record as LF-terminated UTF-8 bytes, healing an unterminated
+        tail first.
 
-        The fault this closes (DW-97) costs TWO records, not one. This is the only
+        The write goes through :func:`~bmad_loop.platform_util.append_line_confined`:
+        the run dir is opened as a directory descriptor and ``journal.jsonl`` under it
+        with an append-only, link-refusing open, so a link AT the run dir or AT
+        ``journal.jsonl`` refuses rather than redirecting the record. Three arms, chosen
+        per call from the live ``pin`` (:meth:`_pin_identity`):
+
+        - **pinned** — the pin's ``run_dir_identity`` is recorded: the opened run dir
+          must be that directory. A refusal raises
+          :class:`~bmad_loop.platform_util.UnconfinedWriteError`, an ``OSError``, so
+          the DW-54 contract holds — an append that cannot land fails loud and is never
+          folded into a silent skip.
+        - **unpinned + notice** — ``pin`` carries no record: the run dir is still
+          opened ``O_NOFOLLOW`` as the last component of a walk from its parent (its
+          ancestors are followed), and the first such append on this object writes one
+          :data:`UNPINNED_NOTICE_KIND` row with ``reason="no-record"``. A journal with
+          no ``pin`` at all takes this arm silently.
+        - **stale-device + notice** — the pinned open refused, and the only mismatch is
+          a renumbered ``st_dev`` on the intact directory with the recorded nonzero
+          inode (:func:`~bmad_loop.platform_util.stale_device_record`): the write is
+          retried unpinned with a ``reason="stale-device"`` notice. That is exactly the
+          residual ``runs.reconcile_root_identities`` accepts when it re-binds, so it
+          widens nothing.
+
+        ``append`` never creates the run dir (only the constructor does). A run dir
+        deleted under a live journal raises instead of being resurrected —
+        ``runsetup._unwind_composition`` relies on that to leave a removed run dir
+        removed.
+
+        The fault the heal closes (DW-97) costs TWO records, not one. This is the only
         writer in this module without a durable path — ``save_state`` uses
         ``atomic_replace``, ``write_verify_stream`` uses ``atomic_write_text`` — so a
         partially flushed write leaves a fragment with no trailing newline. Without
@@ -193,7 +226,8 @@ class Journal:
         of them may be an ``unit-merged`` that
         ``engine._replay_unlatched_ledger_carries`` needs to avoid re-driving merged
         work. Prepending the newline keeps the damage to the one record that was
-        actually torn.
+        actually torn. The probe reads the append descriptor itself; an unknown tail
+        fails toward the heal (:func:`~bmad_loop.platform_util.tail_is_terminated_fd`).
 
         Not routed through ``atomic_write_text``/``atomic_replace``: those rewrite the
         whole target, and this journal is append-only and grows for a whole run, so an
@@ -202,24 +236,25 @@ class Journal:
         (``existing if not existing or existing.endswith(b"\\n") else existing + b"\\n"``)
         applied at O(1) cost.
 
-        Text mode stays, deliberately. Windows translates the ``"\\n"`` to ``"\\r\\n"``
-        on the way out, which both readers already tolerate (``splitlines`` +
-        ``strip``) and which leaves the file's LAST byte a newline either way, so the
-        probe above stays correct without a mode change no other line here needs.
+        Bytes, LF on every platform — no text-mode translation, so Windows no longer
+        writes ``\\r\\n``. Both readers accept either ending, which keeps a legacy CRLF
+        journal readable: ``entries`` splits with ``splitlines`` and strips each line,
+        and ``tui.data.JournalTail`` splits on ``\\n`` and strips.
 
-        The read-then-append window is racy, and the heal BOUNDS the loss rather than
-        eliminating it — do not read it as a guarantee. POSIX ``O_APPEND`` (and
-        Windows' append mode) places every write at the current end, so a rival
-        appender cannot interleave INTO this record; but it can tear its own write
-        inside the window, after the probe has already answered "terminated". That
-        leaves a fresh fragment this append then concatenates onto, and the two-record
-        loss recurs for that one pair. A rival that completes its line in the window
-        is harmless: the tail stays terminated and the prepended newline, if any, is a
-        blank line both readers skip. Closing the race needs a lock, which is
-        deliberately out of scope here (as is fsync): this defect is the SEQUENTIAL
-        concatenation — one writer's own torn record absorbing its own next one —
-        which the probe closes completely.
+        The probe-then-append window is racy, and the heal BOUNDS the loss rather than
+        eliminating it — do not read it as a guarantee. POSIX ``O_APPEND`` (and, on
+        Windows, a handle holding ``FILE_APPEND_DATA`` without ``FILE_WRITE_DATA``)
+        places every write at the current end, so a rival appender cannot interleave
+        INTO this record; but it can tear its own write inside the window, after the
+        probe has already answered "terminated". That leaves a fresh fragment this
+        append then concatenates onto, and the two-record loss recurs for that one
+        pair. A rival that completes its line in the window is harmless: the tail stays
+        terminated and the prepended newline, if any, is a blank line both readers
+        skip. Closing the race needs a lock, which is deliberately out of scope here
+        (as is fsync): this defect is the SEQUENTIAL concatenation — one writer's own
+        torn record absorbing its own next one — which the probe closes completely.
         """
+        identity, reason = self._pin_identity()
         entry = {"ts": time.time(), "kind": kind, **fields}
         if self._log_path is not None:
             try:
@@ -228,11 +263,36 @@ class Journal:
                 size = 0  # pipe-pane has not created the file yet
             entry.setdefault("log_task", self._log_task)
             entry.setdefault("log_pos", size)
-        text = json.dumps(entry, default=str) + "\n"
-        if not self._tail_is_terminated():
-            text = "\n" + text
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(text)
+        line = (json.dumps(entry, default=str) + "\n").encode("utf-8")
+        self._write(line, identity, reason)
+
+    def _write(self, line: bytes, identity: os.stat_result | None, reason: str | None) -> None:
+        """:meth:`append`'s three arms: unpinned (with the notice ``reason`` owes),
+        pinned, and pinned-refused-on-a-stale-device retried unpinned."""
+        if identity is None:
+            self._notice_once(reason)
+            append_line_confined(self.run_dir, JOURNAL_FILE, line, root_identity=None)
+            return
+        try:
+            append_line_confined(self.run_dir, JOURNAL_FILE, line, root_identity=identity)
+        except UnconfinedWriteError:
+            record = self.pin.run_dir_identity if self.pin is not None else None
+            if not stale_device_record(self.run_dir, record):
+                raise
+            self._notice_once("stale-device")
+            append_line_confined(self.run_dir, JOURNAL_FILE, line, root_identity=None)
+
+    def _notice_once(self, reason: str | None) -> None:
+        """Write the :data:`UNPINNED_NOTICE_KIND` row, once per object.
+
+        The flag is set BEFORE the write, which is what bounds the recursion: the notice
+        goes through the public :meth:`append` — so a subclass that classifies its rows
+        (``runs._RearmJournal``) sees it exactly once, and so the kind-inventory scan
+        reads it at an ``.append(`` receiver — and that append re-enters here."""
+        if reason is None or self._unpinned_noticed:
+            return
+        self._unpinned_noticed = True
+        self.append(UNPINNED_NOTICE_KIND, reason=reason)
 
     def write_verify_stream(
         self, name: str, content: str, *, run_dir_identity: RootIdentityRecord | None

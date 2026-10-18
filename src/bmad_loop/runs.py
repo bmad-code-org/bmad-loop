@@ -6089,8 +6089,8 @@ class RearmOutcome:
 class _RearmJournal(Journal):
     """Journal writer that captures successful re-arm notices at append time."""
 
-    def __init__(self, run_dir: Path):
-        super().__init__(run_dir)
+    def __init__(self, run_dir: Path, *, pin: RunState | None = None):
+        super().__init__(run_dir, pin=pin)
         self.notices: list[RearmNotice] = []
         self.hold_resume = False
         self.hold_next_step = ""

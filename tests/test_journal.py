@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import sys
 import threading
 from contextlib import contextmanager
-from pathlib import Path
 
 import pytest
 
@@ -706,40 +706,38 @@ def test_one_partial_flush_costs_one_record_not_two(tmp_path):
     assert entries[1]["unit"] == "u1"
 
 
-def test_append_heals_when_the_probe_cannot_open_an_existing_journal(tmp_path, monkeypatch):
-    """An unknown tail fails TOWARD the heal. The probe's `open` can fail on a file
-    that exists — a transient EACCES/EMFILE, or the Windows sharing violation
-    `atomic_replace` already retries for — and answering "already terminated" there
-    would skip the heal over a real fragment and reproduce the two-record loss on
-    exactly the unlucky path this change exists to close. Costs at worst one blank
-    line, which both readers skip.
+def test_append_heals_when_the_tail_probe_fails(tmp_path, monkeypatch):
+    """An unknown tail fails TOWARD the heal. The probe's seek can fail on a file
+    that exists — a transient EIO, a sharing violation, an emulator that refuses the
+    seek — and answering "already terminated" there would skip the heal over a real
+    fragment and reproduce the two-record loss on exactly the unlucky path this heal
+    exists to close. Costs at worst one blank line, which both readers skip.
 
-    Only `FileNotFoundError` may answer True, and its own test above
+    The empty-file arm answers True from ``fstat`` alone, and its own test above
     (`test_append_to_an_absent_or_empty_journal_writes_no_leading_newline`) is what
     keeps that arm honest — otherwise every fresh journal would open with a blank
     line.
 
-    Ablation: widen the arm back to `except OSError: return True` and this reddens —
-    `unit-merged` is swallowed by the fragment (verified)."""
+    Ablation: answer `True` from `tail_is_terminated_fd`'s `except OSError` and this
+    reddens — `unit-merged` is swallowed by the fragment."""
     _journal_path(tmp_path).write_text('{"ts": 1, "kind": "unit-merge-star', encoding="utf-8")
     journal = Journal(tmp_path)
 
-    real_open = Path.open
-    seen: list[str] = []
+    real_lseek = platform_util.os.lseek
+    seen: list[int] = []
 
-    def deny_the_probe(self, mode="r", *args, **kwargs):
-        # Fail ONLY the "rb" probe read; the append's own "a" open must proceed, or
-        # the test would prove nothing about which direction the probe answered.
-        if mode == "rb" and self == journal.path:
-            seen.append(mode)
+    def deny_the_probe(fd, pos, how):
+        # Fail ONLY the first seek (the tail probe's); the write itself never seeks.
+        if not seen:
+            seen.append(fd)
             raise PermissionError(13, "denied")
-        return real_open(self, mode, *args, **kwargs)
+        return real_lseek(fd, pos, how)
 
-    monkeypatch.setattr(Path, "open", deny_the_probe)
+    monkeypatch.setattr(platform_util.os, "lseek", deny_the_probe)
     journal.append("unit-merged", unit="u1")
     monkeypatch.undo()
 
-    assert seen == ["rb"], "the probe never ran; the test would be vacuous"
+    assert seen, "the probe never ran; the test would be vacuous"
     lines = _journal_path(tmp_path).read_text(encoding="utf-8").splitlines()
     assert lines[0] == '{"ts": 1, "kind": "unit-merge-star'
     assert json.loads(lines[1])["kind"] == "unit-merged"
@@ -812,6 +810,230 @@ def test_rearm_journal_subclass_inherits_the_heal(tmp_path):
         journal_mod.UNREADABLE_LINE_KIND,
         "rearm-ok",
     ]
+
+
+# ------------------------------------------- append confinement and the pin
+
+
+def _state(record=None):
+    return RunState(
+        run_id="r1", project="p", started_at="2026-10-17T00:00:00", run_dir_identity=record
+    )
+
+
+def _kinds(run_dir):
+    return [e["kind"] for e in Journal(run_dir).entries()]
+
+
+def test_append_bare_journal_writes_no_notice(tmp_path):
+    """A journal built with no `pin` takes the unpinned arm silently: the shape is
+    read-only or test-only outside the writers, so a notice there would be noise."""
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    journal.append("session-start", task_id="t0")
+
+    assert _kinds(tmp_path) == ["run-start", "session-start"]
+
+
+def test_append_pinned_without_a_record_writes_one_notice_before_the_first_row(tmp_path):
+    """A pinned state with no `run_dir_identity` (a pre-upgrade run never resumed, a
+    zero-inode filesystem) still writes, confined but unpinned, and says so once —
+    BEFORE the row that needed it. The notice carries only `reason` plus the
+    self-minted fields, `log_*` among them only while a log is active."""
+    Journal(tmp_path, pin=_state()).append("run-start")
+    logged = Journal(tmp_path, pin=_state())
+    logged.set_active_log("t0")
+    logged.append("session-start", task_id="t0")
+
+    entries = Journal(tmp_path).entries()
+    assert [e["kind"] for e in entries] == [
+        journal_mod.UNPINNED_NOTICE_KIND,
+        "run-start",
+        journal_mod.UNPINNED_NOTICE_KIND,
+        "session-start",
+    ]
+    assert entries[0]["reason"] == "no-record"
+    assert set(entries[0]) == {"ts", "kind", "reason"}
+    assert set(entries[2]) == {"ts", "kind", "reason", "log_task", "log_pos"}
+
+
+def test_append_notice_is_once_per_journal_object(tmp_path):
+    """One notice per writer object, not per row: three appends through one object
+    write one; a second object writes its own.
+
+    Ablation: drop `self._unpinned_noticed = True` from `_notice_once` and this
+    reddens (the notice recurses into itself until RecursionError)."""
+    state = _state()
+    journal = Journal(tmp_path, pin=state)
+    for kind in ("a", "b", "c"):
+        journal.append(kind)
+    assert _kinds(tmp_path) == [journal_mod.UNPINNED_NOTICE_KIND, "a", "b", "c"]
+
+    Journal(tmp_path, pin=state).append("d")
+    assert _kinds(tmp_path).count(journal_mod.UNPINNED_NOTICE_KIND) == 2
+
+
+def test_append_pinned_with_a_record_writes_no_notice(tmp_path):
+    journal = Journal(tmp_path, pin=_state(_minted(tmp_path)))
+    journal.append("run-start")
+    journal.append("run-complete")
+
+    assert _kinds(tmp_path) == ["run-start", "run-complete"]
+
+
+def test_append_reads_the_pin_live(tmp_path):
+    """The record is read from the shared `RunState` on every append, never
+    snapshotted at construction: resume and re-arm backfill it after the journal is
+    built. A record that lands later pins the next append — proven by a record for a
+    different inode then refusing."""
+    state = _state()
+    journal = Journal(tmp_path, pin=state)
+    journal.append("run-resume")
+
+    state.run_dir_identity = _minted(tmp_path)
+    journal.append("root-identity-recorded")
+    assert _kinds(tmp_path) == [
+        journal_mod.UNPINNED_NOTICE_KIND,
+        "run-resume",
+        "root-identity-recorded",
+    ]
+
+    dev, ino = _minted(tmp_path)
+    state.run_dir_identity = (dev, ino + 1)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        journal.append("session-start")
+    assert "session-start" not in _kinds(tmp_path)
+
+
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="handle-anchored writes")
+@pytest.mark.parametrize("swap", ["link", "directory"])
+def test_append_pinned_refuses_a_run_dir_swapped_after_the_pin(tmp_path, monkeypatch, swap):
+    """A run dir replaced after its identity was recorded, but before the root open,
+    is refused with the typed error and nothing lands in the replacement — neither
+    swap is a renumbered device, so there is no degrade. The `link` case is refused
+    by the `O_NOFOLLOW` open on either arm; the `directory` case only by the pin.
+
+    Ablation: pass `root_identity=None` on `_write`'s pinned call and the `directory`
+    case fails `DID NOT RAISE`, with the row written into the replacement dir."""
+    if swap == "link" and sys.platform == "win32":
+        pytest.skip("POSIX symlinks")
+    run_dir, elsewhere = tmp_path / "run", tmp_path / "elsewhere"
+    run_dir.mkdir()
+    elsewhere.mkdir()
+    journal = Journal(run_dir, pin=_state(_minted(run_dir)))
+    opener = platform_util.open_dir_confined
+
+    def swap_then_open(root, target, **kwargs):
+        if not (tmp_path / "run-aside").exists():
+            run_dir.rename(tmp_path / "run-aside")
+            if swap == "link":
+                run_dir.symlink_to(elsewhere, target_is_directory=True)
+            else:
+                run_dir.mkdir()
+        return opener(root, target, **kwargs)
+
+    monkeypatch.setattr(platform_util, "open_dir_confined", swap_then_open)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        journal.append("unit-merged", unit="u1")
+
+    assert list(elsewhere.iterdir()) == []
+    assert list(run_dir.iterdir()) == []
+    assert list((tmp_path / "run-aside").iterdir()) == []
+
+
+def test_append_stale_device_degrades_with_a_notice(tmp_path):
+    """A record that misses the intact run dir ONLY by `st_dev` (a reboot renumbered
+    the device) degrades to the unpinned write plus a `stale-device` notice rather
+    than refusing — the residual `reconcile_root_identities` already accepts."""
+    dev, ino = _minted(tmp_path)
+    journal = Journal(tmp_path, pin=_state((dev + 1, ino)))
+    journal.append("stop-requested")
+    journal.append("run-stopped")
+
+    entries = Journal(tmp_path).entries()
+    assert [e["kind"] for e in entries] == [
+        journal_mod.UNPINNED_NOTICE_KIND,
+        "stop-requested",
+        "run-stopped",
+    ]
+    assert entries[0]["reason"] == "stale-device"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="handle-anchored writes")
+def test_append_refuses_a_linked_run_dir_even_unpinned(tmp_path):
+    """Unpinned still means confined: the run dir is opened `O_NOFOLLOW` as the last
+    component of the walk, so a link AT the run dir refuses."""
+    run_dir, elsewhere = tmp_path / "run", tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    run_dir.symlink_to(elsewhere, target_is_directory=True)
+    journal = Journal(run_dir)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        journal.append("run-start")
+    assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_append_unpinned_follows_a_linked_parent(tmp_path):
+    """The control for the refusal above: a link ABOVE the run dir is followed on the
+    unpinned arm — only the run dir itself is opened `O_NOFOLLOW`."""
+    real_parent = tmp_path / "real"
+    (real_parent / "run").mkdir(parents=True)
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    Journal(linked_parent / "run").append("run-start")
+
+    assert _kinds(real_parent / "run") == ["run-start"]
+
+
+def test_append_on_a_deleted_run_dir_raises_without_recreating_it(tmp_path):
+    """`append` never mkdirs: a run dir removed under a live journal raises rather
+    than being resurrected, which `runsetup._unwind_composition` relies on.
+
+    Ablation: add `self.run_dir.mkdir(parents=True, exist_ok=True)` at the top of
+    `append` and this fails `DID NOT RAISE`."""
+    run_dir = tmp_path / "run"
+    journal = Journal(run_dir)
+    shutil.rmtree(run_dir)
+
+    with pytest.raises(OSError):
+        journal.append("composition-unwind-failed")
+    assert not run_dir.exists()
+
+
+def test_append_writes_lf_only_on_every_platform(tmp_path):
+    """Bytes, not text mode: no `\\r` on Windows either."""
+    journal = Journal(tmp_path)
+    journal.append("run-start")
+    journal.append("run-complete")
+
+    raw = _journal_path(tmp_path).read_bytes()
+    assert b"\r" not in raw
+    assert raw.endswith(b"}\n")
+
+
+def test_two_journal_objects_interleave_whole_records(tmp_path):
+    """Two writers on one run dir (the engine and an out-of-band `stop`) alternate
+    whole records: every line parses and every record is kept."""
+    first, second = Journal(tmp_path), Journal(tmp_path)
+    for i in range(10):
+        (first if i % 2 == 0 else second).append("tick", i=i)
+
+    lines = _journal_path(tmp_path).read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["i"] for line in lines] == list(range(10))
+
+
+def test_rearm_journal_classifies_the_unpinned_notice_once(tmp_path):
+    """The notice goes through the PUBLIC `append`, so `_RearmJournal` sees it like
+    any other row — and its classifiers render nothing for it and hold nothing."""
+    journal = runs._RearmJournal(tmp_path, pin=_state())
+    journal.append("rearm-ok", story_key="1-1")
+
+    assert journal.notices == []
+    assert journal.hold_resume is False
+    assert _kinds(tmp_path) == [journal_mod.UNPINNED_NOTICE_KIND, "rearm-ok"]
 
 
 # ------------------------------------------- entries() unreadable-line marker

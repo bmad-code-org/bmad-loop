@@ -25859,24 +25859,38 @@ def test_bundle_artifact_only_receipt_leaves_the_review_ledger_gate_intact(proje
 
 
 def _redirect_the_run_dir(project, tmp_path):
-    """Plant a link at the run directory `make_sweep` will use, pointing OUT of the
-    project, and hand back where it points.
+    """Plant a link at the `runs/` directory above the run dir `make_sweep` will use,
+    pointing OUT of the project, and hand back where the run dir lands through it.
 
-    The link goes at the run dir rather than at `.bmad-loop/` deliberately: the
-    engine writes its journal and state into this same directory through the
-    ordinary (unconfined) writers, and those must keep working so the run reaches
-    the site under test at all. Only the confined writes walk the components from
-    the project root, so only they refuse — which makes the refusal attributable
-    to the site under test rather than to a broken run. Since DW-269 the triage
-    cache write-back is one of them: through this link it refuses and DEGRADES
-    (`sweep-triage-cache-write-failed`), so a decisions-phase row driven through
-    here also carries that row, and the run still reaches the phase."""
-    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
-    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    The link goes one level ABOVE the run dir deliberately: the engine's journal
+    opens the run dir itself as the last component of its walk and refuses a link
+    there, but follows the run dir's ancestors, so it keeps writing and the run
+    reaches the site under test at all. The confined writes walk every component
+    from the project root, so they refuse the link at `runs/` — which makes the
+    refusal attributable to the site under test rather than to a broken run. Since
+    DW-269 the triage cache write-back is one of them: through this link it refuses
+    and DEGRADES (`sweep-triage-cache-write-failed`), so a decisions-phase row driven
+    through here also carries that row, and the run still reaches the phase."""
+    runs_dir = project.project / ".bmad-loop" / "runs"
+    runs_dir.parent.mkdir(parents=True, exist_ok=True)
+    if runs_dir.is_dir():
+        runs_dir.rmdir()
     outside = tmp_path / "outside"
     outside.mkdir()
-    run_dir.symlink_to(outside, target_is_directory=True)
-    return outside
+    runs_dir.symlink_to(outside, target_is_directory=True)
+    return outside / "sweep-run"
+
+
+def _redirect_the_runs_parent(run_dir, tmp_path):
+    """Move the `runs/` directory holding a live `run_dir` out of the project and
+    link it back, handing back where `run_dir` now really lives. The run dir keeps
+    its own inode, so the engine's journal (which follows the run dir's ancestors)
+    keeps writing; the confined writes, walking from the project root, refuse."""
+    runs_dir = run_dir.parent
+    outside = tmp_path / "outside"
+    runs_dir.rename(outside)
+    runs_dir.symlink_to(outside, target_is_directory=True)
+    return outside / run_dir.name
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -25969,16 +25983,13 @@ def test_the_migration_result_write_refuses_a_redirected_run_dir(project, tmp_pa
     ]
     expected_result = migrate_result(mapping)
     consumed: list[list[dict]] = []
-    parked = tmp_path / "run-before-redirect"
-    outside = tmp_path / "outside"
+    parked = tmp_path / "outside" / "sweep-run"
 
     def migrate_then_redirect(spec):
         manifest_path = Path(spec.prompt.split("--migrate ", 1)[1].split()[0])
         consumed.append(json.loads(manifest_path.read_text(encoding="utf-8")))
         project.deferred_work.write_text(migrated_ledger(), encoding="utf-8")
-        engine.run_dir.rename(parked)
-        outside.mkdir()
-        engine.run_dir.symlink_to(outside, target_is_directory=True)
+        assert _redirect_the_runs_parent(engine.run_dir, tmp_path) == parked
         return SessionResult(status="completed", result_json=expected_result)
 
     engine, adapter = make_sweep(project, [migrate_then_redirect])
@@ -25993,8 +26004,8 @@ def test_the_migration_result_write_refuses_a_redirected_run_dir(project, tmp_pa
     summary = engine.run()
 
     assert summary.crashed and not summary.paused
-    assert not (outside / "migrate-rewrite.md").exists()
-    assert list(outside.glob("migrate-rewrite*")) == []  # no staged temp either
+    assert not (parked / "migrate-rewrite.md").exists()
+    assert list(parked.glob("migrate-rewrite*")) == []  # no staged temp either
     assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
     assert consumed == [manifest]  # PRECONDITION: the session consumed the manifest
     assert len(adapter.sessions) == 1
@@ -26047,13 +26058,8 @@ def test_fallback_migration_record_read_refuses_a_redirected_parent(project, tmp
     head = git(project.project, "rev-parse", "HEAD")
     live = project.deferred_work.read_bytes()
     resumed, adapter = resume_sweep(project, engine, [])
-    parked = tmp_path / "parked-run"
-    engine.run_dir.rename(parked)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    external_record = outside / "migrate-baseline.md"
+    external_record = _redirect_the_runs_parent(engine.run_dir, tmp_path) / "migrate-baseline.md"
     external_record.write_text(LEGACY_LEDGER, encoding="utf-8")
-    engine.run_dir.symlink_to(outside, target_is_directory=True)
     reached = []
     monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
     monkeypatch.setattr(

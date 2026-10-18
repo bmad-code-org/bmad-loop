@@ -1283,9 +1283,9 @@ def _unwind_composition(
         # leaves one behind — the guard refusing, or a failed `rmtree` — which is
         # also the only case where a ghost run is what the operator will find. When
         # `_discard_state_dir` is instead what failed the dir is already gone, and
-        # `Journal.append` opens with "a" WITHOUT a mkdir, so it raises rather than
-        # resurrecting the run it just removed. Suppressed, and the stderr line
-        # above still carries the report.
+        # `Journal.append` opens the run dir confined, without a mkdir, so it raises
+        # OSError rather than resurrecting the run it just removed. Suppressed, and the
+        # stderr line above still carries the report.
         #
         # ``journal`` is None when the composer aborted between claiming the run dir
         # and building the Journal — a window only a signal can realistically land

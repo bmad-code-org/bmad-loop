@@ -140,7 +140,11 @@ breaking changes may land in a minor release.
   `resolve --reverify`, `validate`, `--dry-run`) no longer checks the review CLI's skill
   tree unless an active plugin binds an enabled `role = "review"` workflow (DW-380).
 - Add a handle-anchored, link-refusing append primitive on both the POSIX dir-fd arm and
-  the Windows handle arm (`FILE_APPEND_DATA` without `FILE_WRITE_DATA`).
+  the Windows handle arm (`FILE_APPEND_DATA` without `FILE_WRITE_DATA`). Journal appends
+  go through a confined run-dir descriptor (link at the run dir or at `journal.jsonl`
+  refused), write LF-terminated UTF-8 bytes on every platform, and record
+  `journal-unpinned` once per writer when the run has no recorded identity or a
+  renumbered device.
 
 ### Removed
 

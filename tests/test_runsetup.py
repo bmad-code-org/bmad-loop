@@ -2127,8 +2127,8 @@ def test_a_failed_unwind_still_reports_when_the_run_dir_is_already_gone(
     dir and THEN raises (`_discard_state_dir` is the real site — it runs after the
     `rmtree`).
 
-    `Journal.append` opens with "a" and does not mkdir, so appending here raises
-    `FileNotFoundError`. Unsuppressed that would propagate out of the unwind and
+    `Journal.append` opens the run dir confined, without a mkdir, so appending here
+    raises OSError. Unsuppressed that would propagate out of the unwind and
     replace the launch error — the one outcome this whole arm forbids — so the
     suppression around the journal write is load-bearing and gets its own test.
     The stderr report must still land, since it is now the only channel left."""
