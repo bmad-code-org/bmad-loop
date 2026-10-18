@@ -2684,3 +2684,67 @@ def test_project_v7_template_is_clean_and_ignores_user_toml(project_v7):
         assert (root / installed).read_bytes() == (conftest.V7_FIXTURE / vendored).read_bytes()
     assert project_v7.tickets_script == root / conftest.V7_TICKETS_REL
     assert ".bmad-loop/runs/" in (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+
+
+def _module_level_mux_binders(src: Path) -> set[str]:
+    """Dotted names of `src/bmad_loop` modules whose import-time code (module
+    body, including top-level `if`/`try` blocks, never a function or class body)
+    binds `get_multiplexer` from the multiplexer module."""
+    found: set[str] = set()
+
+    def binds(stmts: list[ast.stmt]) -> bool:
+        for node in stmts:
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("multiplexer"):
+                if any(alias.name == "get_multiplexer" for alias in node.names):
+                    return True
+            elif isinstance(node, ast.With):
+                if binds(node.body):
+                    return True
+            elif isinstance(node, ast.If | ast.Try | ast.TryStar):
+                handlers = [] if isinstance(node, ast.If) else [h.body for h in node.handlers]
+                tail = [] if isinstance(node, ast.If) else [node.finalbody]
+                if any(binds(b) for b in (node.body, node.orelse, *handlers, *tail)):
+                    return True
+        return False
+
+    for path in sorted(src.rglob("*.py")):
+        if binds(ast.parse(path.read_text(encoding="utf-8")).body):
+            rel = path.relative_to(src.parent).with_suffix("")
+            found.add(".".join(rel.parts).removesuffix(".__init__"))
+    return found
+
+
+def test_conftest_preloads_every_module_level_mux_binder():
+    """DW-566: a module that binds `get_multiplexer` at import keeps whatever the
+    name held then, and a test patching `multiplexer.get_multiplexer` restores
+    only that module. So each such module must be imported by conftest, before
+    any patch can stand, or the first test on a worker to import it leaks its
+    stand-in into every later one. The load check runs in a fresh interpreter
+    that imports conftest alone: in this process collection has already imported
+    the binders through the test modules, which would mask a missing loop.
+    Ablation: drop `bmad_loop.tui.launch` from `_MUX_BINDING_MODULES` and the set
+    comparison fails; replace the import loop with `pass` and the load check fails."""
+    tests_dir = Path(__file__).resolve().parent
+    src = tests_dir.parent / "src" / "bmad_loop"
+    assert set(conftest._MUX_BINDING_MODULES) == _module_level_mux_binders(src)
+
+    probe = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(tests_dir)!r})\n"
+        "import conftest\n"
+        "from bmad_loop.adapters import multiplexer as mux_mod\n"
+        "for name in conftest._MUX_BINDING_MODULES:\n"
+        "    mod = sys.modules.get(name)\n"
+        "    if mod is None:\n"
+        "        # only the `tui` extra may be absent\n"
+        "        ok = name == 'bmad_loop.tui.app' and 'textual' not in sys.modules\n"
+        "    else:\n"
+        "        ok = mod.get_multiplexer is mux_mod.get_multiplexer\n"
+        "    if not ok:\n"
+        "        print(name)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", f"not bound to the real get_multiplexer after conftest: {proc.stdout}"
