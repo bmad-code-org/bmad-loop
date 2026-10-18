@@ -4513,6 +4513,8 @@ def test_bundle_ledger_close_reopened_when_review_disabled_defers_at_gate(projec
     assert "change for dw-fix" not in (project.project / "src.txt").read_text()
     assert deferredwork.open_ids(project.deferred_work.read_text(encoding="utf-8")) == {"DW-1"}
     assert "sweep-bundle-reopened" in kinds
+    # no store repository (v6): the deferred-bundle store publisher stays silent (DW-567)
+    assert "store-committed" not in kinds and "sweep-ledger-commit-withheld" not in kinds
 
 
 def test_bundle_pre_gate_state_sync_is_a_noop(project):
@@ -37915,17 +37917,20 @@ def _v7_plan(paths: ProjectPaths, name: str) -> Path:
     return paths.implementation_artifacts / f"plan-dw-{name}.md"
 
 
-def _v7_bundle_dev_effect(paths: ProjectPaths, name: str, dw_ids, *, followup_review: bool):
+def _v7_bundle_dev_effect(
+    paths: ProjectPaths, name: str, dw_ids, *, followup_review: bool, deferred=None
+):
     """A v7 build-auto bundle session: it edits code and finishes its plan at
     `built`, never `done` (the orchestrator owns `done`, and a bundle never gets
-    it). It leaves the ledger alone."""
+    it). It leaves the ledger alone; ``deferred`` lists the plan's `deferred:`
+    findings, which the orchestrator harvests into the ledger."""
 
     def effect(spec):
         baseline = rev_parse_head(paths.project)
         source = paths.project / "src.txt"
         source.write_text(source.read_text(encoding="utf-8") + f"change for dw-{name}\n", "utf-8")
         plan = _v7_plan(paths, name)
-        write_spec(plan, "built", baseline)
+        write_spec(plan, "built", baseline, deferred=deferred)
         return SessionResult(
             status="completed",
             result_json={
@@ -38356,8 +38361,9 @@ def test_v7_sweep_bundle_close_store_commit_failure_is_best_effort(
     close stays uncommitted in the store.
 
     ABLATIONS (performed): drop the `except ticketstore.StoreCommitError` clause
-    in `_publish_bundle_close` and `git` fails (the run crashes); drop its
-    `if result.foreign:` arm and `foreign` fails (no foreign-dirt row)."""
+    in `_commit_store_ledger` (the tail `_publish_bundle_close` shares) and `git`
+    fails (the run crashes); drop its `if result.foreign:` arm and `foreign`
+    fails (no foreign-dirt row)."""
     if fault == "git":
         real = ticketstore.StoreCommitter.commit
 
@@ -38382,6 +38388,342 @@ def test_v7_sweep_bundle_close_store_commit_failure_is_best_effort(
     closes = _store_closes(store, ledger_rel)
     assert not [b for b in closes if f"Bmad-Code-Commit: {task.commit_sha}" in b], closes
     assert git(store, "status", "--porcelain", "--", ledger_rel) != ""  # still unpublished
+
+
+_V7_LEDGER_DEFERRED = "chore(sweep): record a deferred bundle's ledger writes"
+
+
+def _v7_store_deferred_sweep(
+    v7,
+    layout,
+    marker: Path,
+    *,
+    arm_doubt: bool = False,
+    stage_foreign_ledger: bool = False,
+    rollback: bool = True,
+):
+    """A v7 sweep over a store with its own repository (``layout`` T3/T4) whose
+    ledger, `{DW-1: open}`, is committed in that store: triage bundles DW-1
+    (`fix-things`), its dev session is accepted (the close is written, and the
+    plan's `deferred:` finding is harvested into the ledger as DW-2), and the
+    post-accept verify gate (``passes_once(marker)``) fails, so the bundle defers
+    IN PLACE with one dev attempt. The defer's reopen restores DW-1's bytes
+    exactly, so the harvested DW-2 is the ledger delta left for the store.
+    ``arm_doubt`` / ``stage_foreign_ledger`` act from inside the dev session as in
+    :func:`_v7_store_ledger_sweep`; ``rollback=False`` turns
+    ``scm.rollback_on_failure`` off, so the defer pauses before its reset.
+    Returns the engine, its paths, the store and the ledger's store-relative
+    path."""
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    ledger_rel = paths.deferred_work.resolve().relative_to(store.resolve()).as_posix()
+    assert git(store, "ls-files", "--", ledger_rel).strip() == ledger_rel  # premise
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == layout
+    triage = triage_result(
+        ["DW-1"], bundles=[{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "fix it"}]
+    )
+    dev = _v7_bundle_dev_effect(
+        paths, "fix-things", ["DW-1"], followup_review=False, deferred=[SWEEP_FINDING]
+    )
+    holder: list[SweepEngine] = []
+
+    def dev_effect(spec):
+        if arm_doubt:
+            holder[0]._record_ledger_doubt()
+        if stage_foreign_ledger:
+            ledger = paths.deferred_work
+            original = ledger.read_bytes()
+            ledger.write_bytes(original + b"\nhand-edited\n")
+            git(store, "add", "--", ledger_rel)
+            ledger.write_bytes(original)
+        return dev(spec)
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=rollback),
+        verify=VerifyPolicy(commands=(passes_once(marker),)),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine, _ = make_sweep(
+        paths,
+        [triage_effect(triage), dev_effect],
+        policy=policy,
+        store_topology=topology.to_dict(),
+    )
+    holder.append(engine)
+    return engine, paths, store, ledger_rel
+
+
+def _store_deferred_commits(store: Path) -> list[str]:
+    """The shas of the store's deferred-bundle ledger commits, newest first."""
+    log = [line.split(" ", 1) for line in git(store, "log", "--format=%H %s").splitlines()]
+    return [sha for sha, subject in log if subject == _V7_LEDGER_DEFERRED]
+
+
+def _assert_deferred_in_place(engine, paths) -> None:
+    """Premise of the deferred-bundle rows: the bundle's close was written after
+    an accepted dev session that harvested DW-2, then the bundle deferred in
+    place and reopened its close, keeping the harvest."""
+    task = engine.state.tasks["dw-fix-things"]
+    assert task.phase == Phase.DEFERRED and not task.worktree_path
+    assert task.bundle_closes_intended == ["DW-1"]
+    assert [r["dw_ids"] for r in _records(engine, "sweep-bundle-closed")] == [["DW-1"]]
+    assert [r["dw_ids"] for r in _records(engine, "sweep-bundle-reopened")] == [["DW-1"]]
+    entries = ledger_entries(paths)
+    assert entries["DW-1"].open and entries["DW-2"].open
+    assert entries["DW-2"].title == SWEEP_FINDING["summary"]
+
+
+@pytest.mark.parametrize(
+    ("fixture", "layout"),
+    [("project_v7_store_repo", "T3"), ("project_v7_external_store", "T4")],
+)
+def test_v7_deferred_bundle_ledger_writes_committed_in_store_repo(
+    request, tmp_path, fixture, layout
+):
+    """DW-567. A v7 bundle that DEFERS never reaches `_land_post_landing_writes`,
+    so `_publish_bundle_close` never runs for it; with the ledger in a store that
+    has its own repository (T3 nested, T4 outside) the close-undo the defer
+    wrote and the deferrals it harvested would stay dirty in the store.
+    `SweepEngine._defer` publishes them: one store commit touching only the
+    ledger, carrying `Bmad-Code-Repo` and no `Bmad-Code-Commit` (no code landed),
+    leaving the store's ledger clean with DW-1 reopened and the harvested DW-2 at
+    HEAD.
+
+    ABLATION (performed): drop the `self._publish_deferred_ledger(task)` call in
+    `SweepEngine._defer` and both rows fail (no deferred-bundle commit; the
+    ledger stays dirty in the store)."""
+    engine, paths, store, ledger_rel = _v7_store_deferred_sweep(
+        request.getfixturevalue(fixture), layout, tmp_path / "verify-ran"
+    )
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.crashed and not summary.paused
+    _assert_deferred_in_place(engine, paths)
+    commits = _store_deferred_commits(store)
+    assert len(commits) == 1, git(store, "log", "--format=%s")
+    assert git(store, "show", "--name-only", "--format=", commits[0]).split() == [ledger_rel]
+    body = git(store, "log", "-1", "--format=%B", commits[0])
+    assert f"Bmad-Code-Repo: {paths.repo_root.as_posix()}" in body
+    assert "Bmad-Code-Commit" not in body and "Bmad-Code-Range" not in body
+    head_ledger = git(store, "show", f"{commits[0]}:{ledger_rel}")
+    assert deferredwork.open_ids(head_ledger) == {"DW-1", "DW-2"}
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    assert [r["commit"] for r in _records(engine, "store-committed")] == commits
+
+
+def test_v7_deferred_bundle_ledger_publish_withheld_while_in_doubt(project_v7_store_repo, tmp_path):
+    """T3: a run that holds its ledger in doubt (armed during the bundle's dev
+    session) does not publish the deferred bundle's ledger writes: it journals
+    `sweep-ledger-commit-withheld` naming the deferred-bundle message and the
+    bundle's ids, and no store commit is made.
+
+    ABLATION (performed): drop the `if self._ledger_unfit_to_publish():` gate in
+    `_publish_deferred_ledger` and this fails (no withheld row; the
+    deferred-bundle commit lands in the store)."""
+    engine, paths, store, ledger_rel = _v7_store_deferred_sweep(
+        project_v7_store_repo, "T3", tmp_path / "verify-ran", arm_doubt=True
+    )
+
+    engine.run()
+
+    _assert_deferred_in_place(engine, paths)
+    withheld = [
+        r
+        for r in _records(engine, "sweep-ledger-commit-withheld")
+        if r["message"] == _V7_LEDGER_DEFERRED
+    ]
+    assert len(withheld) == 1, _records(engine, "sweep-ledger-commit-withheld")
+    assert withheld[0]["dw_ids"] == ["DW-1"] and withheld[0]["reason"] == "ledger-in-doubt"
+    assert _store_deferred_commits(store) == []
+    assert git(store, "status", "--porcelain", "--", ledger_rel) != ""  # still unpublished
+
+
+@pytest.mark.parametrize("fault", ["git", "foreign"])
+def test_v7_deferred_bundle_ledger_publish_failure_is_best_effort(
+    project_v7_store_repo, tmp_path, monkeypatch, fault
+):
+    """T3: the deferred bundle's ledger writes fail to commit in the store
+    repository (a git fault, or a staged foreign version of the ledger). The
+    publish is best effort: the run neither crashes nor pauses, it journals
+    `store-commit-failed` / `store-commit-foreign-dirt` for the bundle, and the
+    writes stay uncommitted in the store.
+
+    ABLATIONS (performed): drop the `except ticketstore.StoreCommitError` clause
+    in `_commit_store_ledger` and `git` fails (the run crashes); drop its
+    `if result.foreign:` arm and `foreign` fails (no foreign-dirt row)."""
+    if fault == "git":
+        real = ticketstore.StoreCommitter.commit
+
+        def commit(self, unit_id, paths, message, **kwargs):
+            if message == _V7_LEDGER_DEFERRED:
+                raise ticketstore.StoreCommitError(f"{unit_id}: index.lock exists")
+            return real(self, unit_id, paths, message, **kwargs)
+
+        monkeypatch.setattr(ticketstore.StoreCommitter, "commit", commit)
+    engine, paths, store, ledger_rel = _v7_store_deferred_sweep(
+        project_v7_store_repo,
+        "T3",
+        tmp_path / "verify-ran",
+        stage_foreign_ledger=fault == "foreign",
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    _assert_deferred_in_place(engine, paths)
+    kind = "store-commit-failed" if fault == "git" else "store-commit-foreign-dirt"
+    assert [r["story_key"] for r in _records(engine, kind)] == ["dw-fix-things"]
+    assert _store_deferred_commits(store) == []
+    assert git(store, "status", "--porcelain", "--", ledger_rel) != ""  # still unpublished
+
+
+def test_v7_deferred_bundle_paused_rollback_publishes_nothing(project_v7_store_repo, tmp_path):
+    """T3 with `scm.rollback_on_failure` off: the defer's rollback pauses before
+    the reset, so the bundle's close is never reopened. The `RunPaused` from the
+    base defer propagates with no publish: no deferred-bundle commit, and the
+    store's HEAD still holds DW-1 open (the un-reopened `done` stays
+    uncommitted for the human the pause hands back to).
+
+    ABLATION (performed): run `self._publish_deferred_ledger(task)` in a
+    `finally:` around `super()._defer` and this fails (the store commits DW-1
+    `done` for code the defer discarded)."""
+    engine, paths, store, ledger_rel = _v7_store_deferred_sweep(
+        project_v7_store_repo, "T3", tmp_path / "verify-ran", rollback=False
+    )
+
+    summary = engine.run()
+
+    assert summary.paused and not summary.crashed
+    assert engine.state.tasks["dw-fix-things"].phase == Phase.DEFERRED
+    assert [r["dw_ids"] for r in _records(engine, "sweep-bundle-closed")] == [["DW-1"]]
+    assert _records(engine, "sweep-bundle-reopened") == []
+    assert _store_deferred_commits(store) == []
+    assert deferredwork.open_ids(git(store, "show", f"HEAD:{ledger_rel}")) == {"DW-1"}
+
+
+def test_v7_isolated_deferred_bundle_reopens_its_shared_store_close(project_v7_store_repo):
+    """T3 under isolation, driven at the seam: a mounted bundle's close went
+    straight into the ledger in the SHARED store (the mount does not carry its
+    own copy), so the base's isolated arm, which trusts the discarded worktree to
+    take the close with it, would leave DW-1 `done` for code nobody kept.
+    `SweepEngine._defer` reopens the close first (`sweep-bundle-reopened`) and
+    then publishes, so the store's HEAD holds DW-1 open (the reopen restores the
+    committed bytes exactly, so nothing is left to commit) and the store's ledger
+    is clean.
+
+    ABLATION (performed): drop the isolated-arm `_reopen_ledger_after_defer` call
+    in `SweepEngine._defer` and this fails (no reopen row; the publish commits
+    DW-1 `done` to the store's HEAD)."""
+    v7 = project_v7_store_repo
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    ledger_rel = paths.deferred_work.resolve().relative_to(store.resolve()).as_posix()
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == "T3"
+    engine, _ = make_sweep(paths, [], store_topology=topology.to_dict())
+    # premise: the ledger lives in the shared store every checkout reads
+    assert engine.paths.in_shared_store(engine.paths.deferred_work)
+    task = StoryTask(
+        story_key="dw-fix-things",
+        epic=0,
+        dw_ids=["DW-1"],
+        phase=Phase.DEV_VERIFY,
+        worktree_path=str(paths.repo_root.parent / "unit"),
+    )
+    engine.state.tasks[task.story_key] = task
+    deferredwork.mark_done_many_reopenable(
+        engine.paths.deferred_work,
+        task.dw_ids,
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    assert not ledger_entries(paths)["DW-1"].open  # premise: the close is in the main ledger
+
+    engine._defer(task, "verify failed")
+
+    assert task.phase == Phase.DEFERRED
+    assert [r["dw_ids"] for r in _records(engine, "sweep-bundle-reopened")] == [["DW-1"]]
+    assert ledger_entries(paths)["DW-1"].open
+    assert deferredwork.open_ids(git(store, "show", f"HEAD:{ledger_rel}")) == {"DW-1"}
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    assert _records(engine, "store-committed") == []  # already at HEAD: nothing journaled
+
+
+def test_v7_isolated_deferred_bundle_publishes_its_shared_store_ledger(project_v7_store_repo):
+    """T3 under isolation, driven at the seam, with a real delta: the mounted
+    bundle's close of DW-1 is in the shared store's ledger and the task carries a
+    harvested deferral, which the base's isolated arm files into that ledger as
+    DW-2. `SweepEngine._defer` reopens DW-1 and publishes: exactly one
+    deferred-bundle store commit touching only the ledger, holding DW-1 and DW-2
+    open, the store's ledger clean, and its `store-committed` row naming it.
+
+    ABLATION (performed): gate the `_publish_deferred_ledger` call in
+    `SweepEngine._defer` to the in-place arm only and this fails (no
+    deferred-bundle commit; the ledger stays dirty in the store)."""
+    v7 = project_v7_store_repo
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    ledger_rel = paths.deferred_work.resolve().relative_to(store.resolve()).as_posix()
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == "T3"
+    engine, _ = make_sweep(paths, [], store_topology=topology.to_dict())
+    assert engine.paths.in_shared_store(engine.paths.deferred_work)  # premise
+    task = StoryTask(
+        story_key="dw-fix-things",
+        epic=0,
+        dw_ids=["DW-1"],
+        phase=Phase.DEV_VERIFY,
+        worktree_path=str(paths.repo_root.parent / "unit"),
+        harvested_deferrals=[
+            {
+                "origin": "spec-deferred plan-dw-fix-things.md",
+                "title": SWEEP_FINDING["summary"],
+                "reason": SWEEP_FINDING["evidence"],
+                "location": SWEEP_FINDING["location"],
+                "severity": SWEEP_FINDING["severity"],
+                "source_spec": "plan-dw-fix-things.md",
+            }
+        ],
+    )
+    engine.state.tasks[task.story_key] = task
+    deferredwork.mark_done_many_reopenable(
+        engine.paths.deferred_work,
+        task.dw_ids,
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    assert not ledger_entries(paths)["DW-1"].open  # premise: the close is in the main ledger
+
+    engine._defer(task, "verify failed")
+
+    assert task.phase == Phase.DEFERRED
+    entries = ledger_entries(paths)
+    assert entries["DW-1"].open and entries["DW-2"].open
+    commits = _store_deferred_commits(store)
+    assert len(commits) == 1, git(store, "log", "--format=%s")
+    assert git(store, "show", "--name-only", "--format=", commits[0]).split() == [ledger_rel]
+    head_ledger = git(store, "show", f"{commits[0]}:{ledger_rel}")
+    assert deferredwork.open_ids(head_ledger) == {"DW-1", "DW-2"}
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    assert [r["commit"] for r in _records(engine, "store-committed")] == commits
 
 
 @pytest.mark.parametrize("publisher", ["plan", "close"])

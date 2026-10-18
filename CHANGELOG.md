@@ -157,6 +157,10 @@ breaking changes may land in a minor release.
 - Commit a v7 sweep bundle's ledger close in the ticket store's own repository (T3/T4) once
   its code lands, best effort with `Bmad-Code-*` trailers and withheld while the ledger is in
   doubt, instead of leaving the store's ledger dirty (DW-556).
+- Commit a deferred v7 sweep bundle's ledger writes (its reopened close and harvested
+  deferrals) in the ticket store's own repository (T3/T4), best effort and withheld while
+  the ledger is in doubt; an isolated defer over a shared store reopens the bundle's close
+  first (DW-567).
 - Latch a worktree-isolated sweep bundle's artifact publication complete when its artifacts
   dir is in a shared ticket store, instead of pausing on
   `artifact publication intent is missing` after the merge (DW-557).

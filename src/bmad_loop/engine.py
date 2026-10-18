@@ -10047,7 +10047,9 @@ class Engine:
         No-op on the base path; only ``SweepEngine`` writes reopenable bundle
         closes. This is reached on the in-place branch after a reset was attempted
         and the ledger was restored. An isolated defer returns earlier because the
-        unit worktree, including its close, is discarded without merging.
+        unit worktree, including its close, is discarded without merging — unless
+        the ledger lives in a shared ticket store, where ``SweepEngine._defer``
+        calls this itself before the base defer.
         """
         return
 
