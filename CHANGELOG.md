@@ -152,6 +152,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Name the T1 ticket plan left `done` (or `blocked`) by an interrupted commit window when the
+  resumed commit fails, instead of a plain `commit failed:`; the COMMITTING save latches the
+  plan's pre-window status and digest (DW-555).
 - Commit a v7 sweep bundle's ledger close in the ticket store's own repository (T3/T4) once
   its code lands, best effort with `Bmad-Code-*` trailers and withheld while the ledger is in
   doubt, instead of leaving the store's ledger dirty (DW-556).

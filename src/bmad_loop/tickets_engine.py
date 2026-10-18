@@ -85,6 +85,7 @@ finishes past the epic its ticket finished.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import stat
 import time
@@ -188,6 +189,17 @@ class _PlanUndo:
 
     plan: Path
     data: bytes | None
+
+
+@dataclass(frozen=True)
+class _PlanLeftMarked:
+    """A plan that reads ``target``, not the ``before`` the COMMITTING save
+    latched: marked since (e.g. by an interrupted commit window, an adoption, or a
+    hand edit). No pre-image bytes survive to restore it."""
+
+    plan: Path
+    target: str
+    before: str
 
 
 def _bytes_or_none(path: Path) -> bytes | None:
@@ -1583,7 +1595,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return None
         return ticket.epic_slug
 
-    def _terminal_plan_write(self, task: StoryTask) -> _PlanUndo | None:
+    def _terminal_plan_write(self, task: StoryTask) -> _PlanUndo | _PlanLeftMarked | None:
         """The ticket's terminal write on the bound plan, inside the commit
         window, for a store tracked inside the code checkout (T1): the marked plan
         rides the unit's own squash and reaches the target branch only with the
@@ -1600,10 +1612,19 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
           under ``"never"`` (the plan stays ``built`` for a person to accept).
 
         Nothing is written for an unbound task, or for a plan already at the
-        target (a no-op mark, e.g. a re-driven window). A failed mark puts back
-        whatever it may have written, then pauses at ``ticket-tree`` with the
-        task still COMMITTING, so a resume re-drives the window and marks again.
-        Returns the pre-image for :meth:`_undo_terminal_plan_write`."""
+        target (a no-op mark). A failed mark puts back whatever it may have
+        written, then pauses at ``ticket-tree`` with the task still COMMITTING, so
+        a resume re-drives the window and marks again.
+
+        Returns the token :meth:`_undo_terminal_plan_write` takes: the in-memory
+        pre-image (:class:`_PlanUndo`) when this window wrote the mark; a
+        :class:`_PlanLeftMarked` when the mark is a no-op on a plan marked since
+        the COMMITTING save (e.g. by an interrupted earlier window) — that save's
+        latch (``ticket_premark_status`` / ``ticket_premark_digest``, from
+        :meth:`_latch_post_landing_writes`) read another status, and the plan's
+        bytes no longer match its digest — so a commit failure names the plan
+        left marked instead of reading as a plain commit failure; else None (a
+        plan at the target before the window, a legacy state with no latch)."""
         plan = self._bound_plan(task)
         ticket = task.ticket
         if plan is None or ticket is None or self.paths.shared_store is not None:
@@ -1637,7 +1658,19 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 if unrestored := self._undo_terminal_plan_write(task, undo):
                     detail = f"{detail}; {unrestored}"
             self._pause_mark_done(task, detail, parked=parked)
-        return undo if mark.outcome == "written" else None
+        if mark.outcome == "written":
+            return undo
+        target = "blocked" if parked else verify.PLAN_DONE
+        before = task.ticket_premark_status
+        digest = task.ticket_premark_digest
+        if (
+            digest
+            and before != target
+            and preimage is not None
+            and hashlib.sha256(preimage).hexdigest() != digest
+        ):
+            return _PlanLeftMarked(plan, target, before)
+        return None
 
     def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> str | None:
         """Put the plan back to its pre-mark bytes through
@@ -1645,8 +1678,20 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         ``ticket-plan-restored`` with its outcome either way. A failed restore is
         never a raise out of the commit window's failure arm: it is returned, so
         the escalation (or pause) names the plan left marked for a commit that
-        does not exist instead of reading as a plain commit failure."""
+        does not exist instead of reading as a plain commit failure.
+
+        A :class:`_PlanLeftMarked` token restores nothing — no pre-image bytes
+        survived whatever marked the plan since the COMMITTING save — and returns
+        the detail that names the plan and asks the operator to restore it by
+        hand."""
         del task
+        if isinstance(undo, _PlanLeftMarked):
+            return (
+                f"{undo.plan} reads {undo.target}, not the {undo.before!r} the COMMITTING "
+                "save latched — marked since, e.g. by an interrupted commit window — and "
+                f"is left {undo.target} for a commit that does not exist; restore it by "
+                "hand before resuming"
+            )
         if not isinstance(undo, _PlanUndo):
             return None
         try:
@@ -1683,8 +1728,23 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         stale latch into its next commit. Journals ``ticket-mark-latched``, and
         ``store-unversioned`` (once per run) for a store without a repository
         (T2/T6) — here, not only when a mark lands, since under ``"never"`` it
-        latches nothing and the session's ``built`` plan lives on disk alone."""
-        if self.paths.shared_store is None or task.ticket is None:
+        latches nothing and the session's ``built`` plan lives on disk alone.
+
+        For a T1 store (tracked in the code checkout) the window marks the plan
+        itself; what is latched instead is the bound plan's pre-window status and
+        the sha256 of its bytes (``ticket_premark_status`` /
+        ``ticket_premark_digest``), so a resumed window can tell a plan marked
+        since that save (e.g. by an interrupted window) from one already at the
+        target (:meth:`_terminal_plan_write`). Both are assigned every time too —
+        cleared for a shared store, an unbound task, no mark owed (``"never"``,
+        not parked), or a plan that cannot be read (the window's own read or mark
+        pauses on that fault)."""
+        task.ticket_premark_status = ""
+        task.ticket_premark_digest = ""
+        if self.paths.shared_store is None:
+            self._latch_premark(task)
+            return
+        if task.ticket is None:
             return
         parked = bool(task.operator_actions)
         accept = not parked and self.policy.tickets.mark_done == "auto"
@@ -1696,6 +1756,22 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         task.ticket_done_pending = accept
         task.ticket_commit_pending = not parked and not accept and versioned
         self._journal_latch(task)
+
+    def _latch_premark(self, task: StoryTask) -> None:
+        """Set the T1 pre-window latch (:meth:`_latch_post_landing_writes`) when
+        the window will mark the bound plan; leave it cleared otherwise."""
+        plan = self._bound_plan(task)
+        if plan is None or task.ticket is None:
+            return
+        if not task.operator_actions and self.policy.tickets.mark_done != "auto":
+            return
+        try:
+            data = plan.read_bytes()
+            status = status_of(parse_frontmatter(data.decode("utf-8-sig")))
+        except (OSError, UnicodeDecodeError):
+            return
+        task.ticket_premark_status = status
+        task.ticket_premark_digest = hashlib.sha256(data).hexdigest()
 
     def _journal_latch(self, task: StoryTask) -> None:
         target = self._post_landing_target(task)

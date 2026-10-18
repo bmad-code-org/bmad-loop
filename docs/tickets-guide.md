@@ -43,6 +43,8 @@ The ticket store is the initiative folder and its plans. Where it lives decides 
 | T4     | its own git repository outside the checkout                | as T3                                                                 |
 | T6     | a plain folder outside any repository                      | as T2                                                                 |
 
+In T1 a commit failure puts the pre-mark plan back; if a resumed commit window finds the plan already marked since the commit started and its commit then fails, the escalation names the plan, for you to restore by hand before resuming.
+
 For T2, T3, T4 and T6 the code commit cannot carry the plan, so the mark is latched on the task when the commit starts and made after `finalize_commit`, or after the merge-back under worktree isolation. A resume replays a latched mark. A failed mark pauses the run at `ticket-tree` and keeps the latch. An unversioned store journals `store-unversioned` once per run.
 
 In T3 and T4 each marked plan (plus the ledger, when the unit wrote to it) gets its own commit, `chore(tickets): <ref> <target> [bmad-loop <run>]`, with `Bmad-Code-*` trailers naming the code commit. Under `mark_done = "never"` nothing is marked, and the plan is committed at `built`. A store commit never overwrites a version of one of its paths that a person has staged, even when the file is gone from disk. A failed store commit is journaled (`store-commit-failed` or `store-commit-foreign-dirt`) and listed by `status`, and the run goes on; it is retried before the run can finish, and one still owed pauses at `ticket-tree` (`store-commit-owed`) so the resume retries it.
