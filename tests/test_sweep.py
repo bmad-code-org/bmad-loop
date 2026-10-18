@@ -25941,26 +25941,47 @@ def test_the_migration_manifest_write_refuses_a_redirected_run_dir(project, tmp_
 def test_manifest_publication_refuses_a_redirect_after_baseline_is_durable(
     project, tmp_path, monkeypatch
 ):
+    """The manifest publication refuses a redirect landing after the baseline is durable.
+
+    The redirect fires right after the last stale-record removal, so the next
+    confined operation is the manifest write itself; a redirect any earlier is
+    refused by the confined removals and never reaches it. The helper spy is the
+    reached-site precondition.
+
+    Ablation: restore the manifest site to `Path.write_text` and the helper never
+    sees the manifest path, and `outside/sweep-run/migrate-manifest.json` lands."""
     write_legacy_ledger(project, LEGACY_LEDGER)
     engine, adapter = make_sweep(
         project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
     )
-    real_save = engine._save
+    real_remove = engine._remove_migration_record
     parked = tmp_path / "outside" / "sweep-run"
     redirected = []
 
-    def save_then_redirect():
-        real_save()
-        task = engine.state.tasks.get("sweep-migrate")
-        if task is not None and task.migration_recovery_format == 1 and not redirected:
+    def remove_then_redirect(path):
+        real_remove(path)
+        if path.name == "migrate-result.json" and not redirected:
             redirected.append(True)
             assert _redirect_the_runs_parent(engine.run_dir, tmp_path) == parked
 
-    monkeypatch.setattr(engine, "_save", save_then_redirect)
+    monkeypatch.setattr(engine, "_remove_migration_record", remove_then_redirect)
+    real_write = sweep_mod.atomic_write_text_confined
+    reached: list[Path] = []
+
+    def observe(path, text, **kwargs):
+        reached.append(path)
+        return real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", observe)
     summary = engine.run()
 
     assert summary.crashed and adapter.sessions == []
     assert redirected == [True]
+    assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
+    assert reached == [  # PRECONDITION: the manifest site was reached
+        engine.run_dir / "migrate-baseline.md",
+        engine.run_dir / "migrate-manifest.json",
+    ]
     assert (parked / "migrate-baseline.md").read_text(encoding="utf-8") == LEGACY_LEDGER
     assert not (parked / "migrate-manifest.json").exists()
     assert list(parked.glob("migrate-manifest*")) == []  # no staged temp either
