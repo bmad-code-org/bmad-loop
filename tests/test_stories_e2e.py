@@ -57,6 +57,7 @@ spawn and reap their own short-lived children, but run no tmux or orchestrator s
 from __future__ import annotations
 
 import errno
+import inspect
 import json
 import os
 import shlex
@@ -103,10 +104,13 @@ from bmad_loop.install import (
 # has no %N and macOS ships no setsid utility, so skipping honestly beats failing.
 HAVE_TMUX = sys.platform.startswith("linux") and shutil.which("tmux") is not None
 # A LIST, not a single mark: every real-tmux test here joins the serialized real-mux
-# xdist group (DW-95). The local-process identity rows below inherit the same marks.
+# xdist group (DW-95) and runs on its own private tmux server (DW-561), so a leaked
+# session never reaches the default one. The local-process identity rows below
+# inherit the same marks.
 pytestmark = [
     pytest.mark.skipif(not HAVE_TMUX, reason="stories E2E needs real tmux on Linux"),
     real_mux_e2e,
+    pytest.mark.usefixtures("private_tmux_server"),
 ]
 
 # The fake CLI: reads the story id + spec folder from the session env (as the real
@@ -752,7 +756,7 @@ def test_e2e_two_story_happy_path(tmp_path):
     assert _commit_count(root) == base + 2
 
 
-def test_e2e_two_story_happy_path_build_auto(tmp_path):
+def test_e2e_two_story_happy_path_build_auto(tmp_path, private_tmux_server):
     """Scenario 9, the post-rename twin of the happy path (BMAD-METHOD #2651):
     the project carries ONLY `bmad-build-auto`, so the real CLI has to resolve the
     invoked primitive off disk. The fake routes on env vars and spec status and
@@ -778,7 +782,7 @@ def test_e2e_two_story_happy_path_build_auto(tmp_path):
     # A FINISHED run tears down its mux session (`cleanup_session_on_finish`); the
     # suite's one real-tmux pin of that — the timeout row now pauses (#727) and a
     # pause keeps the session for resume by design.
-    assert not _tmux_has_session(f"bmad-loop-{run_id}")
+    assert not _tmux_has_session(private_tmux_server, f"bmad-loop-{run_id}")
     dispatched = [
         p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/fake-prompt.txt")
     ]
@@ -1660,6 +1664,16 @@ def test_recorded_children_swept_is_a_noop_without_identity_files(tmp_path):
             raise RuntimeError("pre-bind boom")
 
 
+def _drive_surface(name: str, tmp_path: Path, monkeypatch, socket: Path) -> None:
+    """Call a reap surface directly, live-assertion off, handing it the private tmux
+    socket only when its signature takes one."""
+    surface = globals()[name]
+    takes_socket = "private_tmux_server" in inspect.signature(surface).parameters
+    surface(
+        tmp_path, monkeypatch, False, **({"private_tmux_server": socket} if takes_socket else {})
+    )
+
+
 @pytest.mark.parametrize(
     "surface_name",
     [
@@ -1668,7 +1682,9 @@ def test_recorded_children_swept_is_a_noop_without_identity_files(tmp_path):
         "test_e2e_detached_writer_publication_fault_still_reaped",
     ],
 )
-def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_name):
+def test_reap_e2e_preflight_failure_prevents_run(
+    tmp_path, monkeypatch, private_tmux_server, surface_name
+):
     run_called = False
 
     def unsupported() -> None:
@@ -1684,7 +1700,7 @@ def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_
         patch.setattr(sys.modules[__name__], "preflight_pidfd_support", unsupported)
         patch.setattr(sys.modules[__name__], "_run", unexpected_run)
         with pytest.raises(OSError, match="pidfd unavailable"):
-            globals()[surface_name](tmp_path, monkeypatch, False)
+            _drive_surface(surface_name, tmp_path, monkeypatch, private_tmux_server)
     assert not run_called
 
 
@@ -1696,7 +1712,9 @@ def test_reap_e2e_preflight_failure_prevents_run(tmp_path, monkeypatch, surface_
     ],
 )
 @needs_pidfd
-def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(tmp_path, monkeypatch, surface_name):
+def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(
+    tmp_path, monkeypatch, private_tmux_server, surface_name
+):
     """DW-137: a failure anywhere in the pre-bind window must not leak the child.
 
     Both surfaces spawn their fake child inside `_run` but can only bind a pidfd after
@@ -1715,7 +1733,7 @@ def test_reap_e2e_sweeps_a_recorded_child_when_the_run_fails(tmp_path, monkeypat
             patch.setattr(sys.modules[__name__], "_scaffold_sprint", lambda *_a, **_kw: None)
             patch.setattr(sys.modules[__name__], "_run", failing_run)
             with pytest.raises(RuntimeError, match="run refused"):
-                globals()[surface_name](tmp_path, monkeypatch, False)
+                _drive_surface(surface_name, tmp_path, monkeypatch, private_tmux_server)
         assert proc.wait(timeout=10) == -signal.SIGKILL
     finally:
         _reap(proc)
@@ -1763,13 +1781,14 @@ def test_reap_e2e_sweeps_an_observed_child_when_the_run_fails(tmp_path, monkeypa
         _reap(proc)
 
 
-def _tmux_has_session(name: str) -> bool:
-    return subprocess.run(["tmux", "has-session", "-t", name], capture_output=True).returncode == 0
+def _tmux_has_session(socket: Path, name: str) -> bool:
+    argv = ["tmux", "-S", str(socket), "has-session", "-t", name]
+    return subprocess.run(argv, capture_output=True).returncode == 0
 
 
-def _tmux_window_names(session: str) -> list[str]:
+def _tmux_window_names(socket: Path, session: str) -> list[str]:
     out = subprocess.run(
-        ["tmux", "list-windows", "-t", f"={session}", "-F", "#{window_name}"],
+        ["tmux", "-S", str(socket), "list-windows", "-t", f"={session}", "-F", "#{window_name}"],
         capture_output=True,
         text=True,
     )
@@ -1780,7 +1799,9 @@ def _tmux_window_names(session: str) -> list[str]:
     "force_live_reap_assertion", [False, True], ids=["reaped", "live-assertion"]
 )
 @needs_pidfd
-def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_assertion):
+def test_e2e_session_timeout_teardown(
+    tmp_path, monkeypatch, force_live_reap_assertion, private_tmux_server
+):
     """#157 end to end through the real binary + real tmux: a dev session wedged
     forever (SessionStart, then sleep — never a Stop) is bounded only by the
     session timeout, and the fix makes that firing timely and observable. The
@@ -1898,8 +1919,8 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
         ), state
         assert end.get("produced_work") is False, end
         session_name = f"bmad-loop-{run_id}"
-        assert _tmux_has_session(session_name)
-        windows = _tmux_window_names(session_name)
+        assert _tmux_has_session(private_tmux_server, session_name)
+        windows = _tmux_window_names(private_tmux_server, session_name)
         assert task_id[-40:] not in windows and len(windows) == 1, windows
         if shutil.which("pgrep"):
             pg = subprocess.run(["pgrep", "-af", "fake-cli.sh"], capture_output=True, text=True)
@@ -1942,7 +1963,9 @@ def test_e2e_session_timeout_teardown(tmp_path, monkeypatch, force_live_reap_ass
             # The paused run left its session for a resume that never comes.
             if run_id is not None:
                 subprocess.run(
-                    ["tmux", "kill-session", "-t", f"=bmad-loop-{run_id}"], capture_output=True
+                    ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                    + ["-t", f"=bmad-loop-{run_id}"],
+                    capture_output=True,
                 )
 
     if force_live_reap_assertion:

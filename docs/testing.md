@@ -95,6 +95,15 @@ plain function or constant a test imports by name. The fixtures:
 - **Backend pins.** `force_tmux_backend` and `force_psmux_backend` pin the transport backend
   by name and clear the selection cache, so tests asserting backend argv cannot be hijacked by
   the host's default or an installed external backend.
+- **Private tmux server.** Every tmux-gated test requests `private_tmux_server`, either as
+  an argument or module-wide through `pytest.mark.usefixtures`. The fixture points `TMUX_TMPDIR`
+  at a fresh directory, drops `TMUX`, and yields the socket path. On teardown it kills that
+  server by explicit socket (`tmux -S <socket> kill-server`). Probes and kills in tests also
+  name the socket with `-S`, never the inherited env, so a lost redirect can leak a session
+  but can never kill the developer's default server. `private_tmux_socket` is the same
+  thing as a context manager. A guard in `tests/test_conftest.py` refuses a tmux-gated test
+  that opts out. It sees only tests whose `skipif` reason names tmux. Run real-tmux ablations under a throwaway root:
+  `env -u TMUX -u TMUX_PANE TMUX_TMPDIR=$(mktemp -d) uv run pytest ...`.
 - **Autouse isolation.** `_isolate_ambient_git_ignores` (session-scoped) shadows the
   developer's global gitignore sources (`GIT_CONFIG_GLOBAL`, `XDG_CONFIG_HOME`), so a dev box
   that globally ignores `.claude/` cannot make shield tests measure the wrong thing.
@@ -177,6 +186,7 @@ carry its full rationale and blind spots.
 | Installed-copy drift          | `tests/test_hook_script.py`, `tests/test_probe_hook.py` | the packaged hook relays drifting from their source (wheel-installed runs only), or `init` writing a workspace relay copy                                 |
 | Version sync                  | `tests/test_release.py` + CI                            | version fields disagreeing, or a release leaving `## [Unreleased]` and its compare link unreopened                                                        |
 | Real-mux xdist grouping       | `tests/test_conftest.py`                                | real-tmux E2Es scheduled onto concurrent workers: each must carry exactly the `real_mux_e2e` group, honored by `--dist loadgroup`                         |
+| Private tmux server           | `tests/test_conftest.py`                                | a tmux-gated test running on the developer's default tmux server instead of requesting `private_tmux_server` (or entering `private_tmux_socket`)          |
 | Tmux SessionSpec + reap walls | `tests/test_conftest.py`                                | load-sensitive literal timeouts in real-tmux waits; they must use `REAL_MUX_HANG_CEILING_S`                                                               |
 | Deprecation posture           | `tests/test_conftest.py`                                | deprecation warnings passing silently, including through a later blanket `ignore` that leaves the `error::` entries inert                                 |
 | Docs hygiene                  | `tests/test_docs_hygiene.py`                            | broken relative links and anchors in the docs, and a stale generated policy table in the configuration reference                                          |

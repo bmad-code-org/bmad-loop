@@ -157,6 +157,55 @@ real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 REAL_MUX_HANG_CEILING_S = 90.0
 
 
+# ------------------------------------------------- private tmux server (DW-561)
+# A real-tmux test must never reach the developer's DEFAULT tmux server. A server the
+# first test starts keeps that test's cwd, so once pytest deletes the sandbox every
+# later pane fails shell init (`getcwd: cannot access parent directories`), and leaked
+# `bmad-loop-*` sessions pile up across runs. The default server may also host the
+# session running the suite, so a kill that reaches it ends that session too.
+#
+# `TMUX_TMPDIR` is the only lever: the product builds its own tmux argv, so `-L`/`-S`
+# cannot be injected, but every client it spawns (and every pane, through `$TMUX`)
+# inherits the redirect. Teardown and probes name the socket with `-S` instead of
+# trusting the inherited env, so a lost redirect leaks onto the default server
+# without anything being killed there.
+
+
+def private_tmux_socket_path(base: Path) -> Path:
+    """The socket a tmux client with ``TMUX_TMPDIR=base`` and no ``TMUX`` talks to."""
+    return base / f"tmux-{os.getuid()}" / "default"
+
+
+@contextlib.contextmanager
+def private_tmux_socket(base: Path) -> Iterator[Path]:
+    """Point every tmux client in this process tree at a private server under
+    ``base`` and yield its socket path; kill that server, by explicit socket, on
+    exit. Fails loudly if the server still answers afterwards."""
+    socket = private_tmux_socket_path(base)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("TMUX_TMPDIR", str(base))
+        mp.delenv("TMUX", raising=False)
+        mp.delenv("TMUX_PANE", raising=False)
+        try:
+            yield socket
+        finally:
+            probe = {"capture_output": True, "text": True, "timeout": REAL_MUX_HANG_CEILING_S}
+            subprocess.run(["tmux", "-S", str(socket), "kill-server"], **probe)
+            alive = subprocess.run(["tmux", "-S", str(socket), "list-sessions"], **probe)
+            if alive.returncode == 0:
+                raise AssertionError(
+                    f"private tmux server {socket} survived teardown: {alive.stdout!r}"
+                )
+
+
+@pytest.fixture
+def private_tmux_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """One private tmux server per test; yields its socket path for ``-S`` probes.
+    A short `mktemp` dir keeps the socket far below the 108-byte sun_path limit."""
+    with private_tmux_socket(tmp_path_factory.mktemp("tmux")) as socket:
+        yield socket
+
+
 # --------------------------------------------------- reap-identity helpers (Linux)
 # The identity model DW-126/DW-127 put behind every signal a test sends to a process
 # it did not spawn itself: never trust a bare pid, which the kernel is free to recycle
