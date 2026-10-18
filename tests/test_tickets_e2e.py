@@ -72,10 +72,12 @@ from bmad_loop.frontmatter import parse_frontmatter, status_of
 # Linux-only, not merely non-win32: the fake is bash + GNU coreutils (`date +%s%N`).
 HAVE_TMUX = sys.platform.startswith("linux") and shutil.which("tmux") is not None
 # A LIST, not a single mark: every real-tmux test joins the serialized real-mux xdist
-# group (tests/test_conftest.py's grouping guard enforces it).
+# group (tests/test_conftest.py's grouping guard enforces it) and runs on its own
+# private tmux server (DW-561), so a leaked session never reaches the default one.
 pytestmark = [
     pytest.mark.skipif(not HAVE_TMUX, reason="tickets E2E needs real tmux on Linux"),
     real_mux_e2e,
+    pytest.mark.usefixtures("private_tmux_server"),
 ]
 
 # The fake build-auto. `@PY@` is baked in by the scaffold (tmux does not carry the
