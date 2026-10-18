@@ -5451,14 +5451,21 @@ def _journal_unaccepted_launch(args: argparse.Namespace, reason: str) -> None:
                     file=sys.stderr,
                 )
                 return
-            # Read under the same hold, for the pin; a state that cannot be read
-            # is said by the `except` below like any other fault.
-            state = load_state(run_dir)
+            # Read under the same hold, for the pin. A state that cannot be read
+            # may BE the refusal (resume and resolve both load it first), so it
+            # never costs the row: the append goes confined but unpinned, and
+            # the row names the read fault.
+            state: RunState | None = None
+            unread = ""
+            try:
+                state = load_state(run_dir)
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                unread = f" (its state.json could not be read for the journal pin: {e})"
             Journal(run_dir, pin=state).append(
                 "ctl-window-claim-failed",
                 error=f"a TUI-launched {args.command} exited before driving the run: "
                 f"{reason} — the run's control-window record still names the window "
-                "of the launch before it",
+                f"of the launch before it{unread}",
             )
     except Exception as e:
         print(f"warning: could not journal this refused launch: {e}", file=sys.stderr)

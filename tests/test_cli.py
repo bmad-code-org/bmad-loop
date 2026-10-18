@@ -7528,6 +7528,21 @@ def test_a_refusal_journal_never_lands_in_a_run_its_id_only_suffixes(tmp_path, c
     assert "'other-r1'" in err
 
 
+def test_a_refusal_journal_still_lands_when_the_state_it_pins_to_is_unreadable(tmp_path, capsys):
+    # An unreadable state.json can BE the refusal (resume and resolve load it
+    # first); reading it for the pin must not cost the row. Ablation: let the
+    # `load_state` fault reach the outer `except` and no entry is written.
+    run_dir = _escalated_run(tmp_path, "r1")
+    (run_dir / "state.json").write_text("{not json", encoding="utf-8")
+    cli._journal_unaccepted_launch(
+        argparse.Namespace(project=str(tmp_path), run_id="r1", command="resume"), "refused"
+    )
+    [entry] = _ctl_launch_entries(run_dir)
+    assert "refused" in entry["error"]
+    assert "its state.json could not be read for the journal pin" in entry["error"]
+    assert "could not journal" not in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("raised", [False, True])
 def test_a_launched_refusal_with_one_huge_line_is_cut_before_journaling(
     tmp_path, monkeypatch, capsys, raised
