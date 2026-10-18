@@ -56,6 +56,9 @@ from .signals import attribute_events, session_events
 from .statemachine import advance
 from .worksource import EpicProgress, Pick, WorkSource
 
+if TYPE_CHECKING:
+    from .plugins import HookContext
+
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -3535,7 +3538,8 @@ class SweepEngine(Engine):
     ) -> None:
         """Escalate the migrate task along legal edges only (DW-405/407/314).
 
-        Every other task takes ``Engine._escalate`` unchanged. The migrate task
+        Every other task takes ``Engine._escalate`` unchanged, after
+        :meth:`_reopen_unlanded_close` (DW-569). The migrate task
         can refuse from two boundaries the phase graph gives no ESCALATED edge:
         a marked ``TRIAGE_RUNNING`` recovery walks through ``TRIAGE_VERIFY``
         first, and a refusal while already ESCALATED (the escalated commit-tail
@@ -3552,6 +3556,9 @@ class SweepEngine(Engine):
         advanced-HEAD refusal refused).
         """
         if task.story_key != MIGRATE_KEY:
+            # No code landed: reopen an isolated bundle's shared-store close
+            # before the base's ESCALATED save (DW-569).
+            self._reopen_unlanded_close(task)
             super()._escalate(task, reason)
             return
         if task.phase == Phase.DONE:
@@ -8867,8 +8874,10 @@ class SweepEngine(Engine):
         deferred bundle's ledger writes``: the reopen of its close and any
         harvested deferrals, which the isolated defer's harvested carry leaves to
         this publisher rather than committing itself
-        (:meth:`_store_publishes_harvest_carry`, DW-570). No code landed, so only
-        ``Bmad-Code-Repo`` is stamped. Elsewhere the ledger is in the code
+        (:meth:`_store_publishes_harvest_carry`, DW-570). It also publishes the
+        reopen :meth:`_reopen_unlanded_close` makes when an isolated bundle
+        escalates or is vetoed (DW-569), under the same message. No code landed,
+        so only ``Bmad-Code-Repo`` is stamped. Elsewhere the ledger is in the code
         checkout (or a worktree copy that dies with the unit) and no store commit
         is owed.
 
@@ -8894,6 +8903,62 @@ class SweepEngine(Engine):
             self._withhold_ledger_publish(message, dw_ids=list(task.dw_ids))
             return
         self._commit_store_ledger(task, topology.store_repo, ledger, message, code_commit=None)
+
+    def _vetoed(self, ctx: HookContext | None, task: StoryTask) -> bool:
+        """The base veto routing, after :meth:`_reopen_unlanded_close` when a
+        plugin really vetoed (DW-569). Every veto action (``pause``, ``defer``,
+        ``skip``) ends the unit without landing its code, so the reopen runs
+        ahead of the base's terminal save. A stage nobody vetoed is not an end
+        and reaches the base untouched."""
+        if ctx is not None and ctx.resolved_veto() is not None:
+            self._reopen_unlanded_close(task)
+        return super()._vetoed(ctx, task)
+
+    def _reopen_unlanded_close(self, task: StoryTask) -> None:
+        """Reopen an isolated bundle's shared-store close when the bundle ends
+        without landing (DW-569): before the terminal save of every escalation
+        (:meth:`_escalate`, ``WorktreeFlow.escalate_unit`` for an in-flight unit,
+        ``WorktreeFlow.keep_branch_and_escalate`` for a failed merge-back) and
+        every plugin veto (:meth:`_vetoed`). The defer has its own arm
+        (:meth:`_defer`).
+
+        Acts only on the isolated arm (``self._isolated or task.worktree_path``)
+        with the ledger in the shared ticket store and a close on record
+        (``task.bundle_closes_intended``). There the accepted-dev close went
+        straight into the one ledger every checkout shares, and ``open_ids``
+        re-bundles only ``open`` entries, so a ``done`` left for code that never
+        landed is invisible to every later sweep. Otherwise a no-op that reads
+        nothing: in place the rollback owns the ledger, and an unshared ledger
+        copy dies with the worktree.
+
+        The reopen is :meth:`_reopen_ledger_after_defer` (the same operation
+        id, so only this bundle's close is undone), then
+        :meth:`_publish_deferred_ledger` commits it in a store repository.
+        ``bundle_closes_intended`` is kept, so a re-armed bundle that lands
+        re-closes through :meth:`_carry_isolated_ledger_writes`.
+
+        A ``LedgerReadError`` or ``OSError`` from the reopen is a visible
+        degrade: it journals ``sweep-bundle-reopen-failed`` and skips the
+        publish, and the escalation or veto goes on. The escalation pause is the
+        operator stop; turning it into a crash would lose its reason."""
+        if not task.bundle_closes_intended:
+            return
+        if not (self._isolated or task.worktree_path):
+            return
+        if not self.paths.in_shared_store(self.paths.deferred_work):
+            return
+        try:
+            self._reopen_ledger_after_defer(task)
+        except (deferredwork.LedgerReadError, OSError) as e:
+            # `LedgerReadError` is a plain `Exception` (DW-146), so it is named.
+            self.journal.append(
+                "sweep-bundle-reopen-failed",
+                story_key=task.story_key,
+                dw_ids=list(task.bundle_closes_intended),
+                error=str(e),
+            )
+            return
+        self._publish_deferred_ledger(task)
 
     def _store_publishes_harvest_carry(self, task: StoryTask, *, terminal_composite: bool) -> bool:
         """Whether a sweep store publisher commits the ledger right after this
@@ -9214,7 +9279,8 @@ class SweepEngine(Engine):
         bundle close whose code no longer exists. :meth:`_defer` also calls this on
         the isolated arm when the ledger is in the shared ticket store, where the
         mount wrote its close straight into the one ledger every checkout shares
-        (DW-567). The operation-specific undo marker
+        (DW-567), and :meth:`_reopen_unlanded_close` calls it on the same arm when
+        the bundle escalates or is vetoed (DW-569). The operation-specific undo marker
         makes this "undo my close", not "open these ids": human, legacy, and earlier
         run closures remain untouched. Replaying this method is idempotent.
         """

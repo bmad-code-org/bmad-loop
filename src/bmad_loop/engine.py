@@ -1033,6 +1033,7 @@ class Engine:
             gate_unit=self._gate_unit,
             carry_isolated_ledger_writes=lambda task: self._carry_isolated_ledger_writes(task),
             land_post_landing_writes=lambda task: self._land_post_landing_writes(task),
+            reopen_unlanded_close=lambda task: self._reopen_unlanded_close(task),
             escalation_pause=self._escalation_pause,
             workspace_get=lambda: self.workspace,
             workspace_set=lambda ws: setattr(self, "workspace", ws),
@@ -4920,6 +4921,15 @@ class Engine:
         ``task``'s code is on the target: after ``finalize_commit`` in place, after
         the merge-back under isolation, or on resume. Clears the latch once made; a
         write that fails raises ``RunPaused`` with the latch kept. Base: none."""
+        del task
+
+    def _reopen_unlanded_close(self, task: StoryTask) -> None:
+        """Undo the work source's writes that assumed ``task``'s code would land,
+        now that it ends without landing: before the terminal save of every
+        escalation (:meth:`_escalate`, and ``WorktreeFlow``'s ``escalate_unit`` /
+        ``keep_branch_and_escalate``) and every plugin veto (:meth:`_vetoed`).
+        A sweep reopens an isolated bundle's close in a shared-store ledger
+        (DW-569). Base: none."""
         del task
 
     def _landed_code_commit(self, task: StoryTask) -> str | None:
