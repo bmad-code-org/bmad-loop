@@ -7172,7 +7172,7 @@ class Engine:
                             run_dir_identity=self.state.run_dir_identity,
                         )
                     except OSError as exc:
-                        # Nothing published: atomic_write_text removes its temp and
+                        # Nothing published: the atomic write removes its temp and
                         # leaves the target absent, so 0 retained is the literal truth.
                         captured_bytes = 0
                         capture_error = capture_error or f"{kind}: {exc}"

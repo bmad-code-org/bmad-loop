@@ -622,8 +622,8 @@ pointers under the run's `verify/` directory (not `logs/`, which holds session p
 - **On-disk capture** is bounded by `[verify] stream_capture_kb` (default 256 KiB per stream;
   the tail is kept). `stdout_bytes` / `stderr_bytes` are what the command emitted,
   `*_captured_bytes` what reached disk, and `*_truncated` their inequality. Counts are UTF-8
-  lengths of the decoded stream, not file sizes (Windows newline translation makes files
-  larger). `0` retains nothing: no files, null pointers, full byte counts.
+  lengths of the decoded stream, not file sizes. `0` retains nothing: no files, null
+  pointers, full byte counts.
 - **Capture never fails a run.** If the write raises (ENOSPC, read-only run dir, a `verify/`
   directory whose confinement cannot be established), the pointer is null and
   `capture_error` says why. Treat both `None` and a missing file as normal, and check
