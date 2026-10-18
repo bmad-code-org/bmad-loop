@@ -48,7 +48,14 @@ from .. import (
 from ..gates import ATTENTION_FILE
 from ..journal import JOURNAL_FILE, LOGS_DIR, STATE_FILE, load_state, unreadable_line_entry
 from ..model import RunState
-from ..platform_util import resolve_or_lexical
+from ..platform_util import (
+    UnconfinedWriteError,
+    is_link_like,
+    recorded_root_identity,
+    require_root_pinned,
+    resolve_or_lexical,
+    stale_device_record,
+)
 
 # Run-inventory names relocated to bmad_loop.runs (#650) and re-exported here so
 # tui.data stays the TUI-facing surface (`data.discover_runs`, `data.RUNNING`,
@@ -113,7 +120,13 @@ class RunWatcher:
     flags; one the file is still sitting in a poll later is not torn, it is
     broken. ``attention_fault`` does the same for ATTENTION (DW-475), without the
     two-look rule — that file is appended, never parsed, so there is no torn read
-    to forgive."""
+    to forgive.
+
+    Every reload after the first good parse is pinned to that parse
+    (``load_state(pin=...)``): a run dir or ``runs/`` swapped for a link to another
+    tree raises ``UnconfinedReadError``, an ``OSError``, so the watcher keeps the
+    last good state and ``state_fault`` names the refusal rather than showing the
+    foreign record. The first read has nothing to pin to and reads by path."""
 
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
@@ -149,7 +162,7 @@ class RunWatcher:
             self.state_fault = None
             return self._state
         try:
-            self._state = load_state(self.run_dir)
+            self._state = load_state(self.run_dir, pin=self._state)
         except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
             self._note_state_fault(sig, f"state.json unreadable ({_describe(e)})")
             return self._state  # keep last good — flagged once the fault persists
@@ -222,6 +235,13 @@ class JournalTail:
     one place this reader deliberately diverges from ``Journal.entries``, which
     reads the file whole and so mints a marker for a trailing fragment
     immediately: here the marker appears once the heal terminates the fragment.
+
+    An observer, so it never refuses: unlike a pinned ``Journal.entries`` it reads
+    by path and keeps returning entries. Given the run's held state
+    (``read_new(pin=state)``), a run dir that no longer ``lstat``s as the directory
+    ``state.run_dir_identity`` records (a renumbered ``st_dev`` alone excepted, as
+    the writers except it), or — with or without a record — a run dir or
+    ``journal.jsonl`` that is a link leaves ``fault`` naming the swap — the rows shown may be another tree's. It writes nothing.
     """
 
     def __init__(self, run_dir: Path):
@@ -232,7 +252,36 @@ class JournalTail:
         # rewrite) restarts from zero — so recovering re-reads nothing twice.
         self.fault: str | None = None
 
-    def read_new(self) -> list[dict[str, Any]]:
+    def read_new(self, *, pin: RunState | None = None) -> list[dict[str, Any]]:
+        entries = self._read_new()
+        if self.fault is None:
+            self.fault = self._swap_fault(pin)
+        return entries
+
+    def _swap_fault(self, pin: RunState | None) -> str | None:
+        """Why the journal read by path may not be this run's, or None. Check only:
+        the read already happened, and observation degrades rather than refusing."""
+        if pin is None:
+            return None
+        run_dir = self.path.parent
+        if not run_dir.exists() and not run_dir.is_symlink():
+            return None  # gone, not swapped: the stat above already reads it as absent
+        record = pin.run_dir_identity
+        if record is not None and not stale_device_record(run_dir, record):
+            try:
+                require_root_pinned(run_dir, recorded_root_identity(record))
+            except UnconfinedWriteError:
+                return (
+                    f"run dir is no longer the directory this run recorded ({run_dir}) "
+                    "— journal rows may be from another tree"
+                )
+        if is_link_like(run_dir):
+            return f"run dir is a link ({run_dir}) — journal rows may be from another tree"
+        if is_link_like(self.path):
+            return "journal.jsonl is a link — journal rows may be from another file"
+        return None
+
+    def _read_new(self) -> list[dict[str, Any]]:
         sig, fault = _classified_sig(self.path)
         if fault is not None:
             self.fault = f"journal.jsonl cannot be stat'd ({fault})"

@@ -302,9 +302,15 @@ breaking changes may land in a minor release.
   (`run_dir_identity`) at every engine, CLI, TUI and re-arm writer: a run dir swapped for
   a link or another directory refuses the append or save instead of writing outside the
   run, and an append never recreates a deleted run dir. Windows appends hold
-  `FILE_APPEND_DATA` without `FILE_WRITE_DATA`. Reads and the other run-dir files
-  (`engine.pid`, `ATTENTION`, heartbeats, adapter records, `logs/`) stay path-based
-  (DW-559, DW-560).
+  `FILE_APPEND_DATA` without `FILE_WRITE_DATA`. The first `state.json` read and the other
+  run-dir files (`engine.pid`, `ATTENTION`, heartbeats, adapter records, `logs/`) stay
+  path-based (DW-559, DW-560).
+- Pin `state.json` re-reads by a caller already holding the run's state (resolve, adopt,
+  abandon, reverify, TUI replan/re-arm, the TUI state watcher) and pinned-journal
+  `Journal.entries` to the run dir's recorded identity: a run dir, `runs/` or file swapped
+  for a link or another directory AFTER the first, path-based read raises
+  `UnconfinedReadError` instead of acting on a foreign record. The TUI journal pane keeps
+  reading but names the swap (DW-564).
 - Write verify-stream logs on Windows through the same handle-anchored, pinned run-dir
   open as the journal: `verify/` is created and opened handle-relative with junctions
   refused, replacing a path check-then-write. Windows stream files no longer translate

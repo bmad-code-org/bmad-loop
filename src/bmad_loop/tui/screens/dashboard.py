@@ -803,7 +803,7 @@ class DashboardScreen(Screen[None]):
                     else:
                         snap.stories_mode = True
                         snap.stories = loaded
-                snap.new_entries = ctx.journal.read_new()
+                snap.new_entries = ctx.journal.read_new(pin=snap.state)
                 ctx.entries.extend(snap.new_entries)
                 del ctx.entries[:-_MAX_ENTRIES]
                 snap.decision = data.pending_decision(ctx.entries)

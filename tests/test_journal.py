@@ -1511,3 +1511,284 @@ def test_save_state_round_trips_through_load_state(tmp_path, monkeypatch, arm, p
 
     assert load_state(run_dir).to_dict() == state.to_dict()
     assert sorted(p.name for p in run_dir.iterdir()) == [journal_mod.STATE_FILE]
+
+
+# --------------------------------------------- pinned run-dir reads (DW-564)
+
+
+_JOURNAL_ROW = '{"ts": 1, "kind": "run-start"}\n'
+
+
+def _plant_run_files(run_dir, run_id="r1"):
+    """A real `state.json` and `journal.jsonl` in `run_dir`, bytes the readers parse."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / journal_mod.STATE_FILE).write_text(
+        json.dumps(_state().to_dict() | {"run_id": run_id}), encoding="utf-8"
+    )
+    (run_dir / journal_mod.JOURNAL_FILE).write_text(
+        f'{{"ts": 1, "kind": "{run_id}-row"}}\n', encoding="utf-8"
+    )
+
+
+def _pinned_read(reader, run_dir, pin):
+    """The value one pinned reader returns: the state's run id, or the journal kinds."""
+    if reader == "state":
+        return load_state(run_dir, pin=pin).run_id
+    return [e["kind"] for e in Journal(run_dir, pin=pin).entries()]
+
+
+def _expected(reader, run_id="r1"):
+    return run_id if reader == "state" else [f"{run_id}-row"]
+
+
+@pytest.mark.parametrize("reader", ["state", "journal"])
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+@pytest.mark.parametrize("pinned", [True, False])
+def test_pinned_reads_match_the_path_read_on_an_intact_run_dir(
+    tmp_path, monkeypatch, reader, arm, pinned
+):
+    """The positive control for every refusal below: an intact run dir reads back
+    exactly what the unpinned path read returns, with a record or without one."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "run"
+    _plant_run_files(run_dir)
+    pin = _state(_minted(run_dir) if pinned else None)
+
+    assert _pinned_read(reader, run_dir, pin) == _expected(reader)
+    assert _pinned_read(reader, run_dir, None) == _expected(reader)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("reader", ["state", "journal"])
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_pinned_reads_refuse_a_runs_dir_swapped_for_a_link_holding_a_real_run(
+    tmp_path, monkeypatch, reader, arm
+):
+    """`runs/` swapped, after the mint, for a link to a tree holding a REAL `<id>/`
+    with its own `state.json` and `journal.jsonl`: the run dir path now reaches a
+    real directory that is not the recorded one, so the pinned read refuses typed
+    and never returns the outside record. The unpinned read (the control) follows
+    the link and returns it — the defect this closes.
+
+    Ablation (run): open `_read_run_file`'s pinned run dir unpinned
+    (`open_dir_confined(run_dir.parent, run_dir)` for a record too) and the
+    `anchored` rows fail `DID NOT RAISE`, returning the outside run; drop
+    `_read_run_file_by_path`'s `require_root_pinned` and the `fallback` rows do."""
+    _save_arm(monkeypatch, arm)
+    runs_dir = tmp_path / "project" / ".bmad-loop" / "runs"
+    run_dir = runs_dir / "r1"
+    _plant_run_files(run_dir)
+    pin = _state(_minted(run_dir))
+    outside = tmp_path / "outside"
+    _plant_run_files(outside / "r1", run_id="foreign")
+    runs_dir.rename(runs_dir.with_name("runs-aside"))
+    runs_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedReadError):
+        _pinned_read(reader, run_dir, pin)
+    assert _pinned_read(reader, run_dir, None) == _expected(reader, "foreign")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("reader", ["state", "journal"])
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+@pytest.mark.parametrize("pinned", [True, False])
+def test_pinned_reads_refuse_a_run_dir_replaced_by_a_link(
+    tmp_path, monkeypatch, reader, arm, pinned
+):
+    """The run dir ITSELF replaced by a symlink to a real run: refused on the
+    pinned arm (the identity misses) and on the no-record arm (the run dir is the
+    `O_NOFOLLOW` last component of the walk, or `is_link_like` on the fallback).
+
+    Ablation (run): open the no-record arm's run dir as its own root
+    (`open_dir_confined(run_dir, run_dir)`, following a link at the root) and the
+    `anchored`/unpinned rows fail `DID NOT RAISE`; drop the fallback's
+    `is_link_like(run_dir)` check and the `fallback`/unpinned rows do."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "runs" / "r1"
+    _plant_run_files(run_dir)
+    pin = _state(_minted(run_dir) if pinned else None)
+    outside = tmp_path / "outside"
+    _plant_run_files(outside, run_id="foreign")
+    run_dir.rename(tmp_path / "runs" / "aside")
+    run_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedReadError):
+        _pinned_read(reader, run_dir, pin)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("reader", ["state", "journal"])
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_pinned_reads_refuse_a_link_at_the_file(tmp_path, monkeypatch, reader, arm):
+    """`state.json` / `journal.jsonl` itself replaced by a symlink to a real file
+    outside: the intact run dir passes the pin, and the `AT_NOFOLLOW` open (or the
+    fallback's `is_link_like(file)`) refuses typed rather than reading through it.
+
+    Ablation (run): drop `AT_NOFOLLOW` from `_read_run_file`'s open and the
+    `anchored` rows fail `DID NOT RAISE`, returning the outside file; drop the
+    fallback's `is_link_like(target)` and the `fallback` rows do."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "run"
+    _plant_run_files(run_dir)
+    pin = _state(_minted(run_dir))
+    outside = tmp_path / "outside"
+    _plant_run_files(outside, run_id="foreign")
+    name = journal_mod.STATE_FILE if reader == "state" else journal_mod.JOURNAL_FILE
+    (run_dir / name).unlink()
+    (run_dir / name).symlink_to(outside / name)
+
+    with pytest.raises(platform_util.UnconfinedReadError):
+        _pinned_read(reader, run_dir, pin)
+
+
+@pytest.mark.parametrize("reader", ["state", "journal"])
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_pinned_reads_degrade_on_a_stale_device_record(tmp_path, monkeypatch, reader, arm):
+    """A record that misses the intact run dir ONLY by `st_dev` (a reboot renumbered
+    the device) reads through the unpinned confined open instead of refusing — the
+    residual `reconcile_root_identities` already accepts — and writes no row.
+
+    Ablation (run): drop the `stale_device_record` degrade on either arm and that
+    row raises `UnconfinedReadError`."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "run"
+    _plant_run_files(run_dir)
+    dev, ino = _minted(run_dir)
+
+    assert _pinned_read(reader, run_dir, _state((dev + 1, ino))) == _expected(reader)
+    assert (run_dir / journal_mod.JOURNAL_FILE).read_text(encoding="utf-8") == (
+        '{"ts": 1, "kind": "r1-row"}\n'
+    )
+
+
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_pinned_reads_of_absent_files(tmp_path, monkeypatch, arm):
+    """Reader semantics survive the pin: an absent journal is `[]`, an absent
+    `state.json` is `FileNotFoundError`, a non-regular `journal.jsonl` is `[]`."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    pin = _state(_minted(run_dir))
+
+    assert Journal(run_dir, pin=pin).entries() == []
+    with pytest.raises(FileNotFoundError):
+        load_state(run_dir, pin=pin)
+    (run_dir / journal_mod.JOURNAL_FILE).mkdir()
+    assert Journal(run_dir, pin=pin).entries() == []
+
+
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_pinned_entries_keep_the_unreadable_line_and_utf8_contracts(tmp_path, monkeypatch, arm):
+    """A JSON-undecodable line still becomes the marker in place; invalid UTF-8 still
+    raises `UnicodeDecodeError` (``runs.journal_entries_or_none`` relies on it)."""
+    _save_arm(monkeypatch, arm)
+    pin = _state(_minted(tmp_path))
+    path = tmp_path / journal_mod.JOURNAL_FILE
+    path.write_bytes(b'{"ts": 1, "kind": "a"}\r\n{torn\n\n{"ts": 2, "kind": "b"}\n')
+
+    entries = Journal(tmp_path, pin=pin).entries()
+    assert [e["kind"] for e in entries] == ["a", journal_mod.UNREADABLE_LINE_KIND, "b"]
+    assert entries == Journal(tmp_path).entries()
+
+    path.write_bytes(b'{"ts": 1, "kind": "\xff"}\n')
+    with pytest.raises(UnicodeDecodeError):
+        Journal(tmp_path, pin=pin).entries()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="handle-anchored writes")
+def test_engine_journal_refuses_entries_after_a_run_dir_swap_after_the_mint(tmp_path):
+    """A journal built with `pin=state` (the engine's shape) whose run dir is swapped
+    after the mint: `entries()` raises instead of returning the outside rows, and a
+    record backfilled onto the held state after construction is honoured (read live).
+
+    Ablation (run): make `entries()` read by path whatever `self.pin` is and this
+    fails `DID NOT RAISE`, returning `["foreign-row"]`."""
+    run_dir = tmp_path / "runs" / "r1"
+    _plant_run_files(run_dir)
+    state = _state()
+    journal = Journal(run_dir, pin=state)
+    state.run_dir_identity = _minted(run_dir)  # the locked backfill
+    assert [e["kind"] for e in journal.entries()] == ["r1-row"]
+
+    outside = tmp_path / "outside"
+    _plant_run_files(outside / "r1", run_id="foreign")
+    (tmp_path / "runs").rename(tmp_path / "runs-aside")
+    (tmp_path / "runs").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedReadError):
+        journal.entries()
+
+
+def test_unconfined_read_error_is_an_oserror_but_not_a_write_refusal():
+    """Existing `except OSError` handlers degrade on it; a handler that tells write
+    refusals apart does not file a read refusal with them."""
+    assert issubclass(platform_util.UnconfinedReadError, OSError)
+    assert not issubclass(platform_util.UnconfinedReadError, platform_util.UnconfinedWriteError)
+
+
+@pytest.mark.parametrize("reader", ["state", "journal"])
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_pinned_reads_refuse_a_run_dir_replaced_by_a_real_directory(
+    tmp_path, monkeypatch, reader, arm
+):
+    """The platform-independent refusal (no links, so it runs on Windows too): the
+    run dir renamed aside after the mint and a fresh REAL directory, holding its own
+    files, created at its path. The identity misses, so the pinned read refuses.
+
+    Ablation (run): open `_read_run_file`'s pinned run dir unpinned and the
+    `anchored` rows fail `DID NOT RAISE`; drop `_read_run_file_by_path`'s
+    `require_root_pinned` and the `fallback` rows do."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "runs" / "r1"
+    _plant_run_files(run_dir)
+    pin = _state(_minted(run_dir))
+    run_dir.rename(tmp_path / "runs" / "aside")
+    _plant_run_files(run_dir, run_id="foreign")
+
+    with pytest.raises(platform_util.UnconfinedReadError):
+        _pinned_read(reader, run_dir, pin)
+    assert _pinned_read(reader, run_dir, None) == _expected(reader, "foreign")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+@pytest.mark.parametrize("reader", ["state", "journal"])
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_pinned_reads_do_not_block_on_a_fifo(tmp_path, monkeypatch, reader, arm):
+    """A FIFO planted at `journal.jsonl` / `state.json` is not a regular file: the
+    pinned journal reads `[]` and the pinned state raises `FileNotFoundError`, and
+    neither blocks. The read runs in a thread with a join timeout so a regression
+    FAILS rather than hanging the suite; the FIFO's writer end is opened afterwards
+    to release a reader stuck in `open`.
+
+    Ablation (run): drop `AT_NONBLOCK` from `_read_run_file`'s open and the
+    `anchored` rows fail on the timeout (the open waits for a writer)."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    pin = _state(_minted(run_dir))
+    name = journal_mod.STATE_FILE if reader == "state" else journal_mod.JOURNAL_FILE
+    fifo = run_dir / name
+    os.mkfifo(fifo)
+    outcome: list[object] = []
+
+    def read():
+        try:
+            outcome.append(_pinned_read(reader, run_dir, pin))
+        except BaseException as e:  # reported on the main thread below
+            outcome.append(e)
+
+    worker = threading.Thread(target=read, daemon=True)
+    worker.start()
+    worker.join(5)
+    blocked = worker.is_alive()
+    if blocked:
+        with suppress(OSError):
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        worker.join(5)
+    assert not blocked, "the pinned read blocked opening a FIFO"
+    if reader == "state":
+        assert len(outcome) == 1 and isinstance(outcome[0], FileNotFoundError), outcome
+    else:
+        assert outcome == [[]]

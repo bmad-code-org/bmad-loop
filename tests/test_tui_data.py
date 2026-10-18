@@ -2163,3 +2163,128 @@ def test_pending_missed_decisions_none_pending_is_an_answer(project):
     # `ledger` names what the (empty) listing was read from, for the answer's
     # `listed_ledger` guard.
     assert missed == data.MissedDecisions([], ledger=project.deferred_work)
+
+
+# ----------------------------------------- pinned reads in the observer (DW-564)
+
+
+def _swap_runs_dir_for_a_foreign_tree(root: Path, run_id: str) -> Path:
+    """Swap `runs/` for a link to an outside tree holding a REAL `<run_id>/` with its
+    own state.json and journal.jsonl; return that outside run dir."""
+    outside = root.parent / f"{root.name}-outside"
+    foreign = outside / run_id
+    save_state(
+        foreign,
+        RunState(run_id=run_id, project="elsewhere", started_at="t", current_epic=99),
+    )
+    Journal(foreign).append("foreign-row")
+    runs_dir = root / RUNS_DIR
+    runs_dir.rename(runs_dir.with_name("runs-aside"))
+    runs_dir.symlink_to(outside, target_is_directory=True)
+    return foreign
+
+
+def _minted_run(root: Path, run_id: str = "20260611-100000-aaaa") -> tuple[Path, RunState]:
+    run_dir = root / RUNS_DIR / run_id
+    run_dir.mkdir(parents=True)
+    state = RunState(
+        run_id=run_id,
+        project=str(root),
+        started_at="t",
+        current_epic=1,
+        run_dir_identity=platform_util.root_identity_record(run_dir),
+    )
+    save_state(run_dir, state)
+    Journal(run_dir, pin=state).append("run-start")
+    return run_dir, state
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_journal_tail_flags_a_swapped_run_dir_and_keeps_reading(tmp_path):
+    """An observer never refuses: with the run's held state, a `runs/` swapped for a
+    link to a foreign tree still yields rows (read by path), but `fault` names the
+    swap so the pane is not presented as this run's. An intact dir sets no fault.
+
+    Ablation (run): drop `self.fault = self._swap_fault(pin)` in `read_new` and the
+    swapped look's `fault` assertion fails with None."""
+    run_dir, state = _minted_run(tmp_path)
+    tail = data.JournalTail(run_dir)
+    assert [e["kind"] for e in tail.read_new(pin=state)] == ["run-start"]
+    assert tail.fault is None
+
+    _swap_runs_dir_for_a_foreign_tree(tmp_path, run_dir.name)
+    tail = data.JournalTail(run_dir)
+    assert [e["kind"] for e in tail.read_new(pin=state)] == ["foreign-row"]
+    assert tail.fault is not None and "no longer the directory" in tail.fault
+    assert [e["kind"] for e in data.JournalTail(run_dir).read_new()] == ["foreign-row"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_journal_tail_flags_a_linked_journal_file(tmp_path):
+    """`journal.jsonl` itself replaced by a link: rows still returned, `fault` set."""
+    run_dir, state = _minted_run(tmp_path)
+    outside = tmp_path / "elsewhere.jsonl"
+    outside.write_text('{"ts": 1, "kind": "foreign-row"}\n', encoding="utf-8")
+    (run_dir / "journal.jsonl").unlink()
+    (run_dir / "journal.jsonl").symlink_to(outside)
+
+    tail = data.JournalTail(run_dir)
+    assert [e["kind"] for e in tail.read_new(pin=state)] == ["foreign-row"]
+    assert tail.fault is not None and "journal.jsonl is a link" in tail.fault
+
+
+def test_journal_tail_pin_tolerates_a_stale_device_or_absent_record(tmp_path):
+    """A renumbered `st_dev` alone (the writers' degrade) and a state with no record
+    are not swaps: no fault."""
+    run_dir, state = _minted_run(tmp_path)
+    dev, ino = state.run_dir_identity
+    for record in ((dev + 1, ino), None):
+        state.run_dir_identity = record
+        tail = data.JournalTail(run_dir)
+        assert [e["kind"] for e in tail.read_new(pin=state)] == ["run-start"]
+        assert tail.fault is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_watcher_refuses_a_foreign_state_after_a_runs_dir_swap(tmp_path):
+    """The watcher's reloads are pinned to its last good parse: `runs/` swapped for a
+    link to a tree holding a real `<id>/state.json` keeps the last good state and,
+    once the fault persists, names the refusal — never shows the foreign record.
+
+    Ablation (run): drop `pin=self._state` from `RunWatcher.state`'s `load_state`
+    and the second look returns `current_epic == 99`."""
+    run_dir, _ = _minted_run(tmp_path)
+    watcher = data.RunWatcher(run_dir)
+    assert watcher.state().current_epic == 1
+
+    _swap_runs_dir_for_a_foreign_tree(tmp_path, run_dir.name)
+    assert watcher.state().current_epic == 1
+    assert watcher.state().current_epic == 1
+    assert watcher.state_fault is not None
+    assert "UnconfinedReadError" in watcher.state_fault
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("linked", ["journal", "run-dir"])
+def test_journal_tail_flags_a_link_on_a_no_record_run(tmp_path, linked):
+    """A pin with no `run_dir_identity` has no identity to compare, but the pinned
+    readers still refuse a link at the run dir or at `journal.jsonl` there — so the
+    pane flags both, too.
+
+    Ablation (run): return None from `_swap_fault` when the pin has no record and
+    both rows fail with `fault` None."""
+    run_dir, state = _minted_run(tmp_path)
+    state.run_dir_identity = None
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "journal.jsonl").write_text('{"ts": 1, "kind": "foreign-row"}\n', encoding="utf-8")
+    if linked == "journal":
+        (run_dir / "journal.jsonl").unlink()
+        (run_dir / "journal.jsonl").symlink_to(outside / "journal.jsonl")
+    else:
+        run_dir.rename(run_dir.with_name("aside"))
+        run_dir.symlink_to(outside, target_is_directory=True)
+
+    tail = data.JournalTail(run_dir)
+    assert [e["kind"] for e in tail.read_new(pin=state)] == ["foreign-row"]
+    assert tail.fault is not None and "is a link" in tail.fault
