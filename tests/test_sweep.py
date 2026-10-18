@@ -25942,8 +25942,7 @@ def test_manifest_publication_refuses_a_redirect_after_baseline_is_durable(
         project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
     )
     real_save = engine._save
-    parked = tmp_path / "run-before-manifest-redirect"
-    outside = tmp_path / "outside"
+    parked = tmp_path / "outside" / "sweep-run"
     redirected = []
 
     def save_then_redirect():
@@ -25951,9 +25950,7 @@ def test_manifest_publication_refuses_a_redirect_after_baseline_is_durable(
         task = engine.state.tasks.get("sweep-migrate")
         if task is not None and task.migration_recovery_format == 1 and not redirected:
             redirected.append(True)
-            engine.run_dir.rename(parked)
-            outside.mkdir()
-            engine.run_dir.symlink_to(outside, target_is_directory=True)
+            assert _redirect_the_runs_parent(engine.run_dir, tmp_path) == parked
 
     monkeypatch.setattr(engine, "_save", save_then_redirect)
     summary = engine.run()
@@ -25961,7 +25958,8 @@ def test_manifest_publication_refuses_a_redirect_after_baseline_is_durable(
     assert summary.crashed and adapter.sessions == []
     assert redirected == [True]
     assert (parked / "migrate-baseline.md").read_text(encoding="utf-8") == LEGACY_LEDGER
-    assert not (outside / "migrate-manifest.json").exists()
+    assert not (parked / "migrate-manifest.json").exists()
+    assert list(parked.glob("migrate-manifest*")) == []  # no staged temp either
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -26024,17 +26022,14 @@ def test_result_publication_refuses_a_redirect_after_rewrite_is_durable(
     mapping = _valid_migration_mapping()
     engine, adapter = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
     real_write = sweep_mod.atomic_write_text_confined
-    parked = tmp_path / "run-before-result-redirect"
-    outside = tmp_path / "outside"
+    parked = tmp_path / "outside" / "sweep-run"
     redirected = []
 
     def write_then_redirect(path, text, **kwargs):
         result = real_write(path, text, **kwargs)
         if path.name == "migrate-rewrite.md" and not redirected:
             redirected.append(True)
-            engine.run_dir.rename(parked)
-            outside.mkdir()
-            engine.run_dir.symlink_to(outside, target_is_directory=True)
+            assert _redirect_the_runs_parent(engine.run_dir, tmp_path) == parked
         return result
 
     monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", write_then_redirect)
@@ -26043,7 +26038,8 @@ def test_result_publication_refuses_a_redirect_after_rewrite_is_durable(
     assert summary.crashed and len(adapter.sessions) == 1
     assert redirected == [True]
     assert (parked / "migrate-rewrite.md").read_text(encoding="utf-8") == migrated_ledger()
-    assert not (outside / "migrate-result.json").exists()
+    assert not (parked / "migrate-result.json").exists()
+    assert list(parked.glob("migrate-result*")) == []  # no staged temp either
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")

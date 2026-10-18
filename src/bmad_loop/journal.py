@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from .platform_util import (
     AT_DIRECTORY,
     AT_NOFOLLOW,
     DIR_FD_ANCHORED_WRITES,
+    HANDLE_ANCHORED_WRITES,
     RootIdentityRecord,
     UnconfinedWriteError,
     append_line_confined,
@@ -519,12 +520,89 @@ def state_lock(run_dir: Path, *, blocking: bool = True) -> Iterator[None]:
 
 
 def save_state(run_dir: Path, state: RunState) -> None:
+    """Atomically persist ``state`` as ``run_dir/state.json`` under :func:`state_lock`.
+
+    The write goes through a descriptor on the run dir pinned to
+    ``state.run_dir_identity``, the mint-time ``(st_dev, st_ino)`` record, read
+    from ``state`` on every call. That is the same rule :meth:`Journal.append`
+    follows. On both arms of :data:`HANDLE_ANCHORED_WRITES`:
+
+    - **Pinned** (a record): the run dir is opened by :func:`open_dir_confined`
+      and must be the recorded directory. A run dir that is missing, a link, or
+      a different directory raises :class:`UnconfinedWriteError`. Nothing is
+      created and nothing is written.
+    - **Unpinned** (no record: a pre-upgrade state not yet backfilled, a
+      zero-inode claim, or a bare ``RunState``): the run dir is created if absent,
+      then opened as the last component of a walk from its parent. That open is
+      ``O_NOFOLLOW``, so a link AT the run dir still refuses.
+      ``mkdir(exist_ok=True)`` accepts a symlink-to-directory, so the open, not
+      the ``mkdir``, is what refuses it. Ancestors are followed.
+    - **Stale device** (the record misses an intact run dir only by a renumbered
+      ``st_dev``, :func:`stale_device_record`): the unpinned open, the residual
+      ``runs.reconcile_root_identities`` already accepts when it re-binds. No row
+      is written here, because this function has no journal. Every production
+      writer that saves a run's state also appends to that run's journal with
+      the same ``RunState``, so the journal's ``journal-unpinned`` row covers
+      both records.
+
+    :func:`atomic_write_text_at` stages at a unique, unguessable temp name beside
+    ``state.json``, fsyncs, then replaces relative to the descriptor. On Windows
+    the replace retries the transient sharing violation a concurrent reader
+    raises. The file lands ``0600`` and inherits no prior mode: every reader of
+    ``state.json`` runs as the same user.
+
+    Hosts with neither anchored arm get the path-based fallback, mirroring
+    :meth:`Journal.write_verify_stream`'s: the pin pre-check
+    (:func:`require_root_pinned`), the ``mkdir`` when unpinned, a refusal when the
+    run dir is link-like, a fixed temp sibling, the pin checked again, then
+    :func:`atomic_replace` (the temp is removed when either fails). That is
+    check-then-write, the residual :func:`path_is_confined` documents.
+    """
     with state_lock(run_dir):
-        run_dir.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(state.to_dict(), indent=2)
+        record = state.run_dir_identity
+        if HANDLE_ANCHORED_WRITES:
+            if record is None:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                dir_fd = open_dir_confined(run_dir.parent, run_dir)
+            else:
+                dir_fd = open_dir_confined(
+                    run_dir, run_dir, root_identity=recorded_root_identity(record)
+                )
+                if dir_fd is None and stale_device_record(run_dir, record):
+                    dir_fd = open_dir_confined(run_dir.parent, run_dir)
+            if dir_fd is None:
+                raise UnconfinedWriteError(
+                    f"refusing to write {STATE_FILE} into an unconfined or replaced run dir: "
+                    f"{run_dir}"
+                )
+            try:
+                atomic_write_text_at(dir_fd, STATE_FILE, text)
+            finally:
+                os.close(dir_fd)
+            return
+        identity = (
+            None
+            if record is None or stale_device_record(run_dir, record)
+            else recorded_root_identity(record)
+        )
+        require_root_pinned(run_dir, identity)
+        if identity is None:
+            run_dir.mkdir(parents=True, exist_ok=True)
+        if is_link_like(run_dir):
+            raise UnconfinedWriteError(
+                f"refusing to write {STATE_FILE} into a redirected run dir: {run_dir}"
+            )
         target = run_dir / STATE_FILE
         tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
-        atomic_replace(tmp, target)
+        tmp.write_text(text, encoding="utf-8")
+        try:
+            require_root_pinned(run_dir, identity)
+            atomic_replace(tmp, target)
+        except BaseException:
+            with suppress(OSError):
+                tmp.unlink()
+            raise
 
 
 def load_state(run_dir: Path) -> RunState:

@@ -145,7 +145,9 @@ breaking changes may land in a minor release.
   refused), write LF-terminated UTF-8 bytes on every platform, and record
   `journal-unpinned` once per writer when the run has no recorded identity or a
   renumbered device. Every engine, CLI, TUI and re-arm writer is pinned to the run's
-  recorded identity; the resume backfills the record before its first row.
+  recorded identity; the resume backfills the record before its first row. Write
+  `state.json` through the same pinned run-dir descriptor (owner-only mode, unique temp,
+  fsync before replace).
 
 ### Removed
 

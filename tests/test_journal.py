@@ -1,7 +1,8 @@
 """State persistence: the atomic write must survive the transient Windows
 sharing violation (WinError 5) a concurrent TUI reader triggers. The retry
-lives in platform_util.atomic_replace (unit-tested there); this proves
-save_state still rides it end to end."""
+lives in platform_util.atomic_replace (unit-tested there) and in
+platform_util.replace_at's win32 branch; the tests below prove save_state rides
+each of them end to end, on the arm that reaches it."""
 
 from __future__ import annotations
 
@@ -21,8 +22,17 @@ from bmad_loop.journal import Journal, load_state, save_state, state_lock
 from bmad_loop.model import RunState
 
 
+def _force_path_fallback(monkeypatch):
+    """Take save_state's path-based fallback: no handle-anchored arm on this host."""
+    monkeypatch.setattr(journal_mod, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "HANDLE_ANCHORED_WRITES", False)
+    monkeypatch.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+
+
 def test_save_state_retries_transient_sharing_violation(tmp_path, monkeypatch):
-    """On win32, os.replace denied by a concurrent reader is retried, not fatal."""
+    """On win32, os.replace denied by a concurrent reader is retried, not fatal —
+    on the path-based fallback arm, through `atomic_replace`."""
+    _force_path_fallback(monkeypatch)
     monkeypatch.setattr(platform_util.sys, "platform", "win32")
     monkeypatch.setattr(platform_util.time, "sleep", lambda _s: None)  # no real backoff
     monkeypatch.setattr(
@@ -44,6 +54,47 @@ def test_save_state_retries_transient_sharing_violation(tmp_path, monkeypatch):
 
     assert calls["n"] == 3
     assert load_state(tmp_path).run_id == "r1"
+
+
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="handle-anchored writes")
+def test_save_state_anchored_win32_arm_retries_through_replace_at(tmp_path, monkeypatch):
+    """The anchored arm's replace is `platform_util.replace_at`, whose win32 branch
+    retries the same sharing violation around `win32_at.replace_at`. The branch is
+    taken for the replace alone (`DIR_FD_ANCHORED_WRITES` False inside it), so the
+    descriptor walk before it stays this host's own; on Windows that is a no-op.
+
+    Ablation: call `win32_at.replace_at` bare in `replace_at` (drop the
+    `_retry_on_sharing_violation` wrapper) and this fails on the first
+    `PermissionError`."""
+    real_dir_fd = platform_util.DIR_FD_ANCHORED_WRITES
+    real_win32_replace_at = platform_util.win32_at.replace_at
+    real_replace_at = platform_util.replace_at
+    monkeypatch.setattr(platform_util.time, "sleep", lambda _s: None)  # no real backoff
+    calls = {"n": 0}
+
+    def flaky_replace_at(src_dir_fd, src, dst_dir_fd, dst):
+        calls["n"] += 1
+        if calls["n"] < 3:  # first two collide, third lands
+            raise PermissionError(5, "Access is denied")
+        if real_dir_fd:
+            os.replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        else:
+            real_win32_replace_at(src_dir_fd, src, dst_dir_fd, dst)
+
+    def win32_branch_replace_at(*args):
+        with monkeypatch.context() as m:
+            m.setattr(platform_util, "DIR_FD_ANCHORED_WRITES", False)
+            m.setattr(platform_util.sys, "platform", "win32")
+            real_replace_at(*args)
+
+    monkeypatch.setattr(platform_util.win32_at, "replace_at", flaky_replace_at)
+    monkeypatch.setattr(platform_util, "replace_at", win32_branch_replace_at)
+
+    save_state(tmp_path, _state(_minted(tmp_path)))
+
+    assert calls["n"] == 3
+    assert load_state(tmp_path).run_id == "r1"
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
 
 
 def test_state_lock_holds_the_canonical_run_sidecar(tmp_path):
@@ -207,10 +258,14 @@ def test_save_state_root_error_writes_nothing(tmp_path, monkeypatch):
     assert not run_dir.exists()
 
 
-def test_two_concurrent_saves_never_share_the_fixed_temp_file(tmp_path, monkeypatch):
-    """Ablation: remove save_state's state_lock and the second replace enters while
-    the first is paused, so both calls race on state.json.tmp and one loses it."""
-    real_replace = journal_mod.atomic_replace
+def test_two_concurrent_saves_are_serialised_by_the_state_lock(tmp_path, monkeypatch):
+    """state_lock serialises two saves; both land whole. The second save waits on
+    the lock while the first is paused inside its replace, and neither raises.
+
+    Ablation: remove save_state's state_lock and the second replace enters while
+    the first is paused, so `replace_threads` reads `["first", "second"]` at the
+    checkpoint."""
+    real_replace_at = platform_util.replace_at
     real_file_lock = journal_mod.file_lock
     first_entered = threading.Event()
     second_attempted = threading.Event()
@@ -224,14 +279,14 @@ def test_two_concurrent_saves_never_share_the_fixed_temp_file(tmp_path, monkeypa
         with real_file_lock(path, **_kw):
             yield
 
-    def controlled_replace(src, dst):
+    def controlled_replace(src_dir_fd, src, dst_dir_fd, dst):
         replace_threads.append(threading.current_thread().name)
         if len(replace_threads) == 1:
             first_entered.set()
             assert release_first.wait(2)
-        real_replace(src, dst)
+        real_replace_at(src_dir_fd, src, dst_dir_fd, dst)
 
-    monkeypatch.setattr(journal_mod, "atomic_replace", controlled_replace)
+    monkeypatch.setattr(platform_util, "replace_at", controlled_replace)
     monkeypatch.setattr(journal_mod, "file_lock", observed_file_lock)
     errors: list[BaseException] = []
 
@@ -1112,3 +1167,181 @@ def test_marker_survives_the_journal_entries_or_none_dict_filter(tmp_path):
     assert before is not None and after is not None
     assert len(before) == 2 and before == after
     assert before[0]["kind"] == journal_mod.UNREADABLE_LINE_KIND
+
+
+# ------------------------------------------------- save_state confinement (DW-559)
+
+
+def _save_arm(monkeypatch, arm):
+    """Drive save_state on `arm`: the host's handle-anchored arm or the path fallback."""
+    if arm == "anchored":
+        if not platform_util.HANDLE_ANCHORED_WRITES:
+            pytest.skip("handle-anchored writes")
+    else:
+        _force_path_fallback(monkeypatch)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_save_state_pinned_refuses_a_swapped_run_dir(tmp_path, monkeypatch, arm):
+    """`runs/` swapped, after the mint, for a link to a tree holding a REAL `<id>/`:
+    the run dir path now reaches a real directory that is not the recorded one, so
+    the pinned save refuses with the typed error and nothing lands on either side.
+
+    Ablation: open the anchored arm's run dir unpinned (`open_dir_confined(
+    run_dir.parent, run_dir)` for a record too) and the `anchored` row fails `DID
+    NOT RAISE`, with `outside/r1/state.json` written; drop the fallback's
+    `require_root_pinned` calls and the `fallback` row fails the same way."""
+    _save_arm(monkeypatch, arm)
+    runs_dir = tmp_path / "project" / ".bmad-loop" / "runs"
+    run_dir = runs_dir / "r1"
+    run_dir.mkdir(parents=True)
+    state = _state(_minted(run_dir))
+    outside = tmp_path / "outside"
+    (outside / "r1").mkdir(parents=True)
+    runs_dir.rename(runs_dir.with_name("runs-aside"))
+    runs_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        save_state(run_dir, state)
+
+    assert list((outside / "r1").iterdir()) == []
+    assert list((runs_dir.with_name("runs-aside") / "r1").iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_save_state_unpinned_creates_the_run_dir_and_refuses_a_link_at_it(
+    tmp_path, monkeypatch, arm
+):
+    """A bare `RunState` (no record) still creates a missing run dir, as every
+    `save_state` caller that mints a dir through it relies on. Unpinned still means
+    confined: a link AT the run dir refuses, because `mkdir(exist_ok=True)` accepts
+    a symlink-to-directory and only the `O_NOFOLLOW` open (or, on the fallback, the
+    `is_link_like` check) stands between the write and the link's target.
+
+    Ablation: open the anchored arm's unpinned run dir as its own root
+    (`open_dir_confined(run_dir, run_dir)`, which follows a link at the root) and the
+    `anchored` row fails `DID NOT RAISE`; drop the fallback's `is_link_like(run_dir)`
+    check and the `fallback` row does."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "runs" / "r1"
+    save_state(run_dir, _state())
+    assert load_state(run_dir).run_id == "r1"
+
+    linked, elsewhere = tmp_path / "linked", tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    linked.symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        save_state(linked, _state())
+    assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_save_state_stale_device_record_degrades_to_the_unpinned_write(tmp_path, monkeypatch, arm):
+    """A record that misses the intact run dir ONLY by `st_dev` (a reboot renumbered
+    the device) writes through the unpinned open instead of refusing — the residual
+    `reconcile_root_identities` already accepts. No row: save_state has no journal.
+
+    Ablation: drop the `stale_device_record` degrade on either arm and that row
+    raises `UnconfinedWriteError`."""
+    _save_arm(monkeypatch, arm)
+    dev, ino = _minted(tmp_path)
+
+    save_state(tmp_path, _state((dev + 1, ino)))
+
+    assert load_state(tmp_path).run_dir_identity == (dev + 1, ino)
+
+
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+def test_save_state_pinned_refuses_a_recorded_run_dir_that_is_gone(tmp_path, monkeypatch, arm):
+    """A pinned save never recreates its run dir: only the unpinned arm mkdirs, so a
+    recorded run dir removed underneath raises rather than being resurrected."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    state = _state(_minted(run_dir))
+    shutil.rmtree(run_dir)
+
+    with pytest.raises(platform_util.UnconfinedWriteError):
+        save_state(run_dir, state)
+    assert not run_dir.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+@pytest.mark.skipif(not platform_util.HANDLE_ANCHORED_WRITES, reason="handle-anchored writes")
+@pytest.mark.parametrize("pinned", [True, False])
+def test_save_state_lands_a_private_mode(tmp_path, pinned):
+    """state.json lands `0600` whatever the umask, and keeps it over a prior file of
+    a wider mode: `atomic_write_text_at` states its mode and inherits nothing. The
+    `0o022` bracket is the point (see `test_atomic_write_text_at_lands_a_private_mode`).
+
+    Ablation: revert save_state to the `write_text` + `atomic_replace` pair and both
+    rows fail reporting 0o644."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / journal_mod.STATE_FILE).write_text("{}", encoding="utf-8")
+    os.chmod(run_dir / journal_mod.STATE_FILE, 0o644)
+    previous = os.umask(0o022)
+    try:
+        save_state(run_dir, _state(_minted(run_dir) if pinned else None))
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(os.stat(run_dir / journal_mod.STATE_FILE).st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_save_state_fallback_repins_before_the_replace(tmp_path, monkeypatch):
+    """`runs/` swapped for a link to a tree holding a real `<id>/` AFTER the first
+    pin (on the `is_link_like` call, before the temp is written) is caught by the
+    SECOND `require_root_pinned`, just before the replace. The run dir is a real
+    directory reached through the link, so the link check alone passes the swap.
+    The temp the write staged there is removed with the refusal.
+
+    Ablation: drop the second `require_root_pinned(run_dir, identity)` and this
+    fails `DID NOT RAISE`, with `outside/r1/state.json` written."""
+    _force_path_fallback(monkeypatch)
+    runs_dir = tmp_path / "project" / ".bmad-loop" / "runs"
+    run_dir = runs_dir / "r1"
+    run_dir.mkdir(parents=True)
+    state = _state(_minted(run_dir))
+    outside = tmp_path / "outside"
+    (outside / "r1").mkdir(parents=True)
+    real_is_link_like = journal_mod.is_link_like
+    swapped = False
+
+    def swap_then_check(path):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            runs_dir.rename(runs_dir.with_name("runs-aside"))
+            runs_dir.symlink_to(outside, target_is_directory=True)
+        return real_is_link_like(path)
+
+    monkeypatch.setattr(journal_mod, "is_link_like", swap_then_check)
+
+    with pytest.raises(platform_util.UnconfinedWriteError, match=r"no longer the directory"):
+        save_state(run_dir, state)
+
+    assert swapped  # the premise: the swap happened after the first pin
+    assert list((outside / "r1").iterdir()) == []
+    assert list((runs_dir.with_name("runs-aside") / "r1").iterdir()) == []
+
+
+@pytest.mark.parametrize("arm", ["anchored", "fallback"])
+@pytest.mark.parametrize("pinned", [True, False])
+def test_save_state_round_trips_through_load_state(tmp_path, monkeypatch, arm, pinned):
+    """The positive control for every refusal above: an intact run dir saves and
+    loads back the same state on both arms, pinned or not, and leaves no temp."""
+    _save_arm(monkeypatch, arm)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    state = _state(_minted(run_dir) if pinned else None)
+    state.finished = True
+
+    save_state(run_dir, state)
+    save_state(run_dir, state)  # over an existing state.json
+
+    assert load_state(run_dir).to_dict() == state.to_dict()
+    assert sorted(p.name for p in run_dir.iterdir()) == [journal_mod.STATE_FILE]

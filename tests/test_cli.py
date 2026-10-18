@@ -22796,7 +22796,7 @@ def test_resume_backfills_legacy_root_identities_once(project, monkeypatch):
 def _resume_with_records(project, monkeypatch, record_of):
     """A paused mounted run whose persisted records are ``record_of(path)`` for the
     run dir and the mount; returns ``(run_dir, mount, argv)`` with a stub engine."""
-    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.journal import STATE_FILE, load_state
     from bmad_loop.model import Phase, StoryTask
 
     run_dir = _paused_run_for_resume(
@@ -22819,7 +22819,9 @@ def _resume_with_records(project, monkeypatch, record_of):
     state = load_state(run_dir)
     state.run_dir_identity = record_of(run_dir)
     state.tasks["1-1-a"].worktree_identity = record_of(mount)
-    save_state(run_dir, state)
+    # Seeded as persisted bytes, not through `save_state`: a record naming another
+    # inode is this helper's premise, and the pinned save refuses exactly that.
+    (run_dir / STATE_FILE).write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
     monkeypatch.setattr(cli, "Engine", _StubEngine)
     return run_dir, mount, ["resume", "--project", str(project.project), run_dir.name]
 
