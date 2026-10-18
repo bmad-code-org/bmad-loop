@@ -49,6 +49,10 @@ def _make_run(project, run_id, with_state=True):
 
 def _make_state_run(project, run_id, **state_kwargs):
     run_dir = project / ".bmad-loop" / "runs" / run_id
+    # A minted run carries its run dir's identity, so the CLI/runs writers' pinned
+    # journals append without a `journal-unpinned` notice.
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_kwargs.setdefault("run_dir_identity", platform_util.root_identity_record(run_dir))
     save_state(
         run_dir,
         RunState(
@@ -849,6 +853,23 @@ def test_stop_run_no_pid_falls_back_to_mark(tmp_path, monkeypatch):
     assert killed == ["r1"]
     journal = (run_dir / "journal.jsonl").read_text()
     assert "run-stop" in journal and '"fallback": true' in journal
+
+
+def test_stop_of_a_legacy_run_writes_one_unpinned_notice(tmp_path, monkeypatch):
+    """A run whose state.json predates the recorded run-dir identity (never resumed
+    since) is stopped through a journal pinned to that state: the append degrades to
+    a confined-but-unpinned write and says so ONCE, ahead of the `run-stop` row.
+
+    Ablation: drop `pin=state` from the `run-stop` row and the notice is missing."""
+    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
+    run_dir = _make_state_run(tmp_path, "r1", run_dir_identity=None)
+
+    assert runs.stop_run(run_dir) is True
+
+    entries = Journal(run_dir).entries()
+    assert [e["kind"] for e in entries] == ["journal-unpinned", "run-stop"]
+    assert entries[0]["reason"] == "no-record"
+    assert entries[1]["fallback"] is True
 
 
 def test_stop_run_dead_pid_falls_back(tmp_path, monkeypatch):
@@ -4059,6 +4080,32 @@ def _escalated_run(tmp_path, spec_text, *, restore_patch_stale=None, git_project
         git_project=git_project,
     )
     return run.run_dir, spec
+
+
+@pytest.mark.parametrize("record", ["legacy", "renumbered"])
+def test_rearm_journal_pins_to_the_reconciled_record(tmp_path, record):
+    """The re-arm's journal is pinned to the state it reconciles, and
+    `reconcile_root_identities` assigns the record BEFORE journaling it, so the
+    `root-identity-*` row and every row after it go through the fresh record: no
+    `journal-unpinned` notice, for a legacy state (no record) and for a record a
+    reboot renumbered (same inode, other `st_dev`) alike.
+
+    Ablation: journal before assigning in `reconcile_root_identities` (the old order)
+    and both rows redden — the legacy row on a `no-record` notice, the renumbered row
+    on a `stale-device` one."""
+    run_dir, _spec = _escalated_run(tmp_path, "---\nstatus: escalated\n---\n")
+    state = load_state(run_dir)
+    dev, ino = platform_util.root_identity_record(run_dir)
+    state.run_dir_identity = None if record == "legacy" else (dev + 1, ino)
+    save_state(run_dir, state)
+
+    runs.rearm_escalation(run_dir, "1-1-a", isolated_redrive=False, resolution_recorded=False)
+
+    kinds = [e["kind"] for e in Journal(run_dir).entries()]
+    expected = "root-identity-recorded" if record == "legacy" else "root-identity-rebound"
+    assert kinds[0] == expected, kinds
+    assert "journal-unpinned" not in kinds
+    assert load_state(run_dir).run_dir_identity == (dev, ino)
 
 
 # --------------------------------------------------- restamp_code_root

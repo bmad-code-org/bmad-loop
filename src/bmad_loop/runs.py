@@ -3248,7 +3248,7 @@ def _stop_run_once(run_dir: Path) -> bool | None:
             already_stopped = True
             clear_request = True
         elif engine_may_live and not lodged:
-            Journal(run_dir).append("run-stop-undelivered", pid=pid)
+            Journal(run_dir, pin=state).append("run-stop-undelivered", pid=pid)
             raise StopRunError(
                 f"run {run_dir.name}: the stop request could not be written to the run "
                 "directory and the engine could not be proved dead, so no stop is pending. "
@@ -3289,7 +3289,7 @@ def _stop_run_once(run_dir: Path) -> bool | None:
     # The locked branch above performed the external fallback's final
     # read-modify-write.  The journal remains outside the state transaction: it is
     # append-only observation, not part of state publication.
-    Journal(run_dir).append("run-stop", pid=pid, fallback=True)
+    Journal(run_dir, pin=state).append("run-stop", pid=pid, fallback=True)
     return True
 
 
@@ -4970,10 +4970,19 @@ def reconcile_root_identities(
     refusing. An unpinnable or zero-inode root with no record records nothing and
     journals nothing. Only the locked resume and re-arm call this — including a
     TUI-launched re-arm (`_do_rearm` → `rearm_escalation`), which reconciles like
-    any re-arm; the TUI's replan pin (the observer path) never does."""
+    any re-arm; the TUI's replan pin (the observer path) never does.
+
+    Each record is assigned BEFORE its row is journaled. ``journal`` is pinned to
+    this same ``state`` and reads ``run_dir_identity`` live per append, so the
+    ``root-identity-*`` row for the run dir is itself written through the fresh
+    record — journaled first, a renumbered device would refuse (or degrade) the
+    very row that records the re-bind. The worktree half keeps the same order."""
     changed = False
     old = state.run_dir_identity
     new, what = _reconcile_one_root(old, run_dir)
+    if what is not None:
+        state.run_dir_identity = new
+        changed = True
     if what == "recorded" and new is not None:
         journal.append(
             "root-identity-recorded", root="run-dir", path=str(run_dir), dev=new[0], ino=new[1]
@@ -4987,15 +4996,15 @@ def reconcile_root_identities(
             dev=new[0],
             ino=new[1],
         )
-    if what is not None:
-        state.run_dir_identity = new
-        changed = True
     for task in state.tasks.values():
         if not task.worktree_path:
             continue
         mount = rebase_recorded_project_path(Path(task.worktree_path), state, project_root)
         old = task.worktree_identity
         new, what = _reconcile_one_root(old, mount)
+        if what is not None:
+            task.worktree_identity = new
+            changed = True
         if what == "recorded" and new is not None:
             journal.append(
                 "root-identity-recorded",
@@ -5015,9 +5024,6 @@ def reconcile_root_identities(
                 dev=new[0],
                 ino=new[1],
             )
-        if what is not None:
-            task.worktree_identity = new
-            changed = True
     return changed
 
 
@@ -5965,7 +5971,7 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
             # nothing has been written or cleared yet, so an append that fails
             # here leaves the root and the marker exactly as the retry needs them.
             if state.code_root_restamp_pending:
-                Journal(run_dir).append(
+                Journal(run_dir, pin=state).append(
                     "rearm-code-root-restamped",
                     repo=state.repo_root,
                     code_root_changed=True,
@@ -6034,7 +6040,7 @@ def restamp_code_root(run_dir: Path, repo_root: Path) -> str | None:
         # here is precisely "a record owed by an EARLIER call's real move" — no new
         # state and no new read.
         discharged_owed_move = not moved
-        Journal(run_dir).append(
+        Journal(run_dir, pin=state).append(
             "rearm-code-root-restamped",
             repo=new,
             code_root_changed=moved,
@@ -6089,8 +6095,8 @@ class RearmOutcome:
 class _RearmJournal(Journal):
     """Journal writer that captures successful re-arm notices at append time."""
 
-    def __init__(self, run_dir: Path):
-        super().__init__(run_dir)
+    def __init__(self, run_dir: Path, *, pin: RunState | None = None):
+        super().__init__(run_dir, pin=pin)
         self.notices: list[RearmNotice] = []
         self.hold_resume = False
         self.hold_next_step = ""
@@ -6205,7 +6211,7 @@ def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:
         # record for the story (DW-523).
         task.env_fault_site = None
         save_state(run_dir, state)
-        Journal(run_dir).append(
+        Journal(run_dir, pin=state).append(
             "escalation-adopted",
             story_key=key,
             branch=task.branch,
@@ -6368,7 +6374,7 @@ def _rearm_escalation_locked(
     # names a directory that is no longer there. See the `project_root` note above.
     live_project = project_root if project_root is not None else Path(state.project)
 
-    journal = _RearmJournal(run_dir)
+    journal = _RearmJournal(run_dir, pin=state)
     # DW-446: reconcile the mint-time root identities before the first pinned write
     # below — backfill a state.json written before they existed, and re-bind an
     # `st_dev` a reboot/remount renumbered under a still-matching inode — so the
@@ -7705,7 +7711,7 @@ def _rearm_for_reverify_locked(
         raise RearmError(refusal)
     origin = "deferred" if task.phase == Phase.DEFERRED else "escalated"
 
-    journal = _RearmJournal(run_dir)
+    journal = _RearmJournal(run_dir, pin=state)
     # DW-446, as `_rearm_escalation_locked`: reconcile the mint-time root identities
     # before the pinned spec write below; persisted by the `save_state` that commits.
     reconcile_root_identities(state, run_dir, journal, live_project)

@@ -29,6 +29,9 @@ def _no_ambient_sessions(monkeypatch):
 
 def _state_run(project, run_id, **kw):
     run_dir = project / ".bmad-loop" / "runs" / run_id
+    # Recorded identity, as `test_runs._make_state_run` does: pinned writers stay silent.
+    run_dir.mkdir(parents=True, exist_ok=True)
+    kw.setdefault("run_dir_identity", platform_util.root_identity_record(run_dir))
     save_state(
         run_dir,
         RunState(run_id=run_id, project=str(project), started_at="2026-06-11T10:00:00", **kw),

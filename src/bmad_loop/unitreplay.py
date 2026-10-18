@@ -177,7 +177,7 @@ def mint_replay_run(
             run_dir_identity=runsetup._claim_identity(claim),
         )
         _publish_replay_run(new_dir, state, story_key, src=src, project=project)
-        _journal_handoff(finished_run_dir, story_key, replay_run=run_id, src=src, dst=dst)
+        _journal_handoff(finished_run_dir, finished, story_key, replay_run=run_id, src=src, dst=dst)
     except BaseException as exc:
         if moved is not None and os.path.lexists(moved[2]):
             code_root, src, dst = moved
@@ -275,7 +275,7 @@ def _publish_replay_run(
     """Open the replay run's journal with `unit-replay-start`, then persist its state
     and the out-of-tree config pin (#498), as `runsetup.compose_run` does."""
     task = state.tasks[story_key]
-    journal = Journal(run_dir)
+    journal = Journal(run_dir, pin=state)
     journal.append(
         "unit-replay-start",
         replay_of=state.replay_of,
@@ -290,11 +290,18 @@ def _publish_replay_run(
 
 
 def _journal_handoff(
-    finished_run_dir: Path, story_key: str, *, replay_run: str, src: Path, dst: Path
+    finished_run_dir: Path,
+    finished: RunState,
+    story_key: str,
+    *,
+    replay_run: str,
+    src: Path,
+    dst: Path,
 ) -> None:
     """The one entry the finished run gets: a pointer to the replay run that now owns
-    its kept unit. Its state.json is never written."""
-    journal = Journal(finished_run_dir)
+    its kept unit, pinned to the finished run's own recorded identity. Its state.json
+    is never written."""
+    journal = Journal(finished_run_dir, pin=finished)
     journal.append(
         "unit-replay-handoff",
         story_key=story_key,
@@ -404,7 +411,7 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
             except verify.GitError as e:
                 raise AbandonError(f"{e}; nothing was abandoned") from e
             if ref is not None:
-                Journal(run_dir).append(
+                Journal(run_dir, pin=state).append(
                     "replay-abandon-snapshot",
                     story_key=story_key,
                     worktree=str(wt),
@@ -433,7 +440,7 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
                 f"tearing down the kept worktree {wt} failed ({e}); the run is still "
                 "paused — re-run abandon"
             ) from e
-        Journal(run_dir).append(
+        Journal(run_dir, pin=state).append(
             "replay-abandoned",
             story_key=story_key,
             replay_of=state.replay_of,

@@ -25859,24 +25859,38 @@ def test_bundle_artifact_only_receipt_leaves_the_review_ledger_gate_intact(proje
 
 
 def _redirect_the_run_dir(project, tmp_path):
-    """Plant a link at the run directory `make_sweep` will use, pointing OUT of the
-    project, and hand back where it points.
+    """Plant a link at the `runs/` directory above the run dir `make_sweep` will use,
+    pointing OUT of the project, and hand back where the run dir lands through it.
 
-    The link goes at the run dir rather than at `.bmad-loop/` deliberately: the
-    engine writes its journal and state into this same directory through the
-    ordinary (unconfined) writers, and those must keep working so the run reaches
-    the site under test at all. Only the confined writes walk the components from
-    the project root, so only they refuse — which makes the refusal attributable
-    to the site under test rather than to a broken run. Since DW-269 the triage
-    cache write-back is one of them: through this link it refuses and DEGRADES
-    (`sweep-triage-cache-write-failed`), so a decisions-phase row driven through
-    here also carries that row, and the run still reaches the phase."""
-    run_dir = project.project / ".bmad-loop" / "runs" / "sweep-run"
-    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    The link goes one level ABOVE the run dir deliberately: the engine's journal
+    opens the run dir itself as the last component of its walk and refuses a link
+    there, but follows the run dir's ancestors, so it keeps writing and the run
+    reaches the site under test at all. The confined writes walk every component
+    from the project root, so they refuse the link at `runs/` — which makes the
+    refusal attributable to the site under test rather than to a broken run. Since
+    DW-269 the triage cache write-back is one of them: through this link it refuses
+    and DEGRADES (`sweep-triage-cache-write-failed`), so a decisions-phase row driven
+    through here also carries that row, and the run still reaches the phase."""
+    runs_dir = project.project / ".bmad-loop" / "runs"
+    runs_dir.parent.mkdir(parents=True, exist_ok=True)
+    if runs_dir.is_dir():
+        runs_dir.rmdir()
     outside = tmp_path / "outside"
     outside.mkdir()
-    run_dir.symlink_to(outside, target_is_directory=True)
-    return outside
+    runs_dir.symlink_to(outside, target_is_directory=True)
+    return outside / "sweep-run"
+
+
+def _redirect_the_runs_parent(run_dir, tmp_path):
+    """Move the `runs/` directory holding a live `run_dir` out of the project and
+    link it back, handing back where `run_dir` now really lives. The run dir keeps
+    its own inode, so the engine's journal (which follows the run dir's ancestors)
+    keeps writing; the confined writes, walking from the project root, refuse."""
+    runs_dir = run_dir.parent
+    outside = tmp_path / "outside"
+    runs_dir.rename(outside)
+    runs_dir.symlink_to(outside, target_is_directory=True)
+    return outside / run_dir.name
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -25928,8 +25942,7 @@ def test_manifest_publication_refuses_a_redirect_after_baseline_is_durable(
         project, [migrate_effect(project, migrated_ledger(), _valid_migration_mapping())]
     )
     real_save = engine._save
-    parked = tmp_path / "run-before-manifest-redirect"
-    outside = tmp_path / "outside"
+    parked = tmp_path / "outside" / "sweep-run"
     redirected = []
 
     def save_then_redirect():
@@ -25937,9 +25950,7 @@ def test_manifest_publication_refuses_a_redirect_after_baseline_is_durable(
         task = engine.state.tasks.get("sweep-migrate")
         if task is not None and task.migration_recovery_format == 1 and not redirected:
             redirected.append(True)
-            engine.run_dir.rename(parked)
-            outside.mkdir()
-            engine.run_dir.symlink_to(outside, target_is_directory=True)
+            assert _redirect_the_runs_parent(engine.run_dir, tmp_path) == parked
 
     monkeypatch.setattr(engine, "_save", save_then_redirect)
     summary = engine.run()
@@ -25947,7 +25958,8 @@ def test_manifest_publication_refuses_a_redirect_after_baseline_is_durable(
     assert summary.crashed and adapter.sessions == []
     assert redirected == [True]
     assert (parked / "migrate-baseline.md").read_text(encoding="utf-8") == LEGACY_LEDGER
-    assert not (outside / "migrate-manifest.json").exists()
+    assert not (parked / "migrate-manifest.json").exists()
+    assert list(parked.glob("migrate-manifest*")) == []  # no staged temp either
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -25969,16 +25981,13 @@ def test_the_migration_result_write_refuses_a_redirected_run_dir(project, tmp_pa
     ]
     expected_result = migrate_result(mapping)
     consumed: list[list[dict]] = []
-    parked = tmp_path / "run-before-redirect"
-    outside = tmp_path / "outside"
+    parked = tmp_path / "outside" / "sweep-run"
 
     def migrate_then_redirect(spec):
         manifest_path = Path(spec.prompt.split("--migrate ", 1)[1].split()[0])
         consumed.append(json.loads(manifest_path.read_text(encoding="utf-8")))
         project.deferred_work.write_text(migrated_ledger(), encoding="utf-8")
-        engine.run_dir.rename(parked)
-        outside.mkdir()
-        engine.run_dir.symlink_to(outside, target_is_directory=True)
+        assert _redirect_the_runs_parent(engine.run_dir, tmp_path) == parked
         return SessionResult(status="completed", result_json=expected_result)
 
     engine, adapter = make_sweep(project, [migrate_then_redirect])
@@ -25993,8 +26002,8 @@ def test_the_migration_result_write_refuses_a_redirected_run_dir(project, tmp_pa
     summary = engine.run()
 
     assert summary.crashed and not summary.paused
-    assert not (outside / "migrate-rewrite.md").exists()
-    assert list(outside.glob("migrate-rewrite*")) == []  # no staged temp either
+    assert not (parked / "migrate-rewrite.md").exists()
+    assert list(parked.glob("migrate-rewrite*")) == []  # no staged temp either
     assert platform_util.UnconfinedWriteError.__name__ in str(summary.crash_error)
     assert consumed == [manifest]  # PRECONDITION: the session consumed the manifest
     assert len(adapter.sessions) == 1
@@ -26013,17 +26022,14 @@ def test_result_publication_refuses_a_redirect_after_rewrite_is_durable(
     mapping = _valid_migration_mapping()
     engine, adapter = make_sweep(project, [migrate_effect(project, migrated_ledger(), mapping)])
     real_write = sweep_mod.atomic_write_text_confined
-    parked = tmp_path / "run-before-result-redirect"
-    outside = tmp_path / "outside"
+    parked = tmp_path / "outside" / "sweep-run"
     redirected = []
 
     def write_then_redirect(path, text, **kwargs):
         result = real_write(path, text, **kwargs)
         if path.name == "migrate-rewrite.md" and not redirected:
             redirected.append(True)
-            engine.run_dir.rename(parked)
-            outside.mkdir()
-            engine.run_dir.symlink_to(outside, target_is_directory=True)
+            assert _redirect_the_runs_parent(engine.run_dir, tmp_path) == parked
         return result
 
     monkeypatch.setattr(sweep_mod, "atomic_write_text_confined", write_then_redirect)
@@ -26032,7 +26038,8 @@ def test_result_publication_refuses_a_redirect_after_rewrite_is_durable(
     assert summary.crashed and len(adapter.sessions) == 1
     assert redirected == [True]
     assert (parked / "migrate-rewrite.md").read_text(encoding="utf-8") == migrated_ledger()
-    assert not (outside / "migrate-result.json").exists()
+    assert not (parked / "migrate-result.json").exists()
+    assert list(parked.glob("migrate-result*")) == []  # no staged temp either
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -26047,13 +26054,8 @@ def test_fallback_migration_record_read_refuses_a_redirected_parent(project, tmp
     head = git(project.project, "rev-parse", "HEAD")
     live = project.deferred_work.read_bytes()
     resumed, adapter = resume_sweep(project, engine, [])
-    parked = tmp_path / "parked-run"
-    engine.run_dir.rename(parked)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    external_record = outside / "migrate-baseline.md"
+    external_record = _redirect_the_runs_parent(engine.run_dir, tmp_path) / "migrate-baseline.md"
     external_record.write_text(LEGACY_LEDGER, encoding="utf-8")
-    engine.run_dir.symlink_to(outside, target_is_directory=True)
     reached = []
     monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
     monkeypatch.setattr(
@@ -32791,6 +32793,45 @@ def test_a_consumed_sources_recorded_completion_stands_on_the_target_alone(
     else:
         assert durable.commit_sha in refusal["error"]
     assert verify.rev_parse_head(project.repo_root) == expected_head
+
+
+def test_a_leftover_unregistered_worktree_dir_reads_as_a_consumed_source(project, monkeypatch):
+    """A degraded teardown can drop git's registration and leave the directory.
+    That leftover is no mount: replaying the merge there would reach
+    `_reopen_unit`, which escalates an unregistered path, so the completion
+    stands on the target as for any consumed source and the carry proceeds.
+
+    Ablation: probe `_source_mounted` with `is_dir()` alone and the resume
+    replays into `_reopen_unit` and pauses on the unregistered worktree."""
+    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
+    engine, _ = make_sweep(
+        project,
+        [triage_effect(bundle_plan()), effect],
+        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
+    )
+    crash_at_merge_back(engine, after="merge")
+    assert engine.run().crashed
+
+    durable = load_state(engine.run_dir).tasks["dw-fix"]
+    leftover = Path(durable.worktree_path)
+    leftover.mkdir(parents=True)
+    assert not verify.worktree_is_registered(project.repo_root, leftover)
+    merge = verify.merge_branch
+    replayed: list[str] = []
+
+    def merge_spy(*args, **kwargs):
+        replayed.append("merge")
+        return merge(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "merge_branch", merge_spy)
+    resumed, _ = resume_sweep(project, engine, [])
+
+    summary = resumed.run()
+
+    assert not summary.paused and not summary.crashed
+    assert replayed == []
+    assert load_state(resumed.run_dir).tasks["dw-fix"].isolated_ledger_carried
+    assert "resume-ledger-carry" in journal_kinds(resumed)
 
 
 @pytest.mark.parametrize(

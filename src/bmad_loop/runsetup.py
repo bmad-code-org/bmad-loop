@@ -1146,7 +1146,9 @@ def _claim_identity(claim: os.stat_result) -> tuple[int, int] | None:
     mount writers that is no change (a zero inode never matched), but the win32
     verify-stream arm, which before DW-446 wrote through a zero-inode run dir, now
     REFUSES it (accepted 2026-09-27): each lost log tail is journaled as the
-    verify record's ``capture_error`` and verification proceeds without it."""
+    verify record's ``capture_error`` and verification proceeds without it. The
+    run journal and ``state.json`` do not refuse: they write unpinned and the
+    journal records one ``journal-unpinned`` row (``reason="no-record"``)."""
     if claim.st_ino == 0:
         return None
     return (claim.st_dev, claim.st_ino)
@@ -1283,9 +1285,9 @@ def _unwind_composition(
         # leaves one behind — the guard refusing, or a failed `rmtree` — which is
         # also the only case where a ghost run is what the operator will find. When
         # `_discard_state_dir` is instead what failed the dir is already gone, and
-        # `Journal.append` opens with "a" WITHOUT a mkdir, so it raises rather than
-        # resurrecting the run it just removed. Suppressed, and the stderr line
-        # above still carries the report.
+        # `Journal.append` opens the run dir confined, without a mkdir, so it raises
+        # OSError rather than resurrecting the run it just removed. Suppressed, and the
+        # stderr line above still carries the report.
         #
         # ``journal`` is None when the composer aborted between claiming the run dir
         # and building the Journal — a window only a signal can realistically land
@@ -1361,13 +1363,14 @@ def compose_run(
     # The guard opens on the statement immediately after the claim, because the
     # claim is what publishes that first artifact — the run DIRECTORY itself, which
     # is what a later `--run-id` collides with. Neither statement below can
-    # realistically fail (`Journal` mkdirs `exist_ok=True` over a directory this
-    # frame just created, and `build_run_state` is a pure constructor), but a
+    # realistically fail (`build_run_state` is a pure constructor, and `Journal`
+    # mkdirs `exist_ok=True` over a directory this frame just created), but a
     # signal can land between any two statements, and the arm is `BaseException`
-    # exactly so that case unwinds instead of stranding an empty run dir.
+    # exactly so that case unwinds instead of stranding an empty run dir. The state
+    # is built FIRST so the journal can be pinned to it: the constructor writes no
+    # row, and `run-start` below stays the run's first.
     journal: Journal | None = None
     try:
-        journal = Journal(run_dir)
         state = build_run_state(
             run_id=run_id,
             project=project,
@@ -1387,12 +1390,13 @@ def compose_run(
             store_topology=store_topology,
             ticket_epic_filter=ticket_epic_filter,
         )
+        journal = Journal(run_dir, pin=state)
         # State becoming resumable and the pid making this process live are one
         # publication.  An explicit-id resume waits for the pid rather than entering
         # between these writes and double-driving the freshly composed run.
         with state_lock(run_dir):
             save_state(run_dir, state)
-            # After the run dir exists (Journal mkdir'd it above) and before the pid
+            # After the run dir exists (the claim created it above) and before the pid
             # lands: the ordering `reconcile_orphan_state_dirs` reads runs in, and a
             # stamp that cannot be written fails the launch before an observer can
             # see a live run.
@@ -1557,7 +1561,6 @@ def compose_sweep(
     # artifact to unwind (`sweep.json`).
     journal: Journal | None = None
     try:
-        journal = Journal(run_dir)
         state = RunState(
             run_id=run_id,
             project=str(project),
@@ -1577,6 +1580,7 @@ def compose_sweep(
             ),
             store_topology=store_topology,
         )
+        journal = Journal(run_dir, pin=state)
         # Persist the sweep options atomically (tmp + os.replace), the way save_state
         # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
         # crash mid-write must not leave a torn file the recovery path then chokes on.

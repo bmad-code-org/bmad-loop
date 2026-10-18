@@ -290,6 +290,9 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
         "source": "commit",
     },
     "resume-unit-merge": {"target": "branch", "operation_id": "operation", "source": "commit"},
+    # The replay's refusal of an ordinary unit's bare `unit-merged` row: the unit's
+    # commit and the target `head` it was checked against (`head` is routed by name).
+    "unit-merged-unverified": {"target": "branch", "commit_sha": "commit"},
     "sentinel-cleared": {"sentinel": "spec"},
     # A BMAD v7 ticket key (`story-acme-vault-rotation`, `1.3`): the plan's title
     # slug, identifier-shaped, so `scrub_json` would ship it verbatim. Kind-scoped

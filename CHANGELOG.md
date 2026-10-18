@@ -139,6 +139,11 @@ breaking changes may land in a minor release.
 - With `[review] enabled = false`, the skills preflight (`run`, `sweep`, resume,
   `resolve --reverify`, `validate`, `--dry-run`) no longer checks the review CLI's skill
   tree unless an active plugin binds an enabled `role = "review"` workflow (DW-380).
+- Write `journal.jsonl` as LF-terminated UTF-8 bytes on every platform, and create it and
+  `state.json` owner-only (`0600`); `state.json` is staged at a unique temp name and
+  fsynced before the replace. A run with no recorded run-dir identity, or one whose device
+  number changed, records one `journal-unpinned` row per writer; `resume` records or
+  re-binds the identity before its first row (DW-559).
 
 ### Removed
 
@@ -147,6 +152,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Re-validate an ordinary unit's merge against the target on replay instead of trusting its
+  `unit-merged` journal row; missing evidence pauses the run (`unit-merged-unverified`)
+  (DW-558).
 - Replace a pane's existing pipe instead of toggling it, so a tmux or psmux config hook that
   already logs the pane no longer leaves the run log empty (#947).
 - Read a window whose pane exited as dead even when a `remain-on-exit on` config keeps it
@@ -286,6 +294,13 @@ breaking changes may land in a minor release.
   `bmad-loop plugins accept <name>`; refuse before any plugin code runs (#496, #497).
 - Fail startup when a granted project plugin loses its whole executable surface or its
   dir disappears, naming `bmad-loop plugins revoke <name>` (#496, #497).
+- Pin the run journal and `state.json` to the run dir's recorded identity
+  (`run_dir_identity`) at every engine, CLI, TUI and re-arm writer: a run dir swapped for
+  a link or another directory refuses the append or save instead of writing outside the
+  run, and an append never recreates a deleted run dir. Windows appends hold
+  `FILE_APPEND_DATA` without `FILE_WRITE_DATA`. Reads and the other run-dir files
+  (`engine.pid`, `ATTENTION`, heartbeats, adapter records, `logs/`) stay path-based
+  (DW-559, DW-560).
 
 ## [0.13.2] — 2026-10-09
 

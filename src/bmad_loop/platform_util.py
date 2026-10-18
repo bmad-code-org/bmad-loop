@@ -917,6 +917,140 @@ def open_at(dir_fd: int, name: str, flags: int, mode: int = 0o600) -> int:
     return win32_at.open_at(dir_fd, name, flags, mode)
 
 
+def open_append_at(dir_fd: int, name: str, *, mode: int = 0o600) -> int:
+    """An append descriptor on ``name`` under ``dir_fd``, created at ``mode`` if
+    absent: :func:`open_at` with ``O_RDWR | O_APPEND | O_CREAT`` and
+    :data:`AT_NOFOLLOW`, so a link AT ``name`` refuses with ``ELOOP``. Every
+    write lands at the end of the file whatever the descriptor's offset —
+    ``O_APPEND`` on POSIX; on Windows a handle holding ``FILE_APPEND_DATA``
+    without ``FILE_WRITE_DATA`` plus the CRT's ``O_APPEND``. Readable, so
+    :func:`tail_is_terminated_fd` can probe the same descriptor. Never
+    ``O_TRUNC`` or ``O_EXCL``: an existing file is kept and appended to."""
+    return open_at(dir_fd, name, os.O_RDWR | os.O_APPEND | os.O_CREAT | AT_NOFOLLOW, mode)
+
+
+def tail_is_terminated_fd(fd: int) -> bool:
+    """Whether the file behind ``fd`` ends in a newline — a zero-length file
+    counts as terminated (there is no fragment to close). ``fd`` must be
+    readable; :func:`open_append_at` opens it so.
+
+    The error directions are deliberately not symmetric, because their costs
+    are not. An open descriptor names a file that EXISTS, so any ``OSError``
+    from the probe — a transient EIO, a sharing violation, an emulator that
+    refuses the seek — leaves a tail that is unknown. Answering "terminated"
+    there skips the heal, and if that tail is a fragment the next record
+    concatenates onto it: two records lost to one fault, the loss the heal
+    exists to prevent. Answering "unterminated" costs at worst one blank line,
+    which every journal reader skips. So the unknown case fails toward the heal,
+    and this never raises: a writer that is only trying to record must not be
+    taken down by a probe.
+
+    ``os.lseek`` + ``os.read`` rather than ``os.pread``, which Windows lacks.
+    The offset move is harmless: the descriptor is the caller's own open file
+    description, ``O_APPEND`` ignores the offset for every write on POSIX, and
+    on Windows the handle carries no ``FILE_WRITE_DATA`` and the CRT's
+    ``O_APPEND`` seeks to the end before each write."""
+    try:
+        if os.fstat(fd).st_size == 0:
+            return True
+        os.lseek(fd, -1, os.SEEK_END)
+        return os.read(fd, 1) == b"\n"
+    except OSError:
+        return False
+
+
+def stale_device_record(root: Path, record: RootIdentityRecord | None) -> bool:
+    """Whether ``record`` misses ``root`` ONLY by a renumbered ``st_dev``: ``root``
+    ``lstat``s as a real directory (not a link or junction) with the record's
+    nonzero inode on another device number. That is the shape a reboot leaves on
+    a filesystem whose device numbers are not stable, and the one
+    ``runs.reconcile_root_identities`` re-binds.
+
+    Diagnostic only — it picks which degrade a pinned writer takes after a
+    refusal, never whether a write is confined. A ``None`` record, a zero inode,
+    any other mismatch, or an ``OSError`` from the probe answers False."""
+    if record is None:
+        return False
+    try:
+        info = os.lstat(root)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or link_like_stat(info):
+        return False
+    dev, ino = record
+    return info.st_ino == ino != 0 and info.st_dev != dev
+
+
+def append_line_confined(
+    root: Path, name: str, line: bytes, *, root_identity: os.stat_result | None
+) -> None:
+    """Append ``line`` to ``root / name``, created ``0600`` if absent, healing an
+    unterminated tail first (a ``b"\\n"`` is prepended when the file's last byte
+    is not one, see :func:`tail_is_terminated_fd`). Never creates ``root``.
+
+    On both arms of :data:`HANDLE_ANCHORED_WRITES` the file is opened through a
+    descriptor on ``root`` with :func:`open_append_at`, so a link AT ``name``
+    refuses with ``ELOOP`` and the write lands at the end of the file the walk
+    reached. ``root_identity`` pins ``root`` as :func:`open_dir_confined` does:
+    given, the opened root must be that directory. Without it ``root`` is opened
+    as the last component of a walk from ``root.parent``, so a link AT ``root``
+    still refuses (``O_NOFOLLOW``) while its ancestors are followed. A root that
+    is missing, linked, or not the pinned directory raises
+    :class:`UnconfinedWriteError`; a failed open or write raises its own
+    ``OSError``. Nothing here is folded into a silent no-op.
+
+    Hosts with neither arm get the path-based fallback: the pin pre-check
+    (:func:`require_root_pinned`), a refusal when ``root`` or ``name`` is
+    link-like, an ``O_NOFOLLOW`` open where the host has it, and the pin checked
+    again before the write — check-then-write, the residual
+    :func:`path_is_confined` documents."""
+    if HANDLE_ANCHORED_WRITES:
+        if root_identity is not None:
+            dir_fd = open_dir_confined(root, root, root_identity=root_identity)
+        else:
+            dir_fd = open_dir_confined(root.parent, root)
+        if dir_fd is None:
+            raise UnconfinedWriteError(
+                f"refusing to append {name} under an unconfined or replaced directory: {root}"
+            )
+        fd: int | None = None
+        try:
+            fd = open_append_at(dir_fd, name)
+            _write_line(fd, line)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            os.close(dir_fd)
+        return
+    require_root_pinned(root, root_identity)
+    target = root / name
+    if is_link_like(root) or is_link_like(target):
+        raise UnconfinedWriteError(
+            f"refusing to append {name} under a redirected directory: {root}"
+        )
+    flags = (
+        os.O_RDWR
+        | os.O_APPEND
+        | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    fd = os.open(target, flags, 0o600)
+    try:
+        require_root_pinned(root, root_identity)
+        _write_line(fd, line)
+    finally:
+        os.close(fd)
+
+
+def _write_line(fd: int, line: bytes) -> None:
+    """:func:`append_line_confined`'s write: the tail heal, then every byte of
+    ``line`` through ``os.write`` (a short write is resumed, not dropped)."""
+    view = memoryview(line if tail_is_terminated_fd(fd) else b"\n" + line)
+    while view:
+        view = view[os.write(fd, view) :]
+
+
 def stat_at(dir_fd: int, name: str) -> os.stat_result:
     """``os.stat(name, dir_fd=dir_fd, follow_symlinks=False)`` on either arm: the
     entry's own metadata, a link reported as ``S_IFLNK`` rather than followed."""
@@ -1145,7 +1279,9 @@ def root_identity_record(root: Path) -> RootIdentityRecord | None:
     that is unchanged — a zero inode never matched — but the win32 verify-stream
     arm, which used to write through such a run dir, now refuses it: a refusal,
     not a degrade, journaled per stream as ``capture_error`` (DW-446, accepted
-    2026-09-27). ``st_dev`` is not stable across a reboot or remount, so
+    2026-09-27). The run journal and ``state.json`` are the exception: with no
+    record they write through the unpinned confined open and journal one
+    ``journal-unpinned`` row. ``st_dev`` is not stable across a reboot or remount, so
     ``runs.reconcile_root_identities`` re-binds a record's ``st_dev`` at a locked
     resume/re-arm when the root still ``lstat``s as a real directory with the
     same ``st_ino``; within a live engine the compare stays full ``(st_dev,
@@ -1384,7 +1520,16 @@ def open_dir_confined(
     normalization and snapshot restore, and the deferred-work ledger restores
     (DW-498) — which confine to
     ``workspace.paths.project``/``workspace.root`` and, when that workspace is a
-    unit mount, pin it through ``runs.mount_root_identity`` (DW-445). A pinned
+    unit mount, pin it through ``runs.mount_root_identity`` (DW-445). The run
+    journal (``Journal.append``, through :func:`append_line_confined`) and
+    ``state.json`` (``journal.save_state``, through :func:`atomic_write_text_at`)
+    are pinned run-dir writers too, against ``RunState.run_dir_identity`` read
+    live on every write. Unlike the writers above, a missing record or one that
+    misses an intact run dir only by a renumbered ``st_dev``
+    (:func:`stale_device_record`) does not refuse there: the write degrades to an
+    unpinned open whose run dir is still the ``O_NOFOLLOW`` last component of the
+    walk, and the journal records one ``journal-unpinned`` row per writer object.
+    Any other pinned miss raises :class:`UnconfinedWriteError`. A pinned
     spec writer's EXTERNAL arm (a target outside ``confine_root``) pre-checks the
     pin with :func:`require_root_pinned` before writing, so a path resolved
     through a swapped mount refuses there too while the swap still stands

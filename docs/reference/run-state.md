@@ -8,6 +8,8 @@ Where bmad-loop keeps the state of runs and sweeps, what each file holds, how mu
 
 A directory under `.bmad-loop/runs/` counts as a run only if it contains a `state.json` file.
 
+`state.json` and `journal.jsonl` are written through a descriptor on the run directory, never by path. The descriptor is held to the identity (device and inode) recorded when the run directory was created, and both files are created owner-only (`0600`). When that identity is recorded, a run directory that is a link, has been replaced, or is missing refuses the write with an error instead of writing elsewhere or recreating it. On a run with no recorded identity, or one whose device number changed (a reboot or remount) while its inode did not, the write still refuses a link at the run directory, and each writer records one `journal-unpinned` row (`reason`: `no-record` or `stale-device`) before its first row. `resume` records or re-binds the identity before its own first row. Reads of these two files, and the other run-directory files (`engine.pid`, `ATTENTION`, `tasks/<task_id>/heartbeat.json`, adapter `.jsonl` records, `logs/`), use plain paths.
+
 ## State root
 
 Out-of-tree state is user-scoped. The first rule that applies sets the root:
@@ -77,8 +79,8 @@ Entries other than `state.json`, `journal.jsonl`, `engine.pid`, `tasks/` and `lo
 
 The opencode adapter's environment-fault classifier scans `<task_id>.server.out` and `<task_id>.provider-errors.log`, never the model-written `<task_id>.log`. On OpenCode 2.x provider failures appear only as session events, so the adapter writes each `session.retry.scheduled` / `session.step.failed` / `session.execution.failed` frame as one `provider-error event=… type=… status=… attempt=… message="…"` line built from the event's structured fields (the provider's response body is never copied). The file is created at spawn on both majors and is empty on a healthy session.
 
-- **`state.json`** — the serialized run state (stories, phases, tokens, the `finished` / `stopped` / `crashed` flags, and `paused_reason` with the pause context). Written atomically under a per-run lock; `bmad-loop status` reads it.
-- **`journal.jsonl`** — append-only, one JSON object per line with `ts` and `kind`; the first entry is `run-start`. Written by the engine, and by commands that act on the run (for example `stop`, `resume`, `resolve`). From the first session launch on, lines carry `log_task` / `log_pos`, pointing into the most recent session's log.
+- **`state.json`** — the serialized run state (stories, phases, tokens, the `finished` / `stopped` / `crashed` flags, and `paused_reason` with the pause context). Written atomically under a per-run lock, through the pinned run-directory descriptor above; `bmad-loop status` reads it.
+- **`journal.jsonl`** — append-only, one JSON object per line with `ts` and `kind`; the first entry is `run-start` (after one `journal-unpinned` row on a filesystem that reports no inode numbers). Lines end in LF on every platform. Written through the pinned run-directory descriptor by the engine, and by commands that act on the run (for example `stop`, `resume`, `resolve`). From the first session launch on, lines carry `log_task` / `log_pos`, pointing into the most recent session's log.
 - **`heartbeat.json`** (in `tasks/<task_id>/`) — the wait loop's proof of life, overwritten at most every 30 seconds while a session runs: remaining budget, stall-recovery state and probe or sampling failure counts.
 
 `state.json` records the run's work source. A bmad-loop that does not know that source refuses to resume the run rather than drive it as a sprint run, so finish or abandon a run before downgrading bmad-loop.

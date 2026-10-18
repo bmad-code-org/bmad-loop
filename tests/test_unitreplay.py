@@ -284,3 +284,31 @@ def test_abandon_refusal_refuses_a_task_without_a_kept_unit(wt, branch):
 def test_abandon_refusal_admits_an_escalated_replay_unit():
     state, task = _abandon_subject()
     assert unitreplay.abandon_refusal(state, task, _KEY) is None
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_handoff_journal_is_pinned_to_the_finished_run_state(tmp_path, recorded):
+    """The one row the finished run gets goes through a journal pinned to the
+    finished run's own state: no notice when that state carries its run-dir record,
+    one `journal-unpinned` notice ahead of the handoff when it predates the record.
+
+    Ablation: build the handoff journal bare and the record-less row loses its
+    notice."""
+    run_dir = tmp_path / "finished"
+    run_dir.mkdir()
+    finished = RunState(
+        run_id="finished",
+        project=str(tmp_path),
+        started_at="now",
+        run_dir_identity=root_identity_record(run_dir) if recorded else None,
+    )
+
+    unitreplay._journal_handoff(
+        run_dir, finished, _KEY, replay_run="replay", src=tmp_path / "a", dst=tmp_path / "b"
+    )
+
+    kinds = [e["kind"] for e in Journal(run_dir).entries()]
+    if recorded:
+        assert kinds == ["unit-replay-handoff"]
+    else:
+        assert kinds == ["journal-unpinned", "unit-replay-handoff"]

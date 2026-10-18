@@ -1473,6 +1473,22 @@ def test_compose_run_engine_class_per_source(
     assert (state.source, state.spec_folder) == (source, persisted_folder)
 
 
+def test_compose_run_journal_is_pinned_to_the_claimed_identity(tmp_path):
+    """The composer pins its journal to the `RunState` carrying the claimed run-dir
+    identity, built FIRST so the pin exists before any row: the journal writes no
+    `journal-unpinned` notice and `run-start` stays the run's first row.
+
+    Ablation: build `Journal(run_dir)` bare and `journal.pin is state` reddens; pin it
+    to a record-less state and the first row is the notice instead."""
+    composed = _compose_run_for_source(tmp_path, source="sprint-status", spec_folder="")
+
+    assert composed.journal.pin is composed.state
+    assert composed.state.run_dir_identity is not None
+    kinds = [e["kind"] for e in composed.journal.entries()]
+    assert kinds[0] == "run-start"
+    assert "journal-unpinned" not in kinds
+
+
 def test_compose_run_tickets_builds_tickets_engine(project_v7):
     """A tickets launch with no injected class builds the real `TicketsEngine`
     on the v7 sandbox, pinned to the active initiative — and a resume of that
@@ -1871,8 +1887,9 @@ def test_compose_run_unwinds_a_claim_abandoned_before_save_state(unwinding, monk
 
 
 def test_compose_sweep_unwinds_when_the_journal_itself_cannot_be_built(unwinding, monkeypatch):
-    """The same window in the sweep composer, at its earliest statement — which is
-    also the one case that reaches `_unwind_composition` with NO journal.
+    """The same window in the sweep composer, at the journal build (right after the
+    `RunState` it is pinned to) — the one case that reaches `_unwind_composition`
+    with NO journal.
 
     That is why this drives `Journal` rather than the `RunState` build: the unwind
     writes a `composition-unwind-failed` entry through the journal it is handed, so
@@ -1887,8 +1904,9 @@ def test_compose_sweep_unwinds_when_the_journal_itself_cannot_be_built(unwinding
     removed on this path at all, which fails alone if the `try` moves back down."""
     built: dict[str, bool] = {}
 
-    def exploding_journal(run_dir):
+    def exploding_journal(run_dir, *, pin):
         built["run_dir"] = run_dir.is_dir()
+        built["pinned"] = pin.run_id == RUN_ID
         raise OSError("journal unavailable")
 
     monkeypatch.setattr(runsetup, "Journal", exploding_journal)
@@ -1908,7 +1926,7 @@ def test_compose_sweep_unwinds_when_the_journal_itself_cannot_be_built(unwinding
             sweep_engine_cls=_NeverBuilt,
             trusted_config_digest="deadbeef",
         )
-    assert built == {"run_dir": True}
+    assert built == {"run_dir": True, "pinned": True}
     assert not runs.run_dir_for(unwinding.project, RUN_ID).exists()
     assert unwinding.published == {}
 
@@ -2127,8 +2145,8 @@ def test_a_failed_unwind_still_reports_when_the_run_dir_is_already_gone(
     dir and THEN raises (`_discard_state_dir` is the real site — it runs after the
     `rmtree`).
 
-    `Journal.append` opens with "a" and does not mkdir, so appending here raises
-    `FileNotFoundError`. Unsuppressed that would propagate out of the unwind and
+    `Journal.append` opens the run dir confined, without a mkdir, so appending here
+    raises OSError. Unsuppressed that would propagate out of the unwind and
     replace the launch error — the one outcome this whole arm forbids — so the
     suppression around the journal write is load-bearing and gets its own test.
     The stderr report must still land, since it is now the only channel left."""

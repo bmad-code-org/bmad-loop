@@ -5974,3 +5974,30 @@ def test_rearm_tickets_refused_transition_keeps_the_escalation(tmp_path, monkeyp
 
     assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
     assert "status: ready-for-dev" in plan.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_ticket_context_journal_is_pinned_to_the_run_state(tmp_path, recorded):
+    """`_tickets_context` journals an unreadable plan through a journal pinned to the
+    run's state: a recorded run writes the row alone, a record-less one (a state.json
+    that predates the record) writes one `journal-unpinned` notice ahead of it.
+
+    Ablation: build that journal bare and the record-less row loses its notice."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    state = RunState(
+        run_id="r1",
+        project=str(tmp_path),
+        started_at="now",
+        run_dir_identity=platform_util.root_identity_record(run_dir) if recorded else None,
+    )
+    plan = tmp_path / "plan.md"
+    plan.write_bytes(b"---\nstatus: \xff\n---\n")
+
+    resolve._tickets_context(state, run_dir, "1-1-a", None, plan_path=plan)
+
+    kinds = [e["kind"] for e in _kinds(run_dir)]
+    if recorded:
+        assert kinds == ["resolve-ticket-context-unreadable"]
+    else:
+        assert kinds == ["journal-unpinned", "resolve-ticket-context-unreadable"]

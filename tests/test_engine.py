@@ -54,7 +54,9 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import deferredwork, devcontract, gates, platform_util, runs, verify
+from bmad_loop import deferredwork, devcontract, gates
+from bmad_loop import journal as journal_mod
+from bmad_loop import platform_util, runs, verify
 from bmad_loop.adapters.base import ZERO_TOKEN_TIMEOUT_EVIDENCE, SessionResult, SessionSpec
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import (
@@ -706,8 +708,17 @@ def test_verify_stream_capture_oserror_degrades_instead_of_killing_the_run(proje
     # symlinked `verify/`, win32 keeps the path-based `atomic_write_text`.
     # Patching only the latter left this test green on POSIX for the wrong
     # reason — no write was intercepted, so the degrade arm never ran.
+    real_write_at = journal_mod.atomic_write_text_at
+
+    def _enospc_at(dir_fd, name, text):
+        # `save_state` publishes state.json through the same anchored writer; only
+        # the verify stream is the observation under test.
+        if name == journal_mod.STATE_FILE:
+            return real_write_at(dir_fd, name, text)
+        return _enospc()
+
     monkeypatch.setattr("bmad_loop.journal.atomic_write_text", _enospc)
-    monkeypatch.setattr("bmad_loop.journal.atomic_write_text_at", _enospc)
+    monkeypatch.setattr("bmad_loop.journal.atomic_write_text_at", _enospc_at)
 
     summary = engine.run()
 

@@ -136,14 +136,75 @@ def test_open_at_refuses_anything_but_a_single_component():
 
 
 @WINDOWS
-def test_open_at_refuses_the_flags_it_cannot_honour(tmp_path):
-    """``O_TRUNC``/``O_APPEND`` have no handle-relative caller and no exact NT
-    spelling here; a loud refusal beats a silent approximation."""
+def test_open_at_refuses_o_trunc_and_read_only_append(tmp_path):
+    """``O_TRUNC`` has no handle-relative caller and no exact NT spelling here,
+    and an append needs a writable open; a loud refusal beats a silent
+    approximation."""
     with _directory(tmp_path) as root:
-        for flag in (os.O_TRUNC, os.O_APPEND):
-            with pytest.raises(ValueError, match="O_TRUNC/O_APPEND"):
-                win32_at.open_at(root, "x", os.O_WRONLY | os.O_CREAT | flag)
+        with pytest.raises(ValueError, match="O_TRUNC"):
+            win32_at.open_at(root, "x", os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        with pytest.raises(ValueError, match="O_APPEND"):
+            win32_at.open_at(root, "x", os.O_RDONLY | os.O_CREAT | os.O_APPEND)
     assert list(tmp_path.iterdir()) == []
+
+
+@WINDOWS
+def test_open_at_o_append_lands_every_write_at_the_end(tmp_path):
+    """The append arm: ``FILE_APPEND_DATA`` without ``FILE_WRITE_DATA`` plus the
+    CRT's ``O_APPEND``, so a write after a seek to the start still lands at the
+    end — on this descriptor and on a second, write-only one. The read half of
+    ``O_RDWR`` stays usable for the journal's tail probe.
+
+    Ablation: open with ``_FILE_GENERIC_WRITE`` and drop ``O_APPEND`` from
+    ``_wrap`` and the second write overwrites the first."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | win32_at.AT_NOFOLLOW
+    with _directory(tmp_path) as root:
+        fd = win32_at.open_at(root, "journal.jsonl", flags)
+        try:
+            os.write(fd, b"first\n")
+            os.lseek(fd, 0, os.SEEK_SET)
+            assert os.read(fd, 1) == b"f"
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, b"second\n")
+            assert stat.S_ISREG(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)
+        fd = win32_at.open_at(root, "journal.jsonl", os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(fd, b"third\n")
+        finally:
+            os.close(fd)
+    assert (tmp_path / "journal.jsonl").read_bytes() == b"first\nsecond\nthird\n"
+
+
+@WINDOWS
+def test_open_at_o_append_nofollow_refuses_a_link_at_the_name(tmp_path):
+    """An append open with ``AT_NOFOLLOW`` never writes through a redirect at the
+    name. A junction (directory-only, unprivileged) is refused by the open
+    itself — the reparse point is opened as the directory it is, which a
+    non-directory write open answers ``EISDIR``, or ``_refuse_link`` answers
+    ``ELOOP``. A file symlink, where the runner may plant one, is ``ELOOP``.
+    Either way nothing under the target is touched."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "journal.jsonl").write_bytes(b"kept\n")
+    (tmp_path / "run").mkdir()
+    _junction(tmp_path / "run" / "logs", outside)
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | win32_at.AT_NOFOLLOW
+    with _directory(tmp_path / "run") as run:
+        with pytest.raises(OSError) as refused:
+            win32_at.open_at(run, "logs", flags)
+        assert refused.value.errno in (errno.ELOOP, errno.EISDIR)
+        try:
+            os.symlink(outside / "journal.jsonl", tmp_path / "run" / "journal.jsonl")
+        except OSError:
+            pass  # no SeCreateSymbolicLinkPrivilege here; the junction half stands
+        else:
+            with pytest.raises(OSError) as refused:
+                win32_at.open_at(run, "journal.jsonl", flags)
+            assert refused.value.errno == errno.ELOOP
+    assert (outside / "journal.jsonl").read_bytes() == b"kept\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["journal.jsonl"]
 
 
 @WINDOWS
