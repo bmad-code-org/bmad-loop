@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
+import importlib.util
 import io
 import json
 import os
@@ -61,6 +63,25 @@ if sys.platform == "win32" and not sys.flags.utf8_mode:
         "(e.g. `set PYTHONUTF8=1 && uv run pytest`). The suite assumes UTF-8 to "
         "match the files under test; CI's windows job sets this automatically."
     )
+
+# Modules that bind `get_multiplexer` by name at import. Tests swap a stand-in in
+# by patching `multiplexer.get_multiplexer`, and monkeypatch restores only that
+# module: one of these first imported while a patch stood (cli imports
+# `tui.launch` lazily) keeps the stand-in for every later test on the worker.
+# Importing them here binds the real function before any test runs (DW-566).
+# `tests/test_conftest.py` holds this list to the module-level binders in src.
+_MUX_BINDING_MODULES = (
+    "bmad_loop.adapters.generic",
+    "bmad_loop.probe",
+    "bmad_loop.runs",
+    "bmad_loop.tui.app",
+    "bmad_loop.tui.launch",
+)
+for _mod in _MUX_BINDING_MODULES:
+    # tui.app needs the `tui` extra; without textual it cannot be imported at all,
+    # so it cannot capture a stand-in either.
+    if _mod != "bmad_loop.tui.app" or importlib.util.find_spec("textual") is not None:
+        importlib.import_module(_mod)
 
 
 # Opt-in runtime metrics (`--test-metrics-dir=PATH`, tests/perf_report.py). Both
