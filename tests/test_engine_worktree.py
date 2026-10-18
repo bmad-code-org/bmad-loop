@@ -3704,12 +3704,13 @@ def test_host_loss_after_harvest_append_replays_the_pending_commit(project, monk
     engine, _ = make_engine(project, [])
     engine.state.target_branch = "main"
     worktree = engine.run_dir / "worktrees" / "1-1-a"
-    worktree.mkdir(parents=True)
+    # A consumed source: no worktree on disk, and the target holds the unit.
     task = StoryTask(
         story_key="1-1-a",
         epic=1,
         phase=Phase.DONE,
         worktree_path=str(worktree),
+        commit_sha=rev_parse_head(project.project),
         branch="bmad-loop/test-run/1-1-a",
         harvested_deferrals=[_harvest_record()],
     )
@@ -3764,12 +3765,13 @@ def test_tracked_harvest_carry_commit_failure_retries_its_pending_commit(
     engine, _ = make_engine(project, [])
     engine.state.target_branch = "main"
     worktree = engine.run_dir / "worktrees" / "1-1-a"
-    worktree.mkdir(parents=True)
+    # A consumed source: no worktree on disk, and the target holds the unit.
     task = StoryTask(
         story_key="1-1-a",
         epic=1,
         phase=phase,
         worktree_path=str(worktree),
+        commit_sha=rev_parse_head(project.project),
         branch="bmad-loop/test-run/1-1-a",
         harvested_deferrals=[_harvest_record()],
     )
@@ -3993,12 +3995,13 @@ def test_merged_unit_carry_replay_pauses_over_an_operator_ledger_edit(project, m
     engine, _ = make_engine(project, [])
     engine.state.target_branch = "main"
     worktree = engine.run_dir / "worktrees" / "1-1-a"
-    worktree.mkdir(parents=True)
+    # A consumed source: no worktree on disk, and the target holds the unit.
     task = StoryTask(
         story_key="1-1-a",
         epic=1,
         phase=Phase.DONE,
         worktree_path=str(worktree),
+        commit_sha=rev_parse_head(project.project),
         branch="bmad-loop/test-run/1-1-a",
         harvested_deferrals=[_harvest_record()],
     )
@@ -4048,6 +4051,144 @@ def test_merged_unit_carry_replay_pauses_over_an_operator_ledger_edit(project, m
     assert worktree_clean(project.project)
 
 
+def _ordinary_unit_with_a_bare_merged_row(project, *, commit_sha):
+    """A DONE ordinary unit (no `dw_ids`) whose harvest carry is still owed, its
+    worktree gone, and a bare `unit-merged` row in the journal — the shape a crash
+    after teardown leaves, and the shape a row appended without a merge leaves."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text("# Deferred Work\n", encoding="utf-8")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [])
+    engine.state.target_branch = "main"
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        phase=Phase.DONE,
+        worktree_path=str(engine.run_dir / "worktrees" / "1-1-a"),
+        commit_sha=commit_sha(project) if callable(commit_sha) else commit_sha,
+        branch="bmad-loop/test-run/1-1-a",
+        harvested_deferrals=[_harvest_record()],
+    )
+    engine.state.tasks[task.story_key] = task
+    engine.journal.append(
+        "unit-merged", story_key=task.story_key, branch=task.branch, target="main"
+    )
+    engine._save()
+    return engine, task
+
+
+def test_ordinary_merged_row_without_target_evidence_pauses_the_replay(project):
+    """The `unit-merged` row is the session's to append, so for an ordinary story
+    it never stands for the merge alone: with the source consumed and the unit's
+    commit absent from the target, the replay pauses naming the reason and carries
+    nothing."""
+    from bmad_loop.engine import RunPaused
+
+    def off_target_commit(project):
+        sha = git(project.project, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "elsewhere")
+        git(project.project, "branch", "throwaway", sha)
+        return sha
+
+    engine, task = _ordinary_unit_with_a_bare_merged_row(project, commit_sha=off_target_commit)
+    head = rev_parse_head(project.project)
+
+    resumed, _ = resume_engine(project, engine)
+    with pytest.raises(RunPaused, match="1-1-a"):
+        resumed._replay_unlatched_ledger_carries()
+
+    (row,) = _rows(resumed, "unit-merged-unverified")
+    assert row["reason"] == "not-in-target"
+    assert row["commit_sha"] == task.commit_sha and row["head"] == head
+    assert "resume-ledger-carry" not in journal_kinds(resumed)
+    assert "resume-unit-merge" not in journal_kinds(resumed)
+    restored = load_state(resumed.run_dir).tasks[task.story_key]
+    assert restored.isolated_ledger_carried is False
+    assert _main_harvest_entries(project) == []
+    assert rev_parse_head(project.project) == head
+
+
+def test_ordinary_merged_row_with_no_commit_sha_pauses(project):
+    """A consumed source with no recorded commit has nothing the target could
+    hold: the replay pauses with `no-commit` rather than carry on the row."""
+    from bmad_loop.engine import RunPaused
+
+    engine, task = _ordinary_unit_with_a_bare_merged_row(project, commit_sha=None)
+
+    resumed, _ = resume_engine(project, engine)
+    with pytest.raises(RunPaused, match="1-1-a"):
+        resumed._replay_unlatched_ledger_carries()
+
+    (row,) = _rows(resumed, "unit-merged-unverified")
+    assert row["reason"] == "no-commit" and row["head"] is None
+    assert "resume-ledger-carry" not in journal_kinds(resumed)
+    assert load_state(resumed.run_dir).tasks[task.story_key].isolated_ledger_carried is False
+
+
+def test_ordinary_merged_row_with_consumed_source_carries_without_a_merge(project):
+    """With the source consumed and the unit's commit in the target, the target
+    holds the merge: the replay carries with no merge in front of it and no pause."""
+    engine, task = _ordinary_unit_with_a_bare_merged_row(
+        project, commit_sha=lambda project: rev_parse_head(project.project)
+    )
+    started = journal_kinds(engine).count("unit-merge-started")
+
+    resumed, _ = resume_engine(project, engine)
+    resumed._replay_unlatched_ledger_carries()
+
+    kinds = journal_kinds(resumed)
+    assert "unit-merged-unverified" not in kinds
+    assert "resume-unit-merge" not in kinds
+    assert kinds.count("unit-merge-started") == started
+    assert "resume-ledger-carry" in kinds
+    assert load_state(resumed.run_dir).tasks[task.story_key].isolated_ledger_carried is True
+    assert [entry.title for entry in _main_harvest_entries(project)] == [_HARVEST_CARRY["summary"]]
+
+
+def test_ordinary_merged_row_with_a_mounted_source_replays_the_merge(project, monkeypatch):
+    """While the unit's worktree is still mounted and registered, the replay re-runs
+    the merge rather than read the row: a no-op over the landed branch that
+    re-records `unit-merged` before the carry."""
+    import bmad_loop.workspace as workspace_mod
+
+    ignore_before_commit(project, "deferred-work.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a", followup_review=False, deferred=[_HARVEST_CARRY])],
+    )
+    real_remove = verify.worktree_remove
+    real_rmtree = workspace_mod._rmtree_confined
+
+    def teardown_fails(*args, **kwargs):
+        raise verify.GitError("worktree teardown blocked")
+
+    def crash_before_carry(_task) -> None:
+        raise RuntimeError("host died after degraded teardown")
+
+    monkeypatch.setattr(verify, "worktree_remove", teardown_fails)
+    monkeypatch.setattr(workspace_mod, "_rmtree_confined", lambda *a, **k: True)
+    engine._carry_isolated_ledger_writes = crash_before_carry
+    assert engine.run().crashed
+
+    crashed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert Path(crashed.worktree_path).is_dir()
+    assert verify.worktree_is_registered(project.project, Path(crashed.worktree_path))
+    merged_rows = journal_kinds(engine).count("unit-merged")
+    assert merged_rows == 1
+
+    monkeypatch.setattr(verify, "worktree_remove", real_remove)
+    monkeypatch.setattr(workspace_mod, "_rmtree_confined", real_rmtree)
+    resumed, _ = resume_engine(project, engine)
+    resumed._replay_unlatched_ledger_carries()
+
+    kinds = journal_kinds(resumed)
+    assert "resume-unit-merge" in kinds
+    assert kinds.count("unit-merged") == merged_rows + 1
+    assert "unit-merged-unverified" not in kinds
+    assert kinds.index("resume-unit-merge") < kinds.index("resume-ledger-carry")
+    assert load_state(resumed.run_dir).tasks["1-1-a"].isolated_ledger_carried is True
+
+
 def _merged_unit_crashed_before_append(project, monkeypatch):
     """A merged unit whose terminal carry saved the latch and then lost the host
     BEFORE `append_entries` wrote anything: a tracked ledger still at HEAD, no row
@@ -4058,12 +4199,13 @@ def _merged_unit_crashed_before_append(project, monkeypatch):
     engine, _ = make_engine(project, [])
     engine.state.target_branch = "main"
     worktree = engine.run_dir / "worktrees" / "1-1-a"
-    worktree.mkdir(parents=True)
+    # A consumed source: no worktree on disk, and the target holds the unit.
     task = StoryTask(
         story_key="1-1-a",
         epic=1,
         phase=Phase.DONE,
         worktree_path=str(worktree),
+        commit_sha=rev_parse_head(project.project),
         branch="bmad-loop/test-run/1-1-a",
         harvested_deferrals=[_harvest_record()],
     )
@@ -9208,9 +9350,9 @@ def test_replayed_board_carry_leaves_an_operators_edit_out_of_its_commit(project
     `merge_local` refuses a stray on a protected artifact BEFORE it merges, and that
     refusal is the whole of what keeps `_carry_board_advance`'s pathspec commit from
     taking bytes the run never wrote. `_replay_unlatched_ledger_carries` skips it:
-    the re-merge block is guarded on `merged_key not in merged_units`, so a unit whose
-    `unit-merged` was already journaled falls straight through to the carry with no
-    merge — and therefore no pre-flight — in front of it. The operator's window is the
+    a unit whose `unit-merged` was already journaled and whose torn-down source the
+    target already holds (`_ordinary_completion_holds`) falls straight through to the
+    carry with no merge — and therefore no pre-flight — in front of it. The operator's window is the
     crash itself: the host is down, they edit their own checkout, the run comes back.
 
     `unit-merged` in the crashed run's journal is that leg's precondition and is

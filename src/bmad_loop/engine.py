@@ -2125,7 +2125,10 @@ class Engine:
             # is the whole of it: an in-place task carries "", and `Path("")` is
             # `PosixPath(".")` whose `is_dir()` is True, so any probe placed ahead of
             # this one absorbs the in-place case and leaves it unfalsifiable. Merge
-            # evidence comes from the journal below, never from a mounted worktree.
+            # evidence comes from the target below, never from the `unit-merged`
+            # row alone — that row is the session's to append, for an ordinary
+            # story as for a bundle — and never from a mounted worktree, which
+            # replays the merge instead.
             # A close-only payload replays too: a sweep bundle whose ledger writes
             # are all closures has an empty `harvested_deferrals`, and skipping it
             # here would strand the close and re-triage resolved work for ever.
@@ -2180,6 +2183,13 @@ class Engine:
                 # released legacy payload integrates without a receipt and
                 # keeps its bare row.
                 merged = self._consumed_source_completion_holds(task)
+            elif not task.dw_ids and merged:
+                # An ordinary story has no receipt, but its row is the
+                # session's to append all the same, so the target is the
+                # authority here too: a mounted source replays the merge, a
+                # consumed one holds only on the unit's commit or changes in
+                # the target, or pauses with the reason.
+                merged = self._ordinary_completion_holds(task)
             if not merged:
                 source = task.commit_sha or ""
                 started_key = (*merged_key, source)
@@ -2309,20 +2319,9 @@ class Engine:
                     "the recorded integration names no target branch or source commit"
                 )
             head = verify.ref_revision(repo, f"refs/heads/{target}")
-            if not verify.is_ancestor(repo, task.commit_sha, head):
-                if not task.baseline_commit:
-                    raise verify.IntegrationEvidenceError(
-                        f"{target} does not hold the unit's commit {task.commit_sha} and "
-                        "the unit names no baseline to read its change set from"
-                    )
-                unfolded = verify.unfolded_changes(
-                    repo, task.baseline_commit, task.commit_sha, head
-                )
-                if unfolded:
-                    raise verify.IntegrationEvidenceError(
-                        f"{target} does not hold the unit's commit {task.commit_sha} nor "
-                        f"its changes over {task.baseline_commit} at " + ", ".join(unfolded)
-                    )
+            missing = self._target_lacks_unit(task, head)
+            if missing is not None:
+                raise verify.IntegrationEvidenceError(missing)
             artifact_publication.validate_integrated(task, self.paths, head)
         except (
             artifact_publication.PublicationError,
@@ -2342,6 +2341,83 @@ class Engine:
                 task.story_key,
             ) from exc
         return True
+
+    def _target_lacks_unit(self, task: StoryTask, head: str) -> str | None:
+        """What the target ``head`` lacks of the unit's integration, or ``None``.
+
+        ``None`` when ``task.commit_sha`` is in ``head``'s history, or when every
+        change the unit made over ``task.baseline_commit`` is folded into its
+        tree (a squash seals a commit of its own, never that one). Otherwise a
+        sentence naming what is missing. A pure read: ``GitError`` and
+        ``OSError`` propagate to the caller, which owns the refusal.
+        """
+        target = self.state.target_branch
+        repo = self.paths.repo_root
+        commit = task.commit_sha
+        if not commit:
+            return f"the unit names no commit for {target} to hold"
+        if verify.is_ancestor(repo, commit, head):
+            return None
+        if not task.baseline_commit:
+            return (
+                f"{target} does not hold the unit's commit {commit} and "
+                "the unit names no baseline to read its change set from"
+            )
+        unfolded = verify.unfolded_changes(repo, task.baseline_commit, commit, head)
+        if unfolded:
+            return (
+                f"{target} does not hold the unit's commit {commit} nor "
+                f"its changes over {task.baseline_commit} at " + ", ".join(unfolded)
+            )
+        return None
+
+    def _ordinary_completion_holds(self, task: StoryTask) -> bool:
+        """Whether an ordinary unit's recorded merge holds on the target now.
+
+        The ordinary-story twin of ``_consumed_source_completion_holds``: the
+        ``unit-merged`` row is the session's to append, so it never stands for
+        the merge alone. ``False`` while the unit's worktree is still mounted:
+        the replay re-runs the merge, which is a no-op over a landed merge/ff
+        and takes squash's recovery arm. With the source consumed, the merge
+        holds only when the target head holds the unit (``_target_lacks_unit``)
+        — never ``validate_integrated``, which refuses a task with no artifact
+        payload. Anything else journals ``unit-merged-unverified`` with the
+        reason and pauses the run: there is no source left to replay.
+        """
+        if task.worktree_path and Path(task.worktree_path).is_dir():
+            return False
+        target = self.state.target_branch
+        head: str | None = None
+        cause: Exception | None = None
+        try:
+            if not target:
+                reason, detail = "no-target", "the run names no target branch"
+            elif not task.commit_sha:
+                reason, detail = "no-commit", "the unit recorded no source commit"
+            else:
+                head = verify.ref_revision(self.paths.repo_root, f"refs/heads/{target}")
+                missing = self._target_lacks_unit(task, head)
+                if missing is None:
+                    return True
+                reason, detail = "not-in-target", missing
+        except (verify.GitError, OSError, RuntimeError, ValueError) as exc:
+            reason, detail, cause = "evidence-unreadable", str(exc), exc
+        self.journal.append(
+            "unit-merged-unverified",
+            story_key=task.story_key,
+            branch=task.branch,
+            target=target,
+            commit_sha=task.commit_sha,
+            head=head,
+            reason=reason,
+        )
+        self._save()
+        raise RunPaused(
+            f"recorded merge of {task.story_key} ({task.branch}) into {target} does not "
+            f"hold on the target and its source is consumed (worktree gone): {detail}",
+            PAUSE_ESCALATION,
+            task.story_key,
+        ) from cause
 
     def _clear_accept_baseline(self) -> None:
         """Consume the one-resume ``--accept-baseline`` latch (DW-371) once in-flight

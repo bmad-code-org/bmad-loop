@@ -2122,6 +2122,7 @@ JOURNAL_KINDS = frozenset(
         "unit-closed",
         "unit-merge-started",
         "unit-merged",
+        "unit-merged-unverified",
         "worktree-exclude-degraded",
         "worktree-kept",
         "worktree-module-skills-dropped",

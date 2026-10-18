@@ -147,6 +147,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Re-validate an ordinary unit's merge against the target on replay instead of trusting its
+  `unit-merged` journal row; missing evidence pauses the run (`unit-merged-unverified`).
 - Replace a pane's existing pipe instead of toggling it, so a tmux or psmux config hook that
   already logs the pane no longer leaves the run log empty (#947).
 - Read a window whose pane exited as dead even when a `remain-on-exit on` config keeps it
