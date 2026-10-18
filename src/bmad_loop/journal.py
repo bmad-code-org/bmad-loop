@@ -3,13 +3,19 @@ pinned.
 
 ``Journal.append`` and ``save_state`` write ``journal.jsonl`` and ``state.json``
 through a descriptor on the run dir pinned to ``RunState.run_dir_identity``, read
-live per write; ``write_verify_stream`` takes the same record as an argument. The
-reads (``Journal.entries``, ``load_state``) open their files by path."""
+live per write; ``write_verify_stream`` takes the same record as an argument.
+
+The reads AFTER the first are confined the same way: ``load_state(run_dir,
+pin=state)`` and ``Journal.entries`` on a journal built with ``pin=`` read
+through a descriptor pinned to the held state's record and refuse with
+``UnconfinedReadError``. The first ``load_state(run_dir)`` (there is no record to
+pin to before it) and a journal with no ``pin`` read by path."""
 
 from __future__ import annotations
 
 import json
 import os
+import stat
 import threading
 import time
 from collections.abc import Iterator
@@ -19,8 +25,11 @@ from typing import Any
 
 from .model import RunState
 from .platform_util import (
+    AT_NOFOLLOW,
+    AT_NONBLOCK,
     HANDLE_ANCHORED_WRITES,
     RootIdentityRecord,
+    UnconfinedReadError,
     UnconfinedWriteError,
     _open_subdir_at,
     append_line_confined,
@@ -29,10 +38,13 @@ from .platform_util import (
     atomic_write_text_at,
     file_lock,
     is_link_like,
+    link_like_stat,
+    open_at,
     open_dir_confined,
     recorded_root_identity,
     require_root_pinned,
     stale_device_record,
+    stat_at,
 )
 
 STATE_FILE = "state.json"
@@ -443,11 +455,25 @@ class Journal:
         deliberately, so widening this to swallow it would take away a caller's ability
         to tell a corrupt journal from an empty one. Only ``JSONDecodeError`` becomes a
         marker.
+
+        A journal built with ``pin=`` reads through :func:`_read_run_file`, pinned to
+        the pin's ``run_dir_identity`` read live (as :meth:`append` reads it): a run
+        dir that no longer reaches the recorded directory, or a link at the run dir or
+        at ``journal.jsonl``, raises :class:`~bmad_loop.platform_util.UnconfinedReadError`
+        and no foreign row is returned. Absent or not a regular file is ``[]`` on both
+        arms. A journal with no ``pin`` reads by path, links followed.
         """
-        if not self.path.is_file():
-            return []
+        if self.pin is not None:
+            data = _read_run_file(self.run_dir, JOURNAL_FILE, self.pin.run_dir_identity)
+            if data is None:
+                return []
+            text = data.decode("utf-8")
+        else:
+            if not self.path.is_file():
+                return []
+            text = self.path.read_text(encoding="utf-8")
         out: list[dict[str, Any]] = []
-        for raw_line in self.path.read_text(encoding="utf-8").splitlines():
+        for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
@@ -597,6 +623,115 @@ def save_state(run_dir: Path, state: RunState) -> None:
             raise
 
 
-def load_state(run_dir: Path) -> RunState:
+def load_state(run_dir: Path, *, pin: RunState | None = None) -> RunState:
+    """Parse ``run_dir/state.json``.
+
+    With no ``pin`` — the FIRST read, which has no record to pin against — this is
+    a plain path read that follows links. A caller already holding a ``RunState``
+    for this run passes it as ``pin``: the re-read goes through
+    :func:`_read_run_file` pinned to ``pin.run_dir_identity``, so a run dir (or
+    ``runs/``) swapped for a link between the first read and this one raises
+    :class:`~bmad_loop.platform_util.UnconfinedReadError` instead of returning the
+    foreign record. That binds a locked re-read to the lock-free check before it
+    (the resolve and re-arm shape). On the pinned arm a missing or non-regular
+    ``state.json`` raises ``FileNotFoundError``; the unpinned path read raises
+    whatever ``read_text`` does (``IsADirectoryError`` for a directory)."""
     target = run_dir / STATE_FILE
-    return RunState.from_dict(json.loads(target.read_text(encoding="utf-8")))
+    if pin is None:
+        return RunState.from_dict(json.loads(target.read_text(encoding="utf-8")))
+    data = _read_run_file(run_dir, STATE_FILE, pin.run_dir_identity)
+    if data is None:
+        raise FileNotFoundError(f"{STATE_FILE} is missing or not a regular file: {target}")
+    return RunState.from_dict(json.loads(data.decode("utf-8")))
+
+
+def _read_run_file(run_dir: Path, name: str, record: RootIdentityRecord | None) -> bytes | None:
+    """The bytes of ``run_dir/name``, read confined to the run dir ``record`` pins,
+    or None when the file is absent or not a regular file. Writes nothing.
+
+    The arms are the writers' (:func:`save_state`, :meth:`Journal.append`): a
+    record opens the run dir through :func:`open_dir_confined` pinned to it; a
+    refusal that :func:`stale_device_record` explains (a renumbered ``st_dev`` on
+    the intact directory), or no record at all, opens it unpinned as the
+    ``O_NOFOLLOW`` last component of a walk from its parent. Any other pinned miss
+    — ``runs/`` or the run dir swapped for a link or another directory, the run
+    dir gone — raises :class:`UnconfinedReadError`. No notice row: the same
+    object's appends already journal ``journal-unpinned``.
+
+    The file opens under the descriptor ``O_RDONLY`` with :data:`AT_NOFOLLOW` (a
+    link AT the file refuses typed) and :data:`AT_NONBLOCK` (a FIFO planted there
+    cannot stall the open), then must ``fstat`` as a regular file.
+
+    Hosts with neither handle arm: :func:`require_root_pinned` against the record
+    plus :func:`is_link_like` on the run dir and the file, then a path read —
+    check-then-read, the residual :func:`~bmad_loop.platform_util.path_is_confined`
+    documents."""
+    if not HANDLE_ANCHORED_WRITES:
+        return _read_run_file_by_path(run_dir, name, record)
+    if record is None:
+        dir_fd = open_dir_confined(run_dir.parent, run_dir)
+    else:
+        dir_fd = open_dir_confined(run_dir, run_dir, root_identity=recorded_root_identity(record))
+        if dir_fd is None and stale_device_record(run_dir, record):
+            dir_fd = open_dir_confined(run_dir.parent, run_dir)
+    if dir_fd is None:
+        raise UnconfinedReadError(
+            f"refusing to read {name} from an unconfined or replaced run dir: {run_dir}"
+        )
+    try:
+        try:
+            fd = open_at(dir_fd, name, os.O_RDONLY | AT_NOFOLLOW | AT_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            # Tell the refusal (a link at the file: ELOOP on POSIX, a reparse point
+            # on win32) and a non-file (a directory) apart from a real read fault.
+            try:
+                info = stat_at(dir_fd, name)
+            except OSError:
+                raise e from None
+            if link_like_stat(info):
+                raise UnconfinedReadError(
+                    f"refusing to read {name} through a link: {run_dir / name}"
+                ) from e
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            chunks: list[bytes] = []
+            while chunk := os.read(fd, 1 << 16):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _read_run_file_by_path(
+    run_dir: Path, name: str, record: RootIdentityRecord | None
+) -> bytes | None:
+    """:func:`_read_run_file`'s no-handle fallback: check, then read by path."""
+    identity = (
+        None
+        if record is None or stale_device_record(run_dir, record)
+        else recorded_root_identity(record)
+    )
+    target = run_dir / name
+    try:
+        require_root_pinned(run_dir, identity)
+    except UnconfinedWriteError as e:
+        raise UnconfinedReadError(
+            f"refusing to read {name} from a replaced run dir: {run_dir}"
+        ) from e
+    if is_link_like(run_dir) or is_link_like(target):
+        raise UnconfinedReadError(f"refusing to read {name} through a link: {target}")
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return target.read_bytes()

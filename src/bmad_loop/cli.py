@@ -6317,7 +6317,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # The pre-session checks intentionally stay lock-free; this is the
             # mutation boundary, so repeat every state/liveness precondition from
             # the snapshot left by the preceding writer before restamping anything.
-            fresh_state = load_state(run_dir)
+            fresh_state = load_state(run_dir, pin=state)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
@@ -6448,7 +6448,7 @@ def _resolve_adopt(
         with state_lock(run_dir):
             # Same mutation-boundary re-check as the re-arm path: the checks above
             # ran lock-free, so repeat them against the state left by the last writer.
-            fresh_state = load_state(run_dir)
+            fresh_state = load_state(run_dir, pin=state)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
@@ -6544,7 +6544,7 @@ def _resolve_abandon(
     try:
         with state_lock(run_dir):
             # The checks above ran lock-free: repeat them against the last writer's state.
-            fresh_state = load_state(run_dir)
+            fresh_state = load_state(run_dir, pin=state)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
@@ -6682,7 +6682,7 @@ def _resolve_reverify(
         with state_lock(run_dir):
             # Same mutation-boundary re-check as the re-arm path: the checks above
             # ran lock-free, so repeat them against the state left by the last writer.
-            fresh_state = load_state(run_dir)
+            fresh_state = load_state(run_dir, pin=state)
             if not _resolve_pause_admits(fresh_state.paused_stage, reverify_named=explicit_story):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),

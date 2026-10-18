@@ -1155,6 +1155,22 @@ class UnconfinedWriteError(OSError):
     what a bare ``Path.write_text`` raised before these writes went atomic."""
 
 
+class UnconfinedReadError(OSError):
+    """A pinned run-dir read refused: the run dir (or an ancestor such as
+    ``runs/``) no longer reaches the directory its ``RunState.run_dir_identity``
+    records, the run dir is a link, or the file under it is one. Raised by
+    ``journal.load_state(pin=...)`` and by ``Journal.entries`` on a journal built
+    with ``pin=``, never by an unpinned read.
+
+    An ``OSError`` subclass DIRECTLY, not an :class:`UnconfinedWriteError`: a
+    read wrote nothing, so a handler that tells write refusals apart must not
+    file this one with them. ``OSError`` because the sites that re-read a run's
+    state already handle ``OSError`` from that read — the TUI watcher keeps the
+    last good parse and names the fault, the resolve and re-arm gestures report
+    a failed re-read — so a refusal lands in handling those callers already
+    have instead of escaping as a type nobody catches."""
+
+
 def path_is_confined(root: Path, target: Path) -> bool:
     """Whether ``target`` is reached from ``root`` without traversing a redirect
     at any component below it.
@@ -1529,7 +1545,11 @@ def open_dir_confined(
     (:func:`stale_device_record`) does not refuse there: the write degrades to an
     unpinned open whose run dir is still the ``O_NOFOLLOW`` last component of the
     walk, and the journal records one ``journal-unpinned`` row per writer object.
-    Any other pinned miss raises :class:`UnconfinedWriteError`. A pinned
+    Any other pinned miss raises :class:`UnconfinedWriteError`. The pinned
+    run-dir READS (``journal.load_state(pin=...)`` and ``Journal.entries`` on a
+    journal built with ``pin=``) share those arms and refuse with
+    :class:`UnconfinedReadError`; the first ``load_state`` (no record to pin to
+    yet) and the TUI's ``JournalTail`` stay path-based. A pinned
     spec writer's EXTERNAL arm (a target outside ``confine_root``) pre-checks the
     pin with :func:`require_root_pinned` before writing, so a path resolved
     through a swapped mount refuses there too while the swap still stands

@@ -5082,6 +5082,111 @@ def test_resolve_refuses_a_newer_escalation_after_waiting_for_mutation_lock(
     assert "changed while resolve was in progress" in capsys.readouterr().err
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_resolve_locked_reread_refuses_a_runs_dir_swapped_for_a_foreign_tree(
+    tmp_path, monkeypatch, capsys
+):
+    """DW-564: the locked re-read is pinned to the lock-free read before it. `runs/`
+    swapped, between the two, for a link to a tree holding a REAL `r1/state.json`
+    raises `UnconfinedReadError` instead of re-arming the foreign record; `main`'s
+    backstop reports it as a failure.
+
+    Ablation (run): drop `pin=state` from `cmd_resolve`'s locked `load_state` and
+    this fails at `pytest.fail("re-armed")` — the foreign state's escalation is
+    re-armed."""
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed"))
+    runs_dir = run_dir.parent
+    outside = tmp_path / "outside"
+
+    @contextlib.contextmanager
+    def swap_first(_run_dir):
+        shutil.copytree(runs_dir, outside)
+        runs_dir.rename(runs_dir.with_name("runs-aside"))
+        runs_dir.symlink_to(outside, target_is_directory=True)
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", swap_first)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"])
+
+    assert rc == 1
+    assert "refusing to read state.json from an unconfined" in capsys.readouterr().err
+    assert load_state(run_dir).run_id == "r1"  # the path read follows into the copy
+
+
+def _tree_bytes(root):
+    return {p.relative_to(root): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("mode", ["--adopt-branch", "--abandon", "--reverify"])
+def test_resolve_action_locked_rereads_refuse_a_runs_dir_swapped_for_a_foreign_tree(
+    project, tmp_path, monkeypatch, capsys, mode
+):
+    """DW-564, the action legs of the test above: `_resolve_adopt`, `_resolve_abandon`
+    and `_resolve_reverify` each re-read the state under the lock pinned to the state
+    `cmd_resolve` read first. `runs/` swapped between the two for a link to a tree
+    holding a real `r1/` refuses with rc 1 and leaves the foreign copy byte-identical.
+
+    Ablation (run, per site): drop `pin=state` from that leg's locked `load_state`
+    and its row fails at its `pytest.fail` — the foreign record is acted on."""
+    import contextlib
+
+    from bmad_loop import unitreplay
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    if mode == "--adopt-branch":
+        root = tmp_path
+        run_dir = _adoptable_run(tmp_path)
+        monkeypatch.setattr(
+            runs, "adopt_escalated_branch", lambda *_a, **_k: pytest.fail("adopted")
+        )
+        extra = ["--resume"]
+    elif mode == "--abandon":
+        install_bmad_config(project)
+        root = project.project
+        run_dir = _escalated_run(root, "r1")
+        monkeypatch.setattr(unitreplay, "abandon_refusal", lambda *_a: None)
+        monkeypatch.setattr(
+            unitreplay, "abandon_replay_run", lambda *_a, **_k: pytest.fail("abandoned")
+        )
+        extra = ["--no-interactive"]
+    else:
+        run_dir, root = _reverify_project(tmp_path)
+        monkeypatch.setattr(
+            runs, "rearm_for_reverify", lambda *_a, **_k: pytest.fail("re-armed for reverify")
+        )
+        extra = ["--resume"]
+    runs_dir = run_dir.parent
+    outside = runs_dir.parent / "outside-runs"
+    foreign: list[dict] = []
+
+    @contextlib.contextmanager
+    def swap_first(_run_dir):
+        shutil.copytree(runs_dir, outside)
+        foreign.append(_tree_bytes(outside))
+        runs_dir.rename(runs_dir.with_name("runs-aside"))
+        runs_dir.symlink_to(outside, target_is_directory=True)
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", swap_first)
+
+    rc = cli.main(["resolve", "--project", str(root), "r1", mode, *extra])
+
+    assert rc == 1
+    assert "refusing to read state.json from an unconfined" in capsys.readouterr().err
+    assert foreign and _tree_bytes(outside) == foreign[0]
+
+
 def test_resolve_retains_outer_lock_through_rearm_call(tmp_path, monkeypatch):
     run_dir = _escalated_run(tmp_path, "r1")
     rearms: list[Path] = []
