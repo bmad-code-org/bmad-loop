@@ -13736,6 +13736,119 @@ def test_t3_mark_done_commits_in_store_repo(project_v7_store_repo, monkeypatch):
     assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written")]
 
 
+def test_t3_harvest_carry_rides_the_marked_plan_commit(project_v7_store_repo, monkeypatch):
+    """DW-570, T3: an isolated ticket whose task carries one harvested deferral
+    the shared ledger does not yet hold reaches the terminal composite, whose
+    carry files it into the store's ledger, then `_land_post_landing_writes`.
+    `_commit_marked_plan` is the latched publisher of the plan plus the ledger,
+    so the carry leaves the ledger to it: no carry commit, the `chore(tickets):
+    1.1 done …` commit touches the plan and the ledger with the harvested row at
+    HEAD, and no `harvest-carry-uncommitted` row. The harvest is injected at the
+    hook (the real `worktree_flow` order runs around it): a full run's own
+    harvest lands in the shared ledger at verify time, so the carry would dedupe
+    it and never reach a commit.
+
+    Ablation (performed): drop `TicketsEngine._store_publishes_harvest_carry`
+    and this FAILS (the carry commits the ledger alone first, and the tickets
+    commit holds only the plan)."""
+    from test_tickets_engine import _kinds
+
+    from bmad_loop.tickets_engine import TicketsEngine
+
+    layout = project_v7_store_repo
+    store = layout.output_folder
+    real_carry = TicketsEngine._carry_isolated_ledger_writes
+    seen: list[str] = []
+
+    def carry_with_harvest(self, task):
+        assert self._post_landing_target(task) == "done"  # premise: a mark is latched
+        seen.append(task.story_key)
+        task.harvested_deferrals = [
+            {
+                "origin": "spec-deferred plan-1.1.md",
+                "title": "cart totals ignore discounts",
+                "reason": "found while building 1.1",
+                "location": "src.txt",
+                "severity": "medium",
+                "source_spec": "plan-1.1.md",
+            }
+        ]
+        real_carry(self, task)
+
+    monkeypatch.setattr(TicketsEngine, "_carry_isolated_ledger_writes", carry_with_harvest)
+    engine, _, plan = _store_run(layout, "T3", monkeypatch)
+
+    assert seen == ["1.1"]  # premise: the terminal composite ran
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.worktree_path and not task.ticket_done_pending
+    assert [e["dw_ids"] for e in _kinds(engine, "harvest-carried")] == [["DW-1"]]
+    subjects = git(store, "log", "--format=%s").splitlines()
+    assert not [s for s in subjects if s.startswith("chore(deferred-work): carry")], subjects
+    assert subjects[0] == "chore(tickets): 1.1 done [bmad-loop test-run]"
+    ledger = engine.paths.deferred_work
+    rels = {p.resolve().relative_to(store.resolve()).as_posix() for p in (plan, ledger)}
+    assert set(git(store, "show", "--name-only", "--format=", "HEAD").split()) == rels
+    ledger_rel = ledger.resolve().relative_to(store.resolve()).as_posix()
+    assert deferredwork.open_ids(git(store, "show", f"HEAD:{ledger_rel}")) == {"DW-1"}
+    assert git(store, "status", "--porcelain") == ""
+    assert _kinds(engine, "harvest-carry-uncommitted") == []
+
+
+def test_t3_tickets_replayed_deferred_harvest_commits_in_store_repo(project_v7_store_repo):
+    """DW-570, T3, driven at the seam: the resume replay of an isolated DEFERRED
+    ticket's latched harvest (`_replay_unlatched_ledger_carries`). A deferred
+    ticket owes no post-landing write, so no store publisher follows and the
+    carry commits the harvest in the store itself: exactly one `chore(
+    deferred-work): carry harvested findings from 1.1` commit touching only the
+    ledger, the store's ledger clean, the latch cleared and no
+    `harvest-carry-uncommitted` row.
+
+    Ablation (performed): make `TicketsEngine._store_publishes_harvest_carry`
+    `return True` and this FAILS (no carry commit; the harvest stays dirty in the
+    store)."""
+    from test_tickets_engine import _kinds
+
+    layout = project_v7_store_repo
+    store = layout.output_folder
+    engine, _ = _store_engine(layout, _store_tree(layout, "1.1"), "T3")
+    ledger = engine.paths.deferred_work
+    assert ledger.resolve().is_relative_to(store.resolve())  # premise: a store ledger
+    task = StoryTask(
+        "1.1",
+        0,
+        phase=Phase.DEFERRED,
+        worktree_path=str(engine.paths.repo_root.parent / "unit"),
+        harvest_carry_commit_pending=True,
+        harvested_deferrals=[
+            {
+                "origin": "spec-deferred plan-1.1.md",
+                "title": "cart totals ignore discounts",
+                "reason": "found while building 1.1",
+                "location": "src.txt",
+                "severity": "medium",
+                "source_spec": "plan-1.1.md",
+            }
+        ],
+    )
+    engine.state.tasks["1.1"] = task
+    engine._save()
+
+    engine._replay_unlatched_ledger_carries()
+
+    assert [e["story_key"] for e in _kinds(engine, "resume-ledger-carry")] == ["1.1"]
+    assert [e["dw_ids"] for e in _kinds(engine, "harvest-carried")] == [["DW-1"]]
+    subject = "chore(deferred-work): carry harvested findings from 1.1"
+    log = [line.split(" ", 1) for line in git(store, "log", "--format=%H %s").splitlines()]
+    commits = [sha for sha, s in log if s == subject]
+    assert len(commits) == 1, git(store, "log", "--format=%s")
+    ledger_rel = ledger.resolve().relative_to(store.resolve()).as_posix()
+    assert git(store, "show", "--name-only", "--format=", commits[0]).split() == [ledger_rel]
+    assert deferredwork.open_ids(git(store, "show", f"HEAD:{ledger_rel}")) == {"DW-1"}
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    assert task.harvest_carry_commit_pending is False
+    assert _kinds(engine, "harvest-carry-uncommitted") == []
+
+
 def test_squash_merge_back_trailers_name_the_landed_commit(project_v7_store_repo, monkeypatch):
     """A `squash` merge-back lands a different commit than the unit's, and the
     unit branch's teardown leaves the unit's unreachable: the store trailers name

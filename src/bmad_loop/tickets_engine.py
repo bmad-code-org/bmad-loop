@@ -1786,6 +1786,17 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return verify.PLAN_DONE
         return verify.PLAN_BUILT if task.ticket_commit_pending else ""
 
+    def _store_publishes_harvest_carry(self, task: StoryTask, *, terminal_composite: bool) -> bool:
+        """True for the terminal composite of a ticket that owes a post-landing
+        write (:meth:`_post_landing_target` non-empty, DW-570): ``worktree_flow``
+        runs the harvested carry, then :meth:`_land_post_landing_writes` →
+        :meth:`_commit_marked_plan`, the latched and retried publisher of the plan
+        plus the ledger when the task wrote to it. A carry commit first would take
+        the ledger out of that commit and trade its retry for a best-effort one.
+        An isolated defer and the resume replay owe no post-landing write, so the
+        carry commits those itself."""
+        return terminal_composite and bool(self._post_landing_target(task))
+
     def _land_post_landing_writes(self, task: StoryTask) -> None:
         """Make the latched mark now that the unit's code is on the target: on the
         run's own tree (the main checkout's view of the shared store) and the plan

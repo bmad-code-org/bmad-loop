@@ -32,6 +32,7 @@ from . import (
     envvars,
     gates,
     operatoractions,
+    ticketstore,
     verify,
 )
 from .adapters.base import CodingCLIAdapter, SessionResult, SessionSpec, SpecSnapshot
@@ -10075,6 +10076,74 @@ class Engine:
         self._carry_story_deferred_closes(task)
         self._carry_board_advance(task)
 
+    @property
+    def store_topology(self) -> ticketstore.StoreTopology | None:
+        """The ticket store this run recorded at its start. Base: None — a story
+        run has no ticket store. Modes with a ticket store (``SweepEngine`` on v7,
+        ``TicketsEngine``) override it to locate the recorded topology on the live
+        project."""
+        return None
+
+    def _harvest_carry_store_repo(self, ledger: Path) -> Path | None:
+        """The run's store repository when ``ledger`` resolves inside it (T3/T4),
+        else None: no recorded topology, an unversioned or in-checkout store
+        (``store_repo`` None), a ledger outside the store repository, or a
+        ``resolve()`` fault — which leaves the code-repo path, and its
+        ``commit_paths`` uncertainty raise, in charge (DW-570)."""
+        topology = self.store_topology
+        if topology is None or topology.store_repo is None:
+            return None
+        try:
+            inside = ledger.resolve().is_relative_to(topology.store_repo.resolve())
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return topology.store_repo if inside else None
+
+    def _store_publishes_harvest_carry(self, task: StoryTask, *, terminal_composite: bool) -> bool:
+        """Whether a mode-owned store publisher commits the ledger right after
+        this harvested carry, so the carry's store arm must not (DW-570): one
+        publisher per write. Base: False — no publisher follows, so the carry
+        commits its own harvest in the store repository."""
+        del task, terminal_composite
+        return False
+
+    def _commit_store_ledger(
+        self,
+        task: StoryTask,
+        store_repo: Path,
+        ledger: Path,
+        message: str,
+        *,
+        code_commit: str | None,
+        code_baseline: str | None = None,
+    ) -> None:
+        """The best-effort store commit the sweep ledger publishers and the
+        harvested carry's store arm share: commit ``ledger`` alone in
+        ``store_repo`` under ``message`` and journal the outcome —
+        ``store-committed`` for a commit, ``store-commit-failed`` for a
+        :class:`~bmad_loop.ticketstore.StoreCommitError`,
+        ``store-commit-foreign-dirt`` for a staged foreign version, and nothing
+        when the ledger is already at the store's HEAD."""
+        committer = ticketstore.StoreCommitter(store_repo, self.paths.repo_root)
+        try:
+            result = committer.commit(
+                task.story_key,
+                [ledger],
+                message,
+                code_commit=code_commit,
+                code_baseline=code_baseline,
+            )
+        except ticketstore.StoreCommitError as e:
+            self.journal.append("store-commit-failed", story_key=task.story_key, error=str(e))
+            return
+        if result.foreign:
+            self.journal.append(
+                "store-commit-foreign-dirt", story_key=task.story_key, count=len(result.foreign)
+            )
+            return
+        if result.sha is not None:
+            self.journal.append("store-committed", story_key=task.story_key, commit=result.sha)
+
     def _harvest_carry_commit_may_degrade(self, ledger: Path) -> bool:
         """Whether a carry may remain uncommitted because git cannot own its path.
 
@@ -10279,6 +10348,23 @@ class Engine:
         HEAD plus this task's rows (:meth:`_harvest_carry_holds_only_this_carry`)
         and otherwise pause for the operator without committing or clearing the
         latch (DW-355). A fresh first pass that appends rows is not proved.
+
+        A ledger inside the run's store repository (T3/T4,
+        :meth:`_harvest_carry_store_repo`) takes the STORE ARM instead, after the
+        same DW-237 refusal (DW-570): the code-repo commit is never attempted,
+        since git there can only refuse the path. When a mode-owned store
+        publisher commits the ledger right after this carry
+        (:meth:`_store_publishes_harvest_carry`) the carry leaves the write to it;
+        otherwise it commits the ledger alone in the store through
+        :meth:`_commit_store_ledger` as ``chore(deferred-work): carry harvested
+        findings from <story_key>``, naming the landed code commit and baseline
+        on the terminal composite and no code commit elsewhere. Best effort, like
+        every store publisher: a failed commit journals ``store-commit-failed``, a
+        staged foreign version ``store-commit-foreign-dirt``; either way the latch
+        clears and ``harvest-carried`` is journaled. The DW-355/413 replay proof is
+        not run on the store arm: like every store publisher it publishes the whole
+        file, and :class:`~bmad_loop.ticketstore.StoreCommitter` refuses only a
+        staged foreign version.
         """
         if not task.harvested_deferrals:
             return
@@ -10360,7 +10446,9 @@ class Engine:
                 # nothing to retry — `target-undecodable` among them, because git
                 # accepts any bytes and the fall-through would otherwise commit the
                 # corrupt ledger (the guard splits that cause from this one for
-                # exactly this site; DW-237).
+                # exactly this site; DW-237). A ledger in a store repository takes
+                # the store arm below instead (DW-570): best effort, the latch
+                # clears, as its `may_degrade` degrade did before.
                 refusal = None
             if refusal is not None:
                 cause, error = refusal
@@ -10374,6 +10462,29 @@ class Engine:
                     refuse_cause=cause,
                     **extra,
                 )
+            elif (store_repo := self._harvest_carry_store_repo(ledger)) is not None:
+                # THE STORE ARM (DW-570): the ledger lives in a ticket store with
+                # its own repository (T3/T4), which `commit_paths` in the code repo
+                # can never own. Exactly one publisher per write: a mode-owned
+                # store publisher that commits right after this carry takes it
+                # (the sweep's `_publish_deferred_ledger` and
+                # `_publish_bundle_close`, the tickets `_commit_marked_plan`);
+                # otherwise the carry commits its harvest in the store itself.
+                # Best effort: never a raise, never a pause, and the latch clears
+                # below.
+                if not self._store_publishes_harvest_carry(
+                    task, terminal_composite=terminal_composite
+                ):
+                    self._commit_store_ledger(
+                        task,
+                        store_repo,
+                        ledger,
+                        f"chore(deferred-work): carry harvested findings from {task.story_key}",
+                        code_commit=(
+                            self._landed_code_commit(task) if terminal_composite else None
+                        ),
+                        code_baseline=task.baseline_commit if terminal_composite else None,
+                    )
             else:
                 if latched_before or not carried:
                     # Stages whatever the working-tree ledger holds now, so it is

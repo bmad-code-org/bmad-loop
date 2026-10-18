@@ -38690,11 +38690,18 @@ def test_v7_isolated_deferred_bundle_publishes_its_shared_store_ledger(project_v
     harvested deferral, which the base's isolated arm files into that ledger as
     DW-2. `SweepEngine._defer` reopens DW-1 and publishes: exactly one
     deferred-bundle store commit touching only the ledger, holding DW-1 and DW-2
-    open, the store's ledger clean, and its `store-committed` row naming it.
+    open, the store's ledger clean, and its `store-committed` row naming it. The
+    harvested carry takes its store arm (DW-570): it never asks the code repo to
+    commit a store path (no `harvest-carry-uncommitted`) and leaves the harvest to
+    the deferred publisher (no carry commit of its own).
 
-    ABLATION (performed): gate the `_publish_deferred_ledger` call in
+    ABLATIONS (performed): gate the `_publish_deferred_ledger` call in
     `SweepEngine._defer` to the in-place arm only and this fails (no
-    deferred-bundle commit; the ledger stays dirty in the store)."""
+    deferred-bundle commit; the ledger stays dirty in the store). Remove the
+    store arm from `Engine._carry_harvested_deferrals` and this fails on
+    `harvest-carry-uncommitted`. Make `SweepEngine._store_publishes_harvest_carry`
+    return False and this fails on the deferred-commit count (the carry commits
+    the reopen and the harvest itself, leaving the deferred publisher nothing)."""
     v7 = project_v7_store_repo
     store = v7.output_folder
     paths = _v7_paths(v7)
@@ -38736,15 +38743,216 @@ def test_v7_isolated_deferred_bundle_publishes_its_shared_store_ledger(project_v
     engine._defer(task, "verify failed")
 
     assert task.phase == Phase.DEFERRED
+    assert [r["dw_ids"] for r in _records(engine, "harvest-carried")] == [["DW-2"]]  # premise
+    assert _records(engine, "harvest-carry-uncommitted") == []
     entries = ledger_entries(paths)
     assert entries["DW-1"].open and entries["DW-2"].open
     commits = _store_deferred_commits(store)
     assert len(commits) == 1, git(store, "log", "--format=%s")
+    assert _store_carry_commits(store, task.story_key) == []
     assert git(store, "show", "--name-only", "--format=", commits[0]).split() == [ledger_rel]
     head_ledger = git(store, "show", f"{commits[0]}:{ledger_rel}")
     assert deferredwork.open_ids(head_ledger) == {"DW-1", "DW-2"}
     assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
     assert [r["commit"] for r in _records(engine, "store-committed")] == commits
+
+
+def _store_carry_commits(store: Path, story_key: str) -> list[str]:
+    """The shas of the store's harvested-carry commits for ``story_key``, newest
+    first (DW-570)."""
+    subject = f"chore(deferred-work): carry harvested findings from {story_key}"
+    log = [line.split(" ", 1) for line in git(store, "log", "--format=%H %s").splitlines()]
+    return [sha for sha, s in log if s == subject]
+
+
+def _v7_store_carry_seam(v7, layout, *, distinct_baseline=False):
+    """A v7 sweep engine over a store with its own repository (``layout`` T3/T4)
+    whose ledger, `{DW-1: open}`, is committed in that store, plus a mounted
+    bundle task that landed (``commit_sha`` at the code repo's HEAD) carrying one
+    harvested deferral. ``distinct_baseline`` lands an empty code commit first so
+    the task's ``baseline_commit`` is its parent rather than ``commit_sha``.
+    Returns the engine, its paths, the store, the ledger's store-relative path
+    and the task."""
+    store = v7.output_folder
+    paths = _v7_paths(v7)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    git(store, "add", "-A")
+    git(store, "commit", "-q", "-m", "ledger")
+    ledger_rel = paths.deferred_work.resolve().relative_to(store.resolve()).as_posix()
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""  # premise
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == layout
+    engine, _ = make_sweep(paths, [], store_topology=topology.to_dict())
+    baseline = rev_parse_head(paths.repo_root)
+    if distinct_baseline:
+        git(paths.repo_root, "commit", "-q", "--allow-empty", "-m", "the bundle's code")
+    head = rev_parse_head(paths.repo_root)
+    assert (head != baseline) == distinct_baseline  # premise
+    task = StoryTask(
+        story_key="dw-fix-things",
+        epic=0,
+        dw_ids=["DW-1"],
+        phase=Phase.DONE,
+        worktree_path=str(paths.repo_root.parent / "unit"),
+        commit_sha=head,
+        baseline_commit=baseline,
+        harvested_deferrals=[
+            {
+                "origin": "spec-deferred plan-dw-fix-things.md",
+                "title": SWEEP_FINDING["summary"],
+                "reason": SWEEP_FINDING["evidence"],
+                "location": SWEEP_FINDING["location"],
+                "severity": SWEEP_FINDING["severity"],
+                "source_spec": "plan-dw-fix-things.md",
+            }
+        ],
+    )
+    engine.state.tasks[task.story_key] = task
+    return engine, paths, store, ledger_rel, task
+
+
+@pytest.mark.parametrize(
+    ("fixture", "layout"),
+    [("project_v7_store_repo", "T3"), ("project_v7_external_store", "T4")],
+)
+def test_v7_terminal_harvest_carry_commits_in_store_repo(request, fixture, layout):
+    """DW-570, driven at the seam: the terminal-composite harvested carry of a
+    mounted bundle whose ledger lives in a store with its own repository (T3
+    nested, T4 outside). No store publisher follows a harvest-only write there,
+    so the carry commits it in the store itself: exactly one carry commit
+    touching only the ledger, HEAD holding the harvested DW-2 open, the store's
+    ledger clean, one `store-committed` row naming it, the landed code commit in
+    its trailers, no `harvest-carry-uncommitted` row (the code repo is never
+    asked to commit a store path) and the commit latch cleared.
+
+    ABLATIONS (performed): drop `code_baseline=` from the store arm's commit
+    and both rows fail on `Bmad-Code-Range` (the seam's baseline differs from the
+    commit). Remove the store arm from
+    `Engine._carry_harvested_deferrals` and both rows fail on the carry-commit
+    count (the code-repo commit is refused and degrades to
+    `harvest-carry-uncommitted`, so no carry commit lands in the store)."""
+    engine, paths, store, ledger_rel, task = _v7_store_carry_seam(
+        request.getfixturevalue(fixture), layout, distinct_baseline=True
+    )
+
+    engine._carry_harvested_deferrals(task, terminal_composite=True)
+
+    assert [r["dw_ids"] for r in _records(engine, "harvest-carried")] == [["DW-2"]]
+    commits = _store_carry_commits(store, task.story_key)
+    assert len(commits) == 1, git(store, "log", "--format=%s")
+    assert git(store, "show", "--name-only", "--format=", commits[0]).split() == [ledger_rel]
+    head_ledger = git(store, "show", f"HEAD:{ledger_rel}")
+    assert deferredwork.open_ids(head_ledger) == {"DW-1", "DW-2"}
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    assert [r["commit"] for r in _records(engine, "store-committed")] == commits
+    body = git(store, "log", "-1", "--format=%B", commits[0])
+    assert f"Bmad-Code-Commit: {task.commit_sha}" in body
+    assert task.baseline_commit != task.commit_sha  # premise: the range is graded
+    assert f"Bmad-Code-Range: {task.baseline_commit}..{task.commit_sha}" in body
+    assert _records(engine, "harvest-carry-uncommitted") == []
+    assert task.harvest_carry_commit_pending is False
+
+
+def test_v7_harvest_carry_store_commit_failure_is_best_effort(project_v7_store_repo, monkeypatch):
+    """DW-570, T3: the harvested carry's store commit raises
+    `StoreCommitError`. The store arm is best effort: no raise, a
+    `store-commit-failed` row for the bundle, the commit latch cleared and
+    `harvest-carried` journaled as on success.
+
+    ABLATION (performed): drop the `except ticketstore.StoreCommitError` clause
+    in `Engine._commit_store_ledger` and this fails (the error propagates out of
+    the carry)."""
+    engine, _paths, store, ledger_rel, task = _v7_store_carry_seam(project_v7_store_repo, "T3")
+
+    def commit(self, unit_id, paths, message, **kwargs):
+        raise ticketstore.StoreCommitError(f"{unit_id}: index.lock exists")
+
+    monkeypatch.setattr(ticketstore.StoreCommitter, "commit", commit)
+
+    engine._carry_harvested_deferrals(task, terminal_composite=True)
+
+    assert [r["story_key"] for r in _records(engine, "store-commit-failed")] == ["dw-fix-things"]
+    assert task.harvest_carry_commit_pending is False
+    assert [r["dw_ids"] for r in _records(engine, "harvest-carried")] == [["DW-2"]]
+    assert _records(engine, "harvest-carry-uncommitted") == []
+    assert _store_carry_commits(store, task.story_key) == []
+    assert git(store, "status", "--porcelain", "--", ledger_rel) != ""  # still uncommitted
+
+
+def test_v7_terminal_harvest_carry_rides_the_bundle_close_commit(project_v7_store_repo):
+    """DW-570, T3, driven at the seam: a mounted bundle that landed with a close
+    AND a harvest. Under the shared store its close of DW-1 is already in the one
+    ledger, and `_publish_bundle_close` follows the terminal composite, so the
+    carry leaves the ledger to it: no carry commit, and exactly one close commit
+    touching only the ledger whose HEAD holds DW-1 done and the harvested DW-2
+    open, the store's ledger clean and no `harvest-carry-uncommitted` row.
+
+    ABLATION (performed): drop the terminal-composite case from
+    `SweepEngine._store_publishes_harvest_carry` (return False there) and this
+    fails on the carry-commit count (the carry folds the close into
+    `chore(deferred-work): …` and leaves the close publisher nothing to commit)."""
+    engine, paths, store, ledger_rel, task = _v7_store_carry_seam(project_v7_store_repo, "T3")
+    assert engine.paths.in_shared_store(engine.paths.deferred_work)  # premise
+    task.bundle_closes_intended = ["DW-1"]
+    deferredwork.mark_done_many_reopenable(
+        engine.paths.deferred_work,
+        task.dw_ids,
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    assert not ledger_entries(paths)["DW-1"].open  # premise: the close is in the main ledger
+
+    engine._carry_isolated_ledger_writes(task)
+    engine._publish_bundle_close(task)
+
+    assert [r["dw_ids"] for r in _records(engine, "harvest-carried")] == [["DW-2"]]  # premise
+    assert _store_carry_commits(store, task.story_key) == [], git(store, "log", "--format=%s")
+    closes = _store_closes(store, ledger_rel)  # each asserted to touch the ledger alone
+    assert len(closes) == 1, git(store, "log", "--format=%s")
+    head_ledger = git(store, "show", f"HEAD:{ledger_rel}")
+    assert git(store, "log", "-1", "--format=%s").strip() == _V7_LEDGER_CLOSE
+    assert deferredwork.open_ids(head_ledger) == {"DW-2"}
+    head_entries = {e.id: e for e in deferredwork.parse_ledger(head_ledger)}
+    assert set(head_entries) == {"DW-1", "DW-2"} and not head_entries["DW-1"].open
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    assert _records(engine, "harvest-carry-uncommitted") == []
+    assert task.harvest_carry_commit_pending is False
+
+
+def test_v7_resume_replay_commits_deferred_harvest_in_store_repo(project_v7_store_repo):
+    """DW-570, T3: the resume replay of a DEFERRED isolated bundle's latched
+    harvest (`_replay_unlatched_ledger_carries`). No store publisher follows the
+    replay, so the carry commits the harvest in the store itself: one carry
+    commit with DW-2 open at HEAD, the store's ledger clean, the latch cleared
+    and no `harvest-carry-uncommitted` row.
+
+    ABLATION (performed): drop the `task.phase != Phase.DEFERRED` clause from
+    `SweepEngine._store_publishes_harvest_carry` (return True for every
+    non-terminal carry) and this fails on the carry-commit count (the replay
+    leaves the harvest to a publisher that never runs). Pass `code_commit=` the
+    landed commit on every carry and this fails on `Bmad-Code-Commit` (the task
+    keeps the seam's `commit_sha`, so only the terminal gate keeps it out)."""
+    engine, paths, store, ledger_rel, task = _v7_store_carry_seam(project_v7_store_repo, "T3")
+    task.phase = Phase.DEFERRED
+    task.harvest_carry_commit_pending = True
+    engine._save()
+
+    engine._replay_unlatched_ledger_carries()
+
+    assert [r["story_key"] for r in _records(engine, "resume-ledger-carry")] == [task.story_key]
+    assert [r["dw_ids"] for r in _records(engine, "harvest-carried")] == [["DW-2"]]
+    commits = _store_carry_commits(store, task.story_key)
+    assert len(commits) == 1, git(store, "log", "--format=%s")
+    assert git(store, "show", "--name-only", "--format=", commits[0]).split() == [ledger_rel]
+    head_ledger = git(store, "show", f"HEAD:{ledger_rel}")
+    assert deferredwork.open_ids(head_ledger) == {"DW-1", "DW-2"}
+    assert git(store, "status", "--porcelain", "--", ledger_rel) == ""
+    body = git(store, "log", "-1", "--format=%B", commits[0])
+    assert "Bmad-Code-Repo: " in body  # premise: the trailers are there
+    assert "Bmad-Code-Commit" not in body  # no code landed on a deferred carry
+    assert task.harvest_carry_commit_pending is False
+    assert _records(engine, "harvest-carry-uncommitted") == []
 
 
 @pytest.mark.parametrize("publisher", ["plan", "close"])
