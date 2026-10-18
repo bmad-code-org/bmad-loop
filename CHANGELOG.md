@@ -152,6 +152,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Name the T1 ticket plan left `done` (or `blocked`) by an interrupted commit window when the
+  resumed commit fails, instead of a plain `commit failed:`; the COMMITTING save latches the
+  plan's pre-window status and digest (DW-555).
 - Resolve a relative v6 config path (`implementation_artifacts`, `planning_artifacts`,
   `output_folder`, `repo_root`) against the project root instead of the process cwd, as v7
   does (DW-551).
