@@ -8793,8 +8793,11 @@ class SweepEngine(Engine):
         """Commit the ledger close a landed bundle wrote when the ledger lives in a
         store repository (T3/T4), through
         :class:`~bmad_loop.ticketstore.StoreCommitter` as ``chore(sweep): close
-        resolved deferred-work entries`` with the ``Bmad-Code-*`` trailers.
-        Elsewhere the close rides the bundle's own code commit (``commit_story``'s
+        resolved deferred-work entries`` with the ``Bmad-Code-*`` trailers. A
+        harvest the isolated terminal carry filed into the same ledger rides this
+        commit: the carry leaves it to this publisher rather than committing it
+        itself (:meth:`_store_publishes_harvest_carry`, DW-570). Elsewhere the
+        close rides the bundle's own code commit (``commit_story``'s
         ``git add -A``, or the merge-back and ``_carry_isolated_ledger_writes``
         under isolation); a store repository's ledger is in no tree that commit can
         reach.
@@ -8862,9 +8865,12 @@ class SweepEngine(Engine):
         a store repository (T3/T4), through
         :class:`~bmad_loop.ticketstore.StoreCommitter` as ``chore(sweep): record a
         deferred bundle's ledger writes``: the reopen of its close and any
-        harvested deferrals. No code landed, so only ``Bmad-Code-Repo`` is
-        stamped. Elsewhere the ledger is in the code checkout (or a worktree copy
-        that dies with the unit) and no store commit is owed.
+        harvested deferrals, which the isolated defer's harvested carry leaves to
+        this publisher rather than committing itself
+        (:meth:`_store_publishes_harvest_carry`, DW-570). No code landed, so only
+        ``Bmad-Code-Repo`` is stamped. Elsewhere the ledger is in the code
+        checkout (or a worktree copy that dies with the unit) and no store commit
+        is owed.
 
         Withheld while the run holds its ledger in doubt
         (``sweep-ledger-commit-withheld`` naming the bundle's ids). Otherwise best
@@ -8889,41 +8895,30 @@ class SweepEngine(Engine):
             return
         self._commit_store_ledger(task, topology.store_repo, ledger, message, code_commit=None)
 
-    def _commit_store_ledger(
-        self,
-        task: StoryTask,
-        store_repo: Path,
-        ledger: Path,
-        message: str,
-        *,
-        code_commit: str | None,
-        code_baseline: str | None = None,
-    ) -> None:
-        """The best-effort store commit both ledger publishers share: commit
-        ``ledger`` alone in ``store_repo`` under ``message`` and journal the
-        outcome — ``store-committed`` for a commit, ``store-commit-failed`` for a
-        :class:`~bmad_loop.ticketstore.StoreCommitError`,
-        ``store-commit-foreign-dirt`` for a staged foreign version, and nothing
-        when the ledger is already at the store's HEAD."""
-        committer = ticketstore.StoreCommitter(store_repo, self.paths.repo_root)
-        try:
-            result = committer.commit(
-                task.story_key,
-                [ledger],
-                message,
-                code_commit=code_commit,
-                code_baseline=code_baseline,
-            )
-        except ticketstore.StoreCommitError as e:
-            self.journal.append("store-commit-failed", story_key=task.story_key, error=str(e))
-            return
-        if result.foreign:
-            self.journal.append(
-                "store-commit-foreign-dirt", story_key=task.story_key, count=len(result.foreign)
-            )
-            return
-        if result.sha is not None:
-            self.journal.append("store-committed", story_key=task.story_key, commit=result.sha)
+    def _store_publishes_harvest_carry(self, task: StoryTask, *, terminal_composite: bool) -> bool:
+        """Whether a sweep store publisher commits the ledger right after this
+        harvested carry (DW-570), so the carry's store arm leaves it alone. True
+        in two cases:
+
+        - The direct carry the base :meth:`_defer` makes on the isolated arm: it
+          runs before the base advances the task to DEFERRED, and this class's
+          :meth:`_defer` follows it with :meth:`_publish_deferred_ledger`, the
+          documented publisher of the reopened close and the harvest together.
+          Committing there would sweep the reopen into a carry commit and leave
+          the deferred publisher nothing to do.
+        - The terminal composite of a bundle that landed with a close
+          (``bundle_closes_intended`` non-empty): ``worktree_flow`` runs the
+          carry, then :meth:`_land_post_landing_writes` →
+          :meth:`_publish_bundle_close`. Under a shared store the close is
+          already in the one ledger, so a carry commit would fold it into
+          ``chore(deferred-work): …`` and leave the close publisher nothing.
+
+        A harvest-only terminal composite and the resume replay
+        (``_replay_unlatched_ledger_carries``, phase already DEFERRED) have no
+        store publisher after them, so the carry commits those itself."""
+        if terminal_composite:
+            return bool(task.bundle_closes_intended)
+        return task.phase != Phase.DEFERRED
 
     def _publish_bundle_plan(self, task: StoryTask) -> None:
         """Commit ``task``'s accepted bundle plan in the store's repository through

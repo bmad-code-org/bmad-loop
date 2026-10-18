@@ -161,6 +161,9 @@ breaking changes may land in a minor release.
   deferrals) in the ticket store's own repository (T3/T4), best effort and withheld while
   the ledger is in doubt; an isolated defer over a shared store reopens the bundle's close
   first (DW-567).
+- Commit an isolated unit's harvested deferrals in the ticket store's own repository (T3/T4)
+  when no store publisher follows, best effort, instead of journaling
+  `harvest-carry-uncommitted` for a store path the code repository cannot commit (DW-570).
 - Latch a worktree-isolated sweep bundle's artifact publication complete when its artifacts
   dir is in a shared ticket store, instead of pausing on
   `artifact publication intent is missing` after the merge (DW-557).
