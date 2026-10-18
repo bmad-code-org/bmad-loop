@@ -14,7 +14,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
-from conftest import FakeTicketTree, V7Layout, git, ticket_row
+from conftest import DEFAULT_TREE, FakeTicketTree, V7Layout, git, ticket_row, write_ticket_tree
 
 from bmad_loop import runs, tickets_engine, tickets_source, verify
 from bmad_loop.adapters.base import SessionResult, SessionSpec
@@ -494,6 +494,169 @@ def test_tickets_gate_pauses_on_v6_token(project_v7):
     assert "`v6_key`" in saved.paused_reason
     assert saved.paused_reason.endswith(f"`bmad-loop resume {engine.state.run_id}`")
     assert [e["dw_ids"] for e in _kinds(engine, "story-gated")] == [["DW-1"]]
+
+
+def _v6_keys(layout: V7Layout, **keys: str) -> None:
+    """Rewrite the on-disk `DEFAULT_TREE` with ``keys`` (``e1_1="3-2-x"`` sets
+    entry 1.1's `v6_key`) as the v6→v7 migration leaves them; committed so the
+    checkout stays clean."""
+    epics = tuple(
+        dataclasses.replace(
+            epic,
+            entries=tuple(
+                dataclasses.replace(entry, v6_key=keys.get(f"e{epic.id}_{entry.id}"))
+                for entry in epic.entries
+            ),
+        )
+        for epic in DEFAULT_TREE
+    )
+    write_ticket_tree(layout, epics)
+    git(layout.project, "add", "-A")
+    git(layout.project, "commit", "-q", "-m", "v6 keys")
+
+
+@pytest.mark.parametrize("token", ["3-2-invite-link", "3-2"])
+def test_tickets_gate_resolves_a_v6_token_to_its_ticket(project_v7, token):
+    """A v6 token that exactly one ticket's `v6_key` claims (the key itself, or
+    its `N-M` prefix) gates that ticket as its ref would: the run pauses on 1.1
+    with the ordinary gated clause, naming the token as written, and not the
+    legacy clause. Ablation (performed): return every token unresolved from
+    `deferredwork.partition_legacy_tokens` and the legacy clause comes back —
+    this FAILS."""
+    _v6_keys(project_v7, e1_1="3-2-invite-link")
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, adapter = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, f"gate: {token}")
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert (saved.paused_stage, saved.paused_story_key) == (PAUSE_STORY_GATE, "1.1")
+    assert saved.tasks == {} and adapter.sessions == []
+    assert (
+        f"1.1 is gated by unlanded deferred work: DW-1 (gate: {token} (`v6_key` of 1.1))"
+        in saved.paused_reason
+    )
+    assert "no single ticket" not in saved.paused_reason
+    assert [e["dw_ids"] for e in _kinds(engine, "story-gated")] == [["DW-1"]]
+
+
+def test_tickets_gate_v6_token_resolved_elsewhere_passes(project_v7):
+    """A v6 token resolved to 1.2 gates 1.2 only: a pick of 1.1 dispatches with no
+    `story-gate` pause, while 1.2 itself is refused. Ablation (performed): return
+    every token unresolved from `partition_legacy_tokens` and 1.1 pauses on the
+    legacy clause — this FAILS."""
+    _v6_keys(project_v7, e1_2="3-2-invite-link")
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+
+    picked = engine._pick_next()
+    assert picked is not None and picked.key == "1.1"
+    engine._refuse_gated_story(picked.key)  # must not raise
+    assert _kinds(engine, "story-gated") == []
+    with pytest.raises(RunPaused) as paused:
+        engine._refuse_gated_story("1.2")
+    assert "DW-1 (gate: 3-2 (`v6_key` of 1.2))" in paused.value.reason
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        # ambiguous: two tickets claim it (both halves of a split)
+        {"e1_1": "3-2a-x", "e1_2": "3-2b-y"},
+        # unclaimed: `3-20-x` is a different story, so nothing claims `3-2`
+        {"e1_1": "3-20-x"},
+    ],
+)
+def test_tickets_gate_ambiguous_v6_token_pauses_as_legacy(project_v7, keys):
+    """A token no single ticket claims — two do, or none — stays a legacy token
+    and pauses every pick. Ablation (performed): resolve to the first claimant
+    regardless of count in `partition_legacy_tokens` and the ambiguous row
+    FAILS."""
+    _v6_keys(project_v7, **keys)
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+
+    with pytest.raises(RunPaused) as paused:
+        engine._refuse_gated_story("1.1")
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_STORY_GATE, "1.1")
+    assert "DW-1 (gate: 3-2)" in paused.value.reason
+    assert "no single ticket's `v6_key` claims" in paused.value.reason
+
+
+def test_tickets_gate_unreadable_ticket_file_pauses(project_v7):
+    """A ticket file that cannot be read for its `v6_key` claims pauses at
+    `story-gate` before anything is registered, naming the file, and journals
+    `story-gate-unreadable`; it never resolves or passes the token."""
+    toml = project_v7.initiative_folder / "epic-cart" / "tickets.toml"
+    toml.write_text("[[entry]\n", encoding="utf-8")
+    git(project_v7.project, "add", "-A")
+    git(project_v7.project, "commit", "-q", "-m", "broken")
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, adapter = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert (saved.paused_stage, saved.paused_story_key) == (PAUSE_STORY_GATE, "1.1")
+    assert saved.tasks == {} and adapter.sessions == []
+    assert str(toml) in saved.paused_reason
+    (record,) = _kinds(engine, "story-gate-unreadable")
+    assert record["story_key"] == "1.1" and str(toml) in record["error"]
+    assert _kinds(engine, "story-gated") == []
+
+
+def test_tickets_gate_claims_fault_pauses_before_the_rebind(project_v7):
+    """On the restart arm a crash-unbound task is rebound inside the gate check;
+    an entry whose claims cannot be read pauses before that entry's rebind, so
+    the task stays unbound and no `ticket-rebound` is journaled."""
+    toml = project_v7.initiative_folder / "epic-cart" / "tickets.toml"
+    toml.write_text("[[entry]\n", encoding="utf-8")
+    git(project_v7.project, "add", "-A")
+    git(project_v7.project, "commit", "-q", "-m", "broken")
+    row = ticket_row("2.1", epic="epic-checkout")
+    tree = _tree(project_v7, ready_to_start=(row,))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+    task = StoryTask("2.1", 0)
+    engine.state.tasks["2.1"] = task
+
+    with pytest.raises(RunPaused) as paused:
+        engine._refuse_gated_story("2.1")
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_STORY_GATE, "2.1")
+    assert task.ticket is None
+    assert _kinds(engine, "ticket-rebound") == []
+    assert [e["story_key"] for e in _kinds(engine, "story-gate-unreadable")] == ["2.1"]
+
+
+def test_tickets_gate_reads_claims_once_and_only_for_v6_tokens(project_v7, monkeypatch):
+    """A ledger with no v6 token does no tree I/O, and a check over several v6
+    tokens reads the claims once."""
+    calls: list[object] = []
+
+    def counting(folder):
+        calls.append(folder)
+        return (("3-2-invite-link", "1.2"),)
+
+    monkeypatch.setattr(tickets_engine, "read_v6_key_claims", counting)
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 1.9, epic-checkout")
+    engine._refuse_gated_story("1.1")
+    assert calls == []
+
+    _gate_ledger(engine, project_v7, "gate: 3-2, 3-2-invite-link")
+    engine._refuse_gated_story("1.1")
+    assert calls == [engine.paths.initiative_folder]
+    engine._refuse_gated_story("1.1")  # a fresh check reads the tree again
+    assert len(calls) == 2
 
 
 def test_tickets_gate_closed_v6_entry_gates_nothing(project_v7):

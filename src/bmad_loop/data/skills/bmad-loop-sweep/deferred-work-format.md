@@ -247,12 +247,17 @@ is `deferred.hard-gate-unstructured`, as above. So is a backlog file name
 (`story-login.md`): a run never dispatches a backlog row, and a ticket moved
 into an epic runs under its `E.M` ref, so gate it by that ref instead.
 
-A v6 story-key token (`3-2`, `3-2-invite-link`) names no ticket. A migrated
-ledger keeps its `gate:` lines verbatim, and the v7 migration records each
-story's old key as `v6_key` in its ticket file, but nothing matches the two
-automatically. So while such an entry is unlanded, `bmad-loop validate` fails
-`deferred.hard-gate` for it and a tickets run pauses at `story-gate` before every
-ticket. Rewrite the tokens as ticket refs, or close the entry. Sprint and stories
+A v6 story-key token (`3-2`, `3-2-invite-link`) is a migrated ledger's: it
+keeps its `gate:` lines verbatim, and the v7 migration records each story's old
+key as `v6_key` in its epic's `tickets.toml` entry. The token is looked up there,
+matched as a story key (the exact key, or its `3-2` prefix or split arm). When
+exactly one ticket claims it, it gates that ticket as its `E.M` ref would, and
+messages keep the token as written. When no ticket claims it, or two or more do
+(`3-2a-…` and `3-2b-…` for `3-2`), it names no single ticket: while the entry is
+unlanded, `bmad-loop validate` fails `deferred.hard-gate` for it and a tickets
+run pauses at `story-gate` before every ticket. Rewrite such tokens as ticket
+refs, or close the entry. While such a token stands, a `tickets.toml` that
+cannot be read for its claims pauses the run at `story-gate` and fails `validate` with kind `probe-failed`. Sprint and stories
 modes read the story-key grammar only, so `gate: 1.2` is malformed there.
 
 ## Sweep annotations

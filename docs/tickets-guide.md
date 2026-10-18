@@ -94,7 +94,8 @@ A pick pause fires before the ticket is registered, so a resume re-reads the tre
 | `epic-boundary`    | an epic awaits closure, its verdict is `rejected`, or a later ticket waits on an unclosed epic | close the epic with bmad-ticket and commit it, then resume (see [closure](#epic-retrospective-and-closure)) |
 | `epic-boundary`    | an epic's retrospective document could not be committed in the store repository                | commit or unstage the store's own changes to it, then resume; the commit is retried                         |
 | `escalation`       | a plan is `blocked` and this run did not park it, or a session escalated                       | `bmad-loop resolve <run-id>` (see [Parking and resolve](#parking-and-resolve))                              |
-| `story-gate`       | a deferred-work `gate:` names the ticket, or a gate is a v6 story key                          | close the entry or rewrite the token, then resume (see [Ledger and sweeps](#ledger-and-sweeps))             |
+| `story-gate`       | a deferred-work `gate:` names the ticket, or a gate is a v6 story key no single ticket claims  | close the entry or rewrite the token, then resume (see [Ledger and sweeps](#ledger-and-sweeps))             |
+| `story-gate`       | a `tickets.toml` cannot be read for its `v6_key` claims while a v6 story-key gate stands       | fix the file, then resume                                                                                   |
 
 Every resume also checks that this bmad-loop knows the run's work source, that the store layout is unchanged, and the isolation settings. The [escalations guide](escalations-guide.md) covers the stages tickets mode shares with the other modes.
 
@@ -140,7 +141,9 @@ A code rollback re-arms the plan too: a plan past `ready-for-dev` returns to `re
 
 On v7 the deferred-work ledger is `deferred-work.md` in the initiative folder. When a ticket's plan reaches `built`, its frontmatter `deferred:` findings are harvested into the ledger, each naming the plan by its path inside the initiative folder.
 
-A ledger `gate:` holds a ticket until the entry closes. In tickets mode a gate token names a ticket ref (`1.2`), or an epic by id (`1`) or folder (`epic-cart`). A backlog file name gates nothing, since backlog rows never dispatch, and neither does an id of `true` or `false`, which `tickets.py` reads as a boolean. `validate` warns about both. A v6 story key (`1-2-foo`) cannot be matched: it fails `deferred.hard-gate` in `validate` and pauses the run at `story-gate` until it is rewritten.
+A ledger `gate:` holds a ticket until the entry closes. In tickets mode a gate token names a ticket ref (`1.2`), or an epic by id (`1`) or folder (`epic-cart`). A backlog file name gates nothing, since backlog rows never dispatch, and neither does an id of `true` or `false`, which `tickets.py` reads as a boolean. `validate` warns about both.
+
+A v6 story key (`1-2-foo`, or its `1-2` prefix) is resolved through the `v6_key` the v7 migration records on each ticket's `tickets.toml` entry: when exactly one ticket claims it, it gates that ticket as its ref would, and messages still show the token as written. A key that no ticket claims, or that two or more claim (both halves of a split `1-2a-…` / `1-2b-…`), fails `deferred.hard-gate` in `validate` and pauses the run at `story-gate` before every ticket until it is rewritten. While an unlanded entry carries such a token, a `tickets.toml` that cannot be read for its `v6_key` claims pauses the run at `story-gate` (journaled `story-gate-unreadable`) and fails `validate` with kind `probe-failed`.
 
 Sweeps run on v7 initiatives with no sprint board; each bundle writes `plan-<slug>.md` in the initiative folder and closes at `built`. A sweep is pinned to the initiative it started on, and pre-answers are kept per initiative in `.bmad-loop/decisions-<initiative>.json`. See [Sweeps on BMAD v7](sweep-guide.md#sweeps-on-bmad-v7) and [Hard gates](sweep-guide.md#hard-gates).
 

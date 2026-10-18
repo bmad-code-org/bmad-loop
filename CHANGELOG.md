@@ -55,8 +55,11 @@ breaking changes may land in a minor release.
   `run --epic` / `--story` selectors (an epic id or slug, a ticket ref).
 - Harvest a ticket plan's `deferred:` findings into the initiative's `deferred-work.md`,
   accept v7 `source_plan:` ledger blocks, and gate tickets by ledger `gate:` refs (a
-  ticket, an epic id or folder). A v6 story-key gate pauses at
-  `story-gate` until it is rewritten.
+  ticket, an epic id or folder). A v6 story-key gate resolves through the `v6_key` the
+  v7 migration leaves on each ticket: one ticket claims it, it gates that ticket;
+  none or several do, it pauses at `story-gate` until it is rewritten. While an unlanded
+  entry carries such a gate, an unreadable `tickets.toml` pauses the run and fails
+  validate `probe-failed`.
 - Run deferred-work sweeps on v7 initiatives: no sprint board, bundle plans in the
   initiative folder closed at `built`, the sweep pinned to its initiative, and
   pre-answers kept per initiative in `.bmad-loop/decisions-<initiative>.json`. An answer

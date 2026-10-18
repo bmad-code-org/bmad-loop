@@ -333,6 +333,9 @@ REFUSAL_HELPER_DEFS = {
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("sweep.py", "_refuse_advanced_migration_head"),  # DW-427/428, test_sweep.py
     ("sweep.py", "_refuse_dirty_migration_input"),  # DW-437, test_sweep.py
+    # DW-554: the v6_key claims read fault pause around the base gate check;
+    # test_tickets_engine.py test_tickets_gate_unreadable_ticket_file_pauses
+    ("tickets_engine.py", "_refuse_gated_story"),
     # DW-535: abandon over a kept unit moved under the run dir; test_engine_worktree.py
     ("unitreplay.py", "_refuse_worktrees_left_under_run"),
     ("win32_at.py", "_refuse_link"),  # ELOOP for a symlink/junction under O_NOFOLLOW

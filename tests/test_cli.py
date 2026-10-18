@@ -55,6 +55,7 @@ from conftest import (
     refuse_to_resolve,
     spec_path,
     ticket_row,
+    v7_layout,
     write_gated_ledger,
     write_ledger,
     write_repo_root_override,
@@ -13778,11 +13779,29 @@ def test_validate_json_sprint_mode_initiative_is_empty_string(project, capsys, m
     assert (doc["mode"], doc["initiative"], doc["era"]) == ("sprint", "", "v7")
 
 
-def _validate_ticket_gates(project, monkeypatch, capsys, gate_line, *, rc, rows=None):
+def _validate_ticket_gates(
+    project, monkeypatch, capsys, gate_line, *, rc, rows=None, v6_keys=None, before=None
+):
     """Validate a tickets project whose initiative ledger holds one open entry,
     DW-1, carrying ``gate_line``, against a FakeTicketTree whose `next` lists
-    ``rows`` as ready to start; returns the parsed findings."""
+    ``rows`` as ready to start; returns the parsed findings. ``v6_keys`` maps an
+    on-disk `DEFAULT_TREE` ref (``"1.1"``) to the `v6_key` its entry carries;
+    ``before(paths)`` runs on the project just before the ledger is written."""
     _make_tickets_validate_pass(project, monkeypatch, capsys)
+    if v6_keys:
+        epics = tuple(
+            dataclasses.replace(
+                epic,
+                entries=tuple(
+                    dataclasses.replace(entry, v6_key=v6_keys.get(f"{epic.id}.{entry.id}"))
+                    for entry in epic.entries
+                ),
+            )
+            for epic in DEFAULT_TREE
+        )
+        write_ticket_tree(v7_layout(project.project), epics)
+    if before is not None:
+        before(bmadconfig.load_paths(project.project, want_tickets=True))
     if rows is None:
         rows = (ticket_row("1.1"), ticket_row("2.1", epic="epic-checkout"))
     tree = FakeTicketTree(project.project, next_view=fake_next_view(ready_to_start=rows))
@@ -13845,6 +13864,106 @@ def test_validate_hard_gate_ticket_mode_fails_a_v6_token(project, capsys, monkey
     }
     assert "`v6_key`" in hard["message"]
     assert _gate_findings(findings, "deferred.hard-gate-unstructured") == []
+
+
+@pytest.mark.parametrize("token", ["3-2-invite-link", "3-2"])
+def test_validate_hard_gate_ticket_mode_resolves_a_v6_token(project, capsys, monkeypatch, token):
+    """A v6 token exactly one ticket's `v6_key` claims fails as that ticket's ref
+    would — `story_key` the claimed ref — with `tokens` holding the token as
+    written and no legacy wording. Ablation (performed): return every token
+    unresolved from `deferredwork.partition_legacy_tokens` and the legacy
+    failure comes back — this FAILS."""
+    findings = _validate_ticket_gates(
+        project,
+        monkeypatch,
+        capsys,
+        f"gate: {token}",
+        rc=1,
+        v6_keys={"2.1": "3-2-invite-link"},
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "problem"
+    assert hard["detail"] == {
+        "dw_id": "DW-1",
+        "title": "item DW-1",
+        "story_key": "2.1",
+        "tokens": [token],
+    }
+    assert f"gates 2.1 (gate: {token}; {token} resolves to 2.1" in hard["message"]
+    assert "no single ticket" not in hard["message"]
+    assert _gate_findings(findings, "deferred.hard-gate-unstructured") == []
+
+
+def test_validate_hard_gate_ticket_mode_v6_token_resolved_elsewhere(project, capsys, monkeypatch):
+    """A v6 token resolved to a ticket the queue cannot start gates nothing
+    startable: the check reports its `ok`. Ablation (performed): return every
+    token unresolved from `partition_legacy_tokens` and the legacy failure
+    comes back — this FAILS."""
+    findings = _validate_ticket_gates(
+        project, monkeypatch, capsys, "gate: 3-2", rc=0, v6_keys={"1.2": "3-2-invite-link"}
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "ok"
+    assert hard["detail"] == {"gating_ids": ["DW-1"], "actionable": ["1.1", "2.1"]}
+
+
+def test_validate_hard_gate_ticket_mode_ambiguous_v6_token(project, capsys, monkeypatch):
+    """A token two tickets claim names no single ticket: it fails as a legacy
+    gate, saying so. Ablation (performed): resolve to the first claimant
+    regardless of count in `partition_legacy_tokens` and this FAILS."""
+    findings = _validate_ticket_gates(
+        project, monkeypatch, capsys, "gate: 3-2", rc=1, v6_keys={"1.1": "3-2a-x", "2.1": "3-2b-y"}
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "problem"
+    assert hard["detail"]["tokens"] == ["3-2"] and hard["detail"]["story_key"] == "1.1"
+    assert "no single ticket's `v6_key` claims" in hard["message"]
+
+
+def test_validate_hard_gate_ticket_mode_unreadable_v6_claims(project, capsys, monkeypatch):
+    """A ticket file that cannot be read for its `v6_key` claims fails
+    `deferred.hard-gate` with kind `probe-failed`; nothing is resolved or
+    compared."""
+
+    def break_cart(paths):
+        assert paths.initiative_folder is not None
+        (paths.initiative_folder / "epic-cart" / "tickets.toml").write_text(
+            "[[entry]\n", encoding="utf-8"
+        )
+
+    findings = _validate_ticket_gates(
+        project, monkeypatch, capsys, "gate: 3-2", rc=1, before=break_cart
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "problem"
+    assert hard["detail"]["kind"] == "probe-failed"
+    assert "epic-cart" in hard["detail"]["error"]
+
+
+def test_validate_hard_gate_ticket_mode_no_actionable_ticket_reads_no_claims(
+    project, capsys, monkeypatch
+):
+    """With no actionable ticket the claims are never read — the run reads them
+    only while gate-checking a picked ticket — so an unreadable ticket file is no
+    `probe-failed` failure here."""
+
+    def break_cart(paths):
+        assert paths.initiative_folder is not None
+        (paths.initiative_folder / "epic-cart" / "tickets.toml").write_text(
+            "[[entry]\n", encoding="utf-8"
+        )
+
+    findings = _validate_ticket_gates(
+        project, monkeypatch, capsys, "gate: 3-2", rc=0, rows=(), before=break_cart
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "ok"
+    assert hard["detail"]["actionable"] == []
 
 
 def test_validate_hard_gate_ticket_mode_warns_an_unmatchable_token(project, capsys, monkeypatch):
