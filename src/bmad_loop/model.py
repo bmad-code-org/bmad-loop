@@ -807,6 +807,17 @@ class StoryTask:
     ticket_done_pending: bool = False
     ticket_park_pending: str = ""
     ticket_commit_pending: bool = False
+    # tickets mode, T1 store only (tracked in the code checkout): the bound plan's
+    # status and the sha256 of its bytes as the COMMITTING save found them, before
+    # the commit window marks it `done` (or parks it `blocked`). A resumed window
+    # whose mark is a no-op on a plan that reads another status and no longer
+    # matches the digest finds it marked since (e.g. by an interrupted earlier
+    # window), so a commit failure there names the plan left marked for a commit
+    # that does not exist (no bytes are kept to restore it). Assigned by every
+    # `_commit` before its COMMITTING save (an adoption's or a resume's later saves
+    # keep it); "" when no T1 in-window mark is owed or the plan cannot be read.
+    ticket_premark_status: str = ""
+    ticket_premark_digest: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -922,6 +933,8 @@ class StoryTask:
             "ticket_done_pending": self.ticket_done_pending,
             "ticket_park_pending": self.ticket_park_pending,
             "ticket_commit_pending": self.ticket_commit_pending,
+            "ticket_premark_status": self.ticket_premark_status,
+            "ticket_premark_digest": self.ticket_premark_digest,
         }
 
     def _serialized_worktree_path(
@@ -1210,6 +1223,8 @@ class StoryTask:
             ticket_done_pending=bool(d.get("ticket_done_pending", False)),
             ticket_park_pending=str(d.get("ticket_park_pending", "") or ""),
             ticket_commit_pending=bool(d.get("ticket_commit_pending", False)),
+            ticket_premark_status=str(d.get("ticket_premark_status", "") or ""),
+            ticket_premark_digest=str(d.get("ticket_premark_digest", "") or ""),
         )
 
 

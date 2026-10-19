@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -1691,7 +1692,8 @@ _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
         # `test_reap_identity_*`, `test_recorded_*`.
         _OTHER_DEFS: 28,
     },
-    "test_tickets_e2e.py": {"test_e2e_tickets_": 13},
+    "test_tickets_e2e.py": {"test_e2e_tickets_": 14},
+    "test_conftest.py": {"test_private_tmux_": 1},
 }
 
 
@@ -1829,6 +1831,160 @@ def test_every_real_tmux_e2e_joins_the_serialized_xdist_group():
     )
     counts = _e2e_def_count_offenders(found)
     assert not counts, "\n".join(counts)
+
+
+# ------------------------------------------------- private tmux server (DW-561)
+PRIVATE_TMUX_FIXTURE = "private_tmux_server"
+PRIVATE_TMUX_CONTEXT = "private_tmux_socket"
+
+
+def _on_private_tmux_server(stmt: ast.FunctionDef | ast.AsyncFunctionDef, marks) -> bool:
+    """Whether a test def runs on a private tmux server: it requests the fixture as an
+    argument, carries a `usefixtures` mark naming it, or enters the context manager
+    itself (the conftest row that pins the context manager's own teardown)."""
+    args = [*stmt.args.posonlyargs, *stmt.args.args, *stmt.args.kwonlyargs]
+    if any(a.arg == PRIVATE_TMUX_FIXTURE for a in args):
+        return True
+    for mark in marks:
+        if not isinstance(mark, ast.Call):
+            continue
+        head = _dotted(mark.func)
+        if head is None or head.rsplit(".", 1)[-1] != "usefixtures":
+            continue
+        if any(isinstance(a, ast.Constant) and a.value == PRIVATE_TMUX_FIXTURE for a in mark.args):
+            return True
+    return any(
+        isinstance(item.context_expr, ast.Call)
+        and (_dotted(item.context_expr.func) or "").rsplit(".", 1)[-1] == PRIVATE_TMUX_CONTEXT
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.With)
+        for item in node.items
+    )
+
+
+def _private_tmux_offenders(src: str, rel: str) -> list[str]:
+    """Every tmux-gated test def in one source that does not run on a private server.
+    Gating is `_scan_source`'s own reading, so the two guards agree on what is real-tmux."""
+    gated = {name for _rel, name, _grouped in _scan_source(src, rel)}
+    tree = ast.parse(src, filename=rel)
+    module_marks = _module_pytestmark(tree)
+    return [
+        f"{rel}::{stmt.name}"
+        for stmt, own_marks in _iter_test_defs(tree.body, [])
+        if stmt.name in gated and not _on_private_tmux_server(stmt, [*own_marks, *module_marks])
+    ]
+
+
+def test_every_real_tmux_e2e_runs_on_a_private_tmux_server():
+    """The live scan: no real-tmux test may reach the developer's default tmux server
+    (DW-561). A server left in a deleted sandbox cwd crashes every later pane, and a
+    kill aimed at the default server ends whatever session runs the suite."""
+    offenders: list[str] = []
+    for path in sorted(_TESTS_DIR.glob("test_*.py")):
+        offenders.extend(_private_tmux_offenders(path.read_text(encoding="utf-8"), path.name))
+    assert offenders == [], (
+        f"these real-tmux tests do not request `{PRIVATE_TMUX_FIXTURE}` (as an argument or "
+        f"through `pytest.mark.usefixtures`): {offenders}"
+    )
+    # Non-vacuous: both stories-style E2E modules opt in module-wide.
+    for rel in ("test_stories_e2e.py", "test_tickets_e2e.py"):
+        tree = ast.parse((_TESTS_DIR / rel).read_text(encoding="utf-8"), filename=rel)
+        assert any(
+            isinstance(m, ast.Call)
+            and _dotted(m.func) == "pytest.mark.usefixtures"
+            and [a.value for a in m.args if isinstance(a, ast.Constant)] == [PRIVATE_TMUX_FIXTURE]
+            for m in _module_pytestmark(tree)
+        ), f"{rel}'s pytestmark lost usefixtures({PRIVATE_TMUX_FIXTURE!r})"
+
+
+_PRIVATE_PROBE_HEAD = (
+    "import pytest\n"
+    "from conftest import real_mux_e2e\n"
+    '@pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")\n'
+    "@real_mux_e2e\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("source", "offenders"),
+    [
+        (_PRIVATE_PROBE_HEAD + "def test_spawns(tmp_path):\n    pass\n", ["probe.py::test_spawns"]),
+        (_PRIVATE_PROBE_HEAD + "def test_spawns(tmp_path, private_tmux_server):\n    pass\n", []),
+        (
+            _PRIVATE_PROBE_HEAD
+            + '@pytest.mark.usefixtures("private_tmux_server")\ndef test_spawns():\n    pass\n',
+            [],
+        ),
+        (
+            'import pytest\npytestmark = [pytest.mark.usefixtures("private_tmux_server")]\n'
+            + _PRIVATE_PROBE_HEAD
+            + "def test_spawns():\n    pass\n",
+            [],
+        ),
+        (
+            _PRIVATE_PROBE_HEAD
+            + '@pytest.mark.usefixtures("other")\ndef test_spawns():\n    pass\n',
+            ["probe.py::test_spawns"],
+        ),
+        (
+            _PRIVATE_PROBE_HEAD
+            + "def test_spawns(tmp_path):\n"
+            + "    with conftest.private_tmux_socket(tmp_path) as socket:\n        pass\n",
+            [],
+        ),
+        (
+            _PRIVATE_PROBE_HEAD
+            + "def test_spawns(tmp_path):\n    conftest.private_tmux_socket(tmp_path)\n",
+            ["probe.py::test_spawns"],
+        ),
+        ("def test_no_tmux(tmp_path):\n    pass\n", []),
+    ],
+    ids=[
+        "unprotected",
+        "argument",
+        "own-mark",
+        "module-mark",
+        "other-fixture",
+        "entered-context",
+        "unentered-context",
+        "ungated",
+    ],
+)
+def test_private_server_guard_grades_known_sources(source, offenders):
+    assert _private_tmux_offenders(source, "probe.py") == offenders
+
+
+def _tmux_has_session(socket: Path, name: str) -> bool:
+    argv = ["tmux", "-S", str(socket), "has-session", "-t", f"={name}"]
+    return subprocess.run(argv, capture_output=True).returncode == 0
+
+
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") and shutil.which("tmux")),
+    reason="needs real tmux on Linux",
+)
+@conftest.real_mux_e2e
+def test_private_tmux_socket_keeps_sessions_off_the_default_server(tmp_path_factory):
+    """A session started inside `private_tmux_socket` lands on the private socket and
+    not on the default one, and on exit the private server is gone.
+
+    The default socket is only ever PROBED here (`has-session`), never killed.
+    Ablation: delete the `TMUX_TMPDIR` redirect and the session lands on the default
+    server, so the private-socket probe fails (a `sleep` session leaks there for 30s;
+    nothing is killed); delete the teardown `kill-server` and the context manager's
+    own survivor check raises. Run either ablation under a throwaway server root:
+    `env -u TMUX -u TMUX_PANE TMUX_TMPDIR=$(mktemp -d) uv run pytest ...`."""
+    default = conftest.private_tmux_socket_path(Path(os.environ.get("TMUX_TMPDIR") or "/tmp"))
+    base = tmp_path_factory.mktemp("tmux")
+    name = f"dw561-{os.getpid()}-{base.name}"
+    with conftest.private_tmux_socket(base) as socket:
+        assert socket == conftest.private_tmux_socket_path(base)
+        subprocess.run(["tmux", "new-session", "-d", "-s", name, "sleep 30"], check=True)
+        assert _tmux_has_session(socket, name)
+        assert not _tmux_has_session(default, name)
+    assert not _tmux_has_session(socket, name)
+    listing = subprocess.run(["tmux", "-S", str(socket), "list-sessions"], capture_output=True)
+    assert listing.returncode != 0, listing
 
 
 def test_live_e2e_scan_reads_shared_gates_once(monkeypatch):
@@ -2528,3 +2684,67 @@ def test_project_v7_template_is_clean_and_ignores_user_toml(project_v7):
         assert (root / installed).read_bytes() == (conftest.V7_FIXTURE / vendored).read_bytes()
     assert project_v7.tickets_script == root / conftest.V7_TICKETS_REL
     assert ".bmad-loop/runs/" in (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+
+
+def _module_level_mux_binders(src: Path) -> set[str]:
+    """Dotted names of `src/bmad_loop` modules whose import-time code (module
+    body, including top-level `if`/`try` blocks, never a function or class body)
+    binds `get_multiplexer` from the multiplexer module."""
+    found: set[str] = set()
+
+    def binds(stmts: list[ast.stmt]) -> bool:
+        for node in stmts:
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("multiplexer"):
+                if any(alias.name == "get_multiplexer" for alias in node.names):
+                    return True
+            elif isinstance(node, ast.With):
+                if binds(node.body):
+                    return True
+            elif isinstance(node, ast.If | ast.Try | ast.TryStar):
+                handlers = [] if isinstance(node, ast.If) else [h.body for h in node.handlers]
+                tail = [] if isinstance(node, ast.If) else [node.finalbody]
+                if any(binds(b) for b in (node.body, node.orelse, *handlers, *tail)):
+                    return True
+        return False
+
+    for path in sorted(src.rglob("*.py")):
+        if binds(ast.parse(path.read_text(encoding="utf-8")).body):
+            rel = path.relative_to(src.parent).with_suffix("")
+            found.add(".".join(rel.parts).removesuffix(".__init__"))
+    return found
+
+
+def test_conftest_preloads_every_module_level_mux_binder():
+    """DW-566: a module that binds `get_multiplexer` at import keeps whatever the
+    name held then, and a test patching `multiplexer.get_multiplexer` restores
+    only that module. So each such module must be imported by conftest, before
+    any patch can stand, or the first test on a worker to import it leaks its
+    stand-in into every later one. The load check runs in a fresh interpreter
+    that imports conftest alone: in this process collection has already imported
+    the binders through the test modules, which would mask a missing loop.
+    Ablation: drop `bmad_loop.tui.launch` from `_MUX_BINDING_MODULES` and the set
+    comparison fails; replace the import loop with `pass` and the load check fails."""
+    tests_dir = Path(__file__).resolve().parent
+    src = tests_dir.parent / "src" / "bmad_loop"
+    assert set(conftest._MUX_BINDING_MODULES) == _module_level_mux_binders(src)
+
+    probe = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(tests_dir)!r})\n"
+        "import conftest\n"
+        "from bmad_loop.adapters import multiplexer as mux_mod\n"
+        "for name in conftest._MUX_BINDING_MODULES:\n"
+        "    mod = sys.modules.get(name)\n"
+        "    if mod is None:\n"
+        "        # only the `tui` extra may be absent\n"
+        "        ok = name == 'bmad_loop.tui.app' and 'textual' not in sys.modules\n"
+        "    else:\n"
+        "        ok = mod.get_multiplexer is mux_mod.get_multiplexer\n"
+        "    if not ok:\n"
+        "        print(name)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "", f"not bound to the real get_multiplexer after conftest: {proc.stdout}"

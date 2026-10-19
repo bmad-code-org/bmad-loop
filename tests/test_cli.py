@@ -55,6 +55,7 @@ from conftest import (
     refuse_to_resolve,
     spec_path,
     ticket_row,
+    v7_layout,
     write_gated_ledger,
     write_ledger,
     write_repo_root_override,
@@ -4877,6 +4878,94 @@ def test_delete_dead_run(tmp_path, capsys):
     assert not run_dir.exists()
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_delete_refuses_a_run_holding_unlanded_sweep_closes(
+    project_v7_store_repo, monkeypatch, capsys, force
+):
+    """DW-571. `bmad-loop delete` on a paused isolated sweep run that still holds
+    its shared-store close of DW-1 exits 1. Stderr names the run, DW-1 and
+    `bmad-loop resume <run>`. The run dir and the ledger are unchanged, and
+    `--force` does not waive the refusal.
+
+    Without `--force` the refusal comes from `delete_run`'s under-lock check;
+    with it, from `cmd_delete`'s pre-check.
+
+    Ablation: drop `runs.HeldSweepClosesError` from the except around
+    `delete_run` and the unforced case fails; drop the pre-check's except and the
+    forced case fails (either way the error escapes to `main`'s backstop, which
+    prints `error: ...` rather than the bare message)."""
+    import test_sweep as ts
+    from test_runs import _LivenessMux
+
+    from bmad_loop import runs
+
+    # The unforced path probes for a live agent session first; with no tmux server
+    # up, the real listing warns on stderr ahead of the refusal.
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([]))
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    ledger_before = paths.deferred_work.read_bytes()
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    argv = ["delete", "--project", str(paths.project), ts.HELD_RUN_ID]
+
+    assert cli.main([*argv, "--force"] if force else argv) == 1
+
+    err = capsys.readouterr().err
+    assert err.startswith(f"run {ts.HELD_RUN_ID}: refusing to delete it")
+    assert "DW-1" in err and f"bmad-loop resume {ts.HELD_RUN_ID}" in err
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+
+
+def test_delete_force_refuses_a_live_held_run_without_stopping_it(
+    project_v7_store_repo, monkeypatch, capsys
+):
+    """`delete --force` on a live run that holds unlanded sweep closes is refused
+    before `--force` hard-stops the engine, so the run is not left stopped with
+    nothing deleted.
+
+    Ablation: move the `refuse_held_sweep_closes` pre-check in `cmd_delete` after
+    `_stop_or_block_live_engine` and this fails (`stop_run` is called)."""
+    import test_sweep as ts
+
+    from bmad_loop import runs
+
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    monkeypatch.setattr(
+        runs, "stop_run", lambda _rd: pytest.fail("a held run was stopped before the refusal")
+    )
+
+    assert cli.main(["delete", "--project", str(paths.project), "--force", ts.HELD_RUN_ID]) == 1
+
+    err = capsys.readouterr().err
+    assert f"run {ts.HELD_RUN_ID}: refusing to delete it" in err and "DW-1" in err
+    assert engine.run_dir.is_dir()
+
+
+def test_delete_without_force_gives_a_live_held_run_the_live_engine_refusal(
+    project_v7_store_repo, monkeypatch, capsys
+):
+    """Without `--force`, a live run that holds sweep closes is refused as live.
+    Its close is still in flight, so the held-closes message and its `resume`
+    remedy would be wrong advice.
+
+    Ablation: run the `refuse_held_sweep_closes` pre-check in `cmd_delete`
+    without `--force` too and this fails (the held-closes message wins)."""
+    import test_sweep as ts
+
+    from bmad_loop import runs
+
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+
+    assert cli.main(["delete", "--project", str(paths.project), ts.HELD_RUN_ID]) == 1
+
+    err = capsys.readouterr().err
+    assert f"run {ts.HELD_RUN_ID} is still live" in err
+    assert "refusing to delete it" not in err
+    assert engine.run_dir.is_dir()
+
+
 def test_delete_unknown_warns_but_proceeds(tmp_path, monkeypatch, capsys):
     from bmad_loop import runs
 
@@ -5080,6 +5169,111 @@ def test_resolve_refuses_a_newer_escalation_after_waiting_for_mutation_lock(
 
     assert rc == 1
     assert "changed while resolve was in progress" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_resolve_locked_reread_refuses_a_runs_dir_swapped_for_a_foreign_tree(
+    tmp_path, monkeypatch, capsys
+):
+    """DW-564: the locked re-read is pinned to the lock-free read before it. `runs/`
+    swapped, between the two, for a link to a tree holding a REAL `r1/state.json`
+    raises `UnconfinedReadError` instead of re-arming the foreign record; `main`'s
+    backstop reports it as a failure.
+
+    Ablation (run): drop `pin=state` from `cmd_resolve`'s locked `load_state` and
+    this fails at `pytest.fail("re-armed")` — the foreign state's escalation is
+    re-armed."""
+    import contextlib
+
+    from bmad_loop import runs
+    from bmad_loop.journal import load_state
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed"))
+    runs_dir = run_dir.parent
+    outside = tmp_path / "outside"
+
+    @contextlib.contextmanager
+    def swap_first(_run_dir):
+        shutil.copytree(runs_dir, outside)
+        runs_dir.rename(runs_dir.with_name("runs-aside"))
+        runs_dir.symlink_to(outside, target_is_directory=True)
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", swap_first)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--resume"])
+
+    assert rc == 1
+    assert "refusing to read state.json from an unconfined" in capsys.readouterr().err
+    assert load_state(run_dir).run_id == "r1"  # the path read follows into the copy
+
+
+def _tree_bytes(root):
+    return {p.relative_to(root): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("mode", ["--adopt-branch", "--abandon", "--reverify"])
+def test_resolve_action_locked_rereads_refuse_a_runs_dir_swapped_for_a_foreign_tree(
+    project, tmp_path, monkeypatch, capsys, mode
+):
+    """DW-564, the action legs of the test above: `_resolve_adopt`, `_resolve_abandon`
+    and `_resolve_reverify` each re-read the state under the lock pinned to the state
+    `cmd_resolve` read first. `runs/` swapped between the two for a link to a tree
+    holding a real `r1/` refuses with rc 1 and leaves the foreign copy byte-identical.
+
+    Ablation (run, per site): drop `pin=state` from that leg's locked `load_state`
+    and its row fails at its `pytest.fail` — the foreign record is acted on."""
+    import contextlib
+
+    from bmad_loop import unitreplay
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    if mode == "--adopt-branch":
+        root = tmp_path
+        run_dir = _adoptable_run(tmp_path)
+        monkeypatch.setattr(
+            runs, "adopt_escalated_branch", lambda *_a, **_k: pytest.fail("adopted")
+        )
+        extra = ["--resume"]
+    elif mode == "--abandon":
+        install_bmad_config(project)
+        root = project.project
+        run_dir = _escalated_run(root, "r1")
+        monkeypatch.setattr(unitreplay, "abandon_refusal", lambda *_a: None)
+        monkeypatch.setattr(
+            unitreplay, "abandon_replay_run", lambda *_a, **_k: pytest.fail("abandoned")
+        )
+        extra = ["--no-interactive"]
+    else:
+        run_dir, root = _reverify_project(tmp_path)
+        monkeypatch.setattr(
+            runs, "rearm_for_reverify", lambda *_a, **_k: pytest.fail("re-armed for reverify")
+        )
+        extra = ["--resume"]
+    runs_dir = run_dir.parent
+    outside = runs_dir.parent / "outside-runs"
+    foreign: list[dict] = []
+
+    @contextlib.contextmanager
+    def swap_first(_run_dir):
+        shutil.copytree(runs_dir, outside)
+        foreign.append(_tree_bytes(outside))
+        runs_dir.rename(runs_dir.with_name("runs-aside"))
+        runs_dir.symlink_to(outside, target_is_directory=True)
+        yield
+
+    monkeypatch.setattr(cli, "state_lock", swap_first)
+
+    rc = cli.main(["resolve", "--project", str(root), "r1", mode, *extra])
+
+    assert rc == 1
+    assert "refusing to read state.json from an unconfined" in capsys.readouterr().err
+    assert foreign and _tree_bytes(outside) == foreign[0]
 
 
 def test_resolve_retains_outer_lock_through_rearm_call(tmp_path, monkeypatch):
@@ -9250,6 +9444,39 @@ def test_sweep_resume_refuses_an_initiative_change_before_any_write(project, mon
     assert f"cannot resume {run_dir.name}: initiative switched" in capsys.readouterr().err
     assert _resume_entries(run_dir) == []
     assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
+
+
+@pytest.mark.parametrize(
+    ("pins", "want_tickets"),
+    [
+        ({"initiative": "initiative-demo"}, True),
+        ({"store_topology": {"layout": "T3"}}, True),
+        ({}, False),
+    ],
+)
+def test_sweep_resume_reloads_a_v7_sweep_as_tickets(project, monkeypatch, pins, want_tickets):
+    """A sweep persists no `source`, so resume reads its era off what
+    `compose_sweep` records only on v7 (an initiative pin, a store topology). On a
+    mixed install the auto-detected v6 paths would read the sweep's own pin as a
+    switched initiative and refuse the resume.
+
+    Ablation: key `want_tickets` on `state.source` again and the two v7 rows fail."""
+    from bmad_loop import bmadconfig
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep", **pins)
+    seen: list[bool] = []
+
+    class Stop(Exception):
+        pass
+
+    def load_paths(_project, *, want_tickets=False):
+        seen.append(want_tickets)
+        raise Stop
+
+    monkeypatch.setattr(bmadconfig, "load_paths", load_paths)
+    with pytest.raises(Stop):
+        cli._resume_paused_run(project.project, run_dir)
+    assert seen == [want_tickets]
 
 
 def test_story_resume_is_not_gated_on_the_sweep_skill(project, monkeypatch):
@@ -13673,11 +13900,29 @@ def test_validate_json_sprint_mode_initiative_is_empty_string(project, capsys, m
     assert (doc["mode"], doc["initiative"], doc["era"]) == ("sprint", "", "v7")
 
 
-def _validate_ticket_gates(project, monkeypatch, capsys, gate_line, *, rc, rows=None):
+def _validate_ticket_gates(
+    project, monkeypatch, capsys, gate_line, *, rc, rows=None, v6_keys=None, before=None
+):
     """Validate a tickets project whose initiative ledger holds one open entry,
     DW-1, carrying ``gate_line``, against a FakeTicketTree whose `next` lists
-    ``rows`` as ready to start; returns the parsed findings."""
+    ``rows`` as ready to start; returns the parsed findings. ``v6_keys`` maps an
+    on-disk `DEFAULT_TREE` ref (``"1.1"``) to the `v6_key` its entry carries;
+    ``before(paths)`` runs on the project just before the ledger is written."""
     _make_tickets_validate_pass(project, monkeypatch, capsys)
+    if v6_keys:
+        epics = tuple(
+            dataclasses.replace(
+                epic,
+                entries=tuple(
+                    dataclasses.replace(entry, v6_key=v6_keys.get(f"{epic.id}.{entry.id}"))
+                    for entry in epic.entries
+                ),
+            )
+            for epic in DEFAULT_TREE
+        )
+        write_ticket_tree(v7_layout(project.project), epics)
+    if before is not None:
+        before(bmadconfig.load_paths(project.project, want_tickets=True))
     if rows is None:
         rows = (ticket_row("1.1"), ticket_row("2.1", epic="epic-checkout"))
     tree = FakeTicketTree(project.project, next_view=fake_next_view(ready_to_start=rows))
@@ -13740,6 +13985,106 @@ def test_validate_hard_gate_ticket_mode_fails_a_v6_token(project, capsys, monkey
     }
     assert "`v6_key`" in hard["message"]
     assert _gate_findings(findings, "deferred.hard-gate-unstructured") == []
+
+
+@pytest.mark.parametrize("token", ["3-2-invite-link", "3-2"])
+def test_validate_hard_gate_ticket_mode_resolves_a_v6_token(project, capsys, monkeypatch, token):
+    """A v6 token exactly one ticket's `v6_key` claims fails as that ticket's ref
+    would — `story_key` the claimed ref — with `tokens` holding the token as
+    written and no legacy wording. Ablation (performed): return every token
+    unresolved from `deferredwork.partition_legacy_tokens` and the legacy
+    failure comes back — this FAILS."""
+    findings = _validate_ticket_gates(
+        project,
+        monkeypatch,
+        capsys,
+        f"gate: {token}",
+        rc=1,
+        v6_keys={"2.1": "3-2-invite-link"},
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "problem"
+    assert hard["detail"] == {
+        "dw_id": "DW-1",
+        "title": "item DW-1",
+        "story_key": "2.1",
+        "tokens": [token],
+    }
+    assert f"gates 2.1 (gate: {token}; {token} resolves to 2.1" in hard["message"]
+    assert "no single ticket" not in hard["message"]
+    assert _gate_findings(findings, "deferred.hard-gate-unstructured") == []
+
+
+def test_validate_hard_gate_ticket_mode_v6_token_resolved_elsewhere(project, capsys, monkeypatch):
+    """A v6 token resolved to a ticket the queue cannot start gates nothing
+    startable: the check reports its `ok`. Ablation (performed): return every
+    token unresolved from `partition_legacy_tokens` and the legacy failure
+    comes back — this FAILS."""
+    findings = _validate_ticket_gates(
+        project, monkeypatch, capsys, "gate: 3-2", rc=0, v6_keys={"1.2": "3-2-invite-link"}
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "ok"
+    assert hard["detail"] == {"gating_ids": ["DW-1"], "actionable": ["1.1", "2.1"]}
+
+
+def test_validate_hard_gate_ticket_mode_ambiguous_v6_token(project, capsys, monkeypatch):
+    """A token two tickets claim names no single ticket: it fails as a legacy
+    gate, saying so. Ablation (performed): resolve to the first claimant
+    regardless of count in `partition_legacy_tokens` and this FAILS."""
+    findings = _validate_ticket_gates(
+        project, monkeypatch, capsys, "gate: 3-2", rc=1, v6_keys={"1.1": "3-2a-x", "2.1": "3-2b-y"}
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "problem"
+    assert hard["detail"]["tokens"] == ["3-2"] and hard["detail"]["story_key"] == "1.1"
+    assert "no single ticket's `v6_key` claims" in hard["message"]
+
+
+def test_validate_hard_gate_ticket_mode_unreadable_v6_claims(project, capsys, monkeypatch):
+    """A ticket file that cannot be read for its `v6_key` claims fails
+    `deferred.hard-gate` with kind `probe-failed`; nothing is resolved or
+    compared."""
+
+    def break_cart(paths):
+        assert paths.initiative_folder is not None
+        (paths.initiative_folder / "epic-cart" / "tickets.toml").write_text(
+            "[[entry]\n", encoding="utf-8"
+        )
+
+    findings = _validate_ticket_gates(
+        project, monkeypatch, capsys, "gate: 3-2", rc=1, before=break_cart
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "problem"
+    assert hard["detail"]["kind"] == "probe-failed"
+    assert "epic-cart" in hard["detail"]["error"]
+
+
+def test_validate_hard_gate_ticket_mode_no_actionable_ticket_reads_no_claims(
+    project, capsys, monkeypatch
+):
+    """With no actionable ticket the claims are never read — the run reads them
+    only while gate-checking a picked ticket — so an unreadable ticket file is no
+    `probe-failed` failure here."""
+
+    def break_cart(paths):
+        assert paths.initiative_folder is not None
+        (paths.initiative_folder / "epic-cart" / "tickets.toml").write_text(
+            "[[entry]\n", encoding="utf-8"
+        )
+
+    findings = _validate_ticket_gates(
+        project, monkeypatch, capsys, "gate: 3-2", rc=0, rows=(), before=break_cart
+    )
+
+    (hard,) = _gate_findings(findings)
+    assert hard["severity"] == "ok"
+    assert hard["detail"]["actionable"] == []
 
 
 def test_validate_hard_gate_ticket_mode_warns_an_unmatchable_token(project, capsys, monkeypatch):

@@ -333,6 +333,9 @@ REFUSAL_HELPER_DEFS = {
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("sweep.py", "_refuse_advanced_migration_head"),  # DW-427/428, test_sweep.py
     ("sweep.py", "_refuse_dirty_migration_input"),  # DW-437, test_sweep.py
+    # DW-554: the v6_key claims read fault pause around the base gate check;
+    # test_tickets_engine.py test_tickets_gate_unreadable_ticket_file_pauses
+    ("tickets_engine.py", "_refuse_gated_story"),
     # DW-535: abandon over a kept unit moved under the run dir; test_engine_worktree.py
     ("unitreplay.py", "_refuse_worktrees_left_under_run"),
     ("win32_at.py", "_refuse_link"),  # ELOOP for a symlink/junction under O_NOFOLLOW
@@ -1747,6 +1750,7 @@ JOURNAL_KINDS = frozenset(
         "sweep-bundle-name-discarded",
         "sweep-bundle-name-normalized",
         "sweep-bundle-reclosed",
+        "sweep-bundle-reopen-failed",
         "sweep-bundle-reopened",
         "sweep-bundle-skipped",
         "sweep-bundles-truncated",
@@ -2020,6 +2024,14 @@ JOURNAL_KINDS = frozenset(
         # already reaches `_loop`) and writes no `error`, since there is no fault
         # text to quote.
         "sweep-preanswer-prune-refused",
+        # DW-571. The sweep-start warning (`cli._warn_prior_sweep_closes`): an
+        # earlier run, not live and not this one, still holds isolated bundle
+        # closes in the shared store's ledger that no code landed for
+        # (`runs.held_sweep_closes`), or could not be checked. Read-only; the new
+        # sweep runs unchanged. `run_id` is benign, `dw_ids` a keylist, `error`
+        # (the fault) dropped by name.
+        "sweep-prior-run-closes-unknown",
+        "sweep-prior-run-holds-closes",
         "sweep-remaining-estimate-unreadable",
         "sweep-repeat-done",
         "sweep-resolved-closed",

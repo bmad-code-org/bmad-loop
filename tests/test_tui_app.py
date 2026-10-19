@@ -7219,6 +7219,12 @@ _LIFECYCLE_WORKERS = {"D": "_delete_run_worker", "A": "_archive_run_worker"}
             runs_mod.StateRootError("no usable state root"),
             "delete failed",
         ),
+        (
+            "D",
+            "delete_run",
+            runs_mod.HeldSweepClosesError("20260611-100000-aaaa", ["DW-1"]),
+            "delete failed",
+        ),
         ("A", "archive_run", runs_mod.LiveEngineError("engine resumed"), "archive failed"),
         (
             "A",
@@ -7237,7 +7243,9 @@ def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_visibl
     success. The Pilot twin below keeps one row per action in the running app.
 
     Ablation: omit either new exception type from the worker catch and its rows
-    raise out of the worker body instead of posting the toast. Verified."""
+    raise out of the worker body instead of posting the toast. Verified. The same
+    holds for `HeldSweepClosesError` (a sweep run holding unlanded ledger closes,
+    DW-571) in the delete worker's catch."""
 
     def fail(*_args, **_kwargs):
         raise failure
@@ -11698,3 +11706,158 @@ async def test_resolve_confirm_names_deferred_units(project_tree, monkeypatch):
         await click(pilot, "#ok")
         await until(pilot, lambda: bool(calls))
     assert launched == [(_REVERIFY_RUN, {})]
+
+
+# ------------------------------------------- pinned locked re-reads (DW-564)
+
+
+def _tree_bytes(root: Path) -> dict[Path, bytes]:
+    return {p.relative_to(root): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def _swap_runs_under_the_lock(monkeypatch, run_dir: Path, outside: Path) -> list:
+    """Patch the app's `state_lock` to swap `runs/` for a link to a byte copy of it
+    at `outside` as the lock is taken; returns a list that receives the copy's bytes."""
+    import contextlib
+    import shutil
+
+    from bmad_loop.tui import app as app_mod
+
+    runs_dir = run_dir.parent
+    foreign: list = []
+
+    @contextlib.contextmanager
+    def swap_first(_run_dir, **_kw):
+        shutil.copytree(runs_dir, outside)
+        foreign.append(_tree_bytes(outside))
+        runs_dir.rename(runs_dir.with_name("runs-aside"))
+        runs_dir.symlink_to(outside, target_is_directory=True)
+        yield
+
+    monkeypatch.setattr(app_mod, "state_lock", swap_first)
+    return foreign
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+def test_tui_rearm_locked_reread_refuses_a_runs_dir_swapped_for_a_foreign_tree(
+    project_tree, monkeypatch
+):
+    """The re-arm's locked re-read is pinned to the lock-free read before it: `runs/`
+    swapped under the lock for a link to a tree holding a real `<id>/` refuses with
+    "re-arm failed", re-arms nothing, and leaves the foreign copy byte-identical.
+
+    Ablation (run): drop `pin=recorded` from `_do_rearm`'s locked `load_state` and
+    this FAILS: the foreign record is read and the gesture runs on until the pinned
+    `save_state` of the restamp refuses ("refusing to write state.json") — the read
+    pin is what stops it at the read, before any of the gesture acts on that record."""
+    from bmad_loop import runs
+
+    install_bmad_config(project_tree)
+    run_id = "20260611-100000-aaaa"
+    task = StoryTask(story_key="1", epic=1, phase=Phase.ESCALATED)
+    run_dir = make_run(
+        project_tree.project,
+        run_id,
+        paused_stage="escalation",
+        paused_reason="escalation",
+        paused_story_key="1",
+        tasks={"1": task},
+    )
+    notes: list[str] = []
+    app = BmadLoopApp(project_tree.project)
+    monkeypatch.setattr(app, "notify", lambda message, **_kw: notes.append(message))
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed"))
+    outside = project_tree.project.parent / "outside-runs"
+    foreign = _swap_runs_under_the_lock(monkeypatch, run_dir, outside)
+
+    app._do_rearm(run_id, run_dir, "1")
+
+    assert any(
+        n.startswith("re-arm failed: refusing to read state.json from an unconfined") for n in notes
+    ), notes
+    assert foreign and _tree_bytes(outside) == foreign[0]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+async def test_replan_locked_reread_refuses_a_runs_dir_swapped_for_a_foreign_tree(
+    project_tree, monkeypatch
+):
+    """The tickets replan's locked re-read is pinned to the worker's lock-free read:
+    `runs/` swapped under the lock for a link to a tree holding a real `<id>/`
+    reports "replan failed", marks nothing, resumes nothing, and leaves the foreign
+    copy byte-identical.
+
+    Ablation (run): drop `pin=recorded` from `_ticket_replan_worker`'s locked
+    `load_state` and this FAILS: the foreign record passes the paused-checkpoint
+    re-checks and the mark proceeds until its pinned journal append refuses
+    ("refusing to append journal.jsonl") — the read pin stops it at the read."""
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _no_store_conflict(monkeypatch)
+    run_dir, plan = _tickets_paused_run(
+        project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
+    )
+    tree = _replan_tree(plan)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        outside = project_tree.project.parent / "outside-runs"
+        foreign = _swap_runs_under_the_lock(monkeypatch, run_dir, outside)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any(
+                "replan failed" in m and "refusing to read state.json" in m
+                for m in notifications(app)
+            ),
+        )
+    assert tree.marks == []
+    assert calls == []
+    assert foreign and _tree_bytes(outside) == foreign[0]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+async def test_dashboard_poll_flags_a_runs_dir_swapped_after_the_first_parse(
+    project_tree, monkeypatch
+):
+    """The poll hands the journal pane the run's held state (`read_new(pin=
+    snap.state)`): `runs/` swapped, after the watcher's first good parse, for a link
+    to a byte copy lands the pane's swap fault in `snap.read_faults` while the pane
+    keeps reading.
+
+    Ablation (run): revert the poll to `ctx.journal.read_new()` and no snapshot ever
+    carries the fault (the `until` times out)."""
+    import shutil
+
+    snapshots: list = []
+    apply_snapshot = DashboardScreen._apply
+
+    def track_poll(self, snapshot):
+        snapshots.append(snapshot)
+        apply_snapshot(self, snapshot)
+
+    monkeypatch.setattr(DashboardScreen, "_apply", track_poll)
+    root = project_tree.project
+    run_dir = make_run(root, "20260611-100000-aaaa", finished=True)
+    Journal(run_dir).append("run-start")
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: any(s.state is not None for s in snapshots))
+        runs_dir = run_dir.parent
+        outside = root.parent / "outside-runs"
+        shutil.copytree(runs_dir, outside)
+        runs_dir.rename(runs_dir.with_name("runs-aside"))
+        runs_dir.symlink_to(outside, target_is_directory=True)
+        await until(
+            pilot,
+            lambda: any(
+                any("no longer the directory" in f for f in s.read_faults) for s in snapshots
+            ),
+            what="the journal pane's swap fault in a poll snapshot",
+        )

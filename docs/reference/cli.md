@@ -364,6 +364,8 @@ bmad-loop delete [--project PROJECT] [--force] run_id
 | `--force` | Hard-stop a live engine first (this ends its agent session), and skip the live-agent-session guard (skipping it kills no session). |
 
 - Without `--force`, refuses (exit 1) when the engine is provably alive or an agent session that may belong to the project is live. Unverifiable liveness only warns.
+- Refuses (exit 1), even with `--force` and before `--force` stops anything, an unfinished worktree-isolated sweep run that still holds ledger closes in a shared ticket store for code that never landed. The message names the entries and `bmad-loop resume <run>`, which lands or reopens them. See [the sweep guide](../sweep-guide.md#sweeps-on-bmad-v7).
+- Also refuses (exit 1), even with `--force`, any run of any type whose state cannot be read, and such a sweep run whose config, store topology or ledger cannot be read, or whose pinned initiative is no longer active while its store is shared, since it cannot be told whether it holds such closes. Repair what could not be read and retry; a run you have confirmed holds no closes can be removed by hand.
 - Also prunes git worktree entries for worktrees the run held.
 
 ### `archive`
@@ -374,7 +376,7 @@ Compresses a run into `.bmad-loop/archive/<run-id>.tar.gz`, then removes the run
 bmad-loop archive [--project PROJECT] [--force] run_id
 ```
 
-- `--force` and the refusals are the same as `delete`. The tarball holds the in-tree run directory only.
+- `--force` and the live-engine and live-session refusals are the same as `delete`. `archive` does not refuse a run that holds unlanded sweep ledger closes. The tarball holds the in-tree run directory only.
 
 ### `cleanup`
 
@@ -410,6 +412,7 @@ bmad-loop clean [--project PROJECT] [--dry-run] [--keep RUN_ID] [--retain N] [--
 | `--json`        | Emit one JSON document instead of text.                                                                                                                                     |
 
 - Exits 0 once the policy loads; per-run faults are warnings on stderr or fields in the JSON document.
+- A run past retention that `delete` would refuse because it holds unlanded sweep ledger closes is skipped on the delete arm (`--hard`, or `[cleanup] archive_old = false`) before anything of it is trimmed. Stderr names it and the entries; `--json` lists it under `protected`. The archive arm keeps the run in its tarball and is not affected.
 
 JSON: [`clean --json`](#clean---json).
 
@@ -643,7 +646,7 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `deferred.ledger-unreadable`           | problem                | the deferred-work ledger cannot be read                                                                                                                 |
 | `deferred.ledger-untracked`            | warning                | the ledger is neither committed nor gitignored                                                                                                          |
 | `deferred.ledger-ignored-isolated`     | warning                | the ledger is gitignored under worktree isolation, so session writes are lost                                                                           |
-| `deferred.hard-gate`                   | ok / problem           | an actionable story or ticket is gated by a not-`done` ledger entry; tickets mode also fails a v6 story-key token or an unreadable `tickets.py next`    |
+| `deferred.hard-gate`                   | ok / problem           | an actionable story or ticket is gated by a not-`done` ledger entry; tickets mode also fails a v6 key no single ticket claims, or a tree fault          |
 | `deferred.hard-gate-unstructured`      | warning                | a not-done entry declares a gate `validate` cannot enforce (malformed, empty or misspelled `gate:`, or a prose-only `HARD GATE:`)                       |
 | `deferred.closes-malformed`            | warning                | a spec's `closes_deferred` has an unreadable shape                                                                                                      |
 | `deferred.closes-entry-unreadable`     | warning                | `closes_deferred` names entries that are neither open nor done                                                                                          |

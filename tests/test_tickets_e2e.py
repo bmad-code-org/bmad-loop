@@ -1,6 +1,6 @@
 """Deterministic full-CLI sandbox E2E for tickets mode (the BMAD v7 ticket tree).
 
-Drives the REAL `bmad-loop run/resume/status` binaries through REAL tmux against
+Drives the REAL `bmad-loop run/resume/status/sweep` binaries through REAL tmux against
 a v7 sandbox carrying the vendored upstream `tickets.py`, with a scripted fake
 `bmad-build-auto` wired in as a custom profile: no LLM, no cost, fully
 reproducible. Like `tests/test_stories_e2e.py`'s fake, it writes its own
@@ -13,8 +13,11 @@ build to `built` and commit its own work; a prompt carrying `Halt after
 planning.` → stop at `ready-for-dev`; a committed `.block-<ref>` marker → `mark
 <ref> blocked`; `built`/`done` → a follow-up pass with no status change. The
 `/bmad-retrospective -H <slug>` prompt writes the epic's retrospective document
-with the verdict a `.retro-verdict-<slug>` marker names (default `accepted`). It
-NEVER runs `mark done`: that write belongs to bmad-loop.
+with the verdict a `.retro-verdict-<slug>` marker names (default `accepted`). A
+`/bmad-loop-sweep` prompt writes a one-bundle triage partition, and a `dw-*` bundle
+session edits code and leaves `plan-<key>.md` at `built` in the initiative folder
+its prompt names, with no `tickets.py` call. It NEVER runs `mark done`: that write
+belongs to bmad-loop.
 
 Rows: (1) two tickets marked `done` by bmad-loop inside each unit commit, (2)
 `mark_done = "never"` leaves both at `built` and the second ticket still runs,
@@ -25,8 +28,10 @@ commit, (7) the auto retrospective, its closure pause and the gated next epic, (
 a `rejected` verdict holding the next epic, (9) a session-blocked ticket re-armed by
 `resolve` through `mark`, (10) worktree isolation over a tracked (T1) and an
 ignored, redirected (T2) store, (11) plan and retrospective commits in a separate
-store repository (T3 nested, T4 outside), and the preflight refusals of (12) a
-tracker store and (13) a workspace layout (T5). Rows 7–9 run over T1 and T3. A run
+store repository (T3 nested, T4 outside), the preflight refusals of (12) a
+tracker store and (13) a workspace layout (T5), and (14) a worktree-isolated `sweep`
+over a shared store (T2–T4): its bundle plan and ledger close committed in the store
+repository, or `store-unversioned` for T2. Rows 7–9 run over T1 and T3. A run
 that finishes an epic it committed a ticket of always ends paused at
 `epic-boundary` for a person to close the epic.
 
@@ -54,21 +59,25 @@ from conftest import (
     _store_repo,
     install_bmad_v7,
     install_build_auto_v7_skill,
+    install_sweep_skill,
     real_mux_e2e,
     remove_tree,
     ticket_slug,
     write_ticket_tree,
 )
 
+from bmad_loop import deferredwork
 from bmad_loop.frontmatter import parse_frontmatter, status_of
 
 # Linux-only, not merely non-win32: the fake is bash + GNU coreutils (`date +%s%N`).
 HAVE_TMUX = sys.platform.startswith("linux") and shutil.which("tmux") is not None
 # A LIST, not a single mark: every real-tmux test joins the serialized real-mux xdist
-# group (tests/test_conftest.py's grouping guard enforces it).
+# group (tests/test_conftest.py's grouping guard enforces it) and runs on its own
+# private tmux server (DW-561), so a leaked session never reaches the default one.
 pytestmark = [
     pytest.mark.skipif(not HAVE_TMUX, reason="tickets E2E needs real tmux on Linux"),
     real_mux_e2e,
+    pytest.mark.usefixtures("private_tmux_server"),
 ]
 
 # The fake build-auto. `@PY@` is baked in by the scaffold (tmux does not carry the
@@ -117,6 +126,28 @@ if printf '%s' "$prompt" | grep -q "bmad-retrospective"; then
     printf '%s' '{"workflow": "bmad-retrospective", "status": "done"}' > "$td/result.json"
     stop
 fi
+
+# A sweep's triage (`/bmad-loop-sweep`): the triage adapter reads a real
+# result.json, so write the partition (one bundle owning DW-1) and Stop.
+if printf '%s' "$prompt" | grep -q "bmad-loop-sweep"; then
+    printf '%s' '{"workflow": "deferred-sweep-triage", "open_ids": ["DW-1"], "already_resolved": [], "bundles": [{"name": "fix-things", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}], "blocked": [], "skip": [], "decisions": [], "escalations": []}' \
+        > "$td/result.json"
+    stop
+fi
+
+# A sweep bundle (`dw-<name>`, free-form: no ticket, no `tickets.py`): edit code and
+# leave `plan-<key>.md` at `built` in the initiative folder the prompt names (the
+# main checkout's store under a shared store), uncommitted — bmad-loop commits.
+case "$ref" in
+    dw-*)
+        home=$(printf '%s' "$prompt" | sed -n 's/.*the initiative folder `\([^`]*\)`.*/\1/p' | head -1)
+        [ -n "$home" ] || home="$INIT"
+        echo "impl for $ref" >> src.txt
+        printf -- '---\ntitle: %s\nstatus: built\nbaseline_revision: %s\n---\n\n# %s plan\n\n## Auto Run Result\n\nStatus: built\n' \
+            "$ref" "$baseline" "$ref" > "$home/plan-$ref.md"
+        printf '%s' "$(cd "$home" && pwd -P)/plan-$ref.md" > "$td/fake-plan.txt"
+        stop ;;
+esac
 
 # `ticket <ref>`: resolve the plan through the tree, as upstream step-01 does.
 found=$(tickets find "$ref")
@@ -849,6 +880,124 @@ def test_e2e_tickets_multirepo_store_commits(project_v7, topology):
     doc = _status_doc(root)
     assert doc["status"] == "paused" and doc["paused_stage"] == "epic-boundary", doc
     assert doc["tickets"]["epic_closures"] == {EPIC: "accepted"}
+
+
+SWEEP_POLICY = (
+    '[adapter]\nname = "faketickets"\n\n'
+    "[review]\nenabled = false\n\n"
+    '[gates]\nmode = "none"\n\n'
+    '[scm]\nisolation = "worktree"\n'
+)
+SWEEP_LEDGER = (
+    "# Deferred Work\n\n### DW-1: item DW-1\n\n"
+    "origin: test, 2026-06-01\nlocation: src.txt:1\nreason: test entry.\nstatus: open\n"
+)
+
+
+@pytest.mark.parametrize("topology", ["T2", "T3", "T4"])
+def test_e2e_tickets_isolated_sweep_shared_store(project_v7, topology):
+    """A v7 `bmad-loop sweep` under `isolation = "worktree"` over a store no
+    checkout carries (T2 ignored and unversioned, T3 its own nested repository, T4
+    its own repository outside the project): the store is shared, so the bundle
+    prompt names the main checkout's initiative folder and the fake leaves its
+    `built` plan there, not in the unit mount. The unit's code merges back and DW-1
+    is closed in the main ledger. T3/T4: once the code lands the plan gets its own
+    `chore(sweep): dw-<name> plan [bmad-loop <run>]` commit in the store repository
+    and the bundle's ledger close its own `chore(sweep): close resolved
+    deferred-work entries` commit there, each touching that file alone with the
+    `Bmad-Code-Commit` trailer naming the merged unit commit, so both repositories
+    end clean. T2: nothing to commit the plan in, so `store-unversioned` is
+    journaled once, and no close is withheld or failed. The run must complete:
+    `sweep` exits 0 on a pause too.
+
+    ABLATIONS (performed, singly): A1 drop the `_publish_bundle_plan` call in
+    `SweepEngine._land_post_landing_writes` and T3/T4 fail (no plan commit, the
+    store left dirty) and T2 too (no `store-unversioned`); A2 drop the shared-store
+    redirect (`with_shared_store` in `SweepEngine.__init__`) and T2/T3 fail (the
+    prompt names the unit mount's folder, so the fake writes its plan there; T4's
+    absolute store is unaffected by design); A3 drop the shared-store arm of
+    `WorktreeFlow.finish_publication` and all three fail (the run pauses on
+    `artifact publication intent is missing` after the merge); A4 drop the
+    `_publish_bundle_close` call and T3/T4 fail (no ledger close commit, the
+    store's ledger left dirty)."""
+    layout = _scaffold(
+        project_v7, _epic(EntrySpec(1, "Cart model")), topology=topology, isolation="worktree"
+    )
+    root, store = layout.project, layout.output_folder
+    install_sweep_skill(root)
+    (root / ".bmad-loop" / "policy.toml").write_text(SWEEP_POLICY, encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "sweep policy")
+    ledger = layout.initiative_folder / "deferred-work.md"
+    ledger.write_text(SWEEP_LEDGER, encoding="utf-8")
+    if topology == "T2":
+        _git(
+            root, "check-ignore", "-q", ledger.relative_to(root).as_posix()
+        )  # raises unless ignored
+    else:
+        _git(store, "add", "--", ledger.relative_to(store).as_posix())
+        _git(store, "commit", "-q", "-m", "ledger")
+        assert _clean(store)
+    assert _clean(root)
+    base = _commit_count(root)
+
+    _ok(_run(root, "sweep", "--no-prompt"))
+
+    run_id = _run_dir(root).name
+    assert _journal(root, "run-paused") == [], _journal(root, "run-paused")  # rc 0 on a pause too
+    assert len(_journal(root, "run-complete")) == 1
+    key = "dw-fix-things"
+    (cwd,) = [
+        Path(p.read_text(encoding="utf-8"))
+        for p in _run_dir(root).glob(f"tasks/{key}-*/fake-cwd.txt")
+    ]
+    assert cwd.is_relative_to(_run_dir(root) / "worktrees"), cwd  # the session ran in the mount
+    plan = layout.initiative_folder / f"plan-{key}.md"
+    # ...and wrote its plan straight into the main checkout's store, never the mount
+    (written,) = [
+        Path(p.read_text(encoding="utf-8"))
+        for p in _run_dir(root).glob(f"tasks/{key}-*/fake-plan.txt")
+    ]
+    assert written == plan.resolve(), written
+    assert status_of(parse_frontmatter(plan.read_text(encoding="utf-8"))) == "built"
+    (entry,) = deferredwork.parse_ledger(ledger.read_text(encoding="utf-8"))
+    assert entry.status.startswith("done"), entry.status
+    assert "impl for dw-fix-things" in (root / "src.txt").read_text(encoding="utf-8")
+    assert _commit_count(root) > base
+    unit = _git(root, "show", "--name-only", "--format=", "HEAD^2").split()  # the merged unit
+    assert unit == ["src.txt"], unit  # the plan rides no code commit
+    assert _git(root, "log", "-1", "--format=%s", "HEAD^2").startswith(f"sweep {key}")
+    assert not any(s.startswith("chore(sweep)") for s in _subjects(root)), _subjects(root)
+    for kind in (
+        "sweep-ledger-commit-withheld",
+        "store-commit-failed",
+        "store-commit-foreign-dirt",
+    ):
+        assert _journal(root, kind) == [], kind
+    if topology == "T2":
+        assert [row["layout"] for row in _journal(root, "store-unversioned")] == ["T2"]
+        assert _journal(root, "store-committed") == []
+    else:
+        plan_rel = plan.relative_to(store).as_posix()
+        commits = _git(store, "log", "--format=%H", "--", plan_rel).split()
+        assert len(commits) == 1, commits
+        subject = _git(store, "log", "-1", "--format=%s", commits[0]).strip()
+        assert subject == f"chore(sweep): {key} plan [bmad-loop {run_id}]"
+        assert _git(store, "show", "--name-only", "--format=", commits[0]).split() == [plan_rel]
+        ledger_rel = ledger.relative_to(store).as_posix()
+        log = [line.split(" ", 1) for line in _git(store, "log", "--format=%H %s").splitlines()]
+        (close,) = [
+            sha for sha, s in log if s == "chore(sweep): close resolved deferred-work entries"
+        ]
+        assert _git(store, "show", "--name-only", "--format=", close).split() == [ledger_rel]
+        unit_sha = _git(root, "rev-parse", "HEAD^2").strip()
+        assert f"Bmad-Code-Commit: {unit_sha}" in _git(store, "log", "-1", "--format=%B", close)
+        assert [row["commit"] for row in _journal(root, "store-committed")] == [commits[0], close]
+        assert _journal(root, "store-unversioned") == []
+        assert _clean(store)
+    assert _git(root, "branch", "--list", "bmad-loop/*").strip() == ""
+    assert _git(root, "worktree", "list", "--porcelain").count("worktree ") == 1
+    assert _clean(root)
 
 
 def _validate_problems(root: Path) -> set[str]:

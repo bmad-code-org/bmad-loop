@@ -55,8 +55,8 @@ breaking changes may land in a minor release.
   `run --epic` / `--story` selectors (an epic id or slug, a ticket ref).
 - Harvest a ticket plan's `deferred:` findings into the initiative's `deferred-work.md`,
   accept v7 `source_plan:` ledger blocks, and gate tickets by ledger `gate:` refs (a
-  ticket, an epic id or folder). A v6 story-key gate pauses at
-  `story-gate` until it is rewritten.
+  ticket, an epic id or folder). A v6 story-key gate resolves through the ticket's
+  migrated `v6_key`, pausing at `story-gate` only when no single ticket claims it.
 - Run deferred-work sweeps on v7 initiatives: no sprint board, bundle plans in the
   initiative folder closed at `built`, the sweep pinned to its initiative, and
   pre-answers kept per initiative in `.bmad-loop/decisions-<initiative>.json`. An answer
@@ -144,6 +144,9 @@ breaking changes may land in a minor release.
   fsynced before the replace. A run with no recorded run-dir identity, or one whose device
   number changed, records one `journal-unpinned` row per writer; `resume` records or
   re-binds the identity before its first row (DW-559).
+- Refuse `delete` (even `--force`), the TUI delete and `clean` on a run whose state
+  cannot be read, or on an isolated v7 sweep run still holding shared-store ledger
+  closes for unlanded code; a new sweep warns while such a run exists (DW-571).
 
 ### Removed
 
@@ -152,6 +155,18 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Name the T1 ticket plan an interrupted commit window left `done` or `blocked` when
+  the resumed commit fails, instead of a bare `commit failed:` (DW-555).
+- Commit a v7 sweep's own ledger writes (bundle closes, reopened closes, harvested
+  deferrals) in a T3/T4 ticket store's repository, best effort, instead of leaving
+  them uncommitted (DW-556, DW-567, DW-570).
+- Reopen an isolated sweep bundle's close in a shared ticket store's ledger when the
+  bundle escalates, defers or is vetoed, instead of leaving entries `done` for code
+  that never landed (DW-567, DW-569).
+- Stop pausing an isolated sweep on `artifact publication intent is missing` when its
+  artifacts dir is in a shared ticket store (DW-557).
+- Resolve a relative v6 config path against the project root instead of the process
+  cwd (DW-551).
 - Re-validate an ordinary unit's merge against the target on replay instead of trusting its
   `unit-merged` journal row; missing evidence pauses the run (`unit-merged-unverified`)
   (DW-558).
@@ -298,9 +313,14 @@ breaking changes may land in a minor release.
   (`run_dir_identity`) at every engine, CLI, TUI and re-arm writer: a run dir swapped for
   a link or another directory refuses the append or save instead of writing outside the
   run, and an append never recreates a deleted run dir. Windows appends hold
-  `FILE_APPEND_DATA` without `FILE_WRITE_DATA`. Reads and the other run-dir files
-  (`engine.pid`, `ATTENTION`, heartbeats, adapter records, `logs/`) stay path-based
-  (DW-559, DW-560).
+  `FILE_APPEND_DATA` without `FILE_WRITE_DATA`. The first `state.json` read and the other
+  run-dir files (`engine.pid`, `ATTENTION`, heartbeats, adapter records, `logs/`) stay
+  path-based (DW-559, DW-560).
+- Pin `state.json` re-reads and pinned journal reads to the run dir's recorded identity:
+  a run dir swapped after the first read raises `UnconfinedReadError` instead of
+  acting on a foreign record; the TUI journal pane flags the swap (DW-564).
+- Write Windows verify-stream logs through the journal's pinned, handle-anchored run-dir
+  open, refusing junctions; stream files keep `\n` line endings (DW-563).
 
 ## [0.13.2] — 2026-10-09
 

@@ -10,9 +10,9 @@ Linux only, zero tokens: the parked engine is `bmad-loop run --dry-run`, which
 prints the events channel a real run would use (the control plane, under the
 state root) and spawns nothing. It also gates the park itself: on a host whose
 `sh` is dash, a window that does not park is gone before it can be read. The
-server runs on a private `TMUX_TMPDIR`, and the autouse `_isolate_mux_registry`
-fixture removes `TMUX`, which a client would otherwise follow to the operator's
-own socket.
+server is the `private_tmux_server` fixture's, which redirects `TMUX_TMPDIR`,
+drops `TMUX` (which a client would otherwise follow to the operator's own socket)
+and kills the server by explicit socket on teardown.
 """
 
 from __future__ import annotations
@@ -37,11 +37,8 @@ HAVE_TMUX = sys.platform == "linux" and shutil.which("tmux") is not None
 @real_mux_e2e
 @pytest.mark.skipif(not HAVE_TMUX, reason="requires Linux with tmux on PATH")
 def test_e2e_parked_engine_resolves_the_launchers_root_on_a_stale_server(
-    project, tmp_path, monkeypatch
+    project, tmp_path, monkeypatch, private_tmux_server
 ):
-    socket_dir = tmp_path / "tmux"
-    socket_dir.mkdir()
-    monkeypatch.setenv("TMUX_TMPDIR", str(socket_dir))
     monkeypatch.setenv("BMAD_LOOP_MUX_BACKEND", "tmux")
     multiplexer.get_multiplexer.cache_clear()
     s1, s2 = tmp_path / "s1", tmp_path / "s2"
@@ -96,5 +93,4 @@ def test_e2e_parked_engine_resolves_the_launchers_root_on_a_stale_server(
         assert events.is_relative_to(s2), line
         assert events == runs.events_dir_for(root, "<run-id>")
     finally:
-        subprocess.run(["tmux", "kill-server"], capture_output=True)
         multiplexer.get_multiplexer.cache_clear()

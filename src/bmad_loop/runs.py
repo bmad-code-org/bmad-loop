@@ -40,6 +40,7 @@ from . import (
     envvars,
     platform_util,
     sprintstatus,
+    ticketstore,
     tickettree,
     verify,
     worksource,
@@ -3600,6 +3601,214 @@ def _refuse_uncontained_run_dir(project: Path, run_dir: Path, action: str) -> No
         node = parent
 
 
+# ------------------------------------------- sweep closes a run still holds
+
+
+def bundle_close_operation_id(run_id: str, story_key: str) -> str:
+    """The stable operation id of a sweep bundle's reopenable ledger close and of
+    its undo: ``SweepEngine._bundle_close_operation_id`` and
+    :func:`held_sweep_closes` both use it, so there is only one format."""
+    return f"{run_id}/{story_key}"
+
+
+def bundle_close_note(story_key: str) -> str:
+    """The resolution note of a sweep bundle's ledger close and of its undo. This
+    is the only definition; ``SweepEngine._bundle_close_note`` calls it."""
+    return f"resolved by sweep bundle {story_key}"
+
+
+class HeldClosesUnknownError(Exception):
+    """Could not tell whether a run holds unlanded sweep ledger closes: its state,
+    the BMAD config, its recorded store topology or the ledger could not be
+    read. Never read this as "none held"."""
+
+
+class HeldSweepClosesError(Exception):
+    """:func:`delete_run` refused a run that holds unlanded sweep ledger closes,
+    or one where that could not be told. ``dw_ids`` lists the held ids (empty
+    when ``reason`` names the fault that stopped the check)."""
+
+    def __init__(self, run_id: str, dw_ids: list[str], reason: str | None = None) -> None:
+        self.run_id = run_id
+        self.dw_ids = list(dw_ids)
+        self.reason = reason
+        if reason is None:
+            what = (
+                f"it holds sweep ledger closes whose code never landed "
+                f"({', '.join(self.dw_ids)}). They read `done` in the shared ticket "
+                "store's ledger, and no later sweep re-bundles a `done` entry"
+            )
+            remedy = f"Run `bmad-loop resume {run_id}` to land or reopen them first"
+        else:
+            what = (
+                "it could not be checked for sweep ledger closes whose code never "
+                f"landed: {reason}"
+            )
+            remedy = (
+                "Repair what could not be read and retry, or `bmad-loop resume "
+                f"{run_id}` once it reads to land or reopen any closes it holds; a run "
+                "you have confirmed holds none can be removed by hand"
+            )
+        super().__init__(f"run {run_id}: refusing to delete it — {what}. {remedy}")
+
+
+def _bundle_code_landed(task: StoryTask) -> bool:
+    """Whether ``task``'s code is on the target. In place it lands with the
+    ``DONE`` (or ``AWAITING_OPERATOR``) commit. Under isolation the terminal phase
+    is saved BEFORE ``WorktreeFlow.integrate_unit`` merges the unit back, so the
+    phase alone does not prove a landing: only ``isolated_ledger_carried``, which
+    that merge-back (or ``Engine._replay_unlatched_ledger_carries``) latches once
+    the merge is done, does. A host lost between the two leaves the close held
+    until a resume replays the merge."""
+    if task.phase not in (Phase.DONE, Phase.AWAITING_OPERATOR):
+        return False
+    return not task.worktree_path or task.isolated_ledger_carried
+
+
+def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
+    """The deferred-work ids whose ledger close the sweep run at ``run_dir`` still
+    holds with no code landed, in task order. An isolated v7 bundle over a shared
+    ticket store (T2–T4, T6) writes its accepted-dev close straight into the one
+    shared ledger. If the run then pauses, stops or crashes before landing, that
+    `done` stays, and ``deferredwork.open_ids`` hides it from every later sweep.
+    The engine reopens it only when the run escalates, is vetoed or defers.
+
+    A run holds a close when all of these are true:
+
+    - it is an unfinished, isolated sweep (``state.target_branch`` or the task's
+      ``worktree_path``);
+    - it has a task whose code has not landed (:func:`_bundle_code_landed`) with
+      ``bundle_closes_intended`` set;
+    - the ledger lies in the shared store (``bmadconfig.load_paths`` in the
+      run's era, :func:`resolves_as_tickets`, with its recorded topology,
+      :func:`live_store_topology`);
+    - the ledger still shows that task's close as undoable under its note and
+      operation id (``deferredwork.held_reopenable_closes``), which is exactly
+      what ``deferredwork.mark_open_many`` would reopen.
+
+    Read-only. An absent ``state.json`` or ledger answers ``[]``: there is no
+    record of a close. Any other fault raises :class:`HeldClosesUnknownError`
+    and is never folded into ``[]``. Used by the :func:`delete_run` refusal and
+    the sweep-start warning (:func:`prior_sweep_closes`)."""
+    try:
+        state = load_state(run_dir)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except Exception as e:  # any unreadable or unparseable state is "unknown"
+        raise HeldClosesUnknownError(
+            f"its run state could not be read ({type(e).__name__}: {e})"
+        ) from e
+    if state.run_type != "sweep" or state.finished:
+        return []
+    candidates = [
+        task
+        for task in state.tasks.values()
+        if not _bundle_code_landed(task)
+        and task.bundle_closes_intended
+        and (state.target_branch or task.worktree_path)
+    ]
+    if not candidates:
+        return []
+    try:
+        paths = ticketstore.with_shared_store(
+            bmadconfig.load_paths(project, want_tickets=resolves_as_tickets(state)),
+            live_store_topology(state, project),
+        )
+    except Exception as e:  # a config or topology fault is "unknown", never "none"
+        raise HeldClosesUnknownError(
+            f"the BMAD config or the run's store topology could not be read "
+            f"({type(e).__name__}: {e})"
+        ) from e
+    if paths.shared_store is None:
+        # No shared store under the recorded topology: every close went through a
+        # checkout, whichever initiative is active now.
+        return []
+    from .runsetup import sweep_initiative_conflict  # lazy: runsetup imports runs
+
+    if (conflict := sweep_initiative_conflict(state, paths)) is not None:
+        # The live paths resolve another initiative's ledger, which holds nothing
+        # under this run's op id: answering `[]` there would wave the holder through.
+        raise HeldClosesUnknownError(conflict)
+    ledger = paths.deferred_work
+    if not paths.in_shared_store(ledger):
+        return []
+    text, fault = deferredwork.observe_ledger(ledger)
+    if fault is not None:
+        raise HeldClosesUnknownError(
+            f"the deferred-work ledger {ledger} could not be read ({fault})"
+        )
+    if text is None:
+        return []
+    held: list[str] = []
+    for task in candidates:
+        held.extend(
+            deferredwork.held_reopenable_closes(
+                text,
+                task.bundle_closes_intended,
+                bundle_close_note(task.story_key),
+                bundle_close_operation_id(state.run_id, task.story_key),
+            )
+        )
+    return list(dict.fromkeys(held))
+
+
+@dataclass(frozen=True)
+class PriorSweepCloses:
+    """One row of :func:`prior_sweep_closes`. ``run_id`` is None when the runs
+    dir itself could not be listed. ``fault`` is None when the run was read and
+    holds ``dw_ids``."""
+
+    run_id: str | None
+    dw_ids: tuple[str, ...] = ()
+    fault: str | None = None
+
+
+def prior_sweep_closes(project: Path, *, exclude: str) -> list[PriorSweepCloses]:
+    """The sweep-start scan: every run, other than ``exclude`` (the new sweep) and
+    live runs, that holds unlanded sweep closes (:func:`held_sweep_closes`) or
+    could not be checked. A live run's close is still in flight, so it is skipped.
+    A runs dir that cannot be listed gives a single fault row with no run id.
+    Read-only. A row only warns the caller and never blocks the new sweep."""
+    names, fault = _run_dir_names(project)
+    if names is None:
+        return [PriorSweepCloses(None, fault=fault)]
+    rows: list[PriorSweepCloses] = []
+    for name in sorted(names):
+        if name == exclude:
+            continue
+        run_dir = project / RUNS_DIR / name
+        try:
+            alive = engine_liveness(run_dir) == "alive"
+        except ProcessHostError as e:
+            # A misconfigured process host must not block the new sweep: a fault row.
+            rows.append(
+                PriorSweepCloses(name, fault=f"its engine liveness could not be probed ({e})")
+            )
+            continue
+        if alive:
+            continue
+        try:
+            held = held_sweep_closes(project, run_dir)
+        except HeldClosesUnknownError as e:
+            rows.append(PriorSweepCloses(name, fault=str(e)))
+            continue
+        if held:
+            rows.append(PriorSweepCloses(name, tuple(held)))
+    return rows
+
+
+def refuse_held_sweep_closes(project: Path, run_dir: Path) -> None:
+    """Raise :class:`HeldSweepClosesError` when ``run_dir`` holds unlanded sweep
+    closes or could not be checked (:func:`held_sweep_closes`). This is the
+    :func:`delete_run` gate. ``clean`` also calls it before it trims anything."""
+    try:
+        held = held_sweep_closes(project, run_dir)
+    except HeldClosesUnknownError as e:
+        raise HeldSweepClosesError(run_dir.name, [], str(e)) from e
+    if held:
+        raise HeldSweepClosesError(run_dir.name, held)
+
+
 def delete_run(
     project: Path,
     run_dir: Path,
@@ -3644,14 +3853,22 @@ def delete_run(
     multiplexer and let the removal proceed anyway (DW-466); ``None`` prints it
     on stderr. See :func:`live_session_may_be_ours`.
 
+    After the liveness and session guards, still under the lock and before any
+    removal, a sweep run that holds unlanded ledger closes raises
+    :class:`HeldSweepClosesError` (:func:`refuse_held_sweep_closes`). So does a
+    run that could not be checked. ``force`` does not waive this; the failed-launch
+    unwind (``_expected_composer_claim``) skips it, because a run it just composed
+    holds nothing.
+
     A run dir holding ``worktrees/`` (a paused isolated run's kept unit), or whose
     state records a unit mount (``worktrees/`` already removed by hand), is pruned
     from git's worktree admin after the removal, against the run's own code root
     (DW-538; a project-owned one rebased onto a renamed ``project``) — the rmtree alone left ``.git/worktrees/<id>`` registered. A prune
     that leaves an entry under the run dir, or a listing that cannot say, is
-    reported through ``warn`` too; the deletion itself has already happened. An
-    unreadable state leaves the code root unknown: ``project`` is pruned as the
-    likely one, and ``warn`` always says the cleanup is unconfirmed."""
+    reported through ``warn`` too; the deletion itself has already happened. A
+    missing state (an unreadable one is refused above, except on the failed-launch
+    unwind) leaves the code root unknown: ``project`` is pruned as the likely one,
+    and ``warn`` always says the cleanup is unconfirmed."""
     _refuse_uncontained_run_dir(project, run_dir, "delete")
     with state_lock(run_dir, blocking=wait_for_lock):
         if _expected_composer_claim is not None:
@@ -3680,6 +3897,13 @@ def delete_run(
             )
         if not force:
             _refuse_live_session(project, run_dir.name, "delete", warn=warn)
+        if _expected_composer_claim is None:
+            # A sweep run holding ledger closes whose code never landed is the only
+            # record that can land or reopen them, so it is never deleted. Neither
+            # is a run where that cannot be told. `force` does not waive this: it
+            # overrides the session guard only. The failed-launch unwind skips it,
+            # because a run it just composed holds nothing.
+            refuse_held_sweep_closes(project, run_dir)
         # Read before the rmtree takes them: a kept unit worktree under the run dir
         # is registered with the run's code root, which the rmtree does not tell. A
         # recorded mount counts even with `worktrees/` already gone by hand — its
@@ -3700,7 +3924,7 @@ def delete_run(
                 # No state, no code root: prune the usual one, but a clean listing
                 # there proves nothing for a run that recorded a `repo_root` override.
                 fault = _prune_deleted_run_worktrees(project, run_res) or (
-                    "its run state was unreadable, so the repository its worktrees "
+                    "its run state was missing or unreadable, so the repository its worktrees "
                     f"were registered with is unknown; if that is not {project}, run "
                     "`git worktree prune` there"
                 )
@@ -4517,6 +4741,18 @@ def judged_store_source(state: RunState, sweep_source: str) -> str:
     `RunState.source` is the launch default), so the caller's `sweep_source` — the
     one a sweep launch is judged under."""
     return sweep_source if state.run_type == "sweep" else state.source
+
+
+def resolves_as_tickets(state: RunState) -> bool:
+    """Whether a recorded run reloads the project's BMAD config as v7
+    (``bmadconfig.load_paths(want_tickets=...)``): a tickets run, or a sweep that
+    pinned an initiative or recorded a store topology, which
+    ``runsetup.compose_sweep`` writes only on v7. A mixed install (v6 keys left
+    beside the v7 marker) auto-detects as v6, so a v7 sweep reloaded without this
+    reads its own pin as a switched initiative (``sweep_initiative_conflict``)."""
+    if state.run_type == "sweep":
+        return bool(state.initiative or state.store_topology)
+    return state.source == worksource.SOURCE_TICKETS
 
 
 def live_store_topology(state: RunState, project_root: Path) -> dict[str, str | None]:

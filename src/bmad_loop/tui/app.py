@@ -1409,7 +1409,7 @@ class BmadLoopApp(App[None]):
                         severity="warning",
                     )
                     return
-                fresh = load_state(run_dir)
+                fresh = load_state(run_dir, pin=recorded)
                 if fresh.paused_stage != PAUSE_PLAN_CHECKPOINT:
                     self.call_from_thread(
                         self.notify,
@@ -1565,6 +1565,9 @@ class BmadLoopApp(App[None]):
         # `repo_root:` edit made while the run was paused has moved it. Resume re-stamps
         # it, but this gesture re-arms BEFORE it resumes, so the mirror has to be aimed
         # here or the re-arm advances the baseline in the tree the run has left.
+        # The lock-free read the locked re-read below is pinned to; None (unread,
+        # or unreadable) leaves that re-read the first, by path.
+        recorded: RunState | None = None
         try:
             paths = bmadconfig.load_paths(self.project)
         except (bmadconfig.BmadConfigError, OSError) as e:
@@ -1635,7 +1638,7 @@ class BmadLoopApp(App[None]):
                 # mutation gesture is serialized.
                 if self._resolve_blocked_by_liveness(run_id, run_dir):
                     return
-                fresh_state = load_state(run_dir)
+                fresh_state = load_state(run_dir, pin=recorded)
                 fresh_task = fresh_state.tasks.get(story_key)
                 if (
                     fresh_state.paused_stage != PAUSE_ESCALATION
@@ -2193,7 +2196,13 @@ class BmadLoopApp(App[None]):
         guard_notes: list[str] = []
         try:
             runs.delete_run(self.project, run_dir, warn=guard_notes.append)
-        except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
+        except (
+            OSError,
+            runs.StateRootError,
+            runs.LiveEngineError,
+            runs.LiveSessionError,
+            runs.HeldSweepClosesError,
+        ) as e:
             # The modal's liveness sample is advisory. Surface authoritative
             # lifecycle refusals and lock/removal failures here rather than letting
             # them kill the worker thread or forgetting a run that still exists.

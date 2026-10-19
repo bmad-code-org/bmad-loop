@@ -4221,6 +4221,9 @@ def _budget_adapter(tmp_path, monkeypatch, usage_parser="claude-jsonl"):
         profile=profile,
     )
     adapter._window_alive = lambda handle: True
+    # A crashed verdict asks the mux whether the session vanished (#489); without
+    # this stand-in that probe reaches the host tmux server (DW-568).
+    adapter.mux = _UnitMux()
     sent: list[str] = []
     adapter.send_text = lambda handle, text: sent.append(text)
     (adapter.tasks_dir / "b-1").mkdir()
@@ -4495,8 +4498,23 @@ def test_budget_enforce_probe_fault_flags_liveness_unknown(tmp_path, monkeypatch
 
 def test_budget_grace_expiry_reprobes_liveness_dead_window_is_crashed(tmp_path, monkeypatch):
     """Window death at grace expiry is authoritative: the existing crashed path
-    (artifact honored) wins over the over_budget verdict."""
+    (artifact honored) wins over the over_budget verdict.
+
+    DW-568: the crash path's session-vanished probe stays on the stand-in mux, so
+    no tmux/psmux argv is spawned. Ablation: drop `_budget_adapter`'s `_UnitMux` and
+    the recorder catches `has-session`."""
     adapter, clock, sent = _budget_adapter(tmp_path, monkeypatch)
+    real_run = subprocess.run
+    mux_argv: list[list[str]] = []
+
+    def recording_run(argv, *args, **kwargs):
+        # Both tmux-family binaries share this seam; psmux is the win32 default.
+        if Path(str(argv[0])).stem in {"tmux", "psmux"}:
+            mux_argv.append(list(argv))
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", recording_run)
     transcript = tmp_path / "t.jsonl"
     _write_claude_transcript(transcript, input_tokens=5000)
 
@@ -4514,6 +4532,7 @@ def test_budget_grace_expiry_reprobes_liveness_dead_window_is_crashed(tmp_path, 
 
     assert result.status == "crashed"
     assert result.budget_weighted == 5000
+    assert mux_argv == []
 
 
 def test_budget_timeout_after_trip_carries_weighted(tmp_path, monkeypatch):
@@ -6467,7 +6486,7 @@ def _assert_fake_session_id(adapter, result, fallback="fake-1"):
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
 @real_mux_e2e
 @pytest.mark.parametrize("profile_name", ["claude", "codex", "gemini"])
-def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
+def test_tmux_end_to_end_with_fake_cli(tmp_path, private_tmux_server, profile_name):
     """Spawn a real tmux window running a fake CLI that behaves like a
     hook-instrumented session: emits SessionStart + result.json + Stop."""
     fake = _write_fake_cli(tmp_path)
@@ -6491,7 +6510,10 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
     try:
         result = adapter.run(spec)
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+        subprocess.run(
+            ["tmux", "-S", str(private_tmux_server), "kill-session", "-t", adapter.session_name],
+            capture_output=True,
+        )
 
     assert result.status == "completed"
     assert result.result_json["workflow"] == "auto-dev"
@@ -6504,7 +6526,7 @@ def test_tmux_end_to_end_with_fake_cli(tmp_path, profile_name):
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
 @real_mux_e2e
-def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
+def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path, private_tmux_server):
     """A re-armed run reuses the task_id. A prior cycle's Stop event + result.json
     must NOT replay: start_session clears the stale result, and the launch-time
     floor makes wait_for skip the old Stop so only the fresh session counts."""
@@ -6536,7 +6558,10 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
     try:
         result = adapter.run(spec)
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+        subprocess.run(
+            ["tmux", "-S", str(private_tmux_server), "kill-session", "-t", adapter.session_name],
+            capture_output=True,
+        )
 
     assert result.status == "completed"
     assert result.result_json["workflow"] == "auto-dev"  # fresh, not "STALE"
@@ -6545,7 +6570,7 @@ def test_tmux_reused_task_id_ignores_stale_artifacts(tmp_path):
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
 @real_mux_e2e
-def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
+def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path, private_tmux_server):
     """The version-skew guard, end to end through real tmux: a CURRENT
     orchestrator (it exports BMAD_LOOP_EVENTS_DIR and waits on the out-of-tree
     channel) driving a session whose relay is an OLD copy that writes only to
@@ -6577,7 +6602,10 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
     try:
         result = adapter.run(spec)
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+        subprocess.run(
+            ["tmux", "-S", str(private_tmux_server), "kill-session", "-t", adapter.session_name],
+            capture_output=True,
+        )
 
     assert result.status == "completed"
     _assert_fake_session_id(adapter, result)
@@ -6589,7 +6617,7 @@ def test_tmux_end_to_end_with_a_relay_that_only_knows_the_legacy_dir(tmp_path):
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
 @real_mux_e2e
-def test_tmux_crash_detected(tmp_path):
+def test_tmux_crash_detected(tmp_path, private_tmux_server):
     """A session that dies without writing result.json -> crashed. Also the
     SessionEnd-less path (codex profile) relies on this window-death check."""
     fake = tmp_path / "fake-cli"
@@ -6610,14 +6638,17 @@ def test_tmux_crash_detected(tmp_path):
     try:
         result = adapter.run(spec)
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+        subprocess.run(
+            ["tmux", "-S", str(private_tmux_server), "kill-session", "-t", adapter.session_name],
+            capture_output=True,
+        )
     assert result.status == "crashed"
     assert result.result_json is None
 
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
 @real_mux_e2e
-def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
+def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path, private_tmux_server):
     """End-to-end #61 (total hook loss): the session writes its terminal spec but
     never emits any hook event, so the wait loop idles to `timeout` — a path that
     never arms the stall grace and checks no artifact. run()'s real kill then
@@ -6675,7 +6706,10 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
     try:
         result = adapter.run(spec)
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+        subprocess.run(
+            ["tmux", "-S", str(private_tmux_server), "kill-session", "-t", adapter.session_name],
+            capture_output=True,
+        )
 
     assert result.status == "completed"
     assert result.result_json["status"] == "done"
@@ -6684,7 +6718,7 @@ def test_tmux_timeout_with_flushed_spec_rescued_post_kill(tmp_path):
 
 @pytest.mark.skipif(not HAVE_TMUX, reason="tmux not available")
 @real_mux_e2e
-def test_tmux_timeout_silent_session_not_rescued(tmp_path):
+def test_tmux_timeout_silent_session_not_rescued(tmp_path, private_tmux_server):
     """The #261 counterpart of the rescue above, same call path, one delta: the CLI
     wedges instantly and renders NOTHING. A qualifying spec still appears in the
     shared artifacts dir — here written by a concurrent process, exactly as a
@@ -6766,7 +6800,10 @@ def test_tmux_timeout_silent_session_not_rescued(tmp_path):
         result = adapter.run(spec)
     finally:
         writer.join(timeout=10)
-        subprocess.run(["tmux", "kill-session", "-t", adapter.session_name], capture_output=True)
+        subprocess.run(
+            ["tmux", "-S", str(private_tmux_server), "kill-session", "-t", adapter.session_name],
+            capture_output=True,
+        )
 
     # The foreign spec really is a candidate the read-back would otherwise adopt: it
     # exists, qualifies, and — tested against the launch floor this session actually

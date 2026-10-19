@@ -2183,6 +2183,46 @@ def _warn_bypass_dropped(
                 )
 
 
+def _warn_prior_sweep_closes(project: Path, run_id: str, journal: Journal) -> None:
+    """Warn at a sweep's start about earlier runs that still hold sweep ledger
+    closes whose code never landed (``runs.prior_sweep_closes``). Such a close
+    reads ``done`` in the shared ticket store, so this sweep cannot re-bundle it.
+    Only the held run can land or reopen it.
+
+    Writes one journal row and one stderr ``warning:`` line per finding:
+    ``sweep-prior-run-holds-closes`` for a held run, and
+    ``sweep-prior-run-closes-unknown`` when a run or the runs dir could not be
+    checked. Read-only. It never blocks or changes the new sweep, and the new
+    run and live runs are skipped."""
+    for row in runs.prior_sweep_closes(project, exclude=run_id):
+        if row.run_id is None:
+            journal.append("sweep-prior-run-closes-unknown", error=row.fault)
+            print(
+                "warning: could not check earlier runs for sweep ledger closes whose code "
+                f"never landed: {row.fault}",
+                file=sys.stderr,
+            )
+        elif row.fault is not None:
+            journal.append("sweep-prior-run-closes-unknown", run_id=row.run_id, error=row.fault)
+            print(
+                f"warning: could not check run {row.run_id} for sweep ledger closes whose "
+                f"code never landed: {row.fault}. If it holds any, `bmad-loop resume "
+                f"{row.run_id}` lands or reopens them",
+                file=sys.stderr,
+            )
+        else:
+            journal.append(
+                "sweep-prior-run-holds-closes", run_id=row.run_id, dw_ids=list(row.dw_ids)
+            )
+            print(
+                f"warning: run {row.run_id} holds sweep ledger closes whose code never "
+                f"landed ({', '.join(row.dw_ids)}). They read `done` in the shared ticket "
+                f"store, so this sweep will not re-bundle them; run `bmad-loop resume "
+                f"{row.run_id}` to land or reopen them",
+                file=sys.stderr,
+            )
+
+
 def _fatal_plugin_problems(paths: bmadconfig.ProjectPaths, pol) -> list[str]:
     """The fatal plugin-trust refusals `_reject_plugin_trust` would print, as
     banner lines for `_warn_preflight_would_abort` (no stderr, never raises)."""
@@ -3176,6 +3216,16 @@ def _validate_hard_gates(
     ``validate`` executing no project code, and it happens only when an unlanded
     entry carries a ticket-grammar or v6 story-key token; a ledger whose gates
     have all landed reports its ``ok`` without it.
+
+    A v6 story-key token (``3-2``, a migrated ledger's) is resolved first through
+    the ``v6_key`` the migration wrote into each ticket's ``tickets.toml`` entry,
+    with the same reader (``tickettree.read_v6_key_claims``) and resolver
+    (``deferredwork.partition_legacy_tokens``) the engine's gate check uses. One
+    that exactly one ticket claims gates that ticket as its ``E.M`` ref would,
+    reported under the token as written; any other fails as a legacy gate before
+    every ticket. The claims are read only when an unlanded entry carries such a
+    token and a ticket is actionable, and a tree that cannot be read for them
+    fails ``probe-failed``.
     """
     grammar: deferredwork.GateGrammar = "ticket" if source == worksource.SOURCE_TICKETS else "story"
     noun = "ticket" if grammar == "ticket" else "story"
@@ -3183,9 +3233,10 @@ def _validate_hard_gates(
         (entry, deferredwork.gates(entry, grammar=grammar))
         for entry in deferredwork.parse_ledger(text)
     ]
-    # v6 story keys in a ticket queue's ledger (a migrated ledger keeps them): no
-    # ticket carries one, and the run pauses before every ticket while one stands
-    # (`TicketsEngine._legacy_gate_tokens`), so they fail here rather than warn.
+    # v6 story keys in a ticket queue's ledger (a migrated ledger keeps them). One
+    # that a single ticket's `v6_key` claims resolves to that ticket below; any
+    # other pauses the run before every ticket while it stands
+    # (`TicketsEngine._legacy_gate_tokens`), so it fails here rather than warns.
     legacy = {
         entry.id: stale
         for entry, _ in declared
@@ -3238,6 +3289,25 @@ def _validate_hard_gates(
         # and `queue.stories-manifest` already fail for it; adding an `ok` here would
         # say "no story is gated" about a queue this check never saw.
         return
+    # v6 tokens one ticket's `v6_key` claims resolve to its ref; the rest stay legacy.
+    # Read only when a ticket is actionable: the run reads the claims only while
+    # gate-checking a picked ticket, and with no target the legacy fail is moot.
+    resolved: dict[str, tuple[tuple[str, str], ...]] = {}
+    unresolved: dict[str, tuple[str, ...]] = dict(legacy)
+    if legacy and targets:
+        try:
+            claims = tickettree.read_v6_key_claims(paths.initiative_folder)
+        except tickettree.TicketsV6KeyUnreadable as e:
+            report.fail(
+                "deferred.hard-gate",
+                f"{e.path} cannot be read ({e.detail}), so the v6 story-key `gate:` tokens "
+                f"in {paths.deferred_work.name} could not be resolved to tickets through "
+                f"their `v6_key` — fix the file, then re-run `bmad-loop validate`",
+                {"error": str(e), "kind": e.kind},
+            )
+            return
+        for dw_id, stale in legacy.items():
+            resolved[dw_id], unresolved[dw_id] = deferredwork.partition_legacy_tokens(stale, claims)
     gating = [e.id for e, g in declared if not e.done and (g.tokens or e.id in legacy)]
     gated = False
     for entry, entry_gates in declared:
@@ -3248,18 +3318,19 @@ def _validate_hard_gates(
         # retires a gate; everything else holds until someone writes that word.
         if entry.done:
             continue
-        stale = legacy.get(entry.id, ())
+        stale = unresolved.get(entry.id, ())
         if stale and targets:
             gated = True
             report.fail(
                 "deferred.hard-gate",
                 f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and declares v6 "
-                f"story-key gate tokens no ticket ref can match ({', '.join(stale)}) — a "
-                f"tickets run pauses before every ticket while it stands, starting with "
-                f"{targets[0].key}. The v7 migration keeps each story's old key as "
-                f"`v6_key` in its ticket file: rewrite the tokens as ticket refs (`E.M`, "
-                f"an epic id or `epic-<slug>`), or close the entry in "
-                f"{paths.deferred_work.name} (`status: done <date>`)",
+                f"story-key gate tokens that no single ticket's `v6_key` claims (none "
+                f"does, or more than one) ({', '.join(stale)}) — no ticket ref matches "
+                f"them, so a tickets run pauses before every ticket while it stands, "
+                f"starting with {targets[0].key}. Rewrite the tokens as ticket refs "
+                f"(`E.M`, an epic id or `epic-<slug>`) or as the full v6 key of one "
+                f"ticket, or close the entry in {paths.deferred_work.name} "
+                f"(`status: done <date>`)",
                 {
                     "dw_id": entry.id,
                     "title": entry.title,
@@ -3270,13 +3341,23 @@ def _validate_hard_gates(
         for target in targets:
             story_key = target.key
             hits = [t for t in entry_gates.tokens if _gate_matches(t, target, grammar)]
+            # A resolved v6 token matches through its ticket's ref, reported as written.
+            via = [
+                (token, ref)
+                for token, ref in resolved.get(entry.id, ())
+                if _gate_matches(ref, target, grammar)
+            ]
+            hits += [token for token, _ in via]
             if not hits:
                 continue
             gated = True
+            resolution = "".join(
+                f"; {token} resolves to {ref} through its `v6_key`" for token, ref in via
+            )
             report.fail(
                 "deferred.hard-gate",
                 f"{entry.id} ({entry.title}) {_gate_status_clause(entry)} and gates "
-                f"{story_key} (gate: {', '.join(hits)}) — that {noun} must not run until "
+                f"{story_key} (gate: {', '.join(hits)}{resolution}) — that {noun} must not run until "
                 f"the entry lands. Close it in {paths.deferred_work.name} "
                 f"(`status: done <date>`), or drop the token from its `gate:` line if it "
                 f"no longer blocks this work",
@@ -4412,6 +4493,7 @@ def _start_sweep(
         profiles=profiles,
         journal=composed.journal,
     )
+    _warn_prior_sweep_closes(project, composed.run_id, composed.journal)
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
     print(summary.render())
@@ -4941,7 +5023,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     if (refusal := _unresumable_source(state)) is not None:
         print(f"cannot resume {run_dir.name}: {refusal}", file=sys.stderr)
         return 1
-    paths = bmadconfig.load_paths(project, want_tickets=state.source == worksource.SOURCE_TICKETS)
+    paths = bmadconfig.load_paths(project, want_tickets=runs.resolves_as_tickets(state))
     sweep_options = None
     if state.run_type == "sweep":
         try:
@@ -6317,7 +6399,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # The pre-session checks intentionally stay lock-free; this is the
             # mutation boundary, so repeat every state/liveness precondition from
             # the snapshot left by the preceding writer before restamping anything.
-            fresh_state = load_state(run_dir)
+            fresh_state = load_state(run_dir, pin=state)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
@@ -6448,7 +6530,7 @@ def _resolve_adopt(
         with state_lock(run_dir):
             # Same mutation-boundary re-check as the re-arm path: the checks above
             # ran lock-free, so repeat them against the state left by the last writer.
-            fresh_state = load_state(run_dir)
+            fresh_state = load_state(run_dir, pin=state)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
@@ -6544,7 +6626,7 @@ def _resolve_abandon(
     try:
         with state_lock(run_dir):
             # The checks above ran lock-free: repeat them against the last writer's state.
-            fresh_state = load_state(run_dir)
+            fresh_state = load_state(run_dir, pin=state)
             if fresh_state.paused_stage != PAUSE_ESCALATION:
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
@@ -6682,7 +6764,7 @@ def _resolve_reverify(
         with state_lock(run_dir):
             # Same mutation-boundary re-check as the re-arm path: the checks above
             # ran lock-free, so repeat them against the state left by the last writer.
-            fresh_state = load_state(run_dir)
+            fresh_state = load_state(run_dir, pin=state)
             if not _resolve_pause_admits(fresh_state.paused_stage, reverify_named=explicit_story):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
@@ -8060,12 +8142,23 @@ def cmd_delete(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name
+    if args.force:
+        try:
+            # Before `--force` can hard-stop a live engine: a held run is refused
+            # anyway, and stopping it first would leave it stopped with nothing
+            # deleted. Without `--force` a live run gets the live-engine refusal
+            # first. `delete_run` re-checks under the lock.
+            runs.refuse_held_sweep_closes(project, run_dir)
+        except runs.HeldSweepClosesError as e:
+            print(str(e), file=sys.stderr)
+            return 1
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
     try:
         runs.delete_run(project, run_dir, force=args.force)
-    except runs.LiveEngineError as e:
+    except (runs.LiveEngineError, runs.HeldSweepClosesError) as e:
+        # `--force` waives neither: the held-closes refusal names its own remedy.
         print(str(e), file=sys.stderr)
         return 1
     except runs.LiveSessionError as e:
@@ -8463,6 +8556,21 @@ def _human_bytes(n: int) -> str:
     return f"{size:.1f}TB"
 
 
+def _held_closes_reason(e: runs.HeldSweepClosesError) -> str:
+    """`clean`'s one-line skip reason for a run `delete_run` refuses because it
+    holds unlanded sweep ledger closes, or could not be checked."""
+    if e.reason is not None:
+        return (
+            f"could not be checked for sweep ledger closes whose code never landed "
+            f"({e.reason}); repair it and retry, or `bmad-loop resume {e.run_id}` once it "
+            "reads; a run confirmed to hold none can be removed by hand"
+        )
+    return (
+        f"holds sweep ledger closes whose code never landed ({', '.join(e.dw_ids)}); "
+        f"`bmad-loop resume {e.run_id}` lands or reopens them"
+    )
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     """Reclaim disk from concluded runs: tear down worktrees leaked by a
     mid-flight stop, trim heavy scaffolding from runs kept for history, and
@@ -8535,6 +8643,22 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             continue
+        if run_dir.name in past and (args.hard or not pol.cleanup.archive_old):
+            # A sweep run that holds ledger closes whose code never landed (or
+            # cannot be checked) is the only record that can land or reopen them.
+            # `delete_run` refuses it; asking first, before any trim or worktree
+            # removal, leaves it whole instead of half-reclaimed. The archive arm
+            # keeps the run's record in its tarball and is not gated.
+            try:
+                runs.refuse_held_sweep_closes(project, run_dir)
+            except runs.HeldSweepClosesError as e:
+                protected.append(run_dir.name)
+                if not args.json:
+                    print(
+                        f"run {run_dir.name}: {_held_closes_reason(e)} — not removed",
+                        file=sys.stderr,
+                    )
+                continue
         if runs.engine_liveness(run_dir) == "unknown":
             # warn-only: unknown never blocks cleanup, but say so before removal.
             # In JSON mode this lives in the document instead (unverifiable_pid),
@@ -8580,7 +8704,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     if not dry:
                         runs.archive_run(project, run_dir, wait_for_lock=False)
                     archived.append(run_dir.name)
-            except (runs.LiveEngineError, runs.LiveSessionError, LockUnavailableError) as e:
+            except (
+                runs.LiveEngineError,
+                runs.LiveSessionError,
+                runs.HeldSweepClosesError,
+                LockUnavailableError,
+            ) as e:
                 # A session or engine appeared between the loop-top sample and the
                 # authoritative removal transaction — or the run's state lock is
                 # held, which says the same thing one layer down and is the only
@@ -8606,6 +8735,8 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 if not args.json:
                     if isinstance(e, runs.LiveSessionError):
                         reason = "agent session appeared mid-clean"
+                    elif isinstance(e, runs.HeldSweepClosesError):
+                        reason = _held_closes_reason(e)
                     elif isinstance(e, LockUnavailableError):
                         reason = "run state locked by another process"
                     else:

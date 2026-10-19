@@ -16,18 +16,24 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
 import pytest
 from conftest import (
     V7_USER_CONFIG_REL,
+    EntrySpec,
+    EpicSpec,
     FakeTicketTree,
     V7Layout,
     fake_find,
     ticket_row,
+    v7_layout,
     write_plan,
     write_script_launcher,
+    write_ticket_tree,
 )
 
 from bmad_loop import childrun, frontmatter, platform_util, runs, tickettree
@@ -52,8 +58,12 @@ from bmad_loop.tickettree import (
     TicketsTransitionRefused,
     TicketsUnavailable,
     TicketsUsageError,
+    TicketsV6KeyUnreadable,
     TicketTree,
     TicketTreeLike,
+    V6KeyClaim,
+    read_v6_key_claims,
+    read_v6_key_entries,
 )
 
 HEADER = '# /// script\n# requires-python = ">=3.11"\n# ///\n'
@@ -964,3 +974,219 @@ def test_fake_ticket_tree_decides_marks_with_the_real_table(tmp_path: Path):
     fake.restore_preimage(tmp_path / "p.md", b"x")
     assert fake.discards == ["1.1"] and fake.restores == [(tmp_path / "p.md", b"x")]
     assert [m.outcome for m in fake.marks] == ["written", "noop", "written"]
+
+
+# ------------------------------------------------------------- v6_key claims
+
+V6_TREE = (
+    EpicSpec(
+        1,
+        "epic-cart",
+        "Cart",
+        (
+            EntrySpec(1, "Cart model", v6_key="3-2-invite-link"),
+            EntrySpec(2, "Cart rules"),  # carries no v6_key: claims nothing
+        ),
+    ),
+    EpicSpec(2, "epic-checkout", "Checkout", (EntrySpec(1, "Checkout form", v6_key="4-1-pay"),)),
+)
+
+
+def _v6_layout(tmp_path: Path) -> V7Layout:
+    layout = v7_layout(tmp_path / "sandbox")
+    write_ticket_tree(layout, V6_TREE)
+    return layout
+
+
+def test_v6_key_claims_read_from_the_epic_ticket_files(tmp_path: Path):
+    """Every entry's `v6_key` is a claim on its `E.M` ref, the epic id taken from
+    the initiative's `[[epic]]` row for its folder. An epic folder the table does
+    not list still claims, with no ref, and a folder without a `tickets.toml`
+    holds no entries."""
+    layout = _v6_layout(tmp_path)
+    orphan = layout.initiative_folder / "epic-orphan"
+    orphan.mkdir()
+    (orphan / "tickets.toml").write_text(
+        '[[entry]]\nid = "06"\ntype = "story"\nv6_key = "5-1-x"\n', encoding="utf-8"
+    )
+    (layout.initiative_folder / "epic-empty").mkdir()
+
+    assert read_v6_key_claims(layout.initiative_folder) == (
+        ("3-2-invite-link", "1.1"),
+        ("4-1-pay", "2.1"),
+        ("5-1-x", None),
+    )
+
+
+def test_v6_key_entries_carry_the_ticket_identity(tmp_path: Path):
+    """Each claim keeps the identity its ref is derived from — the epic folder and
+    the entry id as the script compares it — so `names` matches the picked
+    ticket's binding (`06` is entry `6`) even when the ref has moved."""
+    layout = _v6_layout(tmp_path)
+    orphan = layout.initiative_folder / "epic-orphan"
+    orphan.mkdir()
+    (orphan / "tickets.toml").write_text(
+        '[[entry]]\nid = "06"\ntype = "story"\nv6_key = "5-1-x"\n', encoding="utf-8"
+    )
+
+    entries = read_v6_key_entries(layout.initiative_folder)
+
+    assert entries[-1] == V6KeyClaim("5-1-x", None, "epic-orphan", "6")
+    assert entries[-1].names("epic-orphan", "06") and entries[-1].names("epic-orphan", "6")
+    assert not entries[-1].names("epic-orphan", "7")
+    assert not entries[-1].names(V6_TREE[0].slug, "6")
+    assert tuple((c.key, c.ref) for c in entries) == read_v6_key_claims(layout.initiative_folder)
+
+
+def test_v6_key_claims_absent_tree_reads_empty(tmp_path: Path):
+    """No initiative, a missing initiative folder, or epics without ticket files
+    hold no claims — absence, not a fault."""
+    layout = _v6_layout(tmp_path)
+    assert read_v6_key_claims(None) == ()
+    assert read_v6_key_claims(tmp_path / "nowhere") == ()
+    for epic in V6_TREE:
+        (layout.initiative_folder / epic.slug / "tickets.toml").unlink()
+    assert read_v6_key_claims(layout.initiative_folder) == ()
+
+
+def test_v6_key_claims_skip_a_byte_order_mark(tmp_path: Path):
+    """A BOM ahead of the first table is skipped, as `tickets.py` reads with
+    `utf-8-sig`."""
+    layout = _v6_layout(tmp_path)
+    toml = layout.initiative_folder / "epic-checkout" / "tickets.toml"
+    toml.write_bytes(b"\xef\xbb\xbf" + toml.read_bytes())
+    assert ("4-1-pay", "2.1") in read_v6_key_claims(layout.initiative_folder)
+
+
+@pytest.mark.parametrize(
+    ("epic_toml", "needle"),
+    [
+        ("[[entry]\nid = 1\n", "epic-checkout"),  # not TOML
+        ("[[entry]]\nid = 1\nv6_key = 32\n", "`v6_key` is not a string"),
+        ('[[entry]]\nid = true\nv6_key = "3-2"\n', "is not an id"),
+        ('[[entry]]\nid = "a.b"\n', "is not an id"),
+        (
+            '[[entry]]\nid = 1\n\n[[entry]]\nid = "01"\nv6_key = "4-1-pay"\n',
+            "two entries with id 1",
+        ),
+        ("entry = [1, 2]\n", "write `[[entry]]` tables"),
+        ("entry = 3\n", "write `[[entry]]` tables"),
+    ],
+)
+def test_v6_key_claims_fail_loud_on_a_mistyped_ticket_file(tmp_path: Path, epic_toml, needle):
+    """A ticket file that is not TOML, that mistypes an entry, or that gives two
+    entries one id (which `tickets.py` refuses) raises
+    `TicketsV6KeyUnreadable` (kind `probe-failed`) rather than reading as "no
+    claims", which would leave a v6 token legacy under the wrong remedy."""
+    layout = _v6_layout(tmp_path)
+    (layout.initiative_folder / "epic-checkout" / "tickets.toml").write_text(
+        epic_toml, encoding="utf-8"
+    )
+    with pytest.raises(TicketsV6KeyUnreadable, match=re.escape(needle)) as raised:
+        read_v6_key_claims(layout.initiative_folder)
+    assert raised.value.kind == "probe-failed"
+    assert isinstance(raised.value, TicketsError)
+
+
+@pytest.mark.parametrize(
+    ("initiative_toml", "needle"),
+    [
+        ("[[epic]]\nid = 1\n", "epic 1 needs a `slug`"),
+        ('[[epic]]\nid = false\nslug = "epic-cart"\n', "epic id False is not an id"),
+        ("epic = 1\n", "write `[[epic]]` tables"),
+        (
+            '[[epic]]\nid = 1\nslug = "epic-cart"\n\n[[epic]]\nid = 2\nslug = "epic-cart"\n',
+            "two epics with slug epic-cart",
+        ),
+        (
+            '[[epic]]\nid = 1\nslug = "epic-cart"\n\n[[epic]]\nid = "01"\nslug = "epic-checkout"\n',
+            "two epics with id 1",
+        ),
+    ],
+)
+def test_v6_key_claims_fail_loud_on_a_mistyped_epic_table(tmp_path: Path, initiative_toml, needle):
+    """The initiative table that maps a folder to its epic id is read as strictly:
+    an epic row without a slug, with a refused id, not a table, or an id or slug
+    two rows share raises, as `tickets.py` refuses that tree."""
+    layout = _v6_layout(tmp_path)
+    (layout.initiative_folder / "tickets.toml").write_text(initiative_toml, encoding="utf-8")
+    with pytest.raises(TicketsV6KeyUnreadable, match=re.escape(needle)) as raised:
+        read_v6_key_claims(layout.initiative_folder)
+    assert raised.value.kind == "probe-failed"
+
+
+def test_v6_key_claims_fail_loud_on_an_unreadable_ticket_file(tmp_path: Path, monkeypatch):
+    """A read fault other than absence raises; it is never read as no entries."""
+    layout = _v6_layout(tmp_path)
+    target = layout.initiative_folder / "epic-cart" / "tickets.toml"
+    real = Path.read_text
+
+    def refuse(self: Path, *args, **kwargs) -> str:
+        if self == target:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    with pytest.raises(TicketsV6KeyUnreadable, match="Permission denied") as raised:
+        read_v6_key_claims(layout.initiative_folder)
+    assert raised.value.path == target and raised.value.kind == "probe-failed"
+
+
+def test_v6_key_claims_fail_loud_on_a_refused_stat(tmp_path: Path, monkeypatch):
+    """A refused existence probe of one ticket file raises; only absence reads as
+    no entries."""
+    layout = _v6_layout(tmp_path)
+    target = layout.initiative_folder / "epic-checkout" / "tickets.toml"
+    real = Path.stat
+
+    def refuse(self: Path, *args, **kwargs):
+        if self == target:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", refuse)
+    with pytest.raises(TicketsV6KeyUnreadable, match="Permission denied") as raised:
+        read_v6_key_claims(layout.initiative_folder)
+    assert raised.value.path == target and raised.value.kind == "probe-failed"
+
+
+def test_v6_key_claims_fail_loud_on_a_refused_listing(tmp_path: Path, monkeypatch):
+    """A refused listing of the initiative folder raises rather than reading as
+    "no epics" (which `Path.glob` would answer)."""
+    layout = _v6_layout(tmp_path)
+    real = os.scandir
+
+    def refuse(path=".", *args, **kwargs):
+        if Path(path) == layout.initiative_folder:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", refuse)
+    with pytest.raises(TicketsV6KeyUnreadable, match="Permission denied") as raised:
+        read_v6_key_claims(layout.initiative_folder)
+    assert raised.value.path == layout.initiative_folder
+    assert raised.value.kind == "probe-failed"
+
+
+def test_v6_key_claims_read_zero_padded_ids_as_numbers(tmp_path: Path):
+    """Ids compare as the script compares them, digits alone being the number, so
+    an epic `"06"` and an entry `"06"` make the ref `6.6`."""
+    layout = v7_layout(tmp_path / "sandbox")
+    folder = layout.initiative_folder / "epic-pad"
+    folder.mkdir(parents=True)
+    (layout.initiative_folder / "tickets.toml").write_text(
+        '[[epic]]\nid = "06"\nslug = "epic-pad"\n', encoding="utf-8"
+    )
+    (folder / "tickets.toml").write_text(
+        '[[entry]]\nid = "06"\ntype = "story"\nv6_key = "6-6-pad"\n', encoding="utf-8"
+    )
+    assert read_v6_key_claims(layout.initiative_folder) == (("6-6-pad", "6.6"),)
+
+
+def test_v6_key_claims_read_bare_cr_line_endings(tmp_path: Path):
+    """A ticket file with bare-CR line endings reads as the script's universal
+    newlines read it, not as a TOML fault."""
+    layout = _v6_layout(tmp_path)
+    toml = layout.initiative_folder / "epic-checkout" / "tickets.toml"
+    toml.write_bytes(toml.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r"))
+    assert ("4-1-pay", "2.1") in read_v6_key_claims(layout.initiative_folder)

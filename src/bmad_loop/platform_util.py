@@ -1155,6 +1155,22 @@ class UnconfinedWriteError(OSError):
     what a bare ``Path.write_text`` raised before these writes went atomic."""
 
 
+class UnconfinedReadError(OSError):
+    """A pinned run-dir read refused: the run dir (or an ancestor such as
+    ``runs/``) no longer reaches the directory its ``RunState.run_dir_identity``
+    records, the run dir is a link, or the file under it is one. Raised by
+    ``journal.load_state(pin=...)`` and by ``Journal.entries`` on a journal built
+    with ``pin=``, never by an unpinned read.
+
+    An ``OSError`` subclass DIRECTLY, not an :class:`UnconfinedWriteError`: a
+    read wrote nothing, so a handler that tells write refusals apart must not
+    file this one with them. ``OSError`` because the sites that re-read a run's
+    state already handle ``OSError`` from that read — the TUI watcher keeps the
+    last good parse and names the fault, the resolve and re-arm gestures report
+    a failed re-read — so a refusal lands in handling those callers already
+    have instead of escaping as a type nobody catches."""
+
+
 def path_is_confined(root: Path, target: Path) -> bool:
     """Whether ``target`` is reached from ``root`` without traversing a redirect
     at any component below it.
@@ -1275,10 +1291,10 @@ def root_identity_record(root: Path) -> RootIdentityRecord | None:
     is taken is what every later write is held to.
 
     A zero-inode root (some win32 filesystems) records None, so every write
-    pinned to it refuses. For the mount writers and the dir-fd verify-stream arm
-    that is unchanged — a zero inode never matched — but the win32 verify-stream
-    arm, which used to write through such a run dir, now refuses it: a refusal,
-    not a degrade, journaled per stream as ``capture_error`` (DW-446, accepted
+    pinned to it refuses. For the mount writers that is unchanged — a zero inode
+    never matched — and the verify-stream write, which on win32 used to write
+    through such a run dir, now refuses it on every arm: a refusal, not a
+    degrade, journaled per stream as ``capture_error`` (DW-446, accepted
     2026-09-27). The run journal and ``state.json`` are the exception: with no
     record they write through the unpinned confined open and journal one
     ``journal-unpinned`` row. ``st_dev`` is not stable across a reboot or remount, so
@@ -1529,7 +1545,11 @@ def open_dir_confined(
     (:func:`stale_device_record`) does not refuse there: the write degrades to an
     unpinned open whose run dir is still the ``O_NOFOLLOW`` last component of the
     walk, and the journal records one ``journal-unpinned`` row per writer object.
-    Any other pinned miss raises :class:`UnconfinedWriteError`. A pinned
+    Any other pinned miss raises :class:`UnconfinedWriteError`. The pinned
+    run-dir READS (``journal.load_state(pin=...)`` and ``Journal.entries`` on a
+    journal built with ``pin=``) share those arms and refuse with
+    :class:`UnconfinedReadError`; the first ``load_state`` (no record to pin to
+    yet) and the TUI's ``JournalTail`` stay path-based. A pinned
     spec writer's EXTERNAL arm (a target outside ``confine_root``) pre-checks the
     pin with :func:`require_root_pinned` before writing, so a path resolved
     through a swapped mount refuses there too while the swap still stands
@@ -1997,8 +2017,9 @@ def create_exclusive_confined(
 
 def _open_subdir_at(dir_fd: int, name: str, *, create: bool) -> int:
     """One directory component below ``dir_fd``, opened without following a
-    link — created first when ``create`` — for :func:`make_dirs_confined` and
-    :func:`unlink_confined`. The caller owns the returned descriptor.
+    link — created first when ``create`` — for :func:`make_dirs_confined`,
+    :func:`unlink_confined` and ``journal.Journal.write_verify_stream`` (which
+    relies on the refusal shape below). The caller owns the returned descriptor.
 
     The arms of ``verify._make_candidate_parents``: POSIX ``mkdir``-s at the
     descriptor (which never dereferences the final component) and then opens

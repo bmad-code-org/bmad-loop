@@ -2862,6 +2862,56 @@ def test_legacy_story_tokens_are_story_keys_the_ticket_grammar_cannot_read():
 
 
 @pytest.mark.parametrize(
+    ("token", "claims", "resolved"),
+    [
+        # exact: the token is one entry's v6_key
+        ("3-2-invite-link", [("3-2-invite-link", "1.1"), ("3-3-x", "1.2")], "1.1"),
+        # a stories-mode v6_key: the exact id
+        ("CC-2", [("CC-2", "1.3"), ("CC-3", "1.4")], "1.3"),
+        # prefix: the bare N-M of one entry's key
+        ("3-2", [("3-2-invite-link", "1.1"), ("3-3-x", "1.2")], "1.1"),
+        # split: one entry's split key is claimed through the split arm
+        ("3-2", [("3-2a-x", "2.4")], "2.4"),
+        # split, ambiguous: both halves of a split claim the bare N-M
+        ("3-2", [("3-2a-x", "1.1"), ("3-2b-y", "1.2")], None),
+        # ambiguous: the exact key on two entries
+        ("3-2-x", [("3-2-x", "1.1"), ("3-2-x", "2.1")], None),
+        # unclaimed: no entry carries a matching key
+        ("3-2", [("4-1-x", "1.1")], None),
+        # numeric neighbour: `3-20-x` is a different story
+        ("3-2", [("3-20-x", "1.1")], None),
+        # the sole claimant has no `E.M` ref (its epic is unlisted)
+        ("3-2", [("3-2-x", None)], None),
+        # a ref-less claimant still makes a ref'd one ambiguous
+        ("3-2", [("3-2-x", "1.1"), ("3-2-y", None)], None),
+        # no claims at all
+        ("3-2", [], None),
+    ],
+)
+def test_partition_legacy_tokens(token, claims, resolved):
+    """A v6 token resolves to a ticket only when exactly one `(v6_key, ref)` claim
+    satisfies `gates_story(token, v6_key)` and that claim has a ref; every other
+    token stays unresolved. Ablation (performed): return every token as
+    unresolved and the four resolving rows FAIL; resolve to the first claimant
+    regardless of count and the ambiguous rows FAIL."""
+    got = deferredwork.partition_legacy_tokens((token,), claims)
+    if resolved is None:
+        assert got == ((), (token,))
+    else:
+        assert got == (((token, resolved),), ())
+
+
+def test_partition_legacy_tokens_keeps_order_and_the_written_token():
+    """Each side keeps the tokens' order, and a resolved token is reported as
+    written, beside its ref."""
+    claims = [("3-2-invite-link", "1.1"), ("4-1-y", "2.1")]
+    assert deferredwork.partition_legacy_tokens(("4-1", "9-9", "3-2"), claims) == (
+        (("4-1", "2.1"), ("3-2", "1.1")),
+        ("9-9",),
+    )
+
+
+@pytest.mark.parametrize(
     ("token", "ref", "gated"),
     [
         ("1.2", "1.2", True),  # the ticket itself
@@ -4540,6 +4590,40 @@ def test_mark_open_many_writes_nothing_when_no_id_is_eligible(tmp_path, monkeypa
 
     assert writes == []
     assert acquisitions == []
+
+
+def test_held_reopenable_closes_names_exactly_what_mark_open_many_would_reopen(tmp_path):
+    """`held_reopenable_closes` is the read-only twin of `mark_open_many`'s decision:
+    a close this operation wrote is held, while an entry that is still open, was
+    closed by another operation or by a human, or is missing is not. It writes
+    nothing, and `mark_open_many` then reopens exactly the ids it named.
+
+    Ablation: return `dw_ids` unfiltered (skip the `_apply_open_many` fold) and
+    the DW-2 / DW-3 / DW-99 rows fail."""
+    path = write_ledger(tmp_path)
+    close_reopenable(path, "DW-1", "by dw-a")
+    close_reopenable(path, "DW-3", "by dw-b", operation_id="other-run/dw-b")
+    text = path.read_text(encoding="utf-8")
+    ids = ["DW-1", "DW-2", "DW-3", "DW-99"]
+
+    held = deferredwork.held_reopenable_closes(text, ids, "by dw-a", OPERATION_ID)
+
+    assert held == ["DW-1"]
+    assert path.read_text(encoding="utf-8") == text  # read-only
+    assert mark_open_many(path, ids, "by dw-a", OPERATION_ID) == held
+    reopened = path.read_text(encoding="utf-8")
+    assert deferredwork.held_reopenable_closes(reopened, ids, "by dw-a", OPERATION_ID) == []
+
+
+def test_held_reopenable_closes_requires_the_matching_note(tmp_path):
+    """The note is part of the decision, as it is for `mark_open_many`: the same
+    operation id under a different note holds nothing."""
+    path = write_ledger(tmp_path)
+    close_reopenable(path, "DW-1", "by dw-a")
+    text = path.read_text(encoding="utf-8")
+
+    assert deferredwork.held_reopenable_closes(text, ["DW-1"], "by dw-z", OPERATION_ID) == []
+    assert deferredwork.held_reopenable_closes(text, ["DW-1"], "by dw-a", OPERATION_ID) == ["DW-1"]
 
 
 def test_record_decision_close_matches_the_serial_pair_bytes(tmp_path, monkeypatch):

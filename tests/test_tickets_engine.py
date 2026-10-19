@@ -10,10 +10,11 @@ budget: none.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 from pathlib import Path
 
 import pytest
-from conftest import FakeTicketTree, V7Layout, git, ticket_row
+from conftest import DEFAULT_TREE, FakeTicketTree, V7Layout, git, ticket_row, write_ticket_tree
 
 from bmad_loop import runs, tickets_engine, tickets_source, verify
 from bmad_loop.adapters.base import SessionResult, SessionSpec
@@ -47,7 +48,12 @@ from bmad_loop.policy import (
 from bmad_loop.ticketmodel import EpicRow
 from bmad_loop.tickets_engine import TicketsEngine
 from bmad_loop.tickets_source import TicketRef, ticket_binding
-from bmad_loop.tickettree import TicketsCrashed, TicketsLockBusy, TicketsPlanIOError
+from bmad_loop.tickettree import (
+    TicketsCrashed,
+    TicketsLockBusy,
+    TicketsPlanIOError,
+    V6KeyClaim,
+)
 from bmad_loop.workspace import Workspace
 
 QUIET = NotifyPolicy(desktop=False, file=True)
@@ -493,6 +499,208 @@ def test_tickets_gate_pauses_on_v6_token(project_v7):
     assert "`v6_key`" in saved.paused_reason
     assert saved.paused_reason.endswith(f"`bmad-loop resume {engine.state.run_id}`")
     assert [e["dw_ids"] for e in _kinds(engine, "story-gated")] == [["DW-1"]]
+
+
+def _v6_keys(layout: V7Layout, **keys: str) -> None:
+    """Rewrite the on-disk `DEFAULT_TREE` with ``keys`` (``e1_1="3-2-x"`` sets
+    entry 1.1's `v6_key`) as the v6→v7 migration leaves them; committed so the
+    checkout stays clean."""
+    epics = tuple(
+        dataclasses.replace(
+            epic,
+            entries=tuple(
+                dataclasses.replace(entry, v6_key=keys.get(f"e{epic.id}_{entry.id}"))
+                for entry in epic.entries
+            ),
+        )
+        for epic in DEFAULT_TREE
+    )
+    write_ticket_tree(layout, epics)
+    git(layout.project, "add", "-A")
+    git(layout.project, "commit", "-q", "-m", "v6 keys")
+
+
+@pytest.mark.parametrize("token", ["3-2-invite-link", "3-2"])
+def test_tickets_gate_resolves_a_v6_token_to_its_ticket(project_v7, token):
+    """A v6 token that exactly one ticket's `v6_key` claims (the key itself, or
+    its `N-M` prefix) gates that ticket as its ref would: the run pauses on 1.1
+    with the ordinary gated clause, naming the token as written, and not the
+    legacy clause. Ablation (performed): return every token unresolved from
+    `deferredwork.partition_legacy_tokens` and the legacy clause comes back —
+    this FAILS."""
+    _v6_keys(project_v7, e1_1="3-2-invite-link")
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, adapter = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, f"gate: {token}")
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert (saved.paused_stage, saved.paused_story_key) == (PAUSE_STORY_GATE, "1.1")
+    assert saved.tasks == {} and adapter.sessions == []
+    assert (
+        f"1.1 is gated by unlanded deferred work: DW-1 (gate: {token} (`v6_key` of 1.1))"
+        in saved.paused_reason
+    )
+    assert "no single ticket" not in saved.paused_reason
+    assert [e["dw_ids"] for e in _kinds(engine, "story-gated")] == [["DW-1"]]
+
+
+def test_tickets_gate_v6_token_resolved_elsewhere_passes(project_v7):
+    """A v6 token resolved to 1.2 gates 1.2 only: a pick of 1.1 dispatches with no
+    `story-gate` pause, while 1.2 itself is refused. Ablation (performed): return
+    every token unresolved from `partition_legacy_tokens` and 1.1 pauses on the
+    legacy clause — this FAILS."""
+    _v6_keys(project_v7, e1_2="3-2-invite-link")
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+
+    picked = engine._pick_next()
+    assert picked is not None and picked.key == "1.1"
+    engine._refuse_gated_story(picked.key)  # must not raise
+    assert _kinds(engine, "story-gated") == []
+    with pytest.raises(RunPaused) as paused:
+        engine._refuse_gated_story("1.2")
+    assert "DW-1 (gate: 3-2 (`v6_key` of 1.2))" in paused.value.reason
+
+
+def test_tickets_gate_v6_token_follows_the_picked_ticket_across_a_renumber(project_v7):
+    """The binding is the picked ticket's identity (epic folder + entry id), and a
+    resume keeps it; an epic renumbered since (`epic-cart` 1 → 3) gives the same
+    ticket the ref 3.1 in the claims snapshot. The token still gates the picked
+    1.1, through the ticket it names rather than that ref, while the binding-free
+    ref compare cannot see it. Ablation (performed): compare the resolved ref with
+    `story_key` instead of the claim's identity and 1.1 passes — this FAILS."""
+    _v6_keys(project_v7, e1_1="3-2-invite-link")
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+    picked = engine._pick_next()
+    assert picked is not None and picked.key == "1.1"
+    epics = tuple(
+        dataclasses.replace(
+            epic,
+            id=3 if epic.slug == "epic-cart" else epic.id,
+            entries=tuple(
+                dataclasses.replace(
+                    entry,
+                    v6_key="3-2-invite-link" if (epic.id, entry.id) == (1, 1) else None,
+                )
+                for entry in epic.entries
+            ),
+        )
+        for epic in DEFAULT_TREE
+    )
+    write_ticket_tree(project_v7, epics)
+
+    with pytest.raises(RunPaused) as paused:
+        engine._refuse_gated_story("1.1")
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_STORY_GATE, "1.1")
+    assert "DW-1 (gate: 3-2 (`v6_key` of 3.1))" in paused.value.reason
+    # With no binding only the ref can be compared, and 3.1 is not 1.1.
+    engine._picked.clear()
+    engine._refuse_gated_story("1.1")  # must not raise
+
+
+@pytest.mark.parametrize(
+    "keys",
+    [
+        # ambiguous: two tickets claim it (both halves of a split)
+        {"e1_1": "3-2a-x", "e1_2": "3-2b-y"},
+        # unclaimed: `3-20-x` is a different story, so nothing claims `3-2`
+        {"e1_1": "3-20-x"},
+    ],
+)
+def test_tickets_gate_ambiguous_v6_token_pauses_as_legacy(project_v7, keys):
+    """A token no single ticket claims — two do, or none — stays a legacy token
+    and pauses every pick. Ablation (performed): resolve to the first claimant
+    regardless of count in `partition_legacy_tokens` and the ambiguous row
+    FAILS."""
+    _v6_keys(project_v7, **keys)
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+
+    with pytest.raises(RunPaused) as paused:
+        engine._refuse_gated_story("1.1")
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_STORY_GATE, "1.1")
+    assert "DW-1 (gate: 3-2)" in paused.value.reason
+    assert "no single ticket's `v6_key` claims" in paused.value.reason
+
+
+def test_tickets_gate_unreadable_ticket_file_pauses(project_v7):
+    """A ticket file that cannot be read for its `v6_key` claims pauses at
+    `story-gate` before anything is registered, naming the file, and journals
+    `story-gate-unreadable`; it never resolves or passes the token."""
+    toml = project_v7.initiative_folder / "epic-cart" / "tickets.toml"
+    toml.write_text("[[entry]\n", encoding="utf-8")
+    git(project_v7.project, "add", "-A")
+    git(project_v7.project, "commit", "-q", "-m", "broken")
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, adapter = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+
+    summary = engine.run()
+
+    assert summary.paused
+    saved = load_state(engine.run_dir)
+    assert (saved.paused_stage, saved.paused_story_key) == (PAUSE_STORY_GATE, "1.1")
+    assert saved.tasks == {} and adapter.sessions == []
+    assert str(toml) in saved.paused_reason
+    (record,) = _kinds(engine, "story-gate-unreadable")
+    assert record["story_key"] == "1.1" and str(toml) in record["error"]
+    assert _kinds(engine, "story-gated") == []
+
+
+def test_tickets_gate_claims_fault_pauses_before_the_rebind(project_v7):
+    """On the restart arm a crash-unbound task is rebound inside the gate check;
+    an entry whose claims cannot be read pauses before that entry's rebind, so
+    the task stays unbound and no `ticket-rebound` is journaled."""
+    toml = project_v7.initiative_folder / "epic-cart" / "tickets.toml"
+    toml.write_text("[[entry]\n", encoding="utf-8")
+    git(project_v7.project, "add", "-A")
+    git(project_v7.project, "commit", "-q", "-m", "broken")
+    row = ticket_row("2.1", epic="epic-checkout")
+    tree = _tree(project_v7, ready_to_start=(row,))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+    task = StoryTask("2.1", 0)
+    engine.state.tasks["2.1"] = task
+
+    with pytest.raises(RunPaused) as paused:
+        engine._refuse_gated_story("2.1")
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_STORY_GATE, "2.1")
+    assert task.ticket is None
+    assert _kinds(engine, "ticket-rebound") == []
+    assert [e["story_key"] for e in _kinds(engine, "story-gate-unreadable")] == ["2.1"]
+
+
+def test_tickets_gate_reads_claims_once_and_only_for_v6_tokens(project_v7, monkeypatch):
+    """A ledger with no v6 token does no tree I/O, and a check over several v6
+    tokens reads the claims once."""
+    calls: list[object] = []
+
+    def counting(folder):
+        calls.append(folder)
+        return (V6KeyClaim("3-2-invite-link", "1.2", "epic-cart", "2"),)
+
+    monkeypatch.setattr(tickets_engine, "read_v6_key_entries", counting)
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 1.9, epic-checkout")
+    engine._refuse_gated_story("1.1")
+    assert calls == []
+
+    _gate_ledger(engine, project_v7, "gate: 3-2, 3-2-invite-link")
+    engine._refuse_gated_story("1.1")
+    assert calls == [engine.paths.initiative_folder]
+    engine._refuse_gated_story("1.1")  # a fresh check reads the tree again
+    assert len(calls) == 2
 
 
 def test_tickets_gate_closed_v6_entry_gates_nothing(project_v7):
@@ -1241,6 +1449,392 @@ def test_failed_mark_done_undo_is_named_in_the_escalation(project_v7, monkeypatc
     assert escalated["reason"].startswith("commit failed: ")
     assert f"{plan} could not be put back" in escalated["reason"]
     assert "disk full" in escalated["reason"]
+
+
+def _host_dies_past_the_mark(engine: TicketsEngine, monkeypatch) -> list:
+    """Kill the host inside the commit window right after the in-window mark:
+    `finalize_commit` raises `_HostDied`, the window's `BaseException` arm cannot
+    put the plan back (the process is gone), and no save after the COMMITTING
+    one reaches the disk. Returns the `(status, digest)` latch each COMMITTING
+    save carried."""
+    latched: list[tuple[str, str]] = []
+    dead: list[bool] = []
+    real_save = engine._save
+
+    def save():
+        if dead:
+            return  # the host is gone: no later save reaches the disk
+        task = engine.state.tasks.get("1.1")
+        if task is not None and task.phase == Phase.COMMITTING:
+            latched.append((task.ticket_premark_status, task.ticket_premark_digest))
+        real_save()
+
+    def host_dies(*a, **kw):
+        dead.append(True)
+        raise _HostDied
+
+    monkeypatch.setattr(engine, "_save", save)
+    monkeypatch.setattr(verify, "finalize_commit", host_dies)
+    monkeypatch.setattr(engine, "_undo_terminal_plan_write", host_dies)
+    return latched
+
+
+@pytest.mark.parametrize("case", ["commit-fails", "commit-lands", "legacy-state"])
+def test_resumed_window_names_a_plan_an_interrupted_window_marked(project_v7, monkeypatch, case):
+    """A host lost after the in-window `done` mark and before the squash leaves
+    the plan `done` on disk and the unit COMMITTING, with its pre-window latch
+    (`built` + the digest of the built bytes) in the COMMITTING save. The
+    resumed window's mark is a no-op, so no pre-image is in memory; if its
+    commit then fails, the escalation names the plan left `done` for a commit
+    that does not exist — nothing is restored (no bytes were kept) and the plan
+    stays `done` for the operator. A resumed commit that succeeds lands the plan
+    at `done` as usual. A legacy state file (no latch) cannot tell, so its
+    failed commit stays the plain `commit failed:` escalation. Ablation
+    (performed): return None from `_terminal_plan_write`'s no-op arm and the
+    escalation reads as a plain commit failure — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    _disk_restores(tree, monkeypatch)
+    built: list[bytes] = []
+    marking = tree.mark
+
+    def mark(ref, target, **kw):
+        built.append(plan.read_bytes())
+        return marking(ref, target, **kw)
+
+    monkeypatch.setattr(tree, "mark", mark)
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    real_finalize = verify.finalize_commit
+    latched = _host_dies_past_the_mark(engine, monkeypatch)
+
+    with pytest.raises(_HostDied):
+        engine.run()
+
+    digest = hashlib.sha256(built[0]).hexdigest()
+    assert latched == [("built", digest)]
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.COMMITTING and not task.commit_sha
+    assert (task.ticket_premark_status, task.ticket_premark_digest) == ("built", digest)
+    assert _plan_status(plan) == "done"
+    assert tree.restores == []
+
+    monkeypatch.setattr(verify, "finalize_commit", real_finalize)
+    commit_fails = case != "commit-lands"
+    if commit_fails:
+        _reject_commits(project_v7)
+    if case == "legacy-state":
+        state = load_state(engine.run_dir)
+        state.tasks["1.1"].ticket_premark_status = ""
+        state.tasks["1.1"].ticket_premark_digest = ""
+        save_state(engine.run_dir, state)
+    resumed = _resume(engine, tree)
+    summary = resumed.run()
+
+    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written"), ("done", "noop")]
+    assert tree.restores == []
+    assert _plan_status(plan) == "done"
+    task = load_state(engine.run_dir).tasks["1.1"]
+    if commit_fails:
+        assert summary.paused and task.phase == Phase.ESCALATED and not task.commit_sha
+        [escalated] = _kinds(resumed, "story-escalated")
+        reason = escalated["reason"]
+        assert reason.startswith("commit failed: ")
+        if case == "legacy-state":
+            assert "interrupted commit window" not in reason
+        else:
+            assert f"{plan} reads done, not the 'built' the COMMITTING save latched" in reason
+            assert "interrupted commit window" in reason
+            assert "'built'" in reason and "does not exist" in reason and "by hand" in reason
+    else:
+        assert task.phase == Phase.DONE and task.commit_sha
+        assert _committed_status(project_v7, task.commit_sha, plan) == "done"
+        assert _kinds(resumed, "story-escalated") == []
+
+
+def test_resumed_window_after_the_squash_landed_keeps_a_plain_commit_failure(
+    project_v7, monkeypatch
+):
+    """A host lost after `finalize_commit` made the squash and before the DONE
+    save leaves the unit COMMITTING with its pre-window latch, and the `done`
+    plan both on disk and in HEAD. The resumed window's mark is a no-op on a plan
+    whose bytes no longer match the latch, but HEAD already carries them: a
+    replayed commit that fails keeps that HEAD, so the escalation is the plain
+    `commit failed:` one and never tells the operator to restore a plan the
+    landed commit holds. Ablation (performed): drop the `_head_carries` check
+    from `_terminal_plan_write`'s no-op arm and the reason says the commit does
+    not exist — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    _disk_restores(tree, monkeypatch)
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    real_finalize = verify.finalize_commit
+    dead: list[bool] = []
+    real_save = engine._save
+
+    def save():
+        if not dead:
+            real_save()
+
+    def lands_then_host_dies(*a, **kw):
+        landed.append(real_finalize(*a, **kw))
+        dead.append(True)
+        raise _HostDied
+
+    def host_is_gone(*a, **kw):
+        raise _HostDied
+
+    landed: list[str | None] = []
+    monkeypatch.setattr(engine, "_save", save)
+    monkeypatch.setattr(verify, "finalize_commit", lands_then_host_dies)
+    monkeypatch.setattr(engine, "_undo_terminal_plan_write", host_is_gone)
+
+    with pytest.raises(_HostDied):
+        engine.run()
+
+    [sha] = landed
+    assert sha and verify.rev_parse_head(project_v7.project) == sha
+    assert _committed_status(project_v7, sha, plan) == "done"
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.COMMITTING and task.ticket_premark_status == "built"
+
+    monkeypatch.setattr(verify, "finalize_commit", real_finalize)
+    _reject_commits(project_v7)
+    resumed = _resume(engine, tree)
+    summary = resumed.run()
+
+    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written"), ("done", "noop")]
+    assert tree.restores == []
+    assert verify.rev_parse_head(project_v7.project) == sha
+    assert summary.paused
+    [escalated] = _kinds(resumed, "story-escalated")
+    reason = escalated["reason"]
+    assert reason.startswith("commit failed: ")
+    assert "does not exist" not in reason and "by hand" not in reason
+
+
+def test_plan_at_target_before_the_window_keeps_a_plain_commit_failure(project_v7, monkeypatch):
+    """A plan already `done` before the window (a human accepted it once the
+    unit verified) latches `done` with a digest its bytes still match: the
+    window's no-op mark yields no token, so a failed commit is the plain `commit
+    failed:` escalation and nothing is restored. Ablation (performed): drop the
+    digest/status check in `_terminal_plan_write`'s no-op arm and the reason
+    names the plan as marked by an interrupted window — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    real_latch = engine._latch_post_landing_writes
+
+    def accepted_then_latch(task):
+        _write_plan(plan, "done", baseline=task.baseline_commit)
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="done")
+        )
+        real_latch(task)
+
+    monkeypatch.setattr(engine, "_latch_post_landing_writes", accepted_then_latch)
+    _reject_commits(project_v7)
+
+    summary = engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert summary.paused and task.phase == Phase.ESCALATED
+    assert task.ticket_premark_status == "done"
+    assert task.ticket_premark_digest == hashlib.sha256(plan.read_bytes()).hexdigest()
+    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "noop")]
+    assert tree.restores == []
+    [escalated] = _kinds(engine, "story-escalated")
+    assert escalated["reason"].startswith("commit failed: ")
+    assert "interrupted commit window" not in escalated["reason"]
+
+
+@pytest.mark.parametrize("mark_done", ["auto", "never"])
+def test_resumed_window_names_a_park_an_interrupted_window_marked(
+    project_v7, monkeypatch, mark_done
+):
+    """The park arm of the same crash: a parked unit's window marks its
+    `awaiting-operator` plan `blocked` whatever `mark_done` says, so the
+    COMMITTING save latches `awaiting-operator` under `"never"` too. A host lost
+    past that mark, then a resumed commit that fails, escalates naming the plan
+    as reading `blocked`, with nothing restored. Ablations (performed): hardcode
+    the no-op arm's target to `done` and the reason names `done` — this FAILS;
+    drop the `operator_actions` clause from `_latch_premark`'s guard and the
+    `"never"` row latches nothing — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _park_marking_tree(tree, plan, monkeypatch)
+    _disk_restores(tree, monkeypatch)
+    parked: list[bytes] = []
+    marking = tree.mark
+
+    def mark(ref, target, **kw):
+        parked.append(plan.read_bytes())
+        return marking(ref, target, **kw)
+
+    monkeypatch.setattr(tree, "mark", mark)
+    pol = dataclasses.replace(_policy(), tickets=TicketsPolicy(mark_done=mark_done))
+    engine, _ = make_engine(
+        project_v7, tree, policy=pol, script=[_parks(project_v7, tree, plan)], max_stories=1
+    )
+    real_finalize = verify.finalize_commit
+    latched = _host_dies_past_the_mark(engine, monkeypatch)
+
+    with pytest.raises(_HostDied):
+        engine.run()
+
+    assert latched == [("awaiting-operator", hashlib.sha256(parked[0]).hexdigest())]
+    assert _plan_status(plan) == "blocked"
+
+    monkeypatch.setattr(verify, "finalize_commit", real_finalize)
+    _reject_commits(project_v7)
+    resumed = _resume(engine, tree)
+    summary = resumed.run()
+
+    assert [(m.target, m.outcome) for m in tree.marks] == [
+        ("blocked", "written"),
+        ("blocked", "noop"),
+    ]
+    assert tree.restores == []
+    assert _plan_status(plan) == "blocked"
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert summary.paused and task.phase == Phase.ESCALATED and not task.commit_sha
+    [escalated] = _kinds(resumed, "story-escalated")
+    reason = escalated["reason"]
+    assert reason.startswith("commit failed: ")
+    assert (
+        f"{plan} reads blocked, not the 'awaiting-operator' the COMMITTING save latched" in reason
+    )
+    assert "is left blocked for a commit that does not exist" in reason
+
+
+def test_plan_rewritten_at_target_after_the_window_keeps_a_plain_commit_failure(
+    project_v7, monkeypatch
+):
+    """A plan already `done` before the window latches `done`; if its bytes are
+    then rewritten still at `done` (a body edit between a crash and the resume),
+    the digest no longer matches but nothing marked it since — the latched
+    status is already the target — so the resumed commit's failure stays the
+    plain `commit failed:` escalation. Ablation (performed): delete `and before
+    != target` from `_terminal_plan_write`'s no-op arm and the reason names the
+    plan as left marked — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    real_latch = engine._latch_post_landing_writes
+
+    def accepted_then_latch(task):
+        _write_plan(plan, "done", baseline=task.baseline_commit)
+        tree.finds["1.1"] = dataclasses.replace(
+            tree.finds["1.1"], row=ticket_row("1.1", status="done")
+        )
+        real_latch(task)
+
+    monkeypatch.setattr(engine, "_latch_post_landing_writes", accepted_then_latch)
+    real_finalize = verify.finalize_commit
+    latched = _host_dies_past_the_mark(engine, monkeypatch)
+
+    with pytest.raises(_HostDied):
+        engine.run()
+
+    assert [status for status, _ in latched] == ["done"]
+    task = load_state(engine.run_dir).tasks["1.1"]
+    _write_plan(plan, "done", baseline=task.baseline_commit, risk="low")
+    assert hashlib.sha256(plan.read_bytes()).hexdigest() != latched[0][1]
+
+    monkeypatch.setattr(verify, "finalize_commit", real_finalize)
+    _reject_commits(project_v7)
+    resumed = _resume(engine, tree)
+    summary = resumed.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert summary.paused and task.phase == Phase.ESCALATED
+    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "noop"), ("done", "noop")]
+    assert tree.restores == []
+    [escalated] = _kinds(resumed, "story-escalated")
+    assert escalated["reason"].startswith("commit failed: ")
+    assert "COMMITTING save latched" not in escalated["reason"]
+    assert "interrupted commit window" not in escalated["reason"]
+
+
+def test_t1_premark_latch_cleared_when_no_mark_is_owed(project_v7, monkeypatch):
+    """Under `mark_done = "never"` (not parked) the window marks nothing, so the
+    COMMITTING save carries no T1 latch — and a stale one is cleared, since the
+    fields are assigned on every latch. Ablation (performed): return before
+    clearing the T1 fields in `_latch_post_landing_writes` and the stale latch
+    rides the save — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    pol = dataclasses.replace(_policy(), tickets=TicketsPolicy(mark_done="never"))
+    engine, _ = make_engine(
+        project_v7, tree, policy=pol, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    real_latch = engine._latch_post_landing_writes
+
+    def stale_latch(task):
+        task.ticket_premark_status = "in-progress"
+        task.ticket_premark_digest = "0" * 64
+        real_latch(task)
+
+    monkeypatch.setattr(engine, "_latch_post_landing_writes", stale_latch)
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert (task.ticket_premark_status, task.ticket_premark_digest) == ("", "")
+    assert tree.marks == []
+
+
+def test_t1_premark_latch_cleared_when_the_plan_cannot_be_read(project_v7, monkeypatch):
+    """A plan the latch cannot read leaves the T1 latch cleared — never a stale
+    one, and never a digest of nothing — so a later no-op window reads as a
+    legacy state rather than as one an interrupted window marked. Ablation
+    (performed): latch the stale fields through the read fault (skip the
+    clearing) and the COMMITTING save carries them — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    real_latch = engine._latch_post_landing_writes
+    real_read = Path.read_bytes
+    latching: list[bool] = []
+    latched: list[tuple[str, str]] = []
+
+    def read_bytes(self):
+        if latching and self == plan:
+            raise OSError("plan read fault")
+        return real_read(self)
+
+    def faulted_latch(task):
+        task.ticket_premark_status = "in-progress"
+        task.ticket_premark_digest = "0" * 64
+        latching.append(True)
+        try:
+            real_latch(task)
+        finally:
+            latching.clear()
+        latched.append((task.ticket_premark_status, task.ticket_premark_digest))
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(engine, "_latch_post_landing_writes", faulted_latch)
+
+    engine.run()
+
+    assert latched == [("", "")]
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert [m.target for m in tree.marks] == ["done"]
 
 
 def test_mark_done_undone_when_the_window_is_interrupted(project_v7, monkeypatch):
@@ -2876,6 +3470,7 @@ def test_shared_store_marks_done_only_after_merge(project_v7_store_repo, monkeyp
     ]
     assert at_mark == [(verify.rev_parse_head(main), True)]
     assert (task.ticket_done_pending, task.ticket_park_pending) == (False, "")
+    assert (task.ticket_premark_status, task.ticket_premark_digest) == ("", "")  # T1 only
     assert [e["target"] for e in _kinds(engine, "ticket-mark-latched")] == ["done"]
     assert _plan_status(plan) == "done"
     assert git(main, "status", "--porcelain") == ""

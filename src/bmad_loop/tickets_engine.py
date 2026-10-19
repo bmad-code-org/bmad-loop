@@ -85,6 +85,7 @@ finishes past the epic its ticket finished.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import stat
 import time
@@ -111,6 +112,7 @@ from .frontmatter import frontmatter_fault, is_frontmatter_only, parse_frontmatt
 from .model import (
     PAUSE_EPIC_BOUNDARY,
     PAUSE_SPEC_APPROVAL,
+    PAUSE_STORY_GATE,
     PAUSE_TICKET_TREE,
     Phase,
     RunState,
@@ -154,7 +156,14 @@ from .tickets_source import (
     ticket_binding,
     wants_thorough,
 )
-from .tickettree import TicketsError, TicketTree, TicketTreeLike
+from .tickettree import (
+    TicketsError,
+    TicketsV6KeyUnreadable,
+    TicketTree,
+    TicketTreeLike,
+    V6KeyClaim,
+    read_v6_key_entries,
+)
 from .worksource import SOURCE_TICKETS
 from .worksource import Halt as WorkHalt
 from .worksource import WorkRef, WorkSource
@@ -188,6 +197,19 @@ class _PlanUndo:
 
     plan: Path
     data: bytes | None
+
+
+@dataclass(frozen=True)
+class _PlanLeftMarked:
+    """A plan that reads ``target``, not the ``before`` the COMMITTING save
+    latched: marked since (e.g. by an interrupted commit window, an adoption, or a
+    hand edit). No pre-image bytes survive to restore it."""
+
+    plan: Path
+    target: str
+    before: str
+    # Why HEAD could not be compared with the plan (:meth:`_head_carries`), else "".
+    head_fault: str = ""
 
 
 def _bytes_or_none(path: Path) -> bytes | None:
@@ -310,6 +332,11 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self._picked: dict[str, TicketBinding] = {}
         # story key -> plan status its last review launched on (`_verify_review`).
         self._review_entered: dict[str, str] = {}
+        # One gate check's `v6_key` claims snapshot, read on the first v6
+        # story-key token the check meets and cleared around every check
+        # (`_refuse_gated_story`), so `_gate_hits` and `_legacy_gate_tokens` read
+        # one tree and a token cannot fall between them.
+        self._gate_claims: tuple[V6KeyClaim, ...] | None = None
         # Whether this run has journaled `store-unversioned`; None until the
         # journal is first read for it (`_note_store_unversioned`).
         self._unversioned_noted: bool | None = None
@@ -1337,32 +1364,101 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             self._save()
         return self._picked.get(story_key) or (task.ticket if task is not None else None)
 
+    def _refuse_gated_story(self, story_key: str) -> None:
+        """The base gate check, with v6 story-key tokens resolved through the
+        tickets' ``v6_key`` claims (:meth:`_partition_legacy`).
+
+        The claims snapshot is cleared before and after every check, so each
+        check reads the tree at most once and never answers from a previous
+        check's tree. A tree that cannot be read for its claims pauses at
+        :data:`PAUSE_STORY_GATE` exactly as an unreadable ledger does: it is the
+        only evidence of which ticket a v6 token names, and degrading to "no
+        ticket claims it" would still pause (as legacy), but under the wrong
+        remedy. Raised from inside the base loop, before anything the caller
+        does mutates the run."""
+        self._gate_claims = None
+        try:
+            super()._refuse_gated_story(story_key)
+        except TicketsV6KeyUnreadable as e:
+            self.journal.append("story-gate-unreadable", story_key=story_key, error=str(e))
+            reason = (
+                f"{e.path} cannot be read ({e.detail}), so the v6 story-key `gate:` "
+                f"tokens in {self.paths.deferred_work.name} could not be resolved to "
+                f"tickets and the gates protecting {story_key} could not be evaluated — "
+                f"fix the file, then `bmad-loop resume {self.state.run_id}`"
+            )
+            gates.notify(self.policy, self.run_dir, f"story gated: {story_key}", reason)
+            raise RunPaused(reason, PAUSE_STORY_GATE, story_key) from e
+        finally:
+            self._gate_claims = None
+
+    def _partition_legacy(
+        self, entry: deferredwork.DWEntry
+    ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
+        """``entry``'s v6 story-key tokens split into ``(resolved, unresolved)`` by
+        :func:`deferredwork.partition_legacy_tokens` against this check's claims
+        snapshot. The tree is read only when the entry carries such a token, so a
+        ledger with none does no tree I/O."""
+        tokens = deferredwork.legacy_story_tokens(entry)
+        if not tokens:
+            return (), ()
+        if self._gate_claims is None:
+            self._gate_claims = read_v6_key_entries(self.paths.initiative_folder)
+        pairs = ((claim.key, claim.ref) for claim in self._gate_claims)
+        return deferredwork.partition_legacy_tokens(tokens, pairs)
+
+    def _resolved_gates(self, ref: str, story_key: str, binding: TicketBinding | None) -> bool:
+        """Whether the ticket a v6 token resolved to (``ref``, in this check's
+        claims snapshot) is ``story_key``'s. With a binding the claim's identity
+        is compared — its epic folder and entry id — not its ref: the binding
+        was resolved at pick time (and persisted for a resume), so an epic
+        renumbered since gives the same ticket a new ``E.M`` in the snapshot,
+        which would no longer match the picked ref and wave it through. With no
+        binding only the ref can be compared."""
+        if binding is None:
+            return deferredwork.gates_ticket(ref, story_key, epic_id="", epic_slug="")
+        claims = self._gate_claims or ()
+        return any(c.ref == ref and c.names(binding.epic_slug, binding.id) for c in claims)
+
     def _gate_hits(self, entry: deferredwork.DWEntry, story_key: str) -> list[str]:
         """Ticket-grammar tokens that gate ``story_key``: its ref, its epic's id or
         its epic's folder (:func:`deferredwork.gates_ticket`). With no binding only
-        the ref arm can match."""
+        the ref arm can match. Then the v6 story-key tokens one ticket's ``v6_key``
+        claims, when that ticket is ``story_key``'s (:meth:`_resolved_gates`) —
+        each the token as the author wrote it, annotated with the ticket it
+        resolved to (``3-2 (`v6_key` of 1.1)``)."""
+        # Claims first: a fault reading them for THIS entry pauses before this
+        # entry's rebind below. An earlier entry's check may already have rebound.
+        resolved, _ = self._partition_legacy(entry)
         binding = self._gate_binding(story_key)
         epic_id = binding.epic_id if binding is not None else ""
         epic_slug = binding.epic_slug if binding is not None else ""
-        return [
+        hits = [
             token
             for token in deferredwork.gates(entry, grammar="ticket").tokens
             if deferredwork.gates_ticket(token, story_key, epic_id=epic_id, epic_slug=epic_slug)
         ]
+        hits += [
+            f"{token} (`v6_key` of {ref})"
+            for token, ref in resolved
+            if self._resolved_gates(ref, story_key, binding)
+        ]
+        return hits
 
     def _legacy_gate_tokens(self, entry: deferredwork.DWEntry) -> tuple[str, ...]:
-        return deferredwork.legacy_story_tokens(entry)
+        """The v6 story-key tokens no single ticket's ``v6_key`` claims."""
+        return self._partition_legacy(entry)[1]
 
     def _legacy_gate_clause(
         self, story_key: str, legacy: list[tuple[str, tuple[str, ...]]], ledger_name: str
     ) -> str:
         named = ", ".join(f"{dw_id} (gate: {', '.join(tokens)})" for dw_id, tokens in legacy)
         return (
-            f"{named} in {ledger_name} declare v6 story-key gate tokens, which no ticket "
-            f"ref can match, so {story_key} cannot be shown free of them — the v7 "
-            f"migration keeps each story's old key as `v6_key` in its ticket file; "
-            f"rewrite the tokens as ticket refs (`E.M`, an epic id or `epic-<slug>`) or "
-            f"close the entry"
+            f"{named} in {ledger_name} declare v6 story-key gate tokens that no single "
+            f"ticket's `v6_key` claims (none does, or more than one), so no ticket ref "
+            f"matches them and {story_key} cannot be shown free of them — rewrite the "
+            f"tokens as ticket refs (`E.M`, an epic id or `epic-<slug>`), or as the "
+            f"full v6 key of one ticket, or close the entry"
         )
 
     def _dispatched_spec_for_attempt(self, task: StoryTask) -> str | None:
@@ -1583,7 +1679,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             return None
         return ticket.epic_slug
 
-    def _terminal_plan_write(self, task: StoryTask) -> _PlanUndo | None:
+    def _terminal_plan_write(self, task: StoryTask) -> _PlanUndo | _PlanLeftMarked | None:
         """The ticket's terminal write on the bound plan, inside the commit
         window, for a store tracked inside the code checkout (T1): the marked plan
         rides the unit's own squash and reaches the target branch only with the
@@ -1600,10 +1696,20 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
           under ``"never"`` (the plan stays ``built`` for a person to accept).
 
         Nothing is written for an unbound task, or for a plan already at the
-        target (a no-op mark, e.g. a re-driven window). A failed mark puts back
-        whatever it may have written, then pauses at ``ticket-tree`` with the
-        task still COMMITTING, so a resume re-drives the window and marks again.
-        Returns the pre-image for :meth:`_undo_terminal_plan_write`."""
+        target (a no-op mark). A failed mark puts back whatever it may have
+        written, then pauses at ``ticket-tree`` with the task still COMMITTING, so
+        a resume re-drives the window and marks again.
+
+        Returns the token :meth:`_undo_terminal_plan_write` takes: the in-memory
+        pre-image (:class:`_PlanUndo`) when this window wrote the mark; a
+        :class:`_PlanLeftMarked` when the mark is a no-op on a plan marked since
+        the COMMITTING save (e.g. by an interrupted earlier window) — that save's
+        latch (``ticket_premark_status`` / ``ticket_premark_digest``, from
+        :meth:`_latch_post_landing_writes`) read another status, and the plan's
+        bytes no longer match its digest — so a commit failure names the plan
+        left marked instead of reading as a plain commit failure; else None (a
+        plan at the target before the window, a legacy state with no latch, or
+        a mark HEAD already carries — :meth:`_head_carries`)."""
         plan = self._bound_plan(task)
         ticket = task.ticket
         if plan is None or ticket is None or self.paths.shared_store is not None:
@@ -1637,7 +1743,37 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 if unrestored := self._undo_terminal_plan_write(task, undo):
                     detail = f"{detail}; {unrestored}"
             self._pause_mark_done(task, detail, parked=parked)
-        return undo if mark.outcome == "written" else None
+        if mark.outcome == "written":
+            return undo
+        target = "blocked" if parked else verify.PLAN_DONE
+        before = task.ticket_premark_status
+        digest = task.ticket_premark_digest
+        if (
+            digest
+            and before != target
+            and preimage is not None
+            and hashlib.sha256(preimage).hexdigest() != digest
+        ):
+            try:
+                if self._head_carries(plan):
+                    return None
+            except (verify.GitError, OSError, ValueError) as e:
+                return _PlanLeftMarked(plan, target, before, head_fault=str(e))
+            return _PlanLeftMarked(plan, target, before)
+        return None
+
+    def _head_carries(self, plan: Path) -> bool:
+        """Whether HEAD already holds ``plan`` as it reads on disk: a host lost
+        after ``finalize_commit`` made the squash and before the DONE save leaves
+        the mark committed, and a replayed commit that fails keeps that HEAD, so
+        the mark is no orphan. Compared as git counts sameness (clean-filtered
+        blob ids), so a CRLF checkout of the committed plan still matches."""
+        root = self.workspace.root
+        rel = plan.relative_to(root).as_posix()
+        committed = verify.revision_blob_oids(root, "HEAD", (rel,)).get(rel)
+        return committed is not None and committed == verify.git_normalized_blob_oid(
+            root, rel, plan
+        )
 
     def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> str | None:
         """Put the plan back to its pre-mark bytes through
@@ -1645,8 +1781,28 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         ``ticket-plan-restored`` with its outcome either way. A failed restore is
         never a raise out of the commit window's failure arm: it is returned, so
         the escalation (or pause) names the plan left marked for a commit that
-        does not exist instead of reading as a plain commit failure."""
+        does not exist instead of reading as a plain commit failure.
+
+        A :class:`_PlanLeftMarked` token restores nothing — no pre-image bytes
+        survived whatever marked the plan since the COMMITTING save — and returns
+        the detail that names the plan and asks the operator to restore it by
+        hand."""
         del task
+        if isinstance(undo, _PlanLeftMarked):
+            if undo.head_fault:
+                return (
+                    f"{undo.plan} reads {undo.target}, not the {undo.before!r} the "
+                    "COMMITTING save latched — marked since, e.g. by an interrupted "
+                    f"commit window — and HEAD could not be read for it ({undo.head_fault}); "
+                    f"if HEAD does not carry it at {undo.target}, restore it by hand "
+                    "before resuming"
+                )
+            return (
+                f"{undo.plan} reads {undo.target}, not the {undo.before!r} the COMMITTING "
+                "save latched — marked since, e.g. by an interrupted commit window — and "
+                f"is left {undo.target} for a commit that does not exist; restore it by "
+                "hand before resuming"
+            )
         if not isinstance(undo, _PlanUndo):
             return None
         try:
@@ -1683,8 +1839,23 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         stale latch into its next commit. Journals ``ticket-mark-latched``, and
         ``store-unversioned`` (once per run) for a store without a repository
         (T2/T6) — here, not only when a mark lands, since under ``"never"`` it
-        latches nothing and the session's ``built`` plan lives on disk alone."""
-        if self.paths.shared_store is None or task.ticket is None:
+        latches nothing and the session's ``built`` plan lives on disk alone.
+
+        For a T1 store (tracked in the code checkout) the window marks the plan
+        itself; what is latched instead is the bound plan's pre-window status and
+        the sha256 of its bytes (``ticket_premark_status`` /
+        ``ticket_premark_digest``), so a resumed window can tell a plan marked
+        since that save (e.g. by an interrupted window) from one already at the
+        target (:meth:`_terminal_plan_write`). Both are assigned every time too —
+        cleared for a shared store, an unbound task, no mark owed (``"never"``,
+        not parked), or a plan that cannot be read (the window's own read or mark
+        pauses on that fault)."""
+        task.ticket_premark_status = ""
+        task.ticket_premark_digest = ""
+        if self.paths.shared_store is None:
+            self._latch_premark(task)
+            return
+        if task.ticket is None:
             return
         parked = bool(task.operator_actions)
         accept = not parked and self.policy.tickets.mark_done == "auto"
@@ -1696,6 +1867,22 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         task.ticket_done_pending = accept
         task.ticket_commit_pending = not parked and not accept and versioned
         self._journal_latch(task)
+
+    def _latch_premark(self, task: StoryTask) -> None:
+        """Set the T1 pre-window latch (:meth:`_latch_post_landing_writes`) when
+        the window will mark the bound plan; leave it cleared otherwise."""
+        plan = self._bound_plan(task)
+        if plan is None or task.ticket is None:
+            return
+        if not task.operator_actions and self.policy.tickets.mark_done != "auto":
+            return
+        try:
+            data = plan.read_bytes()
+            status = status_of(parse_frontmatter(data.decode("utf-8-sig")))
+        except (OSError, UnicodeDecodeError):
+            return
+        task.ticket_premark_status = status
+        task.ticket_premark_digest = hashlib.sha256(data).hexdigest()
 
     def _journal_latch(self, task: StoryTask) -> None:
         target = self._post_landing_target(task)
@@ -1709,6 +1896,17 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         if task.ticket_done_pending:
             return verify.PLAN_DONE
         return verify.PLAN_BUILT if task.ticket_commit_pending else ""
+
+    def _store_publishes_harvest_carry(self, task: StoryTask, *, terminal_composite: bool) -> bool:
+        """True for the terminal composite of a ticket that owes a post-landing
+        write (:meth:`_post_landing_target` non-empty, DW-570): ``worktree_flow``
+        runs the harvested carry, then :meth:`_land_post_landing_writes` →
+        :meth:`_commit_marked_plan`, the latched and retried publisher of the plan
+        plus the ledger when the task wrote to it. A carry commit first would take
+        the ledger out of that commit and trade its retry for a best-effort one.
+        An isolated defer and the resume replay owe no post-landing write, so the
+        carry commits those itself."""
+        return terminal_composite and bool(self._post_landing_target(task))
 
     def _land_post_landing_writes(self, task: StoryTask) -> None:
         """Make the latched mark now that the unit's code is on the target: on the

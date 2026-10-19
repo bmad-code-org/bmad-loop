@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
+import importlib.util
 import io
 import json
 import os
@@ -61,6 +63,25 @@ if sys.platform == "win32" and not sys.flags.utf8_mode:
         "(e.g. `set PYTHONUTF8=1 && uv run pytest`). The suite assumes UTF-8 to "
         "match the files under test; CI's windows job sets this automatically."
     )
+
+# Modules that bind `get_multiplexer` by name at import. Tests swap a stand-in in
+# by patching `multiplexer.get_multiplexer`, and monkeypatch restores only that
+# module: one of these first imported while a patch stood (cli imports
+# `tui.launch` lazily) keeps the stand-in for every later test on the worker.
+# Importing them here binds the real function before any test runs (DW-566).
+# `tests/test_conftest.py` holds this list to the module-level binders in src.
+_MUX_BINDING_MODULES = (
+    "bmad_loop.adapters.generic",
+    "bmad_loop.probe",
+    "bmad_loop.runs",
+    "bmad_loop.tui.app",
+    "bmad_loop.tui.launch",
+)
+for _mod in _MUX_BINDING_MODULES:
+    # tui.app needs the `tui` extra; without textual it cannot be imported at all,
+    # so it cannot capture a stand-in either.
+    if _mod != "bmad_loop.tui.app" or importlib.util.find_spec("textual") is not None:
+        importlib.import_module(_mod)
 
 
 # Opt-in runtime metrics (`--test-metrics-dir=PATH`, tests/perf_report.py). Both
@@ -155,6 +176,55 @@ real_mux_e2e = pytest.mark.xdist_group(REAL_MUX_XDIST_GROUP)
 # OUTSIDE this constant and are additional, so this ceiling does not guarantee the whole
 # job fits within its cap.
 REAL_MUX_HANG_CEILING_S = 90.0
+
+
+# ------------------------------------------------- private tmux server (DW-561)
+# A real-tmux test must never reach the developer's DEFAULT tmux server. A server the
+# first test starts keeps that test's cwd, so once pytest deletes the sandbox every
+# later pane fails shell init (`getcwd: cannot access parent directories`), and leaked
+# `bmad-loop-*` sessions pile up across runs. The default server may also host the
+# session running the suite, so a kill that reaches it ends that session too.
+#
+# `TMUX_TMPDIR` is the only lever: the product builds its own tmux argv, so `-L`/`-S`
+# cannot be injected, but every client it spawns (and every pane, through `$TMUX`)
+# inherits the redirect. Teardown and probes name the socket with `-S` instead of
+# trusting the inherited env, so a lost redirect leaks onto the default server
+# without anything being killed there.
+
+
+def private_tmux_socket_path(base: Path) -> Path:
+    """The socket a tmux client with ``TMUX_TMPDIR=base`` and no ``TMUX`` talks to."""
+    return base / f"tmux-{os.getuid()}" / "default"
+
+
+@contextlib.contextmanager
+def private_tmux_socket(base: Path) -> Iterator[Path]:
+    """Point every tmux client in this process tree at a private server under
+    ``base`` and yield its socket path; kill that server, by explicit socket, on
+    exit. Fails loudly if the server still answers afterwards."""
+    socket = private_tmux_socket_path(base)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("TMUX_TMPDIR", str(base))
+        mp.delenv("TMUX", raising=False)
+        mp.delenv("TMUX_PANE", raising=False)
+        try:
+            yield socket
+        finally:
+            probe = {"capture_output": True, "text": True, "timeout": REAL_MUX_HANG_CEILING_S}
+            subprocess.run(["tmux", "-S", str(socket), "kill-server"], **probe)
+            alive = subprocess.run(["tmux", "-S", str(socket), "list-sessions"], **probe)
+            if alive.returncode == 0:
+                raise AssertionError(
+                    f"private tmux server {socket} survived teardown: {alive.stdout!r}"
+                )
+
+
+@pytest.fixture
+def private_tmux_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """One private tmux server per test; yields its socket path for ``-S`` probes.
+    A short `mktemp` dir keeps the socket far below the 108-byte sun_path limit."""
+    with private_tmux_socket(tmp_path_factory.mktemp("tmux")) as socket:
+        yield socket
 
 
 # --------------------------------------------------- reap-identity helpers (Linux)
@@ -1678,7 +1748,8 @@ class EntrySpec:
     bare int is a sibling id, ``"E.M"`` another epic's entry, ``"epic-<x>"`` a whole
     epic. ``refine=None`` leaves the key out (upstream then refines bugs only).
     ``refined=True`` also writes the pulled leaf file with ``refined: true``, the only
-    way upstream ever reports a ticket as refined."""
+    way upstream ever reports a ticket as refined. ``v6_key`` is the old sprint key
+    the v6→v7 migration records on the entry; None leaves the key out."""
 
     id: int
     title: str
@@ -1689,6 +1760,7 @@ class EntrySpec:
     refined: bool = False
     plan_checkpoint: bool = False
     done_checkpoint: bool = False
+    v6_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1887,6 +1959,8 @@ def write_ticket_tree(layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicS
                     block += f"{key} = true\n"
             if e.refine is not None:
                 block += f"refine = {_toml_value(e.refine)}\n"
+            if e.v6_key is not None:
+                block += f"v6_key = {json.dumps(e.v6_key)}\n"
             entries.append(block)
             if e.refined:
                 (epic_dir / f"{e.type}-{ticket_slug(e.title)}.md").write_text(

@@ -51,10 +51,20 @@ from .platform_util import (
     open_dir_confined,
     safe_segment,
 )
-from .runs import StateRootError, _project_of_run_dir, events_dir_for, live_store_topology
+from .runs import (
+    StateRootError,
+    _project_of_run_dir,
+    bundle_close_note,
+    bundle_close_operation_id,
+    events_dir_for,
+    live_store_topology,
+)
 from .signals import attribute_events, session_events
 from .statemachine import advance
 from .worksource import EpicProgress, Pick, WorkSource
+
+if TYPE_CHECKING:
+    from .plugins import HookContext
 
 
 def _read_json(path: Path) -> Any:
@@ -3535,7 +3545,8 @@ class SweepEngine(Engine):
     ) -> None:
         """Escalate the migrate task along legal edges only (DW-405/407/314).
 
-        Every other task takes ``Engine._escalate`` unchanged. The migrate task
+        Every other task takes ``Engine._escalate`` unchanged, after
+        :meth:`_reopen_unlanded_close` (DW-569). The migrate task
         can refuse from two boundaries the phase graph gives no ESCALATED edge:
         a marked ``TRIAGE_RUNNING`` recovery walks through ``TRIAGE_VERIFY``
         first, and a refusal while already ESCALATED (the escalated commit-tail
@@ -3552,6 +3563,9 @@ class SweepEngine(Engine):
         advanced-HEAD refusal refused).
         """
         if task.story_key != MIGRATE_KEY:
+            # No code landed: reopen an isolated bundle's shared-store close
+            # before the base's ESCALATED save (DW-569).
+            self._reopen_unlanded_close(task)
             super()._escalate(task, reason)
             return
         if task.phase == Phase.DONE:
@@ -7449,7 +7463,9 @@ class SweepEngine(Engine):
         it — DW-192) and `reason="ledger-in-doubt"`. `dw_ids` (DW-250) is the
         list of ids the declining publisher would otherwise have set out to prove,
         emitted ONLY when given: `_publish_stranded_close` names its cached plan's
-        already-resolved and decision ids, while the three DW-246 callers
+        already-resolved and decision ids, `_publish_bundle_close` (DW-556) the
+        landed bundle's `bundle_closes_intended`, `_publish_deferred_ledger`
+        (DW-567) the deferred bundle's `dw_ids`, while the three DW-246 callers
         deliberately pass none — `_close_resolved`'s arms have `closed` and `ids`
         in scope, but their DW-246 row shape stays unchanged. `diagnostics`
         already routes the field by name (`_JOURNAL_KEYLIST_FIELDS`).
@@ -8779,19 +8795,259 @@ class SweepEngine(Engine):
         return ticketstore.StoreTopology.from_dict(recorded) if recorded else None
 
     def _land_post_landing_writes(self, task: StoryTask) -> None:
-        """Once a bundle's code has landed, publish its accepted plan when the plan
-        lives in a ticket store with its own repository (T3/T4): the code commit
-        cannot carry a file in another repository. See
-        :meth:`_publish_bundle_plan`."""
+        """Once a bundle's code has landed, publish its accepted plan and its
+        ledger close when they live in a ticket store with its own repository
+        (T3/T4): the code commit cannot carry a file in another repository. See
+        :meth:`_publish_bundle_plan` and :meth:`_publish_bundle_close`."""
         super()._land_post_landing_writes(task)
         self._publish_bundle_plan(task)
+        self._publish_bundle_close(task)
+
+    def _publish_bundle_close(self, task: StoryTask) -> None:
+        """Commit the ledger close a landed bundle wrote when the ledger lives in a
+        store repository (T3/T4), through
+        :class:`~bmad_loop.ticketstore.StoreCommitter` as ``chore(sweep): close
+        resolved deferred-work entries`` with the ``Bmad-Code-*`` trailers. A
+        harvest the isolated terminal carry filed into the same ledger rides this
+        commit: the carry leaves it to this publisher rather than committing it
+        itself (:meth:`_store_publishes_harvest_carry`, DW-570). Elsewhere the
+        close rides the bundle's own code commit (``commit_story``'s
+        ``git add -A``, or the merge-back and ``_carry_isolated_ledger_writes``
+        under isolation); a store repository's ledger is in no tree that commit can
+        reach.
+
+        Keyed on ``task.bundle_closes_intended``, as the isolated carry is: a
+        bundle that wrote no close publishes nothing. Withheld while the run holds
+        its ledger in doubt (``sweep-ledger-commit-withheld``). Otherwise best
+        effort, like :meth:`_publish_bundle_plan`: it runs inside
+        ``integrate_unit`` after the merge, so a failed commit journals
+        ``store-commit-failed`` (a staged foreign version of the ledger
+        ``store-commit-foreign-dirt``) and the close stays uncommitted for a human
+        or a later publisher. So does a ledger gone or unreadable in the store
+        repository (:meth:`_store_ledger_to_publish`). A ledger already at the
+        store's HEAD journals nothing."""
+        topology = self.store_topology
+        if topology is None or topology.store_repo is None or not task.bundle_closes_intended:
+            return
+        ledger = self.workspace.paths.deferred_work
+        message = "chore(sweep): close resolved deferred-work entries"
+        if not self._store_ledger_to_publish(task, topology.store_repo, ledger, message):
+            return
+        if self._ledger_unfit_to_publish():
+            self._withhold_ledger_publish(message, dw_ids=list(task.bundle_closes_intended))
+            return
+        self._commit_store_ledger(
+            task,
+            topology.store_repo,
+            ledger,
+            message,
+            code_commit=self._landed_code_commit(task),
+            code_baseline=task.baseline_commit,
+        )
+
+    def _defer(self, task: StoryTask, reason: str) -> None:
+        """The base defer, then publish the ledger writes it left in a store
+        repository (T3/T4, DW-567) through :meth:`_publish_deferred_ledger`. A
+        deferred bundle never reaches ``_land_post_landing_writes``, so without
+        this its reopened close and harvested deferrals stay dirty in the store.
+
+        On the isolated arm (``self._isolated or task.worktree_path``, the base's
+        own test) with the ledger in the shared ticket store, the bundle's close
+        was written straight into the one ledger every checkout shares: the
+        base's premise that the discarded worktree takes its close with it does
+        not hold, so the close is reopened FIRST, ahead of the base's terminal
+        save, and the publish never commits a ``done`` for discarded code. A raise
+        from that reopen propagates before any defer is recorded, so the task is
+        not yet terminal: resume takes ``_recover_inflight_bundle``'s restart arm
+        (a re-verify that defers again, or a re-drive), and a later defer of this
+        bundle undoes the same close, its operation id being per run and bundle.
+        An unshared ledger copy dies with the worktree, as before. A raise from
+        the base (a ``RunPaused`` from its rollback included) propagates
+        untouched, with no publish."""
+        if (self._isolated or task.worktree_path) and self.paths.in_shared_store(
+            self.paths.deferred_work
+        ):
+            self._reopen_ledger_after_defer(task)
+        super()._defer(task, reason)
+        self._publish_deferred_ledger(task)
+
+    def _publish_deferred_ledger(self, task: StoryTask) -> None:
+        """Commit the ledger writes a DEFERRED bundle left when the ledger lives in
+        a store repository (T3/T4), through
+        :class:`~bmad_loop.ticketstore.StoreCommitter` as ``chore(sweep): record a
+        deferred bundle's ledger writes``: the reopen of its close and any
+        harvested deferrals, which the isolated defer's harvested carry leaves to
+        this publisher rather than committing itself
+        (:meth:`_store_publishes_harvest_carry`, DW-570). It also publishes the
+        reopen :meth:`_reopen_unlanded_close` makes when an isolated bundle
+        escalates or is vetoed (DW-569), under the same message. No code landed,
+        so only ``Bmad-Code-Repo`` is stamped. Elsewhere the ledger is in the code
+        checkout (or a worktree copy that dies with the unit) and no store commit
+        is owed.
+
+        Withheld while the run holds its ledger in doubt
+        (``sweep-ledger-commit-withheld`` naming the bundle's ids). Otherwise best
+        effort, like :meth:`_publish_bundle_close`: a failed commit journals
+        ``store-commit-failed`` (a staged foreign version of the ledger
+        ``store-commit-foreign-dirt``) and the writes stay uncommitted for a human
+        or a later publisher, as does a ledger gone or unreadable in the store
+        repository (:meth:`_store_ledger_to_publish`); a ledger already at the
+        store's HEAD journals nothing."""
+        topology = self.store_topology
+        if topology is None or topology.store_repo is None:
+            return
+        ledger = self.paths.deferred_work
+        message = "chore(sweep): record a deferred bundle's ledger writes"
+        if not self._store_ledger_to_publish(task, topology.store_repo, ledger, message):
+            return
+        if self._ledger_unfit_to_publish():
+            self._withhold_ledger_publish(message, dw_ids=list(task.dw_ids))
+            return
+        self._commit_store_ledger(task, topology.store_repo, ledger, message, code_commit=None)
+
+    def _store_ledger_to_publish(
+        self, task: StoryTask, store_repo: Path, ledger: Path, message: str
+    ) -> bool:
+        """Whether a ledger publisher (:meth:`_publish_bundle_close`,
+        :meth:`_publish_deferred_ledger`) commits ``ledger`` in ``store_repo``. A
+        ledger outside the store repository answers False with nothing journaled:
+        the code commit carries it. A ledger that cannot be located (a
+        ``resolve()`` fault), or that is gone, not a regular file or unreadable
+        inside the store repository, journals ``store-commit-failed`` naming
+        ``message`` and answers False. The write it should hold goes unpublished,
+        and that must not read as a publisher with nothing to do."""
+        try:
+            inside = ledger.resolve().is_relative_to(store_repo.resolve())
+        except (OSError, RuntimeError, ValueError) as e:
+            fault: str | None = (
+                f"the deferred-work ledger {ledger} could not be located "
+                f"({type(e).__name__}: {e})"
+            )
+        else:
+            if not inside:
+                return False
+            text, read_fault = deferredwork.observe_ledger(ledger)
+            if read_fault is not None:
+                fault = f"the deferred-work ledger {ledger} could not be read ({read_fault})"
+            elif text is None:
+                fault = f"the deferred-work ledger {ledger} is gone from the store repository"
+            else:
+                return True
+        self.journal.append(
+            "store-commit-failed",
+            story_key=task.story_key,
+            error=f"{fault}; {message!r} was not committed",
+        )
+        return False
+
+    def _vetoed(self, ctx: HookContext | None, task: StoryTask) -> bool:
+        """The base veto routing, after :meth:`_reopen_unlanded_close` when a
+        plugin really vetoed (DW-569). Every veto action (``pause``, ``defer``,
+        ``skip``) ends the unit without landing its code, so the reopen runs
+        ahead of the base's terminal save. Only ``pause`` may degrade a reopen
+        fault: ``defer`` and ``skip`` let the run go on to finish, and a finished
+        run is out of :func:`~bmad_loop.runs.held_sweep_closes`' reach, so their
+        fault propagates before any DEFERRED is recorded, as :meth:`_defer`'s
+        does. A stage nobody vetoed is not an end and reaches the base
+        untouched."""
+        veto = ctx.resolved_veto() if ctx is not None else None
+        if veto is not None:
+            self._reopen_unlanded_close(task, may_degrade=veto.action == "pause")
+        return super()._vetoed(ctx, task)
+
+    def _reopen_unlanded_close(self, task: StoryTask, *, may_degrade: bool = True) -> None:
+        """Reopen an isolated bundle's shared-store close when the bundle ends
+        without landing (DW-569): before the terminal save of every escalation
+        (:meth:`_escalate`, ``WorktreeFlow.escalate_unit`` for an in-flight unit,
+        ``WorktreeFlow.keep_branch_and_escalate`` for a failed merge-back) and
+        every plugin veto (:meth:`_vetoed`). The defer has its own arm
+        (:meth:`_defer`).
+
+        Acts only on the isolated arm (``self._isolated or task.worktree_path``)
+        with the ledger in the shared ticket store and a close on record
+        (``task.bundle_closes_intended``). There the accepted-dev close went
+        straight into the one ledger every checkout shares, and ``open_ids``
+        re-bundles only ``open`` entries, so a ``done`` left for code that never
+        landed is invisible to every later sweep. Otherwise a no-op that reads
+        nothing: in place the rollback owns the ledger, and an unshared ledger
+        copy dies with the worktree.
+
+        The reopen is :meth:`_reopen_ledger_after_defer` (the same operation
+        id, so only this bundle's close is undone), then
+        :meth:`_publish_deferred_ledger` commits it in a store repository.
+        ``bundle_closes_intended`` is kept, so a re-armed bundle that lands
+        re-closes through :meth:`_carry_isolated_ledger_writes`.
+
+        A ``LedgerReadError`` or ``OSError`` from the reopen journals
+        ``sweep-bundle-reopen-failed`` and skips the publish. With
+        ``may_degrade`` (every escalation, a ``pause`` veto) that is a visible
+        degrade and the end goes on: the pause is the operator stop, turning it
+        into a crash would lose its reason, and the paused run stays guarded by
+        :func:`~bmad_loop.runs.held_sweep_closes`. Without it (a ``defer`` or
+        ``skip`` veto, which do not stop the run) the fault then propagates, so
+        the task is not yet terminal and the crashed run stays unfinished and
+        guarded.
+
+        The other ends of such a run (a pause other than an escalation, a stop,
+        a crash) reopen nothing, and no reopen path is built for them (DW-571).
+        They are guarded instead, through one read-only discovery,
+        :func:`~bmad_loop.runs.held_sweep_closes`: a fresh sweep warns about a
+        prior run that still holds closes (``sweep-prior-run-holds-closes``, or
+        ``sweep-prior-run-closes-unknown`` when it cannot tell), and ``delete``,
+        the TUI delete and ``clean`` refuse to remove that run. ``resolve
+        --abandon`` already refuses every sweep run, which is never a replay."""
+        if not task.bundle_closes_intended:
+            return
+        if not (self._isolated or task.worktree_path):
+            return
+        if not self.paths.in_shared_store(self.paths.deferred_work):
+            return
+        try:
+            self._reopen_ledger_after_defer(task)
+        except (deferredwork.LedgerReadError, OSError) as e:
+            # `LedgerReadError` is a plain `Exception` (DW-146), so it is named.
+            self.journal.append(
+                "sweep-bundle-reopen-failed",
+                story_key=task.story_key,
+                dw_ids=list(task.bundle_closes_intended),
+                error=str(e),
+            )
+            if not may_degrade:
+                raise
+            return
+        self._publish_deferred_ledger(task)
+
+    def _store_publishes_harvest_carry(self, task: StoryTask, *, terminal_composite: bool) -> bool:
+        """Whether a sweep store publisher commits the ledger right after this
+        harvested carry (DW-570), so the carry's store arm leaves it alone. True
+        in two cases:
+
+        - The direct carry the base :meth:`_defer` makes on the isolated arm: it
+          runs before the base advances the task to DEFERRED, and this class's
+          :meth:`_defer` follows it with :meth:`_publish_deferred_ledger`, the
+          documented publisher of the reopened close and the harvest together.
+          Committing there would sweep the reopen into a carry commit and leave
+          the deferred publisher nothing to do.
+        - The terminal composite of a bundle that landed with a close
+          (``bundle_closes_intended`` non-empty): ``worktree_flow`` runs the
+          carry, then :meth:`_land_post_landing_writes` →
+          :meth:`_publish_bundle_close`. Under a shared store the close is
+          already in the one ledger, so a carry commit would fold it into
+          ``chore(deferred-work): …`` and leave the close publisher nothing.
+
+        A harvest-only terminal composite and the resume replay
+        (``_replay_unlatched_ledger_carries``, phase already DEFERRED) have no
+        store publisher after them, so the carry commits those itself."""
+        if terminal_composite:
+            return bool(task.bundle_closes_intended)
+        return task.phase != Phase.DEFERRED
 
     def _publish_bundle_plan(self, task: StoryTask) -> None:
         """Commit ``task``'s accepted bundle plan in the store's repository through
         :class:`~bmad_loop.ticketstore.StoreCommitter`, as ``chore(sweep): <bundle>
         plan [bmad-loop <run>]`` with the ``Bmad-Code-*`` trailers. The ledger is
-        not part of it: the sweep's ledger publishers already commit it in the
-        ledger's own repository. An unversioned store (T2/T6) journals
+        not part of it: :meth:`_publish_bundle_close` commits the bundle's ledger
+        close on its own. An unversioned store (T2/T6) journals
         ``store-unversioned`` once per run.
 
         Best effort, like a tickets run's retro commit, and never a pause: the plan
@@ -8991,12 +9247,16 @@ class SweepEngine(Engine):
         return frozenset({"done"})
 
     def _bundle_close_operation_id(self, task: StoryTask) -> str:
-        """Stable identity for a close and its possible defer-time undo."""
-        return f"{self.state.run_id}/{task.story_key}"
+        """Stable identity for a close and its possible defer-time undo. The
+        format is :func:`~bmad_loop.runs.bundle_close_operation_id`, which the
+        held-close discovery (:func:`~bmad_loop.runs.held_sweep_closes`) shares."""
+        return bundle_close_operation_id(self.state.run_id, task.story_key)
 
     def _bundle_close_note(self, task: StoryTask) -> str:
-        """Resolution note shared by a bundle close and its possible undo."""
-        return f"resolved by sweep bundle {task.story_key}"
+        """Resolution note shared by a bundle close and its possible undo. The
+        format is :func:`~bmad_loop.runs.bundle_close_note`, which the held-close
+        discovery shares."""
+        return bundle_close_note(task.story_key)
 
     def _close_declared_deferred(
         self, task: StoryTask, snapshot: list[_ArmedClose] | None = None
@@ -9077,7 +9337,11 @@ class SweepEngine(Engine):
 
         ``Engine._defer`` deliberately restores the whole post-review ledger after
         rollback so harvested findings survive. That restore can also replay a
-        bundle close whose code no longer exists. The operation-specific undo marker
+        bundle close whose code no longer exists. :meth:`_defer` also calls this on
+        the isolated arm when the ledger is in the shared ticket store, where the
+        mount wrote its close straight into the one ledger every checkout shares
+        (DW-567), and :meth:`_reopen_unlanded_close` calls it on the same arm when
+        the bundle escalates or is vetoed (DW-569). The operation-specific undo marker
         makes this "undo my close", not "open these ids": human, legacy, and earlier
         run closures remain untouched. Replaying this method is idempotent.
         """

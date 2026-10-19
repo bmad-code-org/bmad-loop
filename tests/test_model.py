@@ -296,6 +296,23 @@ def test_story_task_post_landing_latches_round_trip_and_default_off():
     ) == (False, "", False)
 
 
+def test_story_task_t1_premark_latch_round_trips_and_defaults_empty():
+    """The T1 pre-window plan latch (status + digest) survives a save, and a
+    legacy state file (no keys) reads it empty — never as a plan marked by an
+    earlier window."""
+    task = StoryTask(story_key="2.1", epic=0)
+    assert (task.ticket_premark_status, task.ticket_premark_digest) == ("", "")
+    task.ticket_premark_status = "built"
+    task.ticket_premark_digest = "ab" * 32
+    state = _state(source="tickets", tasks={"2.1": task})
+    back = RunState.from_dict(json.loads(json.dumps(state.to_dict()))).tasks["2.1"]
+    assert (back.ticket_premark_status, back.ticket_premark_digest) == ("built", "ab" * 32)
+    d = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del d["ticket_premark_status"], d["ticket_premark_digest"]
+    legacy = StoryTask.from_dict(d)
+    assert (legacy.ticket_premark_status, legacy.ticket_premark_digest) == ("", "")
+
+
 def test_story_task_refuses_a_corrupt_ticket_binding():
     """A binding that is not an object is a corrupt state file: loading refuses it
     rather than dropping the ticket a resume needs. Ablation (performed): read a

@@ -3,13 +3,19 @@ pinned.
 
 ``Journal.append`` and ``save_state`` write ``journal.jsonl`` and ``state.json``
 through a descriptor on the run dir pinned to ``RunState.run_dir_identity``, read
-live per write; ``write_verify_stream`` takes the same record as an argument. The
-reads (``Journal.entries``, ``load_state``) open their files by path."""
+live per write; ``write_verify_stream`` takes the same record as an argument.
+
+The reads AFTER the first are confined the same way: ``load_state(run_dir,
+pin=state)`` and ``Journal.entries`` on a journal built with ``pin=`` read
+through a descriptor pinned to the held state's record and refuse with
+``UnconfinedReadError``. The first ``load_state(run_dir)`` (there is no record to
+pin to before it) and a journal with no ``pin`` read by path."""
 
 from __future__ import annotations
 
 import json
 import os
+import stat
 import threading
 import time
 from collections.abc import Iterator
@@ -19,23 +25,26 @@ from typing import Any
 
 from .model import RunState
 from .platform_util import (
-    AT_DIRECTORY,
     AT_NOFOLLOW,
-    DIR_FD_ANCHORED_WRITES,
+    AT_NONBLOCK,
     HANDLE_ANCHORED_WRITES,
     RootIdentityRecord,
+    UnconfinedReadError,
     UnconfinedWriteError,
+    _open_subdir_at,
     append_line_confined,
     atomic_replace,
     atomic_write_text,
     atomic_write_text_at,
     file_lock,
     is_link_like,
+    link_like_stat,
     open_at,
     open_dir_confined,
     recorded_root_identity,
     require_root_pinned,
     stale_device_record,
+    stat_at,
 )
 
 STATE_FILE = "state.json"
@@ -226,7 +235,7 @@ class Journal:
 
         The fault the heal closes (DW-97) costs TWO records, not one. This is the only
         writer in this module without a durable path — ``save_state`` uses
-        ``atomic_replace``, ``write_verify_stream`` uses ``atomic_write_text`` — so a
+        ``atomic_replace``, ``write_verify_stream`` uses ``atomic_write_text_at`` — so a
         partially flushed write leaves a fragment with no trailing newline. Without
         the heal the NEXT append concatenates its own record onto that fragment, and
         both readers then drop the combined line: one fault, two lost records, and one
@@ -332,78 +341,68 @@ class Journal:
         storage only and never decides how much to keep.  Callers retain the
         original stream separately in a hook context.
 
-        :func:`atomic_write_text`, never ``write_text`` (#379) — the rule
-        ``install.py`` states flatly.  The fixed ``.tmp`` sibling this replaces is
-        the collision that helper's own docstring exists to prevent, and its
-        fsync-before-replace is what keeps a pointer from ever naming blocks that
-        were never written.  ``follow_symlinks=False`` because these are
-        machine-minted records under a run directory a coding-CLI session can
-        reach: honouring a planted link would aim the write at a path of that
-        session's choosing, and there is no operator-curated target here to
-        preserve (contrast the ledgers the default was built for).
+        :func:`atomic_write_text_at`, never ``write_text`` (#379) — the rule
+        ``install.py`` states flatly.  A fixed ``.tmp`` sibling is the collision
+        the atomic helpers exist to prevent, and their fsync-before-replace is what
+        keeps a pointer from ever naming blocks that were never written.
 
-        Text mode is deliberate, and it is why the record's byte counts are
-        defined over the *stream*, not the file: ``\\n`` is translated on Windows,
-        so the file can be larger there than the count.  ``read_text`` normalizes
-        it back, so the content round-trips either way.
+        The byte counts in the record are defined over the *stream*, not the file.
+        The anchored write is UTF-8 with no newline translation, so on both handle
+        arms the file holds the stream's own line endings.  Only the no-handle
+        fallback below writes in text mode, where ``\\n`` is translated on Windows
+        and the file can be larger than the count.  ``read_text`` normalizes either
+        form, so the content round-trips.
 
-        The write is **anchored at a directory descriptor** where the platform has
-        one, because ``follow_symlinks=False`` covers the final component and
-        nothing above it.  Sessions are handed this run directory outright
-        (``BMAD_LOOP_RUN_DIR``, which is where they write ``result.json``), so a
-        session that plants a symlink at ``verify/`` before verification redirects
-        every record: ``mkdir(exist_ok=True)`` ACCEPTS a symlink-to-directory —
-        it re-raises only when ``is_dir()`` is false, and that follows links — and
-        the replace then lands wherever the link points, outside the run dir
-        entirely.  Measured, not theorised.
+        The write is **anchored at a directory handle** on both arms of
+        :data:`HANDLE_ANCHORED_WRITES` — the ``*at()`` family on POSIX, the
+        :mod:`~bmad_loop.win32_at` handle-relative opens on Windows — the same rule
+        ``append`` and ``save_state`` follow.  A by-path write is not enough here.
+        Sessions are handed this run directory outright (``BMAD_LOOP_RUN_DIR``,
+        which is where they write ``result.json``), so a session that plants a
+        link at ``verify/`` before verification would redirect every record:
+        ``mkdir(exist_ok=True)`` ACCEPTS a symlink-to-directory — it re-raises only
+        when ``is_dir()`` is false, and that follows links — and the replace then
+        lands wherever the link points, outside the run dir entirely.  Measured,
+        not theorised.  On Windows the redirect that matters is a DIRECTORY
+        JUNCTION, which ``mklink /J`` creates with no elevation at all.
 
-        ``open_dir_confined`` is the fix the repo already keeps for exactly this
-        (``tui/launch.py`` writes its control-window record the same way): it walks
-        each component below the run dir ``O_NOFOLLOW`` and hands back a descriptor
-        for the directory it actually reached, and :func:`atomic_write_text_at`
-        never names a path again.  A path check would be answered *about a path*
-        and stale the moment it returned — the session can re-plant the link
-        between check and write — so this closes the window rather than narrowing
-        it.  ``verify/`` is created relative to the pinned run-dir descriptor, so a
-        planted link there makes the ``mkdir`` answer ``FileExistsError`` and the
-        ``O_NOFOLLOW`` open that follows refuses it.
-
-        This method still branches on :data:`DIR_FD_ANCHORED_WRITES`, not on
-        :data:`HANDLE_ANCHORED_WRITES` as ``append`` and ``save_state`` do, so it
-        is the one confined run-dir writer whose win32 arm does not use the
-        handle-anchored ``win32_at`` calls. That arm keeps a
-        check-then-write, and the check is :func:`is_link_like` rather than
-        ``is_symlink()`` — on Windows the redirect that matters is a DIRECTORY
-        JUNCTION, which ``is_symlink()`` reports False for and which ``mklink /J``
-        creates with no elevation at all, while a directory symlink needs
-        SeCreateSymbolicLinkPrivilege or Developer Mode.  Checking only for
-        symlinks there would leave the unprivileged half of the same escape open,
-        and with no race to win.  The residual is the platform's: a path check is
-        stale the moment it returns, but the planting session runs as the same uid
-        as this writer and the names here are engine-minted, so the exposure is a
-        redirected diagnostic rather than a foothold.
+        :func:`open_dir_confined` opens the run dir and hands back a descriptor for
+        the directory it actually reached, ``verify/`` is created-or-opened
+        relative to that descriptor without following a link
+        (``platform_util._open_subdir_at``: a ``mkdir`` at the descriptor then an
+        ``O_NOFOLLOW`` open on POSIX, one ``O_CREAT`` open with reparse points
+        refused on Windows), and :func:`atomic_write_text_at` never names a path
+        again.  A path check would be answered *about a path* and stale the moment
+        it returned — the session can re-plant the link between check and write —
+        so this closes the window rather than narrowing it.  A planted symlink or
+        junction at ``verify/`` refuses at that open.
 
         The run dir itself is PINNED to its MINT-TIME identity (DW-338, DW-446):
         ``run_dir_identity`` is ``RunState.run_dir_identity``, the ``(st_dev,
         st_ino)`` the composer recorded when it claimed the directory. A fresh
         ``lstat`` would refuse a link only at the run dir itself; ``runs/`` (or
         the run dir) swapped for a link to a tree holding a real ``<id>/`` would
-        answer the outside directory, and every record would land there. On the
-        dir-fd arm the run dir is OPENED first and its ``fstat`` compared against
-        the record, before ``verify/`` is created — relative to that descriptor —
-        so a swapped run dir gets no ``verify/`` in its target, and ``verify/``
-        is then walked ``O_NOFOLLOW`` from the same descriptor. The win32 arm
-        re-``lstat``s the run dir against the record before its ``mkdir`` and
-        again before the write (check-then-write, beside its
-        :func:`is_link_like` checks). A missing record (``None``: a pre-upgrade
-        state not yet backfilled, a zero-inode claim) refuses outright — it never
-        degrades to an unpinned open. That is no change on the dir-fd arm (a zero
-        inode never matched), but the win32 arm, which before DW-446 wrote through
-        a zero-inode run dir, now REFUSES it (accepted 2026-09-27): a refusal, not a
-        degrade, surfaced by the caller as the verify record's ``capture_error``.
+        answer the outside directory, and every record would land there. The run
+        dir is OPENED first and its ``fstat`` compared against the record, before
+        ``verify/`` is created — relative to that descriptor — so a swapped run
+        dir gets no ``verify/`` in its target. A missing record (``None``: a
+        pre-upgrade state not yet backfilled, a zero-inode claim) refuses outright
+        — it never degrades to an unpinned open, and unlike ``append`` and
+        ``save_state`` this writer has no stale-device degrade. A win32 run dir
+        whose filesystem reports inode 0 therefore records nothing, and its
+        streams REFUSE (accepted 2026-09-27): a refusal, not a degrade, surfaced by
+        the caller as the verify record's ``capture_error``.
         Trust-on-first-use: the record is what sat at the run dir when it was
         minted; only a locked resume/re-arm (``runs.reconcile_root_identities``)
         backfills a missing one or re-binds an ``st_dev`` a reboot renumbered.
+
+        Hosts with neither handle arm get the path-based fallback that
+        ``save_state`` and :func:`append_line_confined` also keep: the run dir is
+        re-``lstat``-ed against the record (:func:`require_root_pinned`) and
+        refused when :func:`is_link_like` — not ``is_symlink()``, which reports a
+        junction as False — before the ``mkdir`` and again, with ``verify/``
+        itself, before :func:`atomic_write_text` (``follow_symlinks=False``).  That
+        is check-then-write, the residual :func:`path_is_confined` documents.
 
         Raises ``OSError`` — including when confinement cannot be established, so
         an unconfined ``verify/`` REFUSES rather than writing through the link.
@@ -414,21 +413,17 @@ class Journal:
         root_identity = recorded_root_identity(run_dir_identity)
         # Pin (or refuse) the run dir BEFORE the mkdir: a swapped run dir must not
         # get a `verify/` created in its target ahead of the refusal.
-        if DIR_FD_ANCHORED_WRITES:
+        if HANDLE_ANCHORED_WRITES:
             run_fd = open_dir_confined(self.run_dir, self.run_dir, root_identity=root_identity)
             if run_fd is None:
-                raise OSError(
+                raise UnconfinedWriteError(
                     f"refusing to write into an unconfined verify directory: {verify_dir}"
                 )
             try:
                 try:
-                    os.mkdir(VERIFY_DIR, 0o777, dir_fd=run_fd)
-                except FileExistsError:
-                    pass  # an existing entry — the O_NOFOLLOW open below vets it
-                try:
-                    dir_fd = open_at(run_fd, VERIFY_DIR, os.O_RDONLY | AT_DIRECTORY | AT_NOFOLLOW)
-                except OSError as e:
-                    raise OSError(
+                    dir_fd = _open_subdir_at(run_fd, VERIFY_DIR, create=True)
+                except UnconfinedWriteError as e:
+                    raise UnconfinedWriteError(
                         f"refusing to write into an unconfined verify directory: {verify_dir}"
                     ) from e
             finally:
@@ -460,11 +455,25 @@ class Journal:
         deliberately, so widening this to swallow it would take away a caller's ability
         to tell a corrupt journal from an empty one. Only ``JSONDecodeError`` becomes a
         marker.
+
+        A journal built with ``pin=`` reads through :func:`_read_run_file`, pinned to
+        the pin's ``run_dir_identity`` read live (as :meth:`append` reads it): a run
+        dir that no longer reaches the recorded directory, or a link at the run dir or
+        at ``journal.jsonl``, raises :class:`~bmad_loop.platform_util.UnconfinedReadError`
+        and no foreign row is returned. Absent or not a regular file is ``[]`` on both
+        arms. A journal with no ``pin`` reads by path, links followed.
         """
-        if not self.path.is_file():
-            return []
+        if self.pin is not None:
+            data = _read_run_file(self.run_dir, JOURNAL_FILE, self.pin.run_dir_identity)
+            if data is None:
+                return []
+            text = data.decode("utf-8")
+        else:
+            if not self.path.is_file():
+                return []
+            text = self.path.read_text(encoding="utf-8")
         out: list[dict[str, Any]] = []
-        for raw_line in self.path.read_text(encoding="utf-8").splitlines():
+        for raw_line in text.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
@@ -614,6 +623,115 @@ def save_state(run_dir: Path, state: RunState) -> None:
             raise
 
 
-def load_state(run_dir: Path) -> RunState:
+def load_state(run_dir: Path, *, pin: RunState | None = None) -> RunState:
+    """Parse ``run_dir/state.json``.
+
+    With no ``pin`` — the FIRST read, which has no record to pin against — this is
+    a plain path read that follows links. A caller already holding a ``RunState``
+    for this run passes it as ``pin``: the re-read goes through
+    :func:`_read_run_file` pinned to ``pin.run_dir_identity``, so a run dir (or
+    ``runs/``) swapped for a link between the first read and this one raises
+    :class:`~bmad_loop.platform_util.UnconfinedReadError` instead of returning the
+    foreign record. That binds a locked re-read to the lock-free check before it
+    (the resolve and re-arm shape). On the pinned arm a missing or non-regular
+    ``state.json`` raises ``FileNotFoundError``; the unpinned path read raises
+    whatever ``read_text`` does (``IsADirectoryError`` for a directory)."""
     target = run_dir / STATE_FILE
-    return RunState.from_dict(json.loads(target.read_text(encoding="utf-8")))
+    if pin is None:
+        return RunState.from_dict(json.loads(target.read_text(encoding="utf-8")))
+    data = _read_run_file(run_dir, STATE_FILE, pin.run_dir_identity)
+    if data is None:
+        raise FileNotFoundError(f"{STATE_FILE} is missing or not a regular file: {target}")
+    return RunState.from_dict(json.loads(data.decode("utf-8")))
+
+
+def _read_run_file(run_dir: Path, name: str, record: RootIdentityRecord | None) -> bytes | None:
+    """The bytes of ``run_dir/name``, read confined to the run dir ``record`` pins,
+    or None when the file is absent or not a regular file. Writes nothing.
+
+    The arms are the writers' (:func:`save_state`, :meth:`Journal.append`): a
+    record opens the run dir through :func:`open_dir_confined` pinned to it; a
+    refusal that :func:`stale_device_record` explains (a renumbered ``st_dev`` on
+    the intact directory), or no record at all, opens it unpinned as the
+    ``O_NOFOLLOW`` last component of a walk from its parent. Any other pinned miss
+    — ``runs/`` or the run dir swapped for a link or another directory, the run
+    dir gone — raises :class:`UnconfinedReadError`. No notice row: the same
+    object's appends already journal ``journal-unpinned``.
+
+    The file opens under the descriptor ``O_RDONLY`` with :data:`AT_NOFOLLOW` (a
+    link AT the file refuses typed) and :data:`AT_NONBLOCK` (a FIFO planted there
+    cannot stall the open), then must ``fstat`` as a regular file.
+
+    Hosts with neither handle arm: :func:`require_root_pinned` against the record
+    plus :func:`is_link_like` on the run dir and the file, then a path read —
+    check-then-read, the residual :func:`~bmad_loop.platform_util.path_is_confined`
+    documents."""
+    if not HANDLE_ANCHORED_WRITES:
+        return _read_run_file_by_path(run_dir, name, record)
+    if record is None:
+        dir_fd = open_dir_confined(run_dir.parent, run_dir)
+    else:
+        dir_fd = open_dir_confined(run_dir, run_dir, root_identity=recorded_root_identity(record))
+        if dir_fd is None and stale_device_record(run_dir, record):
+            dir_fd = open_dir_confined(run_dir.parent, run_dir)
+    if dir_fd is None:
+        raise UnconfinedReadError(
+            f"refusing to read {name} from an unconfined or replaced run dir: {run_dir}"
+        )
+    try:
+        try:
+            fd = open_at(dir_fd, name, os.O_RDONLY | AT_NOFOLLOW | AT_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            # Tell the refusal (a link at the file: ELOOP on POSIX, a reparse point
+            # on win32) and a non-file (a directory) apart from a real read fault.
+            try:
+                info = stat_at(dir_fd, name)
+            except OSError:
+                raise e from None
+            if link_like_stat(info):
+                raise UnconfinedReadError(
+                    f"refusing to read {name} through a link: {run_dir / name}"
+                ) from e
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            chunks: list[bytes] = []
+            while chunk := os.read(fd, 1 << 16):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _read_run_file_by_path(
+    run_dir: Path, name: str, record: RootIdentityRecord | None
+) -> bytes | None:
+    """:func:`_read_run_file`'s no-handle fallback: check, then read by path."""
+    identity = (
+        None
+        if record is None or stale_device_record(run_dir, record)
+        else recorded_root_identity(record)
+    )
+    target = run_dir / name
+    try:
+        require_root_pinned(run_dir, identity)
+    except UnconfinedWriteError as e:
+        raise UnconfinedReadError(
+            f"refusing to read {name} from a replaced run dir: {run_dir}"
+        ) from e
+    if is_link_like(run_dir) or is_link_like(target):
+        raise UnconfinedReadError(f"refusing to read {name} through a link: {target}")
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return target.read_bytes()

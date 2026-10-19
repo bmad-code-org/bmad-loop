@@ -1238,8 +1238,7 @@ def test_mixed_install_sprint_mode_stays_v6(tmp_path: Path) -> None:
 
 def test_v7_relative_output_folder_resolves_against_project(tmp_path: Path, monkeypatch) -> None:
     """`tickets.py` joins `output_folder` onto the project root, so a relative value is
-    project-relative regardless of the process cwd (v6 `_resolve` is not, and stays
-    as it is)."""
+    project-relative regardless of the process cwd."""
     root = _v7(tmp_path)
     (root / "_bmad" / "config.toml").write_text(
         '[core]\noutput_folder = "out/docs"\n', encoding="utf-8"
@@ -1250,6 +1249,47 @@ def test_v7_relative_output_folder_resolves_against_project(tmp_path: Path, monk
     paths = bmadconfig.load_paths(root)
     assert paths.output_folder == (root / "out" / "docs").resolve()
     assert paths.initiative_folder == (root / "out" / "docs" / "initiative-demo").resolve()
+
+
+@pytest.mark.parametrize("source", ["yaml", "toml"])
+def test_v6_relative_config_paths_resolve_against_project(
+    tmp_path: Path, monkeypatch, source: str
+) -> None:
+    """A relative v6 path value is project-relative whatever the process cwd, as
+    v7 resolves it — from the legacy YAML and the central TOML alike.
+
+    Ablation: drop the `project /` join in `_resolve` and every member lands under
+    `elsewhere` instead."""
+    root = tmp_path / "p"
+    root.mkdir()
+    keys = {
+        "implementation_artifacts": "out/impl",
+        "planning_artifacts": "out/plan",
+        "output_folder": "out",
+        "repo_root": ".",
+    }
+    if source == "yaml":
+        _write_config(root, **keys)
+    else:
+        _write_layer(
+            root,
+            0,
+            '[core]\noutput_folder = "out"\nrepo_root = "."\n'
+            '[modules.bmm]\nimplementation_artifacts = "out/impl"\n'
+            'planning_artifacts = "out/plan"\n',
+        )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    paths = bmadconfig.load_paths(root)
+
+    canonical = root.resolve()
+    assert paths.era == "v6"
+    assert paths.implementation_artifacts == canonical / "out" / "impl"
+    assert paths.planning_artifacts == canonical / "out" / "plan"
+    assert paths.output_folder == canonical / "out"
+    assert paths.repo_root == canonical
 
 
 def test_v7_unset_output_folder_defaults_to_project_root_like_tickets_py(tmp_path: Path) -> None:
