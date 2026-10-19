@@ -161,7 +161,8 @@ from .tickettree import (
     TicketsV6KeyUnreadable,
     TicketTree,
     TicketTreeLike,
-    read_v6_key_claims,
+    V6KeyClaim,
+    read_v6_key_entries,
 )
 from .worksource import SOURCE_TICKETS
 from .worksource import Halt as WorkHalt
@@ -207,6 +208,8 @@ class _PlanLeftMarked:
     plan: Path
     target: str
     before: str
+    # Why HEAD could not be compared with the plan (:meth:`_head_carries`), else "".
+    head_fault: str = ""
 
 
 def _bytes_or_none(path: Path) -> bytes | None:
@@ -329,11 +332,11 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self._picked: dict[str, TicketBinding] = {}
         # story key -> plan status its last review launched on (`_verify_review`).
         self._review_entered: dict[str, str] = {}
-        # One gate check's `(v6_key, ref)` claims snapshot, read on the first v6
+        # One gate check's `v6_key` claims snapshot, read on the first v6
         # story-key token the check meets and cleared around every check
         # (`_refuse_gated_story`), so `_gate_hits` and `_legacy_gate_tokens` read
         # one tree and a token cannot fall between them.
-        self._gate_claims: tuple[tuple[str, str | None], ...] | None = None
+        self._gate_claims: tuple[V6KeyClaim, ...] | None = None
         # Whether this run has journaled `store-unversioned`; None until the
         # journal is first read for it (`_note_store_unversioned`).
         self._unversioned_noted: bool | None = None
@@ -1400,16 +1403,30 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         if not tokens:
             return (), ()
         if self._gate_claims is None:
-            self._gate_claims = read_v6_key_claims(self.paths.initiative_folder)
-        return deferredwork.partition_legacy_tokens(tokens, self._gate_claims)
+            self._gate_claims = read_v6_key_entries(self.paths.initiative_folder)
+        pairs = ((claim.key, claim.ref) for claim in self._gate_claims)
+        return deferredwork.partition_legacy_tokens(tokens, pairs)
+
+    def _resolved_gates(self, ref: str, story_key: str, binding: TicketBinding | None) -> bool:
+        """Whether the ticket a v6 token resolved to (``ref``, in this check's
+        claims snapshot) is ``story_key``'s. With a binding the claim's identity
+        is compared — its epic folder and entry id — not its ref: the binding
+        was resolved at pick time (and persisted for a resume), so an epic
+        renumbered since gives the same ticket a new ``E.M`` in the snapshot,
+        which would no longer match the picked ref and wave it through. With no
+        binding only the ref can be compared."""
+        if binding is None:
+            return deferredwork.gates_ticket(ref, story_key, epic_id="", epic_slug="")
+        claims = self._gate_claims or ()
+        return any(c.ref == ref and c.names(binding.epic_slug, binding.id) for c in claims)
 
     def _gate_hits(self, entry: deferredwork.DWEntry, story_key: str) -> list[str]:
         """Ticket-grammar tokens that gate ``story_key``: its ref, its epic's id or
         its epic's folder (:func:`deferredwork.gates_ticket`). With no binding only
         the ref arm can match. Then the v6 story-key tokens one ticket's ``v6_key``
-        claims, when that ticket's ref gates ``story_key`` the same way — each the
-        token as the author wrote it, annotated with the ticket it resolved to
-        (``3-2 (`v6_key` of 1.1)``)."""
+        claims, when that ticket is ``story_key``'s (:meth:`_resolved_gates`) —
+        each the token as the author wrote it, annotated with the ticket it
+        resolved to (``3-2 (`v6_key` of 1.1)``)."""
         # Claims first: a fault reading them for THIS entry pauses before this
         # entry's rebind below. An earlier entry's check may already have rebound.
         resolved, _ = self._partition_legacy(entry)
@@ -1424,7 +1441,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         hits += [
             f"{token} (`v6_key` of {ref})"
             for token, ref in resolved
-            if deferredwork.gates_ticket(ref, story_key, epic_id=epic_id, epic_slug=epic_slug)
+            if self._resolved_gates(ref, story_key, binding)
         ]
         return hits
 
@@ -1691,7 +1708,8 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         :meth:`_latch_post_landing_writes`) read another status, and the plan's
         bytes no longer match its digest — so a commit failure names the plan
         left marked instead of reading as a plain commit failure; else None (a
-        plan at the target before the window, a legacy state with no latch)."""
+        plan at the target before the window, a legacy state with no latch, or
+        a mark HEAD already carries — :meth:`_head_carries`)."""
         plan = self._bound_plan(task)
         ticket = task.ticket
         if plan is None or ticket is None or self.paths.shared_store is not None:
@@ -1736,8 +1754,26 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             and preimage is not None
             and hashlib.sha256(preimage).hexdigest() != digest
         ):
+            try:
+                if self._head_carries(plan):
+                    return None
+            except (verify.GitError, OSError, ValueError) as e:
+                return _PlanLeftMarked(plan, target, before, head_fault=str(e))
             return _PlanLeftMarked(plan, target, before)
         return None
+
+    def _head_carries(self, plan: Path) -> bool:
+        """Whether HEAD already holds ``plan`` as it reads on disk: a host lost
+        after ``finalize_commit`` made the squash and before the DONE save leaves
+        the mark committed, and a replayed commit that fails keeps that HEAD, so
+        the mark is no orphan. Compared as git counts sameness (clean-filtered
+        blob ids), so a CRLF checkout of the committed plan still matches."""
+        root = self.workspace.root
+        rel = plan.relative_to(root).as_posix()
+        committed = verify.revision_blob_oids(root, "HEAD", (rel,)).get(rel)
+        return committed is not None and committed == verify.git_normalized_blob_oid(
+            root, rel, plan
+        )
 
     def _undo_terminal_plan_write(self, task: StoryTask, undo: object | None) -> str | None:
         """Put the plan back to its pre-mark bytes through
@@ -1753,6 +1789,14 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         hand."""
         del task
         if isinstance(undo, _PlanLeftMarked):
+            if undo.head_fault:
+                return (
+                    f"{undo.plan} reads {undo.target}, not the {undo.before!r} the "
+                    "COMMITTING save latched — marked since, e.g. by an interrupted "
+                    f"commit window — and HEAD could not be read for it ({undo.head_fault}); "
+                    f"if HEAD does not carry it at {undo.target}, restore it by hand "
+                    "before resuming"
+                )
             return (
                 f"{undo.plan} reads {undo.target}, not the {undo.before!r} the COMMITTING "
                 "save latched — marked since, e.g. by an interrupted commit window — and "

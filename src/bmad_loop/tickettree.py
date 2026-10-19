@@ -72,7 +72,7 @@ that ticket is live. Two more errors belong to writes:
 - :class:`TicketsPlanIOError` — bmad-loop's own read, write or delete of the
   plan file raised ``OSError``.
 
-``v6_key`` claims. :func:`read_v6_key_claims` is a native read of a field
+``v6_key`` claims. :func:`read_v6_key_entries` is a native read of a field
 ``tickets.py`` ignores, not a reimplementation of the script: the v6→v7
 migration writes each story's old sprint key as ``v6_key`` into its
 ``[[entry]]``, and the script's JSON drops it, so a ledger ``gate:`` token
@@ -217,7 +217,7 @@ class TicketsPlanIOError(TicketsError):
 
 
 class TicketsV6KeyUnreadable(TicketsError):
-    """A ``tickets.toml`` :func:`read_v6_key_claims` reads could not be read or
+    """A ``tickets.toml`` :func:`read_v6_key_entries` reads could not be read or
     is mistyped, so no v6 story-key token can be resolved. ``path`` is the file
     (or folder) and ``detail`` the fault."""
 
@@ -818,8 +818,32 @@ def _epic_folders(initiative: Path) -> list[Path]:
     return sorted(folders)
 
 
+@dataclass(frozen=True)
+class V6KeyClaim:
+    """One epic ``[[entry]]``'s ``v6_key`` claim (:func:`read_v6_key_entries`):
+    the ``key``, the entry's ``E.M`` ``ref`` (None when its epic is unlisted),
+    and the identity the ref is derived from — the epic folder ``epic_slug`` and
+    the ``entry_id`` as the script compares it."""
+
+    key: str
+    ref: str | None
+    epic_slug: str
+    entry_id: str
+
+    def names(self, epic_slug: str, entry_id: str) -> bool:
+        """Whether this claim is the entry ``entry_id`` of the folder
+        ``epic_slug`` — a ticket's identity, which an epic renumbered since it
+        was picked does not change (its ``E.M`` ref does)."""
+        return self.epic_slug == epic_slug and self.entry_id == _tree_id(entry_id)
+
+
 def read_v6_key_claims(initiative: Path | None) -> tuple[tuple[str, str | None], ...]:
-    """Every ``(v6_key, ref)`` an epic ``[[entry]]`` of ``initiative`` claims.
+    """Every ``(v6_key, ref)`` pair of :func:`read_v6_key_entries`."""
+    return tuple((claim.key, claim.ref) for claim in read_v6_key_entries(initiative))
+
+
+def read_v6_key_entries(initiative: Path | None) -> tuple[V6KeyClaim, ...]:
+    """Every ``v6_key`` an epic ``[[entry]]`` of ``initiative`` claims.
 
     ``ref`` is the entry's ``E.M`` (``f"{epic_id}.{entry_id}"``, both ids as the
     script compares them), with the epic id taken from the initiative's
@@ -852,7 +876,7 @@ def read_v6_key_claims(initiative: Path | None) -> tuple[tuple[str, str | None],
         if slug in epic_ids:
             raise TicketsV6KeyUnreadable(where, f"two epics with slug {slug}")
         epic_ids[slug] = epic_id
-    claims: list[tuple[str, str | None]] = []
+    claims: list[V6KeyClaim] = []
     for folder in folders:
         where = folder / _BREAKDOWN
         entry_ids: set[str] = set()
@@ -871,7 +895,8 @@ def read_v6_key_claims(initiative: Path | None) -> tuple[tuple[str, str | None],
                     where, f"entry {entry_id} `v6_key` is not a string: {key!r}"
                 )
             epic_id = epic_ids.get(folder.name)
-            claims.append((key, None if epic_id is None else f"{epic_id}.{entry_id}"))
+            ref = None if epic_id is None else f"{epic_id}.{entry_id}"
+            claims.append(V6KeyClaim(key, ref, folder.name, entry_id))
     return tuple(claims)
 
 

@@ -61,7 +61,9 @@ from bmad_loop.tickettree import (
     TicketsV6KeyUnreadable,
     TicketTree,
     TicketTreeLike,
+    V6KeyClaim,
     read_v6_key_claims,
+    read_v6_key_entries,
 )
 
 HEADER = '# /// script\n# requires-python = ">=3.11"\n# ///\n'
@@ -1014,6 +1016,26 @@ def test_v6_key_claims_read_from_the_epic_ticket_files(tmp_path: Path):
         ("4-1-pay", "2.1"),
         ("5-1-x", None),
     )
+
+
+def test_v6_key_entries_carry_the_ticket_identity(tmp_path: Path):
+    """Each claim keeps the identity its ref is derived from — the epic folder and
+    the entry id as the script compares it — so `names` matches the picked
+    ticket's binding (`06` is entry `6`) even when the ref has moved."""
+    layout = _v6_layout(tmp_path)
+    orphan = layout.initiative_folder / "epic-orphan"
+    orphan.mkdir()
+    (orphan / "tickets.toml").write_text(
+        '[[entry]]\nid = "06"\ntype = "story"\nv6_key = "5-1-x"\n', encoding="utf-8"
+    )
+
+    entries = read_v6_key_entries(layout.initiative_folder)
+
+    assert entries[-1] == V6KeyClaim("5-1-x", None, "epic-orphan", "6")
+    assert entries[-1].names("epic-orphan", "06") and entries[-1].names("epic-orphan", "6")
+    assert not entries[-1].names("epic-orphan", "7")
+    assert not entries[-1].names(V6_TREE[0].slug, "6")
+    assert tuple((c.key, c.ref) for c in entries) == read_v6_key_claims(layout.initiative_folder)
 
 
 def test_v6_key_claims_absent_tree_reads_empty(tmp_path: Path):

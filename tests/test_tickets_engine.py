@@ -48,7 +48,12 @@ from bmad_loop.policy import (
 from bmad_loop.ticketmodel import EpicRow
 from bmad_loop.tickets_engine import TicketsEngine
 from bmad_loop.tickets_source import TicketRef, ticket_binding
-from bmad_loop.tickettree import TicketsCrashed, TicketsLockBusy, TicketsPlanIOError
+from bmad_loop.tickettree import (
+    TicketsCrashed,
+    TicketsLockBusy,
+    TicketsPlanIOError,
+    V6KeyClaim,
+)
 from bmad_loop.workspace import Workspace
 
 QUIET = NotifyPolicy(desktop=False, file=True)
@@ -561,6 +566,45 @@ def test_tickets_gate_v6_token_resolved_elsewhere_passes(project_v7):
     assert "DW-1 (gate: 3-2 (`v6_key` of 1.2))" in paused.value.reason
 
 
+def test_tickets_gate_v6_token_follows_the_picked_ticket_across_a_renumber(project_v7):
+    """The binding is the picked ticket's identity (epic folder + entry id), and a
+    resume keeps it; an epic renumbered since (`epic-cart` 1 → 3) gives the same
+    ticket the ref 3.1 in the claims snapshot. The token still gates the picked
+    1.1, through the ticket it names rather than that ref, while the binding-free
+    ref compare cannot see it. Ablation (performed): compare the resolved ref with
+    `story_key` instead of the claim's identity and 1.1 passes — this FAILS."""
+    _v6_keys(project_v7, e1_1="3-2-invite-link")
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    _gate_ledger(engine, project_v7, "gate: 3-2")
+    picked = engine._pick_next()
+    assert picked is not None and picked.key == "1.1"
+    epics = tuple(
+        dataclasses.replace(
+            epic,
+            id=3 if epic.slug == "epic-cart" else epic.id,
+            entries=tuple(
+                dataclasses.replace(
+                    entry,
+                    v6_key="3-2-invite-link" if (epic.id, entry.id) == (1, 1) else None,
+                )
+                for entry in epic.entries
+            ),
+        )
+        for epic in DEFAULT_TREE
+    )
+    write_ticket_tree(project_v7, epics)
+
+    with pytest.raises(RunPaused) as paused:
+        engine._refuse_gated_story("1.1")
+
+    assert (paused.value.stage, paused.value.story_key) == (PAUSE_STORY_GATE, "1.1")
+    assert "DW-1 (gate: 3-2 (`v6_key` of 3.1))" in paused.value.reason
+    # With no binding only the ref can be compared, and 3.1 is not 1.1.
+    engine._picked.clear()
+    engine._refuse_gated_story("1.1")  # must not raise
+
+
 @pytest.mark.parametrize(
     "keys",
     [
@@ -643,9 +687,9 @@ def test_tickets_gate_reads_claims_once_and_only_for_v6_tokens(project_v7, monke
 
     def counting(folder):
         calls.append(folder)
-        return (("3-2-invite-link", "1.2"),)
+        return (V6KeyClaim("3-2-invite-link", "1.2", "epic-cart", "2"),)
 
-    monkeypatch.setattr(tickets_engine, "read_v6_key_claims", counting)
+    monkeypatch.setattr(tickets_engine, "read_v6_key_entries", counting)
     tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
     engine, _ = make_engine(project_v7, tree)
     _gate_ledger(engine, project_v7, "gate: 1.9, epic-checkout")
@@ -1508,6 +1552,70 @@ def test_resumed_window_names_a_plan_an_interrupted_window_marked(project_v7, mo
         assert task.phase == Phase.DONE and task.commit_sha
         assert _committed_status(project_v7, task.commit_sha, plan) == "done"
         assert _kinds(resumed, "story-escalated") == []
+
+
+def test_resumed_window_after_the_squash_landed_keeps_a_plain_commit_failure(
+    project_v7, monkeypatch
+):
+    """A host lost after `finalize_commit` made the squash and before the DONE
+    save leaves the unit COMMITTING with its pre-window latch, and the `done`
+    plan both on disk and in HEAD. The resumed window's mark is a no-op on a plan
+    whose bytes no longer match the latch, but HEAD already carries them: a
+    replayed commit that fails keeps that HEAD, so the escalation is the plain
+    `commit failed:` one and never tells the operator to restore a plan the
+    landed commit holds. Ablation (performed): drop the `_head_carries` check
+    from `_terminal_plan_write`'s no-op arm and the reason says the commit does
+    not exist — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    _disk_restores(tree, monkeypatch)
+    engine, _ = make_engine(
+        project_v7, tree, script=[_builds(project_v7, tree, plan)], max_stories=1
+    )
+    real_finalize = verify.finalize_commit
+    dead: list[bool] = []
+    real_save = engine._save
+
+    def save():
+        if not dead:
+            real_save()
+
+    def lands_then_host_dies(*a, **kw):
+        landed.append(real_finalize(*a, **kw))
+        dead.append(True)
+        raise _HostDied
+
+    def host_is_gone(*a, **kw):
+        raise _HostDied
+
+    landed: list[str | None] = []
+    monkeypatch.setattr(engine, "_save", save)
+    monkeypatch.setattr(verify, "finalize_commit", lands_then_host_dies)
+    monkeypatch.setattr(engine, "_undo_terminal_plan_write", host_is_gone)
+
+    with pytest.raises(_HostDied):
+        engine.run()
+
+    [sha] = landed
+    assert sha and verify.rev_parse_head(project_v7.project) == sha
+    assert _committed_status(project_v7, sha, plan) == "done"
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.COMMITTING and task.ticket_premark_status == "built"
+
+    monkeypatch.setattr(verify, "finalize_commit", real_finalize)
+    _reject_commits(project_v7)
+    resumed = _resume(engine, tree)
+    summary = resumed.run()
+
+    assert [(m.target, m.outcome) for m in tree.marks] == [("done", "written"), ("done", "noop")]
+    assert tree.restores == []
+    assert verify.rev_parse_head(project_v7.project) == sha
+    assert summary.paused
+    [escalated] = _kinds(resumed, "story-escalated")
+    reason = escalated["reason"]
+    assert reason.startswith("commit failed: ")
+    assert "does not exist" not in reason and "by hand" not in reason
 
 
 def test_plan_at_target_before_the_window_keeps_a_plain_commit_failure(project_v7, monkeypatch):
