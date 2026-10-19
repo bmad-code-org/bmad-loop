@@ -3652,6 +3652,19 @@ class HeldSweepClosesError(Exception):
         super().__init__(f"run {run_id}: refusing to delete it — {what}. {remedy}")
 
 
+def _bundle_code_landed(task: StoryTask) -> bool:
+    """Whether ``task``'s code is on the target. In place it lands with the
+    ``DONE`` (or ``AWAITING_OPERATOR``) commit. Under isolation the terminal phase
+    is saved BEFORE ``WorktreeFlow.integrate_unit`` merges the unit back, so the
+    phase alone does not prove a landing: only ``isolated_ledger_carried``, which
+    that merge-back (or ``Engine._replay_unlatched_ledger_carries``) latches once
+    the merge is done, does. A host lost between the two leaves the close held
+    until a resume replays the merge."""
+    if task.phase not in (Phase.DONE, Phase.AWAITING_OPERATOR):
+        return False
+    return not task.worktree_path or task.isolated_ledger_carried
+
+
 def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
     """The deferred-work ids whose ledger close the sweep run at ``run_dir`` still
     holds with no code landed, in task order. An isolated v7 bundle over a shared
@@ -3664,7 +3677,8 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
 
     - it is an unfinished, isolated sweep (``state.target_branch`` or the task's
       ``worktree_path``);
-    - it has a task that is not ``DONE`` with ``bundle_closes_intended`` set;
+    - it has a task whose code has not landed (:func:`_bundle_code_landed`) with
+      ``bundle_closes_intended`` set;
     - the ledger lies in the shared store (``bmadconfig.load_paths`` with the
       run's recorded topology, :func:`live_store_topology`);
     - the ledger still shows that task's close as undoable under its note and
@@ -3688,7 +3702,7 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
     candidates = [
         task
         for task in state.tasks.values()
-        if task.phase != Phase.DONE
+        if not _bundle_code_landed(task)
         and task.bundle_closes_intended
         and (state.target_branch or task.worktree_path)
     ]

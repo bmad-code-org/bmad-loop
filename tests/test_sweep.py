@@ -39558,6 +39558,43 @@ def test_v7_bundle_store_trailers_name_the_landed_squash_commit(project_v7_store
     assert f"Bmad-Code-Range: {task.baseline_commit}..{landed}" in body
 
 
+@pytest.mark.parametrize("publisher", ["close", "deferred"])
+@pytest.mark.parametrize("ledger_state", ["gone", "directory", "undecodable"])
+def test_v7_store_ledger_publisher_journals_a_ledger_it_cannot_publish(
+    project_v7_store_repo, publisher, ledger_state
+):
+    """T3: the bundle's close went into the store repository's ledger, then the
+    ledger was deleted, replaced by a directory or left unreadable before the
+    publisher ran. The publisher commits nothing and journals
+    `store-commit-failed` naming the ledger and its message, rather than
+    returning as if it had nothing to publish.
+
+    ABLATION (performed): answer False with nothing journaled for every ledger
+    `_store_ledger_to_publish` cannot read (the old `not ledger.is_file()`
+    early return) and every row fails (no row)."""
+    engine, paths, store, ledger_rel, task = _v7_isolated_close_seam(project_v7_store_repo, "T3")
+    head = git(store, "rev-parse", "HEAD").strip()
+    ledger = paths.deferred_work
+    ledger.unlink()
+    if ledger_state == "directory":
+        ledger.mkdir()
+    elif ledger_state == "undecodable":
+        ledger.write_bytes(b"\xff\xfe not utf-8")
+
+    if publisher == "close":
+        engine._publish_bundle_close(task)
+        message = _V7_LEDGER_CLOSE
+    else:
+        engine._publish_deferred_ledger(task)
+        message = _V7_LEDGER_DEFERRED
+
+    rows = _records(engine, "store-commit-failed")
+    assert [r["story_key"] for r in rows] == [task.story_key]
+    assert str(ledger) in rows[0]["error"] and message in rows[0]["error"]
+    assert git(store, "rev-parse", "HEAD").strip() == head  # nothing committed
+    assert _records(engine, "store-committed") == []
+
+
 def test_v7_bundle_plan_in_a_checkout_store_rides_the_code_commit(project_v7):
     """T1 (the store is tracked inside the code checkout): the code commit
     already carries the plan, so the sweep makes no store-repository commit and

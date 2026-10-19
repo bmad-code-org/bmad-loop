@@ -11600,25 +11600,37 @@ def _rewrite_state(engine, **changes) -> None:
 
 
 @pytest.mark.parametrize(
-    "shape", ["landed", "not-isolated", "finished", "story-run", "no-close-intended"]
+    "shape",
+    [
+        "landed",
+        "landed-parked",
+        "not-isolated",
+        "finished",
+        "story-run",
+        "no-close-intended",
+    ],
 )
 def test_held_sweep_closes_ignores_a_run_that_holds_nothing(project_v7_store_repo, shape):
-    """Each row breaks one condition of "holds": the task landed (DONE), the run is
-    not isolated, the run finished, the run is not a sweep, or no close was ever
-    intended. The close stays `done` in every row, so only the condition answers
-    `[]`.
+    """Each row breaks one condition of "holds": the task landed (DONE or
+    AWAITING_OPERATOR, merged back), the run is not isolated, the run finished,
+    the run is not a sweep, or no close was ever intended. The close stays `done`
+    in every row, so only the condition answers `[]`.
 
-    Ablation: delete the `task.phase != Phase.DONE` predicate and "landed" fails;
+    Ablation: make `_bundle_code_landed` answer False and both "landed" rows fail;
     delete the isolation predicate and "not-isolated" fails; delete the
     `state.finished` check and "finished" fails; delete the `run_type` check and
     "story-run" fails."""
     ts = _seam()
     seam = {
         "landed": {"phase": Phase.DONE},
+        "landed-parked": {"phase": Phase.AWAITING_OPERATOR},
         "not-isolated": {"worktree": False},
         "no-close-intended": {"intended": False},
     }.get(shape, {})
-    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo, **seam)
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, **seam)
+    if shape.startswith("landed"):
+        task.isolated_ledger_carried = True  # the merge-back's latch
+        engine._save()
     if shape == "finished":
         _rewrite_state(engine, finished=True)
     elif shape == "story-run":
@@ -11626,6 +11638,22 @@ def test_held_sweep_closes_ignores_a_run_that_holds_nothing(project_v7_store_rep
     assert not ts.ledger_entries(paths)["DW-1"].open  # premise: the close stands
 
     assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+
+@pytest.mark.parametrize("phase", [Phase.DONE, Phase.AWAITING_OPERATOR])
+def test_held_sweep_closes_names_a_terminal_unit_not_yet_merged_back(project_v7_store_repo, phase):
+    """An isolated unit saves its terminal phase BEFORE `integrate_unit` merges it
+    back. A host lost between the two leaves a DONE (or AWAITING_OPERATOR) task
+    with `isolated_ledger_carried` False: its code is not on the target, and only
+    a resume replays the merge, so the run still holds its close.
+
+    Ablation: key landing on the phase alone (drop the `isolated_ledger_carried`
+    clause of `_bundle_code_landed`) and this fails."""
+    ts = _seam()
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, phase=phase)
+    assert not task.isolated_ledger_carried  # premise: the merge-back never latched
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]
 
 
 def test_held_sweep_closes_ignores_a_close_already_reopened(project_v7_store_repo):
@@ -11827,10 +11855,12 @@ def test_delete_run_checks_held_closes_under_the_lock_after_the_liveness_guard(
 
 
 def test_delete_run_removes_a_sweep_run_that_holds_nothing(project_v7_store_repo):
-    """A sweep run whose bundle landed (DONE) holds no close, so it is deleted as
-    before."""
+    """A sweep run whose bundle landed (DONE, merged back) holds no close, so it
+    is deleted as before."""
     ts = _seam()
-    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo, phase=Phase.DONE)
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, phase=Phase.DONE)
+    task.isolated_ledger_carried = True  # the merge-back's latch
+    engine._save()
 
     runs.delete_run(paths.project, engine.run_dir, warn=lambda _note: None)
 

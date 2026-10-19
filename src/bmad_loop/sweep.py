@@ -8823,19 +8823,16 @@ class SweepEngine(Engine):
         ``integrate_unit`` after the merge, so a failed commit journals
         ``store-commit-failed`` (a staged foreign version of the ledger
         ``store-commit-foreign-dirt``) and the close stays uncommitted for a human
-        or a later publisher. A ledger already at the store's HEAD journals
-        nothing."""
+        or a later publisher. So does a ledger gone or unreadable in the store
+        repository (:meth:`_store_ledger_to_publish`). A ledger already at the
+        store's HEAD journals nothing."""
         topology = self.store_topology
         if topology is None or topology.store_repo is None or not task.bundle_closes_intended:
             return
         ledger = self.workspace.paths.deferred_work
-        try:
-            inside = ledger.resolve().is_relative_to(topology.store_repo.resolve())
-        except (OSError, RuntimeError, ValueError):
-            inside = False
-        if not inside or not ledger.is_file():
-            return
         message = "chore(sweep): close resolved deferred-work entries"
+        if not self._store_ledger_to_publish(task, topology.store_repo, ledger, message):
+            return
         if self._ledger_unfit_to_publish():
             self._withhold_ledger_publish(message, dw_ids=list(task.bundle_closes_intended))
             return
@@ -8893,23 +8890,55 @@ class SweepEngine(Engine):
         effort, like :meth:`_publish_bundle_close`: a failed commit journals
         ``store-commit-failed`` (a staged foreign version of the ledger
         ``store-commit-foreign-dirt``) and the writes stay uncommitted for a human
-        or a later publisher; a ledger already at the store's HEAD journals
-        nothing."""
+        or a later publisher, as does a ledger gone or unreadable in the store
+        repository (:meth:`_store_ledger_to_publish`); a ledger already at the
+        store's HEAD journals nothing."""
         topology = self.store_topology
         if topology is None or topology.store_repo is None:
             return
         ledger = self.paths.deferred_work
-        try:
-            inside = ledger.resolve().is_relative_to(topology.store_repo.resolve())
-        except (OSError, RuntimeError, ValueError):
-            inside = False
-        if not inside or not ledger.is_file():
-            return
         message = "chore(sweep): record a deferred bundle's ledger writes"
+        if not self._store_ledger_to_publish(task, topology.store_repo, ledger, message):
+            return
         if self._ledger_unfit_to_publish():
             self._withhold_ledger_publish(message, dw_ids=list(task.dw_ids))
             return
         self._commit_store_ledger(task, topology.store_repo, ledger, message, code_commit=None)
+
+    def _store_ledger_to_publish(
+        self, task: StoryTask, store_repo: Path, ledger: Path, message: str
+    ) -> bool:
+        """Whether a ledger publisher (:meth:`_publish_bundle_close`,
+        :meth:`_publish_deferred_ledger`) commits ``ledger`` in ``store_repo``. A
+        ledger outside the store repository answers False with nothing journaled:
+        the code commit carries it. A ledger that cannot be located (a
+        ``resolve()`` fault), or that is gone, not a regular file or unreadable
+        inside the store repository, journals ``store-commit-failed`` naming
+        ``message`` and answers False. The write it should hold goes unpublished,
+        and that must not read as a publisher with nothing to do."""
+        try:
+            inside = ledger.resolve().is_relative_to(store_repo.resolve())
+        except (OSError, RuntimeError, ValueError) as e:
+            fault: str | None = (
+                f"the deferred-work ledger {ledger} could not be located "
+                f"({type(e).__name__}: {e})"
+            )
+        else:
+            if not inside:
+                return False
+            text, read_fault = deferredwork.observe_ledger(ledger)
+            if read_fault is not None:
+                fault = f"the deferred-work ledger {ledger} could not be read ({read_fault})"
+            elif text is None:
+                fault = f"the deferred-work ledger {ledger} is gone from the store repository"
+            else:
+                return True
+        self.journal.append(
+            "store-commit-failed",
+            story_key=task.story_key,
+            error=f"{fault}; {message!r} was not committed",
+        )
+        return False
 
     def _vetoed(self, ctx: HookContext | None, task: StoryTask) -> bool:
         """The base veto routing, after :meth:`_reopen_unlanded_close` when a
