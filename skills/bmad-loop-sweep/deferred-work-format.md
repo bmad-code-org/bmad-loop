@@ -106,7 +106,7 @@ an absent `location:` as `n/a`, never as "not yet known".
 Entries the orchestrator harvests from a spec carry one extra line,
 `source_spec:`, directly after `location:` — the spec the deferral came from. On
 v7 the field keeps its name and holds the plan's path relative to the initiative
-folder (`epic-auth/story-login-plan.md`), because plan names repeat across epics.
+folder (`tickets/epic-auth/tickets/story-login-plan.md`), because plan names repeat across epics.
 It is half the dedupe key (with `origin:`), so never edit or drop it when
 touching an entry; entries written by hand do not need it.
 

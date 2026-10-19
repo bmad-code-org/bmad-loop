@@ -142,7 +142,7 @@ as they read now:
     "ticket_id": "2",
     "title": "List command",
     "epic": "epic-cli",
-    "plan": "/abs/path/to/<initiative>/epic-cli/story-list-command-plan.md",
+    "plan": "/abs/path/to/<initiative>/tickets/epic-cli/tickets/story-list-command-plan.md",
     "plan_status": "blocked",
     "blocked_reason": "intent gap",
     "auto_run_result": "…excerpt of the plan's `## Auto Run Result`…"
@@ -203,8 +203,10 @@ case below — omit it entirely for an ordinary resolution.
    `<intent-contract>` block (v7 plan; `<frozen-after-approval>` in an older
    spec) and any affected acceptance criteria / test
    matrix rows so a fresh dev session has exactly one correct reading. Make the
-   smallest change that removes the ambiguity. You MAY use the `bmad-spec` or
-   `bmad-correct-course` skills if a larger spec change is warranted. **If
+   smallest change that removes the ambiguity. If a larger change is warranted: in
+   sprint or stories mode you MAY use the `bmad-spec` or `bmad-correct-course`
+   skills (BMAD v6); in tickets mode use `bmad-agent-po` to refine or replan the
+   ticket. **If
    `spec_reaches_the_redrive` is `false`, make the same edit and then say plainly
    that this copy is not the one the re-drive reads, and name the remedy that
    `redrive_base_ref` selects: on a branch, the correction must be

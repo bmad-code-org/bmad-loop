@@ -13,8 +13,9 @@ breaking changes may land in a minor release.
   (`[stories] source = "tickets"`): dispatch `bmad-build-auto ticket <ref>` in initiative
   build order, verify each plan at `built`, and mark it `done` through `tickets.py mark`
   (`[tickets] mark_done`, `thorough_review`). See `docs/tickets-guide.md`.
-- Support BMAD-METHOD v7 as of upstream main `8f0d50e1` (`6.13.0-next`; v7 is not yet
-  tagged). The contract tests run against `tickets.py` vendored at that commit.
+- Support BMAD-METHOD v7 as of upstream main `61e01f82` (`6.13.0-next`; v7 is not yet
+  tagged). The contract tests run against `bmad-agent-po`'s `tickets.py` vendored at
+  that commit.
 - Resolve BMAD v7 config (`[core] output_folder`, `active_initiative`): a project with
   `_bmad/method/scripts/tickets.py` resolves its artifacts to the active initiative
   folder. New validate warnings `bmad-config.initiative-unset` and
@@ -32,7 +33,7 @@ breaking changes may land in a minor release.
   review, and `done_checkpoint` pauses after the ticket commits.
 - Run the epic retrospective (`/bmad-retrospective -H <epic-slug>`) when a run finishes
   an epic, record its verdict, and pause at `epic-boundary` for a person to close the
-  epic with bmad-ticket. A `rejected` verdict pauses every later pick while the epic
+  epic with bmad-agent-po. A `rejected` verdict pauses every later pick while the epic
   stays open; any other pauses once. A retrospective refused for a dirty tree, a git fault or a stop request
   records no closure, so the resume runs it.
 - Park a ticket as `blocked` ("awaiting operator: …"), never `done`.
@@ -66,6 +67,9 @@ breaking changes may land in a minor release.
   `tickets` objects; schema 1), and in the TUI: a tickets board, `hitl`/`refine`/`tree`
   badges, pause-reason and epic-closure viewers, a start-run preview, and **Request
   replan** through `tickets.py mark`.
+- Add the `tickets.initiative-parent` validate finding: a run refuses a parent
+  initiative (`[[initiative]]` children in its `tickets.toml`) and names its children,
+  so `[core] active_initiative` can be set to one child.
 - Ship a `bmod.toml` module record (`bmod-bmad-loop`) so BMAD v7 `bmad setup` can
   discover, install and update-check bmad-loop; each bundled skill carries its own
   `[skill]` record.
@@ -106,6 +110,11 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Read the BMAD v7 `tickets/` folder layout, where each initiative and epic keeps its
+  `tickets.toml`, epics, leaf files and plans; the preview-era flat layout is still read
+  when the installed `tickets.py` uses it.
+- Recommend `bmad-agent-po` (Sofia), which replaces the retired `bmad-ticket`, in the
+  bmod record, pause and preflight messages, and the bundled skills.
 - Move the module skills to a repo-root `skills/` directory so the Vercel `skills` CLI
   (`npx skills add bmad-code-org/bmad-loop`) discovers them without the plugin
   manifest. The wheel still bundles them under `bmad_loop/data/skills`; `bmod.toml`
@@ -161,6 +170,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Read an epic the initiative declares but has not sliced yet: `status` no longer
+  faults the board on its folderless row, and it triggers no retrospective or closure.
 - Name the T1 ticket plan an interrupted commit window left `done` or `blocked` when
   the resumed commit fails, instead of a bare `commit failed:` (DW-555).
 - Commit a v7 sweep's own ledger writes (bundle closes, reopened closes, harvested

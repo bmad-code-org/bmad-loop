@@ -2618,6 +2618,34 @@ def test_vendored_bmad_v7_matches_pin():
         assert digest == entry["sha256"], f"{name} drifted from {entry['upstream_path']}"
 
 
+@pytest.mark.parametrize("flat", [False, True], ids=["tickets", "flat"])
+def test_write_ticket_tree_writes_the_tickets_folder_layout(tmp_path, flat):
+    """`write_ticket_tree` and `write_plan` write upstream's `tickets/` layout: the
+    initiative and epic files at their folders' tops, each breakdown, leaf and plan
+    in its container's `tickets/` folder. ``flat`` writes the preview layout, every
+    breakdown beside its container's file. Read from disk, no spawn."""
+    layout = conftest.v7_layout(tmp_path / "sandbox")
+    conftest.write_ticket_tree(layout, conftest.DEFAULT_TREE, flat=flat)
+    plan = conftest.write_plan(layout, "epic-cart", "story-cart-model-plan", 1, "built", flat=flat)
+
+    init = layout.initiative_folder
+    sub = Path() if flat else Path("tickets")
+    cart, checkout = init / sub / "epic-cart", init / sub / "epic-checkout"
+    expected = {
+        init / f"{layout.initiative}.md",
+        init / sub / "tickets.toml",
+        cart / "epic-cart.md",
+        cart / sub / "tickets.toml",
+        cart / sub / "story-cart-model-plan.md",
+        checkout / "epic-checkout.md",
+        checkout / sub / "tickets.toml",
+        checkout / sub / "story-checkout-form.md",
+    }
+    assert {p for p in init.rglob("*") if p.is_file()} == expected
+    assert plan == cart / sub / "story-cart-model-plan.md"
+    assert (init / "tickets").exists() is not flat
+
+
 def _rows(doc: dict, group: str) -> list[dict]:
     rows = doc[group]
     assert isinstance(rows, list)
@@ -2673,8 +2701,8 @@ def test_project_v7_template_is_clean_and_ignores_user_toml(project_v7):
         conftest.V7_STORE_CONFIG_REL.as_posix(),
         "_bmad/config.toml",
         ".claude/skills/bmod-method/bmod.toml",
-        f"{rel_tree}/tickets.toml",
-        f"{rel_tree}/epic-cart/tickets.toml",
+        f"{rel_tree}/tickets/tickets.toml",
+        f"{rel_tree}/tickets/epic-cart/tickets/tickets.toml",
     ):
         assert rel in tracked, rel
     for installed, vendored in (

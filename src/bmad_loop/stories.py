@@ -1,6 +1,8 @@
 """Model of stories.yaml — the Story Breakdown manifest for "stories mode".
 
-The optional Story Breakdown step of `bmad-spec` emits ``stories.yaml``, a
+The optional Story Breakdown step of BMAD v6.12's `bmad-spec` emits
+``stories.yaml`` (a v6-only pipeline: v7 replaced `bmad-spec` with
+`bmad-agent-po` and its ticket tree, which tickets mode reads), a
 fixed-name sibling of ``SPEC.md`` in the spec folder (discovered by name, never
 referenced from frontmatter). It is a flat list, one entry per story, in strict
 execution order — **there is no ``depends_on`` field**, so the schedule is a

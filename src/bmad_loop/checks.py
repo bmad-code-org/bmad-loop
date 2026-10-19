@@ -138,6 +138,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "tickets.uv-missing",
         "tickets.initiative-unset",
         "tickets.initiative-missing",
+        # the active initiative is a parent (`[[initiative]]` children): a run needs one child
+        "tickets.initiative-parent",
         # the ticket-store topology (ticketstore.classify_store): the classified
         # layout, or a store tickets runs refuse (a T1 store outside the project
         # under worktree isolation)

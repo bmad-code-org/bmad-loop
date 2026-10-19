@@ -146,7 +146,7 @@ AWAITING_OPERATOR = "awaiting-operator"
 
 # BMAD v7 ticket-plan terminals. A v7 build session finishes a ticket at
 # `built`: `done` belongs to the orchestrator, which marks it after its own
-# verification. `dropped` is bmad-ticket's, a human withdrawing the ticket, so a
+# verification. `dropped` is bmad-agent-po's, a human withdrawing the ticket, so a
 # session that ends on it has nothing to land. Neither is terminal unless the
 # caller opts in through ``success_statuses`` (see `terminal_statuses`): the v6
 # vocabulary has no such tokens, and a sprint or stories spec reading either one

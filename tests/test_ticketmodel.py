@@ -272,6 +272,110 @@ def test_parse_status_malformed_is_schema_error(mutate):
         parse_status(doc)
 
 
+def _unsliced(slug: str = "epic-payment", epic_id: int = 3) -> dict[str, object]:
+    """A declared epic with no folder yet, as `status_view` prints it."""
+    return {
+        "slug": slug,
+        "id": epic_id,
+        "after": [{"epic": "epic-checkout", "needs": "checkout works"}],
+        "folder": None,
+    }
+
+
+def test_status_epic_row_without_a_folder_parses_as_unsliced():
+    doc = _status()
+    doc["epics"].append(_unsliced())
+    payment = parse_status(doc).epics[2]
+    assert payment.slug == "epic-payment" and payment.id == "3" and payment.folder is None
+    assert payment.after[0].epic == "epic-checkout"
+    assert (payment.status, payment.gated_by, payment.blocks, payment.next_id) == ("", (), (), None)
+    assert payment.refined is False
+
+
+@pytest.mark.parametrize("field", ["status", "gated_by", "blocks", "next_id"])
+def test_status_epic_row_with_a_folder_still_requires_its_fields(field):
+    doc = _status()
+    doc["epics"][0].update(folder="epic-cart", refined=True)
+    del doc["epics"][0][field]
+    with pytest.raises(TicketsSchemaError) as caught:
+        parse_status(doc)
+    assert caught.value.field == field
+
+
+def test_status_epic_row_reads_folder_and_refined():
+    doc = _status()
+    doc["epics"][0].update(folder="epic-cart", refined=False)
+    doc["epics"][1].update(folder="epic-checkout", refined=True)
+    cart, checkout = parse_status(doc).epics
+    assert (cart.folder, cart.refined, cart.next_id) == ("epic-cart", False, 3)
+    assert (checkout.folder, checkout.refined) == ("epic-checkout", True)
+    # A preview-era script prints neither: the row has its folder and is refined.
+    preview = parse_status(_status()).epics[0]
+    assert (preview.folder, preview.refined) == ("epic-cart", True)
+    doc["epics"][0]["refined"] = "no"
+    with pytest.raises(TicketsSchemaError) as caught:
+        parse_status(doc)
+    assert caught.value.field == "refined"
+
+
+def _parent_view(**over: object) -> dict[str, object]:
+    """A parent initiative's `parent_view`, as `status` prints it."""
+    doc: dict[str, object] = {
+        "store": "repo",
+        "folder": "initiative-platform",
+        "initiatives": [
+            {
+                "id": 1,
+                "slug": "initiative-auth",
+                "title": "Auth",
+                "after": [],
+                "folder": "initiative-auth",
+                "status": "in-progress",
+                "counts": {"total": 2, "planned": 2},
+                "waiting_on": [],
+            },
+            {
+                "id": 2,
+                "slug": "initiative-billing",
+                "title": "Billing",
+                "after": [{"initiative": "initiative-auth", "needs": ""}],
+                "folder": None,
+                "waiting_on": ["initiative-auth"],
+            },
+        ],
+        "order_conflict": [],
+    }
+    doc.update(over)
+    return doc
+
+
+def test_status_parent_view_raises_parent_initiative():
+    with pytest.raises(ticketmodel.TicketsParentInitiative) as caught:
+        parse_status(_parent_view())
+    e = caught.value
+    assert isinstance(e, TicketsSchemaError) and e.command == "status"
+    assert e.folder == "initiative-platform"
+    assert e.children == ("initiative-auth", "initiative-billing")
+    assert str(e) == (
+        "active initiative initiative-platform is a parent initiative "
+        "(children: initiative-auth, initiative-billing); "
+        "set `[core] active_initiative` to one child"
+    )
+
+
+def test_next_parent_view_raises_parent_initiative():
+    with pytest.raises(ticketmodel.TicketsParentInitiative) as caught:
+        parse_next(_parent_view(ready=["initiative-auth"]))
+    assert caught.value.command == "next"
+    assert caught.value.children == ("initiative-auth", "initiative-billing")
+    # A child row with no text slug is a schema fault, not a parent with no name.
+    doc = _parent_view()
+    doc["initiatives"][0]["slug"] = 1
+    with pytest.raises(TicketsSchemaError) as plain:
+        parse_next(doc)
+    assert not isinstance(plain.value, ticketmodel.TicketsParentInitiative)
+
+
 def _find(**over: object) -> dict[str, object]:
     doc = _row(file="story-cart-model.md", refined=True)
     doc.update(

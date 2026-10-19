@@ -26,7 +26,16 @@ import perf_report
 import pytest
 import yaml
 
-from bmad_loop import cli, documents, envvars, platform_util, runs, ticketmodel, win32_at
+from bmad_loop import (
+    cli,
+    documents,
+    envvars,
+    platform_util,
+    runs,
+    ticketlayout,
+    ticketmodel,
+    win32_at,
+)
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.checks import ValidationReport
@@ -1874,7 +1883,7 @@ def install_bmad_v7(
         'code = "method"\n'
         f"version = {json.dumps(bmod_version)}\n"
         'update_source = "github:bmad-code-org/BMAD-METHOD/skills"\n'
-        'skills = ["bmad-build-auto", "bmad-ticket"]\n',
+        'skills = ["bmad-build-auto", "bmad-agent-po"]\n',
         encoding="utf-8",
     )
     layout.initiative_folder.mkdir(parents=True, exist_ok=True)
@@ -1912,13 +1921,26 @@ def ticket_slug(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
 
 
-def write_ticket_tree(layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicSpec]) -> None:
-    """Hand-write the initiative's breakdown: its own frontmatter file, the
-    `[[epic]]` table in build order, and per epic its `epic-<x>.md` and `tickets.toml`
-    (plus a pulled leaf file for every ``refined`` entry). Plans are separate:
+def _breakdown(container: Path, *, flat: bool) -> Path:
+    """Where ``container``'s `tickets.toml`, epic folders, leaves and plans go: its
+    `tickets/` folder, or the container itself in the preview layout (``flat``)."""
+    return container if flat else container / ticketlayout.TICKETS
+
+
+def write_ticket_tree(
+    layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicSpec], *, flat: bool = False
+) -> None:
+    """Hand-write the initiative's breakdown in upstream's `tickets/` layout: the
+    initiative's own frontmatter file, `tickets/tickets.toml` with the `[[epic]]` table
+    in build order, and per epic `tickets/<epic>/` holding its `<epic>.md` and its own
+    `tickets/` folder with `tickets.toml` (plus a pulled leaf file for every
+    ``refined`` entry). ``flat`` writes the "7 preview" layout instead, every
+    breakdown beside its container's file, which only a preview-era script reads: keep
+    it to reader tests that never spawn the vendored script. Plans are separate:
     `write_plan`."""
     folder = layout.initiative_folder
-    folder.mkdir(parents=True, exist_ok=True)
+    breakdown = _breakdown(folder, flat=flat)
+    breakdown.mkdir(parents=True, exist_ok=True)
     (folder / f"{layout.initiative}.md").write_text(
         _frontmatter(
             {"type": "initiative", "title": layout.initiative, "parent": "none"},
@@ -1936,10 +1958,11 @@ def write_ticket_tree(layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicS
             )
             block += f"after = [{gates}]\n"
         table.append(block)
-    (folder / "tickets.toml").write_text("\n".join(table), encoding="utf-8")
+    (breakdown / ticketlayout.BREAKDOWN).write_text("\n".join(table), encoding="utf-8")
     for epic in epics:
-        epic_dir = folder / epic.slug
-        epic_dir.mkdir(exist_ok=True)
+        epic_dir = breakdown / epic.slug
+        leaves = _breakdown(epic_dir, flat=flat)
+        leaves.mkdir(parents=True, exist_ok=True)
         fields: dict[str, object] = {"type": "epic", "title": epic.title, "status": epic.status}
         if epic.gated_by:
             fields["after"] = list(epic.gated_by)
@@ -1963,7 +1986,7 @@ def write_ticket_tree(layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicS
                 block += f"v6_key = {json.dumps(e.v6_key)}\n"
             entries.append(block)
             if e.refined:
-                (epic_dir / f"{e.type}-{ticket_slug(e.title)}.md").write_text(
+                (leaves / f"{e.type}-{ticket_slug(e.title)}.md").write_text(
                     _frontmatter(
                         {
                             "id": e.id,
@@ -1978,16 +2001,25 @@ def write_ticket_tree(layout: V7Layout, epics: tuple[EpicSpec, ...] | list[EpicS
                     ),
                     encoding="utf-8",
                 )
-        (epic_dir / "tickets.toml").write_text("\n".join(entries), encoding="utf-8")
+        (leaves / ticketlayout.BREAKDOWN).write_text("\n".join(entries), encoding="utf-8")
 
 
 def write_plan(
-    layout: V7Layout, epic_slug: str, stem: str, ticket: int | str, status: str, **fm: object
+    layout: V7Layout,
+    epic_slug: str,
+    stem: str,
+    ticket: int | str,
+    status: str,
+    *,
+    flat: bool = False,
+    **fm: object,
 ) -> Path:
-    """Write ``<epic>/<stem>.md``, a build plan for entry ``ticket``, with frontmatter
-    `ticket` and `status` plus ``fm``. Upstream names plans
+    """Write ``tickets/<epic>/tickets/<stem>.md`` under the initiative (``<epic>/<stem>.md``
+    when ``flat``, as `write_ticket_tree`), a build plan for entry ``ticket``, with
+    frontmatter `ticket` and `status` plus ``fm``. Upstream names plans
     ``<type>-<title slug>-plan.md``; pass that stem to look like a real build."""
-    path = layout.initiative_folder / epic_slug / f"{stem}.md"
+    epic_dir = _breakdown(layout.initiative_folder, flat=flat) / epic_slug
+    path = _breakdown(epic_dir, flat=flat) / f"{stem}.md"
     fields: dict[str, object] = {"ticket": ticket, "status": status, **fm}
     path.write_text(_frontmatter(fields, f"# {stem}\n"), encoding="utf-8")
     return path

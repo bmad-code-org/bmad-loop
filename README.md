@@ -28,14 +28,14 @@ Plain Python drives the loop — **pick story → implement → adversarially re
 > ⚠️ **Early open beta — experimental, and moving fast.** Expect rough edges and **breaking changes in any pre-1.0 release** (CLI flags, policy keys, on-disk run state, skill contracts). bmad-loop drives real coding agents that write and commit in your repository, so point it at work you can review and roll back (`[scm] isolation = "worktree"` keeps attempts off your main checkout), pin a release tag for a stable base, and read the [CHANGELOG](CHANGELOG.md) before upgrading.
 > Report bugs as an [issue](https://github.com/bmad-code-org/bmad-loop/issues) with `bmad-loop diagnose` output attached, or talk to us on [Discord](https://discord.gg/gk8jAdXWmj).
 
-bmad-loop runs BMAD stories unattended. It reads your sprint board (or a `bmad-spec` story breakdown), launches a fresh coding-agent session for each story inside a terminal multiplexer, checks what the session left on disk, runs your tests, and commits — then moves to the next story. It was inspired by the original [bmad-automator](https://github.com/bmad-code-org/bmad-automator) (a separate, legacy project), but here the orchestrator is ordinary code, not an LLM session.
+bmad-loop runs BMAD stories unattended. It reads your sprint board (or a v6 `bmad-spec` story breakdown, or a BMAD v7 initiative ticket tree), launches a fresh coding-agent session for each story inside a terminal multiplexer, checks what the session left on disk, runs your tests, and commits — then moves to the next story. It was inspired by the original [bmad-automator](https://github.com/bmad-code-org/bmad-automator) (a separate, legacy project), but here the orchestrator is ordinary code, not an LLM session.
 
 ## Why bmad-loop
 
 - 🧠 **No LLM in the control loop.** Story selection, retry budgets, gates and completion checks are plain Python: deterministic, debuggable, and free. A session counts as complete only on a completion event from the coding agent or the death of its session, never on model prose; timeouts, stalls and budget caps end it as a failure.
 - 🔍 **Trust nothing, verify everything.** After each session the orchestrator checks the spec status, the baseline commit, that code actually changed, and that the board matches, then runs _your_ `[verify]` commands before it commits.
 - 🪟 **Fresh-context review.** Review runs as a separate session that never inherits the implementer's context, optionally on a different CLI or model. It is bounded, so a story cannot oscillate forever.
-- 📒 **One board writer.** During a run bmad-loop is the only writer of `sprint-status.yaml` rows; board writes are serialized and never move a story backward, except that a review can return a `done` story to `awaiting-operator`.
+- 📒 **One board writer.** During a run bmad-loop is the only writer of `sprint-status.yaml` rows; board writes are serialized and never move a story backward, except that a review can return a `done` story to `awaiting-operator`. In ticket-tree mode bmad-loop writes a plan's status only through the project's `tickets.py mark`, and never while that ticket's session is live.
 - ♻️ **Built for unattended runs.** Every run is resumable on-disk state. A story that never converges is deferred and the run continues; a CRITICAL escalation pauses for `bmad-loop resolve`; work only a human can do parks until `bmad-loop confirm`.
 - 📋 **Deferred work gets done.** Split-off goals and review findings land in a ledger that `bmad-loop sweep` triages against the code and builds through the same pipeline.
 - 🔌 **Any of six coding CLIs.** `claude`, `codex`, `gemini`, `copilot`, `antigravity` and `opencode` are TOML profiles, mixable per stage, with cost-weighted token budgets.
@@ -47,6 +47,7 @@ bmad-loop runs BMAD stories unattended. It reads your sprint board (or a `bmad-s
 - **Linux, macOS, or Windows via WSL**, with a terminal multiplexer: tmux (3.2+) is the default. Native Windows uses the bundled psmux backend, which is experimental — see [Terminal multiplexer backends](docs/multiplexer-backends.md).
 - A supported coding CLI — `claude` by default, or another [profile](#other-coding-clis).
 - A **BMAD v6 project** on **BMAD-METHOD ≥ 6.10.0**, with the upstream dev skill `bmad-build-auto` installed (`bmad-dev-auto` on pre-rename releases). `bmad-loop validate` checks it and any review skills it invokes. Sprint mode also needs a `sprint-status.yaml` from `bmad-sprint-planning`.
+- Or a **BMAD v7 project** (the v7 preview, BMAD-METHOD `6.13.0-next` or newer) with the `bmad` and `bmad-build-auto` skills and `uv` on `PATH`, planned with Sofia (`bmad-agent-po`). Ticket-tree mode is experimental; see the [ticket-tree mode guide](docs/tickets-guide.md).
 
 ## Quick start
 
@@ -62,6 +63,8 @@ bmad-loop tui                    # …or drive everything from the dashboard
 ```
 
 > **One-time setup:** start the coding CLI once in the project (`claude`) and accept its workspace-trust and hooks prompts before `bmad-loop run`. Spawned sessions can't answer first-run dialogs; see [First-run notes](docs/setup-guide.md#first-run-notes) for each CLI.
+
+On BMAD v7, add the skills with `npx skills add bmad-code-org/bmad-loop`, run `/bmad setup bmad-loop` and then `/bmad-loop-setup`, and set `[stories] source = "tickets"`; see [Installing on BMAD v7](docs/setup-guide.md#installing-on-bmad-v7-bmad-setup).
 
 Every subcommand, flag, `--json` document and exit code is in the [CLI reference](docs/reference/cli.md).
 
@@ -88,12 +91,14 @@ A failed attempt is retried within `[limits] max_dev_attempts`. A story that exh
 A CRITICAL escalation pauses the run and notifies you (desktop notification and an `ATTENTION` file); `bmad-loop resolve <run-id>` fixes the spec with an interactive agent and re-drives the story. In place (`[scm] isolation = "none"`), a failed or deferred attempt that left changes pauses for you to roll back by hand unless `[scm] rollback_on_failure` is on.
 Every pause and its remedy is in [Recovering paused runs](docs/escalations-guide.md).
 
-## Two planning pipelines, one loop
+## Three planning pipelines, one loop
 
 - **Sprint mode (default).** Stories come from `sprint-status.yaml`; the loop picks `backlog` and `ready-for-dev` stories by key.
-- **Stories mode (opt-in).** Stories come from the typed `stories.yaml` that `bmad-spec`'s Story Breakdown writes beside `SPEC.md`, dispatched by spec folder and story id in list order. Each entry can set `spec_checkpoint` (pause after planning, before code) and `done_checkpoint` (pause after the commit).
+- **Stories mode (opt-in, BMAD v6).** Stories come from the typed `stories.yaml` that `bmad-spec`'s Story Breakdown (BMAD-METHOD 6.12) writes beside `SPEC.md`, dispatched by spec folder and story id in list order. Each entry can set `spec_checkpoint` (pause after planning, before code) and `done_checkpoint` (pause after the commit).
 
-Turn stories mode on with `[stories] source = "stories"` and `spec_folder`, or per run with `bmad-loop run --spec <folder>`. Everything downstream is the same loop. See [Stories mode](docs/FEATURES.md#stories-mode).
+- **Ticket-tree mode (opt-in, BMAD v7, experimental).** Tickets come from the active initiative's ticket tree, which Sofia (`bmad-agent-po`) plans: she creates the initiative, slices it into epics and stories, and refines and readies the tickets. The loop dispatches each startable ticket in build order and marks it done through the project's `tickets.py`.
+
+Turn stories mode on with `[stories] source = "stories"` and `spec_folder`, or per run with `bmad-loop run --spec <folder>`; turn ticket-tree mode on with `[stories] source = "tickets"`. Everything downstream is the same loop. See [Stories mode](docs/FEATURES.md#stories-mode) and the [ticket-tree mode guide](docs/tickets-guide.md).
 
 ## Deferred-work sweeps
 
@@ -113,7 +118,7 @@ A live dashboard over every run, and a launcher for new ones. It observes runs o
 <img src="docs/images/dashboard.png" alt="Dashboard: runs table, run header with token totals, per-story phase table, sprint tree, deferred-work ledger, and the journal tab." width="880">
 </div>
 
-**Dashboard.** Runs, the sprint tree (a stories board in stories mode) and the deferred-work ledger on the left; the run header, per-story task table, and journal, pane-log and `ATTENTION` tabs on the right. Panes are [resizable](docs/tui-guide.md#resizing-panes).
+**Dashboard.** Runs, the sprint tree (a stories board in stories mode, a tickets board in ticket-tree mode) and the deferred-work ledger on the left; the run header, per-story task table, and journal, pane-log and `ATTENTION` tabs on the right. Panes are [resizable](docs/tui-guide.md#resizing-panes).
 
 <div align="center">
 <img src="docs/images/sweep-decision.png" alt="A sweep run showing a yellow 'decision needed' banner and the decision-pending journal event." width="880">
@@ -132,7 +137,7 @@ A live dashboard over every run, and a launcher for new ones. It observes runs o
 <img src="docs/images/start-run-modal.png" alt="The start-run modal with epic, story, max-stories, and dry-run fields." width="430">
 </div>
 
-**Ledger entries and launching.** `enter` on a ledger row opens the full entry; `r` opens the start-run modal (sprint or stories source, epic, story, max stories, dry run) and `s` the sweep modal.
+**Ledger entries and launching.** `enter` on a ledger row opens the full entry; `r` opens the start-run modal (sprint, stories or tickets source, epic, story, max stories, dry run) and `s` the sweep modal.
 
 <div align="center">
 <img src="docs/images/settings.png" alt="The settings screen editing .bmad-loop/policy.toml, grouped by section with defaults shown as placeholders." width="880">
@@ -142,7 +147,7 @@ A live dashboard over every run, and a launcher for new ones. It observes runs o
 
 ## Installing and upgrading
 
-`bmad-loop init` installs the three bundled skills — `bmad-loop-resolve`, `bmad-loop-sweep` and `bmad-loop-setup` — into each CLI's skills directory, plus the hook relay and the policy file. Your BMAD install is never modified. If the BMAD-method installer already placed the skills, run `claude "/bmad-loop-setup accept all defaults"`: it installs the tool, wires the hooks, and runs the preflight.
+`bmad-loop init` installs the three bundled skills — `bmad-loop-resolve`, `bmad-loop-sweep` and `bmad-loop-setup` — into each CLI's skills directory, plus the hook relay and the policy file. Your BMAD install is never modified. If the BMAD-method installer already placed the skills, run `claude "/bmad-loop-setup accept all defaults"`: it installs the tool, wires the hooks, and runs the preflight. On BMAD v7, `npx skills add bmad-code-org/bmad-loop` and `/bmad setup bmad-loop` place the skills and the `bmod-bmad-loop` module record, and `/bmad-loop-setup` then does the rest.
 
 To upgrade, run `claude "/bmad-loop-setup upgrade"`, or by hand `uv tool upgrade bmad-loop --reinstall` followed by `bmad-loop init --force-skills` in each project. Pinned-tag installs, other CLIs, upgrading and uninstalling are in the [setup guide](docs/setup-guide.md).
 
@@ -207,6 +212,7 @@ To add a CLI without Python, drop a profile in `.bmad-loop/profiles/<name>.toml`
 - [Setup guide](docs/setup-guide.md) — installing, initializing each CLI, upgrading, uninstalling.
 - Reference: [configuration](docs/reference/configuration.md), [CLI](docs/reference/cli.md), [run state](docs/reference/run-state.md).
 - [Recovering paused runs](docs/escalations-guide.md) and the [sweep guide](docs/sweep-guide.md).
+- [Ticket-tree mode guide](docs/tickets-guide.md) — driving a BMAD v7 initiative ticket tree.
 - [TUI guide](docs/tui-guide.md) and [Terminal multiplexer backends](docs/multiplexer-backends.md).
 
 ## Development

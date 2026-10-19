@@ -22,7 +22,17 @@ for the values upstream emits:
 - the flags upstream emits only when set (``plan_checkpoint``,
   ``done_checkpoint``, ``unknown``, ``waiting_on``, ``gated_by``, ``drift``)
   default to false/empty; a checkpoint flag must be exactly ``true``;
-- ``drift`` (a mapping of differing fields) is read as "present".
+- ``drift`` (a mapping of differing fields) is read as "present";
+- an ``epics`` row with ``folder: null`` (declared in the initiative's
+  ``tickets.toml``, not sliced yet) carries no ``status``/``gated_by``/
+  ``blocks``/``next_id`` and reads as ``""``/empty/None; a row with a folder
+  still requires them, and a row without ``refined`` (a preview-era script)
+  reads as refined.
+
+A parent initiative (one whose ``tickets.toml`` lists ``[[initiative]]``
+children) answers ``status``/``next`` with its children instead of tickets;
+:class:`TicketsParentInitiative` refuses that document, since a run builds one
+child initiative at a time.
 
 ``parse_help`` and :func:`capability_problems` gate the installed script on the
 verbs and ``mark`` statuses bmad-loop drives, from its ``--help`` output (the
@@ -44,7 +54,7 @@ from .statemachine import PLAN_BLOCKED, PLAN_DROPPED, PLAN_STATUS_ORDER, PLAN_TR
 
 # Every plan `status` upstream accepts (`tickets.py` STATUSES). The builds write
 # draft..built, build-auto writes blocked, an orchestrator writes done, and
-# bmad-ticket writes dropped. A row with no plan reads "".
+# bmad-agent-po writes dropped. A row with no plan reads "".
 # The lifecycle order is `statemachine.PLAN_STATUS_ORDER`, beside the plan
 # transition table; `blocked` and `dropped` sit outside it.
 PLAN_STATUSES: Final[tuple[str, ...]] = (
@@ -89,6 +99,26 @@ class TicketsSchemaError(ValueError):
         self.command = command
         self.field = field
         self.detail = detail
+
+
+class TicketsParentInitiative(TicketsSchemaError):
+    """``status``/``next`` answered with a parent initiative's view (its child
+    initiatives, no tickets): the active initiative is a parent, and a run needs
+    one child active. ``children`` are the child slugs in build order."""
+
+    def __init__(self, command: str, folder: str, children: tuple[str, ...]) -> None:
+        named = ", ".join(children) or "none listed"
+        # Not version skew, so not the parent's `tickets.py <command>: …` text.
+        ValueError.__init__(
+            self,
+            f"active initiative {folder} is a parent initiative (children: {named}); "
+            "set `[core] active_initiative` to one child",
+        )
+        self.command = command
+        self.field = "initiatives"
+        self.detail = "parent initiative"
+        self.folder = folder
+        self.children = children
 
 
 @dataclass(frozen=True)
@@ -166,10 +196,13 @@ class EpicEdge:
 
 @dataclass(frozen=True)
 class EpicRow:
-    """``status`` on an initiative: one epic folder. ``status`` is the epic
-    file's (in-progress, done, dropped); ``gated_by`` is its file's ``after``,
-    the gate ``next`` enforces until each named epic is done; ``after`` is the
-    initiative's advisory declaration."""
+    """``status`` on an initiative: one epic. ``status`` is the epic file's
+    (in-progress, done, dropped); ``gated_by`` is its file's ``after``, the gate
+    ``next`` enforces until each named epic is done; ``after`` is the
+    initiative's advisory declaration. ``folder`` is None for an epic the
+    initiative declares but nobody has sliced yet: it has no file and no tickets,
+    so ``status`` is ``""``, ``gated_by``/``blocks`` are empty and ``next_id``
+    is None."""
 
     slug: str
     id: str | None
@@ -177,7 +210,9 @@ class EpicRow:
     after: tuple[EpicEdge, ...]
     gated_by: tuple[str, ...]
     blocks: tuple[str, ...]
-    next_id: int
+    next_id: int | None
+    folder: str | None
+    refined: bool
 
 
 @dataclass(frozen=True)
@@ -403,11 +438,24 @@ def _backlog_error(d: Mapping[str, object], command: str) -> str | None:
 # --------------------------------------------------------------- views
 
 
+def _refuse_parent_view(d: Mapping[str, object], command: str) -> None:
+    """Raise :class:`TicketsParentInitiative` when ``d`` is a parent initiative's
+    view (upstream ``parent_view``: ``initiatives`` and no ``tickets``)."""
+    if "initiatives" not in d or "tickets" in d:
+        return
+    children: list[str] = []
+    for raw in _list(d["initiatives"], command, "initiatives"):
+        children.append(_str(_obj(raw, command, "initiatives"), command, "slug"))
+    raise TicketsParentInitiative(command, _str(d, command, "folder"), tuple(children))
+
+
 def parse_next(doc: object, *, store: str | None = None) -> NextView:
     """``next``'s document. ``store`` is passed for the nested backlog view,
-    which inherits the parent's (upstream prints it once, at the top)."""
+    which inherits the parent's (upstream prints it once, at the top). A parent
+    initiative's view raises :class:`TicketsParentInitiative`."""
     command = "next"
     d = _obj(doc, command, "document")
+    _refuse_parent_view(d, command)
     backlog: NextView | None = None
     backlog_error: str | None = None
     top_store = _str(d, command, "store") if store is None else store
@@ -443,14 +491,34 @@ def _epic(doc: object, command: str) -> EpicRow:
                 needs=_scalar_text(e.get("needs", ""), command, "needs"),
             )
         )
+    slug = _str(d, command, "slug")
+    epic_id = _opt_id(d, command, "id")
+    # A preview-era script prints no `folder`: every row it lists has one.
+    if "folder" in d and d["folder"] is None:
+        return EpicRow(
+            slug=slug,
+            id=epic_id,
+            status="",
+            after=tuple(edges),
+            gated_by=(),
+            blocks=(),
+            next_id=None,
+            folder=None,
+            refined=False,
+        )
+    refined = d.get("refined", True)
+    if not isinstance(refined, bool):
+        raise TicketsSchemaError(command, "refined", f"expected true/false, got {refined!r}")
     return EpicRow(
-        slug=_str(d, command, "slug"),
-        id=_opt_id(d, command, "id"),
+        slug=slug,
+        id=epic_id,
         status=_str(d, command, "status"),
         after=tuple(edges),
         gated_by=_ids(d, command, "gated_by", required=True),
         blocks=_ids(d, command, "blocks", required=True),
         next_id=_int(d, command, "next_id"),
+        folder=_str(d, command, "folder", default=slug),
+        refined=refined,
     )
 
 
@@ -463,9 +531,11 @@ def _counts(d: Mapping[str, object], command: str) -> Mapping[str, int]:
 
 
 def parse_status(doc: object, *, store: str | None = None) -> StatusView:
-    """``status``'s document (``store`` as in :func:`parse_next`)."""
+    """``status``'s document (``store`` as in :func:`parse_next`). A parent
+    initiative's view raises :class:`TicketsParentInitiative`."""
     command = "status"
     d = _obj(doc, command, "document")
+    _refuse_parent_view(d, command)
     backlog: StatusView | None = None
     backlog_error: str | None = None
     top_store = _str(d, command, "store") if store is None else store

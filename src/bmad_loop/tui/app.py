@@ -38,6 +38,7 @@ from .. import (
     runs,
     runsetup,
     stories,
+    ticketlayout,
     ticketstore,
     tickettree,
     verify,
@@ -1078,10 +1079,15 @@ class BmadLoopApp(App[None]):
     def _epic_closure_summary(self, state: RunState) -> str:
         """The epic-closure viewer's head: the retrospective verdict the engine
         recorded for the paused epic (`RunState.ticket_epic_closures`) and the path
-        the retrospective lives at (`<initiative folder>/<slug>/<slug>-retrospective.md`,
-        as `TicketsEngine._retro_doc` spells it). The recorded folder is rebased onto
-        the live project (`runs.rebase_recorded_project_path`), so a moved project
-        names the retrospective the run will read. No file or tree is read."""
+        the retrospective lives at (`ticketlayout.retrospective_doc`, as
+        `TicketsEngine._retro_doc` spells it: the epic folder sits in the
+        initiative's `tickets/` folder, or in the initiative folder in the flat
+        layout). The recorded folder is rebased onto the live project
+        (`runs.rebase_recorded_project_path`), so a moved project names the
+        retrospective the run will read. Only the layout probe stats a directory;
+        no file is read. A probe fault is shown with the fault and the flat-layout
+        path as a guess, never as the located document: the summary is advisory
+        and never fails the viewer."""
         slug = state.paused_story_key or ""
         verdict = state.ticket_epic_closures.get(slug) if slug else None
         lines = [
@@ -1095,8 +1101,17 @@ class BmadLoopApp(App[None]):
             folder = runs.rebase_recorded_project_path(
                 Path(state.initiative_folder), state, self.project
             )
-            retro = folder / slug / f"{slug}-retrospective.md"
-            lines.append(f"retrospective: {retro}")
+            try:
+                retro = ticketlayout.retrospective_doc(folder, slug)
+            except OSError as exc:
+                flat = folder / slug / f"{slug}-retrospective.md"
+                lines.append(
+                    f"retrospective: location unknown — layout probe of "
+                    f"{folder / ticketlayout.TICKETS} failed ({exc}); "
+                    f"flat-layout guess: {flat}"
+                )
+            else:
+                lines.append(f"retrospective: {retro}")
         return "\n".join(lines)
 
     @staticmethod

@@ -12118,6 +12118,90 @@ def test_tickets_preflight_initiative_missing(project_v7, monkeypatch):
     (problem,) = [f for f in findings if f.severity == "problem"]
     assert problem.check == "tickets.initiative-missing"
     assert problem.detail["initiative"] == project_v7.initiative
+    assert "create it with the `bmad-agent-po` skill" in problem.message
+
+
+_PARENT_BREAKDOWN = """\
+[[initiative]]
+id = 1
+slug = "initiative-auth"
+
+[[initiative]]
+id = 2
+slug = "initiative-billing"
+after = [{ initiative = 1 }]
+"""
+
+
+def _make_parent(layout, *, flat: bool = False) -> Path:
+    """Turn the active initiative into a parent: its `tickets.toml` lists
+    `[[initiative]]` children (in its `tickets/` folder, or the folder itself)."""
+    folder = layout.initiative_folder
+    shutil.rmtree(folder / "tickets", ignore_errors=True)
+    breakdown = folder if flat else folder / "tickets"
+    breakdown.mkdir(parents=True, exist_ok=True)
+    path = breakdown / "tickets.toml"
+    path.write_text(_PARENT_BREAKDOWN, encoding="utf-8")
+    return path
+
+
+def test_tickets_preflight_refuses_a_parent_initiative(project_v7, monkeypatch):
+    """A parent initiative has no tickets of its own (tickets.py `status`/`next`
+    print its children, every other verb refuses), so a run needs one child
+    active: a problem naming the children, read from its `tickets.toml` without a
+    spawn, and the store checks are skipped. Ablation (performed): drop the
+    parent check and this FAILS (the store checks pass instead)."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    _make_parent(project_v7)
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-parent"
+    assert problem.detail == {
+        "initiative": project_v7.initiative,
+        "children": ["initiative-auth", "initiative-billing"],
+    }
+    assert "(children: initiative-auth, initiative-billing)" in problem.message
+    assert "`[core] active_initiative`" in problem.message
+    assert "tickets.store-topology" not in _ids(findings)
+    assert set(_ids(findings)) <= VALIDATE_CHECKS
+
+
+def test_tickets_preflight_reads_a_parent_in_the_flat_layout_too(project_v7, monkeypatch):
+    """A preview-era tree keeps `tickets.toml` in the initiative folder itself: the
+    same parent check reads it there (upstream's `tickets/`-is-a-directory rule)."""
+    _make_parent(project_v7, flat=True)
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-parent"
+    assert problem.detail["children"] == ["initiative-auth", "initiative-billing"]
+
+
+@pytest.mark.parametrize("fault", ["stat", "toml"])
+def test_tickets_preflight_parent_probe_fault_is_a_finding(project_v7, monkeypatch, fault):
+    """A `tickets.toml` the parent check cannot stat or parse is a problem naming
+    the error, never read as "no parent" (which would go on to the store checks)
+    and never raised out of the preflight."""
+    path = _make_parent(project_v7)
+    if fault == "toml":
+        path.write_text("[[initiative]\n", encoding="utf-8")
+    else:
+        real_stat = Path.stat
+
+        def stat(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError(errno.EACCES, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+    findings = _tickets_findings(project_v7, monkeypatch)
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-parent"
+    assert problem.detail["path"] == str(path)
+    error = "PermissionError:" if fault == "stat" else "TOMLDecodeError:"
+    assert problem.detail["error"].startswith(error)
+    assert "could not be checked" in problem.message
+    assert "tickets.store-topology" not in _ids(findings)
 
 
 @pytest.mark.parametrize(

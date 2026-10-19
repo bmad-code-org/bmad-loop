@@ -77,7 +77,7 @@ whose tickets are all ``built``/``done``/``dropped`` and of which this run
 committed one gets its retrospective (``gates.retrospective = "auto"``:
 ``/bmad-retrospective -H <slug>``, verified on disk and committed alone), its
 closure recorded in ``RunState.ticket_epic_closures`` and a pause at
-``epic-boundary`` for a person to close it with bmad-ticket — bmad-loop never
+``epic-boundary`` for a person to close it with bmad-agent-po — bmad-loop never
 writes the epic file. A ``rejected`` verdict pauses every later pick while the
 epic stays open; any other pauses once. A ``--story`` run admits no epic, so it
 finishes past the epic its ticket finished.
@@ -94,7 +94,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import deferredwork, gates, ticketstore, verify
+from . import deferredwork, gates, ticketlayout, ticketstore, verify
 from .adapters.base import SessionResult, SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import (
@@ -594,7 +594,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
           recorded: run the retrospective gate (:meth:`_ticket_epic_retro`),
           record its verdict in ``state.ticket_epic_closures``, journal
           ``ticket-epic-closure`` and pause at ``epic-boundary`` for a person to
-          close the epic with bmad-ticket;
+          close the epic with bmad-agent-po;
         * a recorded ``rejected`` verdict on an epic still open and finished:
           pause again — closing the epic is the human override;
         * any other recorded verdict the operator resumed past: acknowledge it
@@ -632,7 +632,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                         step.slug,
                         None,
                         f"{step.slug}'s retrospective verdict is rejected; close {step.slug} "
-                        f"with bmad-ticket before the run goes on",
+                        f"with bmad-agent-po before the run goes on",
                     )
                 )
 
@@ -653,7 +653,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self.journal.append("epic-closure-not-recorded", epic_ref=step.slug, verdict=step.verdict)
 
     def _pause_epic_closure(self, slug: str, verdict: str) -> NoReturn:
-        detail = f"close {slug} with bmad-ticket (closure check; retrospective verdict: {verdict})"
+        detail = (
+            f"close {slug} with bmad-agent-po (closure check; retrospective verdict: {verdict})"
+        )
         if verdict == CLOSURE_REJECTED:
             detail += f"; the rejected verdict holds the run until {slug} is closed"
         self._pause_ticket_pick(Halt(HALT_EPIC_CLOSURE, slug, None, detail))
@@ -688,18 +690,25 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _retro_doc(self, slug: str) -> Path:
         """Where the retrospective skill writes epic ``slug``'s document:
-        ``<epic folder>/<slug>-retrospective.md``, the epic folder named by its
-        slug inside the initiative folder."""
+        ``<epic folder>/<slug>-retrospective.md``, beside the epic file, the epic
+        folder named by its slug inside the initiative's breakdown folder — its
+        ``tickets/`` folder, or the initiative folder in the flat layout
+        (:func:`ticketlayout.retrospective_doc`). Raises ``OSError`` when the
+        layout probe cannot stat."""
         folder = self.paths.initiative_folder or self.paths.output_folder
-        return folder / slug / f"{slug}-retrospective.md"
+        return ticketlayout.retrospective_doc(folder, slug)
 
     def _read_retro_doc(self, slug: str) -> tuple[list[str], str, int]:
         """Read epic ``slug``'s retrospective document as ``(errors, verdict,
         mtime_ns)``: it must be a regular file (``lstat``, never followed) whose
         frontmatter names ``epic: <slug>`` and a ``verdict`` in
         :data:`~bmad_loop.engine.RETRO_VERDICTS`. ``verdict`` is "" unless every
-        check passed; ``mtime_ns`` is -1 when the file cannot be stat'd."""
-        doc = self._retro_doc(slug)
+        check passed; ``mtime_ns`` is -1 when the file cannot be stat'd, or its
+        path cannot be resolved because the tree layout probe faulted."""
+        try:
+            doc = self._retro_doc(slug)
+        except OSError as e:
+            return [f"cannot find {slug}'s retrospective document: {e}"], "", -1
         name = doc.name
         try:
             st = doc.lstat()
@@ -746,9 +755,13 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _retro_doc_uncommitted(self, slug: str) -> bool:
         """Whether epic ``slug``'s retrospective document is dirty in the code repo,
         or in a store with its own repository (T3/T4). A git fault, or a path that
-        does not resolve, reads as dirty: :meth:`_settle_retro_tree` re-reads the
-        tree and pauses on it. Only a document outside a repository skips it."""
-        doc = self._retro_doc(slug)
+        does not resolve (the layout probe included), reads as dirty:
+        :meth:`_settle_retro_tree` re-reads the tree and pauses on it. Only a
+        document outside a repository skips it."""
+        try:
+            doc = self._retro_doc(slug)
+        except OSError:
+            return True
         roots = [self.paths.repo_root]
         topology = self.store_topology
         if topology is not None and topology.store_repo is not None:
@@ -850,16 +863,18 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         if raised is not None:
             errors.insert(0, f"session raised {type(raised).__name__}")
         ok = not errors
-        doc = self._retro_doc(slug)
+        # Only a verified document is resolved again: a failed verification may be
+        # the layout probe's own fault, which a second probe would raise.
+        docs = [self._retro_doc(slug)] if ok else []
         if ok:
             self.journal.append(
-                "retro-auto-finished", epic=0, epic_ref=slug, docs=[doc.name], verdict=verdict
+                "retro-auto-finished", epic=0, epic_ref=slug, docs=[docs[0].name], verdict=verdict
             )
             gates.notify(
                 self.policy,
                 self.run_dir,
                 f"{slug} retrospective done",
-                f"retrospective written: {doc.name}; verdict: {verdict}",
+                f"retrospective written: {docs[0].name}; verdict: {verdict}",
             )
         else:
             verdict = RETRO_VERDICT_UNKNOWN
@@ -871,7 +886,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                 "auto retrospective failed",
                 f"{slug}: {'; '.join(errors)} — run /bmad-retrospective -H {slug} by hand",
             )
-        self._settle_retro_tree(0, ok, [doc] if ok else [], epic_ref=slug)
+        self._settle_retro_tree(0, ok, docs, epic_ref=slug)
         return verdict
 
     # ---------------------------------------------------------------- pauses
@@ -904,9 +919,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         raise RunPaused(reason, halt.stage, halt.key)
 
     def _pause_ticket_refine(self, halt: Halt) -> NoReturn:
-        """The next ticket needs refining (bmad-ticket) before a build can start."""
+        """The next ticket needs refining (bmad-agent-po) before a build can start."""
         self.journal.append("ticket-refine-pause", ref=halt.key)
-        reason = f"{halt.detail} — refine it with bmad-ticket, then {self._resume_hint()}"
+        reason = f"{halt.detail} — refine it with bmad-agent-po, then {self._resume_hint()}"
         gates.notify(self.policy, self.run_dir, f"ticket needs refining: {halt.key}", reason)
         raise RunPaused(reason, halt.stage, halt.key)
 

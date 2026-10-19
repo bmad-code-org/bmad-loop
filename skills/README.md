@@ -62,7 +62,8 @@ the ledger; pre-rename copies append flat entries the sweep normalizes instead).
 On BMAD v6 this requires the BMad Method (bmm) module (`_bmad/bmm/config.yaml`), and sprint
 mode needs a `sprint-status.yaml` from `bmad-sprint-planning`. On BMAD v7 it requires the
 `bmad` and `bmad-build-auto` skills from the method module (6.13.0 or newer), and tickets
-mode needs a `bmad-ticket` ticket tree.
+mode needs a ticket tree from `bmad-agent-po` (Sofia, the Product Owner) with an active
+initiative.
 
 `_bmad/custom/<skill-name>.toml` customization overrides are keyed by skill
 directory name.

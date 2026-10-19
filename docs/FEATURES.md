@@ -33,7 +33,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 ### Stories mode
 
 - **Stability:** stable
-- **Description:** An opt-in second story source. It drives the same pipeline from a `bmad-spec` `stories.yaml` instead of `sprint-status.yaml`, and dispatches each story by spec folder and story id.
+- **Description:** An opt-in second story source. It drives the same pipeline from the `stories.yaml` that BMAD v6.12's `bmad-spec` Story Breakdown writes (a v6-only pipeline) instead of `sprint-status.yaml`, and dispatches each story by spec folder and story id.
 - **Properties:**
   - Each story is dispatched as `/<dev skill> Spec folder: <folder>. Story id: <id>.`, and its spec is read back from `<folder>/stories/<id>-*.md`.
   - Stories run in list order. Done stories are skipped, and interrupted non-terminal stories are re-dispatched.
@@ -50,6 +50,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Description:** An opt-in third story source for BMAD v7 projects. It drives the same pipeline from the active initiative's ticket tree through the project's own `tickets.py`, dispatching each ticket as `/<dev skill> ticket <ref>` in initiative build order, and, under the default `mark_done`, marks a verified ticket `done` itself.
 - **Properties:**
   - A run is pinned to `[core] active_initiative` at start; a changed initiative pauses the run at `ticket-tree` instead of building another initiative's ticket.
+  - The tree is read in the layout the installed `tickets.py` uses: a `tickets/` folder inside each initiative and epic, or the preview-era flat layout. A parent initiative is refused (`tickets.initiative-parent`), and an epic declared but not sliced yet holds no tickets.
   - A hitl ticket pauses at `ticket-hitl` and a ticket that needs refining at `ticket-refine`, both before any session runs for it.
   - bmad-loop writes a plan's `status` and `blocked_*` only through `tickets.py mark`, under a lock, read back afterwards and checked against one plan transition table; it never writes `dropped` or an epic file.
   - Tickets this run did not start are never dispatched or marked.
@@ -207,7 +208,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - An auto retro succeeds only if the session completed, result.json says done, the board reads done and a retro doc exists. It is then committed as `chore(retro): epic N retrospective`.
   - A failed or refused auto retro (unless already done) tells you to run it by hand and never fails the run. If it leaves uncommitted changes, the run pauses at the epic boundary.
   - The retro doc's verdict is reported in the done notice. A `rejected` verdict sends an extra attention notice, and the run continues.
-  - Tickets mode keys the epic by slug. Once this run finishes an epic, `auto` runs `/bmad-retrospective -H <epic-slug>` and commits only `<epic-slug>-retrospective.md`; a valid document already there counts as done. Whatever the mode, the run records the verdict and pauses at `epic-boundary` for you to close the epic with bmad-ticket. A `rejected` verdict pauses again at every pick while the epic stays open; any other pauses once.
+  - Tickets mode keys the epic by slug. Once this run finishes an epic, `auto` runs `/bmad-retrospective -H <epic-slug>` and commits only `<epic-slug>-retrospective.md`; a valid document already there counts as done. Whatever the mode, the run records the verdict and pauses at `epic-boundary` for you to close the epic with bmad-agent-po. A `rejected` verdict pauses again at every pick while the epic stays open; any other pauses once.
 - **Config:** `[gates] retrospective`, `[adapter.retro] name` / `model` / `effort` / `extra_args`
 - **Tested by:** `tests/test_engine.py`, `tests/test_policy.py`, `tests/test_tickets_engine.py`, `tests/test_tickets_e2e.py`
 - **Docs:** [Escalations: epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [Tickets guide: retrospective and closure](tickets-guide.md#epic-retrospective-and-closure), [Configuration: [gates]](reference/configuration.md#gates), [Configuration: [adapter.retro]](reference/configuration.md#adapterretro), [Pointing retrospectives at run journals](setup-guide.md#pointing-retrospectives-at-run-journals), [Roadmap: automate epic retro action items](ROADMAP.md#automate-epic-retro-action-items)

@@ -52,7 +52,7 @@ from textual.widgets import (
 from bmad_loop import bmadconfig, documents, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs as runs_mod
-from bmad_loop import verify
+from bmad_loop import ticketlayout, verify
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, load_state, save_state
 from bmad_loop.model import (
@@ -5247,7 +5247,7 @@ async def test_tickets_mode_run_shows_tickets_board(project_tree, monkeypatch):
         (
             "ticket-refine",
             "1.3",
-            "1.3 needs refining (a bug) — refine it with bmad-ticket, then resume",
+            "1.3 needs refining (a bug) — refine it with bmad-agent-po, then resume",
             "ticket needs refining",
         ),
         (
@@ -5309,7 +5309,7 @@ async def test_epic_closure_viewer_shows_verdict(project_tree, monkeypatch):
         project_tree.project,
         stage="epic-boundary",
         key="epic-cart",
-        reason="close epic-cart with bmad-ticket (closure check; retrospective verdict: "
+        reason="close epic-cart with bmad-agent-po (closure check; retrospective verdict: "
         "rejected) — then resume",
         closures={"epic-cart": "rejected"},
     )
@@ -5331,7 +5331,7 @@ async def test_epic_closure_viewer_shows_verdict(project_tree, monkeypatch):
         assert "retrospective verdict: rejected" in body
         # the render wraps a long path; compare with whitespace dropped
         assert f"retrospective:{retro}" in "".join(body.split())
-        assert "close epic-cart with bmad-ticket" in body
+        assert "close epic-cart with bmad-agent-po" in body
 
 
 def test_epic_closure_summary_follows_a_moved_project(project_tree):
@@ -5355,6 +5355,51 @@ def test_epic_closure_summary_follows_a_moved_project(project_tree):
         / "epic-cart-retrospective.md"
     )
     assert f"retrospective: {retro}" in app._epic_closure_summary(state)
+
+
+def test_epic_closure_summary_names_the_tickets_folder_layout(project_tree):
+    """An initiative in the current upstream layout keeps its epic folders in its
+    `tickets/` folder, so the viewer names the retrospective there, beside the
+    epic file, where the run reads it. Ablation (performed): spell
+    `<initiative>/<slug>/` again and the flat path is shown — this FAILS."""
+    run_dir, _plan = _tickets_paused_run(
+        project_tree.project, stage="epic-boundary", key="epic-cart"
+    )
+    state = load_state(run_dir)
+    epic = project_tree.project / "_bmad-output" / "init-a" / "tickets" / "epic-cart"
+    (epic / "tickets").mkdir(parents=True)
+    app = BmadLoopApp(project_tree.project)
+    retro = epic / "epic-cart-retrospective.md"
+    assert f"retrospective: {retro}" in app._epic_closure_summary(state)
+
+
+def test_epic_closure_summary_surfaces_a_layout_probe_fault(project_tree, monkeypatch):
+    """A `tickets/` stat fault (EACCES, EIO) is not "flat layout": the viewer says
+    the location is unknown, names the fault, and offers the flat path only as a
+    guess. Ablation (performed): fall back to the flat path as the located
+    document again and this FAILS."""
+    run_dir, _plan = _tickets_paused_run(
+        project_tree.project, stage="epic-boundary", key="epic-cart"
+    )
+    state = load_state(run_dir)
+
+    def _denied(_initiative, _slug):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(ticketlayout, "retrospective_doc", _denied)
+    app = BmadLoopApp(project_tree.project)
+    flat = (
+        project_tree.project
+        / "_bmad-output"
+        / "init-a"
+        / "epic-cart"
+        / "epic-cart-retrospective.md"
+    )
+    summary = app._epic_closure_summary(state)
+    assert "retrospective: location unknown" in summary
+    assert "Permission denied" in summary
+    assert f"flat-layout guess: {flat}" in summary
+    assert f"retrospective: {flat}" not in summary
 
 
 async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatch):

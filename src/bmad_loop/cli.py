@@ -4401,7 +4401,10 @@ def _print_tickets_board(state: RunState, status_view: ticketmodel.StatusView) -
     groups: dict[str, list[ticketmodel.TicketRow]] = {e.slug: [] for e in status_view.epics}
     for row in rows:
         groups.setdefault(row.epic, []).append(row)
-    epic_status = {e.slug: e.status for e in status_view.epics}
+    # An epic the initiative declares and nobody sliced yet has no folder.
+    epic_status = {
+        e.slug: "not sliced yet" if e.folder is None else e.status for e in status_view.epics
+    }
     for slug, members in groups.items():
         done = sum(1 for r in members if r.state in ("done", "dropped"))
         closure = state.ticket_epic_closures.get(slug)

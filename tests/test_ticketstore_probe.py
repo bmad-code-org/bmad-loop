@@ -6,6 +6,7 @@ tickets.py (git only)."""
 from __future__ import annotations
 
 import dataclasses
+import os
 import tomllib
 from pathlib import Path
 
@@ -27,14 +28,62 @@ def test_probe_tracked_markers(project_v7):
     paths = _paths(project_v7)
     facts = ticketstore.probe_store_facts(paths, paths.initiative_folder)
     rels = [rel for rel, _ in facts.tracked]
-    assert "_bmad-output/initiative-demo/tickets.toml" in rels
-    assert "_bmad-output/initiative-demo/epic-cart/epic-cart.md" in rels
+    assert "_bmad-output/initiative-demo/tickets/tickets.toml" in rels
+    assert "_bmad-output/initiative-demo/tickets/epic-cart/epic-cart.md" in rels
     assert all(tracked for _, tracked in facts.tracked)
     assert facts.store_toplevel == facts.repo_toplevel == project_v7.project.resolve()
     assert facts.user_config_ignored and not facts.user_config_tracked
     assert ticketstore.assess_store(paths, "worktree") == StoreTopology(
         "T1", "checkout", "code-repo", project_v7.output_folder.resolve()
     )
+
+
+def _tickets_layout_initiative(root: Path) -> Path:
+    """An initiative in the current upstream layout: its `tickets.toml` and epic
+    folder in its `tickets/` folder, the epic's `tickets.toml` in the epic's own
+    `tickets/` folder and its `epic-cart.md` at the epic folder's top."""
+    initiative = root / "init"
+    epic = initiative / "tickets" / "epic-cart"
+    (epic / "tickets").mkdir(parents=True)
+    (initiative / "init.md").write_text("---\ntitle: Init\n---\n", encoding="utf-8")
+    (initiative / "tickets" / "tickets.toml").write_text("[[epic]]\n", encoding="utf-8")
+    (epic / "epic-cart.md").write_text("---\nstatus: open\n---\n", encoding="utf-8")
+    (epic / "tickets" / "tickets.toml").write_text("[[entry]]\n", encoding="utf-8")
+    return initiative
+
+
+def test_markers_in_the_tickets_folder_layout(tmp_path):
+    """The T1 markers of a `tickets/`-layout tree are its real files: the
+    initiative's and the epic's `tickets.toml` in their `tickets/` folders, the
+    epic file at its folder's top. Ablation (performed): list the initiative
+    folder itself and only the absent flat `tickets.toml` is probed — this FAILS."""
+    initiative = _tickets_layout_initiative(tmp_path)
+    assert ticketstore._markers(initiative) == [
+        initiative / "tickets" / "tickets.toml",
+        initiative / "tickets" / "epic-cart" / "tickets" / "tickets.toml",
+        initiative / "tickets" / "epic-cart" / "epic-cart.md",
+    ]
+
+
+@pytest.mark.parametrize("container", ["", "tickets/epic-cart"], ids=["initiative", "epic"])
+def test_markers_refused_tickets_probe_raises(tmp_path, monkeypatch, container):
+    """A refused stat of a container's `tickets/` folder raises `verify.GitError`
+    (`probe-failed` upstream), never a flat read that would drop the tree's real
+    files from the tracking check. Ablation (performed): drop the `OSError` wrap
+    in `ticketstore._breakdown_dir` and a bare `PermissionError` escapes — this
+    FAILS."""
+    initiative = _tickets_layout_initiative(tmp_path)
+    target = (initiative / container if container else initiative) / "tickets"
+    real = os.stat
+
+    def refuse(path, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", refuse)
+    with pytest.raises(verify.GitError, match="Permission denied"):
+        ticketstore._markers(initiative)
 
 
 def test_probe_reads_nested_store_toplevel(project_v7_store_repo):
@@ -122,7 +171,7 @@ def test_probe_tracked_store_outside_a_nested_repo_root_is_refused(project_v7):
     paths = dataclasses.replace(_paths(project_v7), repo_root=root / "code")
     facts = ticketstore.probe_store_facts(paths, paths.initiative_folder)
     assert facts.tracked and all(tracked for _, tracked in facts.tracked)
-    assert "_bmad-output/initiative-demo/tickets.toml" in [rel for rel, _ in facts.tracked]
+    assert "_bmad-output/initiative-demo/tickets/tickets.toml" in [rel for rel, _ in facts.tracked]
     for isolation in ("none", "worktree"):
         result = ticketstore.assess_store(paths, isolation)
         assert isinstance(result, StoreRefusal) and result.code == "tracked-outside-checkout"
@@ -130,11 +179,11 @@ def test_probe_tracked_store_outside_a_nested_repo_root_is_refused(project_v7):
 
 
 def test_probe_unlistable_initiative_is_a_refusal_not_an_empty_tree(project_v7, monkeypatch):
-    """An initiative folder git can enter but Python cannot list (an execute-only
-    directory, a filesystem race) is `probe-failed`: an empty epic list would let
-    the root `tickets.toml` alone read the tree as fully tracked."""
+    """An initiative's `tickets/` folder git can enter but Python cannot list (an
+    execute-only directory, a filesystem race) is `probe-failed`: an empty epic list
+    would let the root `tickets.toml` alone read the tree as fully tracked."""
     paths = _paths(project_v7)
-    initiative = paths.initiative_folder.resolve()
+    initiative = paths.initiative_folder.resolve() / "tickets"
     real_iterdir = Path.iterdir
 
     def iterdir(self):
@@ -153,7 +202,7 @@ def test_probe_unlistable_initiative_is_a_refusal_not_an_empty_tree(project_v7, 
 def test_probe_unstattable_epic_is_a_refusal_not_absent(project_v7, monkeypatch):
     """A stat fault on an epic folder is `probe-failed`, never a missing epic."""
     paths = _paths(project_v7)
-    epic = paths.initiative_folder.resolve() / "epic-cart"
+    epic = paths.initiative_folder.resolve() / "tickets" / "epic-cart"
     real_stat = Path.stat
 
     def stat(self, *args, **kwargs):
