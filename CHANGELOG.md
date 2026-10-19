@@ -55,11 +55,8 @@ breaking changes may land in a minor release.
   `run --epic` / `--story` selectors (an epic id or slug, a ticket ref).
 - Harvest a ticket plan's `deferred:` findings into the initiative's `deferred-work.md`,
   accept v7 `source_plan:` ledger blocks, and gate tickets by ledger `gate:` refs (a
-  ticket, an epic id or folder). A v6 story-key gate resolves through the `v6_key` the
-  v7 migration leaves on each ticket: one ticket claims it, it gates that ticket;
-  none or several do, it pauses at `story-gate` until it is rewritten. While an unlanded
-  entry carries such a gate, an unreadable `tickets.toml` pauses the run and fails
-  validate `probe-failed`.
+  ticket, an epic id or folder). A v6 story-key gate resolves through the ticket's
+  migrated `v6_key`, pausing at `story-gate` only when no single ticket claims it.
 - Run deferred-work sweeps on v7 initiatives: no sprint board, bundle plans in the
   initiative folder closed at `built`, the sweep pinned to its initiative, and
   pre-answers kept per initiative in `.bmad-loop/decisions-<initiative>.json`. An answer
@@ -155,12 +152,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Name the T1 ticket plan left `done` (or `blocked`) by an interrupted commit window when the
-  resumed commit fails, instead of a plain `commit failed:`; the COMMITTING save latches the
-  plan's pre-window status and digest (DW-555).
-- Resolve a relative v6 config path (`implementation_artifacts`, `planning_artifacts`,
-  `output_folder`, `repo_root`) against the project root instead of the process cwd, as v7
-  does (DW-551).
+- Name the T1 ticket plan an interrupted commit window left `done` or `blocked` when
+  the resumed commit fails, instead of a bare `commit failed:` (DW-555).
+- Resolve a relative v6 config path against the project root instead of the process
+  cwd (DW-551).
 - Re-validate an ordinary unit's merge against the target on replay instead of trusting its
   `unit-merged` journal row; missing evidence pauses the run (`unit-merged-unverified`)
   (DW-558).
