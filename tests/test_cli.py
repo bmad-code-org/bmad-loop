@@ -4878,6 +4878,86 @@ def test_delete_dead_run(tmp_path, capsys):
     assert not run_dir.exists()
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_delete_refuses_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, capsys, force):
+    """DW-571. `bmad-loop delete` on a paused isolated sweep run that still holds
+    its shared-store close of DW-1 exits 1. Stderr names the run, DW-1 and
+    `bmad-loop resume <run>`. The run dir and the ledger are unchanged, and
+    `--force` does not waive the refusal.
+
+    Without `--force` the refusal comes from `delete_run`'s under-lock check;
+    with it, from `cmd_delete`'s pre-check.
+
+    Ablation: drop `runs.HeldSweepClosesError` from the except around
+    `delete_run` and the unforced case fails; drop the pre-check's except and the
+    forced case fails (either way the error escapes to `main`'s backstop, which
+    prints `error: ...` rather than the bare message)."""
+    import test_sweep as ts
+
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    ledger_before = paths.deferred_work.read_bytes()
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    argv = ["delete", "--project", str(paths.project), ts.HELD_RUN_ID]
+
+    assert cli.main([*argv, "--force"] if force else argv) == 1
+
+    err = capsys.readouterr().err
+    assert err.startswith(f"run {ts.HELD_RUN_ID}: refusing to delete it")
+    assert "DW-1" in err and f"bmad-loop resume {ts.HELD_RUN_ID}" in err
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+
+
+def test_delete_force_refuses_a_live_held_run_without_stopping_it(
+    project_v7_store_repo, monkeypatch, capsys
+):
+    """`delete --force` on a live run that holds unlanded sweep closes is refused
+    before `--force` hard-stops the engine, so the run is not left stopped with
+    nothing deleted.
+
+    Ablation: move the `refuse_held_sweep_closes` pre-check in `cmd_delete` after
+    `_stop_or_block_live_engine` and this fails (`stop_run` is called)."""
+    import test_sweep as ts
+
+    from bmad_loop import runs
+
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    monkeypatch.setattr(
+        runs, "stop_run", lambda _rd: pytest.fail("a held run was stopped before the refusal")
+    )
+
+    assert cli.main(["delete", "--project", str(paths.project), "--force", ts.HELD_RUN_ID]) == 1
+
+    err = capsys.readouterr().err
+    assert f"run {ts.HELD_RUN_ID}: refusing to delete it" in err and "DW-1" in err
+    assert engine.run_dir.is_dir()
+
+
+def test_delete_without_force_gives_a_live_held_run_the_live_engine_refusal(
+    project_v7_store_repo, monkeypatch, capsys
+):
+    """Without `--force`, a live run that holds sweep closes is refused as live.
+    Its close is still in flight, so the held-closes message and its `resume`
+    remedy would be wrong advice.
+
+    Ablation: run the `refuse_held_sweep_closes` pre-check in `cmd_delete`
+    without `--force` too and this fails (the held-closes message wins)."""
+    import test_sweep as ts
+
+    from bmad_loop import runs
+
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+
+    assert cli.main(["delete", "--project", str(paths.project), ts.HELD_RUN_ID]) == 1
+
+    err = capsys.readouterr().err
+    assert f"run {ts.HELD_RUN_ID} is still live" in err
+    assert "refusing to delete it" not in err
+    assert engine.run_dir.is_dir()
+
+
 def test_delete_unknown_warns_but_proceeds(tmp_path, monkeypatch, capsys):
     from bmad_loop import runs
 

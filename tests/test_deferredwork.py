@@ -4592,6 +4592,40 @@ def test_mark_open_many_writes_nothing_when_no_id_is_eligible(tmp_path, monkeypa
     assert acquisitions == []
 
 
+def test_held_reopenable_closes_names_exactly_what_mark_open_many_would_reopen(tmp_path):
+    """`held_reopenable_closes` is the read-only twin of `mark_open_many`'s decision:
+    a close this operation wrote is held, while an entry that is still open, was
+    closed by another operation or by a human, or is missing is not. It writes
+    nothing, and `mark_open_many` then reopens exactly the ids it named.
+
+    Ablation: return `dw_ids` unfiltered (skip the `_apply_open_many` fold) and
+    the DW-2 / DW-3 / DW-99 rows fail."""
+    path = write_ledger(tmp_path)
+    close_reopenable(path, "DW-1", "by dw-a")
+    close_reopenable(path, "DW-3", "by dw-b", operation_id="other-run/dw-b")
+    text = path.read_text(encoding="utf-8")
+    ids = ["DW-1", "DW-2", "DW-3", "DW-99"]
+
+    held = deferredwork.held_reopenable_closes(text, ids, "by dw-a", OPERATION_ID)
+
+    assert held == ["DW-1"]
+    assert path.read_text(encoding="utf-8") == text  # read-only
+    assert mark_open_many(path, ids, "by dw-a", OPERATION_ID) == held
+    reopened = path.read_text(encoding="utf-8")
+    assert deferredwork.held_reopenable_closes(reopened, ids, "by dw-a", OPERATION_ID) == []
+
+
+def test_held_reopenable_closes_requires_the_matching_note(tmp_path):
+    """The note is part of the decision, as it is for `mark_open_many`: the same
+    operation id under a different note holds nothing."""
+    path = write_ledger(tmp_path)
+    close_reopenable(path, "DW-1", "by dw-a")
+    text = path.read_text(encoding="utf-8")
+
+    assert deferredwork.held_reopenable_closes(text, ["DW-1"], "by dw-z", OPERATION_ID) == []
+    assert deferredwork.held_reopenable_closes(text, ["DW-1"], "by dw-a", OPERATION_ID) == ["DW-1"]
+
+
 def test_record_decision_close_matches_the_serial_pair_bytes(tmp_path, monkeypatch):
     """One `record_decision(close_note=...)` writes exactly what the
     `append_decision` + `mark_done` pair writes, in one write rather than two.

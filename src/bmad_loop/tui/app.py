@@ -2196,7 +2196,13 @@ class BmadLoopApp(App[None]):
         guard_notes: list[str] = []
         try:
             runs.delete_run(self.project, run_dir, warn=guard_notes.append)
-        except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
+        except (
+            OSError,
+            runs.StateRootError,
+            runs.LiveEngineError,
+            runs.LiveSessionError,
+            runs.HeldSweepClosesError,
+        ) as e:
             # The modal's liveness sample is advisory. Surface authoritative
             # lifecycle refusals and lock/removal failures here rather than letting
             # them kill the worker thread or forgetting a run that still exists.

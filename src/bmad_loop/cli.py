@@ -2183,6 +2183,46 @@ def _warn_bypass_dropped(
                 )
 
 
+def _warn_prior_sweep_closes(project: Path, run_id: str, journal: Journal) -> None:
+    """Warn at a sweep's start about earlier runs that still hold sweep ledger
+    closes whose code never landed (``runs.prior_sweep_closes``). Such a close
+    reads ``done`` in the shared ticket store, so this sweep cannot re-bundle it.
+    Only the held run can land or reopen it.
+
+    Writes one journal row and one stderr ``warning:`` line per finding:
+    ``sweep-prior-run-holds-closes`` for a held run, and
+    ``sweep-prior-run-closes-unknown`` when a run or the runs dir could not be
+    checked. Read-only. It never blocks or changes the new sweep, and the new
+    run and live runs are skipped."""
+    for row in runs.prior_sweep_closes(project, exclude=run_id):
+        if row.run_id is None:
+            journal.append("sweep-prior-run-closes-unknown", error=row.fault)
+            print(
+                "warning: could not check earlier runs for sweep ledger closes whose code "
+                f"never landed: {row.fault}",
+                file=sys.stderr,
+            )
+        elif row.fault is not None:
+            journal.append("sweep-prior-run-closes-unknown", run_id=row.run_id, error=row.fault)
+            print(
+                f"warning: could not check run {row.run_id} for sweep ledger closes whose "
+                f"code never landed: {row.fault}. If it holds any, `bmad-loop resume "
+                f"{row.run_id}` lands or reopens them",
+                file=sys.stderr,
+            )
+        else:
+            journal.append(
+                "sweep-prior-run-holds-closes", run_id=row.run_id, dw_ids=list(row.dw_ids)
+            )
+            print(
+                f"warning: run {row.run_id} holds sweep ledger closes whose code never "
+                f"landed ({', '.join(row.dw_ids)}). They read `done` in the shared ticket "
+                f"store, so this sweep will not re-bundle them; run `bmad-loop resume "
+                f"{row.run_id}` to land or reopen them",
+                file=sys.stderr,
+            )
+
+
 def _fatal_plugin_problems(paths: bmadconfig.ProjectPaths, pol) -> list[str]:
     """The fatal plugin-trust refusals `_reject_plugin_trust` would print, as
     banner lines for `_warn_preflight_would_abort` (no stderr, never raises)."""
@@ -4453,6 +4493,7 @@ def _start_sweep(
         profiles=profiles,
         journal=composed.journal,
     )
+    _warn_prior_sweep_closes(project, composed.run_id, composed.journal)
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
     print(summary.render())
@@ -8101,12 +8142,23 @@ def cmd_delete(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name
+    if args.force:
+        try:
+            # Before `--force` can hard-stop a live engine: a held run is refused
+            # anyway, and stopping it first would leave it stopped with nothing
+            # deleted. Without `--force` a live run gets the live-engine refusal
+            # first. `delete_run` re-checks under the lock.
+            runs.refuse_held_sweep_closes(project, run_dir)
+        except runs.HeldSweepClosesError as e:
+            print(str(e), file=sys.stderr)
+            return 1
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
     try:
         runs.delete_run(project, run_dir, force=args.force)
-    except runs.LiveEngineError as e:
+    except (runs.LiveEngineError, runs.HeldSweepClosesError) as e:
+        # `--force` waives neither: the held-closes refusal names its own remedy.
         print(str(e), file=sys.stderr)
         return 1
     except runs.LiveSessionError as e:
@@ -8504,6 +8556,21 @@ def _human_bytes(n: int) -> str:
     return f"{size:.1f}TB"
 
 
+def _held_closes_reason(e: runs.HeldSweepClosesError) -> str:
+    """`clean`'s one-line skip reason for a run `delete_run` refuses because it
+    holds unlanded sweep ledger closes, or could not be checked."""
+    if e.reason is not None:
+        return (
+            f"could not be checked for sweep ledger closes whose code never landed "
+            f"({e.reason}); repair it and retry, or `bmad-loop resume {e.run_id}` once it "
+            "reads; a run confirmed to hold none can be removed by hand"
+        )
+    return (
+        f"holds sweep ledger closes whose code never landed ({', '.join(e.dw_ids)}); "
+        f"`bmad-loop resume {e.run_id}` lands or reopens them"
+    )
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     """Reclaim disk from concluded runs: tear down worktrees leaked by a
     mid-flight stop, trim heavy scaffolding from runs kept for history, and
@@ -8576,6 +8643,22 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             continue
+        if run_dir.name in past and (args.hard or not pol.cleanup.archive_old):
+            # A sweep run that holds ledger closes whose code never landed (or
+            # cannot be checked) is the only record that can land or reopen them.
+            # `delete_run` refuses it; asking first, before any trim or worktree
+            # removal, leaves it whole instead of half-reclaimed. The archive arm
+            # keeps the run's record in its tarball and is not gated.
+            try:
+                runs.refuse_held_sweep_closes(project, run_dir)
+            except runs.HeldSweepClosesError as e:
+                protected.append(run_dir.name)
+                if not args.json:
+                    print(
+                        f"run {run_dir.name}: {_held_closes_reason(e)} — not removed",
+                        file=sys.stderr,
+                    )
+                continue
         if runs.engine_liveness(run_dir) == "unknown":
             # warn-only: unknown never blocks cleanup, but say so before removal.
             # In JSON mode this lives in the document instead (unverifiable_pid),
@@ -8621,7 +8704,12 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     if not dry:
                         runs.archive_run(project, run_dir, wait_for_lock=False)
                     archived.append(run_dir.name)
-            except (runs.LiveEngineError, runs.LiveSessionError, LockUnavailableError) as e:
+            except (
+                runs.LiveEngineError,
+                runs.LiveSessionError,
+                runs.HeldSweepClosesError,
+                LockUnavailableError,
+            ) as e:
                 # A session or engine appeared between the loop-top sample and the
                 # authoritative removal transaction — or the run's state lock is
                 # held, which says the same thing one layer down and is the only
@@ -8647,6 +8735,8 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 if not args.json:
                     if isinstance(e, runs.LiveSessionError):
                         reason = "agent session appeared mid-clean"
+                    elif isinstance(e, runs.HeldSweepClosesError):
+                        reason = _held_closes_reason(e)
                     elif isinstance(e, LockUnavailableError):
                         reason = "run state locked by another process"
                     else:

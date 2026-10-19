@@ -1878,6 +1878,18 @@ def _apply_open_many(
     return text, reopened
 
 
+def held_reopenable_closes(
+    text: str, dw_ids: Sequence[str], note: str, operation_id: str
+) -> list[str]:
+    """The ids in `dw_ids` whose close in `text` :func:`mark_open_many` would undo
+    under `note` and `operation_id`, in the order given — the closes that
+    operation still holds. Pure and read-only: the same fold the writer decides
+    with (:func:`_apply_open_many`), so "would reopen" and "is held" cannot
+    drift. An entry already reopened, closed by another operation, or missing is
+    not held."""
+    return _apply_open_many(text, dw_ids, note, _operation_digest(operation_id))[1]
+
+
 def mark_open_many(path: Path, dw_ids: Sequence[str], note: str, operation_id: str) -> list[str]:
     """Undo every close in `dw_ids` written by :func:`mark_done_many_reopenable`
     under `operation_id`, in ONE read and ONE atomic write. Returns the ids
