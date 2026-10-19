@@ -830,8 +830,9 @@ def read_v6_key_claims(initiative: Path | None) -> tuple[tuple[str, str | None],
 
     Raises :class:`TicketsV6KeyUnreadable` on any fault: an unreadable or
     non-TOML file, ``[[entry]]``/``[[epic]]`` that are not tables, an id the
-    script would refuse, an epic row without a string ``slug`` (or two rows with
-    one slug), or a ``v6_key`` that is not a string. Never spawns ``tickets.py``.
+    script would refuse, an epic row without a string ``slug``, two epic rows with
+    one id or one slug, two entries of one epic with one id, or a ``v6_key`` that
+    is not a string. Never spawns ``tickets.py``.
     """
     if initiative is None:
         return ()
@@ -846,16 +847,22 @@ def read_v6_key_claims(initiative: Path | None) -> tuple[tuple[str, str | None],
             raise TicketsV6KeyUnreadable(where, f"epic id {row.get('id')!r} is not an id")
         if not isinstance(slug, str) or not slug:
             raise TicketsV6KeyUnreadable(where, f"epic {epic_id} needs a `slug`")
+        if epic_id in epic_ids.values():
+            raise TicketsV6KeyUnreadable(where, f"two epics with id {epic_id}")
         if slug in epic_ids:
             raise TicketsV6KeyUnreadable(where, f"two epics with slug {slug}")
         epic_ids[slug] = epic_id
     claims: list[tuple[str, str | None]] = []
     for folder in folders:
         where = folder / _BREAKDOWN
+        entry_ids: set[str] = set()
         for row in _breakdown_rows(folder, "entry") or []:
             entry_id = _tree_id(row.get("id"))
             if entry_id is None:
                 raise TicketsV6KeyUnreadable(where, f"entry id {row.get('id')!r} is not an id")
+            if entry_id in entry_ids:
+                raise TicketsV6KeyUnreadable(where, f"two entries with id {entry_id}")
+            entry_ids.add(entry_id)
             if "v6_key" not in row:
                 continue
             key = row["v6_key"]

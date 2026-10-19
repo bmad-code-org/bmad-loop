@@ -1043,12 +1043,17 @@ def test_v6_key_claims_skip_a_byte_order_mark(tmp_path: Path):
         ("[[entry]]\nid = 1\nv6_key = 32\n", "`v6_key` is not a string"),
         ('[[entry]]\nid = true\nv6_key = "3-2"\n', "is not an id"),
         ('[[entry]]\nid = "a.b"\n', "is not an id"),
+        (
+            '[[entry]]\nid = 1\n\n[[entry]]\nid = "01"\nv6_key = "4-1-pay"\n',
+            "two entries with id 1",
+        ),
         ("entry = [1, 2]\n", "write `[[entry]]` tables"),
         ("entry = 3\n", "write `[[entry]]` tables"),
     ],
 )
 def test_v6_key_claims_fail_loud_on_a_mistyped_ticket_file(tmp_path: Path, epic_toml, needle):
-    """A ticket file that is not TOML, or that mistypes an entry, raises
+    """A ticket file that is not TOML, that mistypes an entry, or that gives two
+    entries one id (which `tickets.py` refuses) raises
     `TicketsV6KeyUnreadable` (kind `probe-failed`) rather than reading as "no
     claims", which would leave a v6 token legacy under the wrong remedy."""
     layout = _v6_layout(tmp_path)
@@ -1071,12 +1076,16 @@ def test_v6_key_claims_fail_loud_on_a_mistyped_ticket_file(tmp_path: Path, epic_
             '[[epic]]\nid = 1\nslug = "epic-cart"\n\n[[epic]]\nid = 2\nslug = "epic-cart"\n',
             "two epics with slug epic-cart",
         ),
+        (
+            '[[epic]]\nid = 1\nslug = "epic-cart"\n\n[[epic]]\nid = "01"\nslug = "epic-checkout"\n',
+            "two epics with id 1",
+        ),
     ],
 )
 def test_v6_key_claims_fail_loud_on_a_mistyped_epic_table(tmp_path: Path, initiative_toml, needle):
     """The initiative table that maps a folder to its epic id is read as strictly:
-    an epic row without a slug, with a refused id, not a table, or a slug two rows
-    share raises."""
+    an epic row without a slug, with a refused id, not a table, or an id or slug
+    two rows share raises, as `tickets.py` refuses that tree."""
     layout = _v6_layout(tmp_path)
     (layout.initiative_folder / "tickets.toml").write_text(initiative_toml, encoding="utf-8")
     with pytest.raises(TicketsV6KeyUnreadable, match=re.escape(needle)) as raised:
