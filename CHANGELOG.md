@@ -144,13 +144,9 @@ breaking changes may land in a minor release.
   fsynced before the replace. A run with no recorded run-dir identity, or one whose device
   number changed, records one `journal-unpinned` row per writer; `resume` records or
   re-binds the identity before its first row (DW-559).
-- Guard an isolated v7 sweep run that paused, stopped or crashed while holding shared-store
-  ledger closes for code that never landed: a new sweep warns and journals
-  `sweep-prior-run-holds-closes` (`sweep-prior-run-closes-unknown` when it cannot tell),
-  and `delete`, the TUI delete and `clean` refuse to remove that run, naming
-  `bmad-loop resume <run>`. They also refuse any run, of any type, whose state cannot be
-  read, and such a sweep run whose config or ledger cannot be read or whose pinned
-  initiative is no longer active; `delete --force` waives neither refusal (DW-571).
+- Refuse `delete` (even `--force`), the TUI delete and `clean` on a run whose state
+  cannot be read, or on an isolated v7 sweep run still holding shared-store ledger
+  closes for unlanded code; a new sweep warns while such a run exists (DW-571).
 
 ### Removed
 
@@ -161,23 +157,14 @@ breaking changes may land in a minor release.
 
 - Name the T1 ticket plan an interrupted commit window left `done` or `blocked` when
   the resumed commit fails, instead of a bare `commit failed:` (DW-555).
-- Commit a v7 sweep bundle's ledger close in the ticket store's own repository (T3/T4) once
-  its code lands, best effort with `Bmad-Code-*` trailers and withheld while the ledger is in
-  doubt, instead of leaving the store's ledger dirty (DW-556).
-- Commit a deferred v7 sweep bundle's ledger writes (its reopened close and harvested
-  deferrals) in the ticket store's own repository (T3/T4), best effort and withheld while
-  the ledger is in doubt; an isolated defer over a shared store reopens the bundle's close
-  first (DW-567).
-- Commit an isolated unit's harvested deferrals in the ticket store's own repository (T3/T4)
-  when no store publisher follows, best effort, instead of journaling
-  `harvest-carry-uncommitted` for a store path the code repository cannot commit (DW-570).
-- Reopen a worktree-isolated sweep bundle's close in a shared ticket store's ledger when the
-  bundle escalates (merge-back failures included) or a plugin vetoes it, instead of leaving
-  the entries `done` for code that never landed; a reopen fault journals
-  `sweep-bundle-reopen-failed` and the escalation still pauses (DW-569).
-- Latch a worktree-isolated sweep bundle's artifact publication complete when its artifacts
-  dir is in a shared ticket store, instead of pausing on
-  `artifact publication intent is missing` after the merge (DW-557).
+- Commit a v7 sweep's own ledger writes (bundle closes, reopened closes, harvested
+  deferrals) in a T3/T4 ticket store's repository, best effort, instead of leaving
+  them uncommitted (DW-556, DW-567, DW-570).
+- Reopen an isolated sweep bundle's close in a shared ticket store's ledger when the
+  bundle escalates, defers or is vetoed, instead of leaving entries `done` for code
+  that never landed (DW-567, DW-569).
+- Stop pausing an isolated sweep on `artifact publication intent is missing` when its
+  artifacts dir is in a shared ticket store (DW-557).
 - Resolve a relative v6 config path against the project root instead of the process
   cwd (DW-551).
 - Re-validate an ordinary unit's merge against the target on replay instead of trusting its
