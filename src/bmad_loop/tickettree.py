@@ -47,6 +47,8 @@ token for journals and pauses:
 - :class:`TicketsSchemaError` — the JSON parsed but lacks or mistypes a pinned
   field (:class:`ticketmodel.TicketsSchemaError`, re-raised as a
   :class:`TicketsError` so one ``except`` catches every tickets failure).
+  :class:`TicketsParentInitiative` is the subclass for a parent initiative's
+  ``status``/``next`` view (its child initiatives, no tickets).
 
 Writes. :meth:`TicketTree.mark` is bmad-loop's sole write path to a plan's
 ``status`` and ``blocked_*`` fields, and :meth:`TicketTree.restore_preimage`
@@ -195,6 +197,17 @@ class TicketsSchemaError(TicketsError, ticketmodel.TicketsSchemaError):
     :class:`ticketmodel.TicketsSchemaError`."""
 
     kind = "schema"
+
+
+class TicketsParentInitiative(TicketsSchemaError, ticketmodel.TicketsParentInitiative):
+    """``status``/``next`` answered with a parent initiative's view: the active
+    initiative lists child initiatives and has no tickets of its own. Also an
+    instance of :class:`ticketmodel.TicketsParentInitiative`."""
+
+    kind = "parent-initiative"
+
+    def __init__(self, command: str, folder: str, children: tuple[str, ...]) -> None:
+        ticketmodel.TicketsParentInitiative.__init__(self, command, folder, children)
 
 
 class TicketsLockBusy(TicketsError):
@@ -729,6 +742,8 @@ def _journal_mark(
 def _parsed(parse: Callable[[object], _T], doc: dict[str, object] | str) -> _T:
     try:
         return parse(doc)
+    except ticketmodel.TicketsParentInitiative as e:
+        raise TicketsParentInitiative(e.command, e.folder, e.children) from e
     except ticketmodel.TicketsSchemaError as e:
         raise TicketsSchemaError(e.command, e.field, e.detail) from e
 

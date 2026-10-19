@@ -35,7 +35,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, NamedTuple
 
-from . import bmadconfig, childrun, ticketmodel, ticketstore, tickettree
+from . import bmadconfig, childrun, ticketlayout, ticketmodel, ticketstore, tickettree
 from .adapters.profile import ALIASES, CANONICAL_EVENTS, CLIProfile, ProfileError, load_profiles
 from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
@@ -795,6 +795,40 @@ def _probe_unreadable(check: str, rel: str, fault: str) -> Finding:
     )
 
 
+def _initiative_children(folder: Path) -> tuple[tuple[str, ...] | None, Path, str]:
+    """Whether the initiative at ``folder`` is a parent initiative, read from its
+    ``tickets.toml`` the way the script's ``is_parent`` reads it (an
+    ``initiative`` key), without spawning the script: the child slugs (None for
+    an initiative that is no parent, or has no ``tickets.toml`` yet), the file
+    read, and "" or the fault that kept the read from answering."""
+    try:
+        path = ticketlayout.breakdown_dir(folder) / ticketlayout.BREAKDOWN
+    except OSError as e:
+        return None, folder / ticketlayout.TICKETS, f"{type(e).__name__}: {e}"
+    present, fault = _probe_fault(path, "file")
+    if fault or not present:
+        return None, path, fault
+    try:
+        # utf-8-sig, as the script reads it: a BOM would hide the first table.
+        data = tomllib.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:  # ValueError: UnicodeDecodeError, TOMLDecodeError
+        return None, path, f"{type(e).__name__}: {e}"
+    if "initiative" not in data:
+        return None, path, ""
+    rows: object = data["initiative"]
+    if not isinstance(rows, list):
+        return None, path, "`initiative` is not a list of `[[initiative]]` tables"
+    children: list[str] = []
+    for row in rows:  # pyright: ignore[reportUnknownVariableType]
+        slug = (
+            row.get("slug") if isinstance(row, dict) else None
+        )  # pyright: ignore[reportUnknownMemberType]
+        if not isinstance(slug, str):
+            return None, path, "an `[[initiative]]` table has no text `slug`"
+        children.append(slug)
+    return tuple(children), path, ""
+
+
 def _tickets_store_findings(
     paths: bmadconfig.ProjectPaths, isolation: str, extra_args_roles: Sequence[str]
 ) -> list[Finding]:
@@ -958,7 +992,26 @@ def tickets_preflight(
                     )
                 )
             else:
-                findings.extend(_tickets_store_findings(paths, isolation, extra_args_roles))
+                assert folder is not None  # folder_ok
+                children, breakdown, parent_fault = _initiative_children(folder)
+                if parent_fault:
+                    findings.append(
+                        _probe_unreadable("tickets.initiative-parent", str(breakdown), parent_fault)
+                    )
+                elif children is not None:
+                    findings.append(
+                        Finding(
+                            "tickets.initiative-parent",
+                            "problem",
+                            f"active initiative {paths.active_initiative!r} is a parent "
+                            f"initiative (children: {', '.join(children) or 'none listed'}) "
+                            "— set `[core] active_initiative` to one child (ask the `bmad` "
+                            "skill to switch it)",
+                            {"initiative": paths.active_initiative, "children": list(children)},
+                        )
+                    )
+                else:
+                    findings.extend(_tickets_store_findings(paths, isolation, extra_args_roles))
     store, store_error = _ticket_store(project)
     if store != "repo":
         findings.append(

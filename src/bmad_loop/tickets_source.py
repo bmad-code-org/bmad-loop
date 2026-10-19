@@ -90,7 +90,7 @@ from .model import (
     TicketBinding,
 )
 from .statemachine import PLAN_BLOCKED, PLAN_STATUS_ORDER
-from .ticketmodel import FindResult, NextView, StatusView, TicketRow
+from .ticketmodel import EpicRow, FindResult, NextView, StatusView, TicketRow
 from .tickettree import TicketsError, TicketTreeLike
 from .worksource import SOURCE_TICKETS, EpicProgress
 from .worksource import Halt as WorkHalt
@@ -288,14 +288,15 @@ def epic_boundary(
 ) -> list[EpicBoundary]:
     """The epic-boundary actions owed before the next pick, in build order, over
     the open epics only (a closed epic owes nothing: its closure is recorded in
-    the tree). ``committed`` holds the epic slugs this run committed a ticket
-    of; ``resumed`` the epics whose closure pause a resume answered
+    the tree), skipping an epic not sliced yet (no folder, no tickets: nothing
+    to retro or close). ``committed`` holds the epic slugs this run committed a
+    ticket of; ``resumed`` the epics whose closure pause a resume answered
     (:func:`resume_epic_closure`). The caller stops at the first
     :data:`BOUNDARY_RETRO`, :data:`BOUNDARY_REJECTED` or :data:`BOUNDARY_PAUSE`;
     acknowledgements before it are carried out."""
     out: list[EpicBoundary] = []
     for epic in status_view.epics:
-        if epic.status in EPIC_CLOSED:
+        if epic.status in EPIC_CLOSED or epic.folder is None:
             continue
         slug = epic.slug
         verdict = closures.get(slug)
@@ -448,13 +449,13 @@ def _awaiting_closure(status_view: StatusView) -> list[str]:
     return out
 
 
-def _unbroken_epics(status_view: StatusView) -> list[str]:
-    """Open epics with no tickets at all, in build order."""
+def _unbroken_epics(status_view: StatusView) -> list[EpicRow]:
+    """Open epics with no tickets at all, in build order: an epic folder nobody
+    broke down, or an epic the initiative declares and nobody sliced yet
+    (``folder`` None)."""
     with_tickets = {t.epic for t in status_view.tickets}
     return [
-        e.slug
-        for e in status_view.epics
-        if e.status not in EPIC_CLOSED and e.slug not in with_tickets
+        e for e in status_view.epics if e.status not in EPIC_CLOSED and e.slug not in with_tickets
     ]
 
 
@@ -662,15 +663,15 @@ def decide_pick(
             f"every ticket of {awaiting[0]} is done; close {awaiting[0]}",
             held_notes,
         )
-    unbroken = [slug for slug in _unbroken_epics(status_view) if scope.admits_epic(slug)]
+    unbroken = [e for e in _unbroken_epics(status_view) if scope.admits_epic(e.slug)]
     if unbroken:
-        return Halt(
-            HALT_STALLED,
-            unbroken[0],
-            None,
-            f"{unbroken[0]} is open but has no tickets: break it down or close it",
-            held_notes,
+        first = unbroken[0]
+        why = (
+            "is declared in the initiative but has no folder yet: create it and break it down"
+            if first.folder is None
+            else "is open but has no tickets: break it down or close it"
         )
+        return Halt(HALT_STALLED, first.slug, None, f"{first.slug} {why}", held_notes)
     return Skip(SKIP_EMPTY, notes=held_notes)
 
 

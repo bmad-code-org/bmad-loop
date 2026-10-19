@@ -404,6 +404,31 @@ def test_schema_error_is_both_a_tickets_error_and_a_model_error(tmp_path, monkey
     assert isinstance(caught.value, TicketsError) and caught.value.field == "folder"
 
 
+@pytest.mark.parametrize("verb", ["next", "status"])
+def test_parent_view_is_a_parent_initiative_fault(tmp_path, monkeypatch, verb):
+    """A parent initiative's `parent_view` (children, no tickets) re-raises as
+    `TicketsParentInitiative`: still a schema fault to every `except`, with its own
+    `kind` and the children kept. No spawn (canned child). Ablation (performed):
+    drop its `except` arm in `_parsed` and the plain schema error FAILS this."""
+    from bmad_loop import ticketmodel
+
+    doc = {
+        "store": "repo",
+        "folder": "initiative-platform",
+        "initiatives": [{"slug": "initiative-auth"}, {"slug": "initiative-billing"}],
+        "order_conflict": [],
+    }
+    canned(monkeypatch, ChildRun(0, json.dumps(doc), ""))
+    with pytest.raises(tickettree.TicketsParentInitiative) as caught:
+        getattr(tree_at(tmp_path), verb)()
+    e = caught.value
+    assert isinstance(e, tickettree.TicketsSchemaError)
+    assert isinstance(e, ticketmodel.TicketsParentInitiative)
+    assert e.kind == "parent-initiative" and e.command == verb
+    assert e.children == ("initiative-auth", "initiative-billing")
+    assert "is a parent initiative (children: initiative-auth, initiative-billing)" in str(e)
+
+
 def test_spawn_oserror_is_unavailable(tmp_path, monkeypatch):
     def boom(argv, **kw):
         raise PermissionError("denied")

@@ -48,10 +48,24 @@ def _epic(slug: str, eid: str, status: str = "in-progress", **kw) -> EpicRow:
         gated_by=kw.get("gated_by", ()),
         blocks=(),
         next_id=3,
+        folder=slug,
+        refined=True,
     )
 
 
 EPICS = (_epic(CART, "1"), _epic(CHECKOUT, "2", gated_by=(CART,)))
+# Declared in the initiative, no folder yet (`folder: null`): no file, no tickets.
+UNSLICED = EpicRow(
+    slug="epic-payment",
+    id="3",
+    status="",
+    after=(),
+    gated_by=(),
+    blocks=(),
+    next_id=None,
+    folder=None,
+    refined=False,
+)
 
 
 def _views(
@@ -786,6 +800,15 @@ def _boundary(views, closures=None, acked=(), committed=(CART,), resumed=()):
             [],
             id="acked-closure-owes-nothing",
         ),
+        pytest.param(
+            _views(others=(_done("1.1"),), epics=(_epic(CART, "1"), UNSLICED)),
+            {"epic-payment": "accepted"},
+            (),
+            (CART, "epic-payment"),
+            (),
+            [("retro", CART, "")],
+            id="unsliced-epic-owes-nothing-even-with-a-closure",
+        ),
     ],
 )
 def test_epic_boundary(views, closures, acked, committed, resumed, expected):
@@ -793,8 +816,10 @@ def test_epic_boundary(views, closures, acked, committed, resumed, expected):
     for a finished epic this run committed to, a re-pause for a rejected one
     still finished, an acknowledgement for any other unacknowledged closure a
     resume answered, and a pause for one no resume answered (the run stopped
-    between recording it and pausing). Ablation (performed): emit the
-    acknowledgement whatever `resumed` holds and the no-resume row FAILS."""
+    between recording it and pausing); an epic not sliced yet owes nothing.
+    Ablation (performed): emit the acknowledgement whatever `resumed` holds and
+    the no-resume row FAILS; drop the `folder is None` skip and the unsliced row
+    FAILS."""
     assert _boundary(views, closures, acked, committed, resumed) == expected
 
 

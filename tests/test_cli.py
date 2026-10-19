@@ -3201,7 +3201,15 @@ def test_status_text_tickets_board_groups_by_epic(project, capsys, monkeypatch):
 
     def epic(slug, eid, status="in-progress"):
         return EpicRow(
-            slug=slug, id=eid, status=status, after=(), gated_by=(), blocks=(), next_id=3
+            slug=slug,
+            id=eid,
+            status=status,
+            after=(),
+            gated_by=(),
+            blocks=(),
+            next_id=3,
+            folder=slug,
+            refined=True,
         )
 
     rows = (
@@ -3240,6 +3248,36 @@ def test_status_text_tickets_board_groups_by_epic(project, capsys, monkeypatch):
     assert body[2][-2:] == ["[run:", "awaiting-operator]"]
     assert "[hitl]" in board[7] and "[run:" not in board[7]
     assert board[8] == "  epic-loose  1/1 done  (not in the initiative table)"
+
+
+def test_status_text_tickets_board_names_an_unsliced_epic(project, capsys, monkeypatch):
+    """An epic the initiative declares but nobody sliced (`folder: null`, no
+    status) reads as not sliced yet, not as an epic missing from the initiative
+    table. No real spawn."""
+    from bmad_loop.ticketmodel import EpicRow
+
+    unsliced = EpicRow(
+        slug="epic-payment",
+        id="3",
+        status="",
+        after=(),
+        gated_by=(),
+        blocks=(),
+        next_id=None,
+        folder=None,
+        refined=False,
+    )
+    tree = FakeTicketTree(
+        project.project,
+        status_view=fake_status_view((ticket_row("1.1"),), epics=(unsliced,)),
+    )
+    _board_tree(monkeypatch, tree)
+    _make_tickets_status_run(project.project)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert "  epic-payment  0/0 done  (not sliced yet)" in out.splitlines()
     assert "mark or store commit owed after landing: 1.1 (done), 1.2 (blocked)" in out
 
 
@@ -14361,6 +14399,8 @@ def _selector_tree(epics=("epic-cart", "epic-checkout")):
                     gated_by=(),
                     blocks=(),
                     next_id=3,
+                    folder=slug,
+                    refined=True,
                 )
                 for i, slug in enumerate(epics, 1)
             ),

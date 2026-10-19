@@ -18,6 +18,7 @@ Tickets mode is **experimental**. It is built and tested against BMAD-METHOD mai
 | `tickets.config-utils-missing`                           | `_bmad/scripts/config_utils.py` exists; `tickets.py` loads it.                                         |
 | `tickets.uv-missing`                                     | `uv` is on `PATH`. build-auto runs `tickets.py` with `uv run`.                                         |
 | `tickets.initiative-unset`, `tickets.initiative-missing` | `active_initiative` is set and its folder exists.                                                      |
+| `tickets.initiative-parent`                              | the active initiative is no parent initiative: a run builds one child at a time.                       |
 | `tickets.store-not-repo`                                 | the store is a repo store, not a tracker.                                                              |
 | `tickets.store-topology` and its siblings                | the store layout is one tickets runs can drive (see [Store layouts](#store-layouts)).                  |
 | `tickets.branch-per-run`                                 | a warning: `[scm] branch_per = "run"` puts every ticket on one branch.                                 |

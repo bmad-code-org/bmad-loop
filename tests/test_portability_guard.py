@@ -333,6 +333,8 @@ REFUSAL_HELPER_DEFS = {
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("sweep.py", "_refuse_advanced_migration_head"),  # DW-427/428, test_sweep.py
     ("sweep.py", "_refuse_dirty_migration_input"),  # DW-437, test_sweep.py
+    # a parent initiative's status/next view; test_ticketmodel.py test_*_parent_view_raises_*
+    ("ticketmodel.py", "_refuse_parent_view"),
     # DW-554: the v6_key claims read fault pause around the base gate check;
     # test_tickets_engine.py test_tickets_gate_unreadable_ticket_file_pauses
     ("tickets_engine.py", "_refuse_gated_story"),

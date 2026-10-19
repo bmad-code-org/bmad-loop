@@ -52,6 +52,7 @@ from bmad_loop.tickets_source import TicketRef, ticket_binding
 from bmad_loop.tickettree import (
     TicketsCrashed,
     TicketsLockBusy,
+    TicketsParentInitiative,
     TicketsPlanIOError,
     V6KeyClaim,
 )
@@ -226,6 +227,31 @@ def test_find_fault_on_refined_plan_checkpoint_pauses_at_ticket_tree(project_v7)
     assert (paused.value.stage, paused.value.story_key) == (PAUSE_TICKET_TREE, "1.1")
     assert "tickets.py died" in paused.value.reason
     assert "approve story file" not in paused.value.reason
+    [halt] = _kinds(engine, "ticket-pick-halt")
+    assert (halt["cause"], halt["stage"]) == ("tree-fault", PAUSE_TICKET_TREE)
+    assert engine.state.tasks == {} and adapter.sessions == []
+
+
+def test_parent_initiative_pauses_with_its_children_named(project_v7):
+    """An active initiative that is a parent answers `next`/`status` with its
+    children (`TicketsParentInitiative`): the pick pauses at `ticket-tree` with
+    the message naming them verbatim, and nothing is built."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    parent = TicketsParentInitiative(
+        "next", "initiative-platform", ("initiative-auth", "initiative-billing")
+    )
+    tree.faults["next"] = tree.faults["status"] = parent
+    engine, adapter = make_engine(project_v7, tree)
+
+    with pytest.raises(RunPaused) as paused:
+        engine._pick_next()
+
+    assert paused.value.stage == PAUSE_TICKET_TREE
+    assert paused.value.reason.startswith(
+        "tickets.py parent-initiative: active initiative initiative-platform is a parent "
+        "initiative (children: initiative-auth, initiative-billing); set "
+        "`[core] active_initiative` to one child"
+    )
     [halt] = _kinds(engine, "ticket-pick-halt")
     assert (halt["cause"], halt["stage"]) == ("tree-fault", PAUSE_TICKET_TREE)
     assert engine.state.tasks == {} and adapter.sessions == []
@@ -2780,7 +2806,30 @@ def test_rollback_restores_plan_preimage_through_chokepoint(project_v7, monkeypa
 
 def _epic(slug: str = "epic-cart", status: str = "in-progress", epic_id: str = "1") -> EpicRow:
     return EpicRow(
-        slug=slug, id=epic_id, status=status, after=(), gated_by=(), blocks=(), next_id=1
+        slug=slug,
+        id=epic_id,
+        status=status,
+        after=(),
+        gated_by=(),
+        blocks=(),
+        next_id=1,
+        folder=slug,
+        refined=True,
+    )
+
+
+def _unsliced(slug: str = "epic-payment", epic_id: str = "3") -> EpicRow:
+    """An epic the initiative declares that has no folder yet (`folder: null`)."""
+    return EpicRow(
+        slug=slug,
+        id=epic_id,
+        status="",
+        after=(),
+        gated_by=(),
+        blocks=(),
+        next_id=None,
+        folder=None,
+        refined=False,
     )
 
 
@@ -3194,6 +3243,35 @@ def test_story_scope_run_finishes_past_the_epic_its_ticket_finished(project_v7, 
     assert state.finished and state.ticket_epic_closures == {}
     [skipped] = _kinds(engine, "retro-run-end-skipped")
     assert (skipped["epic_ref"], skipped["reason"]) == ("epic-cart", "out-of-scope")
+
+
+def test_unsliced_epic_never_triggers_a_retrospective_or_closure(project_v7):
+    """An epic the initiative declares but nobody sliced has no tickets: once the
+    run's work is built it gets no retrospective, no closure and no closure pause,
+    but the run is not finished either: it stalls naming the epic as not created
+    yet (not as one to close). Ablation (performed): word every ticketless epic
+    as open, as before, and this FAILS."""
+    rest = ticket_row("1.2", after=("1",))
+    tree = _epic_tree(project_v7, others=(rest,), epics=(_epic(), _unsliced()))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, adapter = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[_builds_finishing(project_v7, tree, plan)],
+    )
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert state.paused_story_key == "epic-payment"
+    assert "epic-payment is declared in the initiative but has no folder yet" in (
+        state.paused_reason or ""
+    )
+    assert state.ticket_epic_closures == {}
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    assert _kinds(engine, "retro-auto-start") == []
+    assert _kinds(engine, "ticket-epic-closure") == []
 
 
 @pytest.mark.parametrize("mode", ["never", "notify"])
