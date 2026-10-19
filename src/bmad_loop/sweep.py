@@ -8915,13 +8915,18 @@ class SweepEngine(Engine):
         """The base veto routing, after :meth:`_reopen_unlanded_close` when a
         plugin really vetoed (DW-569). Every veto action (``pause``, ``defer``,
         ``skip``) ends the unit without landing its code, so the reopen runs
-        ahead of the base's terminal save. A stage nobody vetoed is not an end
-        and reaches the base untouched."""
-        if ctx is not None and ctx.resolved_veto() is not None:
-            self._reopen_unlanded_close(task)
+        ahead of the base's terminal save. Only ``pause`` may degrade a reopen
+        fault: ``defer`` and ``skip`` let the run go on to finish, and a finished
+        run is out of :func:`~bmad_loop.runs.held_sweep_closes`' reach, so their
+        fault propagates before any DEFERRED is recorded, as :meth:`_defer`'s
+        does. A stage nobody vetoed is not an end and reaches the base
+        untouched."""
+        veto = ctx.resolved_veto() if ctx is not None else None
+        if veto is not None:
+            self._reopen_unlanded_close(task, may_degrade=veto.action == "pause")
         return super()._vetoed(ctx, task)
 
-    def _reopen_unlanded_close(self, task: StoryTask) -> None:
+    def _reopen_unlanded_close(self, task: StoryTask, *, may_degrade: bool = True) -> None:
         """Reopen an isolated bundle's shared-store close when the bundle ends
         without landing (DW-569): before the terminal save of every escalation
         (:meth:`_escalate`, ``WorktreeFlow.escalate_unit`` for an in-flight unit,
@@ -8944,10 +8949,15 @@ class SweepEngine(Engine):
         ``bundle_closes_intended`` is kept, so a re-armed bundle that lands
         re-closes through :meth:`_carry_isolated_ledger_writes`.
 
-        A ``LedgerReadError`` or ``OSError`` from the reopen is a visible
-        degrade: it journals ``sweep-bundle-reopen-failed`` and skips the
-        publish, and the escalation or veto goes on. The escalation pause is the
-        operator stop; turning it into a crash would lose its reason.
+        A ``LedgerReadError`` or ``OSError`` from the reopen journals
+        ``sweep-bundle-reopen-failed`` and skips the publish. With
+        ``may_degrade`` (every escalation, a ``pause`` veto) that is a visible
+        degrade and the end goes on: the pause is the operator stop, turning it
+        into a crash would lose its reason, and the paused run stays guarded by
+        :func:`~bmad_loop.runs.held_sweep_closes`. Without it (a ``defer`` or
+        ``skip`` veto, which do not stop the run) the fault then propagates, so
+        the task is not yet terminal and the crashed run stays unfinished and
+        guarded.
 
         The other ends of such a run (a pause other than an escalation, a stop,
         a crash) reopen nothing, and no reopen path is built for them (DW-571).
@@ -8973,6 +8983,8 @@ class SweepEngine(Engine):
                 dw_ids=list(task.bundle_closes_intended),
                 error=str(e),
             )
+            if not may_degrade:
+                raise
             return
         self._publish_deferred_ledger(task)
 

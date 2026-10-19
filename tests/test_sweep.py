@@ -39108,6 +39108,48 @@ def test_v7_isolated_escalation_reopen_fault_is_journaled_degrade(
     assert _records(engine, "store-committed") == []
 
 
+@pytest.mark.parametrize("action", ["defer", "skip", "pause"])
+def test_v7_isolated_veto_reopen_fault_degrades_only_under_pause(
+    project_v7_store_repo, monkeypatch, action
+):
+    """DW-569. T3: a plugin veto's reopen of the shared close faults. `pause`
+    stops the run, which stays guarded by `held_sweep_closes`, so the fault is
+    the journaled degrade the escalation takes and the veto still pauses.
+    `defer` and `skip` would let the run finish, out of that guard's reach, with
+    a `done` for code that never landed, so the fault propagates before the base
+    records DEFERRED: the task keeps its in-flight phase, with no veto row.
+    Every row journals `sweep-bundle-reopen-failed` and publishes nothing.
+
+    ABLATION (performed): drop the `if not may_degrade: raise` arm in
+    `SweepEngine._reopen_unlanded_close` and the `defer`/`skip` rows fail (the
+    veto returns True and the task is DEFERRED)."""
+    engine, paths, store, _ledger_rel, task = _v7_isolated_close_seam(project_v7_store_repo, "T3")
+    head = git(store, "rev-parse", "HEAD").strip()
+    phase = task.phase
+
+    def mark_open_many(*args, **kwargs):
+        raise OSError("injected reopen write fault")
+
+    monkeypatch.setattr(deferredwork, "mark_open_many", mark_open_many)
+    ctx = HookContext("pre_review_phase", run_id=engine.state.run_id, story_key=task.story_key)
+    ctx.veto(action, "policy says no")
+
+    if action == "pause":
+        with pytest.raises(RunPaused):
+            engine._vetoed(ctx, task)
+        assert task.phase == Phase.ESCALATED
+        assert [r["action"] for r in _records(engine, "plugin-veto")] == ["pause"]
+    else:
+        with pytest.raises(OSError, match="injected reopen"):
+            engine._vetoed(ctx, task)
+        assert task.phase == phase
+        assert _records(engine, "plugin-veto") == []
+    failed = _records(engine, "sweep-bundle-reopen-failed")
+    assert [(r["story_key"], r["dw_ids"]) for r in failed] == [(task.story_key, ["DW-1"])]
+    assert not ledger_entries(paths)["DW-1"].open
+    assert git(store, "rev-parse", "HEAD").strip() == head  # no publish
+
+
 def _store_carry_commits(store: Path, story_key: str) -> list[str]:
     """The shas of the store's harvested-carry commits for ``story_key``, newest
     first (DW-570)."""
