@@ -142,7 +142,7 @@ as they read now:
     "ticket_id": "2",
     "title": "List command",
     "epic": "epic-cli",
-    "plan": "/abs/path/to/<initiative>/epic-cli/story-list-command-plan.md",
+    "plan": "/abs/path/to/<initiative>/tickets/epic-cli/tickets/story-list-command-plan.md",
     "plan_status": "blocked",
     "blocked_reason": "intent gap",
     "auto_run_result": "…excerpt of the plan's `## Auto Run Result`…"

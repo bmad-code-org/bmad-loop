@@ -2,15 +2,16 @@
 
 Ticket-tree mode drives a BMAD v7 initiative ticket tree. bmad-loop picks the next startable ticket, dispatches `bmad-build-auto ticket <ref>` in a fresh session, verifies and reviews the result, and marks the plan `done` through the project's own `tickets.py`. It follows the orchestrator contract upstream wrote for bmad-loop (BMAD-METHOD `docs/build/autonomous-development-loops.md`). The v6 sprint-status and stories.yaml modes are unchanged and run side by side.
 
-Tickets mode is **experimental**. It is built and tested against BMAD-METHOD main at `8f0d50e1` (`6.13.0-next`); the contract tests run against `tickets.py` vendored at that commit.
+Tickets mode is **experimental**. It is built and tested against BMAD-METHOD main at `61e01f82` (`6.13.0-next`); the contract tests run against `bmad-agent-po`'s `tickets.py` vendored at that commit.
 
 ## Prerequisites
 
-1. **Install BMAD v7 and bmad-loop.** Follow [Installing on BMAD v7](setup-guide.md#installing-on-bmad-v7-bmad-setup): `npx skills add bmad-code-org/bmad-loop`, then `/bmad setup bmad-loop`, then `/bmad-loop-setup`. The module record requires `bmad` and `bmad-build-auto` at 6.13.0 or newer and recommends `bmad-ticket` and `bmad-retrospective`, which tickets mode uses.
-2. **Select the source.** Set `[stories] source = "tickets"` in `.bmad-loop/policy.toml`.
-3. **Pick an initiative.** Set `[core] active_initiative` (in `_bmad/custom/config.user.toml`) to an initiative whose folder exists.
-4. **Use a repo store.** `_bmad/custom/ticketing-store-config.toml` must say `store = "repo"`. Tracker stores are refused.
-5. **Check it.** Run `bmad-loop validate --probes`. Every `run` repeats the same `tickets.*` preflight and refuses on any problem.
+1. **Install BMAD v7 and bmad-loop.** Follow [Installing on BMAD v7](setup-guide.md#installing-on-bmad-v7-bmad-setup): `npx skills add bmad-code-org/bmad-loop`, then `/bmad setup bmad-loop`, then `/bmad-loop-setup`. The module record requires `bmad` and `bmad-build-auto` at 6.13.0 or newer and recommends `bmad-agent-po` and `bmad-retrospective`, which tickets mode uses.
+2. **Plan the tree with Sofia.** Talk to Sofia, the Product Owner agent (`bmad-agent-po`): she creates the initiative, slices it into epics and stories, writes and refines the tickets, and readies them. She also replans mid-flight and runs the epic closure check. On v7 she replaces `bmad-spec`, `bmad-ticket` and `bmad-correct-course`.
+3. **Select the source.** Set `[stories] source = "tickets"` in `.bmad-loop/policy.toml`.
+4. **Pick an initiative.** `[core] active_initiative` in `_bmad/custom/config.user.toml` must name an initiative whose folder exists, and not a parent initiative. Sofia records the initiative she creates there, and the `bmad` skill shows, switches, creates or clears it, so you rarely edit the file by hand.
+5. **Use a repo store.** With no `_bmad/custom/ticketing-store-config.toml` the store is the repo store. Sofia writes that file only when you connect a tracker or switch stores, and it must then say `store = "repo"`: tracker stores are refused.
+6. **Check it.** Run `bmad-loop validate --probes`. Every `run` repeats the same `tickets.*` preflight and refuses on any problem.
 
 | Check id                                                 | Requires                                                                                               |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -31,6 +32,14 @@ Tickets mode is **experimental**. It is built and tested against BMAD-METHOD mai
 bmad-loop never parses the tree itself. It runs the project's installed `tickets.py` (`next`, `find`, `status`, `mark`) and reads its JSON. `tickets.py` in turn executes the project's `_bmad/scripts/config_utils.py`, so treat both as project code. bmad-loop runs the script with its own interpreter (`-I -B -X utf8`) when the script's `requires-python` allows, and through `uv run --no-project` otherwise.
 
 These surfaces run it: `run` (including `--dry-run` and the selectors), `resume`, `resolve`, `confirm`, the `status` board, `validate --probes`, and plain `validate` only while an unlanded ledger entry declares a `gate:`. The TUI's tickets board and start-run preview run it too, on a worker thread rather than the UI thread, and the board re-reads only when the initiative's files change.
+
+## Tree layout
+
+An initiative folder holds its own `<initiative>.md` and, in a `tickets/` folder, its `tickets.toml` and one folder per epic. Each epic folder holds `<epic>.md` and its retrospective, with its `tickets.toml`, leaf ticket files and plans in its own `tickets/` folder. `backlog/` stays flat.
+
+bmad-loop reads each folder the way the installed `tickets.py` does: a folder with a `tickets/` folder inside it is read there, and any other folder is read as the preview-era flat layout. A preview-era tree therefore still runs with the preview-era `tickets.py` it was installed with. The current `tickets.py` refuses that layout; `bmad migrate method` moves the tree into `tickets/` folders.
+
+A parent initiative, whose `tickets.toml` lists child initiatives in `[[initiative]]` tables, is refused (`tickets.initiative-parent`): set `active_initiative` to one child. An epic the initiative declares but has not sliced yet has no folder; it holds no tickets, and the tickets gated after it wait for it.
 
 ## Store layouts
 
@@ -79,24 +88,24 @@ A unit's commit carries a `Bmad-Ticket:` trailer, and a `Bmad-Plan:` trailer whe
 
 A pick pause fires before the ticket is registered, so a resume re-reads the tree and picks again. `bmad-loop status <run-id>` and the TUI show the stage; the TUI badges the ticket stages `hitl`, `refine` and `tree`.
 
-| Stage              | Why the run paused                                                                             | Clear it                                                                                                    |
-| ------------------ | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `ticket-hitl`      | the next ticket is a hitl ticket                                                               | build it with a person, then `bmad-loop resume <run-id>`                                                    |
-| `ticket-refine`    | the next ticket needs refining, or a blocked ticket has an open unknown                        | refine it with bmad-ticket, then resume                                                                     |
-| `ticket-tree`      | `active_initiative` no longer matches the run's pinned initiative                              | set it back, then resume                                                                                    |
-| `ticket-tree`      | `tickets.py` failed, or a mark (done, park or rollback re-arm) failed                          | fix the tree, then resume; the mark is retried                                                              |
-| `ticket-tree`      | a store-repository commit is still owed at run end (`store-commit-owed`)                       | commit or unstage the store's own changes to those paths, then resume; the commit is retried                |
-| `ticket-tree`      | only tickets this run did not start stand in the way, or the tree is stalled                   | finish or unblock those tickets, then resume                                                                |
-| `ticket-tree`      | the initiative folder holds uncommitted changes the run does not own                           | commit or stash them, then resume                                                                           |
-| `ticket-tree`      | under worktree isolation the code repo gitignores a tracked store's plan (`ignored-plan`)      | commit the plans with the initiative folder, or gitignore the whole store, then resume                      |
-| `plan-checkpoint`  | a refined `plan_checkpoint` ticket waits for story-file approval                               | review the story file; `resume` records the approval and dispatches                                         |
-| `plan-checkpoint`  | an unrefined `plan_checkpoint` ticket finished its planning leg                                | review the plan, then resume; TUI **Request replan** sends it back to `draft`                               |
-| `story-checkpoint` | a `done_checkpoint` ticket committed                                                           | resume                                                                                                      |
-| `epic-boundary`    | an epic awaits closure, its verdict is `rejected`, or a later ticket waits on an unclosed epic | close the epic with bmad-ticket and commit it, then resume (see [closure](#epic-retrospective-and-closure)) |
-| `epic-boundary`    | an epic's retrospective document could not be committed in the store repository                | commit or unstage the store's own changes to it, then resume; the commit is retried                         |
-| `escalation`       | a plan is `blocked` and this run did not park it, or a session escalated                       | `bmad-loop resolve <run-id>` (see [Parking and resolve](#parking-and-resolve))                              |
-| `story-gate`       | a deferred-work `gate:` names the ticket, or a gate is a v6 story key no single ticket claims  | close the entry or rewrite the token, then resume (see [Ledger and sweeps](#ledger-and-sweeps))             |
-| `story-gate`       | a `tickets.toml` cannot be read for its `v6_key` claims while a v6 story-key gate stands       | fix the file, then resume                                                                                   |
+| Stage              | Why the run paused                                                                             | Clear it                                                                                                      |
+| ------------------ | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `ticket-hitl`      | the next ticket is a hitl ticket                                                               | build it with a person, then `bmad-loop resume <run-id>`                                                      |
+| `ticket-refine`    | the next ticket needs refining, or a blocked ticket has an open unknown                        | refine it with bmad-agent-po, then resume                                                                     |
+| `ticket-tree`      | `active_initiative` no longer matches the run's pinned initiative                              | set it back, then resume                                                                                      |
+| `ticket-tree`      | `tickets.py` failed, or a mark (done, park or rollback re-arm) failed                          | fix the tree, then resume; the mark is retried                                                                |
+| `ticket-tree`      | a store-repository commit is still owed at run end (`store-commit-owed`)                       | commit or unstage the store's own changes to those paths, then resume; the commit is retried                  |
+| `ticket-tree`      | only tickets this run did not start stand in the way, or the tree is stalled                   | finish or unblock those tickets, then resume                                                                  |
+| `ticket-tree`      | the initiative folder holds uncommitted changes the run does not own                           | commit or stash them, then resume                                                                             |
+| `ticket-tree`      | under worktree isolation the code repo gitignores a tracked store's plan (`ignored-plan`)      | commit the plans with the initiative folder, or gitignore the whole store, then resume                        |
+| `plan-checkpoint`  | a refined `plan_checkpoint` ticket waits for story-file approval                               | review the story file; `resume` records the approval and dispatches                                           |
+| `plan-checkpoint`  | an unrefined `plan_checkpoint` ticket finished its planning leg                                | review the plan, then resume; TUI **Request replan** sends it back to `draft`                                 |
+| `story-checkpoint` | a `done_checkpoint` ticket committed                                                           | resume                                                                                                        |
+| `epic-boundary`    | an epic awaits closure, its verdict is `rejected`, or a later ticket waits on an unclosed epic | close the epic with bmad-agent-po and commit it, then resume (see [closure](#epic-retrospective-and-closure)) |
+| `epic-boundary`    | an epic's retrospective document could not be committed in the store repository                | commit or unstage the store's own changes to it, then resume; the commit is retried                           |
+| `escalation`       | a plan is `blocked` and this run did not park it, or a session escalated                       | `bmad-loop resolve <run-id>` (see [Parking and resolve](#parking-and-resolve))                                |
+| `story-gate`       | a deferred-work `gate:` names the ticket, or a gate is a v6 story key no single ticket claims  | close the entry or rewrite the token, then resume (see [Ledger and sweeps](#ledger-and-sweeps))               |
+| `story-gate`       | a `tickets.toml` cannot be read for its `v6_key` claims while a v6 story-key gate stands       | fix the file, then resume                                                                                     |
 
 Every resume also checks that this bmad-loop knows the run's work source, that the store layout is unchanged, and the isolation settings. The [escalations guide](escalations-guide.md) covers the stages tickets mode shares with the other modes.
 
@@ -125,10 +134,10 @@ Checkpoints follow upstream's entries in the epic file:
 
 Before each pick and at run end, the run checks the epic table. An open epic is finished when every ticket is `built`, `done` or `dropped`. If this run committed one of its tickets, the epic gets its retrospective:
 
-- `gates.retrospective = "auto"` runs `/bmad-retrospective -H <epic-slug>`, verifies `<epic-slug>/<epic-slug>-retrospective.md`, and commits only that document (in the store repository for T3 and T4; a failed store commit pauses at `epic-boundary` before the closure is recorded, and the resume commits it). A valid document already on disk counts. A dirty tree or a git fault pauses at `epic-boundary` before the session and a stop request stops the run; neither records a closure, so the resume runs the retrospective.
+- `gates.retrospective = "auto"` runs `/bmad-retrospective -H <epic-slug>`, verifies `<epic-slug>-retrospective.md` beside the epic file, and commits only that document (in the store repository for T3 and T4; a failed store commit pauses at `epic-boundary` before the closure is recorded, and the resume commits it). A valid document already on disk counts. A dirty tree or a git fault pauses at `epic-boundary` before the session and a stop request stops the run; neither records a closure, so the resume runs the retrospective.
 - `"notify"` and `"never"` run no session.
 
-The run records the document's `verdict` (or `unknown` when there is none) and pauses at `epic-boundary`. bmad-loop never writes the epic's file: close the epic with bmad-ticket and commit it, then resume. A `rejected` verdict pauses every later pick while the epic stays open, though fix-up tickets added to the rejected epic still run. Any other verdict pauses once; resuming past an epic still open journals `epic-closure-not-recorded`. A `--story` run checks no epic: it finishes past the epic its ticket finished and journals `retro-run-end-skipped` (`out-of-scope`). Details: [Epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode).
+The run records the document's `verdict` (or `unknown` when there is none) and pauses at `epic-boundary`. bmad-loop never writes the epic's file: close the epic with bmad-agent-po (its closure check) and commit it, then resume. A `rejected` verdict pauses every later pick while the epic stays open, though fix-up tickets added to the rejected epic still run. Any other verdict pauses once; resuming past an epic still open journals `epic-closure-not-recorded`. A `--story` run checks no epic: it finishes past the epic its ticket finished and journals `retro-run-end-skipped` (`out-of-scope`). Details: [Epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode).
 
 ## Parking and resolve
 

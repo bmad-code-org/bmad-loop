@@ -76,12 +76,14 @@ claude "/bmad-loop-setup accept all defaults"
 
 `bmad setup` reads the record's requirements: the `bmad` skill and `bmad-build-auto`
 from the method module at 6.13.0 or newer (a `6.13.0-next` development install counts).
-It recommends `bmad-ticket` and `bmad-retrospective`, which tickets mode uses. Its update
+It recommends `bmad-agent-po` (Sofia, who plans the ticket tree) and `bmad-retrospective`,
+which tickets mode uses. Its update
 check compares the record's version with the one on bmad-loop's `main` branch.
 `bmad setup` installs skills only, so `/bmad-loop-setup` still installs the orchestrator
 tool, as in the v6 route below.
 
-To drive the initiative's ticket tree, set `[stories] source = "tickets"` and follow the
+To drive the initiative's ticket tree, plan it with Sofia (`bmad-agent-po`), set
+`[stories] source = "tickets"` and follow the
 [ticket-tree mode guide](tickets-guide.md#prerequisites).
 
 ## Installed via the BMAD-method installer? (recommended on BMAD v6)
@@ -474,7 +476,9 @@ bmad-loop validate --project <project-root>
 
 `validate` exits non-zero when the project isn't fully ready (e.g. no `sprint-status.yaml`
 yet, or `bmad-sprint-planning` hasn't run). On a fresh project that is **expected** — read its
-output as a readiness checklist, not an install failure.
+output as a readiness checklist, not an install failure. On BMAD v7 with
+`[stories] source = "tickets"`, a fresh project reports `tickets.initiative-unset` or
+`tickets.initiative-missing` until Sofia (`bmad-agent-po`) creates an initiative.
 
 For the dashboard itself, see [docs/tui-guide.md](tui-guide.md). For the full policy
 reference, see the [configuration reference](reference/configuration.md).

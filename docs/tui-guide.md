@@ -165,9 +165,9 @@ and the title. The state is the plan's status when the ticket has a plan, else
 `planned` (or `refine` when it must be refined first).
 
 `tickets.py` is the project's own code, so the board reads it on the poll worker,
-never the UI thread. It runs again only when `tickets.toml`, a `.md` file in the
-initiative or one of its epic folders, the config, the script, or the
-`config_utils.py` it loads changes. A tree that cannot be read shows
+never the UI thread. It runs again only when a `tickets.toml` or `.md` file in the
+initiative tree (its `tickets/` folders and epic folders, in either layout), the
+config, the script, or the `config_utils.py` it loads changes. A tree that cannot be read shows
 `tickets board unavailable:` and the reason, and is retried after 30 seconds.
 
 | Glyph | State                       | Color    |
@@ -530,7 +530,7 @@ run `tickets.py`, always off the UI thread.
 | Stage             | Badge    | What `p` shows                                                                                                                                                                                                                                                                                                                                               |
 | ----------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `ticket-hitl`     | `hitl`   | The pause reason: the next ticket needs a person in the loop. Build it, then **Resume**.                                                                                                                                                                                                                                                                     |
-| `ticket-refine`   | `refine` | The pause reason: the next ticket needs refining with `bmad-ticket`. Refine it, then **Resume**.                                                                                                                                                                                                                                                             |
+| `ticket-refine`   | `refine` | The pause reason: the next ticket needs refining with `bmad-agent-po`. Refine it, then **Resume**.                                                                                                                                                                                                                                                           |
 | `ticket-tree`     | `tree`   | The pause reason: the pinned initiative changed, `tickets.py` failed, the initiative folder is dirty, or only other tickets block progress.                                                                                                                                                                                                                  |
 | `epic-boundary`   | `epic`   | The epic-closure viewer: the retrospective verdict the run recorded, the retrospective's path, and the closure steer.                                                                                                                                                                                                                                        |
 | `plan-checkpoint` | `plan`   | The plan viewer. **Request replan** marks the plan `draft` through `tickets.py mark` (reason `replan`), never by editing frontmatter, then resumes. The run stays paused on a refused or no-op mark, a changed ticket store, an isolation layout resume would refuse, a swapped worktree mount, or a run another controller moved to a different checkpoint. |
