@@ -4879,7 +4879,9 @@ def test_delete_dead_run(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("force", [False, True])
-def test_delete_refuses_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, capsys, force):
+def test_delete_refuses_a_run_holding_unlanded_sweep_closes(
+    project_v7_store_repo, monkeypatch, capsys, force
+):
     """DW-571. `bmad-loop delete` on a paused isolated sweep run that still holds
     its shared-store close of DW-1 exits 1. Stderr names the run, DW-1 and
     `bmad-loop resume <run>`. The run dir and the ledger are unchanged, and
@@ -4893,7 +4895,13 @@ def test_delete_refuses_a_run_holding_unlanded_sweep_closes(project_v7_store_rep
     forced case fails (either way the error escapes to `main`'s backstop, which
     prints `error: ...` rather than the bare message)."""
     import test_sweep as ts
+    from test_runs import _LivenessMux
 
+    from bmad_loop import runs
+
+    # The unforced path probes for a live agent session first; with no tmux server
+    # up, the real listing warns on stderr ahead of the refusal.
+    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([]))
     engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
     ledger_before = paths.deferred_work.read_bytes()
     state_before = (engine.run_dir / "state.json").read_bytes()
