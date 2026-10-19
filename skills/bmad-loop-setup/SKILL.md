@@ -145,7 +145,7 @@ Report:
 Also report:
 
 - The `bmad-loop validate` preflight result (pass, or the readiness checklist of what's still missing).
-- That `_bmad/bmad-loop/module-help.csv` was refreshed. If `_bmad/bmad-loop/` did not exist before this run (i.e. the BMAD installer never installed the module), say that the help entries will appear in `/bmad-help` after the BMAD installer next runs, and that installing the module via `npx bmad-method install` registers it properly.
+- That `_bmad/bmad-loop/module-help.csv` was refreshed. If `_bmad/bmad-loop/` did not exist before this run (i.e. the BMAD installer never installed the module), say that the help entries will appear in `/bmad-help` after the BMAD installer next runs, and that installing the module via `npx bmad-method install` registers it properly (on BMAD v7, `bmad setup bmad-loop` instead).
 - That this skill wrote nothing else under `_bmad/` — module registration, `config.toml`, and the help catalog are owned by the BMAD installer.
 
 Then display the `module_greeting` from `./assets/module.yaml` to the user.
