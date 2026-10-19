@@ -3679,8 +3679,9 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
       ``worktree_path``);
     - it has a task whose code has not landed (:func:`_bundle_code_landed`) with
       ``bundle_closes_intended`` set;
-    - the ledger lies in the shared store (``bmadconfig.load_paths`` with the
-      run's recorded topology, :func:`live_store_topology`);
+    - the ledger lies in the shared store (``bmadconfig.load_paths`` in the
+      run's era, :func:`resolves_as_tickets`, with its recorded topology,
+      :func:`live_store_topology`);
     - the ledger still shows that task's close as undoable under its note and
       operation id (``deferredwork.held_reopenable_closes``), which is exactly
       what ``deferredwork.mark_open_many`` would reopen.
@@ -3710,7 +3711,8 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
         return []
     try:
         paths = ticketstore.with_shared_store(
-            bmadconfig.load_paths(project), live_store_topology(state, project)
+            bmadconfig.load_paths(project, want_tickets=resolves_as_tickets(state)),
+            live_store_topology(state, project),
         )
     except Exception as e:  # a config or topology fault is "unknown", never "none"
         raise HeldClosesUnknownError(
@@ -4739,6 +4741,18 @@ def judged_store_source(state: RunState, sweep_source: str) -> str:
     `RunState.source` is the launch default), so the caller's `sweep_source` — the
     one a sweep launch is judged under."""
     return sweep_source if state.run_type == "sweep" else state.source
+
+
+def resolves_as_tickets(state: RunState) -> bool:
+    """Whether a recorded run reloads the project's BMAD config as v7
+    (``bmadconfig.load_paths(want_tickets=...)``): a tickets run, or a sweep that
+    pinned an initiative or recorded a store topology, which
+    ``runsetup.compose_sweep`` writes only on v7. A mixed install (v6 keys left
+    beside the v7 marker) auto-detects as v6, so a v7 sweep reloaded without this
+    reads its own pin as a switched initiative (``sweep_initiative_conflict``)."""
+    if state.run_type == "sweep":
+        return bool(state.initiative or state.store_topology)
+    return state.source == worksource.SOURCE_TICKETS
 
 
 def live_store_topology(state: RunState, project_root: Path) -> dict[str, str | None]:

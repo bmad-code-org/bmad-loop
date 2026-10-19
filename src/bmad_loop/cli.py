@@ -5023,7 +5023,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     if (refusal := _unresumable_source(state)) is not None:
         print(f"cannot resume {run_dir.name}: {refusal}", file=sys.stderr)
         return 1
-    paths = bmadconfig.load_paths(project, want_tickets=state.source == worksource.SOURCE_TICKETS)
+    paths = bmadconfig.load_paths(project, want_tickets=runs.resolves_as_tickets(state))
     sweep_options = None
     if state.run_type == "sweep":
         try:

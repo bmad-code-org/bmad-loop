@@ -9438,6 +9438,39 @@ def test_sweep_resume_refuses_an_initiative_change_before_any_write(project, mon
     assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
 
 
+@pytest.mark.parametrize(
+    ("pins", "want_tickets"),
+    [
+        ({"initiative": "initiative-demo"}, True),
+        ({"store_topology": {"layout": "T3"}}, True),
+        ({}, False),
+    ],
+)
+def test_sweep_resume_reloads_a_v7_sweep_as_tickets(project, monkeypatch, pins, want_tickets):
+    """A sweep persists no `source`, so resume reads its era off what
+    `compose_sweep` records only on v7 (an initiative pin, a store topology). On a
+    mixed install the auto-detected v6 paths would read the sweep's own pin as a
+    switched initiative and refuse the resume.
+
+    Ablation: key `want_tickets` on `state.source` again and the two v7 rows fail."""
+    from bmad_loop import bmadconfig
+
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep", **pins)
+    seen: list[bool] = []
+
+    class Stop(Exception):
+        pass
+
+    def load_paths(_project, *, want_tickets=False):
+        seen.append(want_tickets)
+        raise Stop
+
+    monkeypatch.setattr(bmadconfig, "load_paths", load_paths)
+    with pytest.raises(Stop):
+        cli._resume_paused_run(project.project, run_dir)
+    assert seen == [want_tickets]
+
+
 def test_story_resume_is_not_gated_on_the_sweep_skill(project, monkeypatch):
     """A story run never dispatches `/bmad-loop-sweep`, so its resume ignores the
     skill. Ablation: drop the `run_type` guard on the resume gate and this reddens."""

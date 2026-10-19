@@ -30,7 +30,7 @@ from conftest import (
     refuse_to_resolve,
 )
 
-from bmad_loop import deferredwork, envvars, platform_util, runs, ticketstore, verify
+from bmad_loop import bmadconfig, deferredwork, envvars, platform_util, runs, ticketstore, verify
 from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
@@ -11913,6 +11913,31 @@ def test_held_sweep_closes_refuses_to_judge_under_a_switched_initiative(project_
         runs.delete_run(paths.project, engine.run_dir)
     assert info.value.reason and "active initiative" in info.value.reason
     assert engine.run_dir.is_dir()
+
+
+def test_held_sweep_closes_judges_a_v7_sweep_on_a_mixed_install_as_v7(project_v7_store_repo):
+    """A tickets run on a mixed install (v6 keys left beside the v7 marker) spawns
+    its sweep on v7 paths, so the sweep pins the v7 initiative and records a store
+    topology. An auto-detecting `load_paths` resolves that install as v6, where no
+    initiative is active: the sweep would read as switched, and its held close as a
+    fault. The recorded v7 run is judged under v7 paths instead.
+
+    Ablation: drop `want_tickets` from `held_sweep_closes`'s `load_paths` call and
+    this fails with "active initiative" raised."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    assert engine.state.initiative and engine.state.store_topology  # premise: a v7 sweep
+    custom = paths.project / "_bmad" / "custom" / "config.toml"
+    custom.parent.mkdir(parents=True, exist_ok=True)
+    with custom.open("a", encoding="utf-8") as f:
+        f.write(
+            "\n[modules.bmm]\n"
+            'planning_artifacts = "{project-root}/_bmad-output/planning-artifacts"\n'
+            'implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n'
+        )
+    assert bmadconfig.load_paths(paths.project).era == "v6"  # premise: mixed install
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]
 
 
 def test_prior_sweep_closes_records_a_liveness_probe_fault_as_a_fault_row(tmp_path, monkeypatch):
