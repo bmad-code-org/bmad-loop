@@ -55,6 +55,13 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/bmad_loop"]
 
+[tool.hatch.build.targets.wheel.force-include]
+# The module skills live at the repo root (`skills/`) so `npx skills add` discovers
+# them; the wheel still bundles them as package data for `bmad-loop init`. An
+# editable install does not apply this mapping — `install.skills_root()` falls back
+# to the checkout's `skills/` there.
+"skills" = "bmad_loop/data/skills"
+
 [tool.hatch.build.targets.sdist]
 # .trunk/tools holds an absolute external symlink (trunk launcher) that breaks
 # sdist packing; it is dev tooling and irrelevant to the source distribution.
@@ -95,12 +102,7 @@ line-length = 100
 target-version = "py311"
 # skill assets contain template placeholders that are not valid Python; the
 # vendored upstream BMAD-METHOD fixture is pinned byte-for-byte (PIN.toml)
-extend-exclude = [
-  ".agents",
-  ".claude",
-  "src/bmad_loop/data/skills",
-  "tests/fixtures/bmad_v7",
-]
+extend-exclude = [".agents", ".claude", "skills", "tests/fixtures/bmad_v7"]
 
 [tool.ruff.lint]
 # CI lints with trunk's ruff (pinned 0.15.17), whose plugin injects no `--select`

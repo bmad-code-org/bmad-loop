@@ -29,7 +29,6 @@ import secrets
 from collections import Counter
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NoReturn
 
@@ -75,6 +74,9 @@ from .install import (
     missing_stories_support,
     renderer_stub_resolved,
     resolve_review_layers,
+)
+from .install import skills_root as _skills_root
+from .install import (
     strip_relay_hooks,
 )
 from .model import Phase
@@ -1134,7 +1136,7 @@ def module_skills_seed_undelivered(
     Returns coarse ``"{tree}/{skill}"`` posix rels in iteration order.
     """
     if skills_root is None:
-        skills_root = resources.files("bmad_loop.data").joinpath("skills")
+        skills_root = _skills_root()
     unresolved_worktree = worktree
     try:
         worktree = worktree.resolve()
@@ -1312,7 +1314,7 @@ def provision_worktree(
     def shield(rel: str) -> str:
         return _shield_rel(worktree, dst_root, rel)
 
-    skills_root = resources.files("bmad_loop.data").joinpath("skills")
+    skills_root = _skills_root()
 
     # project gitignored MCP/CLI configs: copy from the main repo when absent.
     # Resolve-and-contain guards against an `..`/absolute entry escaping either tree.

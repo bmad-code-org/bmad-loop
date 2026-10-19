@@ -145,7 +145,7 @@ def _gather_escalations(
       attributes the abandoned cycle's escalation to the fresh session too.
       Open each directory once.
     * the content-keyed map — the sweep skill's own contract
-      (``data/skills/bmad-loop-sweep/automation-mode.md``) tells a producer to
+      (``skills/bmad-loop-sweep/automation-mode.md``) tells a producer to
       write ``escalation.json`` and then mirror the same entries into
       ``result.json`` ``escalations``. That mirroring is deliberate and stays;
       the READER absorbs it, so a compliant producer is not shown to the human

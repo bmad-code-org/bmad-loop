@@ -208,7 +208,7 @@ Keep messages under 72 characters. Each commit = one logical change.
 - **Keep the control loop deterministic** — orchestration logic is plain Python, never an LLM call. LLMs only run inside disposable coding-CLI sessions.
 - **Python style** is enforced by trunk (ruff, black, isort) at line-length 100 — let `trunk fmt` handle formatting.
 - **Tests** live under `tests/`; add or update them for behavior changes. The mock adapter lets most of the loop run without a live CLI. Where a test belongs and the doctrines it must follow: [docs/testing.md](docs/testing.md).
-- **Skills** ship as markdown under `src/bmad_loop/data/skills/` (the `bmad-loop-*` automation skills).
+- **Skills** ship as markdown under `skills/` (the `bmad-loop-*` automation skills); the wheel bundles them and `npx skills add bmad-code-org/bmad-loop` installs them.
 - **Plugins** extend the orchestrator via a `plugin.toml` manifest — see the [plugin authoring guide](docs/plugin-authoring-guide.md).
 - **New coding CLIs** are usually a TOML profile, not Python — see the CLI adapter section in the [README](README.md) and the [adapter authoring guide](docs/adapter-authoring-guide.md) (use `bmad-loop probe-adapter` to collect the hook/transcript/token data a profile needs).
 

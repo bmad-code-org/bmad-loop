@@ -35,7 +35,7 @@ import pytest
 from bmad_loop.install import MODULE_SKILLS
 
 REPO = Path(__file__).resolve().parent.parent
-SKILLS = REPO / "src" / "bmad_loop" / "data" / "skills"
+SKILLS = REPO / "skills"
 MARKETPLACE = REPO / ".claude-plugin" / "marketplace.json"
 RECORD = "bmod-bmad-loop"
 
@@ -195,7 +195,7 @@ def test_marketplace_lists_every_module_skill():
     market = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
     listed = market["plugins"][0]["skills"]
     assert len(listed) == len(set(listed))
-    assert set(listed) == {f"./src/bmad_loop/data/skills/{s}" for s in MODULE_SKILLS}
+    assert set(listed) == {f"./skills/{s}" for s in MODULE_SKILLS}
 
 
 @pytest.mark.parametrize(

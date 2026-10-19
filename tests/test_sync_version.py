@@ -133,7 +133,6 @@ def test_stamp_writes_lf_under_windows_newline_translation(
         shutil.copyfile(src, dst)
         monkeypatch.setattr(sync_version, name, dst)
         stamped[name] = dst
-    monkeypatch.setattr(sync_version, "ROOT_MODULE_YAML", tmp_path / "root-module.yaml")
     monkeypatch.setattr(sync_version, "_relock", lambda: None)
     emulate_windows_newlines()
 

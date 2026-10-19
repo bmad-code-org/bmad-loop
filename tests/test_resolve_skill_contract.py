@@ -19,15 +19,9 @@ SKILL_DIR = "bmad-loop-resolve"
 
 @pytest.fixture(scope="module")
 def skill_md():
-    from importlib import resources
+    from bmad_loop.install import skills_root
 
-    return (
-        resources.files("bmad_loop.data")
-        .joinpath("skills")
-        .joinpath(SKILL_DIR)
-        .joinpath("SKILL.md")
-        .read_text(encoding="utf-8")
-    )
+    return skills_root().joinpath(SKILL_DIR).joinpath("SKILL.md").read_text(encoding="utf-8")
 
 
 def _emitted_context_keys() -> set[str]:

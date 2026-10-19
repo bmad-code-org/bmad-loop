@@ -31,9 +31,9 @@ SKILL_DIR = "bmad-loop-setup"
 
 @pytest.fixture(scope="module")
 def skill_root():
-    from importlib import resources
+    from bmad_loop.install import skills_root
 
-    return resources.files("bmad_loop.data").joinpath("skills").joinpath(SKILL_DIR)
+    return skills_root().joinpath(SKILL_DIR)
 
 
 @pytest.fixture(scope="module")

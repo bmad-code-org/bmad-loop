@@ -65,10 +65,9 @@ TUI_PATH = "src/bmad_loop/tui"
 STAMPED_PATHS = [
     "src/bmad_loop/__init__.py",
     "pyproject.toml",
-    "module.yaml",
-    "src/bmad_loop/data/skills/bmad-loop-setup/assets/module.yaml",
+    "skills/bmad-loop-setup/assets/module.yaml",
     ".claude-plugin/marketplace.json",
-    "src/bmad_loop/data/skills/bmod-bmad-loop/bmod.toml",
+    "skills/bmod-bmad-loop/bmod.toml",
     "uv.lock",
     "CHANGELOG.md",
 ]

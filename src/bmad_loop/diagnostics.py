@@ -526,7 +526,7 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
 # precisely because an earlier version of this comment got it wrong: the sole
 # producer of this kind is ``engine._review_and_commit``, splatting a
 # bmad-build-auto REVIEW session's ``result.json`` entries. Sweep does not journal
-# ``preference-escalation`` at all. ``data/skills/bmad-loop-sweep/automation-mode.md``
+# ``preference-escalation`` at all. ``skills/bmad-loop-sweep/automation-mode.md``
 # declares the same three-key shape for a DIFFERENT session type, so it corroborates
 # the shape and is not the contract that produces this record. Anything outside those
 # three keys is off-schema and has no diagnostic claim on being shown verbatim.

@@ -69,9 +69,12 @@ directory name.
 
 ## Maintaining the skills
 
-- This directory (`src/bmad_loop/data/skills/`) is **canonical** for the skills
-  and is bundled into the wheel as package data, so `bmad-loop init` can install
-  them. The repo's `.claude/skills/` and `.agents/skills/` hold dev-workspace
+- This directory (`skills/` at the repo root) is **canonical** for the skills.
+  It sits where the Vercel `skills` CLI looks, so `npx skills add
+bmad-code-org/bmad-loop` finds every skill in it. The wheel bundles it as
+  package data (`force-include` maps it to `bmad_loop/data/skills`), so
+  `bmad-loop init` can install the skills too; code reads it through
+  `bmad_loop.install.skills_root()`, which also covers an editable checkout. The repo's `.claude/skills/` and `.agents/skills/` hold dev-workspace
   copies; `tests/test_module_skills_sync.py` fails if they drift. After editing
   here, re-copy the skill dirs into both trees.
 - The orchestrator tool is **not** bundled in the skill dirs — the BMAD installer
@@ -102,5 +105,5 @@ directory name.
 Validate after changes (from the repo root):
 
 ```bash
-python3 .claude/skills/bmad-module-builder/scripts/validate-module.py src/bmad_loop/data/skills
+python3 .claude/skills/bmad-module-builder/scripts/validate-module.py skills
 ```
