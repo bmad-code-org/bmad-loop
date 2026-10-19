@@ -13,8 +13,9 @@ breaking changes may land in a minor release.
   (`[stories] source = "tickets"`): dispatch `bmad-build-auto ticket <ref>` in initiative
   build order, verify each plan at `built`, and mark it `done` through `tickets.py mark`
   (`[tickets] mark_done`, `thorough_review`). See `docs/tickets-guide.md`.
-- Support BMAD-METHOD v7 as of upstream main `8f0d50e1` (`6.13.0-next`; v7 is not yet
-  tagged). The contract tests run against `tickets.py` vendored at that commit.
+- Support BMAD-METHOD v7 as of upstream main `61e01f82` (`6.13.0-next`; v7 is not yet
+  tagged). The contract tests run against `bmad-agent-po`'s `tickets.py` vendored at
+  that commit.
 - Resolve BMAD v7 config (`[core] output_folder`, `active_initiative`): a project with
   `_bmad/method/scripts/tickets.py` resolves its artifacts to the active initiative
   folder. New validate warnings `bmad-config.initiative-unset` and

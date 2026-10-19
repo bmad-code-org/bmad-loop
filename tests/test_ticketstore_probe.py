@@ -28,8 +28,8 @@ def test_probe_tracked_markers(project_v7):
     paths = _paths(project_v7)
     facts = ticketstore.probe_store_facts(paths, paths.initiative_folder)
     rels = [rel for rel, _ in facts.tracked]
-    assert "_bmad-output/initiative-demo/tickets.toml" in rels
-    assert "_bmad-output/initiative-demo/epic-cart/epic-cart.md" in rels
+    assert "_bmad-output/initiative-demo/tickets/tickets.toml" in rels
+    assert "_bmad-output/initiative-demo/tickets/epic-cart/epic-cart.md" in rels
     assert all(tracked for _, tracked in facts.tracked)
     assert facts.store_toplevel == facts.repo_toplevel == project_v7.project.resolve()
     assert facts.user_config_ignored and not facts.user_config_tracked
@@ -171,7 +171,7 @@ def test_probe_tracked_store_outside_a_nested_repo_root_is_refused(project_v7):
     paths = dataclasses.replace(_paths(project_v7), repo_root=root / "code")
     facts = ticketstore.probe_store_facts(paths, paths.initiative_folder)
     assert facts.tracked and all(tracked for _, tracked in facts.tracked)
-    assert "_bmad-output/initiative-demo/tickets.toml" in [rel for rel, _ in facts.tracked]
+    assert "_bmad-output/initiative-demo/tickets/tickets.toml" in [rel for rel, _ in facts.tracked]
     for isolation in ("none", "worktree"):
         result = ticketstore.assess_store(paths, isolation)
         assert isinstance(result, StoreRefusal) and result.code == "tracked-outside-checkout"
@@ -179,11 +179,11 @@ def test_probe_tracked_store_outside_a_nested_repo_root_is_refused(project_v7):
 
 
 def test_probe_unlistable_initiative_is_a_refusal_not_an_empty_tree(project_v7, monkeypatch):
-    """An initiative folder git can enter but Python cannot list (an execute-only
-    directory, a filesystem race) is `probe-failed`: an empty epic list would let
-    the root `tickets.toml` alone read the tree as fully tracked."""
+    """An initiative's `tickets/` folder git can enter but Python cannot list (an
+    execute-only directory, a filesystem race) is `probe-failed`: an empty epic list
+    would let the root `tickets.toml` alone read the tree as fully tracked."""
     paths = _paths(project_v7)
-    initiative = paths.initiative_folder.resolve()
+    initiative = paths.initiative_folder.resolve() / "tickets"
     real_iterdir = Path.iterdir
 
     def iterdir(self):
@@ -202,7 +202,7 @@ def test_probe_unlistable_initiative_is_a_refusal_not_an_empty_tree(project_v7, 
 def test_probe_unstattable_epic_is_a_refusal_not_absent(project_v7, monkeypatch):
     """A stat fault on an epic folder is `probe-failed`, never a missing epic."""
     paths = _paths(project_v7)
-    epic = paths.initiative_folder.resolve() / "epic-cart"
+    epic = paths.initiative_folder.resolve() / "tickets" / "epic-cart"
     real_stat = Path.stat
 
     def stat(self, *args, **kwargs):

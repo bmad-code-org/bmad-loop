@@ -637,7 +637,7 @@ def test_tickets_gate_unreadable_ticket_file_pauses(project_v7):
     """A ticket file that cannot be read for its `v6_key` claims pauses at
     `story-gate` before anything is registered, naming the file, and journals
     `story-gate-unreadable`; it never resolves or passes the token."""
-    toml = project_v7.initiative_folder / "epic-cart" / "tickets.toml"
+    toml = project_v7.initiative_folder / "tickets" / "epic-cart" / "tickets" / "tickets.toml"
     toml.write_text("[[entry]\n", encoding="utf-8")
     git(project_v7.project, "add", "-A")
     git(project_v7.project, "commit", "-q", "-m", "broken")
@@ -661,7 +661,7 @@ def test_tickets_gate_claims_fault_pauses_before_the_rebind(project_v7):
     """On the restart arm a crash-unbound task is rebound inside the gate check;
     an entry whose claims cannot be read pauses before that entry's rebind, so
     the task stays unbound and no `ticket-rebound` is journaled."""
-    toml = project_v7.initiative_folder / "epic-cart" / "tickets.toml"
+    toml = project_v7.initiative_folder / "tickets" / "epic-cart" / "tickets" / "tickets.toml"
     toml.write_text("[[entry]\n", encoding="utf-8")
     git(project_v7.project, "add", "-A")
     git(project_v7.project, "commit", "-q", "-m", "broken")
@@ -2835,7 +2835,8 @@ def _builds_finishing(
 
 
 def _retro_doc(layout: V7Layout, slug: str = "epic-cart") -> Path:
-    return layout.initiative_folder / slug / f"{slug}-retrospective.md"
+    """The epic's retrospective, at the top of its folder in the `tickets/` layout."""
+    return layout.initiative_folder / "tickets" / slug / f"{slug}-retrospective.md"
 
 
 def _write_retro_doc(layout: V7Layout, verdict: str, *, epic: str = "epic-cart") -> Path:
@@ -2859,17 +2860,14 @@ def _write_retro_doc(layout: V7Layout, verdict: str, *, epic: str = "epic-cart")
 
 def test_retro_doc_reads_the_tickets_folder_layout(project_v7):
     """The retrospective sits at the top of the epic folder, which lives in the
-    initiative's `tickets/` folder once it has one (else beside the initiative
-    file), and `_read_retro_doc` reads it there. Ablation (performed): spell
+    initiative's `tickets/` folder, and `_read_retro_doc` reads it there (the
+    flat twin is tests/test_ticketlayout.py's). Ablation (performed): spell
     `<initiative>/<slug>/` in `_retro_doc` and the flat path comes back — this
     FAILS."""
     engine, _ = make_engine(project_v7, _epic_tree(project_v7), policy=_retro_policy())
     initiative = engine.paths.initiative_folder
     assert initiative is not None
-    assert engine._retro_doc("epic-cart") == initiative / "epic-cart" / "epic-cart-retrospective.md"
-
     epic = initiative / "tickets" / "epic-cart"
-    (epic / "tickets").mkdir(parents=True)
     doc = epic / "epic-cart-retrospective.md"
     doc.write_text("---\nepic: epic-cart\nverdict: accepted\n---\n", encoding="utf-8")
     assert engine._retro_doc("epic-cart") == doc
@@ -3379,7 +3377,7 @@ def test_epic_file_never_written(project_v7):
     """bmad-loop never writes the epic's own file: across the retro, the closure
     pause, a rejected re-pause and the human's close, `epic-cart.md` keeps its
     bytes and its one commit, and no mark targets anything but the ticket."""
-    epic_file = project_v7.initiative_folder / "epic-cart" / "epic-cart.md"
+    epic_file = project_v7.initiative_folder / "tickets" / "epic-cart" / "epic-cart.md"
     before = epic_file.read_bytes()
     tree = _epic_tree(project_v7)
     plan = Path(tree.finds["1.1"].plan)

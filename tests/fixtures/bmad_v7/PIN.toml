@@ -2,12 +2,12 @@
 # tests/test_conftest.py checks every file's sha256 against this pin. Re-vendor by
 # copying the files at a new commit and updating commit and every sha256 together.
 source_repo = "https://github.com/bmad-code-org/BMAD-METHOD"
-commit = "8f0d50e1817fdd8fcf05a20c524218222d13cd8d"
+commit = "61e01f82644c4bb533750cfa0d6d61ab61d2cc9b"
 
 [[files]]
 path = "tickets.py"
-upstream_path = "skills/bmad-ticket/scripts/tickets.py"
-sha256 = "05e83d55dca73075df3590832104816b1f8c232be0be517990a586b2a60408fa"
+upstream_path = "skills/bmad-agent-po/scripts/tickets.py"
+sha256 = "366c1cb73834a5232d466da21cb750fbedce2777e887fac105fb27c73b4acbf4"
 
 [[files]]
 path = "config_utils.py"

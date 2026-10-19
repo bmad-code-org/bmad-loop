@@ -166,7 +166,7 @@ def test_status_epics_rows_parse(project_v7: V7Layout):
 
 def test_find_returns_absolute_plan_path_under_initiative(project_v7: V7Layout):
     found = TicketTree(project_v7.project).find("2.1")
-    epic_dir = project_v7.initiative_folder / "epic-checkout"
+    epic_dir = project_v7.initiative_folder / "tickets" / "epic-checkout" / "tickets"
     assert Path(found.plan).is_absolute()
     assert Path(found.plan) == (epic_dir / "story-checkout-form-plan.md").resolve()
     assert not Path(found.plan).exists()  # where a build would write it
@@ -475,7 +475,8 @@ def _cart_plan(layout: V7Layout, status: str, **fm: object) -> Path:
 
 
 def _plan_path(layout: V7Layout) -> Path:
-    return (layout.initiative_folder / "epic-cart" / f"{CART_MODEL_PLAN}.md").resolve()
+    epic_dir = layout.initiative_folder / "tickets" / "epic-cart" / "tickets"
+    return (epic_dir / f"{CART_MODEL_PLAN}.md").resolve()
 
 
 def _fields(plan: Path) -> tuple[str, str]:
@@ -993,8 +994,10 @@ V6_TREE = (
 
 
 def _v6_layout(tmp_path: Path) -> V7Layout:
+    """`V6_TREE` in the preview layout: these claims tests pin the flat reader and
+    never spawn the script (`_tickets_layout_tree` is the `tickets/` twin)."""
     layout = v7_layout(tmp_path / "sandbox")
-    write_ticket_tree(layout, V6_TREE)
+    write_ticket_tree(layout, V6_TREE, flat=True)
     return layout
 
 

@@ -66,7 +66,7 @@ from conftest import (
     write_ticket_tree,
 )
 
-from bmad_loop import deferredwork
+from bmad_loop import deferredwork, ticketlayout
 from bmad_loop.frontmatter import parse_frontmatter, status_of
 
 # Linux-only, not merely non-win32: the fake is bash + GNU coreutils (`date +%s%N`).
@@ -122,7 +122,7 @@ if printf '%s' "$prompt" | grep -q "bmad-retrospective"; then
     verdict=accepted
     [ -f ".retro-verdict-$slug" ] && verdict=$(tr -d '[:space:]' < ".retro-verdict-$slug")
     printf -- '---\nepic: %s\nverdict: %s\n---\n\n# %s retrospective\n' \
-        "$slug" "$verdict" "$slug" > "$INIT/$slug/$slug-retrospective.md"
+        "$slug" "$verdict" "$slug" > "$INIT/tickets/$slug/$slug-retrospective.md"
     printf '%s' '{"workflow": "bmad-retrospective", "status": "done"}' > "$td/result.json"
     stop
 fi
@@ -339,8 +339,13 @@ def _tickets(layout: V7Layout, *argv: str) -> None:
     )
 
 
+def _epic_dir(layout: V7Layout, epic: str = EPIC) -> Path:
+    """The epic's folder, in its initiative's `tickets/` folder."""
+    return layout.initiative_folder / ticketlayout.TICKETS / epic
+
+
 def _plan(layout: V7Layout, title: str, epic: str = EPIC) -> Path:
-    return layout.initiative_folder / epic / f"story-{ticket_slug(title)}-plan.md"
+    return _epic_dir(layout, epic) / ticketlayout.TICKETS / f"story-{ticket_slug(title)}-plan.md"
 
 
 def _plan_fields(layout: V7Layout, title: str, epic: str = EPIC) -> dict:
@@ -516,9 +521,9 @@ def test_e2e_tickets_refine_pauses_before_any_session(project_v7):
     assert doc["paused_story_key"] == "1.1"
     assert not list((_run_dir(root)).glob("tasks/*")), "no session may start before refining"
 
-    epic_dir = layout.initiative_folder / EPIC
+    epic_dir = _epic_dir(layout)
     _tickets(layout, "pull", str(epic_dir), "1")
-    leaf = epic_dir / "bug-cart-crash.md"
+    leaf = epic_dir / ticketlayout.TICKETS / "bug-cart-crash.md"
     leaf.write_text(
         leaf.read_text(encoding="utf-8").replace("refined: false", "refined: true", 1),
         encoding="utf-8",
@@ -528,7 +533,7 @@ def test_e2e_tickets_refine_pauses_before_any_session(project_v7):
 
     _ok(_run(root, "resume", _run_dir(root).name))
 
-    bug_plan = layout.initiative_folder / EPIC / "bug-cart-crash-plan.md"
+    bug_plan = epic_dir / ticketlayout.TICKETS / "bug-cart-crash-plan.md"
     assert status_of(parse_frontmatter(bug_plan.read_text(encoding="utf-8"))) == "done"
     assert _plan_status(layout, "Cart rules") == "done"
     assert len(_prompts(root)) == 2
@@ -641,7 +646,7 @@ def _commit_marker(root: Path, name: str, text: str) -> None:
 def _close_epic(layout: V7Layout, topology: str, slug: str) -> None:
     """What a person closing the epic with bmad-ticket leaves: `status: done` in the
     epic file, committed in the repository that versions the tree."""
-    epic_file = layout.initiative_folder / slug / f"{slug}.md"
+    epic_file = _epic_dir(layout, slug) / f"{slug}.md"
     epic_file.write_text(
         epic_file.read_text(encoding="utf-8").replace("status: in-progress", "status: done", 1),
         encoding="utf-8",
@@ -668,7 +673,7 @@ def test_e2e_tickets_epic_boundary_retro_then_closure_pause(project_v7, topology
     layout = _scaffold(project_v7, TWO_EPICS, topology=topology, retro="auto")
     root = layout.project
     tree = _tree_repo(layout, topology)
-    epic_rel = (layout.initiative_folder / EPIC / f"{EPIC}.md").relative_to(tree).as_posix()
+    epic_rel = (_epic_dir(layout) / f"{EPIC}.md").relative_to(tree).as_posix()
     epic_history = _git(tree, "log", "--format=%H", "--", epic_rel)
 
     _ok(_run(root, "run"))
@@ -681,9 +686,7 @@ def test_e2e_tickets_epic_boundary_retro_then_closure_pause(project_v7, topology
     assert doc["tickets"]["epic_closures"] == {EPIC: "accepted"}
     assert _first_lines(root) == ["/bmad-build-auto ticket 1.1", f"/bmad-retrospective -H {EPIC}"]
     assert _plan_status(layout, "Checkout form", EPIC2) == "absent"
-    retro_rel = (
-        (layout.initiative_folder / EPIC / f"{EPIC}-retrospective.md").relative_to(tree).as_posix()
-    )
+    retro_rel = (_epic_dir(layout) / f"{EPIC}-retrospective.md").relative_to(tree).as_posix()
     suffix = f" [bmad-loop {run_id}]" if topology == "T3" else ""
     assert _subjects(tree)[0] == f"chore(retro): {EPIC} retrospective{suffix}"
     assert _git(tree, "show", "--name-only", "--format=", "HEAD").split() == [retro_rel]

@@ -14051,9 +14051,8 @@ def test_validate_hard_gate_ticket_mode_unreadable_v6_claims(project, capsys, mo
 
     def break_cart(paths):
         assert paths.initiative_folder is not None
-        (paths.initiative_folder / "epic-cart" / "tickets.toml").write_text(
-            "[[entry]\n", encoding="utf-8"
-        )
+        epic = paths.initiative_folder / "tickets" / "epic-cart"
+        (epic / "tickets" / "tickets.toml").write_text("[[entry]\n", encoding="utf-8")
 
     findings = _validate_ticket_gates(
         project, monkeypatch, capsys, "gate: 3-2", rc=1, before=break_cart
@@ -14074,9 +14073,8 @@ def test_validate_hard_gate_ticket_mode_no_actionable_ticket_reads_no_claims(
 
     def break_cart(paths):
         assert paths.initiative_folder is not None
-        (paths.initiative_folder / "epic-cart" / "tickets.toml").write_text(
-            "[[entry]\n", encoding="utf-8"
-        )
+        epic = paths.initiative_folder / "tickets" / "epic-cart"
+        (epic / "tickets" / "tickets.toml").write_text("[[entry]\n", encoding="utf-8")
 
     findings = _validate_ticket_gates(
         project, monkeypatch, capsys, "gate: 3-2", rc=0, rows=(), before=break_cart
