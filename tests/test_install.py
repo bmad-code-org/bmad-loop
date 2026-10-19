@@ -2844,14 +2844,12 @@ def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
 
 def test_bundled_sweep_file_set_is_read_from_the_wheel():
     """The required set is the bundle itself, never a restated literal: every file
-    under the package's `data/skills/bmad-loop-sweep/` is required, so a mode file
+    under the bundled `skills/bmad-loop-sweep/` is required, so a mode file
     added there is checked the moment it ships."""
-    from importlib import resources
-
-    from bmad_loop.install import SWEEP_SKILL, bundled_skill_files
+    from bmad_loop.install import SWEEP_SKILL, bundled_skill_files, skills_root
 
     assert SWEEP_SKILL in MODULE_SKILLS
-    bundle = resources.files("bmad_loop.data").joinpath("skills").joinpath(SWEEP_SKILL)
+    bundle = skills_root().joinpath(SWEEP_SKILL)
     on_disk = sorted(entry.name for entry in bundle.iterdir() if entry.is_file())
     assert list(bundled_skill_files(SWEEP_SKILL)) == on_disk
     assert {"SKILL.md", "automation-mode.md", "migration-mode.md"} <= set(on_disk)
@@ -5361,12 +5359,12 @@ def test_shield_tracked_dir_with_nothing_landed_drops_cleanly(project, tmp_path)
 
     Ablation: restore `kept.add(pattern)` in the `"dir"` branch — the `-ci` assertions
     redden, on the wheel skills the project now tracks itself."""
-    from importlib import resources
+    from bmad_loop.install import skills_root
 
     repo = project.project
     claude = get_profile("claude")
     tree = claude.skill_tree
-    wheel = resources.files("bmad_loop.data").joinpath("skills")
+    wheel = skills_root()
     for skill in MODULE_SKILLS:
         _copy_traversable(wheel.joinpath(skill), repo / tree / skill)
     git(repo, "add", "-A")

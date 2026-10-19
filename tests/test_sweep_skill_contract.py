@@ -7,9 +7,9 @@ SKILL_DIR = "bmad-loop-sweep"
 
 @pytest.fixture(scope="module")
 def skill_root():
-    from importlib import resources
+    from bmad_loop.install import skills_root
 
-    return resources.files("bmad_loop.data").joinpath("skills").joinpath(SKILL_DIR)
+    return skills_root().joinpath(SKILL_DIR)
 
 
 def test_sweep_skill_states_bundle_name_contract(skill_root):

@@ -63,7 +63,7 @@ VERIFY_DIR = "verify"
 #
 # ``result.json`` is the dev/review contract's own result file. ``escalation.json``
 # is the SWEEP SKILL's: its automation contract
-# (``data/skills/bmad-loop-sweep/automation-mode.md``) tells a sweep session to
+# (``skills/bmad-loop-sweep/automation-mode.md``) tells a sweep session to
 # write that file and then mirror the same entries into ``result.json``'s
 # ``escalations``. That sentence lived in both adapters' comments and nowhere else,
 # and it is the whole reason the reader opens two names rather than one.

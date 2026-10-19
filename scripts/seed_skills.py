@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reseed the dev-workspace skill forks from the canonical wheel source.
 
-``src/bmad_loop/data/skills/<skill>`` is the single source of truth for the
+``skills/<skill>`` is the single source of truth for the
 ``bmad-loop-*`` automation skills (bundled into the wheel; ``bmad-loop init``
 installs them). Two dev-workspace trees hold byte-identical *forks* of those
 skills so the local agents can run them out of this repo:
@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 from bmad_loop.install import MODULE_SKILLS  # noqa: E402
 
-SKILLS_SRC = ROOT / "src" / "bmad_loop" / "data" / "skills"
+SKILLS_SRC = ROOT / "skills"
 FORK_TREES = (".claude/skills", ".agents/skills")
 
 

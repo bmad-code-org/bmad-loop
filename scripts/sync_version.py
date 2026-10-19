@@ -10,15 +10,9 @@ The canonical value is ``bmad_loop.__version__`` in ``src/bmad_loop/__init__.py`
 Every other field is derived from it:
 
 * ``pyproject.toml``                              -> ``[project] version``
-* ``src/.../bmad-loop-setup/assets/module.yaml``  -> ``module_version``
+* ``skills/bmad-loop-setup/assets/module.yaml``   -> ``module_version``
 * ``.claude-plugin/marketplace.json``             -> ``plugins[*].version``
-* ``<repo-root>/module.yaml``                     -> byte-identical copy of the
-  canonical module.yaml above. The BMAD installer's ``resolveInstalledModuleYaml``
-  only discovers a descriptor at shallow paths (``skills/``, ``src/``, a
-  ``*-setup/assets/`` directly under those, or the repo root) — the canonical
-  copy under ``src/bmad_loop/data/skills/...`` is too deep, so this root mirror
-  is what lets the installer locate the ``bmad-loop`` module.
-* ``src/.../bmod-bmad-loop/bmod.toml``            -> ``[bmod] version``, the
+* ``skills/bmod-bmad-loop/bmod.toml``             -> ``[bmod] version``, the
   module record BMAD v7 ``bmad setup`` discovers. Only the ``[bmod]`` table's own
   ``version`` key is stamped: the ``required_skills`` entries carry minimum
   versions of *other* modules' skills, which a release never touches.
@@ -41,7 +35,6 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
 import sys
 import tomllib
@@ -51,12 +44,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 INIT = ROOT / "src" / "bmad_loop" / "__init__.py"
 PYPROJECT = ROOT / "pyproject.toml"
-CANONICAL_MODULE_YAML = (
-    ROOT / "src" / "bmad_loop" / "data" / "skills" / "bmad-loop-setup" / "assets" / "module.yaml"
-)
-ROOT_MODULE_YAML = ROOT / "module.yaml"
+CANONICAL_MODULE_YAML = ROOT / "skills" / "bmad-loop-setup" / "assets" / "module.yaml"
 MARKETPLACE = ROOT / ".claude-plugin" / "marketplace.json"
-BMOD_TOML = ROOT / "src" / "bmad_loop" / "data" / "skills" / "bmod-bmad-loop" / "bmod.toml"
+BMOD_TOML = ROOT / "skills" / "bmod-bmad-loop" / "bmod.toml"
 
 # Upstream `bmad setup`'s SEMVER (skills/bmad/scripts/setup.py) minus build metadata,
 # which its manifest validator refuses on a record version: no leading zeros, and an
@@ -173,10 +163,7 @@ def stamp(version: str) -> None:
         newline="\n",
     )
 
-    # Regenerate the installer-discoverable repo-root mirror from the canonical copy.
-    shutil.copyfile(CANONICAL_MODULE_YAML, ROOT_MODULE_YAML)
-
-    print(f"stamped version {version} across all files + regenerated {ROOT_MODULE_YAML.name}")
+    print(f"stamped version {version} across all files")
     _relock()
 
 
@@ -244,21 +231,13 @@ def check() -> int:
         if bmod_version != canonical:
             problems.append(f"bmod.toml [bmod].version = {bmod_version!r} (expected {canonical!r})")
 
-    if not ROOT_MODULE_YAML.exists():
-        problems.append(f"missing repo-root mirror {ROOT_MODULE_YAML} (run sync_version.py)")
-    elif ROOT_MODULE_YAML.read_bytes() != CANONICAL_MODULE_YAML.read_bytes():
-        problems.append(
-            f"{ROOT_MODULE_YAML.name} differs from canonical "
-            f"{CANONICAL_MODULE_YAML.relative_to(ROOT)} (run sync_version.py to regenerate)"
-        )
-
     if problems:
         print(f"version drift detected (canonical __version__ = {canonical}):", file=sys.stderr)
         for p in problems:
             print(f"  - {p}", file=sys.stderr)
         return 1
 
-    print(f"ok: every version field agrees on {canonical} and the root mirror matches")
+    print(f"ok: every version field agrees on {canonical}")
     return 0
 
 

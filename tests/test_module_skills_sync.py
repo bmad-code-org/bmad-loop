@@ -1,9 +1,9 @@
-"""Drift guard: src/bmad_loop/data/skills/ is the canonical source for the
+"""Drift guard: skills/ is the canonical source for the
 bmad-loop skills (bundled into the wheel; `bmad-loop init` installs them).
 
 The forked skills are plain copies (not symlinks) in .claude/skills/ (read by
 Claude Code) and .agents/skills/ (read by codex/gemini). Edits must flow
-src/bmad_loop/data/skills/<skill> -> both trees.
+skills/<skill> -> both trees.
 
 Documented limitation: CI-inert. Both fork trees are gitignored and absent in CI,
 so every parametrization skips there and the guard bites on dev boxes only. The
@@ -18,7 +18,7 @@ import pytest
 from bmad_loop.install import MODULE_SKILLS
 
 REPO = Path(__file__).resolve().parent.parent
-SKILLS_SRC = REPO / "src" / "bmad_loop" / "data" / "skills"
+SKILLS_SRC = REPO / "skills"
 SKILL_TREES = [".claude/skills", ".agents/skills"]
 
 
@@ -41,7 +41,7 @@ def _assert_identical(canonical: Path, installed: Path) -> None:
         stack.extend(node.subdirs.values())
     assert not problems, (
         f"{installed} has drifted from canonical {canonical}; "
-        f"re-copy from src/bmad_loop/data/skills/ to fix:\n  " + "\n  ".join(problems)
+        f"re-copy from skills/ to fix:\n  " + "\n  ".join(problems)
     )
 
 

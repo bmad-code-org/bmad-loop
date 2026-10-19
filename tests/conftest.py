@@ -2593,11 +2593,9 @@ def install_sweep_skill(root: Path, tree: str = ".claude/skills") -> Path:
     (`install.missing_sweep_skill`) passes for the right reason: the file set it
     requires is read from the same bundle, so a stub list here would drift the
     moment a mode file is added. Idempotent. Returns the skill directory."""
-    from importlib import resources
+    from bmad_loop.install import SWEEP_SKILL, bundled_skill_files, skills_root
 
-    from bmad_loop.install import SWEEP_SKILL, bundled_skill_files
-
-    src = resources.files("bmad_loop.data").joinpath("skills").joinpath(SWEEP_SKILL)
+    src = skills_root().joinpath(SWEEP_SKILL)
     dst = Path(root) / tree / SWEEP_SKILL
     for rel in bundled_skill_files(SWEEP_SKILL):
         target = dst.joinpath(*rel.split("/"))

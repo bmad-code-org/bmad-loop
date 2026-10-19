@@ -60,7 +60,8 @@ ANTIGRAVITY_HOOK_TIMEOUT_SEC = 60  # agy hook timeouts are seconds (default 30)
 # wrapper); bmad-loop registers all its handlers under this single group.
 ANTIGRAVITY_HOOK_GROUP = "bmad-loop"
 
-# The bmad-loop-* skills bundled in the wheel (bmad_loop/data/skills/) that
+# The bmad-loop-* skills bundled in the wheel (bmad_loop/data/skills/, mapped from
+# the repo-root `skills/` at build time; see :func:`skills_root`) that
 # `bmad-loop init` lays down. The inner dev primitive (`bmad-build-auto`, formerly
 # `bmad-dev-auto`) is upstream (not bundled here): the orchestrator drives it as an
 # already-installed skill. These dirs are the only skills init writes: the
@@ -1064,6 +1065,24 @@ _SWEEP_REMEDIATION = (
 )
 
 
+# Source checkout layout: src/bmad_loop/install.py -> <repo>/skills.
+_CHECKOUT_SKILLS = Path(__file__).resolve().parent.parent.parent / "skills"
+
+
+def skills_root() -> Traversable:
+    """The root of the bundled ``MODULE_SKILLS`` dirs.
+
+    The canonical skills live at the repo root (``skills/``) so the Vercel
+    ``skills`` CLI discovers them; the wheel's ``force-include`` maps them to
+    ``bmad_loop/data/skills``. An editable install never applies that mapping, so
+    a source checkout falls back to its own ``skills/``. When neither exists the
+    package path is returned unchanged, so the caller's read fails loudly on it."""
+    bundled = resources.files("bmad_loop.data").joinpath("skills")
+    if not bundled.is_dir() and _CHECKOUT_SKILLS.is_dir():
+        return _CHECKOUT_SKILLS
+    return bundled
+
+
 def bundled_skill_files(skill: str) -> tuple[str, ...]:
     """The POSIX rels of every file the wheel bundles under ``skills/<skill>/``.
 
@@ -1071,7 +1090,7 @@ def bundled_skill_files(skill: str) -> tuple[str, ...]:
     file added to the bundled skill is required by the preflight the moment it
     ships — a hand-kept list would silently stop checking it. Sorted and
     deterministic (the walk itself sorts)."""
-    root = resources.files("bmad_loop.data").joinpath("skills").joinpath(skill)
+    root = skills_root().joinpath(skill)
     return tuple(rel for rel, entry in _walk_traversable_files(root) if rel and _is_file(entry))
 
 
@@ -2665,7 +2684,7 @@ _SHIELD_LOCK_NAME = "bmad-loop-shield.lock"
 # <paths>` after the `add -A` at `verify.py:1891` and `:1932`. No shadow, so no
 # seed, no `_shield_inherited_excludes`, no permanent `extensions.worktreeConfig`,
 # no version floor. It is MECHANICALLY REACHABLE: those adds are the orchestrator's
-# own, not an LLM's (no skill in `data/skills/` runs git).
+# own, not an LLM's (no skill in `skills/` runs git).
 #
 # Rejected on the merits, for two reasons that are about correctness rather than
 # scope:
@@ -3857,7 +3876,7 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
     BMAD installer's copy or local edits are never clobbered silently). Returns
     True if any skill was skipped because it already existed.
     """
-    skills_root = resources.files("bmad_loop.data").joinpath("skills")
+    root = skills_root()
     skipped_any = False
     for tree in trees:
         tree_dir = project / tree
@@ -3884,7 +3903,7 @@ def _copy_skills(project: Path, trees: Sequence[str], force: bool) -> bool:
                 continue
             if dst.exists():
                 shutil.rmtree(dst)
-            _copy_traversable(skills_root.joinpath(skill), dst)
+            _copy_traversable(root.joinpath(skill), dst)
             installed.append(skill)
         parts: list[str] = []
         if installed:

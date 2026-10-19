@@ -106,6 +106,12 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Move the module skills to a repo-root `skills/` directory so the Vercel `skills` CLI
+  (`npx skills add bmad-code-org/bmad-loop`) discovers them without the plugin
+  manifest. The wheel still bundles them under `bmad_loop/data/skills`; `bmod.toml`
+  sources and `.claude-plugin/marketplace.json` point at the new path. Drop the
+  repo-root `module.yaml` mirror: the BMAD installer finds
+  `skills/bmad-loop-setup/assets/module.yaml` directly.
 - Refuse release versions `bmad setup` cannot order: `scripts/sync_version.py` accepts
   SemVer `X.Y.Z` with an optional `-` pre-release only (no `.devN`, no `-dev`).
 - Make the setup greeting era-neutral: it names the BMAD v6 and v7 requirements.

@@ -69,7 +69,7 @@ BMAD v7 installs modules from `bmod.toml` records. bmad-loop ships one: the
 register the module:
 
 ```bash
-npx skills add bmad-code-org/bmad-loop
+npx skills add bmad-code-org/bmad-loop          # or: --skill '*' -y to skip the picker
 claude "/bmad setup bmad-loop"
 claude "/bmad-loop-setup accept all defaults"
 ```
@@ -124,7 +124,7 @@ Run `/bmad-loop-setup` with plain prompts if you want to choose interactively â€
 
 If you are working from a clone of this repo, sync the project env and let
 `bmad-loop init` lay down the skills (the canonical skills live at
-`src/bmad_loop/data/skills/` and are bundled into the package):
+`skills/` at the repo root and are bundled into the package):
 
 ```bash
 uv sync --extra tui                                             # the orchestrator tool + TUI
