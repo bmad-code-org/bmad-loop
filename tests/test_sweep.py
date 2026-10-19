@@ -38773,6 +38773,7 @@ def _v7_isolated_close_seam(
     worktree: bool = True,
     intended: bool = True,
     commit_close: bool = False,
+    run_id: str = "sweep-run",
 ):
     """DW-569 seam setup: a v7 sweep over a store with its own repository
     (``layout`` T3/T4) whose ledger, `{DW-1: open}`, is committed in that store,
@@ -38782,8 +38783,8 @@ def _v7_isolated_close_seam(
     isolated arm); ``intended`` records ``bundle_closes_intended``, which only the
     accepted-dev close assigns. ``commit_close`` commits the close into the
     store, so the store's HEAD holds DW-1 `done` and a reopen leaves a real
-    delta. Returns the engine, its paths, the store, the ledger's
-    store-relative path and the task."""
+    delta. ``run_id`` names the sweep run. Returns the engine, its paths, the
+    store, the ledger's store-relative path and the task."""
     store = v7.output_folder
     paths = _v7_paths(v7)
     write_ledger(paths, {"DW-1": "open"}, commit=False)
@@ -38792,7 +38793,7 @@ def _v7_isolated_close_seam(
     ledger_rel = paths.deferred_work.resolve().relative_to(store.resolve()).as_posix()
     topology = ticketstore.assess_store(paths, "none")
     assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == layout
-    engine, _ = make_sweep(paths, [], store_topology=topology.to_dict())
+    engine, _ = make_sweep(paths, [], store_topology=topology.to_dict(), run_id=run_id)
     # premise: the ledger lives in the shared store every checkout reads
     assert engine.paths.in_shared_store(engine.paths.deferred_work)
     assert not engine._isolated  # premise: only `worktree_path` takes the isolated arm
@@ -39180,6 +39181,160 @@ def _v7_store_carry_seam(v7, layout, *, distinct_baseline=False):
     )
     engine.state.tasks[task.story_key] = task
     return engine, paths, store, ledger_rel, task
+
+
+HELD_RUN_ID = "20260101-000000-a571"
+
+
+def _held_sweep_run(v7, layout: str = "T3", *, run_id: str = HELD_RUN_ID, **seam):
+    """DW-571: the DW-569 seam saved to disk as an unfinished run. An isolated
+    sweep paused at the story gate after accepted dev, with its close of DW-1
+    still `done` in the shared store's ledger and no code landed. ``seam`` goes
+    to :func:`_v7_isolated_close_seam`. Returns what the seam returns."""
+    engine, paths, store, ledger_rel, task = _v7_isolated_close_seam(
+        v7, layout, run_id=run_id, **seam
+    )
+    engine.state.paused_stage = PAUSE_STORY_GATE
+    engine.state.paused_story_key = task.story_key
+    engine.state.initiative = paths.active_initiative  # the pin `compose_sweep` records
+    engine._save()
+    on_disk = load_state(engine.run_dir)
+    assert on_disk.run_type == "sweep" and not on_disk.finished  # premise
+    return engine, paths, store, ledger_rel, task
+
+
+def _start_sweep_at_seam(project_root: Path, monkeypatch, run_id: str):
+    """Drive `cli._start_sweep` with `runsetup.compose_sweep` replaced by a fresh
+    run whose engine records the stderr written before it ran. Returns the rc,
+    the new run's journal, and the stderr seen at `engine.run()` (one item when
+    the engine ran)."""
+    from bmad_loop import cli
+    from bmad_loop import policy as policy_mod
+    from bmad_loop import runsetup
+    from bmad_loop.plugins.grants import GrantSet
+
+    run_dir = project_root / ".bmad-loop" / "runs" / run_id
+    journal = Journal(run_dir)
+    seen: list[str] = []
+    summary = SimpleNamespace(crashed=False, render=lambda: "SWEEP DONE")
+
+    def run():
+        seen.append(getattr(sys.stderr, "getvalue", str)())
+        return summary
+
+    composed = SimpleNamespace(run_id=run_id, engine=SimpleNamespace(run=run), journal=journal)
+    monkeypatch.setattr(runsetup, "compose_sweep", lambda **_kwargs: composed)
+    rc = cli._start_sweep(
+        project_root,
+        load_paths(project_root),
+        policy_mod.load(None),
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        trigger="cli",
+        plugin_grants=GrantSet.empty(),
+    )
+    return rc, journal, seen
+
+
+def _journal_rows(journal: Journal, kind: str) -> list[dict]:
+    return [e for e in journal.entries() if e.get("kind") == kind]
+
+
+@_V7_STORE_LAYOUTS
+def test_sweep_start_warns_about_a_prior_run_holding_unlanded_closes(
+    request, fixture, layout, monkeypatch, capsys
+):
+    """DW-571. T3/T4: a paused isolated sweep run still holds its close of DW-1
+    in the shared ledger. A fresh sweep journals `sweep-prior-run-holds-closes`
+    (the held run and its ids) and prints one warning naming `bmad-loop resume`,
+    before its engine runs. Nothing is reopened, the prior run's state and the
+    ledger are byte-identical, and the new sweep still runs.
+
+    Ablation: delete the `_warn_prior_sweep_closes` call in `cli._start_sweep`
+    and this fails (no row, no warning line)."""
+    engine, paths, _store, _ledger_rel, _task = _held_sweep_run(
+        request.getfixturevalue(fixture), layout
+    )
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+    capsys.readouterr()
+
+    rc, journal, _seen = _start_sweep_at_seam(paths.project, monkeypatch, "20990101-000000-b571")
+
+    out, err = capsys.readouterr()
+    assert rc == 0 and "SWEEP DONE" in out  # the new sweep ran
+    rows = _journal_rows(journal, "sweep-prior-run-holds-closes")
+    assert [(r["run_id"], r["dw_ids"]) for r in rows] == [(HELD_RUN_ID, ["DW-1"])]
+    lines = [ln for ln in err.splitlines() if ln.startswith("warning: run")]
+    assert len(lines) == 1
+    assert HELD_RUN_ID in lines[0] and "DW-1" in lines[0]
+    assert f"bmad-loop resume {HELD_RUN_ID}" in lines[0]
+    assert not ledger_entries(paths)["DW-1"].open  # not reopened
+    assert paths.deferred_work.read_bytes() == ledger_before
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+
+
+def test_sweep_start_warning_precedes_the_engine_run(project_v7_store_repo, monkeypatch):
+    """The warning is written before `engine.run()`, so an operator sees it at
+    launch rather than after the sweep. Run under a plain `StringIO` stderr so the
+    order is visible."""
+    _held_sweep_run(project_v7_store_repo)
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    rc, _journal, seen = _start_sweep_at_seam(
+        project_v7_store_repo.project, monkeypatch, "20990101-000000-b572"
+    )
+
+    assert rc == 0 and len(seen) == 1
+    assert f"warning: run {HELD_RUN_ID} holds sweep ledger closes" in seen[0]
+
+
+def test_sweep_start_journals_a_prior_run_it_cannot_check(
+    project_v7_store_repo, monkeypatch, capsys
+):
+    """A prior run whose `state.json` is present but unreadable might hold closes,
+    so it is never reported as holding none. The fresh sweep journals
+    `sweep-prior-run-closes-unknown` naming the run, prints a warning, and runs.
+    The garbage state is left as it was.
+
+    Ablation: answer `[]` instead of raising from `held_sweep_closes`' unreadable
+    state arm and this fails (no row, no line)."""
+    engine, paths, *_ = _held_sweep_run(project_v7_store_repo)
+    (engine.run_dir / "state.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+
+    rc, journal, _seen = _start_sweep_at_seam(paths.project, monkeypatch, "20990101-000000-b573")
+
+    out, err = capsys.readouterr()
+    assert rc == 0 and "SWEEP DONE" in out
+    rows = _journal_rows(journal, "sweep-prior-run-closes-unknown")
+    assert [r["run_id"] for r in rows] == [HELD_RUN_ID]
+    assert "could not be read" in rows[0]["error"]
+    assert _journal_rows(journal, "sweep-prior-run-holds-closes") == []
+    assert f"warning: could not check run {HELD_RUN_ID}" in err
+    assert (engine.run_dir / "state.json").read_text(encoding="utf-8") == "{not json"
+
+
+def test_sweep_start_journals_an_unlistable_runs_dir(project_v7_store_repo, monkeypatch, capsys):
+    """A runs dir that cannot be listed is not "no prior run holds closes": the
+    fresh sweep journals `sweep-prior-run-closes-unknown` with the fault and no
+    run id, prints a warning, and runs.
+
+    Ablation: answer `[]` from `prior_sweep_closes` when the listing fails and
+    this fails."""
+    paths = _v7_paths(project_v7_store_repo)
+    monkeypatch.setattr(runs, "_run_dir_names", lambda _p: (None, "runs: cannot list (EACCES)"))
+    capsys.readouterr()
+
+    rc, journal, _seen = _start_sweep_at_seam(paths.project, monkeypatch, "20990101-000000-b574")
+
+    out, err = capsys.readouterr()
+    assert rc == 0 and "SWEEP DONE" in out
+    rows = _journal_rows(journal, "sweep-prior-run-closes-unknown")
+    assert [(r.get("run_id"), r["error"]) for r in rows] == [(None, "runs: cannot list (EACCES)")]
+    assert "warning: could not check earlier runs" in err
 
 
 @pytest.mark.parametrize(

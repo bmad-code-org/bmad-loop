@@ -12833,16 +12833,18 @@ def test_delete_warns_when_a_kept_worktree_stays_registered(project, tmp_path, m
     assert str(unit) in note and "git worktree prune" in note
 
 
-def test_delete_warns_when_the_run_state_is_unreadable(project, tmp_path, monkeypatch):
-    """An unreadable state.json leaves the code root unknown: `delete_run` still
-    prunes `project` (the usual root, so the unit is deregistered here), but a clean
+def test_delete_warns_when_the_run_state_is_missing(project, tmp_path, monkeypatch):
+    """A missing state.json leaves the code root unknown: `delete_run` still prunes
+    `project` (the usual root, so the unit is deregistered here), but a clean
     listing there is not reported as a confirmed cleanup — the run might have
-    recorded a `repo_root` override.
+    recorded a `repo_root` override. (A present but unreadable state.json is
+    refused before any removal, since it might hold sweep ledger closes;
+    `test_delete_run_refuses_a_run_it_cannot_check_for_held_closes` pins that.)
 
     Ablation: make the state-is-None arm return `_prune_deleted_run_worktrees`'s
     result alone and `notes == []`, failing the unpack."""
     _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
-    (replay_dir / "state.json").write_text("{not json", encoding="utf-8")
+    (replay_dir / "state.json").unlink()
     notes: list[str] = []
 
     runs.delete_run(project.project, replay_dir, warn=notes.append, force=True)
@@ -12850,7 +12852,7 @@ def test_delete_warns_when_the_run_state_is_unreadable(project, tmp_path, monkey
     assert not replay_dir.exists()
     assert _registered_under(project, replay_dir) == []
     [note] = notes
-    assert "run state was unreadable" in note and "git worktree prune" in note
+    assert "run state was missing or unreadable" in note and "git worktree prune" in note
 
 
 def test_delete_warns_when_the_worktree_listing_fails(project, tmp_path, monkeypatch):
@@ -12915,6 +12917,46 @@ def test_abandon_refuses_a_run_that_is_not_a_replay(project, tmp_path, monkeypat
     assert _state_bytes(engine.run_dir) == before
     assert len(Journal(engine.run_dir).entries()) == rows
     assert Path(engine.state.tasks["1-1-a"].worktree_path).is_dir()
+
+
+def test_abandon_refuses_an_isolated_sweep_run_holding_its_close(
+    project_v7_store_repo, monkeypatch, capsys
+):
+    """DW-571. An isolated T3 sweep run paused at an escalation, with its close of
+    DW-1 still `done` in the shared ledger, cannot be abandoned: a sweep run is
+    never a replay, so `resolve --abandon` refuses it with "closes replay runs
+    only". The state, the journal and the ledger stay byte-identical, and DW-1
+    stays `done`.
+
+    Ablation: drop the `not state.replay_of` check in
+    `unitreplay.abandon_refusal` and the message assertion fails."""
+    import test_sweep as ts
+
+    engine, paths, _store, _rel, task = ts._held_sweep_run(project_v7_store_repo)
+    task.phase = Phase.ESCALATED
+    engine.state.paused_stage = PAUSE_ESCALATION
+    engine._save()
+    monkeypatch.setattr(runs, "engine_liveness", lambda _run_dir: "dead")
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]  # premise
+    before = _state_bytes(engine.run_dir)
+    rows = len(Journal(engine.run_dir).entries())
+    ledger_before = paths.deferred_work.read_bytes()
+
+    assert _abandon_at(paths.project, engine.run_dir) == 1
+
+    assert "closes replay runs only" in capsys.readouterr().err
+    assert _state_bytes(engine.run_dir) == before
+    assert len(Journal(engine.run_dir).entries()) == rows
+    assert paths.deferred_work.read_bytes() == ledger_before
+    assert not ts.ledger_entries(paths)["DW-1"].open
+
+
+def _abandon_at(project_root: Path, run_dir: Path) -> int:
+    from bmad_loop import cli
+
+    return cli.main(
+        ["resolve", "--project", str(project_root), run_dir.name, "--abandon", "--no-interactive"]
+    )
 
 
 def test_abandon_refuses_a_finished_run(project, tmp_path, monkeypatch, capsys):

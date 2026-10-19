@@ -30,7 +30,7 @@ from conftest import (
     refuse_to_resolve,
 )
 
-from bmad_loop import envvars, platform_util, runs, verify
+from bmad_loop import deferredwork, envvars, platform_util, runs, ticketstore, verify
 from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
@@ -11552,3 +11552,355 @@ def test_rebase_recorded_code_root_keeps_an_ancestor_root_that_still_exists(tmp_
     repo.mkdir()
     state = RunState(run_id="r", project=str(repo / "app"), repo_root=str(repo), started_at="now")
     assert runs.rebase_recorded_code_root(state, repo / "sub" / "app") == repo
+
+
+# ------------------------------------------- sweep closes a run still holds (DW-571)
+
+
+def _seam():
+    """The DW-569/571 seam helpers live with the sweep suite that owns them."""
+    import test_sweep
+
+    return test_sweep
+
+
+@pytest.mark.parametrize(
+    ("fixture", "layout"),
+    [("project_v7_store_repo", "T3"), ("project_v7_external_store", "T4")],
+)
+def test_held_sweep_closes_names_an_unresumed_isolated_close(request, fixture, layout):
+    """DW-571, the original gap. An isolated T3/T4 sweep run paused after accepted
+    dev and never resumed leaves DW-1 `done` in the shared ledger. No later sweep
+    re-bundles it, and the discovery reports it."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(request.getfixturevalue(fixture), layout)
+
+    assert not ts.ledger_entries(paths)["DW-1"].open
+    assert "DW-1" not in deferredwork.open_ids(paths.deferred_work.read_text(encoding="utf-8"))
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]
+
+
+def test_held_sweep_closes_counts_a_target_branch_as_isolation(project_v7_store_repo):
+    """`state.target_branch` alone marks the run isolated, as `worktree_path` does
+    for one task.
+
+    Ablation: key isolation on `task.worktree_path` alone and this fails."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo, worktree=False)
+    engine.state.target_branch = "main"
+    engine._save()
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]
+
+
+def _rewrite_state(engine, **changes) -> None:
+    for key, value in changes.items():
+        setattr(engine.state, key, value)
+    engine._save()
+
+
+@pytest.mark.parametrize(
+    "shape", ["landed", "not-isolated", "finished", "story-run", "no-close-intended"]
+)
+def test_held_sweep_closes_ignores_a_run_that_holds_nothing(project_v7_store_repo, shape):
+    """Each row breaks one condition of "holds": the task landed (DONE), the run is
+    not isolated, the run finished, the run is not a sweep, or no close was ever
+    intended. The close stays `done` in every row, so only the condition answers
+    `[]`.
+
+    Ablation: delete the `task.phase != Phase.DONE` predicate and "landed" fails;
+    delete the isolation predicate and "not-isolated" fails; delete the
+    `state.finished` check and "finished" fails; delete the `run_type` check and
+    "story-run" fails."""
+    ts = _seam()
+    seam = {
+        "landed": {"phase": Phase.DONE},
+        "not-isolated": {"worktree": False},
+        "no-close-intended": {"intended": False},
+    }.get(shape, {})
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo, **seam)
+    if shape == "finished":
+        _rewrite_state(engine, finished=True)
+    elif shape == "story-run":
+        _rewrite_state(engine, run_type="story")
+    assert not ts.ledger_entries(paths)["DW-1"].open  # premise: the close stands
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+
+def test_held_sweep_closes_ignores_a_close_already_reopened(project_v7_store_repo):
+    """Once the close is undone (the escalation reopen ran), nothing is held.
+
+    Ablation: return the task's `bundle_closes_intended` instead of
+    `held_reopenable_closes` and this fails."""
+    ts = _seam()
+    engine, paths, _store, _rel, task = ts._held_sweep_run(project_v7_store_repo)
+    reopened = deferredwork.mark_open_many(
+        paths.deferred_work,
+        task.dw_ids,
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    assert reopened == ["DW-1"]  # premise
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+
+@pytest.mark.parametrize("switched", [False, True])
+def test_held_sweep_closes_ignores_a_ledger_in_the_checkout(project_v7, switched):
+    """T1: the store is tracked in the code checkout, so an isolated bundle's
+    close lives in the unit worktree's copy and dies with it. A close in this
+    checkout's ledger under the run's identity is not held, and that stays true
+    after the active initiative is switched: with no shared store there is
+    nothing a switch could hide.
+
+    Ablation: delete the `in_shared_store` check and the unswitched case fails;
+    delete the `shared_store is None` early return and the switched case fails
+    (the initiative conflict reads as "unknown")."""
+    from conftest import V7_USER_CONFIG_REL
+
+    ts = _seam()
+    paths = ts._v7_paths(project_v7)
+    ts.write_ledger(paths, {"DW-1": "open"})
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology) and topology.layout == "T1"
+    engine, _ = ts.make_sweep(paths, [], store_topology=topology.to_dict(), run_id=ts.HELD_RUN_ID)
+    assert not engine.paths.in_shared_store(engine.paths.deferred_work)  # premise
+    task = StoryTask(
+        story_key="dw-fix-things",
+        epic=0,
+        dw_ids=["DW-1"],
+        phase=Phase.DEV_VERIFY,
+        worktree_path=str(paths.repo_root.parent / "unit"),
+        bundle_closes_intended=["DW-1"],
+    )
+    engine.state.tasks[task.story_key] = task
+    deferredwork.mark_done_many_reopenable(
+        paths.deferred_work,
+        task.dw_ids,
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    engine.state.initiative = paths.active_initiative  # the pin `compose_sweep` records
+    engine._save()
+    assert not ts.ledger_entries(paths)["DW-1"].open  # premise
+    if switched:
+        (paths.project / V7_USER_CONFIG_REL).write_text(
+            '[core]\nactive_initiative = "another-initiative"\n', encoding="utf-8"
+        )
+
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+
+def test_held_sweep_closes_reads_absence_as_nothing_held(project_v7_store_repo):
+    """An absent `state.json` has no record of a close, and an absent ledger holds
+    none: both answer `[]`, never "unknown"."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    paths.deferred_work.unlink()
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+    (engine.run_dir / "state.json").unlink()
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == []
+
+
+@pytest.mark.parametrize("fault", ["state", "ledger", "topology"])
+def test_held_sweep_closes_never_folds_a_fault_into_nothing_held(project_v7_store_repo, fault):
+    """A present but unreadable `state.json`, a ledger that does not decode, and a
+    recorded store topology that does not parse each raise
+    `HeldClosesUnknownError`. None of them is "none held".
+
+    Ablation: answer `[]` from any one of the three arms (the state `except
+    Exception`, the `observe_ledger` fault check, the config/topology `except`)
+    and its row fails."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    if fault == "state":
+        (engine.run_dir / "state.json").write_text("{not json", encoding="utf-8")
+    elif fault == "ledger":
+        paths.deferred_work.write_bytes(b"\xff\xfe not utf-8\n")
+    else:
+        _rewrite_state(engine, store_topology={"layout": "T3"})
+
+    with pytest.raises(runs.HeldClosesUnknownError):
+        runs.held_sweep_closes(paths.project, engine.run_dir)
+
+
+def test_prior_sweep_closes_skips_the_new_run_and_live_runs(project_v7_store_repo, monkeypatch):
+    """The sweep-start scan reports a held run, but not the run named by
+    `exclude` (the new sweep), and not a live run whose close is still in
+    flight.
+
+    Ablation: drop the `engine_liveness` skip and the live row fails; drop the
+    `exclude` skip and the excluded row fails."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    project = paths.project
+
+    assert runs.prior_sweep_closes(project, exclude="other") == [
+        runs.PriorSweepCloses(ts.HELD_RUN_ID, ("DW-1",))
+    ]
+    assert runs.prior_sweep_closes(project, exclude=ts.HELD_RUN_ID) == []
+    monkeypatch.setattr(
+        runs, "engine_liveness", lambda rd: "alive" if rd == engine.run_dir else "dead"
+    )
+    assert runs.prior_sweep_closes(project, exclude="other") == []
+
+
+def test_prior_sweep_closes_reports_an_unlistable_runs_dir_as_a_fault(tmp_path, monkeypatch):
+    """A runs dir that cannot be listed gives one fault row with no run id, never
+    an empty answer."""
+    monkeypatch.setattr(runs, "_run_dir_names", lambda _p: (None, "runs: EACCES"))
+
+    assert runs.prior_sweep_closes(tmp_path, exclude="x") == [
+        runs.PriorSweepCloses(None, fault="runs: EACCES")
+    ]
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_delete_run_refuses_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, force):
+    """`delete_run` refuses a run that holds a shared-store close no code landed
+    for: the error names the run, DW-1 and `bmad-loop resume`. The run dir, its
+    state and the ledger are byte-identical afterwards. `force` waives only the
+    session guard, so it does not waive this.
+
+    Ablation: delete the `refuse_held_sweep_closes` call in `delete_run` and both
+    rows fail (the run is removed)."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.delete_run(paths.project, engine.run_dir, force=force)
+
+    assert info.value.run_id == ts.HELD_RUN_ID and info.value.dw_ids == ["DW-1"]
+    assert info.value.reason is None
+    message = str(info.value)
+    assert ts.HELD_RUN_ID in message and "DW-1" in message
+    assert f"bmad-loop resume {ts.HELD_RUN_ID}" in message
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+
+
+def test_delete_run_refuses_a_run_it_cannot_check_for_held_closes(project_v7_store_repo):
+    """A present but unreadable `state.json` might hold closes, so `delete_run`
+    refuses it and names the fault. The garbage state is left in place."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    (engine.run_dir / "state.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.delete_run(paths.project, engine.run_dir)
+
+    assert info.value.dw_ids == [] and "could not be read" in (info.value.reason or "")
+    assert f"bmad-loop resume {ts.HELD_RUN_ID}" in str(info.value)
+    assert (engine.run_dir / "state.json").read_text(encoding="utf-8") == "{not json"
+
+
+def test_delete_run_checks_held_closes_under_the_lock_after_the_liveness_guard(
+    project_v7_store_repo, monkeypatch
+):
+    """The held-closes check runs under the run's state lock, and only after the
+    engine-liveness guard: a live run still gets `LiveEngineError`."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    real = runs.held_sweep_closes
+    checked: list[Path] = []
+
+    def held(project, run_dir):
+        assert_run_state_lock_held(run_dir)
+        checked.append(run_dir)
+        return real(project, run_dir)
+
+    monkeypatch.setattr(runs, "held_sweep_closes", held)
+    with pytest.raises(runs.HeldSweepClosesError):
+        runs.delete_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    with pytest.raises(runs.LiveEngineError):
+        runs.delete_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]  # the liveness guard refused first
+    assert engine.run_dir.is_dir()
+
+
+def test_delete_run_removes_a_sweep_run_that_holds_nothing(project_v7_store_repo):
+    """A sweep run whose bundle landed (DONE) holds no close, so it is deleted as
+    before."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo, phase=Phase.DONE)
+
+    runs.delete_run(paths.project, engine.run_dir, warn=lambda _note: None)
+
+    assert not engine.run_dir.exists()
+
+
+def test_delete_run_failed_launch_unwind_skips_the_held_closes_check(
+    project_v7_store_repo, monkeypatch
+):
+    """The runsetup failed-launch unwind (`_expected_composer_claim`) removes a run
+    it just composed, which holds nothing, so the check is skipped.
+
+    Ablation: drop the `_expected_composer_claim is None` condition and this fails
+    with `HeldSweepClosesError`."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    claim = engine.run_dir.stat(follow_symlinks=False)
+
+    runs.delete_run(
+        paths.project,
+        engine.run_dir,
+        warn=lambda _note: None,
+        _expected_composer_pid=os.getpid(),
+        _expected_composer_claim=claim,
+    )
+
+    assert not engine.run_dir.exists()
+
+
+def test_held_sweep_closes_refuses_to_judge_under_a_switched_initiative(project_v7_store_repo):
+    """The live paths resolve the ACTIVE initiative's ledger. A sweep pinned to
+    another initiative would be judged against a ledger that holds nothing under
+    its op id, so a switched initiative is "unknown", never "none held": delete
+    refuses (naming the conflict), and the sweep-start scan reports a fault row.
+
+    Ablation: delete the `sweep_initiative_conflict` check in `held_sweep_closes`
+    and this fails (delete removes the holder; the scan reports nothing)."""
+    from conftest import V7_USER_CONFIG_REL
+
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    assert runs.held_sweep_closes(paths.project, engine.run_dir) == ["DW-1"]  # premise
+    (paths.project / V7_USER_CONFIG_REL).write_text(
+        '[core]\nactive_initiative = "another-initiative"\n', encoding="utf-8"
+    )
+
+    [row] = runs.prior_sweep_closes(paths.project, exclude="other")
+    assert row.run_id == ts.HELD_RUN_ID and row.fault and "active initiative" in row.fault
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.delete_run(paths.project, engine.run_dir)
+    assert info.value.reason and "active initiative" in info.value.reason
+    assert engine.run_dir.is_dir()
+
+
+def test_prior_sweep_closes_records_a_liveness_probe_fault_as_a_fault_row(tmp_path, monkeypatch):
+    """A misconfigured process host makes `engine_liveness` raise
+    `ProcessHostError`. The scan records a fault row for that run rather than
+    letting the error abort the new sweep.
+
+    Ablation: drop the `except ProcessHostError` around the liveness probe and
+    this fails with the raise."""
+    from bmad_loop.process_host import ProcessHostError
+
+    (tmp_path / ".bmad-loop" / "runs" / "20260101-000000-aaaa").mkdir(parents=True)
+
+    def broken(_run_dir):
+        raise ProcessHostError("no such process host 'bogus'")
+
+    monkeypatch.setattr(runs, "engine_liveness", broken)
+
+    [row] = runs.prior_sweep_closes(tmp_path, exclude="x")
+    assert row.run_id == "20260101-000000-aaaa" and row.dw_ids == ()
+    assert row.fault and "bogus" in row.fault

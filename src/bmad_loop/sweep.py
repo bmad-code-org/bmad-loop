@@ -51,7 +51,14 @@ from .platform_util import (
     open_dir_confined,
     safe_segment,
 )
-from .runs import StateRootError, _project_of_run_dir, events_dir_for, live_store_topology
+from .runs import (
+    StateRootError,
+    _project_of_run_dir,
+    bundle_close_note,
+    bundle_close_operation_id,
+    events_dir_for,
+    live_store_topology,
+)
 from .signals import attribute_events, session_events
 from .statemachine import advance
 from .worksource import EpicProgress, Pick, WorkSource
@@ -8940,7 +8947,16 @@ class SweepEngine(Engine):
         A ``LedgerReadError`` or ``OSError`` from the reopen is a visible
         degrade: it journals ``sweep-bundle-reopen-failed`` and skips the
         publish, and the escalation or veto goes on. The escalation pause is the
-        operator stop; turning it into a crash would lose its reason."""
+        operator stop; turning it into a crash would lose its reason.
+
+        The other ends of such a run (a pause other than an escalation, a stop,
+        a crash) reopen nothing, and no reopen path is built for them (DW-571).
+        They are guarded instead, through one read-only discovery,
+        :func:`~bmad_loop.runs.held_sweep_closes`: a fresh sweep warns about a
+        prior run that still holds closes (``sweep-prior-run-holds-closes``, or
+        ``sweep-prior-run-closes-unknown`` when it cannot tell), and ``delete``,
+        the TUI delete and ``clean`` refuse to remove that run. ``resolve
+        --abandon`` already refuses every sweep run, which is never a replay."""
         if not task.bundle_closes_intended:
             return
         if not (self._isolated or task.worktree_path):
@@ -9190,12 +9206,16 @@ class SweepEngine(Engine):
         return frozenset({"done"})
 
     def _bundle_close_operation_id(self, task: StoryTask) -> str:
-        """Stable identity for a close and its possible defer-time undo."""
-        return f"{self.state.run_id}/{task.story_key}"
+        """Stable identity for a close and its possible defer-time undo. The
+        format is :func:`~bmad_loop.runs.bundle_close_operation_id`, which the
+        held-close discovery (:func:`~bmad_loop.runs.held_sweep_closes`) shares."""
+        return bundle_close_operation_id(self.state.run_id, task.story_key)
 
     def _bundle_close_note(self, task: StoryTask) -> str:
-        """Resolution note shared by a bundle close and its possible undo."""
-        return f"resolved by sweep bundle {task.story_key}"
+        """Resolution note shared by a bundle close and its possible undo. The
+        format is :func:`~bmad_loop.runs.bundle_close_note`, which the held-close
+        discovery shares."""
+        return bundle_close_note(task.story_key)
 
     def _close_declared_deferred(
         self, task: StoryTask, snapshot: list[_ArmedClose] | None = None

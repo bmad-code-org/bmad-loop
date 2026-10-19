@@ -1154,3 +1154,162 @@ def test_cmd_clean_json_carries_the_sweep_count_in_both_modes(project, capsys):
     outcome = _clean_json(repo, capsys)
     assert outcome["state_dirs_swept"] == 1
     assert not orphan.exists()
+
+
+# ---------------------------------------- runs holding unlanded sweep closes (DW-571)
+
+
+def _held_and_plain_stopped_runs(v7):
+    """Two stopped runs past any retention window. One is an isolated sweep run
+    still holding its shared-store close of DW-1, the other a plain run. Returns
+    (held engine, paths, plain run dir)."""
+    import test_sweep as ts
+
+    engine, paths, *_ = ts._held_sweep_run(v7)
+    engine.state.paused_stage = None
+    engine.state.paused_story_key = None
+    engine.state.stopped = True
+    engine._save()
+    plain = paths.project / ".bmad-loop" / "runs" / "20260102-000000-bbbb"
+    save_state(
+        plain, RunState(run_id="p", project=str(paths.project), started_at="x", stopped=True)
+    )
+    assert runs.reclaimable(engine.run_dir) and runs.reclaimable(plain)  # premise
+    return engine, paths, plain
+
+
+def test_cmd_clean_hard_skips_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, capsys):
+    """`clean --hard` checks the delete arm's runs for held sweep closes before it
+    mutates anything. The holder is left whole (state, ledger, no trim) with a
+    stderr line naming DW-1 and `bmad-loop resume`, and its sibling is still
+    deleted.
+
+    Ablation: delete the pre-check in `cmd_clean` and this fails. The sibling
+    still goes, but the holder is trimmed, and the refusal surfaces only from
+    `delete_run` as a mid-clean skip."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    heavy = engine.run_dir / VERIFY_DIR
+    heavy.mkdir()
+    (heavy / "verify.log").write_text("kept\n", encoding="utf-8")
+    assert heavy in runs.heavy_run_entries(engine.run_dir)  # premise: a trim takes it
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    assert cli.cmd_clean(_clean_args(paths.project, retain=0, hard=True)) == 0
+
+    err = capsys.readouterr().err
+    assert not plain.exists()
+    assert engine.run_dir.is_dir() and heavy.is_dir()  # untouched, not trimmed
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+    line = next(ln for ln in err.splitlines() if ln.startswith(f"run {engine.run_dir.name}:"))
+    assert "DW-1" in line and f"bmad-loop resume {engine.run_dir.name}" in line
+    assert line.endswith("— not removed")
+
+
+def test_cmd_clean_names_the_fault_when_a_run_could_not_be_checked(project_v7_store_repo, capsys):
+    """A delete-arm run whose ledger cannot be read is skipped with a line naming
+    the fault, never with the held-ids wording and an empty id list. Its sibling
+    is still deleted.
+
+    Ablation: make `_held_closes_reason` always return the held-ids text and this
+    fails (the line reads `holds sweep ledger closes whose code never landed ()`)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    paths.deferred_work.write_bytes(b"\xff\xfe not utf-8\n")
+
+    assert cli.cmd_clean(_clean_args(paths.project, retain=0, hard=True)) == 0
+
+    err = capsys.readouterr().err
+    assert engine.run_dir.is_dir() and not plain.exists()
+    line = next(ln for ln in err.splitlines() if ln.startswith(f"run {engine.run_dir.name}:"))
+    assert "could not be checked" in line and str(paths.deferred_work) in line
+    assert "holds sweep ledger closes" not in line
+
+
+def test_cmd_clean_json_reports_a_held_closes_run_as_protected(project_v7_store_repo, capsys):
+    """In `--json` mode the holder lands in the existing `protected` list and the
+    sibling in `deleted`.
+
+    Green ablation: deleting the pre-check in `cmd_clean` leaves this green,
+    because with nothing to trim the removal's refusal handler also files the
+    holder as protected. `test_cmd_clean_hard_skips_a_run_holding_unlanded_sweep_closes`
+    pins the pre-check."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+
+    doc = _clean_json(paths.project, capsys, "--hard", "--retain", "0")
+
+    assert doc["protected"] == [engine.run_dir.name]
+    assert doc["deleted"] == [plain.name]
+    assert engine.run_dir.is_dir() and not plain.exists()
+
+
+def test_cmd_clean_reports_a_held_closes_refusal_from_delete_run(
+    project_v7_store_repo, monkeypatch, capsys
+):
+    """A run that passed the pre-check can still be refused by `delete_run`, whose
+    under-lock check is authoritative. `clean` records it beside the other
+    mid-clean refusals and goes on, rather than aborting.
+
+    Ablation: drop `runs.HeldSweepClosesError` from the removal's except tuple and
+    this fails (the refusal escapes `cmd_clean`)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    real = runs.held_sweep_closes
+    calls: list[Path] = []
+
+    def held(project, run_dir):
+        calls.append(run_dir)
+        if run_dir == engine.run_dir and calls.count(run_dir) == 1:
+            return []  # the pre-check sees nothing held
+        return real(project, run_dir)
+
+    monkeypatch.setattr(runs, "held_sweep_closes", held)
+
+    assert cli.cmd_clean(_clean_args(paths.project, retain=0, hard=True)) == 0
+
+    err = capsys.readouterr().err
+    assert calls.count(engine.run_dir) == 2  # premise: pre-check, then delete_run
+    assert engine.run_dir.is_dir() and not plain.exists()
+    assert f"run {engine.run_dir.name}: holds sweep ledger closes" in err
+
+
+def test_cmd_clean_policy_delete_arm_skips_a_held_closes_run(project_v7_store_repo, capsys):
+    """Without `--hard`, `[cleanup] archive_old = false` also puts past-retention
+    runs on the delete arm, and the holder is skipped there the same way: left
+    whole and untrimmed, while its sibling is deleted.
+
+    Ablation: narrow the pre-check in `cmd_clean` to `args.hard` and this fails
+    (the holder is trimmed)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    policy = paths.project / ".bmad-loop" / "policy.toml"
+    policy.write_text("[cleanup]\narchive_old = false\n", encoding="utf-8")
+    heavy = engine.run_dir / VERIFY_DIR
+    heavy.mkdir()
+    (heavy / "verify.log").write_text("kept\n", encoding="utf-8")
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    assert cli.cmd_clean(_clean_args(paths.project, retain=0)) == 0
+
+    err = capsys.readouterr().err
+    assert not plain.exists()
+    assert not (paths.project / ".bmad-loop" / "archive").exists()  # premise: delete arm
+    assert engine.run_dir.is_dir() and heavy.is_dir()
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+    assert f"run {engine.run_dir.name}: holds sweep ledger closes" in err
+
+
+def test_cmd_clean_dry_run_plans_a_held_closes_run_as_protected(project_v7_store_repo, capsys):
+    """`--dry-run --hard --json` predicts the skip: the holder is in `protected`,
+    not in `deleted`, and nothing is removed.
+
+    Ablation: gate the pre-check in `cmd_clean` on `not dry` and this fails (the
+    plan lists the holder as deleted)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+
+    doc = _clean_json(paths.project, capsys, "--dry-run", "--hard", "--retain", "0")
+
+    assert engine.run_dir.name in doc["protected"]
+    assert engine.run_dir.name not in doc["deleted"]
+    assert doc["deleted"] == [plain.name]
+    assert engine.run_dir.is_dir() and plain.is_dir()

@@ -147,6 +147,13 @@ breaking changes may land in a minor release.
   fsynced before the replace. A run with no recorded run-dir identity, or one whose device
   number changed, records one `journal-unpinned` row per writer; `resume` records or
   re-binds the identity before its first row (DW-559).
+- Guard an isolated v7 sweep run that paused, stopped or crashed while holding shared-store
+  ledger closes for code that never landed: a new sweep warns and journals
+  `sweep-prior-run-holds-closes` (`sweep-prior-run-closes-unknown` when it cannot tell),
+  and `delete`, the TUI delete and `clean` refuse to remove that run, naming
+  `bmad-loop resume <run>`. They also refuse any run, of any type, whose state cannot be
+  read, and such a sweep run whose config or ledger cannot be read or whose pinned
+  initiative is no longer active; `delete --force` waives neither refusal (DW-571).
 
 ### Removed
 
