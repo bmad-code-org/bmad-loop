@@ -6,6 +6,7 @@ tickets.py (git only)."""
 from __future__ import annotations
 
 import dataclasses
+import os
 import tomllib
 from pathlib import Path
 
@@ -35,6 +36,54 @@ def test_probe_tracked_markers(project_v7):
     assert ticketstore.assess_store(paths, "worktree") == StoreTopology(
         "T1", "checkout", "code-repo", project_v7.output_folder.resolve()
     )
+
+
+def _tickets_layout_initiative(root: Path) -> Path:
+    """An initiative in the current upstream layout: its `tickets.toml` and epic
+    folder in its `tickets/` folder, the epic's `tickets.toml` in the epic's own
+    `tickets/` folder and its `epic-cart.md` at the epic folder's top."""
+    initiative = root / "init"
+    epic = initiative / "tickets" / "epic-cart"
+    (epic / "tickets").mkdir(parents=True)
+    (initiative / "init.md").write_text("---\ntitle: Init\n---\n", encoding="utf-8")
+    (initiative / "tickets" / "tickets.toml").write_text("[[epic]]\n", encoding="utf-8")
+    (epic / "epic-cart.md").write_text("---\nstatus: open\n---\n", encoding="utf-8")
+    (epic / "tickets" / "tickets.toml").write_text("[[entry]]\n", encoding="utf-8")
+    return initiative
+
+
+def test_markers_in_the_tickets_folder_layout(tmp_path):
+    """The T1 markers of a `tickets/`-layout tree are its real files: the
+    initiative's and the epic's `tickets.toml` in their `tickets/` folders, the
+    epic file at its folder's top. Ablation (performed): list the initiative
+    folder itself and only the absent flat `tickets.toml` is probed — this FAILS."""
+    initiative = _tickets_layout_initiative(tmp_path)
+    assert ticketstore._markers(initiative) == [
+        initiative / "tickets" / "tickets.toml",
+        initiative / "tickets" / "epic-cart" / "tickets" / "tickets.toml",
+        initiative / "tickets" / "epic-cart" / "epic-cart.md",
+    ]
+
+
+@pytest.mark.parametrize("container", ["", "tickets/epic-cart"], ids=["initiative", "epic"])
+def test_markers_refused_tickets_probe_raises(tmp_path, monkeypatch, container):
+    """A refused stat of a container's `tickets/` folder raises `verify.GitError`
+    (`probe-failed` upstream), never a flat read that would drop the tree's real
+    files from the tracking check. Ablation (performed): drop the `OSError` wrap
+    in `ticketstore._breakdown_dir` and a bare `PermissionError` escapes — this
+    FAILS."""
+    initiative = _tickets_layout_initiative(tmp_path)
+    target = (initiative / container if container else initiative) / "tickets"
+    real = os.stat
+
+    def refuse(path, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", refuse)
+    with pytest.raises(verify.GitError, match="Permission denied"):
+        ticketstore._markers(initiative)
 
 
 def test_probe_reads_nested_store_toplevel(project_v7_store_repo):

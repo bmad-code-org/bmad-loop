@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -2854,6 +2855,51 @@ def _write_retro_doc(layout: V7Layout, verdict: str, *, epic: str = "epic-cart")
     ]
     doc.write_bytes("\n".join(lines).encode("utf-8"))
     return doc
+
+
+def test_retro_doc_reads_the_tickets_folder_layout(project_v7):
+    """The retrospective sits at the top of the epic folder, which lives in the
+    initiative's `tickets/` folder once it has one (else beside the initiative
+    file), and `_read_retro_doc` reads it there. Ablation (performed): spell
+    `<initiative>/<slug>/` in `_retro_doc` and the flat path comes back — this
+    FAILS."""
+    engine, _ = make_engine(project_v7, _epic_tree(project_v7), policy=_retro_policy())
+    initiative = engine.paths.initiative_folder
+    assert initiative is not None
+    assert engine._retro_doc("epic-cart") == initiative / "epic-cart" / "epic-cart-retrospective.md"
+
+    epic = initiative / "tickets" / "epic-cart"
+    (epic / "tickets").mkdir(parents=True)
+    doc = epic / "epic-cart-retrospective.md"
+    doc.write_text("---\nepic: epic-cart\nverdict: accepted\n---\n", encoding="utf-8")
+    assert engine._retro_doc("epic-cart") == doc
+    errors, verdict, mtime_ns = engine._read_retro_doc("epic-cart")
+    assert (errors, verdict) == ([], "accepted") and mtime_ns >= 0
+
+
+def test_retro_doc_refused_layout_probe_is_an_error_not_a_crash(project_v7, monkeypatch):
+    """A layout probe that cannot stat the initiative's `tickets/` folder leaves
+    no document to verify: `_read_retro_doc` reports the fault as an error (the
+    retro fails and pauses visibly), and the dirty check reads it as dirty —
+    neither lets a bare `OSError` out of the epic boundary. Ablation (performed):
+    drop the `OSError` catch in `_read_retro_doc` and the probe fault escapes —
+    this FAILS."""
+    engine, _ = make_engine(project_v7, _epic_tree(project_v7), policy=_retro_policy())
+    initiative = engine.paths.initiative_folder
+    assert initiative is not None
+    target = initiative / "tickets"
+    real = os.stat
+
+    def refuse(path, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", refuse)
+    errors, verdict, mtime_ns = engine._read_retro_doc("epic-cart")
+    assert verdict == "" and mtime_ns == -1
+    assert len(errors) == 1 and "Permission denied" in errors[0]
+    assert engine._retro_doc_uncommitted("epic-cart")
 
 
 def _retro_writes(layout: V7Layout, verdict: str = "accepted", *, epic: str = "epic-cart"):

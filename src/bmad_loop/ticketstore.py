@@ -48,7 +48,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast, get_args
 
-from . import bmadconfig, platform_util, verify
+from . import bmadconfig, platform_util, ticketlayout, verify
 from .platform_util import atomic_write_bytes
 
 Layout = Literal["T1", "T2", "T3", "T4", "T6"]
@@ -103,8 +103,8 @@ class StoreCommitError(Exception):
 @dataclass(frozen=True)
 class StoreFacts:
     """What the probe saw. ``tracked`` pairs each tree marker that exists (the
-    initiative ``tickets.toml``, each epic's ``tickets.toml`` and ``epic-*.md``)
-    as a posix path relative to the code repo's toplevel with whether the code
+    initiative ``tickets.toml``, each epic's ``tickets.toml`` and ``epic-*.md``,
+    in whichever layout each container uses) as a posix path relative to the code repo's toplevel with whether the code
     repo tracks it;
     empty when the store is not in the code repo. ``ignored`` is whether the code
     repo ignores the initiative folder — or, for a store repository nested in the
@@ -461,19 +461,36 @@ def _has_mode(path: Path, kind: int) -> bool:
         raise verify.GitError(f"cannot stat {path}: {e}") from e
 
 
+def _breakdown_dir(container: Path) -> Path:
+    """:func:`ticketlayout.breakdown_dir`, a probe fault raised as
+    ``verify.GitError`` (never read as the flat layout), as :func:`_has_mode`
+    raises its stat faults."""
+    try:
+        return ticketlayout.breakdown_dir(container)
+    except OSError as e:
+        raise verify.GitError(f"cannot stat {container / ticketlayout.TICKETS}: {e}") from e
+
+
 def _markers(initiative: Path) -> list[Path]:
     """The tree files whose tracking decides T1: the initiative ``tickets.toml``
     and each epic folder's ``tickets.toml`` and ``epic-*.md``, those that exist.
+    Each container is read in its own layout (:func:`ticketlayout.breakdown_dir`):
+    a ``tickets.toml`` and the epic folders sit in its ``tickets/`` folder or
+    beside its file, and an epic's ``epic-*.md`` stays at its folder's top.
     Raises ``verify.GitError`` when the initiative cannot be listed or a candidate
     cannot be statted: an incomplete list could read a partly tracked tree as T1."""
-    found = [initiative / "tickets.toml"]
+    breakdown = _breakdown_dir(initiative)
+    found = [breakdown / ticketlayout.BREAKDOWN]
     try:
-        children = sorted(initiative.iterdir())
+        children = sorted(breakdown.iterdir())
     except OSError as e:
-        raise verify.GitError(f"cannot list the initiative folder {initiative}: {e}") from e
+        raise verify.GitError(f"cannot list the initiative folder {breakdown}: {e}") from e
     for child in children:
         if child.name.startswith("epic-") and _has_mode(child, stat.S_IFDIR):
-            found += [child / "tickets.toml", child / f"{child.name}.md"]
+            found += [
+                _breakdown_dir(child) / ticketlayout.BREAKDOWN,
+                child / f"{child.name}.md",
+            ]
     return [path for path in found if _has_mode(path, stat.S_IFREG)]
 
 

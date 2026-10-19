@@ -1107,8 +1107,9 @@ _tickets_cache: dict[tuple[Path, str, Path], tuple[object, TicketsBoard, float]]
 def _tickets_tree_sig(project: Path, folder: Path) -> object:
     """What a ``tickets.py status`` answer depends on, as one comparable value:
     the ``(path, mtime_ns, size)`` of ``tickets.toml`` and every ``*.md`` in the
-    initiative folder and its subfolders (two levels — epic folders hold their
-    leaves and plans flat), plus the config layers ``active_initiative`` is read
+    initiative folder and its subfolders (four levels, enough for either tree
+    layout: ``tickets/epic-x/tickets/*.md`` in the current one, ``epic-x/*.md`` in
+    the flat one), plus the config layers ``active_initiative`` is read
     from, the script itself and the ``config_utils.py`` it execs. Read with
     ``scandir``; a folder that cannot be listed or a file that cannot be stat'ed
     is part of the signature too."""
@@ -1121,7 +1122,7 @@ def _tickets_tree_sig(project: Path, folder: Path) -> object:
                 for entry in it:
                     try:
                         if entry.is_dir():
-                            if depth < 2:
+                            if depth < 4:
                                 pending.append((Path(entry.path), depth + 1))
                             continue
                         if entry.name != "tickets.toml" and not entry.name.endswith(".md"):

@@ -79,8 +79,10 @@ migration writes each story's old sprint key as ``v6_key`` into its
 written as a v6 story key can be resolved to its ticket only by reading the
 epics' ``tickets.toml`` directly. It reads the way the script does (``utf-8-sig``,
 the ``epic-*`` folders, the initiative's ``[[epic]]`` table for the epic ids, the
-script's id rule) and spawns nothing. Every fault — an unreadable or mistyped
-file — raises :class:`TicketsV6KeyUnreadable` (``kind`` ``probe-failed``), never
+script's id rule), in either tree layout — each container's breakdown in its
+``tickets/`` folder or flat beside its file, decided per container by
+:func:`ticketlayout.breakdown_dir` — and spawns nothing. Every fault — an
+unreadable or mistyped file, or a layout probe that cannot stat — raises :class:`TicketsV6KeyUnreadable` (``kind`` ``probe-failed``), never
 an empty answer that would read as "no ticket claims this token".
 """
 
@@ -100,7 +102,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Protocol, TypeVar, runtime_checkable
 
-from . import bmadconfig, childrun, deferredwork, frontmatter, platform_util, ticketmodel
+from . import (
+    bmadconfig,
+    childrun,
+    deferredwork,
+    frontmatter,
+    platform_util,
+    ticketlayout,
+    ticketmodel,
+)
 from .process_host import ProcessHostError
 from .statemachine import PlanTransitionRefused, PlanWriteReason, check_plan_transition
 from .ticketmodel import Capability, FindResult, NextView, StatusView
@@ -754,14 +764,25 @@ def _result(run: childrun.ChildRun, verb: str, *, json_out: bool) -> dict[str, o
 
 # ---------------------------------------------------------------- v6_key claims
 
-_BREAKDOWN = "tickets.toml"
+
+def _breakdown_dir(container: Path) -> Path:
+    """:func:`ticketlayout.breakdown_dir`, a probe fault raised as
+    :class:`TicketsV6KeyUnreadable` (never read as the flat layout)."""
+    try:
+        return ticketlayout.breakdown_dir(container)
+    except OSError as e:
+        raise TicketsV6KeyUnreadable(container / ticketlayout.TICKETS, str(e)) from e
 
 
-def _breakdown_rows(folder: Path, table: str) -> list[dict[str, object]] | None:
-    """``folder``'s ``tickets.toml`` ``[[table]]`` rows, or None when the file is
-    absent (a missing or non-regular file, as the script's ``is_file`` reads it).
-    Every other fault raises :class:`TicketsV6KeyUnreadable`."""
-    path = folder / _BREAKDOWN
+def _breakdown_file(container: Path) -> Path:
+    """``container``'s ``tickets.toml`` in whichever layout it uses."""
+    return _breakdown_dir(container) / ticketlayout.BREAKDOWN
+
+
+def _breakdown_rows(path: Path, table: str) -> list[dict[str, object]] | None:
+    """The ``tickets.toml`` at ``path``'s ``[[table]]`` rows, or None when the file
+    is absent (a missing or non-regular file, as the script's ``is_file`` reads
+    it). Every other fault raises :class:`TicketsV6KeyUnreadable`."""
     try:
         try:
             if not stat.S_ISREG(path.stat().st_mode):
@@ -802,19 +823,21 @@ def _tree_id(value: object) -> str | None:
 
 
 def _epic_folders(initiative: Path) -> list[Path]:
-    """The initiative's ``epic-*`` folders, sorted; [] when the initiative folder
-    is absent. A listing or probe fault raises :class:`TicketsV6KeyUnreadable`
-    (``Path.glob`` would swallow it and answer "no epics")."""
+    """The ``epic-*`` folders of the initiative's breakdown folder
+    (:func:`_breakdown_dir`), sorted; [] when the initiative folder is absent. A
+    listing or probe fault raises :class:`TicketsV6KeyUnreadable` (``Path.glob``
+    would swallow it and answer "no epics")."""
     folders: list[Path] = []
+    breakdown = _breakdown_dir(initiative)
     try:
-        with os.scandir(initiative) as listing:
+        with os.scandir(breakdown) as listing:
             for item in listing:
                 if fnmatch.fnmatch(item.name, "epic-*") and item.is_dir():
-                    folders.append(initiative / item.name)
+                    folders.append(breakdown / item.name)
     except (FileNotFoundError, NotADirectoryError):
         return []
     except (OSError, ValueError) as e:
-        raise TicketsV6KeyUnreadable(initiative, str(e)) from e
+        raise TicketsV6KeyUnreadable(breakdown, str(e)) from e
     return sorted(folders)
 
 
@@ -848,7 +871,10 @@ def read_v6_key_entries(initiative: Path | None) -> tuple[V6KeyClaim, ...]:
     ``ref`` is the entry's ``E.M`` (``f"{epic_id}.{entry_id}"``, both ids as the
     script compares them), with the epic id taken from the initiative's
     ``[[epic]]`` row whose ``slug`` is the folder name; None when the initiative
-    table lists no such epic, since that entry has no ``E.M`` ref. An entry with
+    table lists no such epic, since that entry has no ``E.M`` ref. Each container
+    is read in its own layout (:func:`ticketlayout.breakdown_dir`): the
+    initiative's ``tickets.toml`` and epic folders in its ``tickets/`` folder or
+    beside its file, and each epic's ``tickets.toml`` likewise. An entry with
     no ``v6_key`` claims nothing; a missing ``tickets.toml`` holds no entries; a
     None ``initiative`` yields ``()``.
 
@@ -856,7 +882,8 @@ def read_v6_key_entries(initiative: Path | None) -> tuple[V6KeyClaim, ...]:
     non-TOML file, ``[[entry]]``/``[[epic]]`` that are not tables, an id the
     script would refuse, an epic row without a string ``slug``, two epic rows with
     one id or one slug, two entries of one epic with one id, or a ``v6_key`` that
-    is not a string. Never spawns ``tickets.py``.
+    is not a string, or a layout probe that cannot stat. Never spawns
+    ``tickets.py``.
     """
     if initiative is None:
         return ()
@@ -864,8 +891,8 @@ def read_v6_key_entries(initiative: Path | None) -> tuple[V6KeyClaim, ...]:
     if not folders:
         return ()
     epic_ids: dict[str, str] = {}
-    where = initiative / _BREAKDOWN
-    for row in _breakdown_rows(initiative, "epic") or []:
+    where = _breakdown_file(initiative)
+    for row in _breakdown_rows(where, "epic") or []:
         epic_id, slug = _tree_id(row.get("id")), row.get("slug")
         if epic_id is None:
             raise TicketsV6KeyUnreadable(where, f"epic id {row.get('id')!r} is not an id")
@@ -878,9 +905,9 @@ def read_v6_key_entries(initiative: Path | None) -> tuple[V6KeyClaim, ...]:
         epic_ids[slug] = epic_id
     claims: list[V6KeyClaim] = []
     for folder in folders:
-        where = folder / _BREAKDOWN
+        where = _breakdown_file(folder)
         entry_ids: set[str] = set()
-        for row in _breakdown_rows(folder, "entry") or []:
+        for row in _breakdown_rows(where, "entry") or []:
             entry_id = _tree_id(row.get("id"))
             if entry_id is None:
                 raise TicketsV6KeyUnreadable(where, f"entry id {row.get('id')!r} is not an id")

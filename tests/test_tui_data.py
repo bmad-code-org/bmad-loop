@@ -1412,6 +1412,28 @@ def test_tickets_overview_stat_gated(tmp_path, monkeypatch):
     assert len(tree.calls) == 3
 
 
+def test_tickets_overview_rereads_a_plan_in_the_tickets_folder_layout(tmp_path, monkeypatch):
+    """In the current upstream layout a plan sits four levels below the
+    initiative (`tickets/epic-x/tickets/*-plan.md`); editing it re-reads the
+    board. Ablation (performed): cap the signature walk at two levels and the
+    cached board is served — this FAILS."""
+    tree = _fake_board_tree(monkeypatch, tmp_path)
+    folder = tmp_path / "_bmad-output" / "init-a"
+    plan = folder / "tickets" / "epic-cart" / "tickets" / "story-cart-model-plan.md"
+    _write_plan(plan, "ready-for-dev")
+    state = _tickets_state(tmp_path)
+
+    first = data.tickets_overview(tmp_path, state)
+    assert data.tickets_overview(tmp_path, state) is first
+    assert len(tree.calls) == 1
+
+    _write_plan(plan, "in-progress")
+    later = plan.stat().st_mtime_ns + 1_000_000_000
+    os.utime(plan, ns=(later, later))
+    data.tickets_overview(tmp_path, state)
+    assert len(tree.calls) == 2
+
+
 def test_tickets_overview_rereads_when_config_utils_changes(tmp_path, monkeypatch):
     """`tickets.py` execs the project's `config_utils.py` to resolve the store and
     initiative, so an upgraded helper re-reads a cached board.

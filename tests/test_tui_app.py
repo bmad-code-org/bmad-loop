@@ -5357,6 +5357,22 @@ def test_epic_closure_summary_follows_a_moved_project(project_tree):
     assert f"retrospective: {retro}" in app._epic_closure_summary(state)
 
 
+def test_epic_closure_summary_names_the_tickets_folder_layout(project_tree):
+    """An initiative in the current upstream layout keeps its epic folders in its
+    `tickets/` folder, so the viewer names the retrospective there, beside the
+    epic file, where the run reads it. Ablation (performed): spell
+    `<initiative>/<slug>/` again and the flat path is shown — this FAILS."""
+    run_dir, _plan = _tickets_paused_run(
+        project_tree.project, stage="epic-boundary", key="epic-cart"
+    )
+    state = load_state(run_dir)
+    epic = project_tree.project / "_bmad-output" / "init-a" / "tickets" / "epic-cart"
+    (epic / "tickets").mkdir(parents=True)
+    app = BmadLoopApp(project_tree.project)
+    retro = epic / "epic-cart-retrospective.md"
+    assert f"retrospective: {retro}" in app._epic_closure_summary(state)
+
+
 async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatch):
     """R13: "Request replan" on a tickets run re-opens the plan to `draft` only
     through `TicketTree.mark(reason="replan")` — pinned to the run's initiative, on

@@ -1183,6 +1183,83 @@ def test_v6_key_claims_read_zero_padded_ids_as_numbers(tmp_path: Path):
     assert read_v6_key_claims(layout.initiative_folder) == (("6-6-pad", "6.6"),)
 
 
+def _tickets_layout_tree(tmp_path: Path) -> Path:
+    """`V6_TREE` hand-written in the current upstream layout: the initiative's
+    `tickets.toml` and epic folders in its `tickets/` folder, each epic's
+    `tickets.toml` in the epic's own `tickets/` folder beside nothing but its
+    `<slug>.md` — plus one epic left flat inside it, as the layout is decided per
+    container."""
+    layout = v7_layout(tmp_path / "sandbox")
+    breakdown = layout.initiative_folder / "tickets"
+    breakdown.mkdir(parents=True)
+    (layout.initiative_folder / f"{layout.initiative}.md").write_text(
+        "---\ntitle: Demo\n---\n", encoding="utf-8"
+    )
+    (breakdown / "tickets.toml").write_text(
+        '[[epic]]\nid = 1\nslug = "epic-cart"\n\n[[epic]]\nid = 2\nslug = "epic-checkout"\n',
+        encoding="utf-8",
+    )
+    for slug, entries in (
+        ("epic-cart", '[[entry]]\nid = 1\nv6_key = "3-2-invite-link"\n\n[[entry]]\nid = 2\n'),
+        ("epic-checkout", '[[entry]]\nid = 1\nv6_key = "4-1-pay"\n'),
+    ):
+        (breakdown / slug / "tickets").mkdir(parents=True)
+        (breakdown / slug / f"{slug}.md").write_text("---\nstatus: open\n---\n", encoding="utf-8")
+        (breakdown / slug / "tickets" / "tickets.toml").write_text(entries, encoding="utf-8")
+    flat = breakdown / "epic-orphan"
+    flat.mkdir()
+    (flat / "tickets.toml").write_text('[[entry]]\nid = "06"\nv6_key = "5-1-x"\n', encoding="utf-8")
+    return layout.initiative_folder
+
+
+def test_v6_key_claims_read_from_the_tickets_folder_layout(tmp_path: Path):
+    """A tree in the `tickets/` layout claims what the flat tree claims: the
+    initiative's epic table and folders are read in its `tickets/` folder, each
+    epic's entries in its own (or beside its file, for an epic still flat).
+    Ablation (performed): read the initiative folder itself in `_epic_folders`
+    and no epic is found — this FAILS."""
+    initiative = _tickets_layout_tree(tmp_path)
+    assert read_v6_key_claims(initiative) == (
+        ("3-2-invite-link", "1.1"),
+        ("4-1-pay", "2.1"),
+        ("5-1-x", None),
+    )
+
+
+def test_v6_key_claims_name_the_tickets_folder_file_in_a_fault(tmp_path: Path):
+    """A fault in a `tickets/`-layout file names that file, not the flat path."""
+    initiative = _tickets_layout_tree(tmp_path)
+    target = initiative / "tickets" / "epic-checkout" / "tickets" / "tickets.toml"
+    target.write_text("entry = 3\n", encoding="utf-8")
+    with pytest.raises(TicketsV6KeyUnreadable) as raised:
+        read_v6_key_claims(initiative)
+    assert raised.value.path == target
+
+
+@pytest.mark.parametrize("container", ["", "tickets/epic-cart"], ids=["initiative", "epic"])
+def test_v6_key_claims_fail_loud_on_a_refused_tickets_probe(
+    tmp_path: Path, monkeypatch, container: str
+):
+    """A refused stat of a container's `tickets/` folder raises
+    `TicketsV6KeyUnreadable` naming it; it is never read as the flat layout,
+    which would answer "no epics" or "no entries". Ablation (performed): drop the
+    `OSError` wrap in `_breakdown_dir` and a bare `PermissionError` escapes —
+    this FAILS."""
+    initiative = _tickets_layout_tree(tmp_path)
+    target = (initiative / container if container else initiative) / "tickets"
+    real = os.stat
+
+    def refuse(path, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", refuse)
+    with pytest.raises(TicketsV6KeyUnreadable, match="Permission denied") as raised:
+        read_v6_key_claims(initiative)
+    assert raised.value.path == target and raised.value.kind == "probe-failed"
+
+
 def test_v6_key_claims_read_bare_cr_line_endings(tmp_path: Path):
     """A ticket file with bare-CR line endings reads as the script's universal
     newlines read it, not as a TOML fault."""
