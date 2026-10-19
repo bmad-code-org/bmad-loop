@@ -1085,8 +1085,9 @@ class BmadLoopApp(App[None]):
         layout). The recorded folder is rebased onto the live project
         (`runs.rebase_recorded_project_path`), so a moved project names the
         retrospective the run will read. Only the layout probe stats a directory;
-        no file is read. A probe fault names the flat path, as the summary is
-        advisory and never fails the viewer."""
+        no file is read. A probe fault is shown with the fault and the flat-layout
+        path as a guess, never as the located document: the summary is advisory
+        and never fails the viewer."""
         slug = state.paused_story_key or ""
         verdict = state.ticket_epic_closures.get(slug) if slug else None
         lines = [
@@ -1102,9 +1103,15 @@ class BmadLoopApp(App[None]):
             )
             try:
                 retro = ticketlayout.retrospective_doc(folder, slug)
-            except OSError:
-                retro = folder / slug / f"{slug}-retrospective.md"
-            lines.append(f"retrospective: {retro}")
+            except OSError as exc:
+                flat = folder / slug / f"{slug}-retrospective.md"
+                lines.append(
+                    f"retrospective: location unknown — layout probe of "
+                    f"{folder / ticketlayout.TICKETS} failed ({exc}); "
+                    f"flat-layout guess: {flat}"
+                )
+            else:
+                lines.append(f"retrospective: {retro}")
         return "\n".join(lines)
 
     @staticmethod

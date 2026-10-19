@@ -52,7 +52,7 @@ from textual.widgets import (
 from bmad_loop import bmadconfig, documents, platform_util
 from bmad_loop import policy as policy_mod
 from bmad_loop import runs as runs_mod
-from bmad_loop import verify
+from bmad_loop import ticketlayout, verify
 from bmad_loop.adapters.multiplexer import MultiplexerError, TerminalMultiplexer
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, load_state, save_state
 from bmad_loop.model import (
@@ -5371,6 +5371,35 @@ def test_epic_closure_summary_names_the_tickets_folder_layout(project_tree):
     app = BmadLoopApp(project_tree.project)
     retro = epic / "epic-cart-retrospective.md"
     assert f"retrospective: {retro}" in app._epic_closure_summary(state)
+
+
+def test_epic_closure_summary_surfaces_a_layout_probe_fault(project_tree, monkeypatch):
+    """A `tickets/` stat fault (EACCES, EIO) is not "flat layout": the viewer says
+    the location is unknown, names the fault, and offers the flat path only as a
+    guess. Ablation (performed): fall back to the flat path as the located
+    document again and this FAILS."""
+    run_dir, _plan = _tickets_paused_run(
+        project_tree.project, stage="epic-boundary", key="epic-cart"
+    )
+    state = load_state(run_dir)
+
+    def _denied(_initiative, _slug):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(ticketlayout, "retrospective_doc", _denied)
+    app = BmadLoopApp(project_tree.project)
+    flat = (
+        project_tree.project
+        / "_bmad-output"
+        / "init-a"
+        / "epic-cart"
+        / "epic-cart-retrospective.md"
+    )
+    summary = app._epic_closure_summary(state)
+    assert "retrospective: location unknown" in summary
+    assert "Permission denied" in summary
+    assert f"flat-layout guess: {flat}" in summary
+    assert f"retrospective: {flat}" not in summary
 
 
 async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatch):
