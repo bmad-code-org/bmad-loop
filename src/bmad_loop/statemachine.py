@@ -108,7 +108,7 @@ def check_board_regression(story_key: str, current: str, target: str) -> None:
 # rollback and replan keep working in tickets mode. `salvage` is the one other
 # forward write: a timed-out review's verified work lands at `built`, never
 # `done`. `done` and `dropped` are final, and bmad-loop never writes `dropped`
-# (bmad-ticket owns it).
+# (bmad-agent-po owns it).
 
 # The lifecycle order of a plan `status`; "" is a row with no plan. `blocked` and
 # `dropped` sit outside it (`ticketmodel.PLAN_STATUSES` adds them).

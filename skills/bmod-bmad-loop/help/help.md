@@ -11,7 +11,7 @@ BMAD Loop runs BMAD implementation work unattended. Its orchestrator, the `bmad-
 - `uv`, `git`, and a terminal multiplexer (tmux; psmux on native Windows).
 - A supported coding CLI: claude, codex, gemini, copilot, antigravity or opencode.
 - The upstream `bmad-build-auto` skill, which every dev and review session invokes.
-- On BMAD v7, a ticket tree from `bmad-ticket` with an active initiative. On BMAD v6, a `sprint-status.yaml` from `bmad-sprint-planning`.
+- On BMAD v7, a ticket tree from `bmad-agent-po` (Sofia, the Product Owner) with an active initiative. On BMAD v6, a `sprint-status.yaml` from `bmad-sprint-planning`.
 
 ## The skills
 

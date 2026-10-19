@@ -2799,7 +2799,7 @@ def test_rollback_restores_plan_preimage_through_chokepoint(project_v7, monkeypa
 #
 # A finished epic this run committed a ticket of gets its retrospective (under
 # `gates.retrospective = "auto"`), its closure recorded and a pause for a person to
-# close it with bmad-ticket. The fake's `status` view is the epic table: each test
+# close it with bmad-agent-po. The fake's `status` view is the epic table: each test
 # lists the epics and moves the built ticket to `built` there, as tickets.py
 # derives it.
 
@@ -2851,7 +2851,7 @@ def _epic_tree(
 
 
 def _close_epic(tree: FakeTicketTree, slug: str, status: str = "done") -> None:
-    """A person closes the epic with bmad-ticket: its file's status in `status`."""
+    """A person closes the epic with bmad-agent-po: its file's status in `status`."""
     epics = tuple(
         dataclasses.replace(e, status=status) if e.slug == slug else e
         for e in tree.status_view.epics
@@ -2972,7 +2972,7 @@ def test_ticket_retro_happy_path_commits_doc_only(project_v7):
     """The run's last ticket finishes epic-cart: under `auto` one retro session
     runs `/bmad-retrospective -H epic-cart`, its document lands alone in a
     `chore(retro)` commit, the verdict is recorded as the epic's closure, and the
-    run pauses at `epic-boundary` naming bmad-ticket. The `retro-auto-*` rows
+    run pauses at `epic-boundary` naming bmad-agent-po. The `retro-auto-*` rows
     keep `epic` 0 and carry the slug in `epic_ref`. Ablation (performed): drop
     the `_settle_retro_tree` call in `_ticket_epic_retro` and the document is
     left uncommitted — this FAILS."""
@@ -2989,7 +2989,7 @@ def test_ticket_retro_happy_path_commits_doc_only(project_v7):
 
     state = load_state(engine.run_dir)
     assert (state.paused_stage, state.paused_story_key) == (PAUSE_EPIC_BOUNDARY, "epic-cart")
-    assert "close epic-cart with bmad-ticket" in (state.paused_reason or "")
+    assert "close epic-cart with bmad-agent-po" in (state.paused_reason or "")
     assert state.ticket_epic_closures == {"epic-cart": "accepted"}
     assert state.tasks["1.1"].phase == Phase.DONE and "epic-cart-retrospective" not in state.tasks
     retro = adapter.sessions[1]
@@ -3020,7 +3020,7 @@ def test_ticket_retro_happy_path_commits_doc_only(project_v7):
 def test_ticket_retro_verdict_rejected_hard_gates_until_epic_done(project_v7):
     """A `rejected` verdict pauses again on every later pick while epic-cart stays
     open — with nothing else queued, and with epic-checkout's 2.1 ready — and
-    only closing the epic (bmad-ticket sets its file to `done`) lets 2.1 start.
+    only closing the epic (bmad-agent-po sets its file to `done`) lets 2.1 start.
     Ablation (performed): drop the `BOUNDARY_REJECTED` arm in
     `tickets_source.epic_boundary` and the first resumed run finishes instead of
     pausing — this FAILS; drop the closure record

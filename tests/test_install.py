@@ -12118,6 +12118,7 @@ def test_tickets_preflight_initiative_missing(project_v7, monkeypatch):
     (problem,) = [f for f in findings if f.severity == "problem"]
     assert problem.check == "tickets.initiative-missing"
     assert problem.detail["initiative"] == project_v7.initiative
+    assert "create it with the `bmad-agent-po` skill" in problem.message
 
 
 _PARENT_BREAKDOWN = """\

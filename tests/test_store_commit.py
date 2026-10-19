@@ -346,7 +346,7 @@ def test_retro_doc_committed_in_store_repo(project_v7_store_repo, monkeypatch):
 
     state = load_state(engine.run_dir)
     assert state.paused_stage == PAUSE_EPIC_BOUNDARY
-    assert "close epic-cart with bmad-ticket" in (state.paused_reason or "")
+    assert "close epic-cart with bmad-agent-po" in (state.paused_reason or "")
     assert _subjects(store)[:2] == [
         "chore(retro): epic-cart retrospective [bmad-loop test-run]",
         "chore(tickets): 1.1 done [bmad-loop test-run]",
@@ -425,7 +425,7 @@ def test_retro_store_commit_failure_pauses_and_resume_commits(
 
     state = load_state(engine.run_dir)
     assert state.paused_stage == PAUSE_EPIC_BOUNDARY
-    assert "close epic-cart with bmad-ticket" in (state.paused_reason or "")
+    assert "close epic-cart with bmad-agent-po" in (state.paused_reason or "")
     assert state.ticket_epic_closures == {"epic-cart": "accepted"}
     assert _subjects(store)[0] == "chore(retro): epic-cart retrospective [bmad-loop test-run]"
     assert _head_files(store) == [doc.relative_to(store).as_posix()]

@@ -54,7 +54,7 @@ from .statemachine import PLAN_BLOCKED, PLAN_DROPPED, PLAN_STATUS_ORDER, PLAN_TR
 
 # Every plan `status` upstream accepts (`tickets.py` STATUSES). The builds write
 # draft..built, build-auto writes blocked, an orchestrator writes done, and
-# bmad-ticket writes dropped. A row with no plan reads "".
+# bmad-agent-po writes dropped. A row with no plan reads "".
 # The lifecycle order is `statemachine.PLAN_STATUS_ORDER`, beside the plan
 # transition table; `blocked` and `dropped` sit outside it.
 PLAN_STATUSES: Final[tuple[str, ...]] = (

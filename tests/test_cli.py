@@ -14623,7 +14623,7 @@ def test_resume_records_an_answered_epic_closure_pause(project, capsys, monkeypa
         "20990101-000000-f00e",
         source="tickets",
         initiative=V7_DEFAULT_INITIATIVE,
-        paused_reason="close epic-cart with bmad-ticket",
+        paused_reason="close epic-cart with bmad-agent-po",
         paused_stage="epic-boundary",
         paused_story_key="epic-cart",
         ticket_epic_closures={"epic-cart": "accepted"},

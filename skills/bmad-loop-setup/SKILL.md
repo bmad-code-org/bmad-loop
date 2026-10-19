@@ -29,7 +29,7 @@ Module identity (name, code, version) comes from `./assets/module.yaml`.
 
 1. Read `./assets/module.yaml` for module metadata (the `code` field is the module identifier).
 2. Check whether `{project-root}/_bmad/` exists. If it does not, this project has no BMAD install — say so, and note that the automation skills expect one. Setup can still install the orchestrator tool.
-3. Check whether `{project-root}/_bmad/bmad-loop/` exists. If it does, the module was installed by the BMAD installer and is already registered. If it does not, tell the user the module is not registered with BMAD, and that installing it via `npx bmad-method install` (selecting **bmad-loop**) adds it to `/bmad-help`. Do **not** gate setup on this — continue either way.
+3. Check whether `{project-root}/_bmad/bmad-loop/` exists. If it does, the module was installed by the BMAD installer and is already registered. If it does not, tell the user the module is not registered with BMAD, and that installing it via `npx bmad-method install` (selecting **bmad-loop**) adds it to `/bmad-help`. Do **not** gate setup on this — continue either way. On BMAD v7 the module installs with `bmad setup bmad-loop` instead (see bmad-loop's docs/setup-guide.md, "Installing on BMAD v7"), not the v6 installer.
 
 **Decide fresh-install vs upgrade.** This drives whether the tool is upgraded and whether the per-project skills are refreshed. Treat it as an **upgrade** when either holds:
 

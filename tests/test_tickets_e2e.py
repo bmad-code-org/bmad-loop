@@ -407,7 +407,7 @@ def _journal(root: Path, kind: str) -> list[dict]:
 
 def _assert_ended_at_epic_boundary(doc: dict) -> None:
     """The end of every row that finishes the epic: a closure pause for the person
-    who closes the epic with bmad-ticket (bmad-loop never writes the epic file)."""
+    who closes the epic with bmad-agent-po (bmad-loop never writes the epic file)."""
     assert doc["status"] == "paused", doc
     assert doc["paused_stage"] == "epic-boundary", doc
     assert doc["tickets"]["epic_closures"] == {EPIC: "unknown"}, doc["tickets"]
@@ -644,7 +644,7 @@ def _commit_marker(root: Path, name: str, text: str) -> None:
 
 
 def _close_epic(layout: V7Layout, topology: str, slug: str) -> None:
-    """What a person closing the epic with bmad-ticket leaves: `status: done` in the
+    """What a person closing the epic with bmad-agent-po leaves: `status: done` in the
     epic file, committed in the repository that versions the tree."""
     epic_file = _epic_dir(layout, slug) / f"{slug}.md"
     epic_file.write_text(

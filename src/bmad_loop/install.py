@@ -983,8 +983,9 @@ def tickets_preflight(
                         "tickets.initiative-missing",
                         "problem",
                         f"active initiative {paths.active_initiative!r} has no folder at "
-                        f"{paths.initiative_folder} — create it with the `bmad-ticket` "
-                        "skill, or switch `[core] active_initiative`",
+                        f"{paths.initiative_folder} — create it with the `bmad-agent-po` "
+                        "skill, or switch `[core] active_initiative` (the `bmad` skill "
+                        "can switch it)",
                         {
                             "initiative": paths.active_initiative,
                             "path": str(paths.initiative_folder),

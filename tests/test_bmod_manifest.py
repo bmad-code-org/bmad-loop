@@ -181,6 +181,16 @@ def test_bmod_manifests_parse_under_upstream_rules():
         assert "scripts" not in skill, f"{folder} declares scripts it does not ship"
 
 
+def test_recommended_skills_name_the_product_owner_agent():
+    """Upstream retired `bmad-ticket` as renamed to `bmad-agent-po` (Sofia), who
+    writes the v7 ticket tree tickets mode drives, so the record recommends her."""
+    bmod = _load(RECORD)["bmod"]
+    assert isinstance(bmod, dict)
+    recommended = [req["skill"] for req in bmod["recommended_skills"]]
+    assert "bmad-agent-po" in recommended
+    assert "bmad-ticket" not in recommended
+
+
 def test_record_skill_md_never_invoked():
     """The record's SKILL.md names the folder and says it is metadata, never a skill."""
     text = (SKILLS / RECORD / "SKILL.md").read_text(encoding="utf-8")

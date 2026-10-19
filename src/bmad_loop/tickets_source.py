@@ -106,7 +106,7 @@ HALT_AWAITING_CLOSURE: Final = "awaiting-closure"
 HALT_EPIC_CLOSURE: Final = "epic-closure"
 """Raised by the engine, not :func:`decide_pick`: an epic this run finished has
 its closure recorded (a retrospective verdict) and waits for a person to close it
-with bmad-ticket (``TicketsEngine._ticket_epic_boundary_check``)."""
+with bmad-agent-po (``TicketsEngine._ticket_epic_boundary_check``)."""
 HALT_EPIC_REJECTED: Final = "epic-rejected"
 HALT_BLOCKED_PLAN: Final = "blocked-plan"
 HALT_FOREIGN_ACTIVE: Final = "foreign-active"
@@ -438,7 +438,7 @@ def _ordered(rows: Sequence[TicketRow], rank: Mapping[str, int]) -> list[TicketR
 
 def _awaiting_closure(status_view: StatusView) -> list[str]:
     """Open epics with tickets, every one done or dropped, in build order: the
-    human closes them (bmad-ticket), never bmad-loop."""
+    human closes them (bmad-agent-po), never bmad-loop."""
     out: list[str] = []
     for epic in status_view.epics:
         if epic.status in EPIC_CLOSED:

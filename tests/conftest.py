@@ -1883,7 +1883,7 @@ def install_bmad_v7(
         'code = "method"\n'
         f"version = {json.dumps(bmod_version)}\n"
         'update_source = "github:bmad-code-org/BMAD-METHOD/skills"\n'
-        'skills = ["bmad-build-auto", "bmad-ticket"]\n',
+        'skills = ["bmad-build-auto", "bmad-agent-po"]\n',
         encoding="utf-8",
     )
     layout.initiative_folder.mkdir(parents=True, exist_ok=True)

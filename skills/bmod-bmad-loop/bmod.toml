@@ -8,7 +8,7 @@ required_skills = [
   { skill = "bmad-build-auto", version = "6.13.0", source = "github:bmad-code-org/BMAD-METHOD/skills" },
 ]
 recommended_skills = [
-  { skill = "bmad-ticket", source = "github:bmad-code-org/BMAD-METHOD/skills" },
+  { skill = "bmad-agent-po", source = "github:bmad-code-org/BMAD-METHOD/skills" },
   { skill = "bmad-retrospective", source = "github:bmad-code-org/BMAD-METHOD/skills" },
 ]
 pre_install_message = ""

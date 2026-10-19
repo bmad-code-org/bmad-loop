@@ -77,7 +77,7 @@ whose tickets are all ``built``/``done``/``dropped`` and of which this run
 committed one gets its retrospective (``gates.retrospective = "auto"``:
 ``/bmad-retrospective -H <slug>``, verified on disk and committed alone), its
 closure recorded in ``RunState.ticket_epic_closures`` and a pause at
-``epic-boundary`` for a person to close it with bmad-ticket — bmad-loop never
+``epic-boundary`` for a person to close it with bmad-agent-po — bmad-loop never
 writes the epic file. A ``rejected`` verdict pauses every later pick while the
 epic stays open; any other pauses once. A ``--story`` run admits no epic, so it
 finishes past the epic its ticket finished.
@@ -594,7 +594,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
           recorded: run the retrospective gate (:meth:`_ticket_epic_retro`),
           record its verdict in ``state.ticket_epic_closures``, journal
           ``ticket-epic-closure`` and pause at ``epic-boundary`` for a person to
-          close the epic with bmad-ticket;
+          close the epic with bmad-agent-po;
         * a recorded ``rejected`` verdict on an epic still open and finished:
           pause again — closing the epic is the human override;
         * any other recorded verdict the operator resumed past: acknowledge it
@@ -632,7 +632,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                         step.slug,
                         None,
                         f"{step.slug}'s retrospective verdict is rejected; close {step.slug} "
-                        f"with bmad-ticket before the run goes on",
+                        f"with bmad-agent-po before the run goes on",
                     )
                 )
 
@@ -653,7 +653,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         self.journal.append("epic-closure-not-recorded", epic_ref=step.slug, verdict=step.verdict)
 
     def _pause_epic_closure(self, slug: str, verdict: str) -> NoReturn:
-        detail = f"close {slug} with bmad-ticket (closure check; retrospective verdict: {verdict})"
+        detail = (
+            f"close {slug} with bmad-agent-po (closure check; retrospective verdict: {verdict})"
+        )
         if verdict == CLOSURE_REJECTED:
             detail += f"; the rejected verdict holds the run until {slug} is closed"
         self._pause_ticket_pick(Halt(HALT_EPIC_CLOSURE, slug, None, detail))
@@ -917,9 +919,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         raise RunPaused(reason, halt.stage, halt.key)
 
     def _pause_ticket_refine(self, halt: Halt) -> NoReturn:
-        """The next ticket needs refining (bmad-ticket) before a build can start."""
+        """The next ticket needs refining (bmad-agent-po) before a build can start."""
         self.journal.append("ticket-refine-pause", ref=halt.key)
-        reason = f"{halt.detail} — refine it with bmad-ticket, then {self._resume_hint()}"
+        reason = f"{halt.detail} — refine it with bmad-agent-po, then {self._resume_hint()}"
         gates.notify(self.policy, self.run_dir, f"ticket needs refining: {halt.key}", reason)
         raise RunPaused(reason, halt.stage, halt.key)
 

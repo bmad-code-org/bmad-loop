@@ -5247,7 +5247,7 @@ async def test_tickets_mode_run_shows_tickets_board(project_tree, monkeypatch):
         (
             "ticket-refine",
             "1.3",
-            "1.3 needs refining (a bug) — refine it with bmad-ticket, then resume",
+            "1.3 needs refining (a bug) — refine it with bmad-agent-po, then resume",
             "ticket needs refining",
         ),
         (
@@ -5309,7 +5309,7 @@ async def test_epic_closure_viewer_shows_verdict(project_tree, monkeypatch):
         project_tree.project,
         stage="epic-boundary",
         key="epic-cart",
-        reason="close epic-cart with bmad-ticket (closure check; retrospective verdict: "
+        reason="close epic-cart with bmad-agent-po (closure check; retrospective verdict: "
         "rejected) — then resume",
         closures={"epic-cart": "rejected"},
     )
@@ -5331,7 +5331,7 @@ async def test_epic_closure_viewer_shows_verdict(project_tree, monkeypatch):
         assert "retrospective verdict: rejected" in body
         # the render wraps a long path; compare with whitespace dropped
         assert f"retrospective:{retro}" in "".join(body.split())
-        assert "close epic-cart with bmad-ticket" in body
+        assert "close epic-cart with bmad-agent-po" in body
 
 
 def test_epic_closure_summary_follows_a_moved_project(project_tree):
