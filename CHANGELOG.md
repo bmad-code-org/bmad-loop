@@ -332,6 +332,11 @@ breaking changes may land in a minor release.
   `BMAD_LOOP_*` environment, not a shared app-server daemon's; require Codex >= 0.156.
   A Codex run paused across the upgrade prints the config-changed advisory once on
   resume (#901).
+- Keep a deferred finding's severity when the dev session qualifies it: `high (unverified)`
+  files `severity: high` and keeps the declared text in `reason:`. An unrecognized
+  severity (`P1`) files the entry without the line and journals
+  `spec-deferrals-severity-unrecognized` instead of dropping it silently; a collection
+  or NUL severity marks the item malformed (#913).
 
 ### Security
 

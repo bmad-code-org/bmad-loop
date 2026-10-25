@@ -520,6 +520,11 @@ for _routing_table in JOURNAL_KIND_ROUTING_TABLES:
 # which would also wave through a branch-carrying ``target`` on a kind nobody has
 # looked at — exactly the hole the flattening left.
 JOURNAL_KIND_BENIGN_FIELDS = {
+    # `items` is the parser's own malformed-item notes on one harvest kind and the
+    # stale DW ids on the other; on `spec-deferrals-severity-unrecognized` it carries
+    # the dev session's summary text and is reduced to a count (#913).
+    "spec-deferrals-malformed": frozenset({"items"}),
+    "spec-deferral-sighting-stale": frozenset({"items"}),
     "board-advance-carried": frozenset({"target"}),
     "board-advance-carry-failed": frozenset({"target"}),
     "board-advance-carry-foreign-dirt": frozenset({"target"}),
@@ -797,7 +802,6 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `verify-command-result` (DW-353): a bare `True`, present only on a pass a
         # hard stop request cut short. No identifier.
         "interrupted",
-        "items",
         "kept",
         "key",
         # `sweep-decision-option-mismatch`'s label clause, as a BARE BOOLEAN. The
@@ -979,6 +983,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "sentinel_kind",
         "session_status",
         "session_vanished",
+        # `spec-deferrals-harvested` (#913): how many filed findings carried a
+        # severity the alias table does not know — a count, never the text.
+        "severity_unrecognized",
         "signum",
         # `session-idle` (#680): the wall timestamp the idle stretch began — the
         # `ts`-shaped float the TUI ages the `· idle <age>` text from.
@@ -1591,6 +1598,7 @@ JOURNAL_KINDS = frozenset(
         "spec-deferral-sighting-stale",
         "spec-deferrals-harvested",
         "spec-deferrals-malformed",
+        "spec-deferrals-severity-unrecognized",
         "spec-deferrals-skipped-out-of-tree",
         "spec-marker-repair-failed",
         "spec-marker-repair-skipped",

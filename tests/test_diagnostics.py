@@ -1242,6 +1242,24 @@ def test_auto_retro_path_lists_reduce_to_counts(kind, field, values):
     assert all(value not in json.dumps(scrubbed) for value in values)
 
 
+def test_unrecognized_severity_items_reduce_to_a_count():
+    """#913: the harvest's unrecognized-severity items carry the dev session's own
+    summary and severity text, so a dump ships their count, never the text.
+
+    Ablation: drop the kind's row from `_JOURNAL_KIND_COUNTLIST_FIELDS` and the
+    one-word values ride `scrub_json` into the dump."""
+    items = [{"summary": "AcmeVault", "declared": "AcmePriority"}]
+    scrubbed = diagnostics._scrub_entry(
+        {"kind": "spec-deferrals-severity-unrecognized", "items": items},
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+
+    assert scrubbed == {"kind": "spec-deferrals-severity-unrecognized", "items_count": 1}
+    assert "Acme" not in json.dumps(scrubbed)
+
+
 @pytest.mark.parametrize("verdict", ["accepted", "accepted-with-open-items", "rejected", "unknown"])
 def test_auto_retro_verdict_ships_as_its_closed_token(verdict):
     """DW-487: `retro-auto-finished`'s `verdict` is a closed token the engine
