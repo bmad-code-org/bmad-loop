@@ -6,6 +6,9 @@ the one real-zone test skips when the zone is absent."""
 
 from __future__ import annotations
 
+import os
+import time
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -203,3 +206,61 @@ def test_real_zone_database_when_present() -> None:
         pytest.skip("no tzdata for Europe/Warsaw on this host")
     at = _at("resets 6pm (Europe/Warsaw)", datetime(2026, 10, 25, 10, 0, tzinfo=UTC))
     assert at.astimezone(UTC) == datetime(2026, 10, 25, 17, 0, tzinfo=UTC)
+
+
+# --- a naive now resolves through the host zone's DST rules -----------------
+
+# Central European rules as a POSIX TZ string (no tzdata needed): +01 in winter,
+# +02 from the last Sunday of March 02:00 to the last Sunday of October 03:00.
+_CET = "CET-1CEST,M3.5.0,M10.5.0/3"
+
+
+@pytest.fixture
+def host_zone() -> Iterator[Callable[[str], None]]:
+    """Point the process's local zone at a TZ string, restored afterwards."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is POSIX-only")
+    saved = os.environ.get("TZ")
+
+    def set_zone(tz: str) -> None:
+        os.environ["TZ"] = tz
+        time.tzset()
+
+    yield set_zone
+    if saved is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = saved
+    time.tzset()
+
+
+def test_naive_now_crosses_spring_forward(host_zone: Callable[[str], None]) -> None:
+    """00:30 on the night summer time starts: 6am is 06:00+02, 4.5 hours away —
+    not 06:00+01 (today's offset), which would read 5.5 and trip the cap."""
+    host_zone(_CET)
+    now = datetime(2026, 3, 29, 0, 30)
+    at = _at("resets 6am", now)
+    assert at.utcoffset() == timedelta(hours=2)
+    assert at - now.astimezone() == timedelta(hours=4, minutes=30)
+
+
+def test_naive_now_weekday_crosses_fall_back(host_zone: Callable[[str], None]) -> None:
+    """A weekly reset across the end of summer time keeps its wall time."""
+    host_zone(_CET)
+    at = _at("resets Mon 12:00am", datetime(2026, 10, 23, 12, 0))
+    assert at.utcoffset() == timedelta(hours=1)
+    assert at.astimezone(UTC) == datetime(2026, 10, 25, 23, 0, tzinfo=UTC)
+
+
+def test_adapter_local_now_resolves_through_dst(
+    host_zone: Callable[[str], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generic adapter's `_local_now` feeds this resolution: it must stay
+    naive, or the reset is pinned to today's offset again."""
+    from bmad_loop.adapters import generic
+
+    host_zone(_CET)
+    # 2026-03-28 23:30 UTC = 00:30 CET on the night summer time starts.
+    monkeypatch.setattr(time, "time", lambda: datetime(2026, 3, 28, 23, 30, tzinfo=UTC).timestamp())
+    at = _at("resets 6am", generic._local_now())
+    assert at.astimezone(UTC) == datetime(2026, 3, 29, 4, 0, tzinfo=UTC)

@@ -228,10 +228,12 @@ class _QuotaWait:
 
 
 def _local_now() -> datetime:
-    """The aware local "now" a usage-limit reset clause is resolved against
-    (#610). Read off this module's wall clock, so the reset moves with the
-    session's own clock (and a test steering that clock steers this too)."""
-    return datetime.fromtimestamp(time.time()).astimezone()
+    """The naive local "now" a usage-limit reset clause is resolved against
+    (#610). Naive so `parse_reset` resolves the reset through the host zone's
+    DST rules rather than today's fixed offset. Read off this module's wall
+    clock, so the reset moves with the session's own clock (and a test steering
+    that clock steers this too)."""
+    return datetime.fromtimestamp(time.time())
 
 
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
@@ -1719,7 +1721,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         if (
                             reset is not None
                             and reset.at is not None
-                            and (reset.at - local_now).total_seconds() > cap_left
+                            and (reset.at - local_now.astimezone()).total_seconds() > cap_left
                         ):
                             # Reset-beyond-cap (#610): the CLI will not continue
                             # before the cap would end the wait anyway, so don't

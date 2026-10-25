@@ -1,7 +1,7 @@
 """Parse the ``resets …`` clause of a coding CLI's usage-limit line (#610).
 
-Pure: no clock reads, no I/O beyond the stdlib zone database. The caller
-passes ``now`` (an aware local datetime) and the full pane line that a
+Pure: no clock reads, no I/O beyond the stdlib zone database and the host's
+local-time rules. The caller passes ``now`` and the full pane line that a
 ``usage_limit_patterns`` / ``usage_wait_patterns`` entry matched; the result
 feeds the pause reason, ``heartbeat.json`` (``quota_resets_at``), the
 ``session-end`` journal field ``usage_limit_resets`` and the quota wait's
@@ -15,7 +15,10 @@ with weekdays ``Mon``..``Sun`` and months ``Jan``..``Dec``, which covers the
 forms seen in the field: ``7:20pm``, ``12:50pm (Asia/Ho_Chi_Minh)``,
 ``6pm (Europe/Warsaw)``, ``Mon 12:00am``, ``Sep 15 at 7pm``. The reset is the
 next occurrence of that wall time strictly after ``now``: in the named zone
-when the clause names one, else in ``now``'s own zone.
+when the clause names one, else in ``now``'s own zone. A naive ``now`` means
+the host's local zone, resolved per candidate through its DST rules; an aware
+``now`` from ``astimezone()`` carries only today's fixed offset, which a reset
+across a DST change would get an hour wrong.
 
 Degrade contract: :func:`parse_reset` never raises. A line with no clause is
 ``None``. A clause it cannot resolve keeps its raw text with ``at=None`` and
@@ -98,9 +101,9 @@ def parse_reset(line: str, now: datetime) -> UsageReset | None:
         except (ZoneInfoNotFoundError, ValueError, OSError):
             return _unresolved(raw, "zone-unavailable")
     try:
-        local_now = now.astimezone(tz) if tz is not None else now
+        local_now = now.astimezone(tz)
         at = _next_occurrence(m, dtime(hour, minute), local_now, tz)
-    except (ValueError, OverflowError):
+    except (ValueError, OverflowError, OSError):
         return _unresolved(raw, "unparsed")
     if at is None:
         return _unresolved(raw, "unparsed")
@@ -115,10 +118,13 @@ def _next_occurrence(
     m: re.Match[str], wall: dtime, now: datetime, tz: tzinfo | None
 ) -> datetime | None:
     """The first ``wall`` time strictly after ``now`` on a date the clause
-    allows. Dates are built with ``datetime.combine`` in ``tz``, so a DST
-    change between now and the reset keeps the stated wall time."""
+    allows. Dates are built with ``datetime.combine`` in ``tz`` (or as host
+    local wall times when ``tz`` is None), so a DST change between now and the
+    reset keeps the stated wall time."""
 
     def at(day: date) -> datetime:
+        if tz is None:
+            return datetime.combine(day, wall).astimezone()
         return datetime.combine(day, wall, tzinfo=tz)
 
     today = now.date()
