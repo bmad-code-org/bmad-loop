@@ -9,6 +9,14 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
+  Claude Code waiting out a usage-window reset and the transcript is idle, freeze the
+  session timeout and hold the stall nudge, so the session finishes after the CLI's own
+  auto-continue. Past the cap, or when the parsed reset lies beyond it, pause with a
+  usage-limit reason. Surface the wait and the reset time in `heartbeat.json`
+  (`quota_waiting`, `quota_wait_s`, `quota_resets_at`), `session-end` (`quota_wait_s`,
+  `usage_limit_resets`), the journal (`quota-wait-*`), the pause reason
+  (`; resets <time>`) and the TUI header (`quota wait`).
 - Add the experimental `tickets` work source for BMAD v7 initiative ticket trees
   (`[stories] source = "tickets"`): dispatch `bmad-build-auto ticket <ref>` in initiative
   build order, verify each plan at `built`, and mark it `done` through `tickets.py mark`
@@ -175,6 +183,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Pause a Claude session seen blocked by a usage limit (credit exhaustion or a
+  session-window limit) with a `usage limit:` reason instead of charging a dev attempt;
+  a live pane sighting is exempt from the token veto. Add the profile fields
+  `usage_limit_patterns` and `usage_wait_patterns`, seeded from lines captured in
+  community reports (#610).
 - Read an epic the initiative declares but has not sliced yet: `status` no longer
   faults the board on its folderless row, and it triggers no retrospective or closure.
 - Name the T1 ticket plan an interrupted commit window left `done` or `blocked` when

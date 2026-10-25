@@ -15331,6 +15331,106 @@ def test_overruled_env_fault_is_journaled_and_retried(project):
     assert "env_fault_overruled" not in plain_end
 
 
+def test_usage_limited_session_end_is_journaled_and_paused(project):
+    """#610: a dev session the adapter saw live behind a usage limit (stalled +
+    parked, stamped env_fault with the pane evidence and exempt from the token
+    veto) pauses the run at the first story with the usage-limit reason, no
+    retry session burned, and `usage_limited` rides `session-end` (present-only).
+    ABLATION: drop the `usage_limited` extras line from `_session_end_extras`
+    and the session-end assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    # The captured credits line, split so this tracked file carries no line the
+    # shipped usage patterns match (test_pane_capture_patterns_do_not_match_this_repo).
+    evidence = (
+        "pane matched 'usage-pattern': You're out of usage credit"
+        + "s. Run /usage-credits to keep using Fable 5.1 or /model to switch models."
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            SessionResult(
+                status="stalled",
+                parked=True,
+                parked_evidence=evidence,
+                usage_limited=evidence,
+                env_fault=True,
+                env_fault_evidence=evidence,
+            )
+        ],
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    assert engine.state.tasks["1-1-a"].attempt == 1
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_reason is not None
+    assert "usage limit: dev session stalled" in engine.state.paused_reason
+    assert evidence in engine.state.paused_reason
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["reason"].startswith("usage limit: dev session stalled")
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["usage_limited"] == evidence
+    # guard pin: a plain stall's session-end omits the key. The journal is
+    # per-project, so only the second run's own last entry may be inspected.
+    engine2, _ = make_engine(project, [SessionResult(status="stalled")])
+    engine2.run()
+    plain_end = [e for e in engine2.journal.entries() if e["kind"] == "session-end"][-1]
+    assert "usage_limited" not in plain_end
+
+
+def test_session_end_carries_quota_wait_s_only_when_positive(project):
+    """DW-396: the engine hands every session it drives the quota-wait cap
+    (`limits.quota_wait_max_min * 60`), and `session-end` carries the seconds the
+    session spent in a usage-limit quota wait only when it waited at all
+    (present-only).
+    ABLATION: drop the `quota_wait_s` extras line from `_session_end_extras` and
+    the first session-end assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [SessionResult(status="stalled", quota_wait_s=480.0)])
+    engine.run()
+    assert adapter.sessions[0].quota_wait_max_s == 300 * 60.0
+    # The stall is retried: the FIRST session-end is the session that waited.
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][0]
+    assert end["quota_wait_s"] == 480.0
+    # The journal is per-project, so only the second run's own last entry counts.
+    engine2, _ = make_engine(project, [SessionResult(status="stalled")])
+    engine2.run()
+    plain_end = [e for e in engine2.journal.entries() if e["kind"] == "session-end"][-1]
+    assert "quota_wait_s" not in plain_end
+
+
+def test_session_end_carries_usage_limit_resets_only_when_set(project):
+    """#610: the usage limit's parsed reset rides `session-end` present-only and
+    names itself in the pause reason.
+    ABLATION: drop the `usage_limit_resets` extras line from `_session_end_extras`
+    and the session-end assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
+    engine, _ = make_engine(
+        project,
+        [
+            SessionResult(
+                status="stalled",
+                parked=True,
+                parked_evidence=evidence,
+                usage_limited=evidence,
+                usage_limit_resets="2026-10-25T19:20:00+00:00",
+            )
+        ],
+    )
+    engine.run()
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["usage_limit_resets"] == "2026-10-25T19:20:00+00:00"
+    assert engine.state.paused_reason is not None
+    assert "; resets 2026-10-25T19:20:00+00:00" in engine.state.paused_reason
+    engine2, _ = make_engine(project, [SessionResult(status="stalled")])
+    engine2.run()
+    plain_end = [e for e in engine2.journal.entries() if e["kind"] == "session-end"][-1]
+    assert "usage_limit_resets" not in plain_end
+
+
 def test_session_env_fault_pauses_dev_without_burning_budget(project):
     """A dev session classified an environment fault (#194) pauses the run at the
     first story rather than charging the attempt; the decision + session-end carry

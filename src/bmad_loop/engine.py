@@ -3078,6 +3078,12 @@ class Engine:
                 wf_extras["parked"] = True
                 if result.parked_evidence:
                     wf_extras["parked_evidence"] = result.parked_evidence
+            if result.usage_limited:
+                wf_extras["usage_limited"] = result.usage_limited
+            if result.usage_limit_resets:
+                wf_extras["usage_limit_resets"] = result.usage_limit_resets
+            if result.quota_wait_s > 0:
+                wf_extras["quota_wait_s"] = round(result.quota_wait_s, 1)
             self.journal.append(
                 "workflow-end",
                 plugin=lp.name,
@@ -8384,6 +8390,19 @@ class Engine:
             extras["parked"] = True
             if result.parked_evidence:
                 extras["parked_evidence"] = result.parked_evidence
+        # usage-limit diagnosis (#610): same present-only convention — the
+        # visible-pane line the adapter saw live, which exempted the env-fault
+        # verdict from the token veto.
+        if result.usage_limited:
+            extras["usage_limited"] = result.usage_limited
+        # the limit's reset, parsed from the same line (#610): ISO-8601, or the
+        # raw clause when it did not resolve.
+        if result.usage_limit_resets:
+            extras["usage_limit_resets"] = result.usage_limit_resets
+        # usage-limit quota wait (DW-396): present-only — the seconds the session
+        # sat behind a usage-window reset with its timeout frozen.
+        if result.quota_wait_s > 0:
+            extras["quota_wait_s"] = round(result.quota_wait_s, 1)
         # empty read-back diagnosis (#780): same present-only convention. The
         # last resultless-stop verdict lands here because nothing reads the
         # crumb file, so a spec nested out of the read-back's reach timed out
@@ -8623,6 +8642,9 @@ class Engine:
             token_budget_mode=self.policy.limits.session_budget_mode,
             token_budget_grace_s=float(self.policy.limits.session_budget_grace_s),
             cache_read_weight=self.policy.limits.cache_read_weight,
+            # usage-limit quota wait cap (DW-396): the timeout freezes while the
+            # CLI waits out a usage-window reset, for at most this long in total.
+            quota_wait_max_s=float(self.policy.limits.quota_wait_max_min * 60),
             # Launch-state snapshot of a review session's spec (#276 M1); None for
             # every other session and on a crash-resume (process-transient).
             spec_snapshot=spec_snapshot,

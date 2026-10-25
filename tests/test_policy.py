@@ -682,6 +682,19 @@ def test_dev_stall_nudges_cap_default_parse_and_template():
         policy.loads("[limits]\ndev_stall_nudges_cap = -1\n")
 
 
+def test_quota_wait_max_min_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").limits.quota_wait_max_min == 300
+    loaded = policy.loads("[limits]\nquota_wait_max_min = 0\n")
+    assert loaded.limits.quota_wait_max_min == 0  # 0 = off
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["quota_wait_max_min"] == policy.LimitsPolicy.quota_wait_max_min
+    with pytest.raises(policy.PolicyError, match="quota_wait_max_min"):
+        policy.loads("[limits]\nquota_wait_max_min = -1\n")
+
+
 def test_dev_contract_nudge_default_parse_and_template():
     import tomllib
 

@@ -37,6 +37,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
@@ -51,6 +52,7 @@ from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from ..signals import REBIND_SOURCES, SessionAttribution, SignalWatcher
 from ..tokens import read_usage as tally_usage
+from ..usagereset import UsageReset, parse_reset
 from ..verify import read_frontmatter, status_of
 from .base import (
     CodingCLIAdapter,
@@ -194,9 +196,68 @@ class _IdleTracker:
     tool_scan_failures: int = 0
 
 
+@dataclass
+class _QuotaWait:
+    """Per-session state of the usage-limit quota wait (DW-396), owned by one
+    `wait_for_completion` call.
+
+    `waiting` is the open-wait flag. While it is set the wait loop re-bases both
+    session deadlines to `frozen_remaining` on every tick, so the timeout stands
+    still. `started_mono` / `started_wall` are the open wait's start on each
+    clock. An open wait's length is the LONGER of the two elapsed spans, so a
+    host suspend (monotonic frozen, wall running) cannot stretch the cap.
+    `closed_s` sums the waits that already ended; `evidence` is the pane line
+    that admitted the open one, `resets` its parsed reset (`UsageReset.value`,
+    #610), None when the line named none. `line` is the full matched pane line;
+    `spent` holds (stripped) the lines of waits the CLI continued from. Such a
+    line is left on screen by a limit that is over, so no live usage gate takes
+    it as evidence again; a later limit prints a new line."""
+
+    waiting: bool = False
+    started_mono: float = 0.0
+    started_wall: float = 0.0
+    frozen_remaining: float = 0.0
+    closed_s: float = 0.0
+    evidence: str | None = None
+    resets: str | None = None
+    line: str | None = None
+    spent: set[str] = dataclasses.field(default_factory=set)
+
+    def open_s(self) -> float:
+        if not self.waiting:
+            return 0.0
+        return max(time.monotonic() - self.started_mono, time.time() - self.started_wall, 0.0)
+
+    def total_s(self) -> float:
+        return self.closed_s + self.open_s()
+
+
+def _local_now() -> datetime:
+    """The naive local "now" a usage-limit reset clause is resolved against
+    (#610). Naive so `parse_reset` resolves the reset through the host zone's
+    DST rules rather than today's fixed offset. Read off this module's wall
+    clock, so the reset moves with the session's own clock (and a test steering
+    that clock steers this too)."""
+    return datetime.fromtimestamp(time.time())
+
+
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
 # heartbeat's staleness is what makes a frozen orchestrator (#157) diagnosable.
 HEARTBEAT_INTERVAL_S = 30.0
+# Usage-limit quota wait (DW-396): how long the live transcript must have held
+# still (three heartbeats) before a visible `usage_wait_patterns` line may freeze
+# the session timeout. A CLI still writing its transcript is working, not
+# waiting out a reset.
+QUOTA_WAIT_IDLE_S = 90.0
+# The floor on the timeout a quota wait freezes, and so on what the session
+# resumes with once the CLI continues: a wait admitted with seconds to spare
+# must leave the auto-continued turn room to finish and Stop.
+QUOTA_WAIT_MIN_REMAINING_S = 120.0
+# The parked-latch kinds that block a quota wait (DW-396): a CLI asking a human
+# for permission or a quota decision is not going to continue by itself. An
+# `IdlePrompt` is deliberately absent — claude sends `idle_prompt` ~60 s after
+# every finished turn, including the one the usage limit ended.
+QUOTA_WAIT_BLOCKING_KINDS = frozenset({"QuotaPrompt", "PermissionPrompt"})
 # Startup-frame window for the #727 no-work verdict: pane-log growth detected on a
 # tick later than this many seconds after the wait loop started counts as work;
 # growth inside it is the CLI painting its first frame — a banner, a menu, a
@@ -1177,12 +1238,29 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         )
 
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
+        """`_wait_loop`, with the quota wait's total carried onto whatever it
+        returns (DW-396). A wait still open at the exit (a Stop with a result,
+        window death, a hard stop, the cap) is closed here, so every
+        `quota-wait-started` gets its `quota-wait-ended`."""
+        quota = _QuotaWait()
+        result = self._wait_loop(handle, spec, quota)
+        if quota.waiting:
+            self._end_quota_wait(handle, quota, "session-exit")
+        if quota.closed_s > 0:
+            result = dataclasses.replace(result, quota_wait_s=round(quota.closed_s, 3))
+        return result
+
+    def _wait_loop(
+        self, handle: SessionHandle, spec: SessionSpec, quota: _QuotaWait
+    ) -> SessionResult:
         deadline = time.monotonic() + spec.timeout_s
         # Wall-clock co-bound (#157): a host suspend freezes time.monotonic(),
         # silently extending the monotonic deadline by the nap's length. The
         # wall clock keeps counting through a suspend, so it may EXPIRE the
         # deadline — never extend it; all sub-waits below stay monotonic (a
-        # wall clock stepped backward must not stretch the session).
+        # wall clock stepped backward must not stretch the session). The one
+        # sanctioned exception is the usage-limit quota wait (DW-396), which
+        # re-bases BOTH deadlines on every tick; see the freeze below.
         wall_deadline = time.time() + spec.timeout_s
         session_id: str | None = None
         # Pinned to the launch-time id when the profile declared one (DW-505);
@@ -1260,6 +1338,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # the stall wake nudge, which it withholds (the nudge's Enter can answer
         # the prompt, #727), ending the session `stalled` + `parked`.
         parked_evidence: str | None = None
+        # The canonical parked kind behind `parked_evidence` (`_parked_hook_kind`),
+        # latched and cleared with it: a QuotaPrompt/PermissionPrompt latch blocks
+        # or ends a usage-limit quota wait, an IdlePrompt one never does (DW-396).
+        parked_kind: str | None = None
+        # Whether this session can enter a usage-limit quota wait at all
+        # (DW-396): a cap and a profile that names the wait line. Off, the
+        # heartbeat stays byte-identical and nothing below is consulted.
+        quota_enabled = spec.quota_wait_max_s > 0 and bool(self._usage_wait_patterns)
         # the running streak of no-event ticks whose liveness probe raised a
         # transport error (e.g. a 30s tmux hang); reset by the next clean probe.
         # It deliberately does NOT escalate to "crashed" — a transient transport
@@ -1430,12 +1516,96 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 handle, stop_seen, activity_seen or transcript_work_seen or usage_seen
             )
 
+        def still_working() -> bool:
+            """The quota wait's activity tests (#610), for a usage line seen at
+            stall-grace expiry or at the timeout. A visible line alone is not
+            proof the CLI is still blocked: one that recovered and kept working
+            can leave it on screen. A transcript written inside QUOTA_WAIT_IDLE_S
+            (as of the last heartbeat sample) or an unanswered tool call is a
+            working session, and so is a tool scan that faults. Unknown activity
+            (no transcript named yet, or no sample) keeps the pane's word."""
+            path = transcript_path
+            if not path:
+                return False
+            if idle.idle_s is not None and idle.idle_s < QUOTA_WAIT_IDLE_S:
+                return True
+            return self._quota_wait_tool_open(handle, path)
+
+        def stall_exit(
+            parked_now: str | None, usage_now: str | None, resets_now: str | None = None
+        ) -> SessionResult:
+            """The non-completion exit of a stalled session (DW-348, #610):
+            resolve, then re-probe liveness. A now-dead window is ``crashed``
+            (never parked or usage-limited: nothing waits on a human once the CLI
+            is gone). Otherwise ``stalled`` with ``accept_result=False``: an
+            artifact on disk cannot upgrade the stall to completed (it may be
+            stale or mid-write; only a Stop or window death vouches for it), and
+            ``parked_now`` / ``usage_now`` / ``resets_now`` label it. Both exits
+            carry the rollout."""
+            try_resolve()
+            if self._probe_liveness(handle, "stall") is False:
+                return self._final(
+                    handle,
+                    spec,
+                    "crashed",
+                    session_id,
+                    transcript_path,
+                    budget_weighted=budget_weighted,
+                    stop_seen=stop_seen,
+                    produced_work=produced_work(),
+                )
+            stalled = self._final(
+                handle,
+                spec,
+                "stalled",
+                session_id,
+                transcript_path,
+                accept_result=False,
+                budget_weighted=budget_weighted,
+                stop_seen=stop_seen,
+                produced_work=produced_work(),
+            )
+            if parked_now is not None:
+                return dataclasses.replace(
+                    stalled,
+                    parked=True,
+                    parked_evidence=parked_now,
+                    usage_limited=usage_now,
+                    usage_limit_resets=resets_now if usage_now is not None else None,
+                )
+            return stalled
+
         while True:
             # Top-of-tick pane-frame sample for the no-work verdict (#727). Before
             # the timeout check so growth on the final tick still counts; before the
             # nudge arm so a tick that both sees growth and sends a nudge scores the
             # growth (the nudge cannot have caused what preceded it).
             sample_frame()
+            if quota.waiting:
+                # Usage-limit quota wait (DW-396): the CLI sits behind a usage
+                # window it will continue from by itself, so the session clock
+                # stands still. The cap is checked first, on the longer of the
+                # two clocks' spans (`_QuotaWait.open_s`), so a host suspend
+                # cannot stretch it; at the cap the session ends stalled + parked
+                # with the usage evidence, never completed (only a Stop or window
+                # death completes a session).
+                waited = quota.total_s()
+                if waited >= spec.quota_wait_max_s:
+                    self._note_quota_wait_cap(
+                        handle, quota.evidence, round(waited, 3), spec.quota_wait_max_s
+                    )
+                    evidence = quota.evidence
+                    self._end_quota_wait(handle, quota, "cap")
+                    return stall_exit(evidence, evidence, quota.resets)
+                # The freeze runs on EVERY tick, not only on heartbeats: a wait
+                # admitted with less than a heartbeat interval left would
+                # otherwise time out between samples. This is the one sanctioned
+                # exception to #157's "the wall clock may expire the deadline,
+                # never extend it": both deadlines are re-based to now plus the
+                # remaining time frozen at admission. The wait's own cap above
+                # is what bounds it.
+                deadline = time.monotonic() + quota.frozen_remaining
+                wall_deadline = time.time() + quota.frozen_remaining
             remaining = deadline - time.monotonic()
             wall_expired = time.time() >= wall_deadline
             if remaining <= 0 or wall_expired:
@@ -1463,6 +1633,26 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # rollout existed, then no further hook event): the exit's
                 # `transcript_path` argument is read before `produced_work()`.
                 try_resolve()
+                # One look at the visible pane for a usage limit (#610): a
+                # session whose clock ran out while it sat behind one is not a
+                # failed attempt. A dead window is never usage-limited (the CLI
+                # is gone, though a remain-on-exit pane still captures), so a
+                # match is confirmed alive first; a probe fault reads "not dead".
+                # A working session's timeout (`still_working`) is an ordinary
+                # one, charged as before #610. A line a quota wait already
+                # continued from is no evidence at all.
+                (usage_hit,) = self._pane_evidence(
+                    handle, self._usage_pane_patterns, skip=quota.spent
+                )
+                usage_now = resets_now = None
+                if (
+                    usage_hit is not None
+                    and self._probe_liveness(handle, "timeout") is not False
+                    and not still_working()
+                ):
+                    usage_now = usage_hit[0]
+                    reset = self._usage_reset(handle, usage_hit[1], _local_now())
+                    resets_now = reset.value if reset is not None else None
                 return SessionResult(
                     status="timeout",
                     session_id=session_id,
@@ -1472,6 +1662,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
                     produced_work=produced_work(),
+                    usage_limited=usage_now,
+                    usage_limit_resets=resets_now,
                 )
             # Hard-stop poll (#319), per-iteration and deliberately NOT inside
             # the heartbeat throttle below: the loop's own wait is capped at 5s
@@ -1509,6 +1701,81 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # has named the transcript.
                 if transcript_path:
                     sample_transcript(transcript_path, now)
+                if quota.waiting:
+                    # The transcript moved: the CLI continued after the reset.
+                    # The timeout resumes from the remaining time frozen at
+                    # admission. A pane that merely stopped matching does not
+                    # end the wait: the line can scroll away. The line it waited
+                    # on is spent: left on screen, it must not reopen a wait
+                    # (or park the session, its reset now read as the next
+                    # day's) at the next idle stretch of a working session.
+                    if idle.idle_s is not None and idle.idle_s < QUOTA_WAIT_IDLE_S:
+                        self._end_quota_wait(handle, quota, "transcript-active")
+                        if quota.line is not None:
+                            quota.spent.add(quota.line.strip())
+                elif (
+                    quota_enabled
+                    and transcript_path
+                    and idle.idle_s is not None
+                    and idle.idle_s >= QUOTA_WAIT_IDLE_S
+                    and parked_kind not in QUOTA_WAIT_BLOCKING_KINDS
+                    and quota.closed_s < spec.quota_wait_max_s
+                ):
+                    # Admission (DW-396): an idle transcript, the wait line on
+                    # the visible pane, and no unanswered tool call (a long
+                    # foreground tool is a working session, whatever the pane
+                    # still shows), on a line no earlier wait continued from.
+                    # The pane look comes first: it is the cheaper read, and a
+                    # non-match skips the transcript scan.
+                    (wait_hit,) = self._pane_evidence(
+                        handle, self._usage_wait_patterns, skip=quota.spent
+                    )
+                    if wait_hit is not None and not self._quota_wait_tool_open(
+                        handle, transcript_path
+                    ):
+                        local_now = _local_now()
+                        reset = self._usage_reset(handle, wait_hit[1], local_now)
+                        resets = reset.value if reset is not None else None
+                        cap_left = spec.quota_wait_max_s - quota.closed_s
+                        if (
+                            reset is not None
+                            and reset.at is not None
+                            and (reset.at - local_now.astimezone()).total_seconds() > cap_left
+                        ):
+                            # Reset-beyond-cap (#610): the CLI will not continue
+                            # before the cap would end the wait anyway, so don't
+                            # freeze the clock for it. Ends exactly as the cap
+                            # does: stalled + parked + usage-limited, never
+                            # completed. An unresolved reset cannot be compared
+                            # and waits as before (the cap still bounds it).
+                            self._note_lifecycle(
+                                handle.task_id,
+                                "quota-wait-skipped",
+                                reason="reset-beyond-cap",
+                                evidence=wait_hit[0],
+                                resets_at=resets,
+                                cap_left_s=round(cap_left, 3),
+                            )
+                            return stall_exit(wait_hit[0], wait_hit[0], resets)
+                        frozen = max(
+                            min(remaining, wall_deadline - time.time()),
+                            QUOTA_WAIT_MIN_REMAINING_S,
+                        )
+                        self._note_quota_wait_started(
+                            handle,
+                            wait_hit[0],
+                            round(frozen, 3),
+                            round(quota.closed_s, 3),
+                            spec.quota_wait_max_s,
+                            resets,
+                        )
+                        quota.waiting = True
+                        quota.started_mono = time.monotonic()
+                        quota.started_wall = time.time()
+                        quota.frozen_remaining = frozen
+                        quota.evidence = wait_hit[0]
+                        quota.resets = resets
+                        quota.line = wait_hit[1]
                 if not saw_session_start and not session_start_noted:
                     session_start_noted = self._note_session_start_missing(
                         handle, now - loop_started
@@ -1532,6 +1799,23 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         "usage_sample_failures": usage_failures,
                         # hook events dropped as a nested CLI's (#767)
                         "foreign_hook_events": foreign_hook_events,
+                        # the usage-limit quota wait (DW-396): present only when
+                        # this session can enter one.
+                        **(
+                            {
+                                "quota_waiting": quota.waiting,
+                                "quota_wait_s": round(quota.total_s(), 3),
+                            }
+                            if quota_enabled
+                            else {}
+                        ),
+                        # the open wait's parsed reset (#610), while waiting
+                        # on a line that named one.
+                        **(
+                            {"quota_resets_at": quota.resets}
+                            if quota.waiting and quota.resets is not None
+                            else {}
+                        ),
                     },
                 )
                 # Mid-session spec-status transition sampling (#276 M2) rides the
@@ -1644,6 +1928,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 self._note_nudge_send_failed(handle, "budget", e)
                             budget_deadline = time.monotonic() + spec.token_budget_grace_s
                             budget_wall_deadline = time.time() + spec.token_budget_grace_s
+            # The token-budget grace is deliberately NOT frozen by a usage-limit
+            # quota wait (DW-396): a crossed budget is real spend, and a session
+            # waiting out a reset after crossing it has nothing left to earn.
             if budget_deadline is not None and (
                 time.monotonic() >= budget_deadline
                 or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
@@ -1774,6 +2061,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         stall_deadline = time.monotonic() + self._stall_grace_s
                         continue
                 if stall_deadline is not None and time.monotonic() >= stall_deadline:
+                    if quota.waiting:
+                        # Stall hold (DW-396): a CLI waiting out a usage-window
+                        # reset is silent by design, and a nudge typed into it
+                        # can only reproduce the limit line. Re-arm the grace,
+                        # spend nothing. A QuotaPrompt/PermissionPrompt latch has
+                        # already ended the wait, so it still parks here.
+                        stall_deadline = time.monotonic() + self._stall_grace_s
+                        last_activity = self._log_activity_key(handle.task_id)
+                        continue
                     # The cap bounds ATTEMPTS, delivered or not (DW-449).
                     nudge_due = stall_nudges_left > 0 and (
                         spec.stall_nudges_cap is None
@@ -1787,15 +2083,39 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # (nudges spent, or none configured) is labelled parked too
                     # and pauses instead of retrying (DW-433). Either way no
                     # nudge is typed and the session ends through the tail below.
+                    # The same single capture is matched against the usage-limit
+                    # lists (#610): a CLI stopped behind a usage limit is parked
+                    # too (a nudge can only reproduce the limit line), and the
+                    # match is recorded as `usage_limited` even when the hook
+                    # latch already supplied the parked evidence, since claude's
+                    # idle_prompt latches on exactly this kind of idle. A line a
+                    # quota wait already continued from matches nothing, and
+                    # neither does one on a working session (`still_working`:
+                    # a silent foreground tool past the grace, say), which
+                    # stalls as before #610 rather than pausing uncharged.
                     parked_now = parked_evidence
+                    parked_hit, usage_hit = self._pane_evidence(
+                        handle,
+                        self._parked_prompt_patterns if parked_now is None else (),
+                        self._usage_pane_patterns,
+                        skip=quota.spent,
+                    )
+                    if parked_now is None and parked_hit is not None:
+                        parked_now = parked_hit[0]
+                    usage_now = resets_now = None
+                    if usage_hit is not None and not still_working():
+                        usage_now = usage_hit[0]
+                        reset = self._usage_reset(handle, usage_hit[1], _local_now())
+                        resets_now = reset.value if reset is not None else None
                     if parked_now is None:
-                        parked_now = self._pane_parked_evidence(handle)
+                        parked_now = usage_now
                     if parked_now is not None:
                         self._note_lifecycle(
                             handle.task_id,
                             "stall-nudge-withheld",
                             evidence=parked_now,
                             nudge_due=nudge_due,
+                            **({"usage_limited": usage_now} if usage_now is not None else {}),
                         )
                     elif nudge_due:
                         # The wake nudge IS the re-invocation bmad-loop otherwise
@@ -1830,36 +2150,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # persistent failure. A dead window is never labelled parked:
                     # nothing is waiting on a human once the CLI is gone. The
                     # probe fault is crumbed (`site="stall"`, DW-454).
-                    # Both exits below (crashed or stalled) carry the rollout.
-                    try_resolve()
-                    if self._probe_liveness(handle, "stall") is False:
-                        return self._final(
-                            handle,
-                            spec,
-                            "crashed",
-                            session_id,
-                            transcript_path,
-                            budget_weighted=budget_weighted,
-                            stop_seen=stop_seen,
-                            produced_work=produced_work(),
-                        )
-                    # Still alive: an artifact on disk cannot upgrade the stall to
-                    # completed — it may be stale or mid-write; only a Stop or
-                    # window death vouches for it.
-                    stalled = self._final(
-                        handle,
-                        spec,
-                        "stalled",
-                        session_id,
-                        transcript_path,
-                        accept_result=False,
-                        budget_weighted=budget_weighted,
-                        stop_seen=stop_seen,
-                        produced_work=produced_work(),
-                    )
-                    if parked_now is not None:
-                        return dataclasses.replace(stalled, parked=True, parked_evidence=parked_now)
-                    return stalled
+                    return stall_exit(parked_now, usage_now, resets_now)
                 continue
             # Drop a nested CLI's events before they can re-point the identity
             # or transcript, set stop_seen, spend nudges or re-arm the stall
@@ -1977,12 +2268,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 evidence = self._parked_hook_evidence(event.event, event.notification_type)
                 if evidence is not None:
                     parked_evidence = evidence
+                    parked_kind = self._parked_hook_kind(event.event, event.notification_type)
                     self._note_lifecycle(handle.task_id, "parked-signal", evidence=evidence)
+                    # A CLI now asking a human is no longer waiting on a reset
+                    # (DW-396): end the wait; the next stall expiry parks it.
+                    # An IdlePrompt never ends one.
+                    if quota.waiting and parked_kind in QUOTA_WAIT_BLOCKING_KINDS:
+                        self._end_quota_wait(handle, quota, "latch")
                 continue
             if event.event == "Stop":
                 # A completed turn proves any prompt the CLI was parked on got
                 # answered: drop the parked latch before anything else (DW-348).
                 parked_evidence = None
+                parked_kind = None
                 # A turn ENDED — the one canonical event that proves the CLI did
                 # something, and so the hook half of the #261 proof-of-work gate.
                 # Latched after the subagent filter above, which rejects a stop that
@@ -2013,6 +2311,17 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
                     )
+                if quota.waiting:
+                    # A result-less Stop while the CLI waits out a usage-window
+                    # reset (DW-396): typing the stop nudge into it can only
+                    # reproduce the limit line. Withhold it and keep waiting.
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "stop-nudge-withheld",
+                        reason="quota-wait",
+                        nudge_due=nudges_left > 0,
+                    )
+                    continue
                 if nudges_left > 0:
                     nudges_left -= 1
                     try:
@@ -2392,6 +2701,126 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return None
         return f"Notification({notification_type}) -> {mapped}"
 
+    def _parked_hook_kind(self, kind: str, notification_type: str | None) -> str | None:
+        """The canonical parked kind behind `_parked_hook_evidence`'s evidence:
+        the kind itself, or the one the profile maps a `Notification` subtype
+        to. None exactly when that evidence is None."""
+        if kind in PARKED_EVENTS:
+            return kind
+        if kind != "Notification" or notification_type is None:
+            return None
+        return self.profile.hooks.notification_types.get(notification_type)
+
+    def _quota_wait_tool_open(self, handle: SessionHandle, transcript_path: str) -> bool:
+        """Whether an unanswered tool call blocks a usage-limit quota wait
+        (DW-396): `_open_tool_call` over the transcript and its subagent tree.
+        A CLI blocked on a foreground tool is working, whatever its pane still
+        shows. Only `claude-jsonl` has the tool_use/tool_result shape; other
+        parsers cannot tell and read as "none open". A read fault refuses the
+        wait (a scan that cannot tell must not freeze the clock), crumbed as
+        `quota-wait-tool-scan-failed`."""
+        if self.profile.usage_parser != "claude-jsonl":
+            return False
+        try:
+            paths = [Path(transcript_path)]
+            root = self._subagent_root(transcript_path)
+            if root is not None:
+                paths.extend(path for path, _ in _subagent_tree_files(root))
+            return self._open_tool_call(paths) is not None
+        except OSError as e:
+            self._note_lifecycle(
+                handle.task_id, "quota-wait-tool-scan-failed", error=f"{type(e).__name__}: {e}"
+            )
+            return True
+
+    # The quota-wait records (DW-396): a lifecycle crumb each, plus, best-effort,
+    # a run-journal event with `task_id` and measured fields alone (the pane
+    # evidence stays in the crumb), the `session-idle` pattern, so the TUI can
+    # read it. An unwritable journal must not end a session; the crumb keeps
+    # the record.
+
+    def _note_quota_wait_started(
+        self,
+        handle: SessionHandle,
+        evidence: str,
+        remaining_s: float,
+        waited_s: float,
+        cap_s: float,
+        resets_at: str | None = None,
+    ) -> None:
+        # the parsed reset (#610), present-only on both records
+        resets = {"resets_at": resets_at} if resets_at is not None else {}
+        self._note_lifecycle(
+            handle.task_id,
+            "quota-wait-started",
+            evidence=evidence,
+            remaining_s=remaining_s,
+            waited_s=waited_s,
+            cap_s=cap_s,
+            **resets,
+        )
+        if self.journal is None:
+            return
+        try:
+            self.journal.append(
+                "quota-wait-started",
+                task_id=handle.task_id,
+                remaining_s=remaining_s,
+                waited_s=waited_s,
+                cap_s=cap_s,
+                **resets,
+            )
+        except OSError:
+            pass
+
+    def _usage_reset(self, handle: SessionHandle, line: str, now: datetime) -> UsageReset | None:
+        """The reset clause of a matched usage-limit pane line (#610), parsed
+        from the FULL line (the evidence excerpt may cut it). A clause that does
+        not resolve is a visible degrade: a `usage-reset-unparsed` crumb
+        (`reason` = `zone-unavailable` | `unparsed`, `raw`), and the caller
+        carries the raw text in place of a time."""
+        reset = parse_reset(line, now)
+        if reset is not None and reset.unresolved is not None:
+            self._note_lifecycle(
+                handle.task_id, "usage-reset-unparsed", reason=reset.unresolved, raw=reset.raw
+            )
+        return reset
+
+    def _note_quota_wait_cap(
+        self, handle: SessionHandle, evidence: str | None, waited_s: float, cap_s: float
+    ) -> None:
+        self._note_lifecycle(
+            handle.task_id, "quota-wait-cap", evidence=evidence, waited_s=waited_s, cap_s=cap_s
+        )
+        if self.journal is None:
+            return
+        try:
+            self.journal.append(
+                "quota-wait-cap", task_id=handle.task_id, waited_s=waited_s, cap_s=cap_s
+            )
+        except OSError:
+            pass
+
+    def _end_quota_wait(self, handle: SessionHandle, quota: _QuotaWait, how: str) -> None:
+        """Close an open quota wait: fold its length into `closed_s` and record
+        `quota-wait-ended` (`waited_s` = this wait, `total_s` = the session's,
+        `how` = `transcript-active` | `latch` | `cap` | `session-exit`)."""
+        waited = round(quota.open_s(), 3)
+        quota.closed_s += waited
+        quota.waiting = False
+        total = round(quota.closed_s, 3)
+        self._note_lifecycle(
+            handle.task_id, "quota-wait-ended", waited_s=waited, total_s=total, how=how
+        )
+        if self.journal is None:
+            return
+        try:
+            self.journal.append(
+                "quota-wait-ended", task_id=handle.task_id, waited_s=waited, total_s=total, how=how
+            )
+        except OSError:
+            pass
+
     @cached_property
     def _parked_prompt_patterns(self) -> tuple[regex.Pattern[str], ...]:
         """``profile.parked_prompt_patterns``, compiled once per adapter on first
@@ -2401,28 +2830,37 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         first stall-expiry, or assign this attribute directly."""
         return tuple(regex.compile(p) for p in self.profile.parked_prompt_patterns)
 
-    def _pane_parked_evidence(self, handle: SessionHandle) -> str | None:
-        """Whether the VISIBLE pane shows a prompt only a human should answer
-        (DW-350): the evidence (pattern plus quoted line) of the first
-        ``parked_prompt_patterns`` match, else None.
+    def _pane_evidence(
+        self,
+        handle: SessionHandle,
+        *pattern_sets: tuple[regex.Pattern[str], ...],
+        skip: set[str] | frozenset[str] = frozenset(),
+    ) -> tuple[tuple[str, str] | None, ...]:
+        """One look at the VISIBLE pane, matched against each pattern set: per
+        set, ``(evidence, matched_line)`` for its first match (lines outer,
+        patterns inner; evidence = pattern plus quoted line), else None.
 
-        Read only at a stall-grace expiry with no hook latch — whether a wake
-        nudge is due or the stall is final (DW-433). Observation that
-        degrades: no patterns, a backend that cannot capture (the seam default
-        raises ``MultiplexerError``; a duck-typed backend may lack the method),
-        a capture fault, or a search that blows ``PARKED_PROMPT_MATCH_TIMEOUT_S``
-        all read as "no match": a due nudge goes out, or the final stall ends
-        unparked, exactly as before. The two faults are not silent (DW-448): a
+        The shared matcher behind the parked gate (DW-350:
+        ``parked_prompt_patterns``) and the usage-limit gates (#610:
+        ``usage_limit_patterns`` + ``usage_wait_patterns``), so a decision point
+        that consults several sets captures the pane ONCE. Observation that
+        degrades: every set empty, or a backend that cannot capture (the seam
+        default raises ``MultiplexerError``; a duck-typed backend may lack the
+        method), reads as "no match" for every set; a capture fault does too;
+        a search that blows ``PARKED_PROMPT_MATCH_TIMEOUT_S`` reads as "no
+        match" for its own set. The two faults are not silent (DW-448): a
         ``parked-probe-failed`` crumb (``reason`` = ``capture-failed`` or
-        ``match-timeout`` + its ``pattern``; ``error``) records that the look
-        at the pane failed. No patterns and a backend without ``capture_pane``
-        are configuration, not faults, and stay silent."""
-        patterns = self._parked_prompt_patterns
-        if not patterns:
-            return None
+        ``match-timeout`` + its ``pattern``; ``error``) records that the look at
+        the pane failed. Empty sets and a backend without ``capture_pane`` are
+        configuration, not faults: no capture, no crumb. A line in ``skip``
+        (compared stripped) is never a match: the usage gates pass the lines of
+        quota waits the CLI already continued from (``_QuotaWait.spent``)."""
+        none: tuple[tuple[str, str] | None, ...] = tuple(None for _ in pattern_sets)
+        if not any(pattern_sets):
+            return none
         capture = getattr(self.mux, "capture_pane", None)
         if capture is None:
-            return None
+            return none
         try:
             screen = capture(handle.pane_target or handle.native_id)
         except MultiplexerError as e:
@@ -2432,11 +2870,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 reason="capture-failed",
                 error=f"{type(e).__name__}: {e}",
             )
-            return None
+            return none
         if not isinstance(screen, str):
-            return None
-        text = _ANSI_RE.sub("", screen.replace("\r", "\n"))
-        for line in text.split("\n"):
+            return none
+        lines = _ANSI_RE.sub("", screen.replace("\r", "\n")).split("\n")
+        if skip:
+            lines = [line for line in lines if line.strip() not in skip]
+        return tuple(self._first_pane_match(handle, lines, pats) for pats in pattern_sets)
+
+    def _first_pane_match(
+        self, handle: SessionHandle, lines: list[str], patterns: tuple[regex.Pattern[str], ...]
+    ) -> tuple[str, str] | None:
+        """``_pane_evidence``'s search of one pattern set over captured lines."""
+        for line in lines:
             for pat in patterns:
                 try:
                     hit = pat.search(line, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
@@ -2450,8 +2896,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                     return None
                 if hit is not None:
-                    return f"pane matched {pat.pattern!r}: {_excerpt(line, hit.start())}"
+                    return (f"pane matched {pat.pattern!r}: {_excerpt(line, hit.start())}", line)
         return None
+
+    @property
+    def _usage_pane_patterns(self) -> tuple[regex.Pattern[str], ...]:
+        """Both usage-limit lists (#610) as the live gates consult them: disjoint
+        by contract, so either one matching means usage-limited."""
+        return self._usage_limit_patterns + self._usage_wait_patterns
 
     def _session_vanished(self, task_id: str) -> bool:
         # The disambiguating probe (#489): `list_window_ids` returns [] for a
@@ -3839,6 +4291,7 @@ class _DevSynthesisMixin(_ResultFileMixin):
             timeout_expired_clock=result.timeout_expired_clock,
             budget_weighted=result.budget_weighted,
             stop_seen=result.stop_seen,
+            quota_wait_s=result.quota_wait_s,
         )
 
 

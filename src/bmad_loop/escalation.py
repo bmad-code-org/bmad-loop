@@ -215,7 +215,12 @@ def env_fault_pause_reason(role: str, result: SessionResult) -> str:
     tail also matches a transport pattern would otherwise pause blaming only the
     provider. Both facts hold and the operator needs both — a lost session is not
     evidence about the API, and a log pattern is not evidence the session
-    survived."""
+    survived.
+
+    A session the adapter saw live behind a usage limit (``result.usage_limited``,
+    #610) gets the usage-limit reason instead, so every pause site inherits it."""
+    if result.usage_limited:
+        return usage_limit_pause_reason(role, result)
     return f"environment fault: {session_failure_reason(role, result)} ({env_fault_detail(result)})"
 
 
@@ -227,12 +232,36 @@ def parked_pause_reason(role: str, result: SessionResult) -> str:
     lost-session suffix survives. The evidence names what the adapter saw — a
     hook signal (``Notification(permission_prompt) -> PermissionPrompt``) or a
     ``parked_prompt_patterns`` match on the visible pane — and the tail says why
-    the session ended `stalled` without the usual wake nudge."""
+    the session ended `stalled` without the usual wake nudge. A session parked
+    behind a usage limit (``result.usage_limited``, #610) gets the usage-limit
+    reason instead."""
+    if result.usage_limited:
+        return usage_limit_pause_reason(role, result)
     evidence = result.parked_evidence or "parked-session signal"
     return (
         f"parked: {session_failure_reason(role, result)} ({evidence}; the CLI was "
         "waiting on a human — the stall nudge was withheld so it could not answer "
         "the prompt)"
+    )
+
+
+def usage_limit_pause_reason(role: str, result: SessionResult) -> str:
+    """The pause reason for a session seen LIVE behind a usage limit (#610):
+    ``usage limit: <role> session <status> (<evidence>; ...)``.
+
+    Reached through ``env_fault_pause_reason`` and ``parked_pause_reason`` when
+    ``result.usage_limited`` is set, so no pause site names it directly. Composed
+    over `session_failure_reason`, like its siblings, so the #489 lost-session
+    suffix survives. The evidence is the visible-pane match, followed by
+    ``; resets <value>`` when the line named a reset (``usage_limit_resets``:
+    ISO-8601, or the raw clause when it did not resolve; read as given, no
+    clock here); the tail names the operator's ways out, since no retry gets
+    past the limit on its own."""
+    resets = f"; resets {result.usage_limit_resets}" if result.usage_limit_resets else ""
+    return (
+        f"usage limit: {session_failure_reason(role, result)} ({result.usage_limited}{resets}; "
+        "the coding CLI is blocked by a usage limit — add credits, switch model or "
+        "wait for the reset, then bmad-loop resolve <run>)"
     )
 
 

@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -7966,6 +7967,56 @@ async def test_header_agent_line_names_the_waited_tool(project_tree, monkeypatch
         header.show_run("r1", data.RUNNING, state, agent=idle)  # unlabelled CLI
         assert "· idle 1h11m" in str(header.content)
         assert "· in" not in str(header.content)
+
+
+async def test_header_open_quota_wait_renders_as_quota_wait_not_idle(project_tree, monkeypatch):
+    """DW-396/#610: an open quota wait renders `· quota wait <age>` IN PLACE OF
+    the idle notice the same silent transcript would otherwise raise, followed
+    by `· resets <local weekday time>` for a resolved reset or the raw clause as
+    given; once the wait closes, the idle notice is back.
+
+    ABLATION: drop the `quota_wait_since` branch in `show_run` and the first
+    assertion reddens (the line reads `· idle`)."""
+    monkeypatch.setattr(widgets.time, "time", lambda: 10_000.0)
+    state = RunState(
+        run_id="r1",
+        project=str(project_tree.project),
+        started_at="now",
+        tasks={"1-1-alpha": StoryTask(story_key="1-1-alpha", epic=1, phase=Phase.DEV_RUNNING)},
+    )
+    idle = data.ActiveAgent(
+        task_id="1-1-alpha-dev-1",
+        story_key="1-1-alpha",
+        role="dev",
+        name="claude",
+        model="opus",
+        idle_since=10_000.0 - 20 * 60,
+        idle_tool="none",
+    )
+    waiting = dataclasses.replace(idle, quota_wait_since=10_000.0 - 17 * 60)
+    # A resolved reset renders in this host's local clock, whatever its zone.
+    local = datetime(2026, 10, 26, 12, 50).astimezone()
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+        header.show_run("r1", data.RUNNING, state, agent=waiting)
+        assert "claude · opus · dev · quota wait 17m" in str(header.content)
+        assert "idle" not in str(header.content)
+        assert "resets" not in str(header.content)
+
+        resolved = dataclasses.replace(
+            waiting, quota_resets_at=local.astimezone(timezone.utc).isoformat()
+        )
+        header.show_run("r1", data.RUNNING, state, agent=resolved)
+        assert "· quota wait 17m · resets Mon 12:50" in str(header.content)
+
+        raw = dataclasses.replace(waiting, quota_resets_at="7pm (Mars/Olympus_Mons)")
+        header.show_run("r1", data.RUNNING, state, agent=raw)
+        assert "· quota wait 17m · resets 7pm (Mars/Olympus_Mons)" in str(header.content)
+
+        header.show_run("r1", data.RUNNING, state, agent=idle)  # quota-wait-ended
+        assert "· idle 20m" in str(header.content)
+        assert "quota wait" not in str(header.content)
 
 
 async def test_header_marks_stale_state_unreadable_agent_and_read_faults(project_tree):

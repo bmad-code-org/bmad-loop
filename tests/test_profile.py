@@ -158,7 +158,10 @@ def test_env_fault_patterns_parse_from_overlay(tmp_path):
     assert prof.env_fault_patterns == ("API Error.*refused", "socket hang up")
 
 
-@pytest.mark.parametrize("field", ["env_fault_patterns", "parked_prompt_patterns"])
+@pytest.mark.parametrize(
+    "field",
+    ["env_fault_patterns", "parked_prompt_patterns", "usage_limit_patterns", "usage_wait_patterns"],
+)
 def test_deeply_nested_pattern_is_a_profile_error_not_a_bare_recursion_error(tmp_path, field):
     """DW-373: `regex.compile` answers a deeply nested pattern with RecursionError,
     not `regex.error` — it must still surface as a ProfileError naming the field,
@@ -265,6 +268,134 @@ def test_shipped_claude_parked_patterns_do_not_match_their_own_profile_line():
     )
     hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
     assert hits == []
+
+
+_USAGE_FIELDS = ("usage_limit_patterns", "usage_wait_patterns")
+
+
+def test_usage_fields_default_empty_when_unset(tmp_path):
+    # MINIMAL_PROFILE declares neither -> both inert (#610)
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE, encoding="utf-8", newline="")
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.usage_limit_patterns == ()
+    assert prof.usage_wait_patterns == ()
+
+
+def test_usage_fields_parse_from_overlay(tmp_path):
+    # a project overlay may seed either list; each parses into a tuple verbatim and
+    # independently of the other (compilation validated, see the invalid-regex cases)
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]",
+            'usage_limit_patterns = ["Out of credit[s]", "Quota gon[e]"]\n'
+            'usage_wait_patterns = ["Limit hi[t] · resets"]\n[hooks]',
+        ),
+        encoding="utf-8",
+        newline="",
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.usage_limit_patterns == ("Out of credit[s]", "Quota gon[e]")
+    assert prof.usage_wait_patterns == ("Limit hi[t] · resets",)
+    # neither list leaks into the env-fault or parked-prompt fields
+    assert prof.env_fault_patterns == ()
+    assert prof.parked_prompt_patterns == ()
+
+
+@pytest.mark.parametrize("field", _USAGE_FIELDS)
+def test_usage_field_invalid_regex_is_a_profile_error(tmp_path, field):
+    """An invalid usage pattern fails fast at parse, naming its own field — not at
+    match time inside a live pane check, where the caller degrades."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f'{field} = ["resets(unbalanced"]\n[hooks]'),
+        encoding="utf-8",
+        newline="",
+    )
+    with pytest.raises(ProfileError, match=f"{field} entry is not a valid regex"):
+        load_profiles(tmp_path)
+
+
+@pytest.mark.parametrize("field", _USAGE_FIELDS)
+def test_usage_field_must_be_a_list_of_strings(tmp_path, field):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f'{field} = "resets"\n[hooks]'),
+        encoding="utf-8",
+        newline="",
+    )
+    with pytest.raises(ProfileError, match=f"{field} must be a list of strings"):
+        load_profiles(tmp_path)
+
+
+# The #610 captured pane lines, concatenated so this file holds no line the
+# shipped patterns match (only tests/test_env_fault_patterns.py and
+# tests/test_generic_tmux.py may). Credits: psmux/Windows 11, runs
+# 20260907-084618-824f and 20260907-090132-98e3. Session limit: the 2026-09-07
+# psmux capture (zone suffix) and macOS/tmux run 20260913-165153-b850 (two spaces
+# after the gutter glyph, no zone).
+_CAPTURED_USAGE_LIMIT_LINES = (
+    "⎿ You're out of usage credit"
+    + "s. Run /usage-credits to keep using Fable 5.1 or /model to switch models.",
+)
+_CAPTURED_USAGE_WAIT_LINES = (
+    "⎿ You've hit your session limi" + "t · resets 12:50pm (Asia/Ho_Chi_Minh)",
+    "⎿  You've hit your session limi" + "t · resets 7:20pm",
+)
+
+
+def test_shipped_claude_usage_patterns_match_the_captured_610_lines():
+    """Each seeded usage pattern matches the lines it was seeded from, in its OWN
+    list only: the two lists are disjoint by contract (blocked vs waiting), so a
+    credits line read as a session-window wait would sit out a reset that never
+    comes."""
+    import regex
+
+    claude = get_profile("claude")
+    limit = [regex.compile(p) for p in claude.usage_limit_patterns]
+    wait = [regex.compile(p) for p in claude.usage_wait_patterns]
+    assert limit and wait
+    for line in _CAPTURED_USAGE_LIMIT_LINES:
+        assert any(p.search(line) for p in limit), line
+        assert not any(p.search(line) for p in wait), line
+    for line in _CAPTURED_USAGE_WAIT_LINES:
+        assert any(p.search(line) for p in wait), line
+        assert not any(p.search(line) for p in limit), line
+    # the advisory a still-working session prints must never read as the wait
+    advisory = "You've used 90% of your session limi" + "t · resets 7:20pm"
+    assert not any(p.search(advisory) for p in limit + wait)
+
+
+def test_shipped_claude_usage_patterns_do_not_match_their_own_profile_line():
+    """A session that prints or diffs claude.toml must not read as usage-limited:
+    the single-character classes (`credit[s]`, `[.]`, `limi[t]`) exist for this. Do
+    not "clean" them up."""
+    import regex
+
+    claude = get_profile("claude")
+    patterns = [regex.compile(p) for f in _USAGE_FIELDS for p in getattr(claude, f)]
+    assert patterns
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
+    assert hits == []
+
+
+def test_only_claude_seeds_usage_patterns():
+    # the other built-ins opt in on their own captured evidence; none has yet
+    for name, prof in load_profiles().items():
+        if name != "claude":
+            assert prof.usage_limit_patterns == (), name
+            assert prof.usage_wait_patterns == (), name
 
 
 def test_skill_tree_defaults_when_unset():
@@ -1112,7 +1243,7 @@ def _plugin_profile(name="acme", adapter="acme", **over):
 def test_entry_point_profile_is_discovered(profile_scan):
     """A pip-installed profile provider (a callable returning CLIProfiles) makes
     its profile resolvable with no project TOML — the zero-config selection path."""
-    profile_scan(_FakeEntryPoint("acme", lambda: (lambda: [_plugin_profile()])))
+    profile_scan(_FakeEntryPoint("acme", lambda: lambda: [_plugin_profile()]))
     prof = get_profile("acme")
     assert prof.name == "acme" and prof.adapter == "acme"
     assert profile_mod.external_profile_errors() == {}
@@ -1293,6 +1424,9 @@ def test_profile_scan_failure_degrades(profile_scan):
         ),
         ({"hooks": HookSpec("none", "", {}, {"x": "PermissionPrompt"})}, "hookless"),
         ({"parked_prompt_patterns": ("Enter(unbalanced",)}, "not a valid regex"),
+        # the #610 usage-limit pane patterns, each list on its own
+        ({"usage_limit_patterns": ("credits(unbalanced",)}, "usage_limit_patterns"),
+        ({"usage_wait_patterns": ("resets(unbalanced",)}, "usage_wait_patterns"),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
         ({"usage_grace_s": -1.0}, "usage_grace_s"),

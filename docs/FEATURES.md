@@ -101,8 +101,9 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A session silent for `dev_stall_grace_s` (default 600) gets up to `dev_stall_nudges` wake nudges, then ends `stalled` and is charged as a failed attempt.
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
   - A dev session that did no work, or any session parked on a prompt only a human should answer, pauses the run instead of being charged.
+  - While the visible pane shows the coding CLI waiting out a usage-limit reset and the transcript is idle, the session timeout is frozen and the stall nudge held, for at most `[limits] quota_wait_max_min` (default 300; 0 = off) cumulative minutes per session; past the cap, or when the parsed reset lies beyond it, the session pauses with a usage-limit reason.
   - Before an attempt is reset, its commits go to an `attempt-preserve/<run>-<tip8>` branch and uncommitted work to a `refs/attempt-preserve-dirty/*` snapshot.
-- **Config:** `[limits] max_dev_attempts`, `[limits] max_review_cycles`, `[limits] session_timeout_min`, `[limits] dev_stall_grace_s`, `[limits] dev_stall_nudges`, `[limits] dev_stall_nudges_cap`, `[scm] preserve_keep`
+- **Config:** `[limits] max_dev_attempts`, `[limits] max_review_cycles`, `[limits] session_timeout_min`, `[limits] dev_stall_grace_s`, `[limits] dev_stall_nudges`, `[limits] dev_stall_nudges_cap`, `[limits] quota_wait_max_min`, `[scm] preserve_keep`
 - **Tested by:** `tests/test_escalation.py`, `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_verify.py`, `tests/test_recovery_flow.py`
 - **Docs:** [Preserved attempts](escalations-guide.md#preserved-attempts), [[limits] reference](reference/configuration.md#limits), [[scm] reference](reference/configuration.md#scm)
 
@@ -161,9 +162,11 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A non-completed session whose log tail matches its profile's `env_fault_patterns` pauses instead of spending a dev attempt.
   - opencode is classified from model-free files only: the server's stdout, plus on OpenCode 2.x the adapter-written `provider-errors.log` (one line per provider-error event). Its 2.x patterns cover the `provider.rate-limit`, `provider.quota` and `provider.transport` error types.
   - A pattern match is overruled when the session's tracked token usage is nonzero; that session is charged like any failure.
-- **Config:** `[environment] probes`, `[environment] probe_timeout_s`, `[verify] env_fault_rc`; profile key `env_fault_patterns`
-- **Tested by:** `tests/test_engine.py`, `tests/test_escalation.py`, `tests/test_env_fault_patterns.py`, `tests/test_env_fault.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`
-- **Docs:** [Environment faults](escalations-guide.md#environment-faults), [[environment] reference](reference/configuration.md#environment), [[verify] reference](reference/configuration.md#verify), [Profile field reference](adapter-authoring-guide.md#cliprofile)
+  - A session whose visible pane shows a usage-limit line from its profile's `usage_limit_patterns` or `usage_wait_patterns`, on an idle session at stall-grace expiry or when the timeout fires, pauses with a `usage limit:` reason and is never charged, whatever its token usage; the same line found only in the log tail stays subject to the overrule.
+  - When the usage-limit line names a reset time, the pause reason ends its evidence with `; resets <time>` (ISO-8601 when the time resolves, the raw text otherwise).
+- **Config:** `[environment] probes`, `[environment] probe_timeout_s`, `[verify] env_fault_rc`, `[limits] quota_wait_max_min`; profile keys `env_fault_patterns`, `usage_limit_patterns`, `usage_wait_patterns`
+- **Tested by:** `tests/test_engine.py`, `tests/test_escalation.py`, `tests/test_env_fault_patterns.py`, `tests/test_env_fault.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`, `tests/test_usagereset.py`
+- **Docs:** [Environment faults](escalations-guide.md#environment-faults), [Usage-limit pauses](escalations-guide.md#usage-limit-pauses), [Usage-limit signals](adapter-authoring-guide.md#usage-limit-signals), [[environment] reference](reference/configuration.md#environment), [[verify] reference](reference/configuration.md#verify), [Profile field reference](adapter-authoring-guide.md#cliprofile)
 
 ### Resumable runs and graceful stop
 

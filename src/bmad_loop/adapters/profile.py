@@ -265,6 +265,26 @@ class CLIProfile:
     # derive from usage_parser (SUBAGENT_TRANSCRIPT_DIR_DEFAULTS); "" = off.
     # APPENDED after session_id_flag for the same positional-compatibility reason.
     subagent_transcript_dir: str | None = None
+    # Patterns naming a subscription/usage limit the CLI is stopped behind (#610),
+    # matched line-by-line against the ANSI-stripped VISIBLE pane at the same live
+    # decision points as parked_prompt_patterns (stall-grace expiry, and once when
+    # the session timeout fires) and, as ordinary env-fault families, against the
+    # post-mortem log tail. Two lists, disjoint by contract — "usage-limited" means
+    # either one matched:
+    #   usage_limit_patterns: the CLI is BLOCKED and will not continue by itself
+    #     (credit exhaustion); pause now, an operator must act.
+    #   usage_wait_patterns: the CLI is blocked but WAITING for a reset it then
+    #     continues from on its own (a session-window limit).
+    # A LIVE pane sighting exempts the verdict from the #764 token veto (the line is
+    # on screen now, so it is not a stale match from earlier in the session); a
+    # tail-only match is still subject to it. Same evidentiary bar as
+    # env_fault_patterns: seed only lines captured from the CLI's own screen, with
+    # the run cited, and single-character classes so the profile line does not
+    # match itself. Compiled and validated at parse time; empty = inert.
+    # APPENDED after subagent_transcript_dir for the same positional-compatibility
+    # reason.
+    usage_limit_patterns: tuple[str, ...] = ()
+    usage_wait_patterns: tuple[str, ...] = ()
 
     @property
     def hookless(self) -> bool:
@@ -583,6 +603,13 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 f"parked_prompt_patterns entry is not a valid regex: {pattern!r} ({e})"
             ) from e
 
+    for field_name in ("usage_limit_patterns", "usage_wait_patterns"):
+        for pattern in getattr(profile, field_name):
+            try:
+                regex.compile(pattern)  # same engine the usage gate matches with (timeout-guarded)
+            except (regex.error, RecursionError) as e:
+                raise fail(f"{field_name} entry is not a valid regex: {pattern!r} ({e})") from e
+
 
 def _legacy_adapter_default(dialect: str) -> str:
     """The adapter kind a TOML profile that predates the ``adapter`` field meant.
@@ -713,6 +740,8 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         seed_files=str_list("seed_files"),
         env_fault_patterns=str_list("env_fault_patterns"),
         parked_prompt_patterns=str_list("parked_prompt_patterns"),
+        usage_limit_patterns=str_list("usage_limit_patterns"),
+        usage_wait_patterns=str_list("usage_wait_patterns"),
         workspace_trust=workspace_trust,
         subagent_transcript_dir=raw_subagent_dir,
     )

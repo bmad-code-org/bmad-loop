@@ -31,6 +31,8 @@ class _Host(EnvFaultMixin):
         self.logs_dir = logs_dir
         self.crumbs: list[dict] = []
         self._env_fault_patterns = (regex.compile(r"^OUTAGE \w+"),)
+        self._usage_limit_patterns = ()
+        self._usage_wait_patterns = ()
 
     def _note_lifecycle(self, task_id: str, event: str, **fields: object) -> None:
         self.crumbs.append({"task": task_id, "event": event, **fields})

@@ -55,10 +55,13 @@ seed_files = [
 # configuration as a provider outage (#507). Pinned by
 # test_shipped_patterns_do_not_match_their_own_profile_line.
 #
-# No usage-limit / quota cause is seeded: no captured Claude Code quota line
-# exists, and on a pane capture that vocabulary is what a story IMPLEMENTING
-# rate limiting prints all day. Seed one only from a captured line, citing the
-# run it came from — the bar test_unseeded_profiles_stay_inert states.
+# No usage-limit / quota cause is seeded HERE: on a pane capture that vocabulary
+# is what a story IMPLEMENTING rate limiting prints all day. The two captured
+# Claude Code usage-limit sentences live in their own class below
+# (usage_limit_patterns / usage_wait_patterns), which is looked at on the live
+# pane and is exempt from the token veto only there. Seed any further one only
+# from a captured line, citing the run it came from — the bar
+# test_unseeded_profiles_stay_inert states.
 #
 # To disable or extend, copy this profile into .bmad-loop/profiles/ and edit.
 env_fault_patterns = [
@@ -87,6 +90,41 @@ parked_prompt_patterns = [
   "WARNING: Claude Code running in Bypass Permissions mod[e]",
   "Enter to confirm · Esc t[o] cancel",
 ]
+
+# Usage-limit patterns (#610): regexes matched line-by-line against the
+# ANSI-stripped VISIBLE pane at stall-grace expiry and when the session timeout
+# fires. A live match withholds the stall nudge and ends the session parked with
+# a usage-limit pause reason, exempt from the token veto (the line is on screen
+# now); the same patterns also scan the post-mortem log tail as ordinary
+# env-fault families, where the veto still applies (a limit the session
+# recovered from must not excuse a later real stall).
+#
+# usage_limit_patterns — BLOCKED, no auto-continue: credit exhaustion, the pane
+# line `You're out of usage credit` + `s. Run /usage-credits to keep using
+# <model> or /model to switch models.`, captured on psmux/Windows 11 (bmad-loop
+# 0.11.1) in runs 20260907-084618-824f (dev-1 and review-1) and
+# 20260907-090132-98e3 (dev-1 and dev-2). The model name is deliberately left
+# out of the anchor: it is whatever model the operator runs, so pinning it would
+# miss the next capture.
+#
+# usage_wait_patterns — blocked but WAITING for a reset Claude Code then
+# continues from on its own (autoContinueAtUsageLimit): the session-window
+# limit, the pane line `You've hit your session limi` + `t · resets <time>`,
+# optionally followed by a ` (<Area/City>)` zone. Captured twice: the 2026-09-07
+# psmux/Windows capture (zone suffix present) and run 20260913-165153-b850 on
+# macOS/tmux (no zone). The anchor stops at the `· resets` separator, which both
+# captures share. The same pane prints an advisory family thirteen times for
+# every two real hits — `You've used <N>% of your session` + ` limit · resets`
+# — from a session that is still working; `hit your` versus `used <N>% of your`
+# is what separates them, so the advisory can never reach this anchor.
+#
+# Both seeds keep ASCII apostrophes (both reports pasted ANSI-stripped logs), and
+# the single-character classes (`credit[s]`, `[.]`, `limi[t]`) keep each pattern
+# from matching its own line here — pinned, with the corpus, in
+# tests/test_env_fault_patterns.py. `[.]` rather than a backslash escape: a TOML
+# basic string rejects that escape.
+usage_limit_patterns = ["You're out of usage credit[s][.] Run /usage-credits"]
+usage_wait_patterns = ["You've hit your session limi[t] · resets"]
 
 # Force Claude Code's classic (inline/scrollback) renderer. The fullscreen TUI
 # (research preview, alt-screen ?1049h like vim/htop) repaints in place, so the

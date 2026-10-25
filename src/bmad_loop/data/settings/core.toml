@@ -186,6 +186,12 @@ minimum = 0
 default_ref = "LimitsPolicy.workflow_stall_nudges_cap"
 description = "total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker · 0 = stall on first grace expiry"
 [[section.field]]
+key = "quota_wait_max_min"
+kind = "int"
+minimum = 0
+default_ref = "LimitsPolicy.quota_wait_max_min"
+description = "cumulative minutes one session may sit in a usage-limit wait (the visible pane shows the coding CLI waiting out a usage-window reset it continues from by itself, and the transcript is idle) with its session timeout frozen and its stall nudge held · past the cap the session ends parked with usage-limit evidence · 0 = off (the timeout keeps counting through the wait)"
+[[section.field]]
 key = "dev_contract_nudge"
 kind = "switch"
 default_ref = "LimitsPolicy.dev_contract_nudge"
