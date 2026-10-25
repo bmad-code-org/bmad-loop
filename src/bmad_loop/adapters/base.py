@@ -366,6 +366,12 @@ class SessionResult:
     # result `wait_for_completion` returns, journaled on `session-end` only when
     # positive. APPENDED.
     quota_wait_s: float = 0.0
+    # The usage limit's reset (#610), parsed from the same live pane line as
+    # `usage_limited` (`usagereset.parse_reset`): ISO-8601 when resolved, else
+    # the raw clause text (an unknown zone, an unknown shape — crumbed as
+    # `usage-reset-unparsed`). None = no `resets` clause on the line, or not
+    # usage-limited. Named by the pause reason; journaled present-only. APPENDED.
+    usage_limit_resets: str | None = None
 
 
 class CodingCLIAdapter(ABC):

@@ -252,10 +252,14 @@ def usage_limit_pause_reason(role: str, result: SessionResult) -> str:
     Reached through ``env_fault_pause_reason`` and ``parked_pause_reason`` when
     ``result.usage_limited`` is set, so no pause site names it directly. Composed
     over `session_failure_reason`, like its siblings, so the #489 lost-session
-    suffix survives. The evidence is the visible-pane match; the tail names the
-    operator's ways out, since no retry gets past the limit on its own."""
+    suffix survives. The evidence is the visible-pane match, followed by
+    ``; resets <value>`` when the line named a reset (``usage_limit_resets``:
+    ISO-8601, or the raw clause when it did not resolve; read as given, no
+    clock here); the tail names the operator's ways out, since no retry gets
+    past the limit on its own."""
+    resets = f"; resets {result.usage_limit_resets}" if result.usage_limit_resets else ""
     return (
-        f"usage limit: {session_failure_reason(role, result)} ({result.usage_limited}; "
+        f"usage limit: {session_failure_reason(role, result)} ({result.usage_limited}{resets}; "
         "the coding CLI is blocked by a usage limit — add credits, switch model or "
         "wait for the reset, then bmad-loop resolve <run>)"
     )

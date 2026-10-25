@@ -3080,6 +3080,8 @@ class Engine:
                     wf_extras["parked_evidence"] = result.parked_evidence
             if result.usage_limited:
                 wf_extras["usage_limited"] = result.usage_limited
+            if result.usage_limit_resets:
+                wf_extras["usage_limit_resets"] = result.usage_limit_resets
             if result.quota_wait_s > 0:
                 wf_extras["quota_wait_s"] = round(result.quota_wait_s, 1)
             self.journal.append(
@@ -8393,6 +8395,10 @@ class Engine:
         # verdict from the token veto.
         if result.usage_limited:
             extras["usage_limited"] = result.usage_limited
+        # the limit's reset, parsed from the same line (#610): ISO-8601, or the
+        # raw clause when it did not resolve.
+        if result.usage_limit_resets:
+            extras["usage_limit_resets"] = result.usage_limit_resets
         # usage-limit quota wait (DW-396): present-only — the seconds the session
         # sat behind a usage-window reset with its timeout frozen.
         if result.quota_wait_s > 0:

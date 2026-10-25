@@ -806,6 +806,40 @@ def _idle_tool(journal_entries: list[dict[str, Any]], start: int, task_id: str) 
     return tool
 
 
+def _quota_wait(
+    journal_entries: list[dict[str, Any]], start: int, task_id: str
+) -> tuple[float | None, str | None]:
+    """The open session's usage-limit quota wait (DW-396, #610): ``(since,
+    resets_at)`` from the last `quota-wait-started` for `task_id` after index
+    `start` — its journal `ts` and its string `resets_at` (None when the wait
+    line named no reset) — or ``(None, None)`` when no wait is open: a later
+    `quota-wait-ended` for the same task closes it, and a wait can re-open
+    after one ends, so the latest wins. A `quota-wait-started` without a finite
+    numeric `ts` is skipped without erasing an earlier open wait, as
+    `_idle_since` skips a malformed stamp. Never raises on a malformed entry."""
+    since: float | None = None
+    resets: str | None = None
+    for entry in journal_entries[start + 1 :]:
+        if str(entry.get("task_id")) != task_id:
+            continue
+        kind = entry.get("kind")
+        if kind == "quota-wait-started":
+            raw = entry.get("ts")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                try:
+                    stamp = float(raw)
+                except OverflowError:
+                    continue
+                if math.isfinite(stamp):
+                    since = stamp
+                    raw_resets = entry.get("resets_at")
+                    resets = raw_resets if isinstance(raw_resets, str) and raw_resets else None
+        elif kind == "quota-wait-ended":
+            since = None
+            resets = None
+    return since, resets
+
+
 def active_task_id(run_dir: Path, journal_entries: list[dict[str, Any]]) -> str | None:
     """Task whose agent session is currently open: the last session-start
     without a later session-end. Falls back to the newest file in logs/ —
@@ -863,6 +897,17 @@ class ActiveAgent:
     # appends `· in <tool>` from it unless it is `none`. APPENDED, like
     # `idle_since`.
     idle_tool: str | None = None
+    # Wall timestamp the session's open usage-limit quota wait began (DW-396) —
+    # the journal `ts` of the last `quota-wait-started` not closed by a later
+    # `quota-wait-ended` — or None when no wait is open. The header renders
+    # `· quota wait <age>` from it IN PLACE OF the idle notice: the transcript
+    # sits still by design while the CLI waits out a usage-window reset, so the
+    # session is neither idle nor stuck. APPENDED, like `idle_since`.
+    quota_wait_since: float | None = None
+    # That open wait's parsed reset (#610): ISO-8601, or the raw clause text
+    # when it did not resolve; None when the wait line named none. The header
+    # appends `· resets <time>` from it. APPENDED.
+    quota_resets_at: str | None = None
 
 
 def _story_key_from_task_id(task_id: str, role: str) -> str:
@@ -918,6 +963,7 @@ def active_agent(
             name, model = resolved.name, resolved.model
         story_raw = entry.get("story_key")
         story_key = str(story_raw) if story_raw else _story_key_from_task_id(task_id, role)
+        quota_since, quota_resets = _quota_wait(journal_entries, start_index, task_id)
         return ActiveAgent(
             task_id=task_id,
             story_key=story_key,
@@ -926,6 +972,8 @@ def active_agent(
             model=model,
             idle_since=_idle_since(journal_entries, start_index, task_id),
             idle_tool=_idle_tool(journal_entries, start_index, task_id),
+            quota_wait_since=quota_since,
+            quota_resets_at=quota_resets,
         )
     except _MALFORMED_AGENT_FAULTS as e:
         return UnreadableAgent(error=f"malformed session-start or snapshot: {_describe(e)}")

@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -12723,10 +12724,18 @@ class _Quota:
         )
 
 
-def _quota_adapter(tmp_path, monkeypatch, *, screen=QUOTA_SCREEN, grace=600.0):
+# The local "now" the wait line's `resets 7:20pm` resolves against in these
+# tests (#610): one minute before the reset, inside every cap below, so the
+# reset-beyond-cap rule never skips a wait a test means to open.
+QUOTA_NOW = datetime(2026, 10, 25, 19, 19, tzinfo=timezone.utc)
+QUOTA_RESETS = "2026-10-25T19:20:00+00:00"
+
+
+def _quota_adapter(tmp_path, monkeypatch, *, screen=QUOTA_SCREEN, grace=600.0, now=QUOTA_NOW):
     """A claude dev adapter over a `_UnitMux` showing `screen`, a fake journal,
-    a pane log, a transcript, captured heartbeats and independently steerable
-    monotonic/wall clocks."""
+    a pane log, a transcript, captured heartbeats, independently steerable
+    monotonic/wall clocks and a pinned local `now` for the reset parse."""
+    monkeypatch.setattr(generic, "_local_now", lambda: now)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
     mux = _UnitMux(screen=screen)
@@ -12833,6 +12842,7 @@ def test_quota_wait_freezes_the_session_timeout(tmp_path, monkeypatch):
         "remaining_s": 210.0,
         "waited_s": 0.0,
         "cap_s": 3600.0,
+        "resets_at": QUOTA_RESETS,
     }
     assert ended == {
         "kind": "quota-wait-ended",
@@ -13131,6 +13141,139 @@ def test_heartbeat_carries_quota_wait_fields(tmp_path, monkeypatch):
         30.0,
     ]
     assert result.quota_wait_s == 120.0
+
+
+# ------------------------------------------ usage-limit reset parse (#610)
+#
+# The matched wait/limit line's `resets …` clause is parsed (`usagereset`) from
+# the FULL pane line into `SessionResult.usage_limit_resets`, the heartbeat's
+# `quota_resets_at` and `quota-wait-started`'s `resets_at`. A reset the cap could
+# not outlast skips the wait. `_quota_adapter` pins the local `now`.
+
+
+def test_reset_beyond_cap_skips_the_wait(tmp_path, monkeypatch):
+    """At 12:00 a `resets 7:20pm` line lies 7h20m out, beyond the 1 h cap: the
+    wait the cap would end anyway is never opened. The session ends at the
+    admission heartbeat (mono 1090) stalled + parked with the usage evidence and
+    the parsed reset, never completed, the timeout untouched, no wait recorded.
+
+    Ablation: drop the reset-beyond-cap branch and the wait opens (quota kinds
+    recorded, no `quota-wait-skipped`), running on to its cap."""
+    q = _quota_adapter(
+        tmp_path, monkeypatch, now=datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    )
+    result = _drive_quota(q, _quota_spec(tmp_path, cap_s=3600.0))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence == result.usage_limited == q.wait_evidence()
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.result_json is None
+    assert result.quota_wait_s == 0.0
+    assert q.quota_kinds() == []
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    assert _lifecycle_events(q.adapter, "timeout-fired") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert skipped["reason"] == "reset-beyond-cap"
+    assert skipped["evidence"] == q.wait_evidence()
+    assert skipped["resets_at"] == QUOTA_RESETS
+    assert skipped["cap_left_s"] == 3600.0
+    assert q.clock["mono"] == 1090.0
+
+
+def test_reset_within_cap_waits(tmp_path, monkeypatch):
+    """At 18:30 the same reset is 50 min out, inside the 1 h cap: the wait opens
+    as before, `quota-wait-started` and the heartbeat carry the parsed reset
+    while waiting (and only then), and the session completes on its Stop after
+    the CLI continues.
+
+    Ablation: compare the reset against the cap with the sign flipped (or
+    against zero) and this skips the wait instead."""
+    q = _quota_adapter(
+        tmp_path, monkeypatch, now=datetime(2026, 10, 25, 18, 30, tzinfo=timezone.utc)
+    )
+
+    def script(call_n):
+        if call_n == 8:
+            _grow(q.transcript, _assistant_line())
+        if call_n == 9:
+            q.finish_spec()
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path, cap_s=3600.0),
+        events={9: _stop_event("3-1-dev-1", "sess", str(q.transcript))},
+        script=script,
+    )
+    assert result.status == "completed"
+    assert result.usage_limit_resets is None  # it continued: no usage verdict
+    assert _lifecycle_events(q.adapter, "quota-wait-skipped") == []
+    assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
+    started = next(e for e in q.adapter.journal.entries if e["kind"] == "quota-wait-started")
+    assert started["resets_at"] == QUOTA_RESETS
+    (crumb,) = _lifecycle_events(q.adapter, "quota-wait-started")
+    assert crumb["resets_at"] == QUOTA_RESETS
+    resets = [hb.get("quota_resets_at") for hb in q.heartbeats]
+    # heartbeats at mono 1000/1030/1060 (before), 1090…1180 (waiting), 1210
+    # (the transcript moved: ended ahead of the write)
+    assert resets[:3] == [None] * 3
+    assert resets[3:7] == [QUOTA_RESETS] * 4
+    assert resets[7:] == [None]
+
+
+def test_usage_limited_result_carries_the_parsed_reset(tmp_path, monkeypatch):
+    """Every usage-limited exit carries the reset parsed from the matched line:
+    the stall-expiry gate (quota wait off, silent pane), the timeout-fired look,
+    and the quota-wait cap."""
+    for sub in ("stall", "timeout", "cap"):
+        (tmp_path / sub).mkdir()
+    stall = _quota_adapter(tmp_path / "stall", monkeypatch, grace=120.0)
+    result = _drive_quota(stall, _quota_spec(tmp_path, cap_s=0.0), repaint=False)
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == stall.wait_evidence()
+    assert result.usage_limit_resets == QUOTA_RESETS
+
+    timeout = _quota_adapter(tmp_path / "timeout", monkeypatch)
+    result = _drive_quota(timeout, _quota_spec(tmp_path, cap_s=0.0))
+    assert result.status == "timeout"
+    assert result.usage_limited == timeout.wait_evidence()
+    assert result.usage_limit_resets == QUOTA_RESETS
+
+    cap = _quota_adapter(tmp_path / "cap", monkeypatch)
+    result = _drive_quota(cap, _quota_spec(tmp_path, cap_s=600.0))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert _lifecycle_events(cap.adapter, "quota-wait-cap")
+    assert result.usage_limit_resets == QUOTA_RESETS
+    for q in (stall, timeout, cap):
+        assert _lifecycle_events(q.adapter, "usage-reset-unparsed") == []
+
+
+@pytest.mark.parametrize(
+    ("clause", "reason"),
+    [("7:20pm (Mars/Olympus_Mons)", "zone-unavailable"), ("in a little while", "unparsed")],
+)
+def test_unparsed_reset_is_crumbed_and_kept_raw(tmp_path, monkeypatch, clause, reason):
+    """A reset that does not resolve (a zone this host's database lacks, an
+    unknown shape) is a visible degrade: a `usage-reset-unparsed` crumb naming
+    why, and the raw clause carried in place of a time. It cannot be compared
+    with the cap, so the wait still opens (the cap bounds it) and ends there
+    with the raw text on the result. The zone lookup is faked, so no host
+    tzdata is read."""
+    from bmad_loop import usagereset
+
+    def no_zone(name):
+        raise usagereset.ZoneInfoNotFoundError(name)
+
+    monkeypatch.setattr(usagereset, "ZoneInfo", no_zone)
+    line = USAGE_SESSION_LINE.replace("7:20pm", clause)
+    q = _quota_adapter(tmp_path, monkeypatch, screen=f"{line}\r\n❯ \r\n")
+    result = _drive_quota(q, _quota_spec(tmp_path, cap_s=600.0))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limit_resets == clause
+    crumbs = _lifecycle_events(q.adapter, "usage-reset-unparsed")
+    assert crumbs and all(c["reason"] == reason and c["raw"] == clause for c in crumbs)
+    assert _lifecycle_events(q.adapter, "quota-wait-skipped") == []
+    started = next(e for e in q.adapter.journal.entries if e["kind"] == "quota-wait-started")
+    assert started["resets_at"] == clause
+    assert any(hb.get("quota_resets_at") == clause for hb in q.heartbeats)
 
 
 # ------------------------------- session-start-missing notice

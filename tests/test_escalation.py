@@ -388,6 +388,23 @@ def test_review_usage_limited_pauses_with_usage_reason(status):
         assert _USAGE_EVIDENCE in decision.reason
 
 
+@pytest.mark.parametrize(
+    "resets", ["2026-10-25T19:20:00+07:00", "7:20pm (Mars/Olympus_Mons)"], ids=["iso", "raw"]
+)
+def test_usage_reason_names_the_reset(resets):
+    """#610: a parsed reset rides the reason as `; resets <value>` right after
+    the evidence — ISO-8601, or the raw clause when it did not resolve, read as
+    given (no clock here). Without one the reason is unchanged.
+    ABLATION: drop the `resets` suffix from `usage_limit_pause_reason` and the
+    first assertion fails."""
+    for result in _usage_limited_results("stalled"):
+        with_reset = dataclasses.replace(result, usage_limit_resets=resets)
+        reason = decide_dev(_task(attempt=1), with_reset, None, POLICY).reason
+        assert f"{_USAGE_EVIDENCE}; resets {resets}; the coding CLI" in reason
+        plain = decide_dev(_task(attempt=1), result, None, POLICY).reason
+        assert "resets" not in plain.replace(_USAGE_EVIDENCE, "")
+
+
 def test_usage_limit_reason_keeps_the_lost_session_suffix():
     """Composed over `session_failure_reason` (#489), like its siblings."""
     vanished = SessionResult(status="stalled", usage_limited="x", session_vanished=True)

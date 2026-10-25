@@ -950,6 +950,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # exists to draw. Names no path, identifier or prose.
         "regen_cause",
         "remaining",
+        # `quota-wait-started` (#610): the wait line's parsed reset — ISO-8601,
+        # or the raw clause text after `resets` when it did not resolve.
+        "resets_at",
         # `quota-wait-started` (DW-396): the session-timeout seconds the wait
         # froze — a measured float.
         "remaining_s",
@@ -1027,6 +1030,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `session-end` / `workflow-end` (DW-396): the seconds the session sat in a
         # usage-limit quota wait with its timeout frozen — a measured float.
         "quota_wait_s",
+        # `session-end` / `workflow-end` (#610): the usage limit's reset parsed
+        # from the same pane line — ISO-8601, or the raw clause text.
+        "usage_limit_resets",
         "verification_sequence",
         "verification_stage",
         "via",
@@ -1206,6 +1212,7 @@ JOURNAL_SPLAT_FIELDS = {
             "parked_evidence",
             "usage_limited",
             "quota_wait_s",
+            "usage_limit_resets",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys

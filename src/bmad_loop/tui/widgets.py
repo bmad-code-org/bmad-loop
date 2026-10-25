@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -147,6 +148,20 @@ def _format_age(seconds: float) -> str:
     return f"{minutes // 60}h{minutes % 60:02d}m"
 
 
+def _format_reset(value: str) -> str:
+    """A quota wait's reset for the header's `· resets <time>` text (#610): an
+    aware ISO-8601 value as this host's local weekday and time (`Mon 12:50`),
+    so the operator reads it in the clock they see; anything else — the raw
+    clause of a reset that did not resolve — as given."""
+    try:
+        at = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if at.tzinfo is None:
+        return value
+    return at.astimezone().strftime("%a %H:%M")
+
+
 class RunHeader(Static):
     """One-glance summary of the selected run, or the empty-state hint."""
 
@@ -246,7 +261,19 @@ class RunHeader(Static):
                 text.append(f" · {agent.model}", style="cyan")
             if agent.role:
                 text.append(f" · {agent.role}", style="dim")
-            if agent.idle_since is not None:
+            if agent.quota_wait_since is not None:
+                # A usage-limit quota wait is open (DW-396): the CLI is waiting
+                # out a usage-window reset it continues from by itself, with the
+                # session timeout frozen. Its transcript sits still by design, so
+                # this replaces the idle notice — the session is neither idle
+                # nor stuck. `· resets <time>` names the parsed reset (#610).
+                text.append(
+                    f" · quota wait {_format_age(time.time() - agent.quota_wait_since)}",
+                    style="yellow",
+                )
+                if agent.quota_resets_at:
+                    text.append(f" · resets {_format_reset(agent.quota_resets_at)}", style="yellow")
+            elif agent.idle_since is not None:
                 # The transcript has sat still past the stall grace (#680): the
                 # pane may still be repainting a spinner, so this is the one
                 # surface that separates a session working from one parked in a

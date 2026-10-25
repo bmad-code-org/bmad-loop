@@ -1043,6 +1043,63 @@ def test_active_agent_idle_since_ignores_other_tasks_and_earlier_sessions():
     assert agent is not None and agent.idle_since is None
 
 
+def test_open_quota_wait_renders_as_quota_wait_not_idle():
+    """DW-396/#610: the last `quota-wait-started` for the open session's task,
+    not closed by a later `quota-wait-ended`, sets `quota_wait_since` to its
+    journal `ts` and `quota_resets_at` to its `resets_at` — alongside the open
+    idle stretch the wait necessarily has, which the header then renders as a
+    quota wait instead. A wait can re-open after it ends: the latest wins.
+
+    ABLATION: drop the `_quota_wait` derivation from `active_agent` and the
+    first assertion reddens."""
+    task = "1-1-alpha-dev-3"
+    idle = {"kind": "session-idle", "task_id": task, "since_ts": 5030.0}
+    started = {
+        "kind": "quota-wait-started",
+        "task_id": task,
+        "ts": 5090.0,
+        "resets_at": "2026-10-25T19:20:00+00:00",
+    }
+    ended = {"kind": "quota-wait-ended", "task_id": task, "ts": 5600.0, "how": "transcript-active"}
+    agent = data.active_agent([_stamped_start(), idle, started], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.quota_wait_since, agent.quota_resets_at) == (5090.0, "2026-10-25T19:20:00+00:00")
+    assert agent.idle_since == 5030.0  # still idle: the header chooses the wait
+
+    agent = data.active_agent([_stamped_start(), idle, started, ended], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.quota_wait_since, agent.quota_resets_at) == (None, None)
+
+    reopened = {"kind": "quota-wait-started", "task_id": task, "ts": 6000.0}
+    agent = data.active_agent([_stamped_start(), started, ended, reopened], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.quota_wait_since, agent.quota_resets_at) == (6000.0, None)
+
+    # another task's wait, an earlier session's, and a session-end all read as none
+    other = dict(started, task_id="2-2-beta-dev-1")
+    for entries in (
+        [_stamped_start(), other],
+        [started, _stamped_start()],
+        [_stamped_start(), started, {"kind": "session-end", "task_id": task}],
+    ):
+        agent = data.active_agent(entries, None)
+        assert not isinstance(agent, data.ActiveAgent) or agent.quota_wait_since is None
+
+
+def test_open_quota_wait_never_raises_on_malformed_entry():
+    """A `quota-wait-started` without a finite numeric `ts` is skipped without
+    erasing an earlier open wait; a non-string `resets_at` reads as none."""
+    task = "1-1-alpha-dev-3"
+    good = {"kind": "quota-wait-started", "task_id": task, "ts": 5090.0, "resets_at": 7}
+    for ts in (None, "soon", True, float("nan"), float("inf"), 10**1000):
+        bad = {"kind": "quota-wait-started", "task_id": task, "ts": ts, "resets_at": "x"}
+        agent = data.active_agent([_stamped_start(), bad], None)
+        assert isinstance(agent, data.ActiveAgent) and agent.quota_wait_since is None
+        agent = data.active_agent([_stamped_start(), good, bad], None)
+        assert isinstance(agent, data.ActiveAgent)
+        assert (agent.quota_wait_since, agent.quota_resets_at) == (5090.0, None)
+
+
 def test_active_agent_idle_since_never_raises_on_malformed_entry():
     """A `session-idle` without a numeric `since_ts` is skipped (the TUI ages the
     text from it); the agent itself is still derived."""

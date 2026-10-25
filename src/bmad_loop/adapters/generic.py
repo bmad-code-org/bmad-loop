@@ -37,6 +37,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
@@ -51,6 +52,7 @@ from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from ..signals import REBIND_SOURCES, SessionAttribution, SignalWatcher
 from ..tokens import read_usage as tally_usage
+from ..usagereset import UsageReset, parse_reset
 from ..verify import read_frontmatter, status_of
 from .base import (
     CodingCLIAdapter,
@@ -205,7 +207,8 @@ class _QuotaWait:
     clock. An open wait's length is the LONGER of the two elapsed spans, so a
     host suspend (monotonic frozen, wall running) cannot stretch the cap.
     `closed_s` sums the waits that already ended; `evidence` is the pane line
-    that admitted the open one."""
+    that admitted the open one, `resets` its parsed reset (`UsageReset.value`,
+    #610), None when the line named none."""
 
     waiting: bool = False
     started_mono: float = 0.0
@@ -213,6 +216,7 @@ class _QuotaWait:
     frozen_remaining: float = 0.0
     closed_s: float = 0.0
     evidence: str | None = None
+    resets: str | None = None
 
     def open_s(self) -> float:
         if not self.waiting:
@@ -221,6 +225,13 @@ class _QuotaWait:
 
     def total_s(self) -> float:
         return self.closed_s + self.open_s()
+
+
+def _local_now() -> datetime:
+    """The aware local "now" a usage-limit reset clause is resolved against
+    (#610). Read off this module's wall clock, so the reset moves with the
+    session's own clock (and a test steering that clock steers this too)."""
+    return datetime.fromtimestamp(time.time()).astimezone()
 
 
 # min spacing between heartbeat.json overwrites in wait_for_completion; the
@@ -1498,15 +1509,17 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 handle, stop_seen, activity_seen or transcript_work_seen or usage_seen
             )
 
-        def stall_exit(parked_now: str | None, usage_now: str | None) -> SessionResult:
+        def stall_exit(
+            parked_now: str | None, usage_now: str | None, resets_now: str | None = None
+        ) -> SessionResult:
             """The non-completion exit of a stalled session (DW-348, #610):
             resolve, then re-probe liveness. A now-dead window is ``crashed``
             (never parked or usage-limited: nothing waits on a human once the CLI
             is gone). Otherwise ``stalled`` with ``accept_result=False``: an
             artifact on disk cannot upgrade the stall to completed (it may be
             stale or mid-write; only a Stop or window death vouches for it), and
-            ``parked_now`` / ``usage_now`` label it. Both exits carry the
-            rollout."""
+            ``parked_now`` / ``usage_now`` / ``resets_now`` label it. Both exits
+            carry the rollout."""
             try_resolve()
             if self._probe_liveness(handle, "stall") is False:
                 return self._final(
@@ -1532,7 +1545,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             )
             if parked_now is not None:
                 return dataclasses.replace(
-                    stalled, parked=True, parked_evidence=parked_now, usage_limited=usage_now
+                    stalled,
+                    parked=True,
+                    parked_evidence=parked_now,
+                    usage_limited=usage_now,
+                    usage_limit_resets=resets_now if usage_now is not None else None,
                 )
             return stalled
 
@@ -1557,7 +1574,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                     evidence = quota.evidence
                     self._end_quota_wait(handle, quota, "cap")
-                    return stall_exit(evidence, evidence)
+                    return stall_exit(evidence, evidence, quota.resets)
                 # The freeze runs on EVERY tick, not only on heartbeats: a wait
                 # admitted with less than a heartbeat interval left would
                 # otherwise time out between samples. This is the one sanctioned
@@ -1600,9 +1617,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # is gone, though a remain-on-exit pane still captures), so a
                 # match is confirmed alive first; a probe fault reads "not dead".
                 (usage_hit,) = self._pane_evidence(handle, self._usage_pane_patterns)
-                usage_now = None
+                usage_now = resets_now = None
                 if usage_hit is not None and self._probe_liveness(handle, "timeout") is not False:
                     usage_now = usage_hit[0]
+                    reset = self._usage_reset(handle, usage_hit[1], _local_now())
+                    resets_now = reset.value if reset is not None else None
                 return SessionResult(
                     status="timeout",
                     session_id=session_id,
@@ -1613,6 +1632,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     stop_seen=stop_seen,
                     produced_work=produced_work(),
                     usage_limited=usage_now,
+                    usage_limit_resets=resets_now,
                 )
             # Hard-stop poll (#319), per-iteration and deliberately NOT inside
             # the heartbeat throttle below: the loop's own wait is capped at 5s
@@ -1674,6 +1694,30 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     if wait_hit is not None and not self._quota_wait_tool_open(
                         handle, transcript_path
                     ):
+                        local_now = _local_now()
+                        reset = self._usage_reset(handle, wait_hit[1], local_now)
+                        resets = reset.value if reset is not None else None
+                        cap_left = spec.quota_wait_max_s - quota.closed_s
+                        if (
+                            reset is not None
+                            and reset.at is not None
+                            and (reset.at - local_now).total_seconds() > cap_left
+                        ):
+                            # Reset-beyond-cap (#610): the CLI will not continue
+                            # before the cap would end the wait anyway, so don't
+                            # freeze the clock for it. Ends exactly as the cap
+                            # does: stalled + parked + usage-limited, never
+                            # completed. An unresolved reset cannot be compared
+                            # and waits as before (the cap still bounds it).
+                            self._note_lifecycle(
+                                handle.task_id,
+                                "quota-wait-skipped",
+                                reason="reset-beyond-cap",
+                                evidence=wait_hit[0],
+                                resets_at=resets,
+                                cap_left_s=round(cap_left, 3),
+                            )
+                            return stall_exit(wait_hit[0], wait_hit[0], resets)
                         frozen = max(
                             min(remaining, wall_deadline - time.time()),
                             QUOTA_WAIT_MIN_REMAINING_S,
@@ -1684,12 +1728,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             round(frozen, 3),
                             round(quota.closed_s, 3),
                             spec.quota_wait_max_s,
+                            resets,
                         )
                         quota.waiting = True
                         quota.started_mono = time.monotonic()
                         quota.started_wall = time.time()
                         quota.frozen_remaining = frozen
                         quota.evidence = wait_hit[0]
+                        quota.resets = resets
                 if not saw_session_start and not session_start_noted:
                     session_start_noted = self._note_session_start_missing(
                         handle, now - loop_started
@@ -1721,6 +1767,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 "quota_wait_s": round(quota.total_s(), 3),
                             }
                             if quota_enabled
+                            else {}
+                        ),
+                        # the open wait's parsed reset (#610), while waiting
+                        # on a line that named one.
+                        **(
+                            {"quota_resets_at": quota.resets}
+                            if quota.waiting and quota.resets is not None
                             else {}
                         ),
                     },
@@ -2004,7 +2057,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                     if parked_now is None and parked_hit is not None:
                         parked_now = parked_hit[0]
-                    usage_now = usage_hit[0] if usage_hit is not None else None
+                    usage_now = resets_now = None
+                    if usage_hit is not None:
+                        usage_now = usage_hit[0]
+                        reset = self._usage_reset(handle, usage_hit[1], _local_now())
+                        resets_now = reset.value if reset is not None else None
                     if parked_now is None:
                         parked_now = usage_now
                     if parked_now is not None:
@@ -2048,7 +2105,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # persistent failure. A dead window is never labelled parked:
                     # nothing is waiting on a human once the CLI is gone. The
                     # probe fault is crumbed (`site="stall"`, DW-454).
-                    return stall_exit(parked_now, usage_now)
+                    return stall_exit(parked_now, usage_now, resets_now)
                 continue
             # Drop a nested CLI's events before they can re-point the identity
             # or transcript, set stop_seen, spend nudges or re-arm the stall
@@ -2644,7 +2701,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         remaining_s: float,
         waited_s: float,
         cap_s: float,
+        resets_at: str | None = None,
     ) -> None:
+        # the parsed reset (#610), present-only on both records
+        resets = {"resets_at": resets_at} if resets_at is not None else {}
         self._note_lifecycle(
             handle.task_id,
             "quota-wait-started",
@@ -2652,6 +2712,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             remaining_s=remaining_s,
             waited_s=waited_s,
             cap_s=cap_s,
+            **resets,
         )
         if self.journal is None:
             return
@@ -2662,9 +2723,23 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 remaining_s=remaining_s,
                 waited_s=waited_s,
                 cap_s=cap_s,
+                **resets,
             )
         except OSError:
             pass
+
+    def _usage_reset(self, handle: SessionHandle, line: str, now: datetime) -> UsageReset | None:
+        """The reset clause of a matched usage-limit pane line (#610), parsed
+        from the FULL line (the evidence excerpt may cut it). A clause that does
+        not resolve is a visible degrade: a `usage-reset-unparsed` crumb
+        (`reason` = `zone-unavailable` | `unparsed`, `raw`), and the caller
+        carries the raw text in place of a time."""
+        reset = parse_reset(line, now)
+        if reset is not None and reset.unresolved is not None:
+            self._note_lifecycle(
+                handle.task_id, "usage-reset-unparsed", reason=reset.unresolved, raw=reset.raw
+            )
+        return reset
 
     def _note_quota_wait_cap(
         self, handle: SessionHandle, evidence: str | None, waited_s: float, cap_s: float

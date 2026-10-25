@@ -16,6 +16,10 @@ breaking changes may land in a minor release.
   auto-continue. Past the cap the session pauses with a usage-limit reason.
   `heartbeat.json` gains `quota_waiting` / `quota_wait_s`, `session-end` gains
   `quota_wait_s`, and the journal gains `quota-wait-started` / `-ended` / `-cap`.
+  The line's `resets …` time is parsed into the pause reason (`; resets <time>`),
+  `heartbeat.json` (`quota_resets_at`), `session-end` (`usage_limit_resets`) and the
+  TUI header, which shows `quota wait` instead of `idle`. A reset beyond the remaining
+  cap skips the wait and pauses at once.
 - Add the experimental `tickets` work source for BMAD v7 initiative ticket trees
   (`[stories] source = "tickets"`): dispatch `bmad-build-auto ticket <ref>` in initiative
   build order, verify each plan at `built`, and mark it `done` through `tickets.py mark`

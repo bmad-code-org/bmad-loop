@@ -15401,6 +15401,36 @@ def test_session_end_carries_quota_wait_s_only_when_positive(project):
     assert "quota_wait_s" not in plain_end
 
 
+def test_session_end_carries_usage_limit_resets_only_when_set(project):
+    """#610: the usage limit's parsed reset rides `session-end` present-only and
+    names itself in the pause reason.
+    ABLATION: drop the `usage_limit_resets` extras line from `_session_end_extras`
+    and the session-end assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
+    engine, _ = make_engine(
+        project,
+        [
+            SessionResult(
+                status="stalled",
+                parked=True,
+                parked_evidence=evidence,
+                usage_limited=evidence,
+                usage_limit_resets="2026-10-25T19:20:00+00:00",
+            )
+        ],
+    )
+    engine.run()
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["usage_limit_resets"] == "2026-10-25T19:20:00+00:00"
+    assert engine.state.paused_reason is not None
+    assert "; resets 2026-10-25T19:20:00+00:00" in engine.state.paused_reason
+    engine2, _ = make_engine(project, [SessionResult(status="stalled")])
+    engine2.run()
+    plain_end = [e for e in engine2.journal.entries() if e["kind"] == "session-end"][-1]
+    assert "usage_limit_resets" not in plain_end
+
+
 def test_session_env_fault_pauses_dev_without_burning_budget(project):
     """A dev session classified an environment fault (#194) pauses the run at the
     first story rather than charging the attempt; the decision + session-end carry
