@@ -222,6 +222,23 @@ What to do depends on where it hit:
 | `probe:decision:dev`, `probe:decision:fix`, `probe:claim:dev`, `probe:claim:fix`                 | yes, if the latest dev session completed       |
 | `probe:dispatch:dev`, `probe:dispatch:review`                                                    | no: it is an `environment` pause; use `resume` |
 
+### Usage-limit pauses
+
+A session the adapter saw blocked by a coding-CLI usage limit (out of credits, or a session-window limit) pauses with a reason of the form:
+
+```text
+usage limit: dev session stalled (<pane line>; resets <time>; the coding CLI is blocked by a usage limit — add credits, switch model or wait for the reset, then bmad-loop resolve <run>)
+```
+
+The attempt is not charged, whatever tokens the session used before the limit hit: the line was on screen when the session ended. `<pane line>` is the matched line from the CLI's screen. `; resets <time>` appears only when that line names a reset: an ISO-8601 time when it resolves, otherwise the text as printed (for example when the host has no time-zone data for the zone the CLI named).
+
+To recover:
+
+1. Clear the limit: add credits, switch the session's model (`[adapter] model`, or the stage's `[adapter.<stage>]`), or wait until the reset time.
+2. `bmad-loop resolve <run-id> --no-interactive` re-arms the story with a fresh attempt budget and resumes. The spec needs no fix.
+
+A session-window limit the CLI waits out by itself does not pause at all at first. While the pane shows that wait and the transcript is idle, the session timeout stands still and no stall nudge is sent, so the session finishes after the CLI continues. `[limits] quota_wait_max_min` (default 300, one five-hour window; 0 = off) caps the minutes one session may spend waiting. Past the cap, or when the parsed reset already lies beyond what is left of it, the session pauses with the reason above. A heartbeat shows the wait as `quota_waiting` / `quota_wait_s` / `quota_resets_at`, and the TUI header as `quota wait`.
+
 ## Worktree merge-back failures
 
 Under `[scm] isolation = "worktree"`, each story merges back into the target branch in the main checkout. When the merge fails, the unit escalates: its branch `bmad-loop/<run-id>[/<story>]` and worktree are kept, the diff is saved to `.bmad-loop/runs/<run-id>/failed/<unit>/changes.patch`, and the run pauses at `escalation`.

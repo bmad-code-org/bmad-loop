@@ -10,16 +10,13 @@ breaking changes may land in a minor release.
 ### Added
 
 - Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
-  Claude Code waiting out a usage-window reset and the transcript is idle, the session
-  timeout stands still and the stall nudge is held, so the session no longer burns
-  `session_timeout_min` behind the limit and can finish after the CLI's own
-  auto-continue. Past the cap the session pauses with a usage-limit reason.
-  `heartbeat.json` gains `quota_waiting` / `quota_wait_s`, `session-end` gains
-  `quota_wait_s`, and the journal gains `quota-wait-started` / `-ended` / `-cap`.
-  The line's `resets …` time is parsed into the pause reason (`; resets <time>`),
-  `heartbeat.json` (`quota_resets_at`), `session-end` (`usage_limit_resets`) and the
-  TUI header, which shows `quota wait` instead of `idle`. A reset beyond the remaining
-  cap skips the wait and pauses at once.
+  Claude Code waiting out a usage-window reset and the transcript is idle, freeze the
+  session timeout and hold the stall nudge, so the session finishes after the CLI's own
+  auto-continue. Past the cap, or when the parsed reset lies beyond it, pause with a
+  usage-limit reason. Surface the wait and the reset time in `heartbeat.json`
+  (`quota_waiting`, `quota_wait_s`, `quota_resets_at`), `session-end` (`quota_wait_s`,
+  `usage_limit_resets`), the journal (`quota-wait-*`), the pause reason
+  (`; resets <time>`) and the TUI header (`quota wait`).
 - Add the experimental `tickets` work source for BMAD v7 initiative ticket trees
   (`[stories] source = "tickets"`): dispatch `bmad-build-auto ticket <ref>` in initiative
   build order, verify each plan at `built`, and mark it `done` through `tickets.py mark`
@@ -186,9 +183,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Pause a Claude session blocked by a usage limit (credit exhaustion or a session-window
-  limit seen on the live pane) with a `usage limit:` reason instead of charging it a dev
-  attempt; a live sighting is exempt from the token veto. New profile fields
+- Pause a Claude session seen blocked by a usage limit (credit exhaustion or a
+  session-window limit) with a `usage limit:` reason instead of charging a dev attempt;
+  a live pane sighting is exempt from the token veto. Add the profile fields
   `usage_limit_patterns` and `usage_wait_patterns`, seeded from lines captured in
   community reports (#610).
 - Read an epic the initiative declares but has not sliced yet: `status` no longer

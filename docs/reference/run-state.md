@@ -83,7 +83,7 @@ The opencode adapter's environment-fault classifier scans `<task_id>.server.out`
 
 - **`state.json`** — the serialized run state (stories, phases, tokens, the `finished` / `stopped` / `crashed` flags, and `paused_reason` with the pause context). Written atomically under a per-run lock, through the pinned run-directory descriptor above; `bmad-loop status` reads it.
 - **`journal.jsonl`** — append-only, one JSON object per line with `ts` and `kind`; the first entry is `run-start` (after one `journal-unpinned` row on a filesystem that reports no inode numbers). Lines end in LF on every platform. Written through the pinned run-directory descriptor by the engine, and by commands that act on the run (for example `stop`, `resume`, `resolve`). From the first session launch on, lines carry `log_task` / `log_pos`, pointing into the most recent session's log.
-- **`heartbeat.json`** (in `tasks/<task_id>/`) — the wait loop's proof of life, overwritten at most every 30 seconds while a session runs: remaining budget, stall-recovery state and probe or sampling failure counts.
+- **`heartbeat.json`** (in `tasks/<task_id>/`) — the wait loop's proof of life, overwritten at most every 30 seconds while a session runs: remaining budget, stall-recovery state and probe or sampling failure counts. A session that can wait out a usage-limit reset (`[limits] quota_wait_max_min` above 0 and a profile with `usage_wait_patterns`) also carries `quota_waiting` and `quota_wait_s` (cumulative seconds waited), plus `quota_resets_at` while it waits on a line that named a reset.
 
 `state.json` records the run's work source. A bmad-loop that does not know that source refuses to resume the run rather than drive it as a sprint run, so finish or abandon a run before downgrading bmad-loop.
 
@@ -114,15 +114,15 @@ A store that is its own git repository (T3 nested, T4 external) then gets a plan
 
 `tasks/<task_id>/` is created per agent session. The task id is `<story_key>-<part>-<n>`, where `part` is `dev`, `review`, `triage` or a workflow label and `n` is the attempt or review cycle; a re-armed story adds `-g<generation>`.
 
-| File                      | Written by        | Contents                                                                                                                                                         |
-| ------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `prompt.txt`              | adapter           | the session prompt, rewritten each launch                                                                                                                        |
-| `result.json`             | session           | the session's result contract (verdict, escalations)                                                                                                             |
-| `escalation.json`         | sweep session     | escalations raised during triage                                                                                                                                 |
-| `heartbeat.json`          | adapter           | proof of life (above)                                                                                                                                            |
-| `resultless-stops.jsonl`  | built-in adapters | one line per Stop event whose result could not be read                                                                                                           |
-| `session-lifecycle.jsonl` | built-in adapters | one line per lifecycle event (timeout, budget trip, environment-fault classification)                                                                            |
-| `messages.json`           | opencode adapter  | raw server messages, kept as the transcript; the shape is the server's own (1.x: each message's info and parts; 2.x: user/assistant/idle messages, oldest first) |
+| File                      | Written by        | Contents                                                                                                                                                                                     |
+| ------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `prompt.txt`              | adapter           | the session prompt, rewritten each launch                                                                                                                                                    |
+| `result.json`             | session           | the session's result contract (verdict, escalations)                                                                                                                                         |
+| `escalation.json`         | sweep session     | escalations raised during triage                                                                                                                                                             |
+| `heartbeat.json`          | adapter           | proof of life (above)                                                                                                                                                                        |
+| `resultless-stops.jsonl`  | built-in adapters | one line per Stop event whose result could not be read                                                                                                                                       |
+| `session-lifecycle.jsonl` | built-in adapters | one line per lifecycle event (timeout, budget trip, environment-fault classification, usage-limit quota wait: `quota-wait-started` / `-ended` / `-cap` / `-skipped`, `usage-reset-unparsed`) |
+| `messages.json`           | opencode adapter  | raw server messages, kept as the transcript; the shape is the server's own (1.x: each message's info and parts; 2.x: user/assistant/idle messages, oldest first)                             |
 
 `result.json` and `escalation.json` are the shared cycle artifacts (`journal.TASK_CYCLE_ARTIFACTS`). Both built-in adapters delete them before launching a session, so a reused task id never inherits a previous session's result. Adapters refuse a task directory that is a symlink or junction, and an adapter-written file (heartbeat, breadcrumb logs, `messages.json`, session logs) that is a link or special file.
 

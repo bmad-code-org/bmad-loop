@@ -206,7 +206,10 @@ default is used; `role` is the session's stage, such as `dev`, `review`,
 `· idle <age>` once the session's transcript (and any subagent transcripts its
 profile declares) has been quiet past
 `limits.dev_stall_grace_s`, followed by `· in <tool>` when the session is
-waiting on a tool call (`unknown` if the transcript could not be read). Between sessions it shows the run's configured
+waiting on a tool call (`unknown` if the transcript could not be read). A session
+waiting out a usage-limit reset shows `· quota wait <age>` in place of `· idle <age>`,
+followed by `· resets <Ddd HH:MM>` (local time) when the limit line named a reset that
+resolved, or the reset text as printed when it did not. Between sessions it shows the run's configured
 adapters from its policy snapshot. A run with no snapshot shows no agent line;
 an unreadable session identity shows `agent unreadable — <fault>`.
 

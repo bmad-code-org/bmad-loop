@@ -323,6 +323,8 @@ a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` reso
 | `seed_files`                       |          | `[]`                                                                           | Project-relative gitignored files copied into each provisioned worktree. Must stay inside the project.                                                                                                            |
 | `env_fault_patterns`               |          | `[]`                                                                           | Regexes that classify a non-completed session as an environment fault. See [Environment-fault patterns](#environment-fault-patterns).                                                                             |
 | `parked_prompt_patterns`           |          | `[]`                                                                           | Regexes matched against the visible pane at each stall-grace expiry. See [Parked-session signals](#parked-session-signals).                                                                                       |
+| `usage_limit_patterns`             |          | `[]`                                                                           | Regexes for a usage-limit line the CLI stays blocked behind until an operator acts. See [Usage-limit signals](#usage-limit-signals).                                                                              |
+| `usage_wait_patterns`              |          | `[]`                                                                           | Regexes for a usage-limit line the CLI waits out and continues from by itself. Disjoint from `usage_limit_patterns`. See [Usage-limit signals](#usage-limit-signals).                                             |
 | `[workspace_trust]`                |          | unset                                                                          | The [`WorkspaceTrustSpec`](#workspacetrustspec-the-workspace_trust-table) table. Unset: nothing under `~` is read or written.                                                                                     |
 | `session_id_flag`                  |          | `""`                                                                           | Launch flag for a caller-chosen session id (claude: `--session-id`). The generic adapter appends `[flag, uuid4]` and pins attribution to that id.                                                                 |
 | `subagent_transcript_dir`          |          | derived from `usage_parser` (`{stem}/subagents` for `claude-jsonl`, else `""`) | Subagent transcript tree beside the transcript, walked recursively and stat-only; its writes count as idle-notice activity. Must contain `{stem}` (the transcript's filename stem) and stay relative; `""` = off. |
@@ -426,6 +428,10 @@ is in [Environment faults](escalations-guide.md#environment-faults).
 - Seeded for `claude` (connection loss and two captured provider 5xx errors) and
   `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit`,
   `provider.quota` and `provider.transport` events on 2.x). Empty means inert.
+- The tail scan also covers `usage_limit_patterns` and `usage_wait_patterns` as ordinary
+  pattern families, under the same token-usage overrule: a session that got past a limit
+  and later failed for another reason is charged. Only a live pane sighting of a usage
+  line exempts a session from the overrule; see [Usage-limit signals](#usage-limit-signals).
 
 ### Parked-session signals
 
@@ -454,6 +460,64 @@ Claude sends `idle_prompt` about 60 s after every finished turn, so a session th
 turn without a result and sits idle pauses as parked instead of being nudged. A project
 overlay (`.bmad-loop/profiles/claude.toml`) that drops `idle_prompt` from
 `[hooks.notification_types]` restores the wake nudge.
+
+### Usage-limit signals
+
+A CLI stopped by a subscription or credit limit either stays blocked until someone acts
+(credit exhaustion) or waits for the limit's reset and continues by itself (a
+session-window limit under Claude Code's auto-continue). Two opt-in profile lists name
+those lines, both matched line by line against the ANSI-stripped visible pane:
+
+- **`usage_limit_patterns`**: the CLI is blocked and will not continue on its own.
+- **`usage_wait_patterns`**: the CLI is blocked and waiting for a reset it continues from.
+
+The lists are disjoint by contract; "usage-limited" means either one matched. They follow
+the env-fault evidentiary bar: reproduce the captured sentence prefix (never a bare
+`session limit`, `resets` or `usage credits`), use single-character classes so a pattern
+cannot match its own profile line, and seed only lines captured off the CLI's screen. The
+shipped `claude` profile seeds one line in each list; every other profile leaves both
+empty, which keeps them inert.
+
+**At stall-grace expiry** the pane is captured once and checked against the parked
+patterns and both usage lists. A usage match withholds the nudge (even when a hook latch
+such as `idle_prompt` is set, since an idle CLI behind a limit latches exactly that) and
+ends the session `stalled` + `parked` with `SessionResult.usage_limited` holding the
+matched evidence. **When the session timeout fires**, one capture against both lists sets
+`usage_limited` on the `timeout` result. A dead window is never usage-limited.
+
+A `usage_limited` result is classified as an environment fault with no token-usage
+overrule and no tail scan, and pauses with a `usage limit:` reason (see
+[Environment faults](escalations-guide.md#environment-faults)). When the matched line
+carries a `resets <time>` clause, the time is parsed (`H[:MM]am|pm`, optionally preceded by
+a weekday or `<Mon> <D> at` and followed by a ` (<Area/City>)` zone) into
+`usage_limit_resets`: ISO-8601 when it resolves, otherwise the raw clause, with a
+`usage-reset-unparsed` lifecycle crumb (`reason` is `unparsed`, or `zone-unavailable` when
+the host has no tz data for the named zone).
+
+**The quota wait.** With `[limits] quota_wait_max_min` above 0 (default 300) and
+`usage_wait_patterns` non-empty, the generic adapter admits a wait at a heartbeat when all
+of these hold: the transcript has been idle for at least 90 s, no tool call is open, the
+visible pane matches `usage_wait_patterns`, no `QuotaPrompt` or `PermissionPrompt` latch is
+set, and the session's cumulative wait is under the cap. While waiting:
+
+- the session timeout is frozen on every tick, at no less than 120 s remaining;
+- a stall-grace expiry re-arms the grace with no nudge (a `QuotaPrompt` or
+  `PermissionPrompt` latch still parks; an `IdlePrompt` latch never ends a wait);
+- a `Stop` without a result withholds the stop nudge (`stop-nudge-withheld`,
+  `reason="quota-wait"`); a `Stop` with a result completes normally;
+- the token-budget grace keeps counting, because a crossed budget is real spend.
+
+The wait ends when the transcript moves again (the timeout resumes from where it was
+frozen) or when a `QuotaPrompt`/`PermissionPrompt` latch arrives. The pane no longer
+matching does not end it, since the line can scroll away. At the cap, measured on both the
+monotonic and the wall clock so a host suspend cannot stretch it, the session ends
+`stalled` + `parked` + `usage_limited` (`quota-wait-cap`). A line whose parsed reset lies
+beyond the remaining cap is not waited on: the session ends the same way at once
+(`quota-wait-skipped`, `reason="reset-beyond-cap"`). An unresolved reset is admitted, and
+the cap bounds it.
+
+The `opencode-http` adapter runs its own wait loop with no pane, so neither the usage gate
+nor the quota wait applies there.
 
 ### Worked TOML — copilot
 
