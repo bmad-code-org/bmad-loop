@@ -9,6 +9,13 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
+  Claude Code waiting out a usage-window reset and the transcript is idle, the session
+  timeout stands still and the stall nudge is held, so the session no longer burns
+  `session_timeout_min` behind the limit and can finish after the CLI's own
+  auto-continue. Past the cap the session pauses with a usage-limit reason.
+  `heartbeat.json` gains `quota_waiting` / `quota_wait_s`, `session-end` gains
+  `quota_wait_s`, and the journal gains `quota-wait-started` / `-ended` / `-cap`.
 - Add the experimental `tickets` work source for BMAD v7 initiative ticket trees
   (`[stories] source = "tickets"`): dispatch `bmad-build-auto ticket <ref>` in initiative
   build order, verify each plan at `built`, and mark it `done` through `tickets.py mark`

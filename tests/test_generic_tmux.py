@@ -12683,6 +12683,456 @@ def test_synthesize_from_threads_plan_halt_and_success_statuses(tmp_path, monkey
     )
 
 
+# ------------------------------------------ usage-limit quota wait (DW-396)
+#
+# Claude Code behind a session-window limit waits for the reset and continues by
+# itself, repainting its pane the whole time, so the stall timer never fires
+# while `session_timeout_min` keeps counting. While the visible pane shows the
+# wait line and the transcript is idle, the session timeout is frozen and the
+# stall nudge held; transcript movement ends the wait; the cap ends the session
+# stalled + parked with the usage evidence. Never a completion path.
+
+QUOTA_SCREEN = f"\x1b[2m{USAGE_SESSION_LINE}\x1b[0m\r\n\r\n❯ \r\n"
+
+
+class _Quota:
+    """One quota-wait fixture: the adapter and every handle a test steers."""
+
+    def __init__(self, adapter, mux, impl, log, transcript, clock, heartbeats):
+        self.adapter = adapter
+        self.mux = mux
+        self.impl = impl
+        self.log = log
+        self.transcript = transcript
+        self.clock = clock
+        self.heartbeats = heartbeats
+
+    def wait_evidence(self) -> str:
+        pattern = self.adapter.profile.usage_wait_patterns[0]
+        return f"pane matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+
+    def quota_kinds(self) -> list[str]:
+        return [e["kind"] for e in self.adapter.journal.entries if e["kind"].startswith("quota-")]
+
+    def finish_spec(self) -> None:
+        """The skill's terminal spec, so the next Stop completes the session."""
+        (self.impl / "spec-3-1-foo.md").write_text(
+            "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n",
+            encoding="utf-8",
+            newline="",
+        )
+
+
+def _quota_adapter(tmp_path, monkeypatch, *, screen=QUOTA_SCREEN, grace=600.0):
+    """A claude dev adapter over a `_UnitMux` showing `screen`, a fake journal,
+    a pane log, a transcript, captured heartbeats and independently steerable
+    monotonic/wall clocks."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux(screen=screen)
+    adapter, impl = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = grace
+    adapter._idle_threshold_s = grace
+    adapter._window_alive = lambda handle: True
+    adapter.journal = _FakeJournal()
+    log = _pane_log(adapter, "3-1-dev-1", 0)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    clock = {"mono": 1000.0, "wall": 5000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["mono"])
+        time = staticmethod(lambda: clock["wall"])
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    heartbeats: list[dict] = []
+    adapter._write_heartbeat = lambda task_id, payload: heartbeats.append(payload)
+    return _Quota(adapter, mux, impl, log, transcript, clock, heartbeats)
+
+
+def _quota_spec(tmp_path, *, timeout_s=300.0, cap_s=3600.0) -> SessionSpec:
+    return dataclasses.replace(_dev_spec(tmp_path), timeout_s=timeout_s, quota_wait_max_s=cap_s)
+
+
+def _drive_quota(q, spec, *, events=None, script=None, step=None, repaint=True, max_calls=500):
+    """Call 1 answers a SessionStart naming the transcript (the idle baseline at
+    mono 1000). Every later call first advances both clocks by `step(call_n)`
+    (default: one heartbeat interval), repaints the pane when `repaint` (the
+    countdown keeps the stall re-arm firing, as in the field), runs
+    `script(call_n)`, then answers `events[call_n]` or None. A loop that outlives
+    `max_calls` fails the test instead of hanging it.
+
+    The admission timeline every test below shares: heartbeats land at mono
+    1000 (no transcript yet), 1030, 1060 and 1090; the 1090 one (iteration 5)
+    reads 90 s of idle and admits the wait."""
+    events = dict(events or {})
+    events.setdefault(1, _session_start("3-1-dev-1", str(q.transcript)))
+
+    def on_call(call_n):
+        if call_n > max_calls:
+            raise AssertionError(f"wait loop still running after {max_calls} ticks")
+        if call_n >= 2:
+            dt = step(call_n) if step is not None else generic.HEARTBEAT_INTERVAL_S
+            q.clock["mono"] += dt
+            q.clock["wall"] += dt
+            if repaint:
+                _grow(q.log, "\r⠋".encode())
+        if script is not None:
+            script(call_n)
+
+    class _Watcher:
+        calls = 0
+
+        def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
+            self.calls += 1
+            on_call(self.calls)
+            return events.get(self.calls)
+
+    q.adapter.watcher = _Watcher()
+    return q.adapter.wait_for_completion(_dev_handle(), spec)
+
+
+def _assistant_line() -> bytes:
+    return b'{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}\n'
+
+
+def test_quota_wait_freezes_the_session_timeout(tmp_path, monkeypatch):
+    """The DW-396 incident, end to end: a 300 s session sits behind the session
+    limit from mono 1090 (210 s left) until the CLI continues at 1570, well past
+    the original deadline (1300). The frozen timeout does not fire; the
+    transcript moving ends the wait (`transcript-active`) and the session
+    completes on its Stop, carrying the 480 s it waited.
+
+    Ablation: drop the per-tick freeze and this times out at mono 1300."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+
+    def script(call_n):
+        if call_n == 20:
+            _grow(q.transcript, _assistant_line())  # the reset passed: it continued
+        if call_n == 21:
+            q.finish_spec()
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={21: _stop_event("3-1-dev-1", "sess", str(q.transcript))},
+        script=script,
+    )
+    assert result.status == "completed"
+    assert result.quota_wait_s == 480.0  # mono 1090 → 1570
+    assert result.usage_limited is None  # it continued: not a usage-limited verdict
+    assert q.mux.sent == []
+    assert _lifecycle_events(q.adapter, "timeout-fired") == []
+    assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
+    started, ended = (e for e in q.adapter.journal.entries if e["kind"].startswith("quota-"))
+    assert started == {
+        "kind": "quota-wait-started",
+        "task_id": "3-1-dev-1",
+        "remaining_s": 210.0,
+        "waited_s": 0.0,
+        "cap_s": 3600.0,
+    }
+    assert ended == {
+        "kind": "quota-wait-ended",
+        "task_id": "3-1-dev-1",
+        "waited_s": 480.0,
+        "total_s": 480.0,
+        "how": "transcript-active",
+    }
+    (crumb,) = _lifecycle_events(q.adapter, "quota-wait-started")
+    assert crumb["evidence"] == q.wait_evidence()  # the pane line stays in the crumb
+
+
+def test_quota_wait_freezes_on_every_tick_not_only_heartbeats(tmp_path, monkeypatch):
+    """A wait admitted with 30 s left (under one heartbeat interval), then 5 s
+    ticks: the freeze must re-base the deadline on EVERY tick. One applied only on
+    heartbeats would leave the admission tick's deadline (mono 1120) standing
+    until the next heartbeat, which the timeout check at mono 1120 reaches
+    first. Here the wait runs on to its 200 s cap instead: stalled + parked, no
+    timeout.
+
+    Ablation: drop the per-tick freeze and this times out at mono 1120."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0),
+        step=lambda call_n: generic.HEARTBEAT_INTERVAL_S if call_n <= 4 else 5.0,
+    )
+    assert _lifecycle_events(q.adapter, "timeout-fired") == []
+    assert (result.status, result.parked) == ("stalled", True)
+    (started,) = _lifecycle_events(q.adapter, "quota-wait-started")
+    assert started["remaining_s"] == generic.QUOTA_WAIT_MIN_REMAINING_S  # 30 s, floored
+
+
+def test_quota_wait_needs_an_idle_transcript(tmp_path, monkeypatch):
+    """The wait line on screen but a transcript still being written (a session
+    that recovered and kept working, the line still on screen): no wait, and the
+    timeout fires on schedule.
+
+    Ablation: drop the `idle_s >= QUOTA_WAIT_IDLE_S` guard and a wait opens at
+    the first heartbeat."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+
+    def script(call_n):
+        if call_n >= 2:
+            _grow(q.transcript, _assistant_line())
+
+    result = _drive_quota(q, _quota_spec(tmp_path), script=script)
+    assert result.status == "timeout"
+    assert result.quota_wait_s == 0.0
+    assert q.quota_kinds() == []
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+
+
+def test_quota_wait_not_admitted_with_an_open_tool_call(tmp_path, monkeypatch):
+    """An idle transcript whose last line opens a `Bash` call: the CLI is waiting
+    on its own foreground tool, not on a reset, whatever the pane still shows.
+    No wait; the timeout fires on schedule.
+
+    Ablation: drop the `_quota_wait_tool_open` guard and the wait opens."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    _grow(q.transcript, _tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
+    result = _drive_quota(q, _quota_spec(tmp_path))
+    assert result.status == "timeout"
+    assert result.quota_wait_s == 0.0
+    assert q.quota_kinds() == []
+
+
+def test_quota_wait_off_when_cap_is_zero(tmp_path, monkeypatch):
+    """`quota_wait_max_s = 0` (the raw SessionSpec default; the engine passes
+    `limits.quota_wait_max_min * 60`): today's behaviour. The timeout fires on
+    schedule, nothing is captured for admission (the one capture is the
+    timeout-fired path's), and the heartbeat carries no quota fields."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(q, _quota_spec(tmp_path, cap_s=0.0))
+    assert result.status == "timeout"
+    assert result.usage_limited == q.wait_evidence()  # S1's look at the timeout
+    assert q.mux.captures == ["@1"]
+    assert q.quota_kinds() == []
+    assert all("quota_waiting" not in hb and "quota_wait_s" not in hb for hb in q.heartbeats)
+
+
+@pytest.mark.parametrize("clock_kind", ["monotonic", "wall-suspend"])
+def test_quota_wait_cap_ends_parked_with_usage_evidence(tmp_path, monkeypatch, clock_kind):
+    """A reset that never comes: at the 600 s cap the session ends stalled +
+    parked with the wait line as both evidences, never completed and never
+    `timeout`. The cap is bounded on BOTH clocks: in the suspend variant the
+    monotonic clock barely moves after admission while the wall clock jumps an
+    hour, and the cap still fires on the wall span.
+
+    Ablation: measure the open wait on the monotonic clock alone and the suspend
+    variant never reaches its cap (the max_calls guard fails it)."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+
+    def step(call_n):
+        if call_n <= 4 or clock_kind == "monotonic":
+            return generic.HEARTBEAT_INTERVAL_S
+        return 0.0
+
+    def script(call_n):
+        if clock_kind == "wall-suspend" and call_n == 8:
+            q.clock["wall"] += 3600.0  # host suspend: monotonic frozen, wall runs
+
+    result = _drive_quota(q, _quota_spec(tmp_path, cap_s=600.0), step=step, script=script)
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence == result.usage_limited == q.wait_evidence()
+    assert result.result_json is None
+    assert result.quota_wait_s >= 600.0
+    assert _lifecycle_events(q.adapter, "timeout-fired") == []
+    (cap,) = _lifecycle_events(q.adapter, "quota-wait-cap")
+    assert cap["evidence"] == q.wait_evidence()
+    assert cap["cap_s"] == 600.0 and cap["waited_s"] >= 600.0
+    assert q.quota_kinds() == ["quota-wait-started", "quota-wait-cap", "quota-wait-ended"]
+    assert q.adapter.journal.entries[-1]["how"] == "cap"
+
+
+def test_quota_wait_holds_the_stall_nudge(tmp_path, monkeypatch):
+    """A silent pane (no repaint) and a 120 s grace with nudges available: once
+    the wait is admitted (mono 1090), every grace expiry re-arms with no nudge and
+    no park, until the CLI continues and Stops with its result.
+
+    Ablation: drop the stall hold and the 1120 expiry parks the session through
+    S1's usage gate."""
+    q = _quota_adapter(tmp_path, monkeypatch, grace=120.0)
+    q.adapter._stall_nudges = 2
+
+    def script(call_n):
+        if call_n == 30:
+            _grow(q.transcript, _assistant_line())
+        if call_n == 31:
+            q.finish_spec()
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={31: _stop_event("3-1-dev-1", "sess", str(q.transcript))},
+        script=script,
+        repaint=False,
+    )
+    assert result.status == "completed"
+    assert _stall_nudges(q.mux) == []
+    assert _lifecycle_events(q.adapter, "stall-nudge-withheld") == []
+    assert result.quota_wait_s > 0
+
+
+@pytest.mark.parametrize(
+    ("subtype", "evidence"),
+    [
+        ("permission_prompt", "Notification(permission_prompt) -> PermissionPrompt"),
+        ("quota_auto_resume_stale", "Notification(quota_auto_resume_stale) -> QuotaPrompt"),
+    ],
+)
+def test_quota_prompt_latch_ends_the_wait_parked(tmp_path, monkeypatch, subtype, evidence):
+    """A CLI that, mid-wait, asks a human for a permission or quota decision is
+    no longer going to continue by itself: the latch ends the wait (`latch`) and
+    the next stall expiry parks the session on the latch's evidence.
+
+    Ablation: drop the latch exit and the session waits on to its cap."""
+    q = _quota_adapter(tmp_path, monkeypatch, grace=120.0)
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path, cap_s=3600.0),
+        events={7: _hook_event("Notification", subtype)},
+        repaint=False,
+    )
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence == evidence
+    assert q.mux.sent == []
+    (ended,) = (e for e in q.adapter.journal.entries if e["kind"] == "quota-wait-ended")
+    assert ended["how"] == "latch"
+    assert _lifecycle_events(q.adapter, "quota-wait-cap") == []
+
+
+def test_idle_prompt_latch_does_not_end_the_wait(tmp_path, monkeypatch):
+    """claude sends `idle_prompt` ~60 s after every finished turn, including the
+    one the limit ended: that latch never ends a wait, so the held stall
+    expiries keep holding and the session completes once the CLI continues.
+
+    Ablation: count IdlePrompt among QUOTA_WAIT_BLOCKING_KINDS and the next
+    expiry parks the session."""
+    q = _quota_adapter(tmp_path, monkeypatch, grace=120.0)
+
+    def script(call_n):
+        if call_n == 30:
+            _grow(q.transcript, _assistant_line())
+        if call_n == 31:
+            q.finish_spec()
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={
+            7: _hook_event("Notification", "idle_prompt"),
+            31: _stop_event("3-1-dev-1", "sess", str(q.transcript)),
+        },
+        script=script,
+        repaint=False,
+    )
+    assert result.status == "completed"
+    assert result.parked is False
+    ended = [e for e in q.adapter.journal.entries if e["kind"] == "quota-wait-ended"]
+    assert [e["how"] for e in ended] == ["transcript-active"]
+
+
+def test_stop_without_result_during_quota_wait_withholds_the_stop_nudge(tmp_path, monkeypatch):
+    """A result-less Stop mid-wait: the stop nudge is withheld (it could only
+    reproduce the limit line), crumbed `stop-nudge-withheld` with
+    `reason="quota-wait"`, and the wait goes on. A later Stop WITH a result
+    completes normally.
+
+    Ablation: drop the quota-wait branch in the Stop handler and NUDGE_TEXT is
+    sent."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    q.adapter._stop_nudges = 1
+
+    def script(call_n):
+        if call_n == 20:
+            _grow(q.transcript, _assistant_line())
+        if call_n == 21:
+            q.finish_spec()
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={
+            8: _stop_event("3-1-dev-1", "sess", str(q.transcript)),
+            21: _stop_event("3-1-dev-1", "sess", str(q.transcript)),
+        },
+        script=script,
+    )
+    assert result.status == "completed"
+    assert [text for _, text in q.mux.sent if text == generic.NUDGE_TEXT] == []
+    (withheld,) = _lifecycle_events(q.adapter, "stop-nudge-withheld")
+    assert withheld["reason"] == "quota-wait"
+    assert withheld["nudge_due"] is True
+    assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
+
+
+def test_pane_non_match_does_not_end_the_wait(tmp_path, monkeypatch):
+    """The wait line scrolls off the visible pane mid-wait: that alone does not
+    end the wait (the timeout stays frozen past the original deadline); only the
+    transcript moving does."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+
+    def script(call_n):
+        if call_n == 6:
+            q.mux.screen = "❯ \r\n"  # the line scrolled away
+        if call_n == 20:
+            _grow(q.transcript, _assistant_line())
+        if call_n == 21:
+            q.finish_spec()
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={21: _stop_event("3-1-dev-1", "sess", str(q.transcript))},
+        script=script,
+    )
+    assert result.status == "completed"
+    assert result.quota_wait_s == 480.0
+    ended = [e for e in q.adapter.journal.entries if e["kind"] == "quota-wait-ended"]
+    assert [e["how"] for e in ended] == ["transcript-active"]
+
+
+def test_heartbeat_carries_quota_wait_fields(tmp_path, monkeypatch):
+    """`heartbeat.json` carries `quota_waiting` and `quota_wait_s` whenever the
+    session can wait: False / 0.0 before admission, True and climbing during the
+    wait (the frozen `remaining_s` holding still), False again after it with the
+    cumulative total kept, while the resumed timeout counts down from the frozen
+    210 s to its fire."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+
+    def script(call_n):
+        if call_n >= 8:
+            _grow(q.transcript, _assistant_line())  # continued, and keeps working
+
+    result = _drive_quota(q, _quota_spec(tmp_path), script=script)
+    assert result.status == "timeout"  # the resumed deadline: mono 1210 + 210
+    fields = [(hb["quota_waiting"], hb["quota_wait_s"]) for hb in q.heartbeats]
+    # heartbeats at mono 1000, 1030, 1060, 1090 (admitted inside this one, ahead
+    # of the write), 1120, 1150, 1180, 1210 (the transcript moved: ended), 1240…
+    assert fields[:3] == [(False, 0.0)] * 3
+    assert fields[3] == (True, 0.0)
+    assert fields[4:7] == [(True, 30.0), (True, 60.0), (True, 90.0)]
+    assert set(fields[7:]) == {(False, 120.0)}
+    assert [hb["remaining_s"] for hb in q.heartbeats[3:]] == [
+        210.0,
+        210.0,
+        210.0,
+        210.0,
+        210.0,
+        180.0,
+        150.0,
+        120.0,
+        90.0,
+        60.0,
+        30.0,
+    ]
+    assert result.quota_wait_s == 120.0
+
+
 # ------------------------------- session-start-missing notice
 #
 # Observation only. A session whose profile maps SessionStart but that has run

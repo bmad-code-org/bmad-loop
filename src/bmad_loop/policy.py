@@ -154,6 +154,13 @@ class LimitsPolicy:
     # after this many total nudges (non-blocking workflows then advance the
     # phase).
     workflow_stall_nudges_cap: int = 3
+    # cap on the cumulative minutes one session may sit in a usage-limit wait
+    # (SessionSpec.quota_wait_max_s): while the visible pane shows the CLI
+    # waiting out a usage-window reset it will continue from by itself, and the
+    # transcript is idle, the session timeout is frozen and the stall nudge is
+    # held (DW-396). Past the cap the session ends parked with usage-limit
+    # evidence. 0 = off (the timeout keeps counting through the wait).
+    quota_wait_max_min: int = 300
     # One targeted nudge per session (#276 M4) when a Stop finds a marker-less
     # terminal-frontmatter spec (a review that finalized `status: done`/`blocked`
     # without appending its required `## Auto Run Result` section): ask the skill
@@ -1018,6 +1025,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         workflow_stall_nudges_cap=_typed_int(
             limits_d, "limits", "workflow_stall_nudges_cap", LimitsPolicy.workflow_stall_nudges_cap
         ),
+        quota_wait_max_min=_typed_int(
+            limits_d, "limits", "quota_wait_max_min", LimitsPolicy.quota_wait_max_min
+        ),
         dev_contract_nudge=_typed_bool(
             limits_d, "limits", "dev_contract_nudge", LimitsPolicy.dev_contract_nudge
         ),
@@ -1083,6 +1093,10 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     if limits.workflow_stall_nudges_cap < 0:
         raise PolicyError(
             f"limits.workflow_stall_nudges_cap must be >= 0: got {limits.workflow_stall_nudges_cap}"
+        )
+    if limits.quota_wait_max_min < 0:
+        raise PolicyError(
+            f"limits.quota_wait_max_min must be >= 0: got {limits.quota_wait_max_min}"
         )
     if limits.session_budget_mode not in SESSION_BUDGET_MODES:
         raise PolicyError(
@@ -1513,6 +1527,7 @@ session_start_grace_s = 120  # seconds a session whose CLI maps SessionStart may
 dev_stall_nudges = 2         # best-effort wake nudges per silent grace before stalling; fresh Stop/idle evidence restores this budget. 0 = stall on grace expiry
 dev_stall_nudges_cap = 6     # total (never-restored) nudge bound per dev/review session; bounds launch-time recovery and Stop/idle budget refills because an accepted nudge does not guarantee a wake. 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry
+quota_wait_max_min = 300     # cumulative minutes one session may wait out a usage-window reset (pane shows the CLI's wait line, transcript idle) with its timeout frozen and stall nudge held; past it the session ends parked. 0 = off
 dev_contract_nudge = true    # true: one targeted nudge per session (#276) when a Stop finds a spec finalized to a terminal frontmatter status but missing its `## Auto Run Result` marker, asking the skill to append it and end its turn; sent exactly once, never refilled, touches no stall counters. false: rely only on harness-side frontmatter synthesis
 max_tokens_per_story = 2000000
 cache_read_weight = 0.1      # cache reads bill at ~0.1x input on all vendors; 1.0 = count raw

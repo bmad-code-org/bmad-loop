@@ -237,6 +237,15 @@ class SessionSpec:
     # only, never a scan for other specs (#261). A relative entry is rebased on
     # `cwd`. Empty for every v6 session. Both kept LAST, after `effort`.
     fallback_result_dirs: tuple[Path, ...] = ()
+    # Usage-limit wait cap (DW-396), in seconds: the most cumulative time this
+    # session may sit in a quota wait — the visible pane matches the profile's
+    # `usage_wait_patterns` while the transcript is idle — with its session
+    # timeout frozen and its stall nudge held. Past it the session ends stalled +
+    # parked with usage-limit evidence. 0.0 (the raw constructor default) = off,
+    # so adapters constructed outside the engine (tests, MockAdapter, resolve)
+    # keep the plain timeout. The engine sets limits.quota_wait_max_min * 60 for
+    # every session it drives. Kept LAST so positional constructions stay valid.
+    quota_wait_max_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -352,6 +361,11 @@ class SessionResult:
     # limit is on screen now, not a stale match), and both pause reasons name it
     # as a usage limit. APPENDED.
     usage_limited: str | None = None
+    # Cumulative seconds this session spent in a usage-limit quota wait (DW-396)
+    # with its session timeout frozen; 0.0 = it never waited. Carried on every
+    # result `wait_for_completion` returns, journaled on `session-end` only when
+    # positive. APPENDED.
+    quota_wait_s: float = 0.0
 
 
 class CodingCLIAdapter(ABC):

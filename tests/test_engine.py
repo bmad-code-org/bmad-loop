@@ -15380,6 +15380,27 @@ def test_usage_limited_session_end_is_journaled_and_paused(project):
     assert "usage_limited" not in plain_end
 
 
+def test_session_end_carries_quota_wait_s_only_when_positive(project):
+    """DW-396: the engine hands every session it drives the quota-wait cap
+    (`limits.quota_wait_max_min * 60`), and `session-end` carries the seconds the
+    session spent in a usage-limit quota wait only when it waited at all
+    (present-only).
+    ABLATION: drop the `quota_wait_s` extras line from `_session_end_extras` and
+    the first session-end assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(project, [SessionResult(status="stalled", quota_wait_s=480.0)])
+    engine.run()
+    assert adapter.sessions[0].quota_wait_max_s == 300 * 60.0
+    # The stall is retried: the FIRST session-end is the session that waited.
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][0]
+    assert end["quota_wait_s"] == 480.0
+    # The journal is per-project, so only the second run's own last entry counts.
+    engine2, _ = make_engine(project, [SessionResult(status="stalled")])
+    engine2.run()
+    plain_end = [e for e in engine2.journal.entries() if e["kind"] == "session-end"][-1]
+    assert "quota_wait_s" not in plain_end
+
+
 def test_session_env_fault_pauses_dev_without_burning_budget(project):
     """A dev session classified an environment fault (#194) pauses the run at the
     first story rather than charging the attempt; the decision + session-end carry

@@ -654,6 +654,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "cache_read_weight",
         "cache_read_weight_was",
         "cap",
+        # `quota-wait-started` / `quota-wait-cap` (DW-396): the session's quota
+        # wait cap in seconds (`SessionSpec.quota_wait_max_s`) — a measured float.
+        "cap_s",
         "checkout_dirty",
         "checkpoint",
         "code_root_changed",
@@ -767,6 +770,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "grace_s",
         "graceful",
         "harvest_attempt",
+        # `quota-wait-ended` (DW-396): what ended the wait, a closed slug the
+        # adapter chose (`transcript-active` / `latch` / `cap` / `session-exit`).
+        "how",
         # `head` is NOT here any more: a HEAD sha (`attempt-preserve-failed`,
         # `attempt-preserve-fallthrough`) moved to `_JOURNAL_ALIAS_FIELDS` (DW-481).
         "id_collisions",
@@ -944,6 +950,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # exists to draw. Names no path, identifier or prose.
         "regen_cause",
         "remaining",
+        # `quota-wait-started` (DW-396): the session-timeout seconds the wait
+        # froze — a measured float.
+        "remaining_s",
         # DW-525: run ids (the `run_id` shape) — the finished run a replay run
         # replays (`unit-replay-start`) and the replay run a finished run handed its
         # kept unit to (`unit-replay-handoff`).
@@ -1007,11 +1016,17 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "tokens",
         "tokens_weighted",
         "total",
+        # `quota-wait-ended` (DW-396): the session's cumulative quota-wait
+        # seconds — a measured float.
+        "total_s",
         "trigger",
         # `session-end` / `workflow-end` (#610): the visible-pane line a usage-limit
         # pattern matched live — the matched profile pattern plus the quoted pane
         # line, the same class of excerpt as `parked_evidence`.
         "usage_limited",
+        # `session-end` / `workflow-end` (DW-396): the seconds the session sat in a
+        # usage-limit quota wait with its timeout frozen — a measured float.
+        "quota_wait_s",
         "verification_sequence",
         "verification_stage",
         "via",
@@ -1190,6 +1205,7 @@ JOURNAL_SPLAT_FIELDS = {
             "parked",
             "parked_evidence",
             "usage_limited",
+            "quota_wait_s",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys
@@ -1340,6 +1356,15 @@ JOURNAL_KINDS = frozenset(
         # `in_tool`, a closed slug the adapter chose (declared benign).
         "session-active",
         "session-idle",
+        # The usage-limit quota wait (DW-396): `quota-wait-started` when a session
+        # behind a usage-window reset has its timeout frozen, `quota-wait-ended`
+        # when the wait closes, `quota-wait-cap` when the cap ends the session.
+        # `task_id` (routed) and measured floats (`remaining_s`, `waited_s`,
+        # `total_s`, `cap_s`) plus the closed slug `how` (declared benign); the
+        # pane evidence stays in the lifecycle crumb.
+        "quota-wait-cap",
+        "quota-wait-ended",
+        "quota-wait-started",
         # One `session-start-missing` when a CLI whose profile maps SessionStart
         # has sent none by `limits.session_start_grace_s`: `task_id` (routed),
         # `waited_s`/`grace_s` (declared benign), `cli` and, on a Codex profile,
