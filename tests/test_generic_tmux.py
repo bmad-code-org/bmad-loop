@@ -13150,6 +13150,90 @@ def test_heartbeat_carries_quota_wait_fields(tmp_path, monkeypatch):
     assert result.quota_wait_s == 120.0
 
 
+def test_spent_wait_line_does_not_reopen_a_wait(tmp_path, monkeypatch):
+    """The CLI continues after the reset (the wait ends at mono 1210), writes once,
+    then goes quiet for longer than QUOTA_WAIT_IDLE_S with the old wait line still
+    on screen and the local clock past its 7:20pm reset. That line is spent: it
+    reopens no wait (whose reset, now read as tomorrow's, lies beyond the cap and
+    would park the session) and does not label the timeout usage-limited.
+
+    Ablation: drop the `spent` skip at admission and the session ends stalled +
+    parked on `quota-wait-skipped`; drop it from the timeout path and the verdict
+    is usage-limited."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+
+    def script(call_n):
+        if call_n == 8:
+            _grow(q.transcript, _assistant_line())  # continued after the reset
+            monkeypatch.setattr(
+                generic, "_local_now", lambda: datetime(2026, 10, 25, 19, 25, tzinfo=timezone.utc)
+            )
+
+    result = _drive_quota(q, _quota_spec(tmp_path), script=script)
+    assert result.status == "timeout"  # the resumed deadline: mono 1210 + 210
+    assert result.usage_limited is None
+    assert result.usage_limit_resets is None
+    assert result.quota_wait_s == 120.0
+    assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
+    assert _lifecycle_events(q.adapter, "quota-wait-skipped") == []
+
+
+def test_spent_wait_line_does_not_park_a_stall(tmp_path, monkeypatch):
+    """The same spent line at stall-grace expiry: the pane goes quiet after the
+    CLI continued (no repaint from mono 1210), and the stall gate does not read
+    the left-over line as a usage limit. The session is not parked or
+    usage-limited and no nudge is withheld for it.
+
+    Ablation: drop the `spent` skip from the stall gate and the session ends
+    stalled + parked + usage-limited."""
+    q = _quota_adapter(tmp_path, monkeypatch, grace=120.0)
+
+    def script(call_n):
+        if call_n < 8:
+            _grow(q.log, "\r⠋".encode())  # the countdown repaints until it continued
+        if call_n == 8:
+            _grow(q.transcript, _assistant_line())
+
+    result = _drive_quota(q, _quota_spec(tmp_path, timeout_s=1000.0), script=script, repaint=False)
+    assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
+    assert result.usage_limited is None
+    assert not result.parked
+    assert _lifecycle_events(q.adapter, "stall-nudge-withheld") == []
+
+
+def test_fresh_wait_line_after_a_spent_one_opens_a_new_wait(tmp_path, monkeypatch):
+    """A second limit after the CLI continued prints a NEW line (below the spent
+    one, its own reset): that is fresh evidence, and a second wait opens on it.
+
+    Ablation: skip every usage line once a wait has ended, rather than only the
+    spent one, and the second wait never opens."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    second = "⎿  You've hit your session limit · resets 11:20pm"
+
+    def script(call_n):
+        if call_n == 8:
+            _grow(q.transcript, _assistant_line())  # continued after the reset
+            q.mux.screen = f"{USAGE_SESSION_LINE}\r\n{second}\r\n❯ \r\n"
+        if call_n == 20:
+            _grow(q.transcript, _assistant_line())
+        if call_n == 21:
+            q.finish_spec()
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path, cap_s=18000.0),  # the 11:20pm reset is ~4 h out
+        events={21: _stop_event("3-1-dev-1", "sess", str(q.transcript))},
+        script=script,
+    )
+    assert result.status == "completed"
+    assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"] * 2
+    first, fresh = _lifecycle_events(q.adapter, "quota-wait-started")
+    assert first["evidence"] == q.wait_evidence()
+    pattern = q.adapter.profile.usage_wait_patterns[0]
+    assert fresh["evidence"] == f"pane matched {pattern!r}: {second.strip()}"
+    assert fresh["resets_at"] == "2026-10-25T23:20:00+00:00"
+
+
 # ------------------------------------------ usage-limit reset parse (#610)
 #
 # The matched wait/limit line's `resets …` clause is parsed (`usagereset`) from

@@ -208,7 +208,10 @@ class _QuotaWait:
     host suspend (monotonic frozen, wall running) cannot stretch the cap.
     `closed_s` sums the waits that already ended; `evidence` is the pane line
     that admitted the open one, `resets` its parsed reset (`UsageReset.value`,
-    #610), None when the line named none."""
+    #610), None when the line named none. `line` is the full matched pane line;
+    `spent` holds (stripped) the lines of waits the CLI continued from. Such a
+    line is left on screen by a limit that is over, so no live usage gate takes
+    it as evidence again; a later limit prints a new line."""
 
     waiting: bool = False
     started_mono: float = 0.0
@@ -217,6 +220,8 @@ class _QuotaWait:
     closed_s: float = 0.0
     evidence: str | None = None
     resets: str | None = None
+    line: str | None = None
+    spent: set[str] = dataclasses.field(default_factory=set)
 
     def open_s(self) -> float:
         if not self.waiting:
@@ -1625,8 +1630,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # sample) or an unanswered tool call is a working session, and
                 # its timeout is an ordinary one, charged as before #610 (so is
                 # a tool scan that faults). Unknown activity (no transcript
-                # named yet, or no sample) keeps the pane's word.
-                (usage_hit,) = self._pane_evidence(handle, self._usage_pane_patterns)
+                # named yet, or no sample) keeps the pane's word. A line a
+                # quota wait already continued from is no evidence at all.
+                (usage_hit,) = self._pane_evidence(
+                    handle, self._usage_pane_patterns, skip=quota.spent
+                )
                 usage_now = resets_now = None
                 if (
                     usage_hit is not None
@@ -1694,9 +1702,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # The transcript moved: the CLI continued after the reset.
                     # The timeout resumes from the remaining time frozen at
                     # admission. A pane that merely stopped matching does not
-                    # end the wait: the line can scroll away.
+                    # end the wait: the line can scroll away. The line it waited
+                    # on is spent: left on screen, it must not reopen a wait
+                    # (or park the session, its reset now read as the next
+                    # day's) at the next idle stretch of a working session.
                     if idle.idle_s is not None and idle.idle_s < QUOTA_WAIT_IDLE_S:
                         self._end_quota_wait(handle, quota, "transcript-active")
+                        if quota.line is not None:
+                            quota.spent.add(quota.line.strip())
                 elif (
                     quota_enabled
                     and transcript_path
@@ -1708,9 +1721,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # Admission (DW-396): an idle transcript, the wait line on
                     # the visible pane, and no unanswered tool call (a long
                     # foreground tool is a working session, whatever the pane
-                    # still shows). The pane look comes first: it is the
-                    # cheaper read, and a non-match skips the transcript scan.
-                    (wait_hit,) = self._pane_evidence(handle, self._usage_wait_patterns)
+                    # still shows), on a line no earlier wait continued from.
+                    # The pane look comes first: it is the cheaper read, and a
+                    # non-match skips the transcript scan.
+                    (wait_hit,) = self._pane_evidence(
+                        handle, self._usage_wait_patterns, skip=quota.spent
+                    )
                     if wait_hit is not None and not self._quota_wait_tool_open(
                         handle, transcript_path
                     ):
@@ -1756,6 +1772,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         quota.frozen_remaining = frozen
                         quota.evidence = wait_hit[0]
                         quota.resets = resets
+                        quota.line = wait_hit[1]
                 if not saw_session_start and not session_start_noted:
                     session_start_noted = self._note_session_start_missing(
                         handle, now - loop_started
@@ -2068,12 +2085,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # too (a nudge can only reproduce the limit line), and the
                     # match is recorded as `usage_limited` even when the hook
                     # latch already supplied the parked evidence, since claude's
-                    # idle_prompt latches on exactly this kind of idle.
+                    # idle_prompt latches on exactly this kind of idle. A line a
+                    # quota wait already continued from matches nothing.
                     parked_now = parked_evidence
                     parked_hit, usage_hit = self._pane_evidence(
                         handle,
                         self._parked_prompt_patterns if parked_now is None else (),
                         self._usage_pane_patterns,
+                        skip=quota.spent,
                     )
                     if parked_now is None and parked_hit is not None:
                         parked_now = parked_hit[0]
@@ -2806,7 +2825,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return tuple(regex.compile(p) for p in self.profile.parked_prompt_patterns)
 
     def _pane_evidence(
-        self, handle: SessionHandle, *pattern_sets: tuple[regex.Pattern[str], ...]
+        self,
+        handle: SessionHandle,
+        *pattern_sets: tuple[regex.Pattern[str], ...],
+        skip: set[str] | frozenset[str] = frozenset(),
     ) -> tuple[tuple[str, str] | None, ...]:
         """One look at the VISIBLE pane, matched against each pattern set: per
         set, ``(evidence, matched_line)`` for its first match (lines outer,
@@ -2824,7 +2846,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         ``parked-probe-failed`` crumb (``reason`` = ``capture-failed`` or
         ``match-timeout`` + its ``pattern``; ``error``) records that the look at
         the pane failed. Empty sets and a backend without ``capture_pane`` are
-        configuration, not faults: no capture, no crumb."""
+        configuration, not faults: no capture, no crumb. A line in ``skip``
+        (compared stripped) is never a match: the usage gates pass the lines of
+        quota waits the CLI already continued from (``_QuotaWait.spent``)."""
         none: tuple[tuple[str, str] | None, ...] = tuple(None for _ in pattern_sets)
         if not any(pattern_sets):
             return none
@@ -2844,6 +2868,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if not isinstance(screen, str):
             return none
         lines = _ANSI_RE.sub("", screen.replace("\r", "\n")).split("\n")
+        if skip:
+            lines = [line for line in lines if line.strip() not in skip]
         return tuple(self._first_pane_match(handle, lines, pats) for pats in pattern_sets)
 
     def _first_pane_match(

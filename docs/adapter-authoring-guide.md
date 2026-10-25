@@ -512,12 +512,14 @@ set, and the session's cumulative wait is under the cap. While waiting:
 
 The wait ends when the transcript moves again (the timeout resumes from where it was
 frozen) or when a `QuotaPrompt`/`PermissionPrompt` latch arrives. The pane no longer
-matching does not end it, since the line can scroll away. At the cap, measured on both the
-monotonic and the wall clock so a host suspend cannot stretch it, the session ends
-`stalled` + `parked` + `usage_limited` (`quota-wait-cap`). A line whose parsed reset lies
-beyond the remaining cap is not waited on: the session ends the same way at once
-(`quota-wait-skipped`, `reason="reset-beyond-cap"`). An unresolved reset is admitted, and
-the cap bounds it.
+matching does not end it, since the line can scroll away. A line the CLI continued from is
+spent: if it stays on screen, no live usage gate (admission, stall-grace expiry or the
+timeout look) takes it as evidence again, and a later limit has to print a new line. At
+the cap, measured on both the monotonic and the wall clock so a host suspend cannot
+stretch it, the session ends `stalled` + `parked` + `usage_limited` (`quota-wait-cap`). A
+line whose parsed reset lies beyond the remaining cap is not waited on: the session ends
+the same way at once (`quota-wait-skipped`, `reason="reset-beyond-cap"`). An unresolved
+reset is admitted, and the cap bounds it.
 
 The `opencode-http` adapter runs its own wait loop with no pane, so neither the usage gate
 nor the quota wait applies there.
