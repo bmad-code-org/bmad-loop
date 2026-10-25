@@ -5551,6 +5551,54 @@ def test_non_completed_triage_reports_hook_evidence_distinctly(project, primary,
     assert diag["hook_event_count"] == len(primary)
 
 
+def test_triage_diagnostic_names_codex_daemon_when_no_hook_events(project):
+    """A Codex triage session that sent no hook event at all (its hooks ran in a
+    shared app-server daemon without the BMAD_LOOP_* env, so the relay dropped
+    them) gets a `hint` naming that cause, closing the escalation text's tail.
+
+    ABLATION: drop the hint assignment in `_session_failure_diagnostic` and this
+    fails on `hint`; drop it from `_diagnostic_suffix` and it fails on the text."""
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.codex_trust import DAEMON_ENV_HINT
+
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(project, [failed_session_effect()] * 2)
+    adapter.profile = get_profile("codex")  # the triage role falls back to this adapter
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert diag["hook_events"] == "none"
+    assert diag["hint"] == DAEMON_ENV_HINT
+    assert f"hook events: none; hint: {DAEMON_ENV_HINT}]" in engine.state.paused_reason
+
+
+@pytest.mark.parametrize(
+    ("profile", "primary"),
+    [
+        (None, ()),  # the mock adapter carries no profile at all
+        ("claude", ()),  # no events, but not a Codex profile
+        ("codex", ("SessionStart",)),  # a Codex relay that did deliver
+    ],
+)
+def test_triage_diagnostic_has_no_hint_for_non_codex_or_with_events(project, profile, primary):
+    """The daemon hint is additive and narrow: absent for a profile that is not
+    `codex-hooks-json`, and absent once any admitted hook event arrived.
+
+    ABLATION: drop the dialect test and the claude row carries the hint; drop the
+    no-events test and the codex row does."""
+    from bmad_loop.adapters.profile import get_profile
+
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(project, [failed_session_effect(primary_events=primary)] * 2)
+    if profile is not None:
+        adapter.profile = get_profile(profile)
+    engine.run()
+
+    diag = _decisions(engine, "triage-decision")[-1]["diagnostic"]
+    assert "hint" not in diag
+    assert "; hint:" not in engine.state.paused_reason
+
+
 def test_non_completed_triage_diagnostic_replays_session_attribution(project):
     """A nested CLI launched from inside the triage session writes into its event
     stream (#767). The diagnostic replays the attribution wait_for_completion

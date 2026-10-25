@@ -367,6 +367,14 @@ parent's stream. The generic adapter tells them apart by `session_id`
 `probe-adapter --probe` shows the payload's field names; confirm the `session_id` and
 `source` casing before relying on them.
 
+The engine passes its `BMAD_LOOP_*` contract on the session window's environment, so only
+processes descended from the launched CLI inherit it. A CLI that runs tool shells or hooks
+in a long-lived server process it shares across sessions gives them the server's
+environment instead: hooks relay nothing and skills cannot tell they run under bmad-loop.
+Host that server per session. The `codex` profile passes `--no-daemon` in `launch_args`,
+and the [opencode adapter](#worked-example-the-opencode-adapter) spawns one
+`opencode serve` per session.
+
 ### `WorkspaceTrustSpec` (the `[workspace_trust]` table)
 
 Some CLIs refuse to start in a workspace that is not listed in a home-level settings file,

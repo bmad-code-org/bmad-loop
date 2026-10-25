@@ -313,11 +313,12 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Bundled profiles: claude, codex, gemini, copilot, antigravity and opencode-http. The names `opencode` and `claude-code-tmux` resolve as aliases.
   - A `.bmad-loop/profiles/*.toml` file whose `name` matches a bundled profile overrides it; a new `name` adds a CLI. Project files win over packaged and entry-point profiles.
   - opencode runs as a headless `opencode serve` over HTTP/SSE. It needs no tmux window and registers no hooks. It speaks both OpenCode server APIs, 1.x and 2.x, picked per session from `opencode --version`; an unsupported major fails the session start with a clear error, and `validate` reports it as `adapter.opencode-version`.
+  - codex runs with `--no-daemon` (Codex ≥ 0.156), so shell tools and hooks run in the session's own process and see its `BMAD_LOOP_*` environment instead of a shared app-server daemon's. `validate` reports the version floor and a profile that drops the flag as `adapter.codex-version`; a session whose CLI never sends `SessionStart` is journaled as `session-start-missing` after `[limits] session_start_grace_s`.
   - `bmad-loop probe-adapter <cli>` does a zero-launch scan by default. `--probe` opts in to one live, content-free turn. Every report is sanitized before it is printed.
   - Antigravity (experimental) never reports token usage. Under worktree isolation, it trusts each unit worktree only when the project root is already trusted.
-- **Config:** `[adapter] name`; `bmad-loop probe-adapter <cli> --probe`; `bmad-loop probe-adapter <cli> --workspace <path>`; `bmad-loop adapters`
-- **Tested by:** `tests/test_profile.py`, `tests/test_probe.py`, `tests/test_adapter_registry.py`, `tests/test_workspace_trust.py`
-- **Docs:** [Choosing which CLIs to drive](setup-guide.md#choosing-which-clis-to-drive), [Adapter authoring guide: finalizing a profile](adapter-authoring-guide.md#walkthrough-finalizing-a-profile), [CLI reference: probe-adapter](reference/cli.md#probe-adapter), [CLI reference: adapters](reference/cli.md#adapters)
+- **Config:** `[adapter] name`; `[limits] session_start_grace_s`; `bmad-loop probe-adapter <cli> --probe`; `bmad-loop probe-adapter <cli> --workspace <path>`; `bmad-loop adapters`
+- **Tested by:** `tests/test_profile.py`, `tests/test_probe.py`, `tests/test_adapter_registry.py`, `tests/test_workspace_trust.py`, `tests/test_codex_trust.py`, `tests/test_generic_tmux.py`, `tests/test_cli.py`
+- **Docs:** [Choosing which CLIs to drive](setup-guide.md#choosing-which-clis-to-drive), [Codex shared app-server daemon](setup-guide.md#codex-shared-app-server-daemon), [Adapter authoring guide: finalizing a profile](adapter-authoring-guide.md#walkthrough-finalizing-a-profile), [CLI reference: probe-adapter](reference/cli.md#probe-adapter), [CLI reference: adapters](reference/cli.md#adapters)
 
 ### Per-stage adapters
 

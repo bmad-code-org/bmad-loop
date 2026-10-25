@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, NoReturn, Ty
 from . import deferredwork, gates, sprintstatus, ticketstore, verify
 from .adapters.generic import load_result_document
 from .bmadconfig import ProjectPaths
+from .codex_trust import DAEMON_ENV_HINT
 from .engine import (
     Engine,
     RunPaused,
@@ -1400,7 +1401,8 @@ def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
     what was on disk and which hook events arrived, so an operator whose event
     channel is miswired debugs the channel, not the agent's output. Nested-CLI
     events attribution dropped are named too: ``foreign ignored`` counts foreign
-    ids (#767), ``foreign id-less events ignored`` the id-less events lineage dropped (DW-507)."""
+    ids (#767), ``foreign id-less events ignored`` the id-less events lineage dropped (DW-507).
+    A ``hint`` naming the likely cause closes the tail."""
     if diagnostic is None:
         return ""
     artifact = str(diagnostic["artifact"])
@@ -1411,6 +1413,8 @@ def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
         hooks += f"; foreign ignored: {diagnostic['hook_foreign_ids']}"
     if diagnostic.get("hook_foreign_idless"):
         hooks += f"; foreign id-less events ignored: {diagnostic['hook_foreign_idless']}"
+    if diagnostic.get("hint"):
+        hooks += f"; hint: {diagnostic['hint']}"
     return f" [result.json: {artifact}; hook events: {hooks}]"
 
 
@@ -5083,6 +5087,11 @@ class SweepEngine(Engine):
         ``hook_foreign_idless`` the id-less events it dropped — only a trusted
         relay-side lineage ``mismatch`` drops those (DW-507).
 
+        ``hint``, present only when ``hook_events`` is ``none`` on a Codex
+        (``codex-hooks-json``) profile: a session attached to a shared app-server
+        daemon runs its hooks without the window's BMAD_LOOP_* env, so the relay
+        drops every event and the skill finds no sweep mode.
+
         Observation degrades, never raises: this runs on a failure path that must
         still reach its retry/escalation decision."""
         # The id `_run_session` just minted for this attempt: the sweep dispatches
@@ -5136,6 +5145,9 @@ class SweepEngine(Engine):
             admitted, foreign = attribute_events(events)
             kinds = {event.event for event in admitted}
             diagnostic["hook_events"] = _hook_verdict(kinds)
+            hooks = getattr(getattr(self.adapters["triage"], "profile", None), "hooks", None)
+            if not kinds and getattr(hooks, "dialect", None) == "codex-hooks-json":
+                diagnostic["hint"] = DAEMON_ENV_HINT
             diagnostic["hook_event_kinds"] = sorted(kinds)
             diagnostic["hook_event_count"] = len(admitted)
             diagnostic["hook_foreign_ids"] = len(foreign)

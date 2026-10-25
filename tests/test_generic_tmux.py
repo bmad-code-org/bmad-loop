@@ -391,10 +391,29 @@ def test_build_command_codex_renders_skill_mention(tmp_path):
     cmd = adapter.build_command(make_spec(tmp_path))
     binary = shutil.which("codex") or "codex"
     assert cmd.startswith(
-        f"{binary} 'Use the $bmad-dev-auto skill now, and use subagents as needed: 1-1-a'"
+        f"{binary} --no-daemon 'Use the $bmad-dev-auto skill now, and use subagents as needed: 1-1-a'"
     )
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert cmd.endswith("--model sonnet")
+
+
+def test_build_command_codex_passes_no_daemon_before_the_prompt(tmp_path):
+    """#901: `--no-daemon` keeps tools and hooks in the window's env, and it is a
+    top-level Codex flag, so it sits right after the binary."""
+    adapter = make_adapter(tmp_path, profile_name="codex")
+    argv = adapter.interactive_argv(make_spec(tmp_path))
+    assert argv[1] == "--no-daemon"
+    assert argv[2].startswith("Use the $bmad-dev-auto skill now")
+
+
+def test_codex_extra_args_keep_no_daemon(tmp_path):
+    """A user `extra_args` replaces the profile's bypass_args, never its
+    launch_args, so `--no-daemon` survives it."""
+    adapter = make_adapter(tmp_path, profile_name="codex", extra_args=("--custom-flag",))
+    argv = adapter.interactive_argv(make_spec(tmp_path))
+    assert argv[1] == "--no-daemon"
+    assert "--custom-flag" in argv
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
 
 
 def test_build_command_gemini_uses_interactive_flag(tmp_path):
@@ -12402,3 +12421,184 @@ def test_synthesize_from_threads_plan_halt_and_success_statuses(tmp_path, monkey
     assert (
         adapter._synth_result(_dev_handle(), make_spec(False), wait=False, dead_window=True) is None
     )
+
+
+# ------------------------------- session-start-missing notice
+#
+# Observation only. A session whose profile maps SessionStart but that has run
+# `limits.session_start_grace_s` without one gets one latched journal entry; a
+# Codex profile's entry names the shared-daemon cause. Nothing here ends, nudges
+# or reclassifies the session.
+
+
+def _start_missing_adapter(tmp_path, monkeypatch, *, hooks_from="claude", grace=None):
+    """The plain adapter (the sweep's triage role, `_stall_grace_s` 0) with a fake
+    journal and the steerable clock; `hooks_from` swaps in that profile's name
+    and hook spec, `grace` overrides the policy's default."""
+    adapter, clock, sent = _budget_adapter(tmp_path, monkeypatch)
+    assert adapter._stall_grace_s == 0.0
+    if hooks_from != "claude":
+        donor = get_profile(hooks_from)
+        adapter.profile = dataclasses.replace(adapter.profile, name=donor.name, hooks=donor.hooks)
+    if grace is not None:
+        adapter._session_start_grace_s = grace
+    adapter.journal = _FakeJournal()
+    return adapter, clock, sent
+
+
+def _start_missing_script(clock, *, end_at=10):
+    """on_call hook: one heartbeat per watcher call from the second on (waited 30,
+    60, 90 ...), then past `spec.timeout_s` at `end_at`."""
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == end_at:
+            clock["t"] += 100_000.0
+
+    return script
+
+
+def _start_missing_entries(adapter):
+    return [e for e in adapter.journal.entries if e["kind"] == "session-start-missing"]
+
+
+def _run_start_missing(adapter, clock, tmp_path, events=()):
+    adapter.watcher = _ScriptedWatcher(list(events), on_call=_start_missing_script(clock))
+    return adapter.wait_for_completion(
+        _budget_handle(), _budget_spec(tmp_path, mode="off", timeout_s=5000.0)
+    )
+
+
+def test_session_start_missing_fires_once_after_grace(tmp_path, monkeypatch):
+    """No SessionStart by the policy's default grace (120 s): one entry at the first
+    heartbeat at or past it, latched for every later tick.
+
+    ABLATION: drop the `session_start_noted` latch and every later heartbeat
+    appends another entry."""
+    adapter, clock, sent = _start_missing_adapter(tmp_path, monkeypatch)
+    assert adapter._session_start_grace_s == 120.0  # read from policy
+    result = _run_start_missing(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert sent == []
+    assert _start_missing_entries(adapter) == [
+        {
+            "kind": "session-start-missing",
+            "task_id": "b-1",
+            "waited_s": 120,
+            "grace_s": 120.0,
+            "cli": "claude",
+        }
+    ]
+
+
+def test_session_start_missing_absent_when_session_start_arrives(tmp_path, monkeypatch):
+    """An admitted SessionStart before the grace crossing means no entry.
+
+    ABLATION: drop `saw_session_start = True` and the entry fires at 120 s."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    result = _run_start_missing(adapter, clock, tmp_path, events=[_start_event(transcript)])
+    assert result.status == "timeout"
+    assert _start_missing_entries(adapter) == []
+
+
+def test_session_start_missing_disabled_at_zero_grace(tmp_path, monkeypatch):
+    """`limits.session_start_grace_s = 0` turns the notice off.
+
+    ABLATION: drop the `grace <= 0` gate and the entry fires on the first
+    heartbeat (waited 0 >= grace 0)."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch, grace=0.0)
+    result = _run_start_missing(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert _start_missing_entries(adapter) == []
+
+
+def test_session_start_missing_skipped_for_profile_without_session_start(tmp_path, monkeypatch):
+    """A profile whose hooks never map SessionStart (antigravity maps only Stop)
+    cannot be missing one. Copilot maps it from a lower-case native name, so the
+    gate reads the canonical side of the table.
+
+    ABLATION: drop the SessionStart gate and the antigravity row fires; test the
+    native keys instead of the canonical values and the copilot row stays silent."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch, hooks_from="antigravity")
+    assert "SessionStart" not in adapter.profile.hooks.events.values()
+    _run_start_missing(adapter, clock, tmp_path)
+    assert _start_missing_entries(adapter) == []
+
+    other = tmp_path / "copilot"
+    other.mkdir()
+    adapter, clock, _ = _start_missing_adapter(other, monkeypatch, hooks_from="copilot")
+    _run_start_missing(adapter, clock, other)
+    assert [e["cli"] for e in _start_missing_entries(adapter)] == ["copilot"]
+
+
+def test_session_start_missing_carries_codex_hint_only_for_codex_dialect(tmp_path, monkeypatch):
+    """A `codex-hooks-json` profile's entry names the shared app-server daemon and
+    the `--no-daemon` flag; other dialects carry no `hint`.
+
+    ABLATION: drop the dialect gate and the claude entry carries the hint too."""
+    from bmad_loop.codex_trust import DAEMON_ENV_HINT, NO_DAEMON_ARG
+
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch, hooks_from="codex")
+    _run_start_missing(adapter, clock, tmp_path)
+    (entry,) = _start_missing_entries(adapter)
+    assert entry["cli"] == "codex"
+    assert entry["hint"] == DAEMON_ENV_HINT
+    assert NO_DAEMON_ARG in entry["hint"] and "BMAD_LOOP_*" in entry["hint"]
+
+    other = tmp_path / "claude"
+    other.mkdir()
+    adapter, clock, _ = _start_missing_adapter(other, monkeypatch)
+    _run_start_missing(adapter, clock, other)
+    (entry,) = _start_missing_entries(adapter)
+    assert "hint" not in entry
+
+
+def test_session_start_missing_never_ends_or_nudges_the_session(tmp_path, monkeypatch):
+    """The notice fires mid-session, and the session still completes on its later
+    Stop with the verdict a grace-0 run reaches: no nudge, no stall, no early end.
+
+    ABLATION: return a "stalled" verdict from the notice site and the first run
+    ends before its Stop."""
+
+    def run(root, grace):
+        root.mkdir()
+        adapter, clock, sent = _start_missing_adapter(root, monkeypatch, grace=grace)
+        transcript = root / "t.jsonl"
+        transcript.write_bytes(b"{}\n")
+        (adapter.tasks_dir / "b-1" / "result.json").write_text('{"ok": true}')
+        events = [None] * 6 + [_stop_event("b-1", "sess", str(transcript))]
+        result = _run_start_missing(adapter, clock, root, events=events)
+        return adapter, result, sent
+
+    adapter, result, sent = run(tmp_path / "on", 120.0)
+    assert len(_start_missing_entries(adapter)) == 1
+    _, control, control_sent = run(tmp_path / "off", 0.0)
+    assert result.status == control.status == "completed"
+    assert result.result_json == control.result_json == {"ok": True}
+    assert result.stop_seen is control.stop_seen is True
+    assert sent == control_sent == []
+
+
+def test_session_start_missing_journal_write_failure_is_swallowed(tmp_path, monkeypatch):
+    """An unwritable journal must not end the session: the write is retried on the
+    next heartbeat and the session runs to its own end.
+
+    ABLATION: drop the `except OSError` and the session raises out of the loop."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    attempts: list[str] = []
+
+    class _Failing(_FakeJournal):
+        def append(self, kind, **fields):
+            attempts.append(kind)
+            if len(attempts) == 1:
+                raise OSError("disk full")
+            super().append(kind, **fields)
+
+    adapter.journal = _Failing()
+    result = _run_start_missing(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert attempts == ["session-start-missing", "session-start-missing"]
+    assert [e["waited_s"] for e in _start_missing_entries(adapter)] == [150]

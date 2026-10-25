@@ -549,3 +549,50 @@ def test_continuous_unrelated_messages_cannot_extend_rpc_deadline(tmp_path, monk
     monkeypatch.setattr(codex_trust, "_TIMEOUT_S", 0.1)
     with pytest.raises(TimeoutError):
         codex_trust._hooks_list(str(script), tmp_path, {})
+
+
+def test_trust_accepts_no_daemon_launch_arg(tmp_path, monkeypatch):
+    """The shipped profile launches with `--no-daemon`, which changes where the
+    app-server is hosted, not which hooks are discovered: it resolves trusted,
+    not unverifiable. Ablation target: drop NO_DAEMON_ARG from the safe set."""
+    data = _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, data))
+    profile = get_profile("codex")
+    assert profile.launch_args == (codex_trust.NO_DAEMON_ARG,)
+    assert codex_trust.project_hook_trust(tmp_path, profile).status == "trusted"
+
+
+def test_trust_still_refuses_unknown_launch_args(tmp_path, monkeypatch):
+    data = _config(tmp_path)
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "codex-stub")
+    monkeypatch.setattr(codex_trust, "_hooks_list", lambda *_: _rpc(tmp_path, data))
+    profile = replace(
+        get_profile("codex"), launch_args=(codex_trust.NO_DAEMON_ARG, "--profile", "x")
+    )
+    result = codex_trust.project_hook_trust(tmp_path, profile)
+    assert result.status == "unverifiable"
+    assert "launch arguments" in result.reason
+
+
+def test_hook_discovery_args_safe_accepts_no_daemon():
+    assert codex_trust.hook_discovery_args_safe(None)
+    assert codex_trust.hook_discovery_args_safe(("--no-daemon",))
+    assert codex_trust.hook_discovery_args_safe(
+        ("--no-daemon", "--dangerously-bypass-approvals-and-sandbox")
+    )
+    assert not codex_trust.hook_discovery_args_safe(("--no-daemon", "-c", "x=1"))
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("codex-cli 0.164.0", (0, 164, 0)),
+        ("0.156.0", (0, 156, 0)),
+        ("codex-cli 0.155.1-alpha.2", (0, 155, 1)),
+        ("codex-cli", None),
+        ("", None),
+    ],
+)
+def test_parse_codex_version(text, expected):
+    assert codex_trust.parse_codex_version(text) == expected
