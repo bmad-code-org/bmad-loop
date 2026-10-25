@@ -391,10 +391,29 @@ def test_build_command_codex_renders_skill_mention(tmp_path):
     cmd = adapter.build_command(make_spec(tmp_path))
     binary = shutil.which("codex") or "codex"
     assert cmd.startswith(
-        f"{binary} 'Use the $bmad-dev-auto skill now, and use subagents as needed: 1-1-a'"
+        f"{binary} --no-daemon 'Use the $bmad-dev-auto skill now, and use subagents as needed: 1-1-a'"
     )
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert cmd.endswith("--model sonnet")
+
+
+def test_build_command_codex_passes_no_daemon_before_the_prompt(tmp_path):
+    """#901: `--no-daemon` keeps tools and hooks in the window's env, and it is a
+    top-level Codex flag, so it sits right after the binary."""
+    adapter = make_adapter(tmp_path, profile_name="codex")
+    argv = adapter.interactive_argv(make_spec(tmp_path))
+    assert argv[1] == "--no-daemon"
+    assert argv[2].startswith("Use the $bmad-dev-auto skill now")
+
+
+def test_codex_extra_args_keep_no_daemon(tmp_path):
+    """A user `extra_args` replaces the profile's bypass_args, never its
+    launch_args, so `--no-daemon` survives it."""
+    adapter = make_adapter(tmp_path, profile_name="codex", extra_args=("--custom-flag",))
+    argv = adapter.interactive_argv(make_spec(tmp_path))
+    assert argv[1] == "--no-daemon"
+    assert "--custom-flag" in argv
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
 
 
 def test_build_command_gemini_uses_interactive_flag(tmp_path):

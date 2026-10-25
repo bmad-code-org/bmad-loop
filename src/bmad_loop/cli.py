@@ -689,6 +689,67 @@ def _check_opencode_version(report: ValidationReport, profile_name: str, resolve
         )
 
 
+def _check_codex_version(report: ValidationReport, profile: CLIProfile, resolved: str) -> None:
+    """``adapter.codex-version``: whether ``resolved`` accepts ``--no-daemon``
+    (Codex >= :data:`codex_trust.CODEX_MIN_VERSION`) and whether ``profile``
+    passes it. Without it a session can attach to a shared app-server daemon that
+    runs tools and hooks with the daemon's env, so they never see BMAD_LOOP_*.
+    OK or a warning, never a problem: validate's rc is a compatibility contract.
+
+    Called only once ``binary_runs`` saw ``--version`` exit 0, like
+    :func:`_check_opencode_version`, so an unreadable second read warns here."""
+    from . import probe as probe_mod
+    from .codex_trust import CODEX_MIN_VERSION, NO_DAEMON_ARG, parse_codex_version
+
+    floor = ".".join(str(part) for part in CODEX_MIN_VERSION)
+    first_line = probe_mod.binary_version_text(resolved)
+    if first_line is None:
+        report.warn(
+            "adapter.codex-version",
+            f"{profile.name}: `--version` exited 0 once, but a second read failed, "
+            f"timed out, or printed nothing — sessions need Codex >= {floor} for "
+            f"{NO_DAEMON_ARG}",
+            {"profile": profile.name, "path": resolved, "output": None},
+        )
+        return
+    detail: dict[str, object] = {"profile": profile.name, "path": resolved, "output": first_line}
+    version = parse_codex_version(first_line)
+    if version is None:
+        report.warn(
+            "adapter.codex-version",
+            f"{profile.name}: `--version` printed {first_line[:200]!r}, which names no "
+            f"Codex version — sessions need Codex >= {floor} for {NO_DAEMON_ARG}",
+            detail,
+        )
+        return
+    found = ".".join(str(part) for part in version)
+    detail["version"] = found
+    if version < CODEX_MIN_VERSION:
+        detail["verdict"] = "below-floor"
+        report.warn(
+            "adapter.codex-version",
+            f"{profile.name}: codex {found} is older than {floor}: it rejects "
+            f"{NO_DAEMON_ARG} and every session exits at launch; upgrade Codex",
+            detail,
+        )
+    elif NO_DAEMON_ARG not in profile.launch_args:
+        detail["verdict"] = "no-daemon-missing"
+        report.warn(
+            "adapter.codex-version",
+            f"{profile.name}: launch_args lack {NO_DAEMON_ARG}, so sessions can attach "
+            "to a shared Codex app-server daemon whose tools and hooks never see the "
+            "BMAD_LOOP_* environment",
+            detail,
+        )
+    else:
+        detail["verdict"] = "ok"
+        report.ok(
+            "adapter.codex-version",
+            f"{profile.name}: codex {found} runs sessions with {NO_DAEMON_ARG}",
+            detail,
+        )
+
+
 def _report_bmad_config(report: ValidationReport, paths: bmadconfig.ProjectPaths) -> None:
     """The `bmad-config` ok line, plus the v7 warnings. A v6 config reports exactly
     as it always has; a v7 one names the era and the active initiative, warns when
@@ -1090,6 +1151,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
             resolved_binary = runnable.get(profile.binary)
             if resolved_binary is not None:
                 _check_opencode_version(report, profile.name, resolved_binary)
+        if profile.hooks.dialect == "codex-hooks-json":
+            # The same packaged-provenance gate as the opencode read above; never
+            # a problem, for the same rc contract.
+            resolved_binary = runnable.get(profile.binary)
+            if resolved_binary is not None:
+                _check_codex_version(report, profile, resolved_binary)
         if profile.hookless:
             report.ok(
                 "adapter.hookless",

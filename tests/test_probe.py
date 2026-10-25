@@ -1239,3 +1239,15 @@ def test_cli_json_without_workspace_reports_null(tmp_path, capsys):
         err_contains="ok:",
     )
     assert doc["workspace_trust"] is None
+
+
+def test_probe_argv_carries_codex_launch_args(monkeypatch):
+    """probe-adapter launches Codex as a session would: the shipped
+    `--no-daemon` launch arg sits right after the binary, ahead of the prompt."""
+    from bmad_loop import codex_trust
+
+    monkeypatch.setattr(codex_trust, "resolved_codex_binary", lambda *_: "/bin/codex")
+    argv = probe._probe_argv(get_profile("codex"), "codex", probe.Hints())
+    assert argv[:2] == ["/bin/codex", "--no-daemon"]
+    assert argv[2] == probe.PROBE_PROMPT
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv[3:]

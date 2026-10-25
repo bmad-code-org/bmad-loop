@@ -107,6 +107,7 @@ breaking changes may land in a minor release.
   `in_tool`, and the TUI shows `· idle <age> · in <tool>` (#858).
 - Add `[verify] command_timeout_min` (default 30): per-command verify timeout,
   previously fixed at 30 minutes (#857).
+- `validate` reports `adapter.codex-version` (#901).
 
 ### Changed
 
@@ -310,6 +311,10 @@ breaking changes may land in a minor release.
   a failed pin falls back to the window and is crumbed `pane-pin-failed` (#948).
 - Refuse to type a nudge into a pane in copy or clock mode, which swallowed it while
   it counted as sent; the nudge is now recorded as not delivered (#949).
+- Run Codex sessions with `--no-daemon` so tools and hooks see the session's
+  `BMAD_LOOP_*` environment instead of a shared app-server daemon's; Codex >= 0.156 is
+  now required. A Codex run paused across this upgrade prints the config-changed
+  advisory once on resume (#901).
 
 ### Security
 

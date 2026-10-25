@@ -41,6 +41,8 @@ def test_builtin_profiles_load():
     assert {"claude", "codex", "gemini", "opencode-http"} <= set(profiles)
     assert profiles["claude"].usage_parser == "claude-jsonl"
     assert profiles["codex"].hooks.dialect == "codex-hooks-json"
+    # tools and hooks run in the client, not a shared app-server daemon (#901)
+    assert profiles["codex"].launch_args == ("--no-daemon",)
     assert "SessionEnd" not in profiles["codex"].hooks.events  # codex has no such hook
     assert profiles["gemini"].hooks.events["AfterAgent"] == "Stop"
     assert profiles["gemini"].launch_args == ("-i",)

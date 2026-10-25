@@ -1,17 +1,21 @@
-# OpenAI Codex CLI (>= 0.139). Slash commands are NOT expanded when passed as
+# OpenAI Codex CLI (>= 0.156). Slash commands are NOT expanded when passed as
 # the initial prompt argument; the $skill-name mention syntax attaches the
 # skill instead (skills live in .agents/skills/) — live-verified 2026-06-11.
 # "use subagents as needed" is required or Codex runs the skill's parallel
 # phases (e.g. review layers) without spawning subagents. Codex defines
 # SessionEnd and SubagentStop hook events, but bmad-loop maps only SessionStart
 # and Stop; the adapter's window-death fallback covers crashes.
+# `--no-daemon` keeps tools and hooks in this client's process, so they inherit
+# the window's BMAD_LOOP_* env. A shared app-server daemon (Codex's default since
+# 0.157) runs them with the daemon's env instead.
 name = "codex"
 binary = "codex"
+launch_args = ["--no-daemon"]
 prompt_template = "Use the ${skill} skill now, and use subagents as needed: {args}"
 bypass_args = ["--dangerously-bypass-approvals-and-sandbox"]
 model_flag = "--model"
 usage_parser = "codex-rollout"
-first_run_note = "run `codex` once in the project and accept BOTH prompts: workspace trust, then 'Hooks need review' -> 'Trust all and continue' (untrusted hooks silently never fire); requires Codex >= 0.139"
+first_run_note = "run `codex` once in the project and accept BOTH prompts: workspace trust, then 'Hooks need review' -> 'Trust all and continue' (untrusted hooks silently never fire); requires Codex >= 0.156"
 skill_tree = ".agents/skills"
 # Project-scoped Codex config (MCP servers under [mcp_servers]) — gitignored, so
 # a worktree checkout omits it and isolated sessions lose their MCP servers.

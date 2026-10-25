@@ -595,7 +595,7 @@ def test_dry_run_sprint_output_is_pinned(project, capsys):
 
     out, err = capsys.readouterr()
     review = (
-        'codex "Use the $bmad-build-auto skill now, and use subagents as needed: '
+        'codex --no-daemon "Use the $bmad-build-auto skill now, and use subagents as needed: '
         '<done spec from dev>" --dangerously-bypass-approvals-and-sandbox --model gpt-5-codex'
     )
     assert rc == 0
@@ -11464,6 +11464,116 @@ def test_validate_opencode_version_warns_when_second_read_fails(project, capsys,
     assert [f["severity"] for f in findings] == ["warning"]
     assert findings[0]["detail"]["output"] is None
     assert "refuse to start" in findings[0]["message"]
+
+
+def _codex_version_findings(
+    project, capsys, monkeypatch, version_line: str | None, *, overlay_launch_args=None
+):
+    """`adapter.codex-version` findings for a codex project whose binary resolves,
+    runs, and prints ``version_line`` for `--version`. With ``overlay_launch_args``
+    the triage role runs a project overlay profile `codex-mine` with those launch
+    args beside the shipped `codex`.
+
+    Validates twice, the second time with the check stubbed out, and asserts the
+    rc is the same: the check warns and never fails, whatever it finds. The rc
+    itself is not asserted: other gates legitimately vary by machine."""
+    from importlib import resources
+
+    install_bmad_config(project)
+    policy = '[adapter]\nname = "codex"\n'
+    if overlay_launch_args is not None:
+        shipped = (
+            resources.files("bmad_loop.data")
+            .joinpath("profiles/codex.toml")
+            .read_text(encoding="utf-8")
+        )
+        lines = [
+            (
+                f"launch_args = {json.dumps(list(overlay_launch_args))}"
+                if line.startswith("launch_args")
+                else 'name = "codex-mine"' if line.startswith("name =") else line
+            )
+            for line in shipped.splitlines()
+        ]
+        overlay = project.project / ".bmad-loop" / "profiles" / "codex-mine.toml"
+        overlay.parent.mkdir(parents=True, exist_ok=True)
+        overlay.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        policy += '[adapter.triage]\nname = "codex-mine"\n'
+    _write_policy(project.project, policy)
+    monkeypatch.setattr(cli.shutil, "which", lambda tool, *_a, **_kw: f"/usr/bin/{tool}")
+    monkeypatch.setattr(probe_mod, "binary_runs", lambda *_a, **_kw: 0)
+    monkeypatch.setattr(probe_mod, "binary_version_text", lambda *_a, **_kw: version_line)
+    rc = cli.main(["validate", "--project", str(project.project), "--json"])
+    captured = capsys.readouterr()
+    assert captured.out, captured.err
+    doc = json.loads(captured.out)
+    findings = [f for f in doc["findings"] if f["check"] == "adapter.codex-version"]
+    assert all(f["severity"] != "problem" for f in findings)
+    monkeypatch.setattr(cli, "_check_codex_version", lambda *_a, **_kw: None)
+    assert cli.main(["validate", "--project", str(project.project), "--json"]) == rc
+    capsys.readouterr()
+    return findings
+
+
+def test_validate_codex_version_ok_on_current(project, capsys, monkeypatch):
+    """#901: a Codex that accepts --no-daemon, under the shipped profile."""
+    findings = _codex_version_findings(project, capsys, monkeypatch, "codex-cli 0.164.0")
+    assert [f["severity"] for f in findings] == ["ok"]
+    assert findings[0]["detail"] == {
+        "profile": "codex",
+        "path": "/usr/bin/codex",
+        "output": "codex-cli 0.164.0",
+        "version": "0.164.0",
+        "verdict": "ok",
+    }
+
+
+def test_validate_codex_version_warns_below_floor(project, capsys, monkeypatch):
+    """A Codex older than 0.156 rejects --no-daemon, so every session exits at
+    launch: a warning, never a problem (validate's rc is a compatibility contract)."""
+    findings = _codex_version_findings(project, capsys, monkeypatch, "codex-cli 0.155.1")
+    assert [f["severity"] for f in findings] == ["warning"]
+    assert findings[0]["detail"]["verdict"] == "below-floor"
+    assert "older than 0.156" in findings[0]["message"]
+    assert "upgrade Codex" in findings[0]["message"]
+
+
+def test_validate_codex_version_warns_when_overlay_drops_no_daemon(project, capsys, monkeypatch):
+    """A project overlay profile without --no-daemon lets its sessions attach to a
+    shared daemon. The shipped profile beside it stays ok.
+
+    Ablation target: drop the launch_args test and the overlay reads ok."""
+    findings = _codex_version_findings(
+        project, capsys, monkeypatch, "codex-cli 0.164.0", overlay_launch_args=()
+    )
+    by_profile = {f["detail"]["profile"]: f for f in findings}
+    assert by_profile["codex"]["severity"] == "ok"
+    assert by_profile["codex-mine"]["severity"] == "warning"
+    assert by_profile["codex-mine"]["detail"]["verdict"] == "no-daemon-missing"
+    assert "BMAD_LOOP_* environment" in by_profile["codex-mine"]["message"]
+
+
+def test_validate_codex_version_overlay_keeping_no_daemon_is_ok(project, capsys, monkeypatch):
+    findings = _codex_version_findings(
+        project, capsys, monkeypatch, "codex-cli 0.164.0", overlay_launch_args=("--no-daemon",)
+    )
+    assert sorted(f["detail"]["profile"] for f in findings) == ["codex", "codex-mine"]
+    assert {f["severity"] for f in findings} == {"ok"}
+
+
+@pytest.mark.parametrize("version_line", [None, "codex-cli unknown"])
+def test_validate_codex_version_warns_on_unreadable_version(
+    project, capsys, monkeypatch, version_line
+):
+    """The check runs only after `binary_runs` saw `--version` exit 0, so a read
+    that now fails or names no version is reported by no other finding.
+
+    Ablation target: return early on an unreadable read and this sees no finding."""
+    findings = _codex_version_findings(project, capsys, monkeypatch, version_line)
+    assert [f["severity"] for f in findings] == ["warning"]
+    assert findings[0]["detail"]["output"] == version_line
+    assert "verdict" not in findings[0]["detail"]
+    assert "0.156" in findings[0]["message"]
 
 
 def test_validate_warns_when_no_desktop_notifier(project, monkeypatch, capsys):
