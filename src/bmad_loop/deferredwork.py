@@ -2990,7 +2990,10 @@ def _normalize_severity(value: str) -> str | None:
     return SEVERITY_ALIASES.get(value.lower())
 
 
-_LEADING_SEVERITY_RE = re.compile(r"[ \t\r\n*_`]*([A-Za-z]+)")
+# The word must end there: a digit, letter or `_word` suffix ("critical1",
+# "high_priority") is a different token, while a closing `_` emphasis or a
+# hyphenated qualifier ("high-if-true") still reads as the level.
+_LEADING_SEVERITY_RE = re.compile(r"[ \t\r\n*_`]*([A-Za-z]+)(?![^\W_]|_\w)")
 
 
 def leading_severity(text: str) -> str | None:
