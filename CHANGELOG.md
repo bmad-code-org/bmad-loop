@@ -108,6 +108,9 @@ breaking changes may land in a minor release.
 - Add `[verify] command_timeout_min` (default 30): per-command verify timeout,
   previously fixed at 30 minutes (#857).
 - `validate` reports `adapter.codex-version` (#901).
+- Journal `session-start-missing` when a session's CLI reports no SessionStart within
+  `limits.session_start_grace_s` (default 120 s); Codex failures with no hook events
+  name the shared-daemon cause in sweep escalation text (#901).
 
 ### Changed
 

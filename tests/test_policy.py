@@ -636,6 +636,24 @@ def test_teardown_grace_must_be_nonnegative():
         policy.loads("[limits]\nteardown_grace_s = -1\n")
 
 
+def test_session_start_grace_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").limits.session_start_grace_s == 120
+    loaded = policy.loads("[limits]\nsession_start_grace_s = 45\n")
+    assert loaded.limits.session_start_grace_s == 45
+    # 0 is legal: no session-start-missing notice
+    assert policy.loads("[limits]\nsession_start_grace_s = 0\n").limits.session_start_grace_s == 0
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["session_start_grace_s"] == policy.LimitsPolicy.session_start_grace_s
+
+
+def test_session_start_grace_must_be_nonnegative():
+    with pytest.raises(policy.PolicyError, match=r"limits\.session_start_grace_s must be >= 0"):
+        policy.loads("[limits]\nsession_start_grace_s = -1\n")
+
+
 def test_workflow_stall_nudges_cap_default_parse_and_template():
     import tomllib
 
@@ -697,6 +715,7 @@ def test_dev_contract_nudge_rejects_non_boolean():
         "teardown_grace_s",
         "stop_without_result_nudges",
         "dev_stall_grace_s",
+        "session_start_grace_s",
         "dev_stall_nudges",
         "dev_stall_nudges_cap",
         "workflow_stall_nudges_cap",

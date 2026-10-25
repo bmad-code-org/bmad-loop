@@ -542,6 +542,11 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # DW-446: the recorded root's `(st_dev, st_ino)` — two integers naming no story,
     # branch, commit or path; left as-is so a maintainer can compare the record with
     # a later refusal. Kind-scoped because `dev` is generic.
+    # `session-start-missing`: `cli` is the session's CLI profile name, the config
+    # name `profile` carries on `bypass-dropped`; `hint` is a code constant
+    # (`codex_trust.DAEMON_ENV_HINT`), never session or operator text. Kind-scoped
+    # because both names are generic.
+    "session-start-missing": frozenset({"cli", "hint"}),
     "root-identity-recorded": frozenset({"dev", "ino"}),
     # DW-446: the `st_dev` a locked resume/re-arm re-bound (`old_dev` -> `dev`) under
     # a still-matching `ino` — integers only, kept for the same comparison.
@@ -757,6 +762,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "followup_review_recommended",
         "frm",
         "generation",
+        # `session-start-missing`: `limits.session_start_grace_s` as a float, so
+        # the record reads without the policy snapshot in hand.
+        "grace_s",
         "graceful",
         "harvest_attempt",
         # `head` is NOT here any more: a HEAD sha (`attempt-preserve-failed`,
@@ -1003,6 +1011,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "verification_sequence",
         "verification_stage",
         "via",
+        # `session-start-missing`: whole seconds the session had run without a
+        # SessionStart when the notice fired — a measured integer.
+        "waited_s",
         "weighted",
         "workflow",
         "worktree",
@@ -1324,6 +1335,11 @@ JOURNAL_KINDS = frozenset(
         # `in_tool`, a closed slug the adapter chose (declared benign).
         "session-active",
         "session-idle",
+        # One `session-start-missing` when a CLI whose profile maps SessionStart
+        # has sent none by `limits.session_start_grace_s`: `task_id` (routed),
+        # `waited_s`/`grace_s` (declared benign), `cli` and, on a Codex profile,
+        # the constant `hint` (declared benign on this kind).
+        "session-start-missing",
         # checkpoints.py
         "checkpoint-pause",
         "checkpoint-resume",

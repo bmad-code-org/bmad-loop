@@ -127,6 +127,10 @@ class LimitsPolicy:
     # the idle notice) while retaining fail-fast handling when a turn ends without
     # a terminal spec/result.
     dev_stall_grace_s: int = 600
+    # seconds a session whose CLI maps SessionStart may run without one before
+    # the journal gets a one-shot session-start-missing notice. Observation only:
+    # no deadline, nudge or verdict depends on it. 0 = off.
+    session_start_grace_s: int = 120
     # how many best-effort wake nudges a silent dev/review session receives on
     # dev_stall_grace_s expiry before it is called stalled. Transport activity
     # re-arms the grace without spending a nudge; fresh Stop/idle evidence also
@@ -1002,6 +1006,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         dev_stall_grace_s=_typed_int(
             limits_d, "limits", "dev_stall_grace_s", LimitsPolicy.dev_stall_grace_s
         ),
+        session_start_grace_s=_typed_int(
+            limits_d, "limits", "session_start_grace_s", LimitsPolicy.session_start_grace_s
+        ),
         dev_stall_nudges=_typed_int(
             limits_d, "limits", "dev_stall_nudges", LimitsPolicy.dev_stall_nudges
         ),
@@ -1063,6 +1070,10 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         )
     if limits.dev_stall_grace_s < 0:
         raise PolicyError(f"limits.dev_stall_grace_s must be >= 0: got {limits.dev_stall_grace_s}")
+    if limits.session_start_grace_s < 0:
+        raise PolicyError(
+            f"limits.session_start_grace_s must be >= 0: got {limits.session_start_grace_s}"
+        )
     if limits.dev_stall_nudges < 0:
         raise PolicyError(f"limits.dev_stall_nudges must be >= 0: got {limits.dev_stall_nudges}")
     if limits.dev_stall_nudges_cap < 0:
@@ -1498,6 +1509,7 @@ git_timeout_s = 120          # bound on any single git subprocess; exceeding it 
 teardown_grace_s = 20        # verified teardown: poll a killed session window up to this long, then force-kill its pane pids and re-kill (#157). 0 = single unverified best-effort kill
 stop_without_result_nudges = 1
 dev_stall_grace_s = 600      # silence grace armed at dev/review launch and re-armed by transport activity or fresh Stop/idle evidence before bounded recovery; also the transcript-idle notice threshold (journal session-idle/session-active, TUI idle age). 0 = no launch timer (and no idle notice), but a result-less turn end still fails fast
+session_start_grace_s = 120  # seconds a session whose CLI maps SessionStart may run without one before a journal-only session-start-missing notice; 0 = off
 dev_stall_nudges = 2         # best-effort wake nudges per silent grace before stalling; fresh Stop/idle evidence restores this budget. 0 = stall on grace expiry
 dev_stall_nudges_cap = 6     # total (never-restored) nudge bound per dev/review session; bounds launch-time recovery and Stop/idle budget refills because an accepted nudge does not guarantee a wake. 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry

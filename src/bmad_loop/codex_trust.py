@@ -31,6 +31,13 @@ _TIMEOUT_S = 5.0
 NO_DAEMON_ARG = "--no-daemon"
 # The first Codex that accepts NO_DAEMON_ARG; older ones exit at launch on it.
 CODEX_MIN_VERSION: tuple[int, int, int] = (0, 156, 0)
+# Why a Codex session can report no hook events: the sweep's failure text and
+# the adapter's session-start-missing journal notice both carry it.
+DAEMON_ENV_HINT = (
+    "a Codex session attached to a shared app-server daemon runs tools and hooks"
+    f" without the BMAD_LOOP_* environment; keep {NO_DAEMON_ARG} in the profile's"
+    f" launch_args (Codex >= {CODEX_MIN_VERSION[0]}.{CODEX_MIN_VERSION[1]})"
+)
 # Launch args that leave hook discovery unchanged: the bypass switch changes
 # approvals, and NO_DAEMON_ARG changes where the app-server is hosted.
 _HOOK_DISCOVERY_SAFE_ARGS = frozenset({"--dangerously-bypass-approvals-and-sandbox", NO_DAEMON_ARG})

@@ -958,6 +958,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # and belongs to every pane-driven session the same. Same knob, no new
         # policy field; 0 disables the notice along with the stall timer.
         self._idle_threshold_s = float(policy.limits.dev_stall_grace_s)
+        # Grace for the one-shot `session-start-missing` journal notice
+        # (`_note_session_start_missing`). Observation only, like the idle notice,
+        # so every adapter reads it, the plain one included; 0 disables it.
+        self._session_start_grace_s = float(policy.limits.session_start_grace_s)
         # Wake-nudges to spend on grace expiry before stalling. 0 here is moot for
         # the base adapter (grace 0 never opens the window); the dev adapter sets
         # it from policy so an idle wait is re-invoked rather than killed outright.
@@ -1328,6 +1332,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # stalls or kills (#680 item 2 stays open), and `stall_deadline` is
         # neither consulted nor touched.
         idle = _IdleTracker()
+        # An admitted SessionStart arrived, and the one-shot `session-start-missing`
+        # notice was journaled; see `_note_session_start_missing`. Observes only.
+        saw_session_start = False
+        session_start_noted = False
 
         # A transcript can grow for an initial user prompt or the loop's own
         # wake nudge, neither of which proves model work. Latch model-side
@@ -1501,6 +1509,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # has named the transcript.
                 if transcript_path:
                     sample_transcript(transcript_path, now)
+                if not saw_session_start and not session_start_noted:
+                    session_start_noted = self._note_session_start_missing(
+                        handle, now - loop_started
+                    )
                 self._write_heartbeat(
                     handle.task_id,
                     {
@@ -1949,6 +1961,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             try_resolve()
 
             if event.event == "SessionStart":
+                saw_session_start = True
                 continue
             if event.event == "Notification" or event.event in PARKED_EVENTS:
                 # Parked-session signal (DW-348): latch it, never act on it here.
@@ -2289,6 +2302,51 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 pass
             else:
                 idle.open_since = idle.last_change_wall
+
+    def _note_session_start_missing(self, handle: SessionHandle, waited_s: float) -> bool:
+        """Journal one `session-start-missing` (`task_id`, `waited_s`, `grace_s`,
+        `cli`) for a session whose profile maps SessionStart but that has run
+        `limits.session_start_grace_s` without one; True once written, so the
+        caller latches it.
+
+        A CLI whose hooks run without the window's BMAD_LOOP_* env (a Codex
+        session attached to a shared app-server daemon) fires its hooks into a
+        relay that exits silently, so the session would otherwise look healthy
+        until `session_timeout_min`. A `codex-hooks-json` profile adds `hint`,
+        naming that cause. Observation only: no deadline, nudge or verdict reads
+        it, and it fires on the plain adapter too, which arms no stall timer. No
+        journal, grace 0, a window that is not alive (or a liveness probe that
+        raised) or an unwritable journal writes nothing and leaves it unlatched,
+        and the session runs on."""
+        if (
+            self.journal is None
+            or "SessionStart" not in self.profile.hooks.events.values()
+            or self._session_start_grace_s <= 0
+            or waited_s < self._session_start_grace_s
+        ):
+            return False
+        try:
+            if not self._window_alive(handle):
+                return False
+        except MultiplexerError:
+            return False
+        extra: dict[str, str] = {}
+        if self.profile.hooks.dialect == "codex-hooks-json":
+            from ..codex_trust import DAEMON_ENV_HINT
+
+            extra["hint"] = DAEMON_ENV_HINT
+        try:
+            self.journal.append(
+                "session-start-missing",
+                task_id=handle.task_id,
+                waited_s=int(waited_s),
+                grace_s=self._session_start_grace_s,
+                cli=self.profile.name,
+                **extra,
+            )
+        except OSError:
+            return False
+        return True
 
     def _window_alive(self, handle: SessionHandle) -> bool:
         return self.mux.window_alive(self.session_name, handle.native_id)
