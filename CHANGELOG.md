@@ -175,6 +175,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Pause a Claude session blocked by a usage limit (credit exhaustion or a session-window
+  limit seen on the live pane) with a `usage limit:` reason instead of charging it a dev
+  attempt; a live sighting is exempt from the token veto. New profile fields
+  `usage_limit_patterns` and `usage_wait_patterns`, seeded from lines captured in
+  community reports (#610).
 - Read an epic the initiative declares but has not sliced yet: `status` no longer
   faults the board on its folderless row, and it triggers no retrospective or closure.
 - Name the T1 ticket plan an interrupted commit window left `done` or `blocked` when

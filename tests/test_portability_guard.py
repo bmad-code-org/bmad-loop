@@ -1008,6 +1008,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "tokens_weighted",
         "total",
         "trigger",
+        # `session-end` / `workflow-end` (#610): the visible-pane line a usage-limit
+        # pattern matched live — the matched profile pattern plus the quoted pane
+        # line, the same class of excerpt as `parked_evidence`.
+        "usage_limited",
         "verification_sequence",
         "verification_stage",
         "via",
@@ -1185,6 +1189,7 @@ JOURNAL_SPLAT_FIELDS = {
             "session_vanished",
             "parked",
             "parked_evidence",
+            "usage_limited",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys

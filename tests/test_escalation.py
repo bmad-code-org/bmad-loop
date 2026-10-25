@@ -343,6 +343,58 @@ def test_review_env_fault_outranks_parked():
     assert decision.reason.startswith("environment fault: review session stalled")
 
 
+# The #610 credit-exhaustion pane line, split so this file carries no line the
+# shipped claude usage patterns match (test_pane_capture_patterns_do_not_match_this_repo).
+_USAGE_EVIDENCE = (
+    "pane matched 'usage-pattern': You're out of usage credit"
+    + "s. Run /usage-credits to keep using Fable 5.1 or /model to switch models."
+)
+
+
+def _usage_limited_results(status):
+    """The two shapes a live usage-limit sighting reaches a decider in: the
+    adapter's stalled + parked exit, and that result after `_classify_env_fault`
+    stamped it (env_fault with the pane evidence)."""
+    parked = SessionResult(
+        status=status, parked=True, parked_evidence=_USAGE_EVIDENCE, usage_limited=_USAGE_EVIDENCE
+    )
+    return [parked, dataclasses.replace(parked, env_fault=True, env_fault_evidence=_USAGE_EVIDENCE)]
+
+
+@pytest.mark.parametrize("attempt", [1, 2])  # budget left, then spent
+@pytest.mark.parametrize("status", ["stalled", "timeout"])
+def test_dev_usage_limited_pauses_with_usage_reason(attempt, status):
+    """A dev session seen live behind a usage limit (#610) PAUSEs with the
+    usage-limit reason — through either the env-fault or the parked arm, with
+    or without budget left — naming the evidence and the operator's ways out.
+    ABLATION: drop the `usage_limited` delegation from `env_fault_pause_reason`
+    / `parked_pause_reason` and the reason reads `environment fault:` /
+    `parked:` instead."""
+    for result in _usage_limited_results(status):
+        decision = decide_dev(_task(attempt=attempt), result, None, POLICY)
+        assert decision.action == Action.PAUSE
+        assert decision.reason.startswith(f"usage limit: dev session {status} (")
+        assert _USAGE_EVIDENCE in decision.reason
+        assert "bmad-loop resolve" in decision.reason
+
+
+@pytest.mark.parametrize("status", ["stalled", "timeout"])
+def test_review_usage_limited_pauses_with_usage_reason(status):
+    """The review-side twin: no review cycle is charged for a usage limit."""
+    for result in _usage_limited_results(status):
+        decision = decide_review_session(_task(attempt=1), result, POLICY)
+        assert decision.action == Action.PAUSE
+        assert decision.reason.startswith(f"usage limit: review session {status} (")
+        assert _USAGE_EVIDENCE in decision.reason
+
+
+def test_usage_limit_reason_keeps_the_lost_session_suffix():
+    """Composed over `session_failure_reason` (#489), like its siblings."""
+    vanished = SessionResult(status="stalled", usage_limited="x", session_vanished=True)
+    reason = escalation.usage_limit_pause_reason("dev", vanished)
+    assert reason.startswith("usage limit: dev session stalled: the multiplexer no longer")
+
+
 def test_dev_plain_noncompleted_still_retries_with_budget():
     """Guard pin: a NON-env-fault timeout with budget left still RETRYs — the
     env-fault branch must not swallow ordinary transient failures."""

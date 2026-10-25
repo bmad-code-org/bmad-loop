@@ -1,4 +1,12 @@
-"""The shipped profiles' env_fault_patterns, held to both halves of the contract.
+"""The shipped profiles' pane patterns, held to both halves of the contract.
+
+"Pane patterns" are the three fields matched against what a session's log or
+visible pane says: env_fault_patterns (a provider outage) and the #610 pair
+usage_limit_patterns / usage_wait_patterns (a subscription limit the CLI is
+blocked behind, or waiting out). The usage pair is matched against the live pane
+AND, as ordinary env-fault families, against the post-mortem log tail, so it
+answers to exactly the same corpus as env_fault_patterns. parked_prompt_patterns
+is not held here (tests/test_profile.py pins it).
 
 A pattern that misses a real provider outage burns a story's retry budget on an
 environment fault (the bug that motivated this file). A pattern that fires on
@@ -9,7 +17,9 @@ to rediscover, so the corpora below are the gate: add a line here before
 loosening a pattern.
 
 Only two profiles seed patterns, and only because captured output exists for
-them. The other four stay inert deliberately — see test_unseeded_profiles_stay_inert.
+them: opencode seeds env_fault_patterns, claude seeds all three fields
+(SEEDED_PANE_FIELDS). The other four stay inert deliberately — see
+test_unseeded_profiles_stay_inert.
 
 WHAT BAIT IS FOR. The tmux adapters match against a tmux pane capture, which
 contains the MODEL'S OWN OUTPUT: a story about quota handling prints this
@@ -68,6 +78,20 @@ PANE_CAPTURE_PROFILES = ("claude",)
 # Seeding nothing costs only the status quo. See test_unseeded_profiles_stay_inert.
 UNSEEDED_PROFILES = ("codex", "gemini", "copilot", "antigravity")
 ALL_PROFILES = SEEDED_PROFILES + UNSEEDED_PROFILES
+# The pane pattern fields this module holds to the corpus. Every BAIT-style
+# assertion below is made against the UNION of them: a usage-limit hit on a
+# healthy session parks the run exactly as an env-fault hit pauses it.
+PANE_PATTERN_FIELDS = ("env_fault_patterns", "usage_limit_patterns", "usage_wait_patterns")
+# Exactly the (profile, field) pairs that ship patterns, each backed by captured
+# output in REAL_BY_PROFILE. Listed rather than discovered, so withdrawing a seed
+# reddens test_pane_fields_are_seeded_exactly_where_listed instead of silently
+# shrinking every parametrization keyed on this.
+SEEDED_PANE_FIELDS = (
+    ("opencode", "env_fault_patterns"),
+    ("claude", "env_fault_patterns"),
+    ("claude", "usage_limit_patterns"),
+    ("claude", "usage_wait_patterns"),
+)
 
 # The two logfmt shapes `opencode serve` emitted during a real 5-hour provider
 # quota outage on the opencode-http adapter (zai-coding-plan/glm-5.2). The line
@@ -206,12 +230,13 @@ OPENCODE_V2_REAL = [line for line in OPENCODE_REAL if line.startswith("provider-
 # `claude` adapter. The last three come from Claude Code's own JSONL transcripts,
 # from entries structurally tagged `"isApiErrorMessage": true`.
 #
-# The quota class is still ABSENT, and deliberately so: no captured Claude Code
-# usage-limit line exists — not in this repo, not in #194/#323/#507, not in the
-# local transcripts. Seeding one needs a captured line with its run cited, the
-# bar test_unseeded_profiles_stay_inert states; a plausible-looking string is
-# exactly what that bar refuses. So an Anthropic plan's usage limit is still
-# unclassified on this adapter — a real, deliberately-left gap (#323).
+# The quota class is still ABSENT from env_fault_patterns, and deliberately so:
+# no captured Claude Code provider-side quota line exists — not in this repo, not
+# in #194/#323/#507, not in the local transcripts. Seeding one needs a captured
+# line with its run cited, the bar test_unseeded_profiles_stay_inert states; a
+# plausible-looking string is exactly what that bar refuses. The SUBSCRIPTION
+# usage limits Claude Code prints on its own screen were captured (#610) and live
+# in their own fields — see CLAUDE_USAGE_REAL.
 CLAUDE_REAL = [
     "API Error: Unable to connect to API (ConnectionRefused)",
     "API Error: Unable to connect to API: Self-signed certificate detected. "
@@ -223,10 +248,51 @@ CLAUDE_REAL = [
     "try again in a moment. If it persists, check https://status.claude.com.",
 ]
 
-# Every profile with patterns, paired with the lines its own CLI actually emits.
+# Claude Code's subscription usage-limit lines (#610), as its pane prints them —
+# behind the `⎿` gutter glyph, with one or two spaces after it depending on the
+# terminal. Keyed by the field each must be caught by, because the two are
+# disjoint by contract: usage_limit_patterns is BLOCKED (credit exhaustion, an
+# operator must act), usage_wait_patterns is WAITING for a reset the CLI then
+# continues from by itself.
+#
+# Provenance, verbatim from #610:
+# * credits: psmux/Windows 11, bmad-loop 0.11.1, runs 20260907-084618-824f
+#   (dev-1 and review-1) and 20260907-090132-98e3 (dev-1 and dev-2) —
+#   `⎿ You're out of usage credits. Run /usage-credits to keep using Fable 5.1 or
+#   /model to switch models.`
+# * session limit: the 2026-09-07 psmux capture
+#   `⎿ You've hit your session limit · resets 12:50pm (Asia/Ho_Chi_Minh)`, and
+#   macOS/tmux run 20260913-165153-b850 `⎿  You've hit your session limit ·
+#   resets 7:20pm` (two spaces after the glyph, no zone).
+# The gutter-prefix and zone variants are the same captured sentences under the
+# other observed spacing, and with the optional zone on or off.
+_CLAUDE_CREDITS_SENTENCES = (
+    "You're out of usage credits. Run /usage-credits to keep using Fable 5.1 or "
+    "/model to switch models.",
+)
+_CLAUDE_SESSION_LIMIT_SENTENCES = (
+    "You've hit your session limit · resets 12:50pm (Asia/Ho_Chi_Minh)",
+    "You've hit your session limit · resets 12:50pm",
+    "You've hit your session limit · resets 7:20pm",
+    "You've hit your session limit · resets 7:20pm (Asia/Ho_Chi_Minh)",
+)
+_CLAUDE_PANE_GUTTERS = ("⎿ ", "⎿  ", "")
+CLAUDE_USAGE_REAL = {
+    field: [gutter + sentence for sentence in sentences for gutter in _CLAUDE_PANE_GUTTERS]
+    for field, sentences in (
+        ("usage_limit_patterns", _CLAUDE_CREDITS_SENTENCES),
+        ("usage_wait_patterns", _CLAUDE_SESSION_LIMIT_SENTENCES),
+    )
+}
+
+# Every seeded (profile, field), paired with the lines its own CLI actually emits.
 REAL_BY_PROFILE = [
-    (name, line)
-    for name, corpus in (("opencode", OPENCODE_REAL), ("claude", CLAUDE_REAL))
+    (name, field, line)
+    for name, field, corpus in (
+        ("opencode", "env_fault_patterns", OPENCODE_REAL),
+        ("claude", "env_fault_patterns", CLAUDE_REAL),
+        *(("claude", field, lines) for field, lines in CLAUDE_USAGE_REAL.items()),
+    )
     for line in corpus
 ]
 
@@ -238,9 +304,10 @@ REAL_BY_PROFILE = [
 # only remaining anchor, so the test guarded nothing while looking thorough.
 #
 # So the bar for a line here is mechanical, and test_anchor_reaching_bait_is_not_
-# vacuous enforces it: every seeded profile must have at least one line carrying
-# its literal anchor. Lines below reproduce `error.error="AI_APICallError: ` (the
-# opencode anchor) inside ordinary healthy-session output.
+# vacuous enforces it: every seeded (profile, field) must have at least one line
+# carrying each of its literal anchors. Lines below reproduce
+# `error.error="AI_APICallError: ` (the opencode anchor) inside ordinary
+# healthy-session output.
 ANCHOR_REACHING_BAIT = [
     # The cause OUTSIDE the quoted error value: a real but UNRELATED provider
     # error whose trailing logfmt fields merely happen to contain a cause word.
@@ -316,6 +383,21 @@ ANCHOR_REACHING_BAIT = [
     '  assert log == "API Error: 502 Overloaded"',
     "- [ ] AC-6: retry on API Error: 500 Overloaded and surface a banner",
     'it("renders API Error: 529 Internal server error", () => {',
+    # claude's usage-limit sentences (#610), each anchor carried but the sentence
+    # left unfinished — the opening words a story about a credits banner or a
+    # session-limit toast writes all day. The patterns run to `credits. Run
+    # /usage-credits` and `limit · resets`, so none of these reach a match. (The
+    # `You've used <N>% of your session limit` advisory never reaches the wait
+    # anchor at all — it is in BAIT.)
+    "You're out of usage credits!",
+    "You're out of usage credits.",
+    '  assert banner.text == "You\'re out of usage credits. Upgrade to keep going."',
+    "- [ ] AC-3: when You're out of usage credits, link to /usage-credits in the toast",
+    "docs: You're out of usage credits. Run the billing page to top up",
+    "You've hit your session limit, so the banner says to wait for the reset.",
+    "You've hit your session limit — resets at 7:20pm (em dash, not the CLI's separator)",
+    'expect(toast).toBe("You\'ve hit your session limit")',
+    "- [ ] AC-4: You've hit your session limit · show the reset time in the header",
 ]
 
 # The limit of content-based matching, pinned rather than papered over.
@@ -390,14 +472,30 @@ def _leading_literal(pattern: str) -> list[tuple[str, str]]:
     return tokens
 
 
+def _anchor_literal(pattern: str) -> str:
+    """One pattern's contribution to its anchor family: its leading literal run —
+    cut before the first single-character class when that run is the WHOLE
+    pattern. A wholly literal pattern (the #610 usage sentences) has nothing past
+    its leading literal, so an anchor spanning all of it could only be reached by
+    a line that matches; the first class is where the profile's own source line
+    stops spelling the sentence, and so where the rest of the pattern begins to
+    discriminate."""
+    tokens = _leading_literal(pattern)
+    if "".join(raw for raw, _ in tokens) == pattern:
+        cut = next((i for i, (raw, _) in enumerate(tokens) if raw.startswith("[")), len(tokens))
+        tokens = tokens[:cut]
+    return "".join(lit for _, lit in tokens)
+
+
 def _derive_anchors(patterns: tuple[str, ...]) -> tuple[str, ...]:
-    """Each anchor family's literal: the patterns' leading literal runs, grouped
-    by a shared prefix of at least MIN_ANCHOR_LEN characters, each group reduced
-    to its longest common prefix. One profile can key on more than one framing
-    (opencode: the 1.x server log's `error.error=` field and the 2.x
-    provider-errors line), and every family has to be reached by the corpus."""
+    """Each anchor family's literal: the patterns' anchor literals (see
+    `_anchor_literal`), grouped by a shared prefix of at least MIN_ANCHOR_LEN
+    characters, each group reduced to its longest common prefix. One field can
+    key on more than one framing (opencode: the 1.x server log's `error.error=`
+    field and the 2.x provider-errors line), and every family has to be reached
+    by the corpus."""
     anchors: list[str] = []
-    for literal in ("".join(lit for _, lit in _leading_literal(p)) for p in patterns):
+    for literal in (_anchor_literal(p) for p in patterns):
         for i, anchor in enumerate(anchors):
             n = 0
             while n < min(len(anchor), len(literal)) and anchor[n] == literal[n]:
@@ -422,7 +520,8 @@ def _leading_spelling(pattern: str, anchor: str) -> str | None:
 
 
 PROFILE_ANCHOR_LITERALS = {
-    name: _derive_anchors(get_profile(name).env_fault_patterns) for name in SEEDED_PROFILES
+    (name, field): _derive_anchors(getattr(get_profile(name), field))
+    for name, field in SEEDED_PANE_FIELDS
 }
 
 # Ordinary output from a healthy session working on a story that involves rate
@@ -515,8 +614,7 @@ BAIT = [
     '  File "src/retry.py", line 41, in _raise_exhausted: '
     'RuntimeError("exceeded retry limit, last status: 429 Too Many Requests")',
     'raise UpstreamError("exceeded retry limit, last status: 503 Service Unavailable")',
-    "> exceeded retry limit, last status: 429 Too Many Requests   "
-    "(expected output, docs/retry.md)",
+    "> exceeded retry limit, last status: 429 Too Many Requests   (expected output, docs/retry.md)",
     '+    RESOURCE_EXHAUSTED_COPY = "Resource has been exhausted (e.g. check quota)."',
     '-        code: "rate_limit_exceeded",',
     'FIXTURE = {"error": {"code": 429, "message": "Resource has been exhausted '
@@ -528,11 +626,9 @@ BAIT = [
     'it("gives up once it has exceeded retry limit, last status: 503", async () => {',
     "  1) rate limiter › Model call failed: rate_limited (expected, retries once)",
     "stdout | src/quota.test.ts > Model call failed: quota_exceeded",
-    '✗ should render "Quota exceeded for metric: generativelanguage.googleapis.com/x" '
-    "in the toast",
+    '✗ should render "Quota exceeded for metric: generativelanguage.googleapis.com/x" in the toast',
     "  ✓ TerminalQuotaError is raised after the third 429 (18ms)",
-    "# You have exhausted your daily quota on this model.  <- exact upstream copy, "
-    "do not reword",
+    "# You have exhausted your daily quota on this model.  <- exact upstream copy, do not reword",
     "* You exceeded your current quota, please check your plan and billing details.",
     "> Resource has been exhausted (e.g. check quota).",
     "  GaxiosError: request to https://generativelanguage.googleapis.com/v1beta/models/x "
@@ -589,6 +685,21 @@ BAIT = [
     "2026-07-27T09:15:44.001Z ERROR codex_api_shim::mock: replaying error=http 429 "
     "fixture for the retry test",
     "- Sorry, you've hit a rate limit that restricts the number of Copilot model requests",
+    # ---------------------------------------------------------------------
+    # claude's usage-limit vocabulary (#610). The first three are Claude Code's
+    # OWN advisory, captured from a HEALTHY session in run 20260913-165153-b850
+    # (thirteen of them for every two real limit lines): the session is still
+    # working, so a hit here parks a run mid-story. `used <N>% of your` versus
+    # `hit your` is all that separates it from the wait line.
+    "You've used 90% of your session limit · resets 7:20pm…",
+    "You've used 96% of your session limit · resets 7:20pm…",
+    "You've used 97% of your session limit · resets 7:20pm…",
+    # …and a story implementing a credits banner, in its own words.
+    "AC-3: show a banner when the user is out of usage credits",
+    "PASS tests/test_credits.py::test_out_of_usage_credits_banner",
+    "docs: implement the /usage-credits banner copy",
+    "session limit reached — resets 3pm",
+    "Run /usage-credits to keep using the model",
 ]
 
 # A duplicated bait line silently weakens the corpus (it reads as coverage it is
@@ -596,12 +707,17 @@ BAIT = [
 assert len(BAIT) == len(set(BAIT)), "BAIT contains duplicate lines"
 
 
-def _patterns(name: str) -> tuple[regex.Pattern[str], ...]:
-    return tuple(regex.compile(p) for p in get_profile(name).env_fault_patterns)
+def _patterns(
+    name: str, fields: tuple[str, ...] = PANE_PATTERN_FIELDS
+) -> tuple[regex.Pattern[str], ...]:
+    """``name``'s compiled patterns across ``fields`` — by default every pane
+    field, since a hit in any of them stops a healthy session."""
+    profile = get_profile(name)
+    return tuple(regex.compile(p) for field in fields for p in getattr(profile, field))
 
 
-def _matches(name: str, line: str) -> bool:
-    return any(p.search(line) for p in _patterns(name))
+def _matches(name: str, line: str, fields: tuple[str, ...] = PANE_PATTERN_FIELDS) -> bool:
+    return any(p.search(line) for p in _patterns(name, fields))
 
 
 @pytest.mark.parametrize("name", SEEDED_PROFILES)
@@ -638,23 +754,23 @@ def test_verbatim_citation_of_the_real_error_is_inseparable(line: str) -> None:
     their fixture to whatever path the code resolves — only the end-to-end test
     caught it. If the scanned file is ever repointed again, re-derive this safety
     argument before trusting it: see EnvFaultMixin.ENV_FAULT_LOG_SUFFIX."""
-    assert _matches("opencode", line)
+    assert _matches("opencode", line, ("env_fault_patterns",))
 
 
-@pytest.mark.parametrize("name", SEEDED_PROFILES)
-def test_anchor_reaching_bait_is_not_vacuous(name: str) -> None:
+@pytest.mark.parametrize(("name", "field"), SEEDED_PANE_FIELDS)
+def test_anchor_reaching_bait_is_not_vacuous(name: str, field: str) -> None:
     """Guards the guard. The test above is worthless unless its corpus actually
     contains the anchor under test — and it silently stopped doing so once, when
     the profile the corpus had been written for was withdrawn. Assert reachability
-    mechanically instead of trusting it, for every anchor family the profile
-    keys on."""
-    for anchor in PROFILE_ANCHOR_LITERALS[name]:
+    mechanically instead of trusting it, for every anchor family each seeded
+    field keys on."""
+    for anchor in PROFILE_ANCHOR_LITERALS[name, field]:
         reaching = [line for line in ANCHOR_REACHING_BAIT if anchor in line]
-        assert reaching, f"no ANCHOR_REACHING_BAIT line contains {name}'s anchor {anchor!r}"
+        assert reaching, f"no ANCHOR_REACHING_BAIT line contains {name}'s {field} anchor {anchor!r}"
 
 
-@pytest.mark.parametrize("name", SEEDED_PROFILES)
-def test_anchor_literal_is_the_live_patterns_anchor(name: str) -> None:
+@pytest.mark.parametrize(("name", "field"), SEEDED_PANE_FIELDS)
+def test_anchor_literal_is_the_live_patterns_anchor(name: str, field: str) -> None:
     """DW-373: guards the derivation of `PROFILE_ANCHOR_LITERALS`. The vacuity guard
     above is only as good as its input — an empty or trivially short anchor is
     `in` every bait line, so a derivation that silently went vacuous would pass it
@@ -663,36 +779,69 @@ def test_anchor_literal_is_the_live_patterns_anchor(name: str) -> None:
     tokens, run through the regex engine, must match the anchor exactly — so a
     decoding slip in `_leading_literal` cannot fake the prefix.
 
+    And an anchor must not by itself SATISFY a pattern: if it did, every line
+    reaching it would be a match, and the bait that reaches it could only ever
+    redden the test above — the trap a wholly literal pattern sets
+    (`_anchor_literal`).
+
     ABLATION: make `_derive_anchors` return ("",) (or stop decoding `[.]`) and this
     reddens; move a live pattern's anchor off the corpus and the guard above does."""
-    patterns = get_profile(name).env_fault_patterns
-    assert patterns, f"{name} ships no env_fault_patterns"
-    anchors = PROFILE_ANCHOR_LITERALS[name]
+    patterns = getattr(get_profile(name), field)
+    assert patterns, f"{name} ships no {field}"
+    anchors = PROFILE_ANCHOR_LITERALS[name, field]
     for anchor in anchors:
         assert (
             len(anchor) >= MIN_ANCHOR_LEN
-        ), f"{name}: derived anchor {anchor!r} is shorter than {MIN_ANCHOR_LEN} chars"
+        ), f"{name}.{field}: derived anchor {anchor!r} is shorter than {MIN_ANCHOR_LEN} chars"
+        assert not any(
+            regex.search(pattern, anchor) for pattern in patterns
+        ), f"{name}.{field}: derived anchor {anchor!r} alone matches a live pattern"
     for pattern in patterns:
         spellings = [
             (anchor, spelling)
             for anchor in anchors
             if (spelling := _leading_spelling(pattern, anchor)) is not None
         ]
-        assert spellings, f"{name}: live pattern {pattern!r} opens with none of {anchors!r}"
+        assert spellings, f"{name}.{field}: live pattern {pattern!r} opens with none of {anchors!r}"
         for anchor, spelling in spellings:
-            assert pattern.startswith(spelling), (name, pattern)
+            assert pattern.startswith(spelling), (name, field, pattern)
             assert regex.fullmatch(spelling, anchor), (
-                f"{name}: live pattern {pattern!r} does not open with anchor {anchor!r} "
-                f"(its leading spelling {spelling!r})"
+                f"{name}.{field}: live pattern {pattern!r} does not open with anchor "
+                f"{anchor!r} (its leading spelling {spelling!r})"
             )
 
 
-@pytest.mark.parametrize(("name", "line"), REAL_BY_PROFILE)
-def test_each_seeded_profile_catches_its_own_cli_error_lines(name: str, line: str) -> None:
-    """The false-negative half, per CLI. Each seeded profile is anchored on a
-    framing token its CLI emits, so a miss here means a real provider outage would
-    burn the story's retry budget instead of pausing the run."""
-    assert _matches(name, line), f"{name}.toml misses a real error line: {line[:120]}"
+def test_pane_fields_are_seeded_exactly_where_listed() -> None:
+    """SEEDED_PANE_FIELDS is the whole truth: every listed (profile, field) ships
+    patterns and no other does. A withdrawn seed must surface here rather than
+    silently drop its cases out of every parametrization keyed on the list, and a
+    new seed must arrive WITH its captured lines in REAL_BY_PROFILE."""
+    seeded = {
+        (name, field)
+        for name in ALL_PROFILES
+        for field in PANE_PATTERN_FIELDS
+        if getattr(get_profile(name), field)
+    }
+    assert seeded == set(SEEDED_PANE_FIELDS)
+    assert {(name, field) for name, field, _ in REAL_BY_PROFILE} == set(SEEDED_PANE_FIELDS)
+
+
+@pytest.mark.parametrize(("name", "field", "line"), REAL_BY_PROFILE)
+def test_each_seeded_profile_catches_its_own_cli_error_lines(
+    name: str, field: str, line: str
+) -> None:
+    """The false-negative half, per CLI and per field. Each seeded field is
+    anchored on a sentence its CLI emits, so a miss here means a real provider
+    outage burns the story's retry budget instead of pausing the run — or, for
+    the usage fields, a usage-limited session idles into a stall nudge and a
+    timeout instead of parking.
+
+    And ONLY by its own field: the fields are disjoint by contract. A credits line
+    read as a session-window wait sits out a reset that never comes; a provider
+    outage read as a usage limit escapes the token veto."""
+    assert _matches(name, line, (field,)), f"{name}.{field} misses a real line: {line[:120]}"
+    others = tuple(f for f in PANE_PATTERN_FIELDS if f != field)
+    assert not _matches(name, line, others), f"{name}: {line[:120]!r} matches outside {field}"
 
 
 @pytest.mark.parametrize("name", SEEDED_PROFILES)
@@ -708,6 +857,9 @@ def test_patterns_require_an_anchor_not_a_bare_cause(name: str) -> None:
         "type=provider.quota ",
         "provider.rate-limit",
         "type=provider.transport status=- attempt=2",
+        "session limit",
+        "/usage-credits",
+        "resets 3pm",
     ):
         assert not _matches(name, bare), f"{name}.toml classifies the bare cause {bare!r}"
 
@@ -716,18 +868,22 @@ def test_patterns_require_an_anchor_not_a_bare_cause(name: str) -> None:
 def test_shipped_patterns_do_not_match_their_own_profile_line(name: str) -> None:
     """A profile must not classify ITSELF. The pane log carries the model's own
     output, so a session that prints, greps or diffs its profile would otherwise
-    read its own configuration as a provider outage — one of the four non-test
-    false positives #507 names, and the most absurd of them.
+    read its own configuration as a provider outage (or a usage limit) — one of
+    the four non-test false positives #507 names, and the most absurd of them.
+    Every pane field's patterns are held to every line of the file, comments
+    included: the usage comments quote their captured sentences, split.
 
     What prevents it is the single-character classes in the shipped patterns
-    (`t[o]`, `respons[e]`, `5[2]9`, `5[0]0`): they change nothing about what the
-    regex MATCHES, and everything about what the regex's own source line matches.
-    This test is why they must not be "cleaned up"."""
+    (`t[o]`, `respons[e]`, `5[2]9`, `5[0]0`, `credit[s]`, `[.]`, `limi[t]`): they
+    change nothing about what the regex MATCHES, and everything about what the
+    regex's own source line matches. This test is why they must not be
+    "cleaned up"."""
     packaged = resources.files("bmad_loop.data").joinpath("profiles").joinpath(f"{name}.toml")
     # Compiled ONCE rather than per line via _matches: that helper re-resolves the
     # profile and recompiles its patterns on every call, which is free for a
     # one-line corpus entry and minutes across a whole file.
     patterns = _patterns(name)
+    assert patterns, f"{name} compiled no pane patterns; this guard would be vacuous"
     hits = [
         f"{name}.toml:{n}: {line.strip()[:120]}"
         for n, line in enumerate(packaged.read_text(encoding="utf-8").splitlines(), 1)
@@ -739,8 +895,8 @@ def test_shipped_patterns_do_not_match_their_own_profile_line(name: str) -> None
 # Files that hold matching lines ON PURPOSE, and are therefore excluded from the
 # repo-wide guard below.
 #
-# * this module is the corpus: CLAUDE_REAL quotes the captured CLI sentences
-#   verbatim, because a pattern may only be seeded from a captured line and the
+# * this module is the corpus: CLAUDE_REAL and CLAUDE_USAGE_REAL quote the
+#   captured CLI sentences verbatim, because a pattern may only be seeded from a captured line and the
 #   false-negative half has to assert against the real thing.
 # * test_generic_tmux.py drives the REAL classifier end to end, so its fixture
 #   logs must be lines the shipped patterns actually match.
@@ -753,7 +909,8 @@ DELIBERATE_CORPUS_FILES = ("tests/test_env_fault_patterns.py", "tests/test_gener
 
 def test_pane_capture_patterns_do_not_match_this_repo() -> None:
     """#507's own methodology, kept as a standing guard: compile the pane-capture
-    profiles' patterns and scan every tracked file line-by-line.
+    profiles' patterns — every pane field, the #610 usage pair included — and
+    scan every tracked file line-by-line.
 
     bmad-loop is developed by bmad-loop, so this repo's own text is pane-log
     input. Measured against the tree this guard landed on, the withdrawn
@@ -768,7 +925,9 @@ def test_pane_capture_patterns_do_not_match_this_repo() -> None:
 
     This is what fails if a future CHANGELOG entry, doc bullet or profile comment
     writes the framing token and a cause on the SAME line; write them separated
-    (`API Error` … `<cause>`) instead. Only DELIBERATE_CORPUS_FILES are exempt.
+    (`API Error` … `<cause>`) instead — or, for a usage sentence, split it
+    (`You've hit your session limi` + `t · resets`). Only
+    DELIBERATE_CORPUS_FILES are exempt.
 
     opencode is out of scope on purpose, not by oversight: the file its patterns
     are matched against is `<task_id>.server.out` (see
@@ -796,6 +955,14 @@ def test_pane_capture_patterns_do_not_match_this_repo() -> None:
     # one-line corpus entry and minutes across every tracked line in the repo.
     patterns = [p for name in PANE_CAPTURE_PROFILES for p in _patterns(name)]
     assert patterns, "no pane-capture patterns compiled; this guard would be vacuous"
+    # Every seeded pane field of every pane-capture profile is in the scan — a
+    # field dropped from PANE_PATTERN_FIELDS would otherwise leave its patterns
+    # free to match this repo unseen.
+    for name, field in SEEDED_PANE_FIELDS:
+        if name in PANE_CAPTURE_PROFILES:
+            assert all(
+                any(p.pattern == raw for p in patterns) for raw in getattr(get_profile(name), field)
+            ), f"{name}.{field} is not in the repo scan"
 
     hits: list[str] = []
     corpus_hits: dict[str, int] = dict.fromkeys(DELIBERATE_CORPUS_FILES, 0)
@@ -812,8 +979,8 @@ def test_pane_capture_patterns_do_not_match_this_repo() -> None:
                 continue
             hits.append(f"{rel}:{n}: {line.strip()[:120]}")
     assert not hits, (
-        "tracked lines classify as an environment fault on a pane-capture profile; "
-        "split the framing token from the cause:\n" + "\n".join(hits)
+        "tracked lines classify as an environment fault or a usage limit on a "
+        "pane-capture profile; split the framing token from the cause:\n" + "\n".join(hits)
     )
     # Non-vacuity for the exemptions themselves: each excluded file must still be
     # carrying the matching lines it was excluded FOR. A file that stops matching
@@ -834,9 +1001,12 @@ def test_unseeded_profiles_stay_inert(name: str) -> None:
     nothing costs only the status quo.
 
     Do not seed these from a plausible-looking string. Seed them from a captured
-    log line, with the run it came from cited, and add it to REAL_BY_PROFILE and
-    this module's BAIT in the same change."""
-    assert get_profile(name).env_fault_patterns == ()
+    log line, with the run it came from cited, and add it to REAL_BY_PROFILE,
+    SEEDED_PANE_FIELDS and this module's BAIT in the same change. The bar covers
+    every pane field: a usage pattern stops a healthy session just as surely."""
+    profile = get_profile(name)
+    for field in PANE_PATTERN_FIELDS:
+        assert getattr(profile, field) == (), f"{name} seeds {field}"
 
 
 def test_v2_corpus_lines_are_what_the_adapter_writes() -> None:
@@ -856,7 +1026,11 @@ def test_v2_provider_error_line_is_model_free_shape(line: str) -> None:
     provider- or model-sourced is what made it match; and the same line behind
     any leading text — quoted in the transcript, a doc, a fixture — does not."""
     head = line.split(' message="', 1)[0] + " "
-    v2 = [p for p in _patterns("opencode") if p.pattern.startswith("^provider-error")]
+    v2 = [
+        p
+        for p in _patterns("opencode", ("env_fault_patterns",))
+        if p.pattern.startswith("^provider-error")
+    ]
     assert len(v2) == 1, "the opencode profile should ship one 2.x provider-error pattern"
     assert v2[0].search(head)
     assert v2[0].search(line)

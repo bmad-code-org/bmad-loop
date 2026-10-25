@@ -1430,6 +1430,44 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 handle, stop_seen, activity_seen or transcript_work_seen or usage_seen
             )
 
+        def stall_exit(parked_now: str | None, usage_now: str | None) -> SessionResult:
+            """The non-completion exit of a stalled session (DW-348, #610):
+            resolve, then re-probe liveness. A now-dead window is ``crashed``
+            (never parked or usage-limited: nothing waits on a human once the CLI
+            is gone). Otherwise ``stalled`` with ``accept_result=False``: an
+            artifact on disk cannot upgrade the stall to completed (it may be
+            stale or mid-write; only a Stop or window death vouches for it), and
+            ``parked_now`` / ``usage_now`` label it. Both exits carry the
+            rollout."""
+            try_resolve()
+            if self._probe_liveness(handle, "stall") is False:
+                return self._final(
+                    handle,
+                    spec,
+                    "crashed",
+                    session_id,
+                    transcript_path,
+                    budget_weighted=budget_weighted,
+                    stop_seen=stop_seen,
+                    produced_work=produced_work(),
+                )
+            stalled = self._final(
+                handle,
+                spec,
+                "stalled",
+                session_id,
+                transcript_path,
+                accept_result=False,
+                budget_weighted=budget_weighted,
+                stop_seen=stop_seen,
+                produced_work=produced_work(),
+            )
+            if parked_now is not None:
+                return dataclasses.replace(
+                    stalled, parked=True, parked_evidence=parked_now, usage_limited=usage_now
+                )
+            return stalled
+
         while True:
             # Top-of-tick pane-frame sample for the no-work verdict (#727). Before
             # the timeout check so growth on the final tick still counts; before the
@@ -1463,6 +1501,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # rollout existed, then no further hook event): the exit's
                 # `transcript_path` argument is read before `produced_work()`.
                 try_resolve()
+                # One look at the visible pane for a usage limit (#610): a
+                # session whose clock ran out while it sat behind one is not a
+                # failed attempt. A dead window is never usage-limited (the CLI
+                # is gone, though a remain-on-exit pane still captures), so a
+                # match is confirmed alive first; a probe fault reads "not dead".
+                (usage_hit,) = self._pane_evidence(handle, self._usage_pane_patterns)
+                usage_now = None
+                if usage_hit is not None and self._probe_liveness(handle, "timeout") is not False:
+                    usage_now = usage_hit[0]
                 return SessionResult(
                     status="timeout",
                     session_id=session_id,
@@ -1472,6 +1519,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
                     produced_work=produced_work(),
+                    usage_limited=usage_now,
                 )
             # Hard-stop poll (#319), per-iteration and deliberately NOT inside
             # the heartbeat throttle below: the loop's own wait is capped at 5s
@@ -1787,15 +1835,30 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # (nudges spent, or none configured) is labelled parked too
                     # and pauses instead of retrying (DW-433). Either way no
                     # nudge is typed and the session ends through the tail below.
+                    # The same single capture is matched against the usage-limit
+                    # lists (#610): a CLI stopped behind a usage limit is parked
+                    # too (a nudge can only reproduce the limit line), and the
+                    # match is recorded as `usage_limited` even when the hook
+                    # latch already supplied the parked evidence, since claude's
+                    # idle_prompt latches on exactly this kind of idle.
                     parked_now = parked_evidence
+                    parked_hit, usage_hit = self._pane_evidence(
+                        handle,
+                        self._parked_prompt_patterns if parked_now is None else (),
+                        self._usage_pane_patterns,
+                    )
+                    if parked_now is None and parked_hit is not None:
+                        parked_now = parked_hit[0]
+                    usage_now = usage_hit[0] if usage_hit is not None else None
                     if parked_now is None:
-                        parked_now = self._pane_parked_evidence(handle)
+                        parked_now = usage_now
                     if parked_now is not None:
                         self._note_lifecycle(
                             handle.task_id,
                             "stall-nudge-withheld",
                             evidence=parked_now,
                             nudge_due=nudge_due,
+                            **({"usage_limited": usage_now} if usage_now is not None else {}),
                         )
                     elif nudge_due:
                         # The wake nudge IS the re-invocation bmad-loop otherwise
@@ -1830,36 +1893,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # persistent failure. A dead window is never labelled parked:
                     # nothing is waiting on a human once the CLI is gone. The
                     # probe fault is crumbed (`site="stall"`, DW-454).
-                    # Both exits below (crashed or stalled) carry the rollout.
-                    try_resolve()
-                    if self._probe_liveness(handle, "stall") is False:
-                        return self._final(
-                            handle,
-                            spec,
-                            "crashed",
-                            session_id,
-                            transcript_path,
-                            budget_weighted=budget_weighted,
-                            stop_seen=stop_seen,
-                            produced_work=produced_work(),
-                        )
-                    # Still alive: an artifact on disk cannot upgrade the stall to
-                    # completed — it may be stale or mid-write; only a Stop or
-                    # window death vouches for it.
-                    stalled = self._final(
-                        handle,
-                        spec,
-                        "stalled",
-                        session_id,
-                        transcript_path,
-                        accept_result=False,
-                        budget_weighted=budget_weighted,
-                        stop_seen=stop_seen,
-                        produced_work=produced_work(),
-                    )
-                    if parked_now is not None:
-                        return dataclasses.replace(stalled, parked=True, parked_evidence=parked_now)
-                    return stalled
+                    return stall_exit(parked_now, usage_now)
                 continue
             # Drop a nested CLI's events before they can re-point the identity
             # or transcript, set stop_seen, spend nudges or re-arm the stall
@@ -2401,28 +2435,32 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         first stall-expiry, or assign this attribute directly."""
         return tuple(regex.compile(p) for p in self.profile.parked_prompt_patterns)
 
-    def _pane_parked_evidence(self, handle: SessionHandle) -> str | None:
-        """Whether the VISIBLE pane shows a prompt only a human should answer
-        (DW-350): the evidence (pattern plus quoted line) of the first
-        ``parked_prompt_patterns`` match, else None.
+    def _pane_evidence(
+        self, handle: SessionHandle, *pattern_sets: tuple[regex.Pattern[str], ...]
+    ) -> tuple[tuple[str, str] | None, ...]:
+        """One look at the VISIBLE pane, matched against each pattern set: per
+        set, ``(evidence, matched_line)`` for its first match (lines outer,
+        patterns inner; evidence = pattern plus quoted line), else None.
 
-        Read only at a stall-grace expiry with no hook latch — whether a wake
-        nudge is due or the stall is final (DW-433). Observation that
-        degrades: no patterns, a backend that cannot capture (the seam default
-        raises ``MultiplexerError``; a duck-typed backend may lack the method),
-        a capture fault, or a search that blows ``PARKED_PROMPT_MATCH_TIMEOUT_S``
-        all read as "no match": a due nudge goes out, or the final stall ends
-        unparked, exactly as before. The two faults are not silent (DW-448): a
+        The shared matcher behind the parked gate (DW-350:
+        ``parked_prompt_patterns``) and the usage-limit gates (#610:
+        ``usage_limit_patterns`` + ``usage_wait_patterns``), so a decision point
+        that consults several sets captures the pane ONCE. Observation that
+        degrades: every set empty, or a backend that cannot capture (the seam
+        default raises ``MultiplexerError``; a duck-typed backend may lack the
+        method), reads as "no match" for every set; a capture fault does too;
+        a search that blows ``PARKED_PROMPT_MATCH_TIMEOUT_S`` reads as "no
+        match" for its own set. The two faults are not silent (DW-448): a
         ``parked-probe-failed`` crumb (``reason`` = ``capture-failed`` or
-        ``match-timeout`` + its ``pattern``; ``error``) records that the look
-        at the pane failed. No patterns and a backend without ``capture_pane``
-        are configuration, not faults, and stay silent."""
-        patterns = self._parked_prompt_patterns
-        if not patterns:
-            return None
+        ``match-timeout`` + its ``pattern``; ``error``) records that the look at
+        the pane failed. Empty sets and a backend without ``capture_pane`` are
+        configuration, not faults: no capture, no crumb."""
+        none: tuple[tuple[str, str] | None, ...] = tuple(None for _ in pattern_sets)
+        if not any(pattern_sets):
+            return none
         capture = getattr(self.mux, "capture_pane", None)
         if capture is None:
-            return None
+            return none
         try:
             screen = capture(handle.pane_target or handle.native_id)
         except MultiplexerError as e:
@@ -2432,11 +2470,17 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 reason="capture-failed",
                 error=f"{type(e).__name__}: {e}",
             )
-            return None
+            return none
         if not isinstance(screen, str):
-            return None
-        text = _ANSI_RE.sub("", screen.replace("\r", "\n"))
-        for line in text.split("\n"):
+            return none
+        lines = _ANSI_RE.sub("", screen.replace("\r", "\n")).split("\n")
+        return tuple(self._first_pane_match(handle, lines, pats) for pats in pattern_sets)
+
+    def _first_pane_match(
+        self, handle: SessionHandle, lines: list[str], patterns: tuple[regex.Pattern[str], ...]
+    ) -> tuple[str, str] | None:
+        """``_pane_evidence``'s search of one pattern set over captured lines."""
+        for line in lines:
             for pat in patterns:
                 try:
                     hit = pat.search(line, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
@@ -2450,8 +2494,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                     return None
                 if hit is not None:
-                    return f"pane matched {pat.pattern!r}: {_excerpt(line, hit.start())}"
+                    return (f"pane matched {pat.pattern!r}: {_excerpt(line, hit.start())}", line)
         return None
+
+    @property
+    def _usage_pane_patterns(self) -> tuple[regex.Pattern[str], ...]:
+        """Both usage-limit lists (#610) as the live gates consult them: disjoint
+        by contract, so either one matching means usage-limited."""
+        return self._usage_limit_patterns + self._usage_wait_patterns
 
     def _session_vanished(self, task_id: str) -> bool:
         # The disambiguating probe (#489): `list_window_ids` returns [] for a

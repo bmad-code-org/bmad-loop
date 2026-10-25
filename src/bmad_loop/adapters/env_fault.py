@@ -47,6 +47,14 @@ the evidence, and the session is charged like any other failure. It is the
 rationale that already excludes ``over_budget``. Untracked usage (``None``), a
 tracked zero, or a fault reading usage keep today's verdict: only a measurement
 can overrule.
+
+A usage-limit line the wait loop saw LIVE on the visible pane (#610,
+``SessionResult.usage_limited``) is the one verdict the veto does not touch: a
+session that billed tokens and then hit its subscription limit is exactly the
+case the limit pause exists for, and the sighting is of the screen as it stood,
+not a stale line from earlier in the log. The same usage patterns also scan the
+log TAIL as ordinary families, and there the veto applies — a limit the session
+recovered from must not excuse a later real stall.
 """
 
 from __future__ import annotations
@@ -112,7 +120,8 @@ class EnvFaultMixin:
     Mixed into every adapter that writes a per-task diagnostic log; which files
     are scanned is named by ``ENV_FAULT_LOG_SUFFIXES`` (or, when that is unset,
     the single ``ENV_FAULT_LOG_SUFFIX``). Inert for a profile with no
-    ``env_fault_patterns``, so mixing it in is always safe.
+    ``env_fault_patterns`` and no usage-limit patterns (and no live
+    ``usage_limited`` sighting), so mixing it in is always safe.
 
     Several files are scanned independently — each its own tail, straddle and
     match-timeout handling, each read fault its own crumb — and the last match
@@ -190,6 +199,26 @@ class EnvFaultMixin:
         ``_env_fault_patterns`` directly instead."""
         return tuple(regex.compile(p) for p in self.profile.env_fault_patterns)
 
+    @cached_property
+    def _usage_limit_patterns(self) -> tuple[regex.Pattern[str], ...]:
+        """``profile.usage_limit_patterns``, compiled once per adapter (#610).
+        Validated at parse time with this engine, so compiling cannot raise. Same
+        caching CONSTRAINT as ``_env_fault_patterns``. Read by the live pane gates
+        (generic.py) and, as ordinary families, by the log-tail scan here."""
+        return tuple(regex.compile(p) for p in self.profile.usage_limit_patterns)
+
+    @cached_property
+    def _usage_wait_patterns(self) -> tuple[regex.Pattern[str], ...]:
+        """``profile.usage_wait_patterns``, compiled once per adapter (#610); as
+        ``_usage_limit_patterns``."""
+        return tuple(regex.compile(p) for p in self.profile.usage_wait_patterns)
+
+    @property
+    def _tail_scan_patterns(self) -> tuple[regex.Pattern[str], ...]:
+        """Every family the post-mortem tail scan matches: the env-fault patterns,
+        then both usage-limit lists as ordinary families (subject to the veto)."""
+        return self._env_fault_patterns + self._usage_limit_patterns + self._usage_wait_patterns
+
     def _classify_env_fault(
         self, handle: SessionHandle, spec: SessionSpec, result: SessionResult
     ) -> SessionResult:
@@ -208,12 +237,30 @@ class EnvFaultMixin:
         ``env_fault`` stays False, ``env_fault_overruled`` carries the evidence,
         and an ``env-fault-overruled`` breadcrumb (with ``tokens``) replaces the
         classified one. Usage is read only after a match, so a healthy log costs
-        no extra read."""
-        if (
-            not self._env_fault_patterns
-            or result.status not in ENV_FAULT_STATUSES
-            or result.result_json is not None
-        ):
+        no extra read. The tail scan covers ``env_fault_patterns`` and both usage
+        lists (``_tail_scan_patterns``); a tail-only usage match is overruled
+        like any other.
+
+        A LIVE usage-limit sighting (``result.usage_limited``, #610) short-cuts
+        all of that: ``env_fault`` is stamped with that evidence and no veto and
+        no tail scan, crumbed ``env-fault-classified`` with
+        ``usage_limited=True``."""
+        if result.status not in ENV_FAULT_STATUSES or result.result_json is not None:
+            return result
+        if result.usage_limited is not None:
+            # Veto-exempt by design: the line was on the visible pane at the
+            # verdict, so tokens spent BEFORE the limit cannot disprove it.
+            self._note_lifecycle(
+                handle.task_id,
+                "env-fault-classified",
+                status=result.status,
+                evidence=result.usage_limited,
+                usage_limited=True,
+            )
+            return dataclasses.replace(
+                result, env_fault=True, env_fault_evidence=result.usage_limited
+            )
+        if not self._tail_scan_patterns:
             return result
         evidence = self._env_fault_evidence(handle.task_id)
         if evidence is None:
@@ -287,7 +334,7 @@ class EnvFaultMixin:
             if lines is None:
                 continue  # read fault, crumbed: the other files still count
             for line in lines:
-                for pat in self._env_fault_patterns:
+                for pat in self._tail_scan_patterns:
                     try:
                         hit = pat.search(line, timeout=ENV_FAULT_MATCH_TIMEOUT_S)
                     except TimeoutError as exc:

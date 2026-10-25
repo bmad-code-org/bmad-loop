@@ -5293,21 +5293,25 @@ def test_classify_env_fault_inert_without_patterns(tmp_path):
     _env_fault_patterns is a cached_property, so a swap afterwards would leave the
     old patterns compiled (documented on the property)."""
     adapter = make_adapter(tmp_path)
-    adapter.profile = dataclasses.replace(adapter.profile, env_fault_patterns=())
-    assert adapter._env_fault_patterns == ()
+    # The tail scan also covers both usage-limit lists (#610), which claude
+    # seeds, so all three are emptied for the scan to be inert.
+    adapter.profile = dataclasses.replace(
+        adapter.profile, env_fault_patterns=(), usage_limit_patterns=(), usage_wait_patterns=()
+    )
+    assert adapter._tail_scan_patterns == ()
     _write_task_log(adapter, b"API Error: Connection closed mid-response\n")
     # DW-373: an empty pattern set matches nothing anyway, so the verdict alone
     # cannot tell the guard from a full scan. Pin the guard itself: the log is
-    # never even located. ABLATION: drop `not self._env_fault_patterns` from the
-    # guard and `opened` records the task.
+    # never even located. ABLATION: drop `if not self._tail_scan_patterns` from
+    # `_classify_env_fault` and `opened` records the task.
     opened: list[str] = []
-    real_log_path = adapter._env_fault_log_path
+    real_log_paths = adapter._env_fault_log_paths
 
-    def recording_log_path(task_id: str):
+    def recording_log_paths(task_id: str):
         opened.append(task_id)
-        return real_log_path(task_id)
+        return real_log_paths(task_id)
 
-    adapter._env_fault_log_path = recording_log_path
+    adapter._env_fault_log_paths = recording_log_paths
     result = _classify(adapter, "timeout")
     assert result.env_fault is False
     assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
@@ -5487,6 +5491,81 @@ def test_classify_env_fault_no_usage_read_without_pattern_hit(tmp_path):
     assert result.env_fault_overruled is None
     assert reads == []
     assert _lifecycle_lines(adapter, _ENV_FAULT_TASK) == []
+
+
+# The #610 captured Claude Code usage-limit lines, verbatim (this file is a
+# DELIBERATE_CORPUS_FILES entry: its fixtures must be lines the shipped patterns
+# really match). Credit exhaustion BLOCKS (usage_limit_patterns); the
+# session-window limit WAITS for its reset (usage_wait_patterns).
+USAGE_CREDITS_LINE = (
+    "⎿ You're out of usage credits. Run /usage-credits to keep using Fable 5.1 "
+    "or /model to switch models."
+)
+USAGE_SESSION_LINE = "⎿  You've hit your session limit · resets 7:20pm"
+
+
+def _usage_evidence(adapter, line=USAGE_CREDITS_LINE) -> str:
+    """The `usage_limited` string the live pane gate writes for `line`."""
+    return f"pane matched {adapter.profile.usage_limit_patterns[0]!r}: {line.strip()}"
+
+
+@pytest.mark.parametrize("status", ["timeout", "stalled"])
+def test_usage_limited_env_fault_is_not_overruled_by_tokens(tmp_path, status):
+    """A LIVE usage-limit sighting (`usage_limited`, #610) is the one env-fault
+    verdict the #764 token veto does not touch: tracked nonzero usage leaves
+    env_fault True with the pane evidence, usage is never read, the log tail is
+    never scanned (its own usage line would be overruled), and the classified
+    crumb says `usage_limited=True`.
+    ABLATION: drop the `if result.usage_limited is not None:` short-cut and the
+    tail match is overruled (env_fault False)."""
+    adapter = make_adapter(tmp_path)
+    reads: list[SessionResult] = []
+    adapter.read_usage = lambda r: (reads.append(r), TokenUsage(input_tokens=5))[1]
+    _write_task_log(adapter, f"implementing...\n{USAGE_CREDITS_LINE}\n".encode())
+    evidence = _usage_evidence(adapter)
+    handle = SessionHandle(task_id=_ENV_FAULT_TASK, native_id="@1")
+    live = SessionResult(
+        status=status, parked=True, parked_evidence=evidence, usage_limited=evidence
+    )
+    spec = make_spec(adapter.run_dir, task_id=_ENV_FAULT_TASK)
+    result = adapter._classify_env_fault(handle, spec, live)
+    assert result.env_fault is True
+    assert result.env_fault_evidence == evidence
+    assert result.env_fault_overruled is None
+    assert reads == []
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == ["env-fault-classified"]
+    assert events[0]["usage_limited"] is True
+    assert events[0]["evidence"] == evidence
+    assert events[0]["status"] == status
+
+
+def test_tail_only_usage_match_is_still_overruled(tmp_path):
+    """The usage lists also scan the log TAIL as ordinary families (#610), and
+    there the #764 veto applies: a limit line the pane no longer showed, from a
+    session that billed tokens, is overruled like any other match. The untracked
+    twin pins that the tail scan really reaches the usage lists (else both
+    halves would read False for a scan that never matched)."""
+    log = f"implementing...\n{USAGE_CREDITS_LINE}\nback to work\n".encode()
+    tracked = make_adapter(tmp_path)
+    tracked.read_usage = lambda r: TokenUsage(input_tokens=5)
+    _write_task_log(tracked, log)
+    result = _classify(tracked, "timeout")
+    assert result.usage_limited is None
+    assert result.env_fault is False
+    assert result.env_fault_overruled is not None
+    assert "Run /usage-credits" in result.env_fault_overruled
+    assert [e["event"] for e in _lifecycle_lines(tracked, _ENV_FAULT_TASK)] == [
+        "env-fault-overruled"
+    ]
+
+    untracked = make_adapter(tmp_path)
+    untracked.read_usage = lambda r: None
+    _write_task_log(untracked, log)
+    kept = _classify(untracked, "timeout")
+    assert kept.env_fault is True
+    assert "Run /usage-credits" in kept.env_fault_evidence
+    assert kept.usage_limited is None  # the tail never sets the live field
 
 
 def test_run_overruled_timeout_is_plain_timeout(tmp_path):
@@ -11644,8 +11723,11 @@ def test_parked_notification_withholds_the_stall_nudge(tmp_path, monkeypatch, su
     assert result.parked is True
     assert result.parked_evidence == f"Notification({subtype}) -> {kind}"
     assert _stall_nudges(mux) == []
-    # The hook latch decides alone: the screen is never read.
-    assert mux.captures == []
+    # The hook latch decides parked alone: the parked patterns are never
+    # consulted, and the one capture is the usage-limit look (#610), which a
+    # screen without a limit line leaves unset.
+    assert mux.captures == ["@1"]
+    assert result.usage_limited is None
     # ...and the engine's dev decider pauses it with budget left (DW-348 AC).
     from bmad_loop.escalation import Action, decide_dev
     from bmad_loop.model import StoryTask
@@ -11792,8 +11874,9 @@ def test_pane_matched_prompt_withholds_the_stall_nudge(tmp_path, monkeypatch, li
     at grace expiry is withheld and the evidence quotes pattern and line. The
     screen carries ANSI styling and CR line ends, as a real capture can.
 
-    Ablation: delete `parked_now = self._pane_parked_evidence(handle)` and this
-    fails on the STALL_NUDGE_TEXT the mux then records."""
+    Ablation: delete `parked_now = parked_hit[0]` (the parked-set arm of the
+    shared `_pane_evidence` look in the stall-expiry gate) and this fails on the
+    STALL_NUDGE_TEXT the mux then records."""
     screen = f"\x1b[1m  {line}\x1b[0m\r\n\r\n❯ 1. No, exit\r\n  2. Yes, I accept\r\n"
     adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=screen)
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
@@ -12020,10 +12103,187 @@ def test_profile_without_parked_patterns_never_captures(tmp_path, monkeypatch):
     """Inert for a profile that declares no patterns: the screen is not read."""
     adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=BYPASS_FOOTER, nudges=1)
     adapter._parked_prompt_patterns = ()
+    adapter._usage_limit_patterns = ()
+    adapter._usage_wait_patterns = ()
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert (result.status, result.parked) == ("stalled", False)
     assert mux.captures == []
     assert _lifecycle_events(adapter, "parked-probe-failed") == []  # config, not a fault
+
+
+# ------------------------------------------ usage-limit pane gates (#610)
+#
+# Claude Code stopped behind a usage limit idles exactly like a parked prompt;
+# the stall-expiry gate's one capture is matched against the usage-limit lists
+# too, and the timeout-fired path takes one look of its own. A live match is
+# recorded as `usage_limited` (which `_classify_env_fault` and both pause reasons
+# read); a dead window never is.
+
+
+@pytest.mark.parametrize(
+    ("line", "field"),
+    [
+        (USAGE_CREDITS_LINE, "usage_limit_patterns"),
+        (USAGE_SESSION_LINE, "usage_wait_patterns"),
+    ],
+)
+@pytest.mark.parametrize("nudges", [0, 2])
+def test_stall_expiry_on_usage_limit_line_is_parked_and_usage_limited(
+    tmp_path, monkeypatch, line, field, nudges
+):
+    """No hook latch, a usage-limit line on the visible pane: the stall-grace
+    expiry ends the session `stalled` + `parked`, with `usage_limited` naming
+    the matched pattern and quoting the line — whether a nudge was due (2) or
+    none is configured (0). Either list counts; one capture serves both the
+    parked and the usage patterns.
+
+    Ablation: drop `self._usage_pane_patterns` from the stall gate's
+    `_pane_evidence` call (usage_now stays None) and this fails on an unparked
+    stall with `usage_limited` None."""
+    screen = f"\x1b[2m{line}\x1b[0m\r\n\r\n❯ \r\n"
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=screen, nudges=nudges)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited is not None
+    pattern = getattr(adapter.profile, field)[0]
+    assert result.usage_limited == f"pane matched {pattern!r}: {line.strip()}"
+    assert result.parked_evidence == result.usage_limited  # no latch: the limit IS the park
+    assert mux.sent == []
+    assert mux.captures == ["@1"]
+
+
+@pytest.mark.parametrize(
+    "events",
+    [[], [_hook_event("Notification", "idle_prompt")]],
+    ids=["no-latch", "idle-latch"],
+)
+def test_usage_line_withholds_the_stall_nudge(tmp_path, monkeypatch, events):
+    """Nudges available and a usage-limit line on screen: the wake nudge is
+    WITHHELD (it could only reproduce the limit line) and the
+    `stall-nudge-withheld` crumb carries `usage_limited`. With claude's
+    `idle_prompt` latch already supplying the parked evidence, the usage look
+    still runs and is still recorded.
+
+    Ablation: drop `self._usage_pane_patterns` from the stall gate's
+    `_pane_evidence` call and the no-latch case sends two STALL_NUDGE_TEXTs; the
+    latched case loses `usage_limited` from the crumb and the result."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, events, screen=f"{USAGE_CREDITS_LINE}\n", nudges=2
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    evidence = _usage_evidence(adapter)
+    assert _stall_nudges(mux) == []
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    (withheld,) = _lifecycle_events(adapter, "stall-nudge-withheld")
+    assert withheld["usage_limited"] == evidence
+    assert withheld["nudge_due"] is True
+    if events:
+        assert result.parked_evidence == "Notification(idle_prompt) -> IdlePrompt"
+        assert withheld["evidence"] == "Notification(idle_prompt) -> IdlePrompt"
+    else:
+        assert withheld["evidence"] == evidence
+
+
+def test_timeout_with_usage_line_visible_is_usage_limited(tmp_path, monkeypatch):
+    """The session clock ran out while the CLI sat behind the session-window
+    limit: the timeout-fired path's one look at the pane records `usage_limited`
+    (the status stays `timeout`). A clean screen on the same path leaves it
+    unset, so the field is the match's, not the timeout's."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    mux = _UnitMux(screen=f"working…\n{USAGE_SESSION_LINE}\n")
+    adapter.mux = mux
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    assert result.status == "timeout"
+    pattern = adapter.profile.usage_wait_patterns[0]
+    assert result.usage_limited == f"pane matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert mux.captures == ["@1"]
+
+    mux.screen = "working…\n❯ \n"
+    clock["mono"] = 1000.0
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+    clean = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    assert clean.status == "timeout"
+    assert clean.usage_limited is None
+
+
+def test_dead_window_is_never_usage_limited(tmp_path, monkeypatch):
+    """A usage-limit line still captures off a dead (remain-on-exit) pane, but a
+    CLI that is gone is not waiting on a limit: the stall re-probe finding the
+    window dead is `crashed`, never parked or usage-limited, and a timeout whose
+    liveness check finds it dead leaves `usage_limited` unset."""
+    stall_dir = tmp_path / "stall"
+    stall_dir.mkdir()
+    adapter, mux = _parked_adapter(
+        stall_dir, monkeypatch, [], screen=f"{USAGE_CREDITS_LINE}\n", nudges=2
+    )
+    # alive on every tick, dead at the re-probe right after the gate's verdict
+    adapter._window_alive = lambda handle: not _lifecycle_events(adapter, "stall-nudge-withheld")
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(stall_dir))
+    assert result.status == "crashed"
+    assert result.parked is False
+    assert result.usage_limited is None
+    assert _stall_nudges(mux) == []
+    assert mux.captures == ["@1"]  # the line WAS seen: the probe is what declined it
+
+    timeout_dir = tmp_path / "timeout"
+    timeout_dir.mkdir()
+    timed, clock = _timeout_clock_adapter(timeout_dir, monkeypatch)
+    timed_mux = _UnitMux(screen=f"{USAGE_SESSION_LINE}\n")
+    timed.mux = timed_mux
+    timed._window_alive = lambda handle: not _lifecycle_events(timed, "timeout-fired")
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    timed.watcher = _ScriptedWatcher([], on_call=advance)
+    late = timed.wait_for_completion(_dev_handle(), _short_spec(timeout_dir))
+    assert late.status == "timeout"
+    assert late.usage_limited is None
+    assert timed_mux.captures == ["@1"]
+
+
+def test_profile_without_usage_patterns_never_captures_for_them(tmp_path, monkeypatch):
+    """Inert without usage patterns: with a hook latch deciding parked (so the
+    parked patterns are not consulted either) the stall gate never reads the
+    screen, and neither does the timeout-fired path — a limit line on screen
+    notwithstanding."""
+    stall_dir = tmp_path / "stall"
+    stall_dir.mkdir()
+    adapter, mux = _parked_adapter(
+        stall_dir,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt")],
+        screen=f"{USAGE_CREDITS_LINE}\n",
+    )
+    adapter._usage_limit_patterns = ()
+    adapter._usage_wait_patterns = ()
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(stall_dir))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited is None
+    assert mux.captures == []
+    assert _lifecycle_events(adapter, "parked-probe-failed") == []  # config, not a fault
+
+    timeout_dir = tmp_path / "timeout"
+    timeout_dir.mkdir()
+    timed, clock = _timeout_clock_adapter(timeout_dir, monkeypatch)
+    timed_mux = _UnitMux(screen=f"{USAGE_SESSION_LINE}\n")
+    timed.mux = timed_mux
+    timed._usage_limit_patterns = ()
+    timed._usage_wait_patterns = ()
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    timed.watcher = _ScriptedWatcher([], on_call=advance)
+    late = timed.wait_for_completion(_dev_handle(), _short_spec(timeout_dir))
+    assert (late.status, late.usage_limited) == ("timeout", None)
+    assert timed_mux.captures == []
 
 
 def test_capture_pane_argv_reads_the_visible_screen(monkeypatch, force_tmux_backend):

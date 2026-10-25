@@ -3078,6 +3078,8 @@ class Engine:
                 wf_extras["parked"] = True
                 if result.parked_evidence:
                     wf_extras["parked_evidence"] = result.parked_evidence
+            if result.usage_limited:
+                wf_extras["usage_limited"] = result.usage_limited
             self.journal.append(
                 "workflow-end",
                 plugin=lp.name,
@@ -8384,6 +8386,11 @@ class Engine:
             extras["parked"] = True
             if result.parked_evidence:
                 extras["parked_evidence"] = result.parked_evidence
+        # usage-limit diagnosis (#610): same present-only convention — the
+        # visible-pane line the adapter saw live, which exempted the env-fault
+        # verdict from the token veto.
+        if result.usage_limited:
+            extras["usage_limited"] = result.usage_limited
         # empty read-back diagnosis (#780): same present-only convention. The
         # last resultless-stop verdict lands here because nothing reads the
         # crumb file, so a spec nested out of the read-back's reach timed out
