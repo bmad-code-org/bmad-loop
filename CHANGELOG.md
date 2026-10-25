@@ -107,10 +107,11 @@ breaking changes may land in a minor release.
   `in_tool`, and the TUI shows `· idle <age> · in <tool>` (#858).
 - Add `[verify] command_timeout_min` (default 30): per-command verify timeout,
   previously fixed at 30 minutes (#857).
-- `validate` reports `adapter.codex-version` (#901).
-- Journal `session-start-missing` when a session's CLI reports no SessionStart within
-  `limits.session_start_grace_s` (default 120 s); Codex failures with no hook events
-  name the shared-daemon cause in sweep escalation text (#901).
+- Add `adapter.codex-version` to `validate`: warn when Codex is older than 0.156 or the
+  profile's `launch_args` drop `--no-daemon` (#901).
+- Journal `session-start-missing` when a session's CLI sends no SessionStart within
+  `[limits] session_start_grace_s` (default 120 s); a Codex sweep session with no hook
+  events names the shared daemon in its escalation text (#901).
 
 ### Changed
 
@@ -315,9 +316,9 @@ breaking changes may land in a minor release.
 - Refuse to type a nudge into a pane in copy or clock mode, which swallowed it while
   it counted as sent; the nudge is now recorded as not delivered (#949).
 - Run Codex sessions with `--no-daemon` so tools and hooks see the session's
-  `BMAD_LOOP_*` environment instead of a shared app-server daemon's; Codex >= 0.156 is
-  now required. A Codex run paused across this upgrade prints the config-changed
-  advisory once on resume (#901).
+  `BMAD_LOOP_*` environment, not a shared app-server daemon's; require Codex >= 0.156.
+  A Codex run paused across the upgrade prints the config-changed advisory once on
+  resume (#901).
 
 ### Security
 

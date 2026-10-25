@@ -361,7 +361,7 @@ them to whoever owns the machine:
   dialogs.
 - **codex** — run `codex` once in the project and accept **both** prompts: workspace trust,
   then "Hooks need review → Trust all and continue" (untrusted hooks silently never fire).
-  Requires Codex ≥ 0.139.
+  Requires Codex ≥ 0.156.
 - **gemini** — authenticate once (browser OAuth or `GEMINI_API_KEY`). Requires Gemini CLI
   ≥ 0.46.
 - **copilot** — run `copilot` once in the project and authenticate (`gh` / a Copilot
@@ -457,6 +457,14 @@ Under `[scm] isolation = "worktree"`, every unit runs in a new worktree that Cod
 3. `bmad-loop resolve <run-id> --no-interactive` and answer yes: it re-arms the story and resumes the run. (With `--no-resume`, run `bmad-loop resume <run-id>` afterwards.)
 
 Expect one pause per unit: each worktree path needs its own grant. The re-armed story restarts from its baseline. bmad-loop never writes Codex's trust state itself.
+
+#### Codex shared app-server daemon
+
+By default, Codex attaches to a shared background app-server daemon, which may have been started by an unrelated Codex session. Shell tools and hooks run inside that daemon, with the daemon's environment rather than the session window's, so they never see the session's `BMAD_LOOP_*` variables: a skill that checks `BMAD_LOOP_MODE` quits early, and the hook relay drops every event. The bundled `codex` profile therefore passes `--no-daemon` (Codex ≥ 0.156), which hosts the app-server inside the session's own client process.
+
+- **Overlay profiles:** a `.bmad-loop/profiles/codex.toml` that sets `launch_args` must keep `--no-daemon` in them. It goes in `launch_args`, not `bypass_args`: a stage's `extra_args` replace `bypass_args`.
+- **Check:** `bmad-loop validate` reports `adapter.codex-version`. It warns when the installed Codex is older than 0.156 (it rejects `--no-daemon`, so every session exits at launch), when the profile's `launch_args` lack `--no-daemon`, or when the version can't be read. It never fails validation.
+- **Symptom:** when a CLI that maps `SessionStart` sends none within `[limits] session_start_grace_s` (default 120 s), the run journals one `session-start-missing` entry (`task_id`, `waited_s`, `grace_s`, `cli`, plus a `hint` naming the daemon for Codex). The notice is observation only and never ends the session. A sweep triage session on Codex that reports no hook events adds the same hint to its escalation text (`; hint: …`).
 
 ### Skill location
 
