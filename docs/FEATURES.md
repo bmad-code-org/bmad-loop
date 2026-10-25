@@ -317,7 +317,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `bmad-loop probe-adapter <cli>` does a zero-launch scan by default. `--probe` opts in to one live, content-free turn. Every report is sanitized before it is printed.
   - Antigravity (experimental) never reports token usage. Under worktree isolation, it trusts each unit worktree only when the project root is already trusted.
 - **Config:** `[adapter] name`; `[limits] session_start_grace_s`; `bmad-loop probe-adapter <cli> --probe`; `bmad-loop probe-adapter <cli> --workspace <path>`; `bmad-loop adapters`
-- **Tested by:** `tests/test_profile.py`, `tests/test_probe.py`, `tests/test_adapter_registry.py`, `tests/test_workspace_trust.py`, `tests/test_codex_trust.py`, `tests/test_generic_tmux.py`
+- **Tested by:** `tests/test_profile.py`, `tests/test_probe.py`, `tests/test_adapter_registry.py`, `tests/test_workspace_trust.py`, `tests/test_codex_trust.py`, `tests/test_generic_tmux.py`, `tests/test_cli.py`
 - **Docs:** [Choosing which CLIs to drive](setup-guide.md#choosing-which-clis-to-drive), [Codex shared app-server daemon](setup-guide.md#codex-shared-app-server-daemon), [Adapter authoring guide: finalizing a profile](adapter-authoring-guide.md#walkthrough-finalizing-a-profile), [CLI reference: probe-adapter](reference/cli.md#probe-adapter), [CLI reference: adapters](reference/cli.md#adapters)
 
 ### Per-stage adapters
