@@ -483,10 +483,11 @@ patterns and both usage lists. A usage match withholds the nudge (even when a ho
 such as `idle_prompt` is set, since an idle CLI behind a limit latches exactly that) and
 ends the session `stalled` + `parked` with `SessionResult.usage_limited` holding the
 matched evidence. **When the session timeout fires**, one capture against both lists sets
-`usage_limited` on the `timeout` result, unless the session is visibly working: a
-transcript written within the last 90 s (as of the last heartbeat) or an unanswered tool
-call means the line is left over from a limit it recovered from, and the timeout is an
-ordinary one. A dead window is never usage-limited.
+`usage_limited` on the `timeout` result. Neither gate takes a usage match from a session
+that is visibly working: a transcript written within the last 90 s (as of the last
+heartbeat) or an unanswered tool call means the line is left over from a limit it
+recovered from, and the stall or timeout is an ordinary one. A dead window is never
+usage-limited.
 
 A `usage_limited` result is classified as an environment fault with no token-usage
 overrule and no tail scan, and pauses with a `usage limit:` reason (see

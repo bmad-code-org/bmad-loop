@@ -1516,6 +1516,21 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 handle, stop_seen, activity_seen or transcript_work_seen or usage_seen
             )
 
+        def still_working() -> bool:
+            """The quota wait's activity tests (#610), for a usage line seen at
+            stall-grace expiry or at the timeout. A visible line alone is not
+            proof the CLI is still blocked: one that recovered and kept working
+            can leave it on screen. A transcript written inside QUOTA_WAIT_IDLE_S
+            (as of the last heartbeat sample) or an unanswered tool call is a
+            working session, and so is a tool scan that faults. Unknown activity
+            (no transcript named yet, or no sample) keeps the pane's word."""
+            path = transcript_path
+            if not path:
+                return False
+            if idle.idle_s is not None and idle.idle_s < QUOTA_WAIT_IDLE_S:
+                return True
+            return self._quota_wait_tool_open(handle, path)
+
         def stall_exit(
             parked_now: str | None, usage_now: str | None, resets_now: str | None = None
         ) -> SessionResult:
@@ -1623,15 +1638,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # failed attempt. A dead window is never usage-limited (the CLI
                 # is gone, though a remain-on-exit pane still captures), so a
                 # match is confirmed alive first; a probe fault reads "not dead".
-                # A visible line alone is not proof the CLI is still blocked:
-                # one that recovered and kept working can leave it on screen.
-                # The quota wait's activity tests apply here too — a transcript
-                # written inside QUOTA_WAIT_IDLE_S (as of the last heartbeat
-                # sample) or an unanswered tool call is a working session, and
-                # its timeout is an ordinary one, charged as before #610 (so is
-                # a tool scan that faults). Unknown activity (no transcript
-                # named yet, or no sample) keeps the pane's word. A line a
-                # quota wait already continued from is no evidence at all.
+                # A working session's timeout (`still_working`) is an ordinary
+                # one, charged as before #610. A line a quota wait already
+                # continued from is no evidence at all.
                 (usage_hit,) = self._pane_evidence(
                     handle, self._usage_pane_patterns, skip=quota.spent
                 )
@@ -1639,13 +1648,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 if (
                     usage_hit is not None
                     and self._probe_liveness(handle, "timeout") is not False
-                    and not (
-                        transcript_path
-                        and (
-                            (idle.idle_s is not None and idle.idle_s < QUOTA_WAIT_IDLE_S)
-                            or self._quota_wait_tool_open(handle, transcript_path)
-                        )
-                    )
+                    and not still_working()
                 ):
                     usage_now = usage_hit[0]
                     reset = self._usage_reset(handle, usage_hit[1], _local_now())
@@ -2086,7 +2089,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # match is recorded as `usage_limited` even when the hook
                     # latch already supplied the parked evidence, since claude's
                     # idle_prompt latches on exactly this kind of idle. A line a
-                    # quota wait already continued from matches nothing.
+                    # quota wait already continued from matches nothing, and
+                    # neither does one on a working session (`still_working`:
+                    # a silent foreground tool past the grace, say), which
+                    # stalls as before #610 rather than pausing uncharged.
                     parked_now = parked_evidence
                     parked_hit, usage_hit = self._pane_evidence(
                         handle,
@@ -2097,7 +2103,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     if parked_now is None and parked_hit is not None:
                         parked_now = parked_hit[0]
                     usage_now = resets_now = None
-                    if usage_hit is not None:
+                    if usage_hit is not None and not still_working():
                         usage_now = usage_hit[0]
                         reset = self._usage_reset(handle, usage_hit[1], _local_now())
                         resets_now = reset.value if reset is not None else None

@@ -13201,6 +13201,32 @@ def test_spent_wait_line_does_not_park_a_stall(tmp_path, monkeypatch):
     assert _lifecycle_events(q.adapter, "stall-nudge-withheld") == []
 
 
+@pytest.mark.parametrize("activity", ["open-tool", "active-transcript"])
+def test_working_session_stall_is_not_usage_limited(tmp_path, monkeypatch, activity):
+    """A limit line left on screen by a session that recovered with no wait
+    ever admitted, and a quiet pane past the grace: a silent foreground tool
+    (an unanswered `Bash` call), or a transcript still being written. The
+    stall gate applies the quota wait's activity tests, as the timeout does:
+    the session is not parked or usage-limited (which would pause the run
+    uncharged for a limit long gone) and no nudge is withheld for it.
+
+    Ablation: drop `still_working()` from the stall gate and both cases end
+    stalled + parked + usage-limited."""
+    q = _quota_adapter(tmp_path, monkeypatch, grace=120.0)
+    if activity == "open-tool":
+        _grow(q.transcript, _tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
+
+    def script(call_n):
+        if activity == "active-transcript":
+            _grow(q.transcript, _assistant_line())
+
+    result = _drive_quota(q, _quota_spec(tmp_path, timeout_s=1000.0), script=script, repaint=False)
+    assert q.quota_kinds() == []
+    assert result.usage_limited is None
+    assert not result.parked
+    assert _lifecycle_events(q.adapter, "stall-nudge-withheld") == []
+
+
 def test_fresh_wait_line_after_a_spent_one_opens_a_new_wait(tmp_path, monkeypatch):
     """A second limit after the CLI continued prints a NEW line (below the spent
     one, its own reset): that is fresh evidence, and a second wait opens on it.
