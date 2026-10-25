@@ -12879,10 +12879,12 @@ def test_quota_wait_freezes_on_every_tick_not_only_heartbeats(tmp_path, monkeypa
 def test_quota_wait_needs_an_idle_transcript(tmp_path, monkeypatch):
     """The wait line on screen but a transcript still being written (a session
     that recovered and kept working, the line still on screen): no wait, and the
-    timeout fires on schedule.
+    timeout fires on schedule as an ordinary one, not usage-limited (#610's
+    veto exemption would otherwise pause the run for a limit long gone).
 
     Ablation: drop the `idle_s >= QUOTA_WAIT_IDLE_S` guard and a wait opens at
-    the first heartbeat."""
+    the first heartbeat; drop the timeout path's idle test and the verdict is
+    usage-limited."""
     q = _quota_adapter(tmp_path, monkeypatch)
 
     def script(call_n):
@@ -12891,6 +12893,8 @@ def test_quota_wait_needs_an_idle_transcript(tmp_path, monkeypatch):
 
     result = _drive_quota(q, _quota_spec(tmp_path), script=script)
     assert result.status == "timeout"
+    assert result.usage_limited is None
+    assert result.usage_limit_resets is None
     assert result.quota_wait_s == 0.0
     assert q.quota_kinds() == []
     assert _lifecycle_events(q.adapter, "quota-wait-started") == []
@@ -12899,13 +12903,16 @@ def test_quota_wait_needs_an_idle_transcript(tmp_path, monkeypatch):
 def test_quota_wait_not_admitted_with_an_open_tool_call(tmp_path, monkeypatch):
     """An idle transcript whose last line opens a `Bash` call: the CLI is waiting
     on its own foreground tool, not on a reset, whatever the pane still shows.
-    No wait; the timeout fires on schedule.
+    No wait; the timeout fires on schedule, and not as usage-limited: the open
+    call is still a working session when the clock runs out.
 
-    Ablation: drop the `_quota_wait_tool_open` guard and the wait opens."""
+    Ablation: drop the `_quota_wait_tool_open` guard and the wait opens; drop
+    it from the timeout path and the verdict is usage-limited."""
     q = _quota_adapter(tmp_path, monkeypatch)
     _grow(q.transcript, _tool_use("t1", "Bash", "2026-01-01T00:00:01Z"))
     result = _drive_quota(q, _quota_spec(tmp_path))
     assert result.status == "timeout"
+    assert result.usage_limited is None
     assert result.quota_wait_s == 0.0
     assert q.quota_kinds() == []
 

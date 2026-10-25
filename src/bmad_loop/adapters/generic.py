@@ -1616,9 +1616,27 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # failed attempt. A dead window is never usage-limited (the CLI
                 # is gone, though a remain-on-exit pane still captures), so a
                 # match is confirmed alive first; a probe fault reads "not dead".
+                # A visible line alone is not proof the CLI is still blocked:
+                # one that recovered and kept working can leave it on screen.
+                # The quota wait's activity tests apply here too — a transcript
+                # written inside QUOTA_WAIT_IDLE_S (as of the last heartbeat
+                # sample) or an unanswered tool call is a working session, and
+                # its timeout is an ordinary one, charged as before #610 (so is
+                # a tool scan that faults). Unknown activity (no transcript
+                # named yet, or no sample) keeps the pane's word.
                 (usage_hit,) = self._pane_evidence(handle, self._usage_pane_patterns)
                 usage_now = resets_now = None
-                if usage_hit is not None and self._probe_liveness(handle, "timeout") is not False:
+                if (
+                    usage_hit is not None
+                    and self._probe_liveness(handle, "timeout") is not False
+                    and not (
+                        transcript_path
+                        and (
+                            (idle.idle_s is not None and idle.idle_s < QUOTA_WAIT_IDLE_S)
+                            or self._quota_wait_tool_open(handle, transcript_path)
+                        )
+                    )
+                ):
                     usage_now = usage_hit[0]
                     reset = self._usage_reset(handle, usage_hit[1], _local_now())
                     resets_now = reset.value if reset is not None else None
