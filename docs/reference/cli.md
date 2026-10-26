@@ -210,6 +210,8 @@ bmad-loop resume [--project PROJECT] [--accept-baseline] run_id
 - Refused with exit 1 for a live engine, a finished run, a sweep whose ledger cannot be read, and the same git-floor, isolation, skill and plugin-trust gates as `run`. Does not require a clean worktree.
 - Refused with exit 1, before any side effect, for a story run whose work source this version does not know (the run was started by a newer bmad-loop) or cannot run yet. Do not downgrade bmad-loop while a run is in progress.
 - Discards any pending stop request and re-reads the policy and config before continuing.
+- For a story run, prints `warning: run <id>: story '<key>' is still escalated — resume skips it; resolve it with bmad-loop resolve <id>` on stderr for each escalated story, then continues.
+- Clears the pause before the engine starts. A resume that fails before that (an adapter, profile or multiplexer error, `error: …`) puts the cleared pause fields back and journals `resume-aborted` with `error` set to the exception class, unless the run finished or was paused again meanwhile; a restore that fails prints `could not restore the pause this resume cleared` and the original error still ends the command. After a resolve re-arm the story is already `pending`, so a plain `resume` re-drives it.
 
 ### `resolve`
 
@@ -222,7 +224,7 @@ bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
 
 | Option                     | Description                                                                                                                                  |
 | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--story STORY`            | Story to resolve. Default: the run's paused story.                                                                                           |
+| `--story STORY`            | Story to resolve. Default: the paused story, or with no pause stage the first escalated story.                                               |
 | `--no-interactive`         | Skip the resolve agent (the spec was fixed by hand), then re-arm and resume. With `--abandon`: skip the confirm prompt.                      |
 | `--restore-patch PATH`     | Re-arm the spec to `in-review` and re-apply this saved patch, so review resumes on the attempted change.                                     |
 | `--adopt-branch`           | Commit and merge the kept worktree branch as-is and mark the story done. Worktree isolation only; not for sweeps.                            |
@@ -234,7 +236,8 @@ bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
 - `--restore-patch`, `--adopt-branch`, `--reverify` and `--abandon` are mutually exclusive.
 - Tickets mode: `--story` takes a ticket ref. The re-arm moves the plan through `tickets.py mark` to `ready-for-dev`, or `in-review` for a restore, and a refused move aborts it. Refused with exit 1 when the ticket store's layout changed since the run started. See the [tickets guide](../tickets-guide.md#parking-and-resolve).
 - `--reverify --story KEY` on a finished sprint run creates a new replay run for a kept DEFERRED worktree unit; the finished run is not modified.
-- Refuses with exit 1, leaving the run unchanged, when the run is not paused at an escalation (`--reverify --story` accepts any pause), the engine is live, there is no escalated story, or a DEFERRED story is targeted without `--reverify`. Declining the confirm prompt exits 0 and leaves the run paused.
+- Acts on a run paused at `escalation`, or on an unfinished story run with no pause stage and a story still escalated (a resume whose engine exited before run end leaves this). With no pause stage, `--story` must name an escalated story.
+- Refuses with exit 1, leaving the run unchanged, in this order: the engine is live (`still live`; stop it first), the run is neither of the shapes above (any other pause stage, a finished run, a sweep with no pause stage; `--reverify --story` accepts any pause), there is no escalated story, or a DEFERRED story is targeted without `--reverify`. Declining the confirm prompt exits 0 and leaves the run paused.
 
 ### `decisions`
 
@@ -298,6 +301,7 @@ bmad-loop status [--project PROJECT] [--json] [run_id]
 ```
 
 - The status line (`status: …`) is `finished`, `PAUSED (<stage>) — <reason>`, `in progress — graceful stop pending (will stop after the current item)`, or `in progress (or interrupted)`.
+- For an unfinished story run with no pause stage, each story still escalated adds `escalated: story '<key>' awaiting resolve — bmad-loop resolve <id>` below the status line. Not in `--json`.
 - For a tickets run, the footer is the tickets board, read live through the project's `tickets.py status` and pinned to the run's initiative. It shows the run's selectors, the ticket counts by state, then one block per epic in build order: done count, epic status and any recorded closure, and each ticket's state, plan status, flags and this run's phase. A tree that cannot be read prints `tickets board unavailable: <reason>`, and `status` still exits 0. Marks or store commits still owed after landing are listed last.
 - Exits 1 with `no runs found`, or on a bad or ambiguous ref (stdout stays empty under `--json`).
 

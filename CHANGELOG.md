@@ -183,6 +183,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Let `resolve` re-arm, adopt or abandon a story left escalated after a `resume` cleared
+  the run's pause and its engine exited before run end (#958). Warn on `resume` and hint
+  in `status` and the TUI header when a story is still escalated; restore the pause
+  (journaling `resume-aborted`) when a resume fails before its engine starts; report a
+  live engine before the pause stage.
 - Pause a Claude session seen blocked by a usage limit (credit exhaustion or a
   session-window limit) with a `usage limit:` reason instead of charging a dev attempt;
   a live pane sighting is exempt from the token veto. Add the profile fields

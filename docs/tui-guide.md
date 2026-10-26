@@ -232,6 +232,9 @@ Situational banners below that:
   a crash; the error follows on the next line.
 - `✖ engine gone — run was interrupted · press e to resume`: the recorded
   engine pid is dead.
+- `escalated: story '<key>' awaiting resolve — press R (bmad-loop resolve <id>)`:
+  an unfinished run with no pause stage still has an escalated story, as a
+  resume whose engine exited before run end leaves it.
 - `⚠ auto-sweep not run: <trigger> (<why>) — deferred work is untouched`: an
   auto-sweep was refused; run `bmad-loop sweep` with a clean worktree. A sweep
   that ran shows a dim `auto-sweep ran: <triggers>` line.
@@ -422,6 +425,9 @@ selects the new run.
 `e` resumes the selected unfinished run: paused, stopped, crashed or
 interrupted. It refuses finished runs and runs whose state is unreadable. The confirmation shows `paused at <stage> — <reason>` for a paused
 run, or `run is not paused — it looks interrupted`.
+For a story run it adds a yellow
+`story '<key>' is still escalated — resume skips it; resolve it with bmad-loop resolve <id>`
+line for each escalated story.
 
 If the original engine still appears to be running, the confirmation adds, in
 bold red, `engine.pid may still be live — resuming could double-drive this run`.
@@ -457,8 +463,9 @@ with `run <id> is live — stop it first`.
 
 ## Resolving an escalation (`R`)
 
-`R` works only on a run paused at the `escalation` stage and refuses a run
-whose engine may still be live. A CRITICAL escalation parks its story at
+`R` works on a run paused at the `escalation` stage, or on an unfinished story
+run with no pause stage and a story still escalated (it resolves the first such
+story), and refuses a run whose engine may still be live. A CRITICAL escalation parks its story at
 `escalated`, which a plain resume skips; `R` is how you un-stick it.
 
 1. Confirming launches `bmad-loop resolve <run-id>` in a control window and
