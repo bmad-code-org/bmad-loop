@@ -7700,9 +7700,13 @@ def _commit_confirmation(
     if story.followup_review_recommended is True:
         # The park skipped the pass; the now-done (or built) spec is one the build
         # skill routes to a fresh review, which a parked spec is not.
+        # Named as the review session would spell it (a pre-rename project still
+        # drives `bmad-dev-auto`); an unreadable policy leaves it generic.
         target = story.spec_path if story.spec_path is not None else "the story's spec"
+        pol = _confirm_policy(project)
+        skill = "the build skill" if pol is None else _dev_skill_for_role(pol, project, "review")
         print(
-            f"  follow-up review still owed: invoke bmad-build-auto on {target} "
+            f"  follow-up review still owed: invoke {skill} on {target} "
             "(it routes a done or built spec to a fresh review pass)"
         )
     return 0

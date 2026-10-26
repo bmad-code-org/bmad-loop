@@ -5324,8 +5324,10 @@ class Engine:
         flag — so without this fallback a recommended follow-up review would be
         silently skipped. Gates on the frontmatter's own status (mirroring the
         fold): a faulted replay leaves ``rj["status"]`` at the stale snapshot
-        value, so the result status must not decide. Degrades to False on a read
-        fault (journaled) — the pre-existing absent-key default.
+        value, so the result status must not decide. A parked spec counts too,
+        as it does in the synthesis: its park record carries the recommendation.
+        Degrades to False on a read fault (journaled) — the pre-existing
+        absent-key default.
         """
         if not self._generic_dev():
             return False
@@ -5338,9 +5340,10 @@ class Engine:
         fm = self._observed_frontmatter(spec_path, task.story_key, "followup-routing")
         if fm is None:
             return False
-        return verify.status_of(fm) == self._dev_success_status() and bool(
-            fm.get("followup_review_recommended", False)
-        )
+        return verify.status_of(fm) in (
+            self._dev_success_status(),
+            verify.AWAITING_OPERATOR,
+        ) and bool(fm.get("followup_review_recommended", False))
 
     def _reconcile_generic_terminal_status(self, task: StoryTask, result_json: dict | None) -> None:
         """Repair a generic-skill spec the session finalized in prose but not in

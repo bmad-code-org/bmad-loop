@@ -197,7 +197,7 @@ A park skips the review loop: a review would either re-park the story or finaliz
 To run the owed pass:
 
 1. Confirm the story first (`bmad-loop confirm <story-key>`). Its success output repeats the recommendation and names the spec.
-2. Invoke bmad-build-auto on the now-`done` spec. The skill routes a `done` spec to a fresh follow-up review pass.
+2. Invoke the build skill that `confirm` names (bmad-build-auto, or bmad-dev-auto on a pre-rename install) on the now-`done` spec. The skill routes a `done` spec to a fresh follow-up review pass.
 3. Commit what the pass patches.
 
 Reviewing before you confirm does not work, because the build skill does not route a parked spec. If the owed action is a manual test, review the parked work first with a review that leaves the spec's status alone (for example bmad-code-review over the park commit), so the test covers reviewed code. Otherwise re-test after the post-confirm pass if it patches code.

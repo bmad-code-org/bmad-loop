@@ -148,7 +148,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `bmad-loop confirm --list` shows each parked story and what it owes; `--json` emits it as a machine-readable document.
   - A confirmation adds an `## Operator Confirmation` section, moves spec and board to `done`, and commits.
   - `confirm --reverify` runs the environment probes and `[verify]` commands first; a failure blocks the confirmation.
-  - A park keeps the build's follow-up review recommendation on the park record and shows it in `confirm`, `status --json` and the park notification; the park never runs that review, which runs after confirmation.
+  - A park keeps the build's follow-up review recommendation on the park record and shows it in `confirm`, `status --json` and the park notification. The park never runs that review: after confirming, the operator invokes the build skill on the spec to run it.
   - `[operator] on_review_demotion = "park"` lets a review demote a `done` story to `awaiting-operator` (sprint and tickets mode); the default `escalate` rejects the demotion.
 - **Config:** `[operator] enabled`, `[operator] on_review_demotion`, `bmad-loop confirm --list`, `bmad-loop confirm --yes`, `bmad-loop confirm --reverify`, `bmad-loop confirm --json`
 - **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_operatoractions.py`, `tests/test_tickets_engine.py`

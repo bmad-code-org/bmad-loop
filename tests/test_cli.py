@@ -17434,6 +17434,7 @@ def test_confirm_success_names_the_owed_followup_review(project, capsys, monkeyp
     (performed): drop the hint from `_commit_confirmation` and the recommended
     case FAILS."""
     install_bmad_config(project)
+    install_build_auto_skill(project.project)
     sp = _park_story(project, followup=followup)
     git(project.project, "add", "-A")
     git(project.project, "commit", "-q", "-m", "park")
@@ -17448,6 +17449,23 @@ def test_confirm_success_names_the_owed_followup_review(project, capsys, monkeyp
         assert tail[1].startswith(hint)
     else:
         assert "follow-up review" not in out
+
+
+def test_confirm_followup_hint_names_the_installed_build_skill(project, capsys, monkeypatch):
+    """The hint spells the dev primitive the project's review session would drive,
+    so a pre-rename project that only carries `bmad-dev-auto` is told that name.
+    Ablation (performed): hard-code `bmad-build-auto` in the hint and this FAILS."""
+    install_bmad_config(project)
+    install_dev_base_skills(project.project, folder_id=True)  # the legacy era alone
+    sp = _park_story(project, followup=True)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    tail = capsys.readouterr().out.split("✓ 1-1-a confirmed", 1)[1].splitlines()
+    assert tail[1].startswith(f"  follow-up review still owed: invoke bmad-dev-auto on {sp} ")
 
 
 def test_confirm_list_shows_what_each_story_owes(project, capsys):
@@ -25187,6 +25205,7 @@ def test_confirm_tickets_names_the_plan_for_the_owed_followup_review(
         policy_text='[stories]\nsource = "tickets"\n\n[tickets]\nmark_done = "never"\n',
         followup=True,
     )
+    install_build_auto_skill(project_v7.project)
     reason = "awaiting operator: " + "; ".join(TICKET_PARK_ACTIONS)
     row = ticket_row("1.1", status="blocked", blocked_reason=reason)
     tree = FakeTicketTree(project_v7.project, finds={"1.1": fake_find(row, plan.parent)})

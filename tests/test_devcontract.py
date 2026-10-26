@@ -482,14 +482,33 @@ def test_synth_awaiting_operator_synthesizes_no_escalation(tmp_path):
     """The distinction the whole state exists for: `blocked` means the session
     could not proceed and the run must halt; a park means it finished everything
     an agent could. A CRITICAL here would collapse the two into the pause
-    channel. `followup_review_recommended` is likewise absent — a parked story
-    does not route into the review loop at all."""
+    channel."""
     sp = _spec(tmp_path / "s.md", status="awaiting-operator", auto_run=None, actions="['do it']")
     out = devcontract.synthesize_result(sp, story_key="1-1-a")
 
     assert out.result_json["escalations"] == []
-    assert "followup_review_recommended" not in out.result_json
     assert out.result_json["park_asserted"] is False
+
+
+@pytest.mark.parametrize("followup", [True, False, None])
+def test_synth_awaiting_operator_carries_the_followup_recommendation(tmp_path, followup):
+    """A park skips the review loop, but its record keeps the session's follow-up
+    review recommendation for the operator, so the synthesis carries the
+    frontmatter flag on a park as it does on a success (an absent key reads
+    False, as on `done`). The engine's park record reads this key.
+
+    Ablation: drop the AWAITING_OPERATOR arm of the followup carry and the key is
+    absent, so every case fails."""
+    sp = _spec(
+        tmp_path / "s.md",
+        status="awaiting-operator",
+        auto_run="awaiting-operator",
+        followup=followup,
+        actions="['do it']",
+    )
+    rj = devcontract.synthesize_result(sp, story_key="1-1-a").result_json
+
+    assert rj is not None and rj["followup_review_recommended"] is bool(followup)
 
 
 def test_synth_park_assertion_uses_only_the_last_real_marker(tmp_path):

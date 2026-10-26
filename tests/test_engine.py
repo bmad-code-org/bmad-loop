@@ -4252,6 +4252,56 @@ def test_park_without_a_followup_records_false(project):
     assert record["followup_review_recommended"] is False
 
 
+@pytest.mark.parametrize("keyed", [True, False])
+def test_park_followup_survives_the_real_synthesis(project, keyed):
+    """The two tests above hand the engine a result that already holds the key.
+    Here the result is what `devcontract.synthesize_result` builds from a parked
+    spec whose frontmatter recommends a follow-up review, so the recommendation
+    must survive the synthesis (``keyed``) or, for a result without the key (a
+    resumed pre-reconcile snapshot), the `_followup_from_spec` re-derivation.
+
+    Ablation: drop the AWAITING_OPERATOR arm of the synthesis carry (keyed: the
+    key reads None) or of `_followup_from_spec`'s status gate (not keyed) and the
+    park records something other than True."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+
+    def effect(spec: SessionSpec) -> SessionResult:
+        baseline = rev_parse_head(project.project)
+        src = project.project / "src.txt"
+        src.write_text(src.read_text() + "change for 1-1-a\n")
+        sp = spec_path(project, "1-1-a")
+        write_spec(
+            sp,
+            "awaiting-operator",
+            baseline,
+            prose_status="awaiting-operator",
+            operator_actions=ACTIONS,
+        )
+        text = sp.read_text()
+        sp.write_text(text.replace("---\n", "---\nfollowup_review_recommended: true\n", 1))
+        rj = devcontract.synthesize_result(
+            sp, story_key="1-1-a", park_marker_session_authored=True
+        ).result_json
+        assert rj is not None
+        carried = rj.pop("followup_review_recommended", None)
+        if keyed:
+            rj["followup_review_recommended"] = carried
+        return SessionResult(status="completed", result_json=rj)
+
+    engine, adapter = make_engine(project, [effect], policy=_park_policy())
+
+    engine.run()
+
+    parked = engine.state.tasks["1-1-a"]
+    assert parked.phase == Phase.AWAITING_OPERATOR
+    assert not any(s.role == "review" for s in adapter.sessions)
+    parked_entry = next(
+        e for e in engine.journal.entries() if e["kind"] == "story-awaiting-operator"
+    )
+    assert parked_entry["followup_review_recommended"] is True
+    assert _committed_park_record(project, parked.commit_sha)["followup_review_recommended"] is True
+
+
 def test_park_commit_message_marks_the_story_awaiting_operator(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(

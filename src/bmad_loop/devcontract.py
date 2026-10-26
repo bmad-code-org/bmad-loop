@@ -638,9 +638,11 @@ def synthesize_result(
     # bmad-build-auto (BMAD-METHOD PR #2505) self-reviews inline and, on a `done`
     # exit, sets `followup_review_recommended: true` when its review-driven
     # changes warrant an independent second-opinion pass. The skill never sets it
-    # on a blocked exit, so only carry it through on a successful exit: `done`, or
-    # the caller's `success_statuses` (`built` for a v7 ticket).
-    if status in success_statuses:
+    # on a blocked exit, so only carry it through on a successful exit (`done`, or
+    # the caller's `success_statuses`: `built` for a v7 ticket) or a park. A park
+    # never routes into the review loop, but its record keeps the recommendation
+    # so the operator can run that skipped pass after confirming.
+    if status in success_statuses or status == AWAITING_OPERATOR:
         result["followup_review_recommended"] = bool(fm.get("followup_review_recommended", False))
     # A park's obligations travel with its result so the engine never has to
     # re-read the spec to learn them. Folded on the awaiting-operator status
