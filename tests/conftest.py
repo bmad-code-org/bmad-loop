@@ -3499,6 +3499,16 @@ def escalated_run(
     return EscalatedRun(run_dir=run_dir, state=state, task=task)
 
 
+def clear_escalation_pause(run: EscalatedRun) -> EscalatedRun:
+    """Persist ``run`` with its pause cleared and its task still ESCALATED: the
+    state a resume leaves when it clears the pause and its engine exits before the
+    run ends (#958). Mutates and returns ``run`` so a caller can chain it on
+    `escalated_run`."""
+    run.state.clear_pause()
+    save_state(run.run_dir, run.state)
+    return run
+
+
 # DW-522: an in-place run paused on a story whose attempt committed above its
 # baseline — shared by the `rearm_for_reverify` (tests/test_runs.py) and
 # `resolve --reverify` (tests/test_cli.py) tests.

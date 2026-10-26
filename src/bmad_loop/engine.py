@@ -55,6 +55,7 @@ from .escalation import (
     review_exhausted,
     review_retry_or_exhaust,
     session_failure_reason,
+    unresolved_escalation_keys,
 )
 from .frontmatter import FrontmatterWriteError
 from .install import dev_primitive_or_default
@@ -1164,11 +1165,9 @@ class Engine:
     def _unresolved_escalation_key(self) -> str | None:
         """The first ESCALATED task that still blocks ``finished`` at run end
         (DW-386), or None. ``StoriesEngine`` narrows it: its pick-time wedges are
-        disk projections a drained schedule has already cleared."""
-        return next(
-            (k for k, t in self.state.tasks.items() if t.phase == Phase.ESCALATED),
-            None,
-        )
+        disk projections a drained schedule has already cleared. The predicate is
+        ``escalation.unresolved_escalation_keys``, which resolve's admission shares."""
+        return next(iter(unresolved_escalation_keys(self.state)), None)
 
     def _kill_run_session(self) -> None:
         """Tear down this run's agent session, journaling a kill the

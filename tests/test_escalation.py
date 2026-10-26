@@ -21,8 +21,9 @@ from bmad_loop.escalation import (
     preference_escalations,
     review_retry_or_exhaust,
     session_failure_reason,
+    unresolved_escalation_keys,
 )
-from bmad_loop.model import PAUSE_ESCALATION, PAUSE_STORY_GATE, RunState, StoryTask
+from bmad_loop.model import PAUSE_ESCALATION, PAUSE_STORY_GATE, Phase, RunState, StoryTask
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy, ReviewPolicy
 from bmad_loop.verify import VerifyOutcome
 
@@ -809,3 +810,47 @@ def test_decide_reverify_never_retries():
             VerifyOutcome.escalate("x"),
         ):
             assert decide_reverify(_reverify_task(origin), outcome).action != Action.RETRY
+
+
+# ----------------------------------------------------------- unresolved_escalation_keys
+
+
+def _escalation_state(source: str, *tasks: tuple[str, Phase, int]) -> RunState:
+    state = RunState(run_id="r1", project="/p", started_at="now", source=source)
+    for key, phase, attempt in tasks:
+        state.tasks[key] = StoryTask(story_key=key, epic=1, phase=phase, attempt=attempt)
+    return state
+
+
+def test_unresolved_escalation_keys_sprint_counts_every_escalated_task_in_order():
+    """A sprint run's run-end re-pause (DW-386) counts any ESCALATED task, including
+    one at attempt 0, and resolve's admission reads the keys in task order."""
+    state = _escalation_state(
+        "sprint-status",
+        ("b", Phase.ESCALATED, 0),
+        ("a", Phase.DONE, 1),
+        ("c", Phase.ESCALATED, 2),
+        ("d", Phase.DEFERRED, 1),
+    )
+    assert unresolved_escalation_keys(state) == ["b", "c"]
+
+
+@pytest.mark.parametrize("source", ["stories", "tickets"])
+def test_unresolved_escalation_keys_checkpoint_flow_skips_attempt0_wedges(source):
+    """Stories and tickets runs re-classify a pick-time wedge (attempt 0) from disk
+    every pick, so only an in-run escalation (attempt > 0) is unresolved.
+
+    Ablation: drop the attempt narrowing and the wedge key comes back."""
+    state = _escalation_state(
+        source,
+        ("w", Phase.ESCALATED, 0),
+        ("x", Phase.ESCALATED, 1),
+        ("y", Phase.PENDING, 1),
+        ("z", Phase.ESCALATED, 3),
+    )
+    assert unresolved_escalation_keys(state) == ["x", "z"]
+
+
+def test_unresolved_escalation_keys_empty_without_an_escalated_task():
+    state = _escalation_state("sprint-status", ("a", Phase.DONE, 1), ("b", Phase.PENDING, 0))
+    assert unresolved_escalation_keys(state) == []

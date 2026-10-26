@@ -74,7 +74,7 @@ from pathlib import Path
 from . import runs, runsetup, verify, worksource
 from .bmadconfig import ProjectPaths
 from .journal import Journal, load_state, save_state, state_lock
-from .model import PAUSE_ESCALATION, Phase, RunState, StoryTask
+from .model import Phase, RunState, StoryTask
 from .platform_util import pinned_root_identity, root_identity_record, safe_segment
 from .policy import Policy
 from .workspace import (
@@ -369,16 +369,20 @@ def abandon_replay_run(run_dir: Path, story_key: str, *, paths: ProjectPaths) ->
     between the journal and the save, with a second ``replay-abandoned`` row). ``paths`` is the current config: ``paths.repo_root`` is the
     repository the worktree is registered with (as `WorktreeFlow.reopen_unit` reads
     it). Liveness and the task generation are the CLI caller's locked checks.
+    Admission is `runs.escalation_resolvable`, so a replay run a resume left
+    unpaused with its unit still escalated (#958) is closable too.
     Raises AbandonError."""
     with state_lock(run_dir):
         state = load_state(run_dir)
-        if state.paused_stage != PAUSE_ESCALATION:
+        if not runs.escalation_resolvable(state):
             raise AbandonError(runs.not_escalation_pause_message(run_dir.name, state.paused_stage))
         task = state.tasks.get(story_key)
         if task is None:
             raise AbandonError(f"run {run_dir.name} has no task for story {story_key}")
         if (refusal := abandon_refusal(state, task, story_key)) is not None:
             raise AbandonError(refusal)
+        if not runs.escalation_story_admitted(state, story_key):
+            raise AbandonError(runs.not_escalation_pause_message(run_dir.name, state.paused_stage))
         repo_root = paths.repo_root
         # The recorded mount is launch-time: after a project move, the bare path names
         # a tree that is gone and would send a standing worktree down the

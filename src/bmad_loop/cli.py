@@ -80,9 +80,13 @@ from .documents import (
     validate_document,
 )
 from .engine import Engine, _publication_refusal
-from .escalation import display_pause_reason
+from .escalation import (
+    cleared_pause_escalation_keys,
+    display_pause_reason,
+    resume_skipped_escalation_keys,
+)
 from .journal import Journal, load_state, save_state, state_lock
-from .model import RunState, StoryTask
+from .model import PauseSnapshot, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
     LockUnavailableError,
@@ -5443,6 +5447,9 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # Likewise a tickets run paused for an epic's closure: this resume answers that
     # pause, so the engine acknowledges the closure instead of pausing for it again.
     tickets_source.resume_epic_closure(state)
+    # What clear_pause() is about to clear, so _resume_paused_run can put it back
+    # if the resume fails before its engine starts (see _restore_aborted_resume).
+    pause = state.pause_snapshot()
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
@@ -5456,7 +5463,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants
+    return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants, pause
 
 
 class _CtlLaunch:
@@ -5661,42 +5668,59 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
         if isinstance(prepared, int):
             return prepared
-        paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants = prepared
+        paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants, pause = (
+            prepared
+        )
         _claim_ctl_window(project, run_dir, state)
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
     # observe this process as live while these unbounded operations proceed.
-    composed = runsetup.compose_resume(
-        project=project,
-        paths=paths,
-        run_dir=run_dir,
-        state=state,
-        policy=pol,
-        journal=journal,
-        sweep_factory=_sweep_factory(project, paths, new_digest, plugin_grants=plugin_grants),
-        make_adapters=_make_adapters,
-        engine_cls=Engine,
-        stories_engine_cls=StoriesEngine,
-        tickets_engine_cls=TicketsEngine,
-        sweep_engine_cls=SweepEngine,
-        profiles=profiles,
-        sweep_options=sweep_options,
-        plugin_grants=plugin_grants,
-    )
-    _warn_bypass_dropped(
-        pol,
-        project,
-        (
-            ("triage", "dev", "review")
-            if state.run_type == "sweep"
-            else worksource.launch_roles(
-                worksource.resumed_traits_for(state.source).name, pol.gates.retrospective
+    try:
+        composed = runsetup.compose_resume(
+            project=project,
+            paths=paths,
+            run_dir=run_dir,
+            state=state,
+            policy=pol,
+            journal=journal,
+            sweep_factory=_sweep_factory(project, paths, new_digest, plugin_grants=plugin_grants),
+            make_adapters=_make_adapters,
+            engine_cls=Engine,
+            stories_engine_cls=StoriesEngine,
+            tickets_engine_cls=TicketsEngine,
+            sweep_engine_cls=SweepEngine,
+            profiles=profiles,
+            sweep_options=sweep_options,
+            plugin_grants=plugin_grants,
+        )
+        _warn_bypass_dropped(
+            pol,
+            project,
+            (
+                ("triage", "dev", "review")
+                if state.run_type == "sweep"
+                else worksource.launch_roles(
+                    worksource.resumed_traits_for(state.source).name, pol.gates.retrospective
+                )
+            ),
+            profiles=profiles,
+            journal=composed.journal,
+        )
+    except BaseException as e:
+        # make_adapters raises SystemExit for every refusal; anything escaping
+        # before the engine starts must not strand the pause cleared above. A
+        # restore that fails is reported, never raised: the resume's own failure
+        # is the one the operator has to act on.
+        try:
+            _restore_aborted_resume(run_dir, journal, pause, e)
+        except Exception as restore_error:
+            print(
+                f"warning: run {run_dir.name}: could not restore the pause this resume"
+                f" cleared ({type(restore_error).__name__}); the run is left unpaused",
+                file=sys.stderr,
             )
-        ),
-        profiles=profiles,
-        journal=composed.journal,
-    )
+        raise
     summary = composed.engine.run()
     print(summary.render())
     return (
@@ -5704,6 +5728,34 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None
         else ExitCode.OK
     )
+
+
+def _restore_aborted_resume(
+    run_dir: Path, journal: Journal, pause: PauseSnapshot, error: BaseException
+) -> None:
+    """Put back the pause a resume cleared when it fails before its engine starts.
+
+    `_prepare_resume_locked` clears the pause fields and saves before the adapters
+    are built, and only the engine writes them back (on its `RunPaused`). An
+    adapter build that raises — `make_adapters` turns every refusal into a
+    `SystemExit` — therefore stranded a run paused at an escalation with no
+    pause stage and its story still escalated (#958). Restoring exactly the fields `clear_pause()` cleared returns the run to the
+    pause it was in.
+
+    Only when nothing moved in between: the run still exists, has not finished,
+    and carries no pause of its own (a concurrent re-pause wins). Through
+    resolve's re-arm the escalated task is already PENDING, so the restored pause
+    plus a plain `resume` re-drives it. The journal row names the exception class
+    only: its text can carry profile or adapter content (see `run-resume`)."""
+    with state_lock(run_dir):
+        if not runs.is_run(run_dir):
+            return
+        fresh = load_state(run_dir)
+        if fresh.finished or fresh.paused_reason is not None:
+            return
+        fresh.restore_pause(pause)
+        save_state(run_dir, fresh)
+        journal.append("resume-aborted", error=type(error).__name__)
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -5748,6 +5800,22 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
+    # A story still escalated is skipped and re-paused on (DW-386), and a resume
+    # that ends early leaves it escalated behind a run that reads as not paused
+    # (#958) — so name it, and the resolve that clears it. A warning, never a
+    # refusal, and HERE rather than in `_resume_paused_run` for the reason the
+    # gates above give: resolve's re-arm reaches that helper with the story already
+    # re-armed. An unreadable state skips the warning; the resume below reports it.
+    try:
+        skipped = resume_skipped_escalation_keys(load_state(run_dir))
+    except (OSError, KeyError, ValueError):
+        skipped = []
+    for key in skipped:
+        print(
+            f"warning: run {args.run_id}: story '{key}' is still escalated — resume skips "
+            f"it; resolve it with bmad-loop resolve {args.run_id}",
+            file=sys.stderr,
+        )
     # No `verify.worktree_clean` gate here, unlike cmd_run / cmd_sweep — on purpose
     # (DW-360). Those gates prove a run LAUNCHES from a clean tree; resume continues
     # a run that already passed one. A dirty tree at resume is often the
@@ -5953,7 +6021,7 @@ def _hand_back_ctl_window(
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
-    from .model import PAUSE_ESCALATION, Phase
+    from .model import Phase
 
     # DW-535: `--abandon` closes the run, so "resume after this?" has no meaning —
     # pairing it with either answer is a usage error, refused before even the run lookup.
@@ -6001,16 +6069,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # gate (a finished run is not paused); every paused-run branch below is untouched.
     if getattr(args, "reverify", False) and state.finished:
         return _resolve_reverify_finished(args, project, run_dir, state)
-    # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
-    # stage (an isolated defer never pauses the run); `reverify_refusal` decides
-    # whether the named story qualifies. Everything else needs the escalation pause.
-    reverify_named = bool(getattr(args, "reverify", False) and args.story)
-    if not _resolve_pause_admits(state.paused_stage, reverify_named=reverify_named):
-        print(
-            runs.not_escalation_pause_message(args.run_id, state.paused_stage),
-            file=sys.stderr,
-        )
-        return 1
+    # Liveness comes ahead of the pause gate below: a resume clears the pause before
+    # its engine starts (#958), so a resumed engine that is still running reads as
+    # unpaused, and the true refusal is "still live", not "not paused".
     # Not a cleanup path, so the "unknown must not block" invariant does not apply:
     # an unverifiable-but-live pid must not be re-driven. A provably-live engine
     # always blocks (--force never bypasses it); unknown blocks unless the operator
@@ -6034,7 +6095,18 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             "proceeding anyway (--force)",
             file=sys.stderr,
         )
-    story_key = args.story or state.paused_story_key
+    # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
+    # stage (an isolated defer never pauses the run); `reverify_refusal` decides
+    # whether the named story qualifies. Everything else needs the escalation pause,
+    # or no pause with the story still escalated (`runs.escalation_resolvable`, #958).
+    reverify_named = bool(getattr(args, "reverify", False) and args.story)
+    if not _resolve_pause_admits(state, reverify_named=reverify_named):
+        print(
+            runs.not_escalation_pause_message(args.run_id, state.paused_stage),
+            file=sys.stderr,
+        )
+        return 1
+    story_key = args.story or runs.default_escalation_key(state)
     task = state.tasks.get(story_key) if story_key else None
     reverify = getattr(args, "reverify", False)
     if story_key is not None and task is not None and task.phase == Phase.DEFERRED and not reverify:
@@ -6046,10 +6118,13 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # Unpaused (#958), only an unresolved escalation is resolvable: a named stories
+    # attempt-0 wedge is lifted by fixing its disk state and resuming, never re-armed.
     if (
         story_key is None
         or task is None
         or task.phase not in ((Phase.ESCALATED, Phase.DEFERRED) if reverify else (Phase.ESCALATED,))
+        or (not reverify_named and not runs.escalation_story_admitted(state, story_key))
     ):
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
@@ -6059,8 +6134,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # this flow reaches it the interactive session has run and `runs.rearm_escalation`
     # has spent the escalation, so a refusal there is a refusal after the side
     # effects. LAST in this gate block, not first: the refusals above answer "this
-    # gesture does not apply to this run at all" (alias, not paused at an escalation,
-    # live engine, no escalated story) and must not be displaced by a ledger-repair
+    # gesture does not apply to this run at all" (alias, live engine, not paused at an
+    # escalation, no escalated story) and must not be displaced by a ledger-repair
     # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
     # also wins outright and the ledger gate follows it.
     if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
@@ -6470,7 +6545,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # mutation boundary, so repeat every state/liveness precondition from
             # the snapshot left by the preceding writer before restamping anything.
             fresh_state = load_state(run_dir, pin=state)
-            if fresh_state.paused_stage != PAUSE_ESCALATION:
+            if not runs.escalation_resolvable(fresh_state):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
@@ -6580,7 +6655,7 @@ def _resolve_adopt(
     and merges the branch through its COMMITTING recovery arm. No interactive
     session runs, and review, the `[verify]` commands and `pre_commit_gate`
     workflows are NOT re-run."""
-    from .model import PAUSE_ESCALATION, Phase
+    from .model import Phase
 
     if (refusal := runs.adopt_refusal(state, task, story_key)) is not None:
         print(f"error: {refusal}", file=sys.stderr)
@@ -6601,7 +6676,7 @@ def _resolve_adopt(
             # Same mutation-boundary re-check as the re-arm path: the checks above
             # ran lock-free, so repeat them against the state left by the last writer.
             fresh_state = load_state(run_dir, pin=state)
-            if fresh_state.paused_stage != PAUSE_ESCALATION:
+            if not runs.escalation_resolvable(fresh_state):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
@@ -6666,7 +6741,7 @@ def _resolve_abandon(
     a usage error), re-checks pause, liveness, phase and generation under the run lock
     and hands the transaction to `unitreplay.abandon_replay_run`. No session and no
     engine run; the board, the ledger and the origin run are never written."""
-    from .model import PAUSE_ESCALATION, Phase
+    from .model import Phase
     from .unitreplay import AbandonError, abandon_refusal, abandon_replay_run
 
     if (refusal := abandon_refusal(state, task, story_key)) is not None:
@@ -6697,7 +6772,7 @@ def _resolve_abandon(
         with state_lock(run_dir):
             # The checks above ran lock-free: repeat them against the last writer's state.
             fresh_state = load_state(run_dir, pin=state)
-            if fresh_state.paused_stage != PAUSE_ESCALATION:
+            if not runs.escalation_resolvable(fresh_state):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
@@ -6752,16 +6827,15 @@ def _resolve_abandon(
     return 0
 
 
-def _resolve_pause_admits(paused_stage: str | None, *, reverify_named: bool) -> bool:
-    """Whether `resolve` may act on a run paused at ``paused_stage``: the escalation
-    pause always; any pause for `--reverify --story <key>` (DW-522), whose
-    `runs.reverify_refusal` then admits only a worktree unit off the escalation pause.
-    One rule for `cmd_resolve`'s entry gate and `_resolve_reverify`'s locked re-check."""
-    from .model import PAUSE_ESCALATION
-
+def _resolve_pause_admits(state: RunState, *, reverify_named: bool) -> bool:
+    """Whether `resolve` may act on ``state``'s pause: `runs.escalation_resolvable`
+    (the escalation pause, or no pause with a story still escalated, #958); any
+    pause for `--reverify --story <key>` (DW-522), whose `runs.reverify_refusal`
+    then admits only a worktree unit off the escalation pause. One rule for
+    `cmd_resolve`'s entry gate and `_resolve_reverify`'s locked re-check."""
     if reverify_named:
-        return paused_stage is not None
-    return paused_stage == PAUSE_ESCALATION
+        return state.paused_stage is not None
+    return runs.escalation_resolvable(state)
 
 
 def _resolve_reverify(
@@ -6835,7 +6909,7 @@ def _resolve_reverify(
             # Same mutation-boundary re-check as the re-arm path: the checks above
             # ran lock-free, so repeat them against the state left by the last writer.
             fresh_state = load_state(run_dir, pin=state)
-            if not _resolve_pause_admits(fresh_state.paused_stage, reverify_named=explicit_story):
+            if not _resolve_pause_admits(fresh_state, reverify_named=explicit_story):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
@@ -7897,6 +7971,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
         print("status: in progress (or interrupted)")
+    # #958: a story left escalated behind a run that reads as not paused — the
+    # same predicate as resolve's admission, so the hint never names a refusal.
+    for key in cleared_pause_escalation_keys(state):
+        print(f"escalated: story '{key}' awaiting resolve — bmad-loop resolve {state.run_id}")
     if state.run_type == "sweep":
         print(_sweep_options_line(run_dir, state))
     if state.sweeps_refused:

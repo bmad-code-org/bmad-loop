@@ -128,12 +128,14 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Properties:**
   - A CRITICAL escalation marks the story `escalated`, sends a `CRITICAL escalation: <story>` notice and pauses the run at `escalation`.
   - A PREFERENCE escalation is journaled as `preference-escalation` and the run continues.
+  - Resolve also admits an unfinished story run with no pause stage and a story still escalated, as a resume whose engine exited before run end leaves it; `resume` warns of each escalated story it skips, and `status` and the TUI header name the resolve that clears it.
+  - A resume that fails before its engine starts puts back the pause it cleared and journals `resume-aborted`.
   - `--abandon` (in-progress) closes an escalated replay run unmerged, keeping its branch and parking dirty work on a preserve ref.
   - Re-arming resets the story to `pending` with fresh dev-attempt and review-cycle budgets.
   - `--reverify` re-runs `[verify]` on a deferred or environment-fault story's kept work without a dev session; on a finished run it replays a kept worktree unit in a new run.
   - In tickets mode the re-arm moves the ticket's plan through `tickets.py mark` and clears its `blocked_*` fields; a refused move puts the plan back byte for byte.
 - **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`
-- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`, `tests/test_runs.py`, `tests/test_tui_app.py`
 - **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [resolve CLI reference](reference/cli.md#resolve)
 
 ### Human-only actions

@@ -13,8 +13,16 @@ from typing import Any
 
 from .adapters.base import SessionResult
 from .gates import NOTICE_FULL_DETAIL_SOURCE, NOTICE_TRUNCATION_MARKER, notice_line
-from .model import ENV_FAULT_CLAIM_LIMIT, PAUSE_ESCALATION, RunState, StoryTask, VerifyOutcome
+from .model import (
+    ENV_FAULT_CLAIM_LIMIT,
+    PAUSE_ESCALATION,
+    Phase,
+    RunState,
+    StoryTask,
+    VerifyOutcome,
+)
 from .policy import Policy
+from .worksource import SOURCE_STORIES, SOURCE_TICKETS
 
 SEVERITY_CRITICAL = "CRITICAL"
 SEVERITY_PREFERENCE = "PREFERENCE"
@@ -184,6 +192,53 @@ def display_pause_reason(state: RunState) -> str:
 
         source = notice_line(str(task_spec_path(task, state)))
     return display_critical_reason(reason, source)
+
+
+# The sources driven by a `CheckpointFlowMixin` engine (`runsetup._engine_cls_for`),
+# whose pick-time wedges are ESCALATED tasks at ``attempt == 0``.
+_CHECKPOINT_FLOW_SOURCES = frozenset({SOURCE_STORIES, SOURCE_TICKETS})
+
+
+def unresolved_escalation_keys(state: RunState) -> list[str]:
+    """The ESCALATED tasks that still block ``finished`` at run end (DW-386), in
+    task order — the one predicate the engine's run-end re-pause and resolve's
+    admission share, so the two cannot drift.
+
+    A stories or tickets run counts only an in-run escalation (``attempt > 0``):
+    its pick-time wedges (``attempt == 0``) are re-classified from disk every
+    pick, so a stale ESCALATED record of one is not an escalation a human still
+    owes (``CheckpointFlowMixin._unresolved_escalation_key``)."""
+    checkpoint_flow = state.source in _CHECKPOINT_FLOW_SOURCES
+    return [
+        key
+        for key, task in state.tasks.items()
+        if task.phase == Phase.ESCALATED and (task.attempt > 0 or not checkpoint_flow)
+    ]
+
+
+def resume_skipped_escalation_keys(state: RunState) -> list[str]:
+    """The escalated stories a ``resume`` of ``state`` skips and re-pauses on
+    (DW-386), in task order — what ``resume`` and the TUI's resume confirm warn
+    about. Empty for a finished run and for a sweep: a sweep's migrate/triage
+    ESCALATED tasks are cleared by a plain resume, so there is nothing to warn of."""
+    if state.finished or state.run_type == "sweep":
+        return []
+    return unresolved_escalation_keys(state)
+
+
+def cleared_pause_escalation_keys(state: RunState) -> list[str]:
+    """The escalated stories of a run whose pause fields are null (#958): a resume
+    clears the pause before its engine starts, so an exit before run end leaves a
+    story ESCALATED behind a run that reads as not paused.
+
+    The one predicate behind ``runs.escalation_resolvable``'s null-stage admission
+    and the ``status`` / TUI header hint, so the hint never names a run resolve
+    refuses. A run paused at the escalation stage already says so, and any other
+    stage (``environment``, a gate, a checkpoint) refuses resolve, so both are
+    empty here."""
+    if state.paused_stage is not None:
+        return []
+    return resume_skipped_escalation_keys(state)
 
 
 def preference_escalations(result_json: dict[str, Any] | None) -> list[dict[str, Any]]:

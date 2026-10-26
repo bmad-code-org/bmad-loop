@@ -610,6 +610,22 @@ def test_bare_resume_does_not_leapfrog_a_wedged_story(project):
     assert not any(s.role == "dev" for s in radapter.sessions)  # story 2 never dispatched
 
 
+def test_unresolved_escalation_key_matches_the_shared_seam(project):
+    """`CheckpointFlowMixin._unresolved_escalation_key` and resolve's admission
+    (#958) share `escalation.unresolved_escalation_keys`: a stories run skips an
+    attempt-0 wedge in both."""
+    from bmad_loop.escalation import unresolved_escalation_keys
+
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(project, [])
+    assert engine.state.source == "stories"
+    engine.state.tasks["w"] = StoryTask(story_key="w", epic=1, phase=Phase.ESCALATED, attempt=0)
+    assert engine._unresolved_escalation_key() is None
+    engine.state.tasks["x"] = StoryTask(story_key="x", epic=1, phase=Phase.ESCALATED, attempt=1)
+    assert unresolved_escalation_keys(engine.state) == ["x"]
+    assert engine._unresolved_escalation_key() == "x"
+
+
 def test_bare_resume_finishes_after_a_wedge_is_fixed_by_hand(project):
     """A pick-time wedge's designed exit is a hand fix plus a bare resume. The
     run-end never-finish-over-ESCALATED guard (DW-386) must not re-pause on the

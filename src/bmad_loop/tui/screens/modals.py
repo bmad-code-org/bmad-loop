@@ -22,7 +22,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
 from ... import stories, tickets_source, worksource
-from ...escalation import display_pause_reason
+from ...escalation import display_pause_reason, resume_skipped_escalation_keys
 from ...model import RunState
 from .. import data, widgets
 
@@ -490,6 +490,14 @@ class ConfirmResumeModal(ConfirmModal):
                 body.append(f" — {display_pause_reason(state)}", style="yellow")
         else:
             body.append("run is not paused — it looks interrupted", style="dim")
+        # The same fact `bmad-loop resume` warns of: a still-escalated story is
+        # skipped and re-paused on (DW-386); resolve (R) is what clears it.
+        for key in resume_skipped_escalation_keys(state):
+            body.append(
+                f"\nstory '{key}' is still escalated — resume skips it; "
+                f"resolve it with bmad-loop resolve {run_id}",
+                style="yellow",
+            )
         warning = (
             "engine.pid may still be live — resuming could double-drive this run"
             if engine_alive

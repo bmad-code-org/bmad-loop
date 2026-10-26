@@ -51,6 +51,7 @@ from .adapters.multiplexer import (
     get_multiplexer,
     mux_usable,
 )
+from .escalation import cleared_pause_escalation_keys, unresolved_escalation_keys
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state, state_lock
 from .model import (
@@ -4636,6 +4637,50 @@ def not_escalation_pause_message(run_id: str, paused_stage: str | None) -> str:
     return message
 
 
+def escalation_resolvable(state: RunState) -> bool:
+    """Whether a resolve path (re-arm, adopt, abandon) admits ``state``.
+
+    A run paused at the escalation stage is admitted, as before. So is a run
+    whose pause fields are null while an escalation it owes is still unresolved
+    (#958): ``resume`` clears the pause before its engine starts, and only a
+    run-end or in-run ``RunPaused`` writes it back, so any exit in between — a
+    kill, a stop, a crash, an adapter-build failure — leaves an ESCALATED task
+    behind a run that reads as not paused. Every later resume re-pauses on it,
+    so without this admission the run has no way out.
+
+    The null-stage arm excludes a finished run, and a sweep: a sweep's
+    migrate/triage ESCALATED tasks are cleared by a plain resume, so a sweep
+    resolve keeps stage-only admission. Any other stage (``environment``, a
+    story gate, a checkpoint) keeps its refusal: a resolve that resumes would
+    clear that pause and silently approve what it gates."""
+    if state.paused_stage == PAUSE_ESCALATION:
+        return True
+    return bool(cleared_pause_escalation_keys(state))
+
+
+def default_escalation_key(state: RunState) -> str | None:
+    """The story a resolve path acts on when no story is named: the paused story
+    at the escalation stage, else the first unresolved escalation under the
+    null-stage admission of :func:`escalation_resolvable` (#958), else None."""
+    if state.paused_stage == PAUSE_ESCALATION:
+        return state.paused_story_key
+    if escalation_resolvable(state):
+        return unresolved_escalation_keys(state)[0]
+    return None
+
+
+def escalation_story_admitted(state: RunState, story_key: str) -> bool:
+    """Whether a resolve path may act on ``story_key`` in ``state``, which
+    :func:`escalation_resolvable` already admits. At the escalation stage any
+    story passes here and meets the path's own per-task refusals; under the
+    null-stage admission (#958) only an unresolved escalation does, so a named
+    attempt-0 stories wedge or a non-escalated task is refused rather than
+    re-armed past the run's other stages."""
+    if state.paused_stage == PAUSE_ESCALATION:
+        return True
+    return story_key in unresolved_escalation_keys(state)
+
+
 def validate_restore_latch(
     state: RunState, task: StoryTask, story_key: str, *, worktree_isolation: bool = False
 ) -> str | None:
@@ -6417,14 +6462,18 @@ def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:
     the existing commit-window recovery path, so no session runs and review is
     deliberately NOT re-run. Does not clear the pause; the caller resumes.
 
+    Admission is `escalation_resolvable`: paused at the escalation stage, or not
+    paused while the story is still an unresolved escalation (#958), and the
+    default story is `default_escalation_key`.
+
     Returns the adopted branch. Raises RearmError, with state untouched, when the
-    run is not paused at an escalation, the story is not ESCALATED, or
-    `adopt_refusal` names a reason."""
+    run is not admitted, the story is not ESCALATED (or, unpaused, not an
+    unresolved escalation), or `adopt_refusal` names a reason."""
     with state_lock(run_dir):
         state = load_state(run_dir)
-        if state.paused_stage != PAUSE_ESCALATION:
+        if not escalation_resolvable(state):
             raise RearmError(not_escalation_pause_message(run_dir.name, state.paused_stage))
-        key = story_key or state.paused_story_key
+        key = story_key or default_escalation_key(state)
         if key is None:
             raise RearmError(f"run {run_dir.name} has no escalated story to resolve")
         task = state.tasks.get(key)
@@ -6432,6 +6481,8 @@ def adopt_escalated_branch(run_dir: Path, story_key: str | None = None) -> str:
             raise RearmError(f"run {run_dir.name} has no task for story {key}")
         if task.phase != Phase.ESCALATED:
             raise RearmError(f"story {key} is not escalated (phase: {task.phase})")
+        if not escalation_story_admitted(state, key):
+            raise RearmError(not_escalation_pause_message(run_dir.name, state.paused_stage))
         if (refusal := adopt_refusal(state, task, key)) is not None:
             raise RearmError(refusal)
         # Deliberate direct assignment, not a state-machine transition: ESCALATED has
@@ -6465,7 +6516,13 @@ def _rearm_escalation_locked(
     resolution_recorded: bool,
     project_root: Path | None = None,
 ) -> RearmOutcome:
-    """Re-arm an escalation-paused story so the next resume re-drives it.
+    """Re-arm an escalated story so the next resume re-drives it.
+
+    Admission is `escalation_resolvable`: the run is paused at the escalation stage,
+    or not paused while the story is still an unresolved escalation — a resume
+    clears the pause before its engine starts, so an exit before run end leaves it
+    null with the story still ESCALATED (#958). The default story is
+    `default_escalation_key`.
 
     Flips the escalated task out of its terminal ESCALATED phase back to
     PENDING — which makes `_finish_inflight` reset the tree to the story's
@@ -6579,15 +6636,16 @@ def _rearm_escalation_locked(
 
     Returns the authoritative re-arm outcome: the story key, the ordered notices
     whose journal appends succeeded during this call, and whether one of the appended
-    records holds the combined re-arm/resume gesture. Raises RearmError when the run is not paused at
-    the escalation stage, the target story is not escalated, or a supplied
+    records holds the combined re-arm/resume gesture. Raises RearmError when the run is not
+    admitted, the target story is not escalated (or, unpaused, not an unresolved
+    escalation), or a supplied
     `restore_patch` fails `validate_restore_latch` (the shared precondition set —
     sentinel wedge, spec-less escalation, worktree isolation).
     """
     state = load_state(run_dir)
-    if state.paused_stage != PAUSE_ESCALATION:
+    if not escalation_resolvable(state):
         raise RearmError(not_escalation_pause_message(run_dir.name, state.paused_stage))
-    key = story_key or state.paused_story_key
+    key = story_key or default_escalation_key(state)
     if key is None:
         raise RearmError(f"run {run_dir.name} has no escalated story to resolve")
     task = state.tasks.get(key)
@@ -6595,6 +6653,8 @@ def _rearm_escalation_locked(
         raise RearmError(f"run {run_dir.name} has no task for story {key}")
     if task.phase != Phase.ESCALATED:
         raise RearmError(f"story {key} is not escalated (phase: {task.phase})")
+    if not escalation_story_admitted(state, key):
+        raise RearmError(not_escalation_pause_message(run_dir.name, state.paused_stage))
     # Patch-restore preconditions (T1 guard + spec-less wedge + worktree isolation),
     # rejected here before any task mutation so the escalation stays armed for a
     # corrected resolve. `cli._resolve_restore_patch` runs the same validator ahead

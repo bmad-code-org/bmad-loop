@@ -1443,6 +1443,26 @@ def test_clear_pause_also_clears_crashed():
     assert state.paused is False
 
 
+def test_restore_pause_undoes_clear_pause():
+    """`pause_snapshot` captures exactly the fields `clear_pause` clears, so a resume
+    that fails before its engine starts can put the pause back. Every field is set
+    to a non-default value: a field the snapshot missed would come back cleared."""
+    state = _state(
+        paused_reason="CRITICAL escalation",
+        paused_stage="escalation",
+        paused_story_key="s1",
+        stopped=True,
+        crashed=True,
+        crash_error="RuntimeError: boom",
+    )
+    before = state.to_dict()
+    snapshot = state.pause_snapshot()
+    state.clear_pause()
+    assert state.to_dict() != before
+    state.restore_pause(snapshot)
+    assert state.to_dict() == before
+
+
 def test_cache_read_weight_from_snapshot():
     state = _state(policy_snapshot={"limits": {"cache_read_weight": 0.5}})
     assert state.cache_read_weight() == 0.5

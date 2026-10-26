@@ -26,7 +26,7 @@ from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
 from .. import policy
-from ..escalation import display_pause_reason
+from ..escalation import cleared_pause_escalation_keys, display_pause_reason
 from ..journal import UNREADABLE_LINE_KIND
 from ..model import (
     PAUSE_ENVIRONMENT,
@@ -351,6 +351,14 @@ class RunHeader(Static):
             text.append(
                 "\n✖ engine gone — run was interrupted · press e to resume",
                 style="bold red",
+            )
+        # #958: a story left escalated behind a run that reads as not paused —
+        # `cmd_status`'s hint, under resolve's own admission predicate.
+        for key in cleared_pause_escalation_keys(state):
+            text.append(
+                f"\nescalated: story '{key}' awaiting resolve — press R "
+                f"(bmad-loop resolve {state.run_id})",
+                style="bold yellow",
             )
         if decision is not None and status not in (
             data.FINISHED,

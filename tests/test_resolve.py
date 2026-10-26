@@ -7,16 +7,17 @@ from pathlib import Path
 
 import pytest
 import yaml
-from conftest import escalated_run, git, json_recursion_payload
+from conftest import clear_escalation_pause, escalated_run, git, json_recursion_payload
 
 from bmad_loop import devcontract, platform_util, resolve, runs, verify
 from bmad_loop.engine import _session_task_id
-from bmad_loop.journal import JOURNAL_FILE, TASK_CYCLE_ARTIFACTS, load_state, save_state
+from bmad_loop.journal import JOURNAL_FILE, TASK_CYCLE_ARTIFACTS, Journal, load_state, save_state
 from bmad_loop.model import (
     PAUSE_ESCALATION,
     Phase,
     RunState,
     SessionRecord,
+    StoryTask,
 )
 from bmad_loop.platform_util import safe_segment
 
@@ -2487,6 +2488,129 @@ def test_rearm_rejects_unescalated_story(tmp_path):
     save_state(run_dir, state)
     with pytest.raises(runs.RearmError, match="not escalated"):
         runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+
+# #958: a resume clears the pause before its engine starts, so an engine that exits
+# before run end leaves the run unpaused with the story still ESCALATED.
+
+
+def _cleared_run(tmp_path, **kw):
+    run = clear_escalation_pause(escalated_run(tmp_path, **kw))
+    assert run.state.paused_stage is None and run.task.phase == Phase.ESCALATED
+    return run
+
+
+def test_rearm_admits_cleared_pause_escalated_task(tmp_path):
+    """The #958 shape re-arms, defaulting to the unresolved escalated story."""
+    run = _cleared_run(tmp_path)
+    outcome = runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert outcome.story_key == "s1"
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.PENDING
+
+
+def test_rearm_cleared_pause_story_must_be_unresolved(tmp_path):
+    """Unpaused, a named story must be an unresolved escalation: a task that is
+    not escalated keeps its refusal, and an attempt-0 stories wedge is not admitted.
+
+    Ablation: drop the `escalation_story_admitted` check in
+    `_rearm_escalation_locked` and the wedge row re-arms."""
+    run = _cleared_run(tmp_path, source="stories")
+    run.state.tasks["s2"] = StoryTask(story_key="s2", epic=1, phase=Phase.DONE, attempt=1)
+    run.state.tasks["w"] = StoryTask(story_key="w", epic=1, phase=Phase.ESCALATED, attempt=0)
+    save_state(run.run_dir, run.state)
+    with pytest.raises(runs.RearmError, match="not escalated"):
+        runs.rearm_escalation(run.run_dir, "s2", isolated_redrive=False, resolution_recorded=False)
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.rearm_escalation(run.run_dir, "w", isolated_redrive=False, resolution_recorded=False)
+    with pytest.raises(runs.RearmError, match="no task for story"):
+        runs.rearm_escalation(
+            run.run_dir, "ghost", isolated_redrive=False, resolution_recorded=False
+        )
+    assert load_state(run.run_dir).tasks["w"].phase == Phase.ESCALATED
+
+
+def test_rearm_cleared_pause_refuses_sweep(tmp_path):
+    """A sweep's ESCALATED tasks are cleared by a plain resume, so an unpaused
+    sweep keeps stage-only admission.
+
+    Ablation: drop the sweep exclusion in `runs.escalation_resolvable` and this
+    re-arms."""
+    run = _cleared_run(tmp_path, run_type="sweep")
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_rearm_cleared_pause_refuses_finished(tmp_path):
+    """Ablation: drop the finished exclusion in `runs.escalation_resolvable` and
+    this re-arms."""
+    run = _cleared_run(tmp_path)
+    run.state.finished = True
+    save_state(run.run_dir, run.state)
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+@pytest.mark.parametrize("source", ["stories", "tickets"])
+def test_rearm_cleared_pause_ignores_stories_attempt0_wedge(tmp_path, source):
+    """A checkpoint-flow run's pick-time wedge (attempt 0) is lifted by a hand fix
+    and a resume, so an unpaused run holding only that wedge is not admitted.
+
+    Ablation: drop the attempt narrowing in `unresolved_escalation_keys` and this
+    re-arms."""
+    run = _cleared_run(tmp_path, source=source, attempt=0)
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_rearm_cleared_pause_keeps_the_other_stage_refusals(tmp_path):
+    """Admission by task applies only to a null stage: an environment pause (or any
+    other non-escalation stage) with an escalated task still refuses."""
+    run = escalated_run(tmp_path)
+    for stage in ("environment", "story-gate"):
+        run.state.paused_stage = stage
+        save_state(run.run_dir, run.state)
+        with pytest.raises(runs.RearmError, match=f"stage: {stage}"):
+            runs.rearm_escalation(run.run_dir, isolated_redrive=False, resolution_recorded=False)
+    assert load_state(run.run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_build_context_reason_reads_the_journal_after_a_cleared_pause(tmp_path):
+    """Unpaused (#958), the run carries no `paused_reason`, so the context takes the
+    story's LAST `story-escalated` row; none at all reads as None.
+
+    Ablation: return `state.paused_reason` unconditionally and this reddens."""
+    run_dir, state, _ = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    state.clear_pause()
+    save_state(run_dir, state)
+    assert _context_reason(state, run_dir, key) is None
+    journal = Journal(run_dir)
+    journal.append("story-escalated", story_key=key, reason="first escalation")
+    journal.append("story-escalated", story_key="other", reason="not this story")
+    journal.append("story-escalated", story_key=key, reason="latest escalation")
+    assert _context_reason(state, run_dir, key) == "latest escalation"
+
+
+def test_build_context_reason_for_another_story_than_the_paused_one(tmp_path):
+    """Resolving `--story B` while paused on A hands B's session B's own reason, never
+    A's; the paused story keeps the run's `paused_reason`."""
+    run_dir, state, _ = _escalated_run(tmp_path)
+    key = "6-4-cli-list-command"
+    state.tasks["b"] = StoryTask(story_key="b", epic=6, phase=Phase.ESCALATED, attempt=1)
+    save_state(run_dir, state)
+    Journal(run_dir).append("story-escalated", story_key="b", reason="b's escalation")
+    assert _context_reason(state, run_dir, "b") == "b's escalation"
+    assert _context_reason(state, run_dir, key) == (
+        "CRITICAL escalation from review session: names not unique"
+    )
+
+
+def _context_reason(state, run_dir, story_key):
+    path = _context(state, run_dir, story_key, isolation="")
+    return json.loads(path.read_text(encoding="utf-8"))["paused_reason"]
 
 
 # ------------------------------------------------- _gather_escalations

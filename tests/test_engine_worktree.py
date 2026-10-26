@@ -12676,6 +12676,33 @@ def test_abandon_closes_an_escalated_replay_run_and_keeps_its_branch(
     assert _state_bytes(engine.run_dir) == origin_before
 
 
+def test_abandon_admits_cleared_escalation_pause(project, tmp_path, monkeypatch, capsys):
+    """#958: a resume clears the pause before its engine starts, so an engine exit
+    before run end leaves the replay run unpaused with its unit still ESCALATED.
+    `--abandon` still closes it: rc 0, worktree removed, branch kept, run finished.
+
+    Ablation, performed: restore the stage-only `paused_stage != PAUSE_ESCALATION`
+    gate in `abandon_replay_run` and this reddens on rc."""
+    _engine, replay_dir = _escalated_replay(project, tmp_path, monkeypatch)
+    state = load_state(replay_dir)
+    state.clear_pause()
+    save_state(replay_dir, state)
+    task = state.tasks["1-1-a"]
+    unit, branch = Path(task.worktree_path), task.branch
+    sha = _branch_sha(project, branch)
+    capsys.readouterr()
+
+    assert _abandon(project, replay_dir, "--no-interactive") == 0, capsys.readouterr().err
+
+    assert f"kept on branch {branch}" in capsys.readouterr().out
+    assert not unit.exists() and _registered_under(project, replay_dir) == []
+    assert _branch_sha(project, branch) == sha
+    replay = load_state(replay_dir)
+    assert replay.finished and replay.paused_stage is None
+    assert replay.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert Journal(replay_dir).entries()[-1]["kind"] == "replay-abandoned"
+
+
 def test_abandon_parks_uncommitted_work_on_an_abandon_ref(project, tmp_path, monkeypatch, capsys):
     """An untracked file in the kept worktree is parked on
     `refs/attempt-preserve-dirty/<run>-<head8>-abandon` before the removal, named in

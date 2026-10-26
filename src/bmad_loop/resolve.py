@@ -27,9 +27,10 @@ from .adapters.base import SessionSpec
 from .engine import _session_task_id
 from .escalation import critical_escalations
 from .journal import TASK_CYCLE_ARTIFACTS, Journal
-from .model import RunState, StoryTask
+from .model import PAUSE_ESCALATION, RunState, StoryTask
 from .platform_util import safe_segment
 from .runs import (
+    journal_entries_or_none,
     live_stories_root,
     rebase_recorded_project_path,
     redrive_base_ref,
@@ -294,6 +295,27 @@ def _gather_escalations(
     return list(found.values()), sum(1 for key in answered if key not in found)
 
 
+def escalation_reason(state: RunState, run_dir: Path, story_key: str) -> str | None:
+    """The reason ``story_key`` escalated, for the resolve context's ``paused_reason``.
+
+    The run's ``paused_reason`` answers only while the run is paused at the escalation
+    stage on THIS story. A resume clears the pause before its engine starts, so a run
+    left with the story still escalated has none (#958), and resolving ``--story B``
+    while paused on A must not hand B's session A's reason. Otherwise the reason is
+    the last ``story-escalated`` journal row for the story; None when the journal is
+    unreadable or holds no such row, which the skill reports as a malformed context."""
+    if state.paused_stage == PAUSE_ESCALATION and state.paused_story_key == story_key:
+        return state.paused_reason
+    entries = journal_entries_or_none(run_dir)
+    if entries is None:
+        return None
+    for entry in reversed(entries):
+        if entry.get("kind") == "story-escalated" and entry.get("story_key") == story_key:
+            reason = entry.get("reason")
+            return reason if isinstance(reason, str) else None
+    return None
+
+
 def build_context(
     state: RunState,
     run_dir: Path,
@@ -401,7 +423,7 @@ def build_context(
         # spelling for every reader — and consumed by an agent, which accepts '/'.
         "spec_file": context_spec_path.as_posix() if context_spec_path is not None else None,
         "baseline_commit": task.baseline_commit if task else None,
-        "paused_reason": state.paused_reason,
+        "paused_reason": escalation_reason(state, run_dir, story_key),
         # Where the escalation's environment fault was detected (DW-523), a closed
         # `model.ENV_FAULT_SITES` slug; None when the escalation is not one. Set,
         # it tells the session the spec needs no change: the environment does.
