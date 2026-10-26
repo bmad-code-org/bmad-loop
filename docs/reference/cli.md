@@ -517,7 +517,7 @@ Each row: `name`, `origin`, `path` (POSIX path from the code root), `surface` (`
 
 ### `confirm --json`
 
-`parked`: stories at `awaiting-operator`, in story-key order. Each has `story_key`, `actions` (list of str), `spec_file`, `spec_status`, `board_status`, `commit` (`""` until a commit carries the park record), `run_id`, `parked_at`, `confirmable`, `confirmation_recorded`, `resumable` (an interrupted confirmation `confirm` will finish), and `drift` (human-readable).
+`parked`: stories at `awaiting-operator`, in story-key order. Each has `story_key`, `actions` (list of str), `spec_file`, `spec_status`, `board_status`, `commit` (`""` until a commit carries the park record), `run_id`, `parked_at`, `confirmable`, `confirmation_recorded`, `resumable` (an interrupted confirmation `confirm` will finish), `drift` (human-readable), and `followup_review_recommended` (bool: the build recommended a follow-up review the park skipped; null for a park record that predates the field).
 
 ### `list --json`
 
@@ -547,7 +547,7 @@ Built from the run's `state.json`.
 | `tickets`                                           | object \| null | tickets runs only, below; null for every other source                  |
 | `tasks`                                             | array          | one entry per story                                                    |
 
-Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `adapters_used` (`{role: {name, model}}`), `ticket` (object or null, below).
+Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `followup_review_recommended` (bool: the build session recommended a follow-up review), `adapters_used` (`{role: {name, model}}`), `ticket` (object or null, below).
 
 `epic` is always an integer. A unit of a source with no integer epics (stories, sweep, tickets) reports `0`; a ticket's epic is in its `ticket` object.
 

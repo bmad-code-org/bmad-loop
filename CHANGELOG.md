@@ -342,6 +342,11 @@ breaking changes may land in a minor release.
   severity (`P1`) files the entry without the line and journals
   `spec-deferrals-severity-unrecognized` instead of dropping it silently; a collection
   or NUL severity marks the item malformed (#913).
+- Keep a parked story's follow-up review recommendation: the park record, the
+  `story-awaiting-operator` journal row, the park notification, `confirm --list`/`--json`,
+  `confirm`'s success output and `status --json` now carry `followup_review_recommended`,
+  and the escalations and tickets guides give the post-confirm review procedure. A park
+  still never runs the review (#888).
 
 ### Security
 
