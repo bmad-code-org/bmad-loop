@@ -4788,6 +4788,124 @@ async def test_resolve_refused_on_environment_pause_with_resume_hint(project_tre
     assert launched == []  # warned, never launched
 
 
+def _cleared_escalated_run(root: Path, *, run_type: str = "story", **kw) -> Path:
+    """A run whose pause a resume cleared before its engine exited early, its story
+    still ESCALATED (#958): no pause fields, one in-run escalation."""
+    return make_run(
+        root,
+        "20260611-100000-aaaa",
+        run_type=run_type,
+        tasks={"7-7": StoryTask(story_key="7-7", epic=7, phase=Phase.ESCALATED, attempt=1)},
+        **kw,
+    )
+
+
+async def test_resolve_admits_cleared_pause_escalated_run(project_tree, monkeypatch):
+    """#958: `R` admits an unpaused run whose story is still escalated, by the CLI's
+    own rule, and its confirm names that story rather than "?".
+
+    Ablation: restore the stage-only `paused_stage != "escalation"` check and `R`
+    warns "only available" instead of confirming."""
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    _cleared_escalated_run(project_tree.project)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("R")
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        assert "open the resolve agent for 7-7?" in app.screen._body.plain
+        assert not any("only available" in m for m in notifications(app))
+
+
+@pytest.mark.parametrize(
+    ("run_type", "extra", "refusal"),
+    [
+        ("sweep", {}, "only available"),
+        (
+            "story",
+            {"paused_stage": PAUSE_ENVIRONMENT, "paused_reason": "environment fault"},
+            "an environment pause needs no resolve",
+        ),
+    ],
+    ids=["cleared-sweep", "environment-pause"],
+)
+async def test_resolve_refuses_escalated_task_outside_admission(
+    project_tree, monkeypatch, run_type, extra, refusal
+):
+    """An unpaused sweep keeps stage-only admission (its ESCALATED tasks are cleared
+    by a plain resume), and an environment pause still refuses with its own hint
+    though a story is escalated — a resolve would lift that pause unseen.
+
+    Ablation: drop the sweep clause of `resume_skipped_escalation_keys` and the
+    sweep row confirms; move the environment refusal below admission and that row
+    gets the resolve confirm."""
+    launched: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(launch, "start_resolve_detached", lambda proj, rid: launched.append(rid))
+    _cleared_escalated_run(project_tree.project, run_type=run_type, **extra)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("R")
+        await until(pilot, lambda: any(refusal in m for m in notifications(app)))
+        assert isinstance(app.screen, DashboardScreen), "no confirm"
+    assert launched == []
+
+
+async def test_do_rearm_admits_cleared_pause(project_tree, monkeypatch):
+    """#958: the re-arm's locked re-check admits an unpaused run whose story is still
+    escalated, so the gesture re-arms and resumes it.
+
+    Ablation: restore `fresh_state.paused_stage != PAUSE_ESCALATION` and this
+    toasts "no longer paused at escalation" with neither recorder filled."""
+    from bmad_loop import runs
+
+    install_bmad_config(project_tree)
+    rearms: list = []
+    resumes: list = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: resumes.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    monkeypatch.setattr(
+        runs,
+        "rearm_escalation",
+        lambda rd, sk, **_k: rearms.append(sk) or _rearm_outcome(sk),
+    )
+    run_dir = _cleared_escalated_run(project_tree.project)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        app._do_rearm("20260611-100000-aaaa", run_dir, "7-7")
+        await pilot.pause()
+        await until(pilot, lambda: rearms == ["7-7"] and resumes == ["20260611-100000-aaaa"])
+        assert not any("no longer paused" in m for m in notifications(app))
+
+
+def test_resume_confirm_names_a_skipped_escalated_story(project_tree):
+    """The resume confirm states what `bmad-loop resume` warns of: a still-escalated
+    story is skipped, and resolve clears it — but not for a sweep, whose escalated
+    tasks a plain resume clears.
+
+    Ablation: drop the loop in `ConfirmResumeModal.__init__` and the story row
+    reads no warning; drop the sweep clause and the sweep row shows one."""
+    from bmad_loop.journal import load_state
+
+    run_dir = _cleared_escalated_run(project_tree.project)
+    body = ConfirmResumeModal(run_dir.name, load_state(run_dir), engine_alive=False)._body.plain
+    assert (
+        "story '7-7' is still escalated — resume skips it; "
+        "resolve it with bmad-loop resolve 20260611-100000-aaaa"
+    ) in body
+
+    sweep_dir = _cleared_escalated_run(project_tree.project, run_type="sweep")
+    body = ConfirmResumeModal(sweep_dir.name, load_state(sweep_dir), engine_alive=False)._body.plain
+    assert "still escalated" not in body
+
+
 # ------------------------------------------------- stories mode: board + badges
 
 
@@ -7731,6 +7849,43 @@ async def test_header_counts_parked_stories_only_when_there_are_any(project_tree
         assert "awaiting 1" in content
         assert "tasks 2" in content
         assert "done 1" in content  # the park did not absorb the done story
+
+
+async def test_header_hints_an_escalated_story_after_a_cleared_pause(project_tree):
+    """#958: `cmd_status`'s hint, in the header — a run that reads as not paused
+    while a story is still escalated names it and `R`. Not for a run paused at the
+    escalation (its badge already says so), nor for a sweep, whose escalated tasks
+    a plain resume clears.
+
+    Ablation: drop the hint loop in `show_run` and the first row lacks it; drop the
+    `paused_stage` or sweep clause of `cleared_pause_escalation_keys` and the
+    paused or sweep row shows it."""
+    escalated = StoryTask(story_key="7-7", epic=7, phase=Phase.ESCALATED, attempt=1)
+
+    def _state(**kw):
+        return RunState(
+            run_id="r1",
+            project=str(project_tree.project),
+            started_at="now",
+            tasks={"7-7": escalated},
+            **kw,
+        )
+
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+
+        header.show_run("r1", data.INTERRUPTED, _state())
+        assert "escalated: story '7-7' awaiting resolve — press R" in str(header.content)
+
+        paused = _state(
+            paused_stage="escalation", paused_reason="CRITICAL escalation", paused_story_key="7-7"
+        )
+        header.show_run("r1", data.PAUSED, paused)
+        assert "awaiting resolve" not in str(header.content)
+
+        header.show_run("r1", data.INTERRUPTED, _state(run_type="sweep"))
+        assert "awaiting resolve" not in str(header.content)
 
 
 async def test_header_shows_a_refused_auto_sweep_apart_from_one_that_ran(project_tree):

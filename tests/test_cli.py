@@ -5245,6 +5245,71 @@ def test_resolve_reports_live_engine_before_stage(tmp_path, monkeypatch, capsys)
     assert "not paused at an escalation" not in err
 
 
+def test_resume_warns_on_escalated_task(tmp_path, monkeypatch, capsys):
+    """A resume skips a still-escalated story and re-pauses on it, so it names the
+    story and the resolve that clears it — paused at the escalation or, after an
+    earlier resume cleared the pause, not (#958). A warning: the resume proceeds.
+
+    Ablation: drop the warning loop in `cmd_resume` and neither line prints."""
+    from bmad_loop import runs
+
+    reached: list[str] = []
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda _p, run_dir, **_k: reached.append(run_dir.name) or 0
+    )
+    _escalated_run(tmp_path, "r1")
+    _cleared_escalated_run(tmp_path, "r2", story_key="7-7")
+    for run_id, story in (("r1", "s1"), ("r2", "7-7")):
+        assert cli.main(["resume", "--project", str(tmp_path), run_id]) == 0
+        assert (
+            f"warning: run {run_id}: story '{story}' is still escalated — resume skips it; "
+            f"resolve it with bmad-loop resolve {run_id}"
+        ) in capsys.readouterr().err
+    assert reached == ["r1", "r2"]
+
+
+def test_resume_no_warning_for_sweep(tmp_path, monkeypatch, capsys):
+    """A sweep's migrate/triage ESCALATED tasks are cleared by a plain resume, so a
+    sweep resume warns of nothing.
+
+    Ablation: drop the sweep clause of `resume_skipped_escalation_keys` and the
+    warning prints here."""
+    from bmad_loop import runs
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+    monkeypatch.setattr(runs, "unreadable_sweep_ledger", lambda *_a: None)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a, **_k: 0)
+    _escalated_run(tmp_path, "r1", run_type="sweep")
+    assert cli.main(["resume", "--project", str(tmp_path), "r1"]) == 0
+    assert "still escalated" not in capsys.readouterr().err
+
+
+def test_status_hints_escalated_story_after_cleared_pause(tmp_path, capsys):
+    """#958: a run that reads as not paused while a story is still escalated names
+    the story and the resolve that clears it.
+
+    Ablation: drop the hint loop in `cmd_status` and the line is absent."""
+    _cleared_escalated_run(tmp_path, "r1", story_key="7-7")
+    assert cli.main(["status", "--project", str(tmp_path), "r1"]) == 0
+    out = capsys.readouterr().out
+    assert "status: in progress (or interrupted)" in out
+    assert "escalated: story '7-7' awaiting resolve — bmad-loop resolve r1" in out
+
+
+def test_status_no_hint_when_paused_at_escalation(tmp_path, capsys):
+    """A run paused at the escalation already says so on its status line; an
+    unpaused sweep is resolved by a plain resume. Neither gets the hint.
+
+    Ablation: drop the `paused_stage` clause of `cleared_pause_escalation_keys` and
+    the paused row prints it; drop its sweep clause and the sweep row does."""
+    _escalated_run(tmp_path, "r1")
+    _cleared_escalated_run(tmp_path, "r2", run_type="sweep")
+    for run_id in ("r1", "r2"):
+        assert cli.main(["status", "--project", str(tmp_path), run_id]) == 0
+        assert "awaiting resolve" not in capsys.readouterr().out
+
+
 # resolve refuses 'unknown' too, not just 'alive' — re-driving a possibly-live engine.
 @pytest.mark.parametrize(
     "liveness,msg",

@@ -51,7 +51,7 @@ from .adapters.multiplexer import (
     get_multiplexer,
     mux_usable,
 )
-from .escalation import unresolved_escalation_keys
+from .escalation import cleared_pause_escalation_keys, unresolved_escalation_keys
 from .frontmatter import auto_dev_baseline_of, parse_frontmatter, status_of
 from .journal import STATE_FILE, VERIFY_DIR, Journal, load_state, save_state, state_lock
 from .model import (
@@ -4655,12 +4655,7 @@ def escalation_resolvable(state: RunState) -> bool:
     clear that pause and silently approve what it gates."""
     if state.paused_stage == PAUSE_ESCALATION:
         return True
-    return (
-        state.paused_stage is None
-        and not state.finished
-        and state.run_type != "sweep"
-        and bool(unresolved_escalation_keys(state))
-    )
+    return bool(cleared_pause_escalation_keys(state))
 
 
 def default_escalation_key(state: RunState) -> str | None:

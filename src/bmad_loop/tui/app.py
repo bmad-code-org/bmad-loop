@@ -804,7 +804,10 @@ class BmadLoopApp(App[None]):
                 markup=False,
             )
             return
-        if state.paused_stage != "escalation":
+        # Admission is `runs.escalation_resolvable`, the CLI's own rule: paused at
+        # the escalation stage, or not paused while a story is still escalated —
+        # a resume clears the pause before its engine starts (#958).
+        if not runs.escalation_resolvable(state):
             self.notify(
                 "resolve is only available for a run paused at an escalation"
                 + (f"\n{pointer}" if pointer else ""),
@@ -817,7 +820,7 @@ class BmadLoopApp(App[None]):
         if _engine_possibly_live(run_dir):
             self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
             return
-        story = state.paused_story_key or "?"
+        story = runs.default_escalation_key(state) or "?"
 
         self.push_screen(
             ConfirmModal(
@@ -1656,7 +1659,7 @@ class BmadLoopApp(App[None]):
                 fresh_state = load_state(run_dir, pin=recorded)
                 fresh_task = fresh_state.tasks.get(story_key)
                 if (
-                    fresh_state.paused_stage != PAUSE_ESCALATION
+                    not runs.escalation_resolvable(fresh_state)
                     or fresh_task is None
                     or fresh_task.phase != Phase.ESCALATED
                 ):

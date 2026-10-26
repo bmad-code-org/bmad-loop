@@ -216,6 +216,31 @@ def unresolved_escalation_keys(state: RunState) -> list[str]:
     ]
 
 
+def resume_skipped_escalation_keys(state: RunState) -> list[str]:
+    """The escalated stories a ``resume`` of ``state`` skips and re-pauses on
+    (DW-386), in task order — what ``resume`` and the TUI's resume confirm warn
+    about. Empty for a finished run and for a sweep: a sweep's migrate/triage
+    ESCALATED tasks are cleared by a plain resume, so there is nothing to warn of."""
+    if state.finished or state.run_type == "sweep":
+        return []
+    return unresolved_escalation_keys(state)
+
+
+def cleared_pause_escalation_keys(state: RunState) -> list[str]:
+    """The escalated stories of a run whose pause fields are null (#958): a resume
+    clears the pause before its engine starts, so an exit before run end leaves a
+    story ESCALATED behind a run that reads as not paused.
+
+    The one predicate behind ``runs.escalation_resolvable``'s null-stage admission
+    and the ``status`` / TUI header hint, so the hint never names a run resolve
+    refuses. A run paused at the escalation stage already says so, and any other
+    stage (``environment``, a gate, a checkpoint) refuses resolve, so both are
+    empty here."""
+    if state.paused_stage is not None:
+        return []
+    return resume_skipped_escalation_keys(state)
+
+
 def preference_escalations(result_json: dict[str, Any] | None) -> list[dict[str, Any]]:
     return [
         e

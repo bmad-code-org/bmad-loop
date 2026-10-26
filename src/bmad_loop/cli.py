@@ -80,7 +80,11 @@ from .documents import (
     validate_document,
 )
 from .engine import Engine, _publication_refusal
-from .escalation import display_pause_reason
+from .escalation import (
+    cleared_pause_escalation_keys,
+    display_pause_reason,
+    resume_skipped_escalation_keys,
+)
 from .journal import Journal, load_state, save_state, state_lock
 from .model import RunState, StoryTask
 from .platform_util import (
@@ -5748,6 +5752,22 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
         print(refusal, file=sys.stderr)
         return ExitCode.FAILURE
+    # A story still escalated is skipped and re-paused on (DW-386), and a resume
+    # that ends early leaves it escalated behind a run that reads as not paused
+    # (#958) — so name it, and the resolve that clears it. A warning, never a
+    # refusal, and HERE rather than in `_resume_paused_run` for the reason the
+    # gates above give: resolve's re-arm reaches that helper with the story already
+    # re-armed. An unreadable state skips the warning; the resume below reports it.
+    try:
+        skipped = resume_skipped_escalation_keys(load_state(run_dir))
+    except (OSError, KeyError, ValueError):
+        skipped = []
+    for key in skipped:
+        print(
+            f"warning: run {args.run_id}: story '{key}' is still escalated — resume skips "
+            f"it; resolve it with bmad-loop resolve {args.run_id}",
+            file=sys.stderr,
+        )
     # No `verify.worktree_clean` gate here, unlike cmd_run / cmd_sweep — on purpose
     # (DW-360). Those gates prove a run LAUNCHES from a clean tree; resume continues
     # a run that already passed one. A dirty tree at resume is often the
@@ -7903,6 +7923,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("status: in progress — graceful stop pending (will stop after the current item)")
     else:
         print("status: in progress (or interrupted)")
+    # #958: a story left escalated behind a run that reads as not paused — the
+    # same predicate as resolve's admission, so the hint never names a refusal.
+    for key in cleared_pause_escalation_keys(state):
+        print(f"escalated: story '{key}' awaiting resolve — bmad-loop resolve {state.run_id}")
     if state.run_type == "sweep":
         print(_sweep_options_line(run_dir, state))
     if state.sweeps_refused:
