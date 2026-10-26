@@ -60,8 +60,9 @@ def _legacy_entry(paths, key="1-1-a", *, actions=None, commit="abcdef1234567890"
     store.write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
-def _park(paths, key="1-1-a", *, actions=None, status="awaiting-operator", board=None):
-    """Record a park and write the committed state it points at."""
+def _park(paths, key="1-1-a", *, actions=None, status="awaiting-operator", board=None, **record):
+    """Record a park and write the committed state it points at. ``record`` is
+    forwarded to `record_park` (its optional keys)."""
     if not (paths.project / "_bmad" / "bmm" / "config.yaml").is_file():
         install_bmad_config(paths)
     acts = ACTIONS if actions is None else actions
@@ -80,6 +81,7 @@ def _park(paths, key="1-1-a", *, actions=None, status="awaiting-operator", board
         spec_file=spec.relative_to(paths.project).as_posix(),
         run_id="run-1",
         parked_at="2026-07-28",
+        **record,
     )
     return spec
 
@@ -494,6 +496,34 @@ def test_resolve_falls_back_to_the_recorded_actions_when_the_spec_has_none(proje
     write_spec(spec, "awaiting-operator", "base")  # no operator_actions
     (story,) = operatoractions.resolve(project.project, project)
     assert story.actions == tuple(ACTIONS)
+
+
+@pytest.mark.parametrize("recommended", [True, False])
+def test_park_record_carries_the_followup_recommendation(project, recommended):
+    """The build's follow-up review recommendation is a pass the park skips, so
+    the record keeps it and `resolve` reads it back as itself: False is a real
+    answer, written, not an absent key."""
+    _park(project, followup_review_recommended=recommended)
+    assert operatoractions.load(project.project)["1-1-a"]["followup_review_recommended"] is (
+        recommended
+    )
+    (story,) = operatoractions.resolve(project.project, project)
+    assert story.followup_review_recommended is recommended
+
+
+def test_park_record_without_the_followup_key_reads_unknown(project):
+    """A record that predates the key, or holds a non-bool, says nothing about the
+    recommendation. It must read None (unknown), never False, which would claim
+    no review is owed."""
+    _park(project)
+    assert "followup_review_recommended" not in operatoractions.load(project.project)["1-1-a"]
+    _park(project, "1-2-b")
+    rp = operatoractions.record_path(project.project, "1-2-b")
+    record = json.loads(rp.read_text())
+    record["followup_review_recommended"] = "yes"
+    rp.write_text(json.dumps(record))
+    stories = operatoractions.resolve(project.project, project)
+    assert [s.followup_review_recommended for s in stories] == [None, None]
 
 
 def test_resolve_is_sorted_by_story_key(project):

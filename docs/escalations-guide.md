@@ -190,6 +190,18 @@ If `confirm` is interrupted, run the same command again; it finishes without pro
 
 In tickets mode the park lives on the ticket's plan, not a board. The unit's commit marks the plan `blocked` with a reason starting `awaiting operator: ` that lists the actions, and the park record names the ticket ref. Tickets that wait on it end the run with a parked summary. `confirm <ref>` appends the same section, then marks the plan through `tickets.py mark`: `done` under `[tickets] mark_done = "auto"`, `built` under `"never"`. A review that demotes a built ticket parks the same way under `[operator] on_review_demotion = "park"`.
 
+### When a parked story's build recommended a follow-up review
+
+A park skips the review loop: a review would either re-park the story or finalize the park away before the human acts. When the build session recommended a follow-up review, that pass is still owed, and the park keeps the recommendation. It shows in the park notification, in `confirm --list` (a `follow-up review recommended at park time` line under the actions), as `followup_review_recommended` in `confirm --json` and `status --json`, and on the `story-awaiting-operator` journal row. A park recorded before the field existed reads `null` and shows no line.
+
+To run the owed pass:
+
+1. Confirm the story first (`bmad-loop confirm <story-key>`). Its success output repeats the recommendation and names the spec.
+2. Invoke the build skill that `confirm` names (bmad-build-auto, or bmad-dev-auto on a pre-rename install) on the now-`done` spec. The skill routes a `done` spec to a fresh follow-up review pass.
+3. Commit what the pass patches.
+
+Reviewing before you confirm does not work, because the build skill does not route a parked spec. If the owed action is a manual test, review the parked work first with a review that leaves the spec's status alone (for example bmad-code-review over the park commit), so the test covers reviewed code. Otherwise re-test after the post-confirm pass if it patches code.
+
 ## Environment faults
 
 An environment fault is a failure caused by the environment rather than the code. It never charges a dev attempt.

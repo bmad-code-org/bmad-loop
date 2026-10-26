@@ -2651,6 +2651,24 @@ def test_status_json_carries_the_preserve_ref(project, capsys):
     assert entry_done["preserve_ref"] is None
 
 
+def test_status_json_carries_the_followup_recommendation(project, capsys):
+    """A parked story's follow-up review recommendation is reported from
+    state.json: the park skipped that pass, so it is still owed after confirm.
+    Ablation (performed): drop the field from the status task projection and
+    this FAILS on the missing key."""
+    from bmad_loop.model import Phase, StoryTask
+
+    parked = StoryTask(story_key="1-1-login", epic=1, phase=Phase.AWAITING_OPERATOR)
+    parked.followup_review_recommended = True
+    done = StoryTask(story_key="1-2-logout", epic=1, phase=Phase.DONE)
+    _make_run_with_tokens(project, {"1-1-login": parked, "1-2-logout": done}, weight=0.1)
+
+    doc = _status_json(project, capsys)
+    entry_parked, entry_done = doc["tasks"]
+    assert entry_parked["followup_review_recommended"] is True
+    assert entry_done["followup_review_recommended"] is False
+
+
 def test_status_text_names_the_preserve_ref_beside_the_reason(project, capsys):
     from bmad_loop.model import Phase, StoryTask
 
@@ -17212,8 +17230,11 @@ def test_mux_detection_failure_reports_instead_of_vanishing(mux_registry, monkey
 CONFIRM_ACTIONS = ["buy example.com at the registrar", "publish the _acme-challenge TXT record"]
 
 
-def _park_story(paths, key="1-1-a", *, actions=None, spec_status="awaiting-operator", board=None):
-    """Put the project in the state a park leaves behind: spec, board, record."""
+def _park_story(
+    paths, key="1-1-a", *, actions=None, spec_status="awaiting-operator", board=None, followup=None
+):
+    """Put the project in the state a park leaves behind: spec, board, record.
+    ``followup`` None writes a record without the follow-up key (a legacy park)."""
     from bmad_loop import operatoractions
 
     acts = CONFIRM_ACTIONS if actions is None else actions
@@ -17227,6 +17248,7 @@ def _park_story(paths, key="1-1-a", *, actions=None, spec_status="awaiting-opera
         spec_file=sp.relative_to(paths.project).as_posix(),
         run_id="run-1",
         parked_at="2026-07-28",
+        followup_review_recommended=followup,
     )
     return sp
 
@@ -17404,6 +17426,48 @@ def test_confirm_refuses_a_park_declaring_nothing(project, capsys, monkeypatch):
     assert "no readable actions" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("followup", [True, False, None], ids=["recommended", "not", "legacy"])
+def test_confirm_success_names_the_owed_followup_review(project, capsys, monkeypatch, followup):
+    """Confirming a park whose build recommended a follow-up review says the pass
+    is still owed and names the now-done spec the build skill routes to it; a park
+    recommending nothing, or a legacy record, keeps the one-line success. Ablation
+    (performed): drop the hint from `_commit_confirmation` and the recommended
+    case FAILS."""
+    install_bmad_config(project)
+    install_build_auto_skill(project.project)
+    sp = _park_story(project, followup=followup)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    out = capsys.readouterr().out
+    hint = f"  follow-up review still owed: invoke bmad-build-auto on {sp} (it routes"
+    if followup is True:
+        tail = out[out.index("✓ 1-1-a confirmed") :].splitlines()
+        assert tail[1].startswith(hint)
+    else:
+        assert "follow-up review" not in out
+
+
+def test_confirm_followup_hint_names_the_installed_build_skill(project, capsys, monkeypatch):
+    """The hint spells the dev primitive the project's review session would drive,
+    so a pre-rename project that only carries `bmad-dev-auto` is told that name.
+    Ablation (performed): hard-code `bmad-build-auto` in the hint and this FAILS."""
+    install_bmad_config(project)
+    install_dev_base_skills(project.project, folder_id=True)  # the legacy era alone
+    sp = _park_story(project, followup=True)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "park")
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(_confirm_argv(project, "1-1-a")) == 0
+
+    tail = capsys.readouterr().out.split("✓ 1-1-a confirmed", 1)[1].splitlines()
+    assert tail[1].startswith(f"  follow-up review still owed: invoke bmad-dev-auto on {sp} ")
+
+
 def test_confirm_list_shows_what_each_story_owes(project, capsys):
     install_bmad_config(project)
     _park_story(project)
@@ -17413,6 +17477,35 @@ def test_confirm_list_shows_what_each_story_owes(project, capsys):
     assert "1-1-a" in out and "parked 2026-07-28" in out
     for action in CONFIRM_ACTIONS:
         assert action in out
+
+
+FOLLOWUP_LIST_LINE = "follow-up review recommended at park time: run it after confirming"
+
+
+@pytest.mark.parametrize(
+    ("followup", "shown"),
+    [
+        pytest.param(True, True, id="recommended"),
+        pytest.param(False, False, id="not-recommended"),
+        pytest.param(None, False, id="legacy-record"),
+    ],
+)
+def test_confirm_list_flags_a_recommended_followup(project, capsys, followup, shown):
+    """A park skips the review loop, so a follow-up review the build recommended
+    is still owed; the listing says so under the story's actions. A record that
+    predates the field reads unknown and shows nothing, like one recommending no
+    pass. Ablation (performed): drop the line from `_print_parked` and the
+    recommended case FAILS."""
+    install_bmad_config(project)
+    _park_story(project, followup=followup)
+
+    assert cli.main(_confirm_argv(project, "--list")) == 0
+    out = capsys.readouterr().out
+    assert (FOLLOWUP_LIST_LINE in out) is shown
+    if shown:
+        # under the story's numbered actions, not after the closing hint
+        assert out.index(CONFIRM_ACTIONS[-1]) < out.index(FOLLOWUP_LIST_LINE)
+        assert out.index(FOLLOWUP_LIST_LINE) < out.index("confirm one when")
 
 
 def test_confirm_list_marks_a_drifted_entry_rather_than_hiding_it(project, capsys):
@@ -17467,6 +17560,31 @@ def test_confirm_json_carries_both_sides_of_a_disagreement(project, capsys):
     (entry,) = doc["parked"]
     assert entry["spec_status"] == "done" and entry["board_status"] == "awaiting-operator"
     assert entry["confirmable"] is False and "done" in entry["drift"]
+
+
+def test_confirm_json_carries_the_followup_recommendation(project, capsys):
+    """`followup_review_recommended` is the park's recorded bool, and null — not
+    false — for a record that predates the field: absence is unknown, never a
+    healthy-looking "nothing owed". Ablation (performed): drop the field from
+    `confirm_document` and every case FAILS on the missing key."""
+    install_bmad_config(project)
+    _park_story(project, "1-1-a", followup=True)
+    _park_story(project, "1-2-b", followup=False)
+    _park_story(project, "1-3-c")  # no key: a legacy record
+    write_sprint(
+        project,
+        {
+            "epic-1": "in-progress",
+            "1-1-a": "awaiting-operator",
+            "1-2-b": "awaiting-operator",
+            "1-3-c": "awaiting-operator",
+        },
+    )
+
+    doc = machine_json(_confirm_argv(project, "--json"), capsys)
+    got = {e["story_key"]: e["followup_review_recommended"] for e in doc["parked"]}
+    assert got == {"1-1-a": True, "1-2-b": False, "1-3-c": None}
+    assert doc["schema_version"] == 1
 
 
 def test_confirm_json_with_nothing_parked_is_an_empty_document(project, capsys):
@@ -24910,7 +25028,7 @@ def test_validate_trust_reads_the_configured_repo_root(project, capsys, monkeypa
 TICKET_PARK_ACTIONS = ["buy example.com at the registrar", "publish the acme TXT record"]
 
 
-def _park_ticket(layout, *, policy_text: str):
+def _park_ticket(layout, *, policy_text: str, followup: bool | None = None):
     """Leave ticket 1.1 as a tickets run's park commits it: the plan `blocked`
     with an operator-park reason and its owed actions, and a park record naming
     source and ref — all committed, under a tickets policy."""
@@ -24945,6 +25063,7 @@ def _park_ticket(layout, *, policy_text: str):
         parked_at="2026-10-15",
         source="tickets",
         ref="1.1",
+        followup_review_recommended=followup,
     )
     git(layout.project, "add", "-A")
     git(layout.project, "commit", "-q", "-m", "park 1.1")
@@ -25067,6 +25186,37 @@ def test_confirm_tickets_never_policy_marks_built(project_v7, capsys, monkeypatc
     assert cli.main(["confirm", "--project", str(project_v7.project), "1.1"]) == 1
     assert "1.1" in operatoractions.load(project_v7.project)
     assert "NOT confirmed" in capsys.readouterr().err
+
+
+def test_confirm_tickets_names_the_plan_for_the_owed_followup_review(
+    project_v7, capsys, monkeypatch
+):
+    """A ticket park's owed follow-up review names the PLAN: after confirm it is
+    `built` (here, under `mark_done = "never"`) or `done`, both of which the build
+    skill routes to a follow-up pass, where the parked `blocked` plan was refused.
+    Ablation (performed): drop the hint from `_commit_confirmation` and this
+    FAILS."""
+    import dataclasses
+
+    from conftest import FakeTicketTree, fake_find, ticket_row
+
+    plan = _park_ticket(
+        project_v7,
+        policy_text='[stories]\nsource = "tickets"\n\n[tickets]\nmark_done = "never"\n',
+        followup=True,
+    )
+    install_build_auto_skill(project_v7.project)
+    reason = "awaiting operator: " + "; ".join(TICKET_PARK_ACTIONS)
+    row = ticket_row("1.1", status="blocked", blocked_reason=reason)
+    tree = FakeTicketTree(project_v7.project, finds={"1.1": fake_find(row, plan.parent)})
+    tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
+    monkeypatch.setattr(cli, "_confirm_ticket_tree", lambda _project: tree)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
+
+    assert cli.main(["confirm", "--project", str(project_v7.project), "1.1"]) == 0
+
+    tail = capsys.readouterr().out.split("✓ 1.1 confirmed — plan is built\n", 1)[1]
+    assert tail.startswith(f"  follow-up review still owed: invoke bmad-build-auto on {plan} ")
 
 
 def test_resolve_restore_patch_latches_the_evacuated_copy(project_v7):

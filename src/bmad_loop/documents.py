@@ -167,7 +167,12 @@ def confirm_document(parked: list[ParkedStory]) -> dict[str, object]:
     DERIVED from the park record's git history rather than stored at park time
     (the committed record cannot contain its own sha), so it can be `""` for a
     record not yet in any commit — a consumer that pinned "always 40 hex chars"
-    must treat empty as "no provenance", which the field always could express."""
+    must treat empty as "no provenance", which the field always could express.
+
+    `followup_review_recommended` is the build session's follow-up review
+    recommendation at park time, a pass the park skipped and the operator still
+    owes after confirming. It is a real bool for a park recorded with it and null
+    for a record that predates the field: unknown, deliberately not false."""
     return {
         "schema_version": CONFIRM_SCHEMA_VERSION,
         "parked": [
@@ -184,6 +189,7 @@ def confirm_document(parked: list[ParkedStory]) -> dict[str, object]:
                 "confirmation_recorded": p.confirmation_recorded,
                 "resumable": p.resumable,
                 "drift": p.drift(),
+                "followup_review_recommended": p.followup_review_recommended,
             }
             for p in parked
         ],
@@ -378,6 +384,9 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
                 # null. Reported verbatim from state.json — never re-validated
                 # against git here (retention may since have pruned it).
                 "preserve_ref": task.preserve_ref,
+                # the build session's follow-up review recommendation; a park
+                # skips that pass, so a parked story still owes it after confirm.
+                "followup_review_recommended": task.followup_review_recommended,
                 "adapters_used": adapters_used,
                 "ticket": _ticket_projection(task),
             }

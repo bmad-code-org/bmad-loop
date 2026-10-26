@@ -154,6 +154,7 @@ def record_park(
     root_identity: os.stat_result | None = None,
     source: str | None = None,
     ref: str | None = None,
+    followup_review_recommended: bool | None = None,
 ) -> Path:
     """Write a story's park record, returning its path. Re-parking the same key
     overwrites rather than accumulates: a story owes whatever its latest park
@@ -164,6 +165,11 @@ def record_park(
     ``confirm`` marks through the ticket chokepoint (:data:`SOURCE_TICKETS`).
     Each is recorded only when given, so a sprint or stories record keeps its
     five keys.
+
+    ``followup_review_recommended`` records the build session's follow-up review
+    recommendation at park time, a pass the park skips, so the record is where the
+    operator learns it is still owed. Like ``source``/``ref`` it is written only
+    when given.
 
     The write goes through :func:`platform_util.atomic_write_text` (#379), which
     carries the unlink-on-raise this used to hand-roll — hence no try/except here;
@@ -229,6 +235,8 @@ def record_park(
         record["source"] = source
     if ref is not None:
         record["ref"] = ref
+    if followup_review_recommended is not None:
+        record["followup_review_recommended"] = followup_review_recommended
     atomic_write_text_confined(
         path,
         json.dumps(record, indent=2, sort_keys=True),
@@ -340,7 +348,12 @@ class ParkedStory:
     A ticket park (``source`` :data:`SOURCE_TICKETS`) has no board: its committed
     truth is the plan alone, parked as ``blocked`` with an operator-park
     ``blocked_reason`` (read from the plan, "" when unset), and ``ref`` is the
-    ticket whose plan ``confirm`` marks."""
+    ticket whose plan ``confirm`` marks.
+
+    ``followup_review_recommended`` is the build session's follow-up review
+    recommendation at park time, read from the record. None means the record
+    predates the field or holds a non-bool: unknown, deliberately distinct from
+    False (the engine always records a real bool)."""
 
     story_key: str
     actions: tuple[str, ...]
@@ -354,6 +367,7 @@ class ParkedStory:
     source: str = ""
     ref: str = ""
     blocked_reason: str = ""
+    followup_review_recommended: bool | None = None
 
     @property
     def ticket(self) -> bool:
@@ -500,6 +514,7 @@ def resolve(project: Path, paths: ProjectPaths) -> list[ParkedStory]:
         spec_path = _spec_path(entry, paths)
         spec_fm = _spec_frontmatter(spec_path)
         spec_actions = operator_actions_of(spec_fm) if spec_fm is not None else ()
+        raw = entry.get("followup_review_recommended")
         out.append(
             ParkedStory(
                 story_key=key,
@@ -516,6 +531,7 @@ def resolve(project: Path, paths: ProjectPaths) -> list[ParkedStory]:
                 source=str(entry.get("source") or ""),
                 ref=str(entry.get("ref") or ""),
                 blocked_reason=_blocked_reason(spec_fm),
+                followup_review_recommended=raw if isinstance(raw, bool) else None,
             )
         )
     return out
