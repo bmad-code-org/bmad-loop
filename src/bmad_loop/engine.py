@@ -4899,12 +4899,16 @@ class Engine:
             advance(task, Phase.AWAITING_OPERATOR)
             # The durable record of what a human owes: the actions themselves,
             # not just a count, because the journal and the spec frontmatter are
-            # what survive the run.
+            # what survive the run. The follow-up review recommendation is the
+            # dev pass's (a dev park) or the last review pass's (a review-demotion
+            # park); a park never runs the recommended pass, so this row and the
+            # park record are where it survives.
             self.journal.append(
                 "story-awaiting-operator",
                 story_key=task.story_key,
                 commit=task.commit_sha,
                 actions=list(task.operator_actions),
+                followup_review_recommended=task.followup_review_recommended,
             )
             self._notify_park(task)
         else:
@@ -5055,6 +5059,7 @@ class Engine:
                 run_id=self.state.run_id,
                 parked_at=self._today(),
                 root_identity=self._mount_root_identity(task, self.workspace.paths.project),
+                followup_review_recommended=task.followup_review_recommended,
                 **self._park_record_fields(task),
             )
         except (OSError, RuntimeError) as e:
@@ -5174,9 +5179,19 @@ class Engine:
 
         Each action is agent-authored text, so it is folded through
         ``gates.notice_line`` (DW-417): an embedded line break stays on its own
-        numbered line as a `` ⏎ `` segment instead of landing loose in ATTENTION."""
+        numbered line as a `` ⏎ `` segment instead of landing loose in ATTENTION.
+
+        When the build session recommended a follow-up review, a line before the
+        confirm hint says so: a park skips that pass, so the human runs it after
+        confirming."""
         actions = "\n".join(
             f"  {i}. {gates.notice_line(a)}" for i, a in enumerate(task.operator_actions, 1)
+        )
+        followup = (
+            "the build session also recommended a follow-up review, which a park skips: "
+            "after confirming, re-run the build skill on the spec for that pass.\n"
+            if task.followup_review_recommended
+            else ""
         )
         gates.notify(
             self.policy,
@@ -5184,6 +5199,7 @@ class Engine:
             f"story awaiting operator: {task.story_key}",
             f"committed, but {len(task.operator_actions)} action(s) are owed outside the repo:\n"
             f"{actions}\n"
+            f"{followup}"
             f"run `bmad-loop confirm {task.story_key}` once they are done.",
             multiline=True,
         )

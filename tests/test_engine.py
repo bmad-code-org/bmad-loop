@@ -4194,6 +4194,64 @@ def test_dev_declared_park_commits_and_the_run_continues(project):
     assert parked_entry["actions"] == ACTIONS and parked_entry["commit"] == parked.commit_sha
 
 
+def _committed_park_record(project, sha, key="1-1-a"):
+    """The park record as committed at ``sha`` — what `confirm` reads later."""
+    return json.loads(git(project.project, "show", f"{sha}:.bmad-loop/operator/{key}.json"))
+
+
+def _park_with_followup(project, recommended):
+    """Drive one dev park whose session reports ``recommended`` as its
+    `followup_review_recommended`, and return what the park left: the parked task,
+    the `story-awaiting-operator` row and the committed park record."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=ACTIONS,
+                followup_review=recommended,
+            )
+        ],
+        policy=_park_policy(),
+    )
+
+    engine.run()
+
+    parked = engine.state.tasks["1-1-a"]
+    assert parked.phase == Phase.AWAITING_OPERATOR
+    # trigger="always": the park, not a recommendation-free trigger, skipped review
+    assert not any(s.role == "review" for s in adapter.sessions)
+    parked_entry = next(
+        e for e in engine.journal.entries() if e["kind"] == "story-awaiting-operator"
+    )
+    return parked, parked_entry, _committed_park_record(project, parked.commit_sha)
+
+
+def test_park_with_a_recommended_followup_records_it_and_still_skips_review(project):
+    """A park skips the review loop, so a follow-up review the dev pass recommended
+    never runs. The `story-awaiting-operator` row and the committed park record
+    keep the recommendation for the human; the park itself is unchanged.
+
+    Ablation: drop the field from the journal row or from `_write_park_record`'s
+    `record_park` call and this fails on the KeyError."""
+    _, parked_entry, record = _park_with_followup(project, True)
+    assert parked_entry["followup_review_recommended"] is True
+    assert record["followup_review_recommended"] is True
+
+
+def test_park_without_a_followup_records_false(project):
+    """No recommendation is a real answer, written as False rather than left
+    absent: an absent key reads as unknown (a record that predates the field).
+
+    Ablation: as above — the KeyError, not a falsy read, is what fails."""
+    _, parked_entry, record = _park_with_followup(project, False)
+    assert parked_entry["followup_review_recommended"] is False
+    assert record["followup_review_recommended"] is False
+
+
 def test_park_commit_message_marks_the_story_awaiting_operator(project):
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -5121,13 +5179,19 @@ def test_park_notice_keeps_its_numbered_action_list_on_separate_lines(project):
     the header line the way a reason-carrying notice does.
 
     Ablation: drop `multiline=True` from `_notify_park` and the actions fold onto
-    the header line with ` ⏎ `, so the per-line assertions redden."""
+    the header line with ` ⏎ `, so the per-line assertions redden. No follow-up is
+    recommended, so the confirm hint follows the actions directly (the follow-up
+    line's own placement is pinned by the test below)."""
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
         project,
         [
             generic_dev_effect(
-                project, "1-1-a", final_status="awaiting-operator", operator_actions=ACTIONS
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                operator_actions=ACTIONS,
+                followup_review=False,
             )
         ],
         policy=_park_policy(),
@@ -5141,6 +5205,41 @@ def test_park_notice_keeps_its_numbered_action_list_on_separate_lines(project):
     for n, action in enumerate(ACTIONS, 1):
         assert lines[header + n] == f"  {n}. {action}"
     assert lines[header + len(ACTIONS) + 1].startswith("run `bmad-loop confirm 1-1-a`")
+
+
+_FOLLOWUP_NOTICE = (
+    "the build session also recommended a follow-up review, which a park skips: "
+    "after confirming, re-run the build skill on the spec for that pass."
+)
+
+
+@pytest.mark.parametrize("recommended", [True, False])
+def test_park_notification_mentions_a_recommended_followup(project, recommended):
+    """The notification is the one park artifact that reaches someone away from the
+    repo, so it says when the skipped follow-up review is still owed, on its own
+    line before the confirm hint. Without a recommendation the body is unchanged.
+
+    Ablation: drop the follow-up line from `_notify_park` and the True case fails."""
+    engine, _ = make_engine(project, [], policy=_park_policy())
+    engine.run_dir.mkdir(parents=True, exist_ok=True)
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        operator_actions=list(ACTIONS),
+        followup_review_recommended=recommended,
+    )
+
+    engine._notify_park(task)
+
+    lines = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8").splitlines()
+    (header,) = [i for i, ln in enumerate(lines) if "story awaiting operator: 1-1-a" in ln]
+    after_actions = header + len(ACTIONS) + 1
+    if recommended:
+        assert lines[after_actions] == _FOLLOWUP_NOTICE
+        after_actions += 1
+    else:
+        assert not any("follow-up review" in ln for ln in lines)
+    assert lines[after_actions].startswith("run `bmad-loop confirm 1-1-a`")
 
 
 # A multi-line, control-bearing untrusted fragment (DW-417): its second line must
@@ -5231,12 +5330,13 @@ def _demotion_policy(mode="park", **kw):
     return _park_policy(operator=OperatorPolicy(on_review_demotion=mode), **kw)
 
 
-def _review_pass(paths, story_key, status, *, operator_actions=None, on_entry=None):
+def _review_pass(paths, story_key, status, *, operator_actions=None, on_entry=None, followup=False):
     """A review pass that finalizes the spec at ``status`` and — like the real
     skill, which is told never to write the board — leaves sprint-status alone.
     (``review_effect`` writes the board to ``done`` itself, which would mask the
     orchestrator's own board writes these tests are about.) ``on_entry`` runs
-    first, to observe the state the pass was launched into."""
+    first, to observe the state the pass was launched into. ``followup`` is the
+    pass's `followup_review_recommended`."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         if on_entry is not None:
@@ -5252,7 +5352,7 @@ def _review_pass(paths, story_key, status, *, operator_actions=None, on_entry=No
                 "spec_file": str(sp),
                 "baseline_commit": baseline,
                 "status": status,
-                "followup_review_recommended": False,
+                "followup_review_recommended": followup,
                 "escalations": [],
             },
         )
@@ -5307,6 +5407,38 @@ def test_review_demotion_parks_under_park_policy_and_the_run_continues(project):
     assert ".bmad-loop/operator/1-1-a.json" in git(
         project.project, "ls-tree", "-r", "--name-only", parked.commit_sha
     )
+
+
+def test_review_demotion_park_records_the_last_pass_followup(project):
+    """A demotion pass converges whatever its own follow-up flag says, so the
+    review it recommends is skipped exactly like a dev park's. The latest pass's
+    flag is the one the park carries: the dev pass here recommended a review (it
+    ran, as the demotion pass) and the demotion pass recommends another.
+
+    Ablation: drop the field from the journal row or the park record write and
+    this fails."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            generic_dev_effect(project, "1-1-a"),
+            _review_pass(
+                project, "1-1-a", "awaiting-operator", operator_actions=ACTIONS, followup=True
+            ),
+        ],
+        policy=_demotion_policy(),
+    )
+
+    engine.run()
+
+    parked = engine.state.tasks["1-1-a"]
+    assert parked.phase == Phase.AWAITING_OPERATOR
+    assert len([s for s in adapter.sessions if s.role == "review"]) == 1
+    parked_entry = next(
+        e for e in engine.journal.entries() if e["kind"] == "story-awaiting-operator"
+    )
+    assert parked_entry["followup_review_recommended"] is True
+    assert _committed_park_record(project, parked.commit_sha)["followup_review_recommended"] is True
 
 
 def test_review_demotion_is_not_taken_under_the_default_escalate(project):

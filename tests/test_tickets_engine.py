@@ -2574,10 +2574,11 @@ def _write_parked_plan(
     plan.write_bytes("\n".join(lines).encode("utf-8"))
 
 
-def _parks(layout: V7Layout, tree: FakeTicketTree, plan: Path):
+def _parks(layout: V7Layout, tree: FakeTicketTree, plan: Path, *, followup: bool | None = None):
     """A dev session that builds what it can and parks the ticket: code in the
     tree, the plan at `awaiting-operator` with its actions, and the fake's row
-    reading the session's own token as `tickets.py` would hand it back."""
+    reading the session's own token as `tickets.py` would hand it back.
+    ``followup``, when given, is the result's `followup_review_recommended`."""
 
     def park(spec: SessionSpec) -> SessionResult:
         cwd = Path(spec.cwd)
@@ -2589,6 +2590,8 @@ def _parks(layout: V7Layout, tree: FakeTicketTree, plan: Path):
             tree.finds["1.1"], row=ticket_row("1.1", status="awaiting-operator")
         )
         result = {"workflow": "auto-dev", "spec_file": str(here), "status": "awaiting-operator"}
+        if followup is not None:
+            result["followup_review_recommended"] = followup
         return SessionResult(status="completed", result_json=result)
 
     return park
@@ -2657,6 +2660,35 @@ def test_park_converted_to_blocked_at_commit(project_v7, monkeypatch):
     assert [e["kind"] for e in engine.journal.entries()].count(
         "review-skipped-awaiting-operator"
     ) == 1
+
+
+def test_ticket_park_records_the_followup_recommendation(project_v7, monkeypatch):
+    """A ticket park skips review like a sprint park, so a follow-up review the
+    build recommended is carried on the park record beside the source and ref
+    `confirm` needs: the operator runs it after confirming the plan.
+
+    Ablation: drop the field from `_write_park_record`'s `record_park` call and
+    this fails on the KeyError."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _park_marking_tree(tree, plan, monkeypatch)
+    engine, adapter = make_engine(
+        project_v7, tree, script=[_parks(project_v7, tree, plan, followup=True)]
+    )
+    engine.state.max_stories = 1
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
+    assert not any(s.role == "review" for s in adapter.sessions)
+    record = _park_record(project_v7)
+    assert (record["source"], record["ref"]) == ("tickets", "1.1")
+    assert record["followup_review_recommended"] is True
+    parked_entry = next(
+        e for e in engine.journal.entries() if e["kind"] == "story-awaiting-operator"
+    )
+    assert parked_entry["followup_review_recommended"] is True
 
 
 @pytest.mark.parametrize("mark_done", ["auto", "never"])
