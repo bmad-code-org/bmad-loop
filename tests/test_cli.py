@@ -5285,6 +5285,144 @@ def test_resume_no_warning_for_sweep(tmp_path, monkeypatch, capsys):
     assert "still escalated" not in capsys.readouterr().err
 
 
+def _failing_resume_run(project, monkeypatch, *, before_raise=None, **state_fields):
+    """An escalation-paused run under a real BMAD config whose resume fails while
+    building its adapters — `make_adapters`' own failure shape, a `SystemExit` —
+    after `_prepare_resume_locked` cleared and saved the pause. `state_fields`
+    override the saved state; `before_raise(run_dir)` runs inside the failing build."""
+    from conftest import install_base_skills
+
+    from bmad_loop.journal import load_state, save_state
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    run_dir = _escalated_run(project.project)
+    if state_fields:
+        state = load_state(run_dir)
+        for name, value in state_fields.items():
+            setattr(state, name, value)
+        save_state(run_dir, state)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "dead")
+
+    def failing_build(*_a, **_k):
+        if before_raise is not None:
+            before_raise(run_dir)
+        raise SystemExit("error: x")
+
+    monkeypatch.setattr(cli, "_make_adapters", failing_build)
+    return run_dir
+
+
+def _journal_kinds(run_dir):
+    return [
+        json.loads(line)["kind"] for line in (run_dir / "journal.jsonl").read_text().splitlines()
+    ]
+
+
+def test_resume_restores_pause_when_adapter_build_fails(project, monkeypatch, capsys):
+    """A resume clears the pause before its adapters are built; one whose build
+    fails puts the pause back and journals `resume-aborted` with the exception class
+    only, so the run stays paused at its escalation and `resolve` still takes it.
+
+    Ablation: drop the `except BaseException` arm in `_resume_paused_run` and the
+    pause stays cleared and no `resume-aborted` row lands."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir = _failing_resume_run(project, monkeypatch)
+    before = load_state(run_dir)
+    with pytest.raises(SystemExit, match="error: x"):
+        cli.main(["resume", "--project", str(project.project), "r1"])
+    after = load_state(run_dir)
+    assert (after.paused_reason, after.paused_stage, after.paused_story_key) == (
+        before.paused_reason,
+        before.paused_stage,
+        before.paused_story_key,
+    )
+    assert after.paused_stage == "escalation"
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "journal.jsonl").read_text().splitlines()
+        if json.loads(line)["kind"] == "resume-aborted"
+    ]
+    assert [{k: v for k, v in r.items() if k != "ts"} for r in rows] == [
+        {"kind": "resume-aborted", "error": "SystemExit"}
+    ]
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    rc = cli.main(
+        ["resolve", "--project", str(project.project), "r1", "--no-interactive", "--no-resume"]
+    )
+    assert rc == 0, capsys.readouterr().err
+    assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING
+
+
+def test_resume_restore_keeps_stopped_crashed_flags(project, monkeypatch):
+    """The restore puts back every field `clear_pause()` cleared, the stop and crash
+    flags with the pause fields.
+
+    Ablation: drop the `stopped`/`crashed`/`crash_error` lines from
+    `RunState.restore_pause` and they come back cleared."""
+    from bmad_loop.journal import load_state
+
+    run_dir = _failing_resume_run(
+        project, monkeypatch, stopped=True, crashed=True, crash_error="RuntimeError: boom"
+    )
+    with pytest.raises(SystemExit):
+        cli.main(["resume", "--project", str(project.project), "r1"])
+    after = load_state(run_dir)
+    assert (after.stopped, after.crashed, after.crash_error) == (True, True, "RuntimeError: boom")
+    assert after.paused_stage == "escalation"
+
+
+@pytest.mark.parametrize("change", ["re-paused", "finished"])
+def test_resume_restore_skips_when_state_changed(project, monkeypatch, change):
+    """A run that moved while the adapters were being built — re-paused by a rival,
+    or finished — keeps its new state: the restore writes nothing and journals no
+    `resume-aborted`.
+
+    Ablation: drop the `finished` / `paused_reason` check in
+    `_restore_aborted_resume` and the escalation pause overwrites the new state."""
+    from bmad_loop.journal import load_state, save_state
+
+    def move(run_dir):
+        state = load_state(run_dir)
+        if change == "re-paused":
+            state.paused_reason, state.paused_stage = "environment fault", "environment"
+        else:
+            state.finished = True
+        save_state(run_dir, state)
+
+    run_dir = _failing_resume_run(project, monkeypatch, before_raise=move)
+    with pytest.raises(SystemExit):
+        cli.main(["resume", "--project", str(project.project), "r1"])
+    after = load_state(run_dir)
+    if change == "re-paused":
+        assert (after.paused_reason, after.paused_stage) == ("environment fault", "environment")
+    else:
+        assert after.finished and after.paused_reason is None and after.paused_stage is None
+    assert "resume-aborted" not in _journal_kinds(run_dir)
+
+
+def test_resume_restore_failure_keeps_the_resume_error(project, monkeypatch, capsys):
+    """A restore that cannot read the state warns and lets the resume's own failure
+    propagate, rather than replacing it with the restore's fault.
+
+    Ablation: drop the `try`/`except Exception` around `_restore_aborted_resume` and
+    the KeyError from the unreadable state escapes instead of the SystemExit."""
+
+    def corrupt(run_dir):
+        (run_dir / "state.json").write_text("{}", encoding="utf-8")
+
+    _failing_resume_run(project, monkeypatch, before_raise=corrupt)
+    with pytest.raises(SystemExit, match="error: x"):
+        cli.main(["resume", "--project", str(project.project), "r1"])
+    assert (
+        "warning: run r1: could not restore the pause this resume cleared (KeyError); "
+        "the run is left unpaused"
+    ) in capsys.readouterr().err
+
+
 def test_status_hints_escalated_story_after_cleared_pause(tmp_path, capsys):
     """#958: a run that reads as not paused while a story is still escalated names
     the story and the resolve that clears it.

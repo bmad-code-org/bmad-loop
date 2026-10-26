@@ -259,6 +259,8 @@ REARM_ESCALATION_CALLERS = {
 # relying on a reviewer to find it by grep.
 SAVE_STATE_CALLERS = {
     ("cli.py", "_prepare_resume_locked"),
+    # a resume that failed before its engine started puts its cleared pause back
+    ("cli.py", "_restore_aborted_resume"),
     ("engine.py", "_save"),
     ("runs.py", "_rearm_escalation_locked"),
     ("runs.py", "_rearm_for_reverify_locked"),
@@ -274,6 +276,9 @@ SAVE_STATE_CALLERS = {
 }
 RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resume_paused_run"),
+    # the failed-resume restore: reload, re-check finished / a concurrent re-pause,
+    # then put back the pause `_prepare_resume_locked` cleared
+    ("cli.py", "_restore_aborted_resume"),
     ("cli.py", "cmd_resolve"),
     ("cli.py", "_hand_back_ctl_window"),
     ("cli.py", "_resolve_adopt"),
@@ -1398,6 +1403,10 @@ JOURNAL_KINDS = frozenset(
         # #920: the accepting process could not publish its control window;
         # `error` is a drop field.
         "ctl-window-claim-failed",
+        # A resume whose adapter build raised before its engine started put the
+        # cleared pause back; `error` is the exception class name only (a drop
+        # field), never its text.
+        "resume-aborted",
         "run-resume",
         # The resume of a tickets run paused for a refined ticket's story-file
         # approval records that approval (`tickets_source.approve_paused_story_file`).

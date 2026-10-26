@@ -86,7 +86,7 @@ from .escalation import (
     resume_skipped_escalation_keys,
 )
 from .journal import Journal, load_state, save_state, state_lock
-from .model import RunState, StoryTask
+from .model import PauseSnapshot, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
     LockUnavailableError,
@@ -5447,6 +5447,9 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # Likewise a tickets run paused for an epic's closure: this resume answers that
     # pause, so the engine acknowledges the closure instead of pausing for it again.
     tickets_source.resume_epic_closure(state)
+    # What clear_pause() is about to clear, so _resume_paused_run can put it back
+    # if the resume fails before its engine starts (see _restore_aborted_resume).
+    pause = state.pause_snapshot()
     state.clear_pause()
     runs.write_pid(run_dir)
     # Persist before the engine starts: status, the TUI and diagnose only ever
@@ -5460,7 +5463,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants
+    return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants, pause
 
 
 class _CtlLaunch:
@@ -5665,42 +5668,59 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
         if isinstance(prepared, int):
             return prepared
-        paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants = prepared
+        paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants, pause = (
+            prepared
+        )
         _claim_ctl_window(project, run_dir, state)
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
     # observe this process as live while these unbounded operations proceed.
-    composed = runsetup.compose_resume(
-        project=project,
-        paths=paths,
-        run_dir=run_dir,
-        state=state,
-        policy=pol,
-        journal=journal,
-        sweep_factory=_sweep_factory(project, paths, new_digest, plugin_grants=plugin_grants),
-        make_adapters=_make_adapters,
-        engine_cls=Engine,
-        stories_engine_cls=StoriesEngine,
-        tickets_engine_cls=TicketsEngine,
-        sweep_engine_cls=SweepEngine,
-        profiles=profiles,
-        sweep_options=sweep_options,
-        plugin_grants=plugin_grants,
-    )
-    _warn_bypass_dropped(
-        pol,
-        project,
-        (
-            ("triage", "dev", "review")
-            if state.run_type == "sweep"
-            else worksource.launch_roles(
-                worksource.resumed_traits_for(state.source).name, pol.gates.retrospective
+    try:
+        composed = runsetup.compose_resume(
+            project=project,
+            paths=paths,
+            run_dir=run_dir,
+            state=state,
+            policy=pol,
+            journal=journal,
+            sweep_factory=_sweep_factory(project, paths, new_digest, plugin_grants=plugin_grants),
+            make_adapters=_make_adapters,
+            engine_cls=Engine,
+            stories_engine_cls=StoriesEngine,
+            tickets_engine_cls=TicketsEngine,
+            sweep_engine_cls=SweepEngine,
+            profiles=profiles,
+            sweep_options=sweep_options,
+            plugin_grants=plugin_grants,
+        )
+        _warn_bypass_dropped(
+            pol,
+            project,
+            (
+                ("triage", "dev", "review")
+                if state.run_type == "sweep"
+                else worksource.launch_roles(
+                    worksource.resumed_traits_for(state.source).name, pol.gates.retrospective
+                )
+            ),
+            profiles=profiles,
+            journal=composed.journal,
+        )
+    except BaseException as e:
+        # make_adapters raises SystemExit for every refusal; anything escaping
+        # before the engine starts must not strand the pause cleared above. A
+        # restore that fails is reported, never raised: the resume's own failure
+        # is the one the operator has to act on.
+        try:
+            _restore_aborted_resume(run_dir, journal, pause, e)
+        except Exception as restore_error:
+            print(
+                f"warning: run {run_dir.name}: could not restore the pause this resume"
+                f" cleared ({type(restore_error).__name__}); the run is left unpaused",
+                file=sys.stderr,
             )
-        ),
-        profiles=profiles,
-        journal=composed.journal,
-    )
+        raise
     summary = composed.engine.run()
     print(summary.render())
     return (
@@ -5708,6 +5728,34 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None
         else ExitCode.OK
     )
+
+
+def _restore_aborted_resume(
+    run_dir: Path, journal: Journal, pause: PauseSnapshot, error: BaseException
+) -> None:
+    """Put back the pause a resume cleared when it fails before its engine starts.
+
+    `_prepare_resume_locked` clears the pause fields and saves before the adapters
+    are built, and only the engine writes them back (on its `RunPaused`). An
+    adapter build that raises — `make_adapters` turns every refusal into a
+    `SystemExit` — therefore stranded a run paused at an escalation with no
+    pause stage and its story still escalated (#958). Restoring exactly the fields `clear_pause()` cleared returns the run to the
+    pause it was in.
+
+    Only when nothing moved in between: the run still exists, has not finished,
+    and carries no pause of its own (a concurrent re-pause wins). Through
+    resolve's re-arm the escalated task is already PENDING, so the restored pause
+    plus a plain `resume` re-drives it. The journal row names the exception class
+    only: its text can carry profile or adapter content (see `run-resume`)."""
+    with state_lock(run_dir):
+        if not runs.is_run(run_dir):
+            return
+        fresh = load_state(run_dir)
+        if fresh.finished or fresh.paused_reason is not None:
+            return
+        fresh.restore_pause(pause)
+        save_state(run_dir, fresh)
+        journal.append("resume-aborted", error=type(error).__name__)
 
 
 def cmd_resume(args: argparse.Namespace) -> int:

@@ -1268,6 +1268,21 @@ def env_fault_site_reverifiable(task: StoryTask) -> bool:
     return latest is not None and latest.status == "completed"
 
 
+@dataclass(frozen=True)
+class PauseSnapshot:
+    """The six fields :meth:`RunState.clear_pause` clears, captured just before a
+    resume clears them so a resume that fails before its engine starts can put
+    them back (:meth:`RunState.restore_pause`). Without it that failure left an
+    escalated story behind a run with no pause stage, which ``resolve`` refused."""
+
+    paused_reason: str | None
+    paused_stage: str | None
+    paused_story_key: str | None
+    stopped: bool
+    crashed: bool
+    crash_error: str | None
+
+
 @dataclass
 class RunState:
     run_id: str
@@ -1555,6 +1570,26 @@ class RunState:
         self.stopped = False
         self.crashed = False
         self.crash_error = None
+
+    def pause_snapshot(self) -> PauseSnapshot:
+        """Exactly the fields :meth:`clear_pause` clears, for :meth:`restore_pause`."""
+        return PauseSnapshot(
+            paused_reason=self.paused_reason,
+            paused_stage=self.paused_stage,
+            paused_story_key=self.paused_story_key,
+            stopped=self.stopped,
+            crashed=self.crashed,
+            crash_error=self.crash_error,
+        )
+
+    def restore_pause(self, snapshot: PauseSnapshot) -> None:
+        """Undo a :meth:`clear_pause` from the :meth:`pause_snapshot` taken before it."""
+        self.paused_reason = snapshot.paused_reason
+        self.paused_stage = snapshot.paused_stage
+        self.paused_story_key = snapshot.paused_story_key
+        self.stopped = snapshot.stopped
+        self.crashed = snapshot.crashed
+        self.crash_error = snapshot.crash_error
 
     def cache_read_weight(self) -> float:
         """The run's cache-read weight from its persisted policy snapshot; the
