@@ -2598,7 +2598,7 @@ def test_parse_deferred_findings_defaults_optional_fields_and_coerces_scalars():
     ]
 
 
-@pytest.mark.parametrize("field", ["summary", "evidence", "location"])
+@pytest.mark.parametrize("field", ["summary", "evidence", "location", "severity"])
 @pytest.mark.parametrize("collection", [["nested", "values"], {"nested": "value"}])
 def test_parse_deferred_findings_rejects_collection_valued_text_fields(field, collection):
     """A malformed optional field costs its whole item too: silently dropping
@@ -2614,7 +2614,7 @@ def test_parse_deferred_findings_rejects_collection_valued_text_fields(field, co
     assert malformed == [f"item 1: `{field}` is not a scalar (got {type(collection).__name__})"]
 
 
-@pytest.mark.parametrize("field", ["summary", "evidence", "location"])
+@pytest.mark.parametrize("field", ["summary", "evidence", "location", "severity"])
 @pytest.mark.parametrize("value", ["before\0after", "x" * 1001 + "\0"])
 def test_parse_deferred_findings_rejects_embedded_nul_in_text_fields(field, value):
     """Reject before clamping too, so a late NUL cannot evade the stated schema."""
@@ -2627,7 +2627,11 @@ def test_parse_deferred_findings_rejects_embedded_nul_in_text_fields(field, valu
     assert malformed == [f"item 1: `{field}` contains a NUL character"]
 
 
-def test_parse_deferred_findings_normalizes_known_severity_and_drops_unknown(tmp_path):
+def test_parse_deferred_findings_normalizes_known_severity_and_keeps_unknown_as_declared(
+    tmp_path,
+):
+    """An unrecognized severity leaves `severity` empty but is never discarded:
+    the declared text rides along so the harvest can file and journal it (#913)."""
     fm = _deferred_spec(
         tmp_path / "spec.md",
         [
@@ -2638,7 +2642,29 @@ def test_parse_deferred_findings_normalizes_known_severity_and_drops_unknown(tmp
     )
     findings, malformed = devcontract.parse_deferred_findings(fm)
     assert malformed == []
-    assert [finding.severity for finding in findings] == ["critical", "high", ""]
+    assert [(f.severity, f.declared_severity) for f in findings] == [
+        ("critical", ""),
+        ("high", ""),
+        ("", "spicy"),
+    ]
+
+
+def test_parse_deferred_findings_keeps_qualified_severity_level_and_text(tmp_path):
+    """The leading word carries the level; the qualifier is kept as declared
+    text, while a bare alias in any case or padding says nothing more (#913)."""
+    fm = _deferred_spec(
+        tmp_path / "spec.md",
+        [
+            {"summary": "a", "severity": "high (unverified)"},
+            {"summary": "b", "severity": " HIGH "},
+        ],
+    )
+    findings, malformed = devcontract.parse_deferred_findings(fm)
+    assert malformed == []
+    assert [(f.severity, f.declared_severity) for f in findings] == [
+        ("high", "high (unverified)"),
+        ("high", ""),
+    ]
 
 
 def test_parse_deferred_findings_isolates_each_malformed_item(tmp_path):

@@ -310,6 +310,7 @@ DEFERRED_FIELD = "deferred"
 _SUMMARY_LIMIT = 200
 _EVIDENCE_LIMIT = 1000
 _LOCATION_LIMIT = 200
+_SEVERITY_LIMIT = 80
 
 
 @dataclass(frozen=True)
@@ -321,6 +322,9 @@ class DeferredFinding:
     location: str
     severity: str
     fingerprint: str
+    # The dev session's flattened severity text, kept only when it said more
+    # than a bare alias (a qualifier, or an unrecognized word); "" otherwise.
+    declared_severity: str = ""
 
 
 def harvest_fingerprint(*parts: str) -> str:
@@ -381,6 +385,13 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
     scalars (numeric and boolean scalars are string-normalized), never
     collections or embedded NULs. This observation path never raises for the
     YAML shapes it accepts.
+
+    ``severity`` is read by its leading word (``deferredwork.leading_severity``),
+    so a qualified value ("high (unverified)") keeps its level. Whenever the
+    text says more than a bare alias -- a qualifier, or a leading word that is
+    no alias at all ("P1") -- it is kept as ``declared_severity`` so the ledger
+    entry can record it; an unrecognized one leaves ``severity`` empty but the
+    finding stays well-formed.
     """
     raw = fm.get(DEFERRED_FIELD)
     if raw is None:
@@ -401,7 +412,11 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
             )
             continue
         bad_optional = next(
-            (field for field in ("evidence", "location") if not _is_yaml_scalar(item.get(field))),
+            (
+                field
+                for field in ("evidence", "location", "severity")
+                if not _is_yaml_scalar(item.get(field))
+            ),
             None,
         )
         if bad_optional is not None:
@@ -414,6 +429,7 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
             "summary": summary_raw,
             "evidence": item.get("evidence"),
             "location": item.get("location"),
+            "severity": item.get("severity"),
         }
         bad_nul = next(
             (field for field, value in raw_text_values.items() if _contains_nul(value)), None
@@ -427,15 +443,17 @@ def parse_deferred_findings(fm: dict[str, Any]) -> tuple[list[DeferredFinding], 
             continue
         evidence = _flatten(item.get("evidence"), _EVIDENCE_LIMIT)
         location = _flatten(item.get("location"), _LOCATION_LIMIT)
+        declared = _flatten(item.get("severity"), _SEVERITY_LIMIT)
+        severity = deferredwork.leading_severity(declared) or ""
+        bare_alias = bool(severity) and declared.lower() in deferredwork.SEVERITY_ALIASES
         findings.append(
             DeferredFinding(
                 summary=summary,
                 evidence=evidence,
                 location=location,
-                severity=deferredwork.SEVERITY_ALIASES.get(
-                    str(item.get("severity", "")).strip().lower(), ""
-                ),
+                severity=severity,
                 fingerprint=harvest_fingerprint(summary, location),
+                declared_severity="" if bare_alias else declared,
             )
         )
     return findings, malformed

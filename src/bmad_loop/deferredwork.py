@@ -2990,6 +2990,20 @@ def _normalize_severity(value: str) -> str | None:
     return SEVERITY_ALIASES.get(value.lower())
 
 
+# The word must end there: a digit, letter or `_word` suffix ("critical1",
+# "high_priority") is a different token, while a closing `_` emphasis or a
+# hyphenated qualifier ("high-if-true") still reads as the level.
+_LEADING_SEVERITY_RE = re.compile(r"[ \t\r\n*_`]*([A-Za-z]+)(?![^\W_]|_\w)")
+
+
+def leading_severity(text: str) -> str | None:
+    """Normalize a dev session's declared severity by its leading word, so a
+    qualifier ("high (unverified)") keeps its level; harvest-only — the ledger
+    reader's SEVERITY_FIELD_RE is deliberately untouched."""
+    m = _LEADING_SEVERITY_RE.match(text)
+    return _normalize_severity(m.group(1)) if m else None
+
+
 @dataclass(frozen=True)
 class LegacyEntry:
     key: str  # stable content-derived identity, unique within the file

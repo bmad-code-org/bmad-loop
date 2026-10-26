@@ -772,11 +772,15 @@ def _harvest_row(
     finding whose `seen-again:` match died inside the ledger lock files the
     byte-identical row it would have filed had the match never existed. Two
     spellings of this tuple would diverge on exactly the rare path nothing
-    exercises."""
+    exercises. It therefore stays a pure function of the finding, including
+    the declared-severity note appended to the reason (#913)."""
+    reason = finding.evidence or finding.summary
+    if finding.declared_severity:
+        reason += f" (declared severity: {finding.declared_severity})"
     return (
         f"{HARVEST_ORIGIN} {finding.fingerprint}",
         finding.summary,
-        finding.evidence or finding.summary,
+        reason,
         finding.location or None,
         finding.severity or None,
     )
@@ -6097,6 +6101,19 @@ class Engine:
         pending: list[tuple[str, str, str, str | None, str | None]] = [
             _harvest_row(finding) for finding in harvestable
         ]
+        # An unrecognized severity is no reason to drop the finding: its entry is
+        # still filed (without `severity:`), and this event keeps the missing
+        # level visible instead of a silent drop (#913).
+        unrecognized = [f for f in harvestable if f.declared_severity and not f.severity]
+        if unrecognized:
+            self.journal.append(
+                "spec-deferrals-severity-unrecognized",
+                story_key=task.story_key,
+                spec=spec_name,
+                items=[
+                    {"summary": f.summary, "declared": f.declared_severity} for f in unrecognized
+                ],
+            )
         if malformed:
             self.journal.append(
                 "spec-deferrals-malformed",
@@ -6285,6 +6302,7 @@ class Engine:
             seen_again=seen_again_ids,
             deduped=deduped,
             malformed=len(malformed),
+            severity_unrecognized=len(unrecognized),
         )
 
     def _manifest_closes_deferred(self, task: StoryTask) -> tuple[str, ...]:

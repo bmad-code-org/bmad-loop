@@ -22597,6 +22597,74 @@ def test_spec_deferrals_malformed_siblings_file_valid_and_one_aggregated_entry(p
     assert len(malformed) == 1 and len(malformed[0]["items"]) == 2
 
 
+def test_spec_deferrals_qualified_severity_files_level_and_keeps_qualifier(project):
+    """A qualified severity files its leading-word level and keeps the declared
+    text in `reason:`, so `--min-severity` still selects the entry (#913)."""
+    from bmad_loop import sweep
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[{**HARVEST_A, "severity": "high (unverified)"}],
+            )
+        ],
+        policy=_harvest_policy(),
+    )
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert re.search(r"^severity: high$", entry.body, re.M)
+    assert deferredwork.field_severity(entry.body) == "high"
+    reason = next(line for line in entry.body.splitlines() if line.startswith("reason:"))
+    assert "(declared severity: high (unverified))" in reason
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "spec-deferrals-severity-unrecognized" not in kinds
+    selection = sweep.select_entries([e for e in entries if e.open], min_severity="high")
+    assert [e.id for e in selection.selected] == [entry.id]
+
+
+def test_spec_deferrals_unrecognized_severity_files_entry_and_journals(project):
+    """An unrecognized severity still files the finding — without `severity:` —
+    and journals the declared text rather than dropping it silently (#913)."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(
+                project,
+                "1-1-a",
+                followup_review=False,
+                deferred=[{**HARVEST_A, "severity": "P1"}],
+            )
+        ],
+        policy=_harvest_policy(),
+    )
+
+    assert engine.run().done == 1
+
+    entries = _harvest_entries(project)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.title == HARVEST_A["summary"]
+    assert not re.search(r"^severity:", entry.body, re.M)
+    reason = next(line for line in entry.body.splitlines() if line.startswith("reason:"))
+    assert "(declared severity: P1)" in reason
+    journal = engine.journal.entries()
+    unrecognized = [e for e in journal if e["kind"] == "spec-deferrals-severity-unrecognized"]
+    assert len(unrecognized) == 1
+    assert unrecognized[0]["items"] == [{"summary": HARVEST_A["summary"], "declared": "P1"}]
+    harvested = [e for e in journal if e["kind"] == "spec-deferrals-harvested"]
+    assert len(harvested) == 1 and harvested[0]["severity_unrecognized"] == 1
+
+
 def test_spec_deferrals_unreadable_spec_returns_retry_without_harvest(project, monkeypatch):
     engine, _ = make_engine(project, [], policy=_harvest_policy())
     sp = spec_path(project, "1-1-a")

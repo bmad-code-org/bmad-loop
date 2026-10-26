@@ -1251,6 +1251,30 @@ def test_field_severity_forms():
     assert field_severity("no field here") is None
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("high (unverified)", "high"),
+        ("Medium (unverified)", "medium"),
+        ("**major**", "high"),
+        ("high-if-true", "high"),
+        ("med.", "medium"),
+        ("blocker: confirmed", "critical"),
+        ("highest", None),
+        ("critical1", None),
+        ("high_priority", None),
+        ("lowé", None),
+        ("_high_", "high"),
+        ("P1", None),
+        ("unknown", None),
+        ("", None),
+        ("   ", None),
+    ],
+)
+def test_leading_severity_reads_the_leading_word(text, expected):
+    assert deferredwork.leading_severity(text) == expected
+
+
 def test_canonical_severity_uses_the_whole_file_fence_index():
     text = """\
 # Deferred Work

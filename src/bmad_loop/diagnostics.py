@@ -502,6 +502,10 @@ _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     # the session touched, customer source included) and its retro doc filenames.
     "retro-auto-dirty": frozenset({"paths"}),
     "retro-auto-finished": frozenset({"docs"}),
+    # The harvested findings whose declared severity no alias reads (#913): each
+    # item carries the dev session's summary and severity text, so only the count
+    # ships.
+    "spec-deferrals-severity-unrecognized": frozenset({"items"}),
     "stale-restore-excluded": frozenset({"files"}),
 }
 
