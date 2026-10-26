@@ -5953,7 +5953,7 @@ def _hand_back_ctl_window(
 
 
 def cmd_resolve(args: argparse.Namespace) -> int:
-    from .model import PAUSE_ESCALATION, Phase
+    from .model import Phase
 
     # DW-535: `--abandon` closes the run, so "resume after this?" has no meaning —
     # pairing it with either answer is a usage error, refused before even the run lookup.
@@ -6001,16 +6001,9 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # gate (a finished run is not paused); every paused-run branch below is untouched.
     if getattr(args, "reverify", False) and state.finished:
         return _resolve_reverify_finished(args, project, run_dir, state)
-    # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
-    # stage (an isolated defer never pauses the run); `reverify_refusal` decides
-    # whether the named story qualifies. Everything else needs the escalation pause.
-    reverify_named = bool(getattr(args, "reverify", False) and args.story)
-    if not _resolve_pause_admits(state.paused_stage, reverify_named=reverify_named):
-        print(
-            runs.not_escalation_pause_message(args.run_id, state.paused_stage),
-            file=sys.stderr,
-        )
-        return 1
+    # Liveness comes ahead of the pause gate below: a resume clears the pause before
+    # its engine starts (#958), so a resumed engine that is still running reads as
+    # unpaused, and the true refusal is "still live", not "not paused".
     # Not a cleanup path, so the "unknown must not block" invariant does not apply:
     # an unverifiable-but-live pid must not be re-driven. A provably-live engine
     # always blocks (--force never bypasses it); unknown blocks unless the operator
@@ -6034,7 +6027,18 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             "proceeding anyway (--force)",
             file=sys.stderr,
         )
-    story_key = args.story or state.paused_story_key
+    # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
+    # stage (an isolated defer never pauses the run); `reverify_refusal` decides
+    # whether the named story qualifies. Everything else needs the escalation pause,
+    # or no pause with the story still escalated (`runs.escalation_resolvable`, #958).
+    reverify_named = bool(getattr(args, "reverify", False) and args.story)
+    if not _resolve_pause_admits(state, reverify_named=reverify_named):
+        print(
+            runs.not_escalation_pause_message(args.run_id, state.paused_stage),
+            file=sys.stderr,
+        )
+        return 1
+    story_key = args.story or runs.default_escalation_key(state)
     task = state.tasks.get(story_key) if story_key else None
     reverify = getattr(args, "reverify", False)
     if story_key is not None and task is not None and task.phase == Phase.DEFERRED and not reverify:
@@ -6046,10 +6050,13 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # Unpaused (#958), only an unresolved escalation is resolvable: a named stories
+    # attempt-0 wedge is lifted by fixing its disk state and resuming, never re-armed.
     if (
         story_key is None
         or task is None
         or task.phase not in ((Phase.ESCALATED, Phase.DEFERRED) if reverify else (Phase.ESCALATED,))
+        or (not reverify_named and not runs.escalation_story_admitted(state, story_key))
     ):
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
@@ -6059,8 +6066,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # this flow reaches it the interactive session has run and `runs.rearm_escalation`
     # has spent the escalation, so a refusal there is a refusal after the side
     # effects. LAST in this gate block, not first: the refusals above answer "this
-    # gesture does not apply to this run at all" (alias, not paused at an escalation,
-    # live engine, no escalated story) and must not be displaced by a ledger-repair
+    # gesture does not apply to this run at all" (alias, live engine, not paused at an
+    # escalation, no escalated story) and must not be displaced by a ledger-repair
     # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
     # also wins outright and the ledger gate follows it.
     if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
@@ -6470,7 +6477,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # mutation boundary, so repeat every state/liveness precondition from
             # the snapshot left by the preceding writer before restamping anything.
             fresh_state = load_state(run_dir, pin=state)
-            if fresh_state.paused_stage != PAUSE_ESCALATION:
+            if not runs.escalation_resolvable(fresh_state):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
@@ -6580,7 +6587,7 @@ def _resolve_adopt(
     and merges the branch through its COMMITTING recovery arm. No interactive
     session runs, and review, the `[verify]` commands and `pre_commit_gate`
     workflows are NOT re-run."""
-    from .model import PAUSE_ESCALATION, Phase
+    from .model import Phase
 
     if (refusal := runs.adopt_refusal(state, task, story_key)) is not None:
         print(f"error: {refusal}", file=sys.stderr)
@@ -6601,7 +6608,7 @@ def _resolve_adopt(
             # Same mutation-boundary re-check as the re-arm path: the checks above
             # ran lock-free, so repeat them against the state left by the last writer.
             fresh_state = load_state(run_dir, pin=state)
-            if fresh_state.paused_stage != PAUSE_ESCALATION:
+            if not runs.escalation_resolvable(fresh_state):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
@@ -6666,7 +6673,7 @@ def _resolve_abandon(
     a usage error), re-checks pause, liveness, phase and generation under the run lock
     and hands the transaction to `unitreplay.abandon_replay_run`. No session and no
     engine run; the board, the ledger and the origin run are never written."""
-    from .model import PAUSE_ESCALATION, Phase
+    from .model import Phase
     from .unitreplay import AbandonError, abandon_refusal, abandon_replay_run
 
     if (refusal := abandon_refusal(state, task, story_key)) is not None:
@@ -6697,7 +6704,7 @@ def _resolve_abandon(
         with state_lock(run_dir):
             # The checks above ran lock-free: repeat them against the last writer's state.
             fresh_state = load_state(run_dir, pin=state)
-            if fresh_state.paused_stage != PAUSE_ESCALATION:
+            if not runs.escalation_resolvable(fresh_state):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,
@@ -6752,16 +6759,15 @@ def _resolve_abandon(
     return 0
 
 
-def _resolve_pause_admits(paused_stage: str | None, *, reverify_named: bool) -> bool:
-    """Whether `resolve` may act on a run paused at ``paused_stage``: the escalation
-    pause always; any pause for `--reverify --story <key>` (DW-522), whose
-    `runs.reverify_refusal` then admits only a worktree unit off the escalation pause.
-    One rule for `cmd_resolve`'s entry gate and `_resolve_reverify`'s locked re-check."""
-    from .model import PAUSE_ESCALATION
-
+def _resolve_pause_admits(state: RunState, *, reverify_named: bool) -> bool:
+    """Whether `resolve` may act on ``state``'s pause: `runs.escalation_resolvable`
+    (the escalation pause, or no pause with a story still escalated, #958); any
+    pause for `--reverify --story <key>` (DW-522), whose `runs.reverify_refusal`
+    then admits only a worktree unit off the escalation pause. One rule for
+    `cmd_resolve`'s entry gate and `_resolve_reverify`'s locked re-check."""
     if reverify_named:
-        return paused_stage is not None
-    return paused_stage == PAUSE_ESCALATION
+        return state.paused_stage is not None
+    return runs.escalation_resolvable(state)
 
 
 def _resolve_reverify(
@@ -6835,7 +6841,7 @@ def _resolve_reverify(
             # Same mutation-boundary re-check as the re-arm path: the checks above
             # ran lock-free, so repeat them against the state left by the last writer.
             fresh_state = load_state(run_dir, pin=state)
-            if not _resolve_pause_admits(fresh_state.paused_stage, reverify_named=explicit_story):
+            if not _resolve_pause_admits(fresh_state, reverify_named=explicit_story):
                 print(
                     runs.not_escalation_pause_message(args.run_id, fresh_state.paused_stage),
                     file=sys.stderr,

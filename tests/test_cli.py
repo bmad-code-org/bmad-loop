@@ -31,6 +31,7 @@ from conftest import (
     FakeTicketTree,
     _reverify_run,
     assert_run_state_lock_held,
+    clear_escalation_pause,
     escalated_run,
     fake_find,
     fake_next_view,
@@ -5099,6 +5100,151 @@ def test_resolve_refuses_environment_pause_with_resume_hint(tmp_path, capsys):
     assert "bmad-loop resume" not in err
 
 
+def _cleared_escalated_run(project, run_id="r1", **kw):
+    """`_escalated_run` after a resume cleared its pause and the engine exited before
+    run end: unpaused, the task still ESCALATED (#958)."""
+    return clear_escalation_pause(escalated_run(project, run_id, **kw)).run_dir
+
+
+def test_resolve_no_interactive_rearms_after_resume_cleared_pause(tmp_path, monkeypatch, capsys):
+    """#958: a resume cleared the pause and its engine never reached run end, so the
+    run is unpaused while the story stays escalated. `resolve` re-arms it.
+
+    Ablation: restore `_resolve_pause_admits`' stage-only rule and this exits 1 with
+    "not paused at an escalation (stage: none)"."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir = _cleared_escalated_run(tmp_path)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--no-resume"])
+    out = capsys.readouterr()
+    assert rc == 0, out.err
+    assert "resume when ready" in out.out
+    assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING
+
+
+def test_resolve_default_story_after_cleared_pause(tmp_path, monkeypatch, capsys):
+    """Unpaused, the default story is the first unresolved escalation, and a named
+    `--story` must be one: a non-escalated task is refused.
+
+    Ablation: drop the `escalation_story_admitted` clause in `cmd_resolve` and the
+    attempt-0 wedge row re-arms."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    run_dir = _cleared_escalated_run(tmp_path, story_key="s2")
+    state = load_state(run_dir)
+    state.tasks = {
+        "s1": StoryTask(story_key="s1", epic=1, phase=Phase.DONE, attempt=1),
+        **state.tasks,
+    }
+    save_state(run_dir, state)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    args = ["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--no-resume"]
+
+    assert cli.main([*args, "--story", "s1"]) == 1
+    assert "no escalated story to resolve in run r1" in capsys.readouterr().err
+
+    assert cli.main(args) == 0, capsys.readouterr().err
+    saved = load_state(run_dir)
+    assert saved.tasks["s2"].phase == Phase.PENDING
+    assert saved.tasks["s1"].phase == Phase.DONE
+
+
+def test_resolve_cleared_pause_refuses_a_named_stories_wedge(tmp_path, monkeypatch, capsys):
+    """A stories run's attempt-0 wedge is lifted by a hand fix and a resume; naming it
+    on an unpaused run that also holds an in-run escalation is refused, not re-armed.
+
+    Ablation: drop the `escalation_story_admitted` clause in `cmd_resolve` and this
+    exits 0 with the wedge re-armed."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    run_dir = _cleared_escalated_run(tmp_path, source="stories")
+    state = load_state(run_dir)
+    state.tasks["w"] = StoryTask(story_key="w", epic=1, phase=Phase.ESCALATED, attempt=0)
+    save_state(run_dir, state)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    rc = cli.main(
+        [
+            "resolve",
+            "--project",
+            str(tmp_path),
+            "r1",
+            "--story",
+            "w",
+            "--no-interactive",
+            "--no-resume",
+        ]
+    )
+    assert rc == 1
+    assert "no escalated story to resolve in run r1" in capsys.readouterr().err
+    assert load_state(run_dir).tasks["w"].phase == Phase.ESCALATED
+
+
+def test_resolve_environment_pause_still_refused_with_escalated_task(tmp_path, monkeypatch, capsys):
+    """Task-keyed admission applies only to a null stage: an environment pause is
+    lifted by a plain resume, even with an ESCALATED task on record.
+
+    Ablation: admit any stage with an unresolved escalation in
+    `runs.escalation_resolvable` and this re-arms."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase
+
+    run_dir = _escalated_run(tmp_path, "r1")
+    state = load_state(run_dir)
+    state.paused_stage = "environment"
+    save_state(run_dir, state)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--no-interactive", "--no-resume"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "not paused at an escalation (stage: environment)" in err
+    assert "an environment pause needs no resolve" in err
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+def test_resolve_cleared_pause_refuses_sweep_and_finished(tmp_path, monkeypatch, capsys):
+    """An unpaused sweep keeps stage-only admission, and a finished run still refuses
+    with the existing message."""
+    from bmad_loop.journal import load_state, save_state
+
+    _cleared_escalated_run(tmp_path, "r1", run_type="sweep")
+    finished = _cleared_escalated_run(tmp_path, "r2")
+    state = load_state(finished)
+    state.finished = True
+    save_state(finished, state)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *_a: pytest.fail("resumed"))
+    for run_id in ("r1", "r2"):
+        rc = cli.main(
+            ["resolve", "--project", str(tmp_path), run_id, "--no-interactive", "--no-resume"]
+        )
+        assert rc == 1
+        assert f"run {run_id} is not paused at an escalation (stage: none)" in (
+            capsys.readouterr().err
+        )
+
+
+def test_resolve_reports_live_engine_before_stage(tmp_path, monkeypatch, capsys):
+    """A resumed engine that is still running reads as unpaused, because the resume
+    cleared the pause before it started: resolve says "still live", not "not paused".
+
+    Ablation: move the liveness block back below the pause gate and this reports
+    "not paused at an escalation (stage: none)"."""
+    from bmad_loop import runs
+    from bmad_loop.model import Phase, StoryTask
+
+    _make_run_with_state(
+        tmp_path, "r1", tasks={"s1": StoryTask(story_key="s1", epic=1, phase=Phase.DEV_RUNNING)}
+    )
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
+    err = capsys.readouterr().err
+    assert "run r1 is still live — stop it first" in err
+    assert "not paused at an escalation" not in err
+
+
 # resolve refuses 'unknown' too, not just 'alive' — re-driving a possibly-live engine.
 @pytest.mark.parametrize(
     "liveness,msg",
@@ -5405,6 +5551,32 @@ def test_resolve_adopt_branch_moves_to_committing_and_resumes(tmp_path, monkeypa
     err = capsys.readouterr().err
     assert "bypasses automated checks" in err
     assert "review" in err and "[verify]" in err and "pre_commit_gate" in err
+
+
+def test_resolve_adopt_branch_admits_cleared_escalation_pause(tmp_path, monkeypatch, capsys):
+    """#958: a resume clears the pause before its engine starts, so an engine exit
+    before run end leaves the pause null with the task still ESCALATED.
+    `resolve --adopt-branch` admits that run at its entry gate and under the lock,
+    defaulting to the unresolved escalation.
+
+    Ablation, performed: restore the stage-only `paused_stage != PAUSE_ESCALATION`
+    re-check in `_resolve_adopt` and this reddens on rc."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase
+
+    run_dir = _adoptable_run(tmp_path)
+    state = load_state(run_dir)
+    state.clear_pause()
+    save_state(run_dir, state)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-branch", "--resume"])
+
+    assert rc == 0, capsys.readouterr().err
+    assert resumed == [run_dir]
+    task = load_state(run_dir).tasks["s1"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending
 
 
 def test_resolve_adopt_branch_force_unknown_proceeds(tmp_path, monkeypatch, capsys):

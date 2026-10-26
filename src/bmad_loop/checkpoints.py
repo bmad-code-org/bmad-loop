@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from . import gates
 from .engine import RunPaused
+from .escalation import unresolved_escalation_keys
 from .model import (
     PAUSE_ESCALATION,
     PAUSE_PLAN_CHECKPOINT,
@@ -125,15 +126,9 @@ class CheckpointFlowMixin(_MixinBase):
         from disk every pick (see ``_repause_inrun_escalation``), so reaching run end
         means the human fixed it by hand; its stale ESCALATED record must not
         re-pause the run, whose only way past would be a re-arm that re-drives the
-        fixed story."""
-        return next(
-            (
-                k
-                for k, t in self.state.tasks.items()
-                if t.phase == Phase.ESCALATED and t.attempt > 0
-            ),
-            None,
-        )
+        fixed story. ``escalation.unresolved_escalation_keys`` holds the narrowing
+        for the stories and tickets sources, so resolve's admission shares it."""
+        return next(iter(unresolved_escalation_keys(self.state)), None)
 
     def _pause_wedged(
         self,

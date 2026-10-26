@@ -17170,6 +17170,21 @@ def test_resume_past_an_escalation_pauses_instead_of_finishing(project):
     assert paused["stage"] == PAUSE_ESCALATION and paused["story_key"] == "1-1-a"
 
 
+def test_unresolved_escalation_key_matches_the_shared_seam(project):
+    """The run-end re-pause (DW-386) and resolve's admission (#958) read one
+    predicate: `Engine._unresolved_escalation_key` is the first key of
+    `escalation.unresolved_escalation_keys`, attempt-0 tasks included."""
+    from bmad_loop.escalation import unresolved_escalation_keys
+
+    engine, _ = make_engine(project, [])
+    assert engine._unresolved_escalation_key() is None
+    for key, phase, attempt in (("a", Phase.DONE, 1), ("b", Phase.ESCALATED, 0)):
+        engine.state.tasks[key] = StoryTask(story_key=key, epic=1, phase=phase, attempt=attempt)
+    engine.state.tasks["c"] = StoryTask(story_key="c", epic=1, phase=Phase.ESCALATED, attempt=2)
+    assert unresolved_escalation_keys(engine.state) == ["b", "c"]
+    assert engine._unresolved_escalation_key() == "b"
+
+
 def test_run_without_an_escalation_still_finishes(project):
     """DW-386's guard is inert when no task is ESCALATED."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})

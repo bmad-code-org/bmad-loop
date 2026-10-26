@@ -4599,6 +4599,44 @@ def _adoptable(tmp_path):
     return run_dir, wt
 
 
+def test_adopt_admits_cleared_escalation_pause(tmp_path):
+    """#958: a resume clears the pause before its engine starts, so an engine exit
+    before run end leaves the pause null with the task still ESCALATED. Adoption
+    admits that run and defaults to the unresolved escalation, as at the pause.
+
+    Ablation, performed: restore the stage-only `paused_stage != PAUSE_ESCALATION`
+    gate in `adopt_escalated_branch` and this reddens."""
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.clear_pause()
+    save_state(run_dir, state)
+
+    assert runs.adopt_escalated_branch(run_dir) == "bmad-loop/r1/1-1-a"
+
+    task = load_state(run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.COMMITTING and task.adopt_pending is True
+
+
+def test_adopt_refuses_a_finished_run_with_its_escalation_still_recorded(tmp_path):
+    """#958: the null-stage admission excludes a finished run, whose ESCALATED task
+    is a closed record (an abandoned replay run keeps one), not an escalation a
+    human still owes: refused as not paused, state untouched.
+
+    Ablation, performed: drop `not state.finished` from `escalation_resolvable`'s
+    null-stage arm and this reddens (the adoption goes through)."""
+    run_dir, _wt = _adoptable(tmp_path)
+    state = load_state(run_dir)
+    state.clear_pause()
+    state.finished = True
+    save_state(run_dir, state)
+    before = (run_dir / "state.json").read_bytes()
+
+    with pytest.raises(runs.RearmError, match=r"not paused at an escalation \(stage: none\)"):
+        runs.adopt_escalated_branch(run_dir)
+
+    assert (run_dir / "state.json").read_bytes() == before
+
+
 def test_adopt_under_lock_refuses_a_task_no_longer_escalated(tmp_path):
     """DW-386: the locked re-check, not the CLI's lock-free early exit, is what stops
     a stale adopt gesture from latching a task a rival already moved.
