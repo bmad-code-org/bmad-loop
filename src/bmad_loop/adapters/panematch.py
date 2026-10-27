@@ -75,8 +75,8 @@ class MatchTimeout:
 
 def screen_rows(screen: str) -> list[str]:
     """``screen`` as its physical rows, with ANSI and terminal-control sequences
-    stripped and a bare CR read as a row break."""
-    return _ANSI_RE.sub("", screen.replace("\r", "\n")).split("\n")
+    stripped, a CRLF read as one row break and a bare CR as another."""
+    return _ANSI_RE.sub("", screen.replace("\r\n", "\n").replace("\r", "\n")).split("\n")
 
 
 def _joins(window: Sequence[str]) -> list[str]:

@@ -159,3 +159,15 @@ def test_window_pass_timeout_returns_at_once():
 
 def test_no_match_is_none():
     assert _match(screen_rows("\x1b[1mhello\x1b[0m\r\nworld\n")) is None
+
+
+def test_crlf_is_one_row_break():
+    """A CRLF capture splits into the same rows as an LF one, so a footer wrapped
+    across three rows still fits the window pass; a bare CR stays a break.
+
+    ABLATION: fold only `\\r` to `\\n` in `screen_rows` and every CRLF grows a
+    blank row, pushing the three-row wrap past `MAX_WINDOW_ROWS`."""
+    assert screen_rows("a\r\nb\rc\n") == ["a", "b", "c", ""]
+    rows = [" Enter to confirm", "· Esc to", "cancel"]
+    found = _match(screen_rows("\r\n".join(rows)))
+    assert isinstance(found, Hit)
