@@ -34,12 +34,12 @@ Escalations come in two severities:
 
 Some escalation pauses are not a contradiction in the spec, and their notices say so by reason:
 
-| Reason starts with                       | Notice title                          | Cause                                                                                           |
-| ---------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `parked: `                               | `Paused (parked prompt): <story>`     | the session waited on a prompt only a human should answer                                       |
-| `no work produced: `                     | `Paused (no work): <story>`           | a dev, review, fix, triage, migration or blocking-workflow session ended without producing work |
-| `usage limit: `                          | `Paused (usage limit): <story>`       | the coding CLI hit a [usage limit](#usage-limit-pauses)                                         |
-| `environment fault: `, or a verify fault | `Paused (environment fault): <story>` | an [environment fault](#environment-faults) during the story                                    |
+| Reason starts with                      | Notice title                          | Cause                                                                                           |
+| --------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `parked:`                               | `Paused (parked prompt): <story>`     | the session waited on a prompt only a human should answer                                       |
+| `no work produced:`                     | `Paused (no work): <story>`           | a dev, review, fix, triage, migration or blocking-workflow session ended without producing work |
+| `usage limit:`                          | `Paused (usage limit): <story>`       | the coding CLI hit a [usage limit](#usage-limit-pauses)                                         |
+| `environment fault:`, or a verify fault | `Paused (environment fault): <story>` | an [environment fault](#environment-faults) during the story                                    |
 
 Every other reason keeps the `CRITICAL escalation: <story>` title. Fix the cause (answer or dismiss the prompt, check the CLI's login, credits or permission mode), then resolve as below.
 
