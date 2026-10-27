@@ -90,9 +90,9 @@ def parked_prompt(
     reads as unrecorded. Never raises on a malformed entry."""
     parked: ParkedPrompt | None = None
     for entry in journal_entries[start + 1 :]:
-        if (
-            not isinstance(entry, dict) or str(entry.get("task_id")) != task_id
-        ):  # pyright: ignore[reportUnnecessaryIsInstance]
+        if not isinstance(entry, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+            continue
+        if str(entry.get("task_id")) != task_id:
             continue
         kind = entry.get("kind")
         if kind == "session-parked":

@@ -664,6 +664,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "budget_weighted",
         "bundles",
         "bundles_not_run",
+        # `parked-answered` (#855): who answered the parked prompt, the constant
+        # "tui".
+        "by",
         "cache_read_weight",
         "cache_read_weight_was",
         "cap",
@@ -671,6 +674,8 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # wait cap in seconds (`SessionSpec.quota_wait_max_s`) — a measured float.
         "cap_s",
         "checkout_dirty",
+        # `parked-answered` (#855): the closed answer slug, approve or deny.
+        "choice",
         "checkpoint",
         "code_root_changed",
         "command_index",
@@ -1675,6 +1680,10 @@ JOURNAL_KINDS = frozenset(
         # `RunState` has no recorded run-dir identity or a renumbered device. Its
         # one field, `reason`, is a drop field.
         "journal-unpinned",
+        # parked_answer.py — an operator's answer to a parked permission prompt,
+        # sent from the TUI (#855): `task_id` (routed), the closed `choice`
+        # (approve/deny) and the constant `by` (declared benign).
+        "parked-answered",
         # plugins/bus.py
         "plugin-hook",
         "plugin-hook-error",

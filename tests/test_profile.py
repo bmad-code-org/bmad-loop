@@ -10,6 +10,7 @@ from bmad_loop.adapters import profile as profile_mod
 from bmad_loop.adapters.profile import (
     CLIProfile,
     HookSpec,
+    ParkedAnswersSpec,
     ProfileError,
     get_profile,
     load_profiles,
@@ -460,6 +461,130 @@ def test_auto_deny_pattern_without_its_named_groups_is_a_profile_error(tmp_path)
     )
     with pytest.raises(ProfileError, match="missing sec"):
         load_profiles(tmp_path)
+
+
+# The screen in the #855 report, the countdown line split like the profile
+# comment so this file never quotes it whole.
+_CAPTURED_855_SCREEN = (
+    'Dangerous rm operation on possibly-empty variable path: "$P/[refId]" ...\n'
+    f"{_CAPTURED_AUTO_DENY_LINE}\n"
+    "\n"
+    "Do you want to proceed?\n"
+    "❯ 1. Yes\n"
+    "  2. No\n"
+)
+# Claude Code's bypass startup dialog: Enter there confirms the focused "No, exit".
+_BYPASS_DIALOG_SCREEN = (
+    # split so this file never holds the heading claude's parked pattern matches
+    "WARNING: Claude Code running in Bypass Permissions mod" + "e\n"
+    "\n"
+    "❯ 1. No, exit\n"
+    "  2. Yes, I accept\n"
+)
+
+_PARKED_ANSWERS_TABLE = """
+[parked_answers]
+approve = ["Enter"]
+deny = ["Escape"]
+approve_guard = ['Do you want']
+deny_guard = ['Do you want']
+"""
+
+
+def test_parked_answers_table_parses_into_its_spec(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE + _PARKED_ANSWERS_TABLE, encoding="utf-8"
+    )
+    assert load_profiles(tmp_path)["mycli"].parked_answers == ParkedAnswersSpec(
+        approve=("Enter",),
+        deny=("Escape",),
+        approve_guard=("Do you want",),
+        deny_guard=("Do you want",),
+    )
+    # absent table: no answer keys
+    assert get_profile("gemini").parked_answers is None
+
+
+@pytest.mark.parametrize(
+    ("table", "match"),
+    [
+        (_PARKED_ANSWERS_TABLE + "confirm = ['y']\n", "unknown keys"),
+        (_PARKED_ANSWERS_TABLE.replace('["Enter"]', '"Enter"'), "approve must be a list"),
+        (_PARKED_ANSWERS_TABLE.replace('["Enter"]', '["Return"]'), "approve must list named keys"),
+        (
+            _PARKED_ANSWERS_TABLE.replace('["Escape"]', '["Escape", "q"]'),
+            "deny must list named keys",
+        ),
+        (
+            _PARKED_ANSWERS_TABLE.replace("deny_guard = ['Do you want']", "deny_guard = []"),
+            "deny_guard must list at least one",
+        ),
+        (
+            _PARKED_ANSWERS_TABLE.replace(
+                "approve_guard = ['Do you want']", "approve_guard = ['(']"
+            ),
+            "approve_guard entry is not a valid regex",
+        ),
+        ("parked_answers = 1\n", "must be a table"),
+    ],
+)
+def test_malformed_parked_answers_is_a_profile_error(tmp_path, table, match):
+    """Every shape and value fault refuses the profile at load rather than
+    offering keys that would press something unvetted, or on any screen.
+
+    ABLATION: drop the matching check (`_parse_profile` unknown keys, the
+    ALLOWED_KEYS membership, the empty-guard or compile check in
+    `_validate_profile`) and its case loads."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    body = (
+        MINIMAL_PROFILE.replace("[hooks]", table + "[hooks]")
+        if table.startswith("parked_answers =")
+        else MINIMAL_PROFILE + table
+    )
+    (profiles_dir / "mycli.toml").write_text(body, encoding="utf-8")
+    with pytest.raises(ProfileError, match=match):
+        load_profiles(tmp_path)
+
+
+def test_shipped_claude_answer_guards_match_the_captured_855_screen():
+    """Approve (Enter) and deny (Escape) guards both match the #855 prompt; on
+    the bypass startup dialog — where Enter chooses "No, exit" and Escape exits —
+    neither does; and no guard matches its own claude.toml line, alone or
+    wrapped (`procee[d]`, `1[.]`)."""
+    import regex
+
+    from bmad_loop.adapters.panematch import Hit, match_rows, screen_rows
+
+    answers = get_profile("claude").parked_answers
+    assert answers is not None
+    assert (answers.approve, answers.deny) == (("Enter",), ("Escape",))
+
+    def all_match(screen, guards):
+        rows = screen_rows(screen)
+        return all(
+            isinstance(match_rows(rows, [regex.compile(g)], timeout=2.0), Hit) for g in guards
+        )
+
+    assert all_match(_CAPTURED_855_SCREEN, answers.approve_guard)
+    assert all_match(_CAPTURED_855_SCREEN, answers.deny_guard)
+    assert not all_match(_BYPASS_DIALOG_SCREEN, answers.approve_guard)
+    assert not all_match(_BYPASS_DIALOG_SCREEN, answers.deny_guard)
+    # focus moved to "2. No": approve's Enter would deny, so approve refuses
+    moved = _CAPTURED_855_SCREEN.replace("❯ 1. Yes", "  1. Yes").replace("  2. No", "❯ 2. No")
+    assert not all_match(moved, answers.approve_guard)
+
+    patterns = [regex.compile(g) for g in (*answers.approve_guard, *answers.deny_guard)]
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    assert [line for line in text.splitlines() if any(p.search(line) for p in patterns)] == []
+    assert _wrapped_hits(text, patterns) == []
 
 
 def test_only_claude_seeds_usage_patterns():
@@ -1502,6 +1627,17 @@ def test_profile_scan_failure_degrades(profile_scan):
         # the #855 auto-deny countdown: it must compile and name `min` + `sec`
         ({"auto_deny_patterns": ("deny(unbalanced",)}, "auto_deny_patterns"),
         ({"auto_deny_patterns": ("deny in (?P<min>[0-9]+)",)}, "'min' and 'sec'"),
+        # the #855 answer keys: allowed named keys, non-empty compiling guards
+        ({"parked_answers": ParkedAnswersSpec(("y",), ("Escape",), ("x",), ("x",))}, "approve"),
+        ({"parked_answers": ParkedAnswersSpec(("Enter",), (), ("x",), ("x",))}, "deny"),
+        (
+            {"parked_answers": ParkedAnswersSpec(("Enter",), ("Escape",), (), ("x",))},
+            "approve_guard must list",
+        ),
+        (
+            {"parked_answers": ParkedAnswersSpec(("Enter",), ("Escape",), ("x",), ("(",))},
+            "deny_guard entry is not a valid regex",
+        ),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
         ({"usage_grace_s": -1.0}, "usage_grace_s"),

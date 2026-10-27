@@ -159,6 +159,14 @@ def _spec(tmp_path):
     )
 
 
+def test_a_backend_without_send_keys_inherits_the_seam_refusal():
+    """A backend written before #855 (StubMux overrides no `send_keys`) still
+    constructs, and pressing keys raises the seam error the answer path reads as
+    a refusal — never a silent no-op that looks like a delivered answer."""
+    with pytest.raises(MultiplexerError, match="StubMux cannot send named keys"):
+        StubMux().send_keys("@1", "Enter")
+
+
 def test_window_alive_matches_a_session_qualified_id(monkeypatch):
     """A tmux-family backend may mint `session:@N` ids (psmux does, and a plugin
     subclass may too) while list-panes rows carry bare `@N`; the base compares

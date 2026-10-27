@@ -35,6 +35,9 @@ APP_ACTIONS = [
     "toggle_dark",
 ]
 DASHBOARD_ACTIONS = ["copy_pane", "resize_mode", "unpin_log"]
+# Dashboard actions check_action gates off until a live parked prompt is
+# answerable (#855), so they are in PALETTE but not listed on a fresh dashboard.
+GATED_DASHBOARD_ACTIONS = ["approve_parked", "deny_parked"]
 SETTINGS_ACTIONS = ["save", "toggle_all", "back"]
 MODAL_ACTIONS = ["cancel", "toggle_detail"]
 
@@ -77,7 +80,7 @@ def test_every_binding_is_in_palette_or_excluded():
     # The tables cover exactly the planned commands, so a PALETTE entry for a
     # (still bound) key cannot silently move to EXCLUDED.
     assert sorted(commands.PALETTE) == sorted(
-        APP_ACTIONS + DASHBOARD_ACTIONS + SETTINGS_ACTIONS + MODAL_ACTIONS
+        APP_ACTIONS + DASHBOARD_ACTIONS + GATED_DASHBOARD_ACTIONS + SETTINGS_ACTIONS + MODAL_ACTIONS
     )
 
 
@@ -89,7 +92,7 @@ async def test_dashboard_palette_lists_app_and_dashboard_commands(project):
         for action in APP_ACTIONS + DASHBOARD_ACTIONS:
             assert _title(action) in titles, action
         assert {"Quit", "Theme"} <= titles  # Textual's built-ins stay
-        for action in SETTINGS_ACTIONS + MODAL_ACTIONS:
+        for action in SETTINGS_ACTIONS + MODAL_ACTIONS + GATED_DASHBOARD_ACTIONS:
             assert _title(action) not in titles, action
         # One entry per action even when it has several live keys.
         listed = [c.title for c in app.get_system_commands(app.screen)]

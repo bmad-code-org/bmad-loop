@@ -12677,6 +12677,54 @@ def test_send_text_types_into_a_pane_not_in_mode(monkeypatch, force_tmux_backend
     ]
 
 
+def test_send_keys_presses_named_keys_without_l_or_enter(monkeypatch, force_tmux_backend):
+    """#855: one `send-keys -t <pane> <key>` per key, looked up as a key name (no
+    `-l`) and nothing appended — Escape alone must not become Escape + Enter.
+    Ablation: reuse send_text's `-l` + trailing Enter and this fails."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _scripted_tmux(monkeypatch, "0\n")
+    get_multiplexer().send_keys("@7.%9", "Escape")
+    assert calls == [
+        ["tmux", "-u", "display-message", "-p", "-t", "@7.%9", "#{pane_in_mode}"],
+        ["tmux", "-u", "send-keys", "-t", "@7.%9", "Escape"],
+    ]
+
+
+def test_send_keys_refuses_a_pane_in_mode(monkeypatch, force_tmux_backend):
+    """#949's refusal holds for named keys too: a mode would read Enter or Escape
+    as mode keys (Escape leaves copy mode), so nothing is pressed.
+    Ablation: drop the `#{pane_in_mode}` check and a key is pressed."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _scripted_tmux(monkeypatch, "1\n")
+    with pytest.raises(MultiplexerError, match="pane mode"):
+        get_multiplexer().send_keys("@7.%9", "Enter")
+    assert [c for c in calls if "send-keys" in c] == []
+
+
+@pytest.mark.parametrize("keys", [("y",), ("C-c",), ("Enter", "q"), ("go on",)])
+def test_send_keys_refuses_a_key_outside_the_allowed_set(monkeypatch, force_tmux_backend, keys):
+    """Only Enter and Escape: anything else is refused before tmux is asked
+    anything, so a mixed list presses none of its keys.
+    Ablation: drop the ALLOWED_KEYS check and the key is pressed."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _scripted_tmux(monkeypatch, "0\n")
+    with pytest.raises(MultiplexerError, match="refusing to send keys"):
+        get_multiplexer().send_keys("@7.%9", *keys)
+    assert calls == []
+
+
+def test_the_seam_default_send_keys_raises_the_seam_error():
+    """`TerminalMultiplexer.send_keys` is non-abstract so released backends keep
+    loading; its default refuses, which the answer path reads as "not sent"."""
+    from bmad_loop.adapters.multiplexer import TerminalMultiplexer
+
+    with pytest.raises(MultiplexerError, match="cannot send named keys"):
+        TerminalMultiplexer.send_keys(object(), "@1", "Enter")  # type: ignore[arg-type]
+
+
 class _PinningMux(_LaunchingUnitMux):
     def __init__(self, pin):
         super().__init__()

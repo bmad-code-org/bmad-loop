@@ -57,6 +57,11 @@ class MultiplexerError(Exception):
 # from one whose command is still running, which neither the pane's pid nor its
 # current command can: both name the parking shell either way (#876).
 PARKED_BANNER = "[bmad-loop exited {ec} — press enter]"
+# The named keys :meth:`TerminalMultiplexer.send_keys` may press. Closed on
+# purpose: an operator answering a parked prompt from the dashboard (#855) needs
+# only confirm (Enter) and decline (Escape), and a backend refuses anything else
+# rather than typing a key it was never asked to vouch for.
+ALLOWED_KEYS: Final = frozenset({"Enter", "Escape"})
 # Matched against the screen with all whitespace removed (see parked_screen).
 # The dash, and only these spellings of it: the real em dash; its UTF-8 bytes
 # read as cp1252 (`â€”`); the escapes of the capture's backslashreplace decode,
@@ -437,6 +442,22 @@ class TerminalMultiplexer(ABC):
         the caller treats exactly like a clean screen. A backend that can read
         its pane overrides this."""
         raise MultiplexerError(f"{type(self).__name__} cannot capture a pane's visible screen")
+
+    def send_keys(self, target: str, *keys: str) -> None:
+        """Press each named key of ``keys`` in order in the pane ``target`` names
+        (a window id or a :meth:`pane_target`).
+
+        Named keys only, each one of :data:`ALLOWED_KEYS`, never literal text,
+        and no implicit Enter: what is sent is exactly ``keys``. Raises
+        :class:`MultiplexerError` instead of pressing anything when a key is not
+        allowed or the target pane is in a mode (copy, clock, ...) that would
+        swallow the keys, as :meth:`send_text` does (#949).
+
+        NON-abstract so released out-of-tree backends keep working unchanged:
+        the default raises :class:`MultiplexerError` ("cannot send keys"), and
+        the caller reads that as a refusal. A backend that can press keys
+        overrides this."""
+        raise MultiplexerError(f"{type(self).__name__} cannot send named keys to a pane")
 
     # ----------------------------------------------------- client / attach
 

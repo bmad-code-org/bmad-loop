@@ -140,6 +140,21 @@ auto_deny_patterns = [
   'automatically deny this reques[t] in (?P<min>[0-9]+):(?P<sec>[0-9]{2})',
 ]
 
+# Answer keys for a parked permission prompt, offered in the TUI as Y (approve)
+# and N (deny). The keys go out only when a fresh capture of the visible pane
+# matches EVERY guard of that choice: Enter confirms whatever option is focused
+# (on the bypass startup dialog that is "No, exit") and Escape there exits
+# Claude, so both choices require the prompt's own question, and approve also
+# requires the focus marker on option 1. Guards come from the screen captured
+# in the #855 report (the question line, then the focused option 1 "Yes" over
+# option 2 "No"); the `[d]` and `[.]` brackets keep each pattern from matching
+# its own line here.
+[parked_answers]
+approve = ["Enter"]
+deny = ["Escape"]
+approve_guard = ['Do you want to procee[d]\?', '❯ 1[.] Yes']
+deny_guard = ['Do you want to procee[d]\?']
+
 # Force Claude Code's classic (inline/scrollback) renderer. The fullscreen TUI
 # (research preview, alt-screen ?1049h like vim/htop) repaints in place, so the
 # tmux pane capture only ever holds the final frame and the Log tab shows a single

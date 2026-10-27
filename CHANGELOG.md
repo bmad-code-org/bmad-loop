@@ -124,6 +124,8 @@ breaking changes may land in a minor release.
   prompt, with the CLI's auto-deny deadline (`auto_deny_patterns` profile key) (#855).
 - Show a session parked on a permission prompt, and its auto-deny countdown, in the TUI
   header and Log pane (#855).
+- Answer a parked permission prompt from the TUI (`Y` approve, `N` deny), sent only while
+  a fresh pane capture still shows the prompt (`[parked_answers]` profile table) (#855).
 
 ### Changed
 

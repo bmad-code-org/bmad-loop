@@ -50,6 +50,7 @@ from ..platform_util import (
 )
 from ..policy import PROFILE_ALIASES
 from .entrypoints import record_load_error
+from .multiplexer import ALLOWED_KEYS
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
 # The subagent transcript tree a usage parser's CLI writes beside its session
@@ -135,6 +136,25 @@ class WorkspaceTrustSpec:
 
     settings_path: str  # "~/"-prefixed, e.g. "~/.gemini/antigravity-cli/settings.json"
     key: str  # a top-level key holding a list of path strings
+
+
+@dataclass(frozen=True)
+class ParkedAnswersSpec:
+    """The keys that answer a parked permission prompt from the dashboard (#855).
+
+    ``approve`` / ``deny`` are named keys (each one of
+    :data:`~.multiplexer.ALLOWED_KEYS`) pressed in order with no implicit Enter.
+    ``approve_guard`` / ``deny_guard`` are regexes that must ALL match a fresh
+    capture of the visible pane before that choice's keys are sent: the same
+    keys answer other dialogs differently (Enter on Claude Code's bypass startup
+    dialog chooses "No, exit"), so a screen that is not plainly the prompt sends
+    nothing. Both guard lists are non-empty and compile; validated in
+    :func:`_validate_profile`."""
+
+    approve: tuple[str, ...]
+    deny: tuple[str, ...]
+    approve_guard: tuple[str, ...]
+    deny_guard: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -296,6 +316,10 @@ class CLIProfile:
     # validated at parse time; empty = no deadline is ever read. APPENDED after
     # usage_wait_patterns for the same positional-compatibility reason.
     auto_deny_patterns: tuple[str, ...] = ()
+    # The keys that answer a parked permission prompt from the TUI (#855); None =
+    # the CLI offers no answer keys and the operator attaches to answer. APPENDED
+    # after auto_deny_patterns for the same positional-compatibility reason.
+    parked_answers: ParkedAnswersSpec | None = None
 
     @property
     def hookless(self) -> bool:
@@ -633,6 +657,30 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 f"(missing {', '.join(missing)})"
             )
 
+    answers = profile.parked_answers
+    if answers is not None:
+        for field_name in ("approve", "deny"):
+            keys = getattr(answers, field_name)
+            bad = [key for key in keys if key not in ALLOWED_KEYS]
+            if not keys or bad:
+                raise fail(
+                    f"parked_answers.{field_name} must list named keys from "
+                    f"{sorted(ALLOWED_KEYS)}: got {list(keys)!r}"
+                )
+        for field_name in ("approve_guard", "deny_guard"):
+            guards = getattr(answers, field_name)
+            # Empty would let the keys out on any screen, the one thing a guard
+            # exists to stop.
+            if not guards:
+                raise fail(f"parked_answers.{field_name} must list at least one pattern")
+            for pattern in guards:
+                try:
+                    regex.compile(pattern)  # same engine the answer guard matches with
+                except (regex.error, RecursionError) as e:
+                    raise fail(
+                        f"parked_answers.{field_name} entry is not a valid regex: {pattern!r} ({e})"
+                    ) from e
+
 
 def _legacy_adapter_default(dialect: str) -> str:
     """The adapter kind a TOML profile that predates the ``adapter`` field meant.
@@ -707,6 +755,25 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             raise fail("workspace_trust.settings_path and workspace_trust.key must be strings")
         workspace_trust = WorkspaceTrustSpec(settings_path=settings_path, key=key)
 
+    # Same shape-only rule as workspace_trust: four string lists, values in
+    # `_validate_profile`.
+    answers_d = doc.get("parked_answers")
+    parked_answers: ParkedAnswersSpec | None = None
+    if answers_d is not None:
+        if not isinstance(answers_d, dict):
+            raise fail("parked_answers must be a table")
+        answer_keys = ("approve", "deny", "approve_guard", "deny_guard")
+        unknown = sorted(set(answers_d) - set(answer_keys))
+        if unknown:
+            raise fail(f"parked_answers has unknown keys: {unknown}")
+        lists: dict[str, tuple[str, ...]] = {}
+        for key in answer_keys:
+            raw = answers_d.get(key, [])
+            if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+                raise fail(f"parked_answers.{key} must be a list of strings")
+            lists[key] = tuple(raw)
+        parked_answers = ParkedAnswersSpec(**lists)
+
     # A dedicated shape check rather than the `str()` coercion the neighbouring
     # scalars get, because `adapter` has no parse-time membership test to land in
     # afterwards: `str(["x"])` would coerce a TOML array to the literal `"['x']"`
@@ -768,6 +835,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         auto_deny_patterns=str_list("auto_deny_patterns"),
         workspace_trust=workspace_trust,
         subagent_transcript_dir=raw_subagent_dir,
+        parked_answers=parked_answers,
     )
     _validate_profile(profile, source)
     return profile

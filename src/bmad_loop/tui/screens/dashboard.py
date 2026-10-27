@@ -35,8 +35,12 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option, OptionDoesNotExist
 
+from ... import parked_answer
 from ... import policy as policy_mod
 from ... import sprintstatus, stories
+from ...adapters import multiplexer
+from ...adapters.multiplexer import MultiplexerError
+from ...adapters.profile import ProfileError, get_profile
 from ...model import RunState, StoryTask
 from ...runs import RUNS_DIR
 from .. import data, launch
@@ -69,6 +73,7 @@ _HSPLITS = ("#split-runs", "#split-deferred", "#split-tasks")
 # Resize-mode actions gated off (key passes through to the focused widget) unless
 # the mode is active. Tab/Shift+Tab are intentionally absent: they stay live and
 # delegate to focus movement when not resizing.
+_PARKED_ACTIONS = frozenset({"approve_parked", "deny_parked"})
 _RESIZE_ACTIONS = frozenset(
     {"resize_up", "resize_down", "resize_left", "resize_right", "resize_done"}
 )
@@ -116,6 +121,10 @@ class _PollContext:
         self.log: data.LogView | None = None
         self.log_task: str | None = None
         self.log_parked = False  # the Log pane last rendered the parked-prompt note
+        # (adapter, parked_since) the answerable flag was resolved for, and that
+        # flag: the profile is read once per park, not on every tick (#855)
+        self.parked_key: tuple[str, float] | None = None
+        self.parked_answerable = False
         self.attention_seen = 0
         self.first_poll = True
         self.decision_toasted: str | None = None  # dw_id already announced
@@ -153,6 +162,7 @@ class _Snapshot:
     log_transcript: str | None = None  # agent JSONL transcript, when an altscreen log has one
     log_scan_fault: str | None = None  # the altscreen prefix scan could not read the log
     log_parked: bool = False  # the log task is parked on a permission prompt (#855)
+    parked_answerable: bool = False  # the live park's profile has [parked_answers] (#855)
     attention_reset: bool = False
     new_attention: str = ""
     toast_attention: bool = False
@@ -164,6 +174,10 @@ class DashboardScreen(Screen[None]):
     BINDINGS = [
         Binding("escape", "unpin_log", "follow log", show=False),
         Binding("y", "copy_pane", "copy"),
+        # Answer a parked permission prompt (#855); check_action hides both unless
+        # the live session is parked and its profile has [parked_answers].
+        Binding("Y", "approve_parked", "approve"),
+        Binding("N", "deny_parked", "deny"),
         Binding("ctrl+w", "resize_mode", "resize"),
         # Priority so they beat the focused table/tree/list in resize mode;
         # check_action() disables them (key passes through) when not resizing.
@@ -227,6 +241,7 @@ class DashboardScreen(Screen[None]):
         self._pending_jump: tuple[str, int] | None = None  # (task_id, log_pos)
         self._log_follow_tail = True  # stick to newest log lines until a jump pins us
         self._runs_fault: str | None = None  # last listing fault toasted (DW-468)
+        self._parked_answerable = False  # Y/N live: see check_action (#855)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -464,6 +479,45 @@ class DashboardScreen(Screen[None]):
         self._log_follow_tail = True
         self._tick(force_rescan=False)
 
+    def action_approve_parked(self) -> None:
+        self._answer_parked("approve")
+
+    def action_deny_parked(self) -> None:
+        self._answer_parked("deny")
+
+    def _answer_parked(self, choice: parked_answer.Choice) -> None:
+        # The answer path re-checks everything on a fresh capture; this only
+        # refuses early when there is no backend or no run to answer in.
+        if not launch.mux_available():
+            self.notify("multiplexer backend unavailable — cannot answer", severity="error")
+            return
+        run_id = self.selected_run_id
+        if run_id is None:
+            self.notify("no run selected", severity="warning")
+            return
+        self._answer_parked_worker(run_id, choice)
+
+    @work(thread=True, exclusive=True, group="parked-answer")
+    def _answer_parked_worker(self, run_id: str, choice: parked_answer.Choice) -> None:
+        # Worker thread: the capture and send are mux round-trips, and notify()
+        # is marshalled back to the UI thread.
+        try:
+            outcome = parked_answer.answer(
+                self.project, run_id, choice, mux=multiplexer.get_multiplexer()
+            )
+        except MultiplexerError as e:
+            outcome = parked_answer.AnswerOutcome(False, str(e))
+        if outcome.sent:
+            self.app.call_from_thread(self.notify, outcome.reason, markup=False)
+        else:
+            self.app.call_from_thread(
+                self.notify,
+                f"{choice} not sent: {outcome.reason} — attach (a) to answer",
+                severity="warning",
+                markup=False,
+                timeout=10,
+            )
+
     def action_copy_pane(self) -> None:
         """Copy the whole Log/Attention pane to the clipboard (mouse-free
         alternative to click-drag + ctrl+c). Only the two RichLog tabs hold
@@ -678,6 +732,8 @@ class DashboardScreen(Screen[None]):
         # widget (Tab/Shift+Tab stay live — see action_resize_cycle).
         if action in _RESIZE_ACTIONS and not self._resize_mode:
             return False
+        if action in _PARKED_ACTIONS and not self._parked_answerable:
+            return False
         return True
 
     def action_resize_mode(self) -> None:
@@ -836,6 +892,7 @@ class DashboardScreen(Screen[None]):
                 )
                 # The parked note sits above the log, so a park opening or closing
                 # re-renders the pane even on a tick the log itself did not grow.
+                snap.parked_answerable = self._parked_answerable_in(ctx, live)
                 parked_changed = snap.log_parked != ctx.log_parked
                 ctx.log_parked = snap.log_parked
                 if ctx.log is not None and (ctx.log.read_new() or snap.log_reset or parked_changed):
@@ -865,7 +922,31 @@ class DashboardScreen(Screen[None]):
         finally:
             self._poll_lock.release()
 
+    def _parked_answerable_in(self, ctx: _PollContext, live: data.ActiveAgent | None) -> bool:
+        """Whether `live` is parked on a permission prompt its profile can answer
+        (`[parked_answers]`). Worker-side; the profile is resolved once per park.
+        A profile that will not resolve offers no keys, and the operator still
+        has attach."""
+        if live is None or live.parked_since is None:
+            ctx.parked_key, ctx.parked_answerable = None, False
+            return False
+        key = (live.name, live.parked_since)
+        if key != ctx.parked_key:
+            ctx.parked_key = key
+            try:
+                profile = get_profile(live.name, self.project)
+            except (ProfileError, OSError):
+                ctx.parked_answerable = False
+            else:
+                ctx.parked_answerable = profile.parked_answers is not None
+        return ctx.parked_answerable
+
     # ------------------------------------------------------------ applying
+
+    def _set_parked_answerable(self, answerable: bool) -> None:
+        if answerable != self._parked_answerable:
+            self._parked_answerable = answerable
+            self.refresh_bindings()
 
     def _apply(self, snap: _Snapshot) -> None:
         # A thread-worker poll delivers its snapshot here via call_from_thread; that
@@ -882,8 +963,11 @@ class DashboardScreen(Screen[None]):
             self._apply_sprint_tree(snap.sprint)
             self._apply_deferred(snap.deferred)
             self._apply_missed_decisions(snap.missed_decisions, snap.missed_decisions_fault)
+        if not snap.has_run:
+            self._set_parked_answerable(False)
         if not snap.has_run or snap.generation != self._generation:
             return  # selection changed mid-poll: per-run parts are stale
+        self._set_parked_answerable(snap.parked_answerable)
 
         self._decision = snap.decision
         header = self.query_one("#runheader", RunHeader)
@@ -949,7 +1033,11 @@ class DashboardScreen(Screen[None]):
                 # The session is parked on a permission prompt (#855): the pane
                 # below shows the dialog, and nothing moves until it is answered
                 # in the session's window or the CLI's countdown denies it.
-                note = "⚠ parked on a permission prompt — a attach to answer"
+                note = "⚠ parked on a permission prompt — " + (
+                    "Y approve · N deny · a attach"
+                    if snap.parked_answerable
+                    else "a attach to answer"
+                )
                 log.write(Text(note, style="yellow"), scroll_end=False)
             if snap.log_altscreen:
                 # A fullscreen (alt-screen) TUI repaints in place, so the emulated

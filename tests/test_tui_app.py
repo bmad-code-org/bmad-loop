@@ -1088,7 +1088,8 @@ async def test_log_pane_shows_emulated_content(project_tree):
 
 async def test_log_pane_notes_a_parked_permission_prompt(project_tree):
     """#855: while the log task's session is parked on a permission prompt, the
-    Log pane leads with a yellow note pointing at the attach key; another task's
+    Log pane leads with a yellow note pointing at the answer keys (claude has
+    `[parked_answers]`) and the attach key; another task's
     park, or a log pinned to another task, leaves it out, and a `session-unparked` takes it down again even when
     the log itself did not grow.
 
@@ -1122,7 +1123,7 @@ async def test_log_pane_notes_a_parked_permission_prompt(project_tree):
 
         journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
         screen._tick(force_rescan=False)
-        note = "⚠ parked on a permission prompt — a attach to answer"
+        note = "⚠ parked on a permission prompt — Y approve · N deny · a attach"
         await until(pilot, lambda: note in text())
         lines = text().splitlines()
         assert lines[0] == "— story-1.log —" and lines[1] == note
@@ -1141,6 +1142,94 @@ async def test_log_pane_notes_a_parked_permission_prompt(project_tree):
         screen._tick(force_rescan=False)
         await until(pilot, lambda: "parked on a permission prompt" not in text())
         assert "done in 3s" in text()
+
+
+def _parked_keys(screen) -> set[str]:
+    return {
+        key
+        for key, active in screen.active_bindings.items()
+        if active.enabled and active.binding.action in ("approve_parked", "deny_parked")
+    }
+
+
+async def test_parked_answer_keys_follow_the_live_prompt(project_tree, monkeypatch):
+    """#855: Y/N are offered only while the live session is parked on a prompt
+    its profile can answer; Y runs `parked_answer.answer` for the selected run and
+    toasts the outcome, a refusal points at attach, and an unpark withdraws both.
+
+    ABLATION: return True from `check_action` for the parked actions and the
+    first `_parked_keys` assertion fails."""
+    from bmad_loop import parked_answer
+
+    root = project_tree.project
+    run_id = "20260611-100000-aaaa"
+    run_dir = make_run(root, run_id, alive=True)
+    journal = Journal(run_dir)
+    journal.append("session-start", task_id="story-1", role="dev", adapter="claude")
+    calls: list[tuple[object, str, str]] = []
+    outcomes = {
+        "approve": parked_answer.AnswerOutcome(True, "sent approve (Enter) to story-1"),
+        "deny": parked_answer.AnswerOutcome(False, "the pane does not show the prompt"),
+    }
+
+    def fake_answer(project, rid, choice, *, mux):
+        calls.append((project, rid, choice))
+        return outcomes[choice]
+
+    monkeypatch.setattr(parked_answer, "answer", fake_answer)
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == run_id)
+        screen._tick(force_rescan=False)
+        await pilot.pause()
+        assert _parked_keys(screen) == set()
+        assert not screen.check_action("approve_parked", ())
+
+        journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: _parked_keys(screen) == {"Y", "N"})
+
+        await pilot.press("Y")
+        await until(pilot, lambda: any("sent approve" in e.message for e in emitted(app)))
+        assert calls == [(root, run_id, "approve")]
+
+        await pilot.press("N")
+        await until(pilot, lambda: any("deny not sent" in e.message for e in emitted(app)))
+        (refused,) = (e for e in emitted(app) if "deny not sent" in e.message)
+        assert "attach (a) to answer" in refused.message
+        assert refused.severity == "warning"
+
+        journal.append("session-unparked", task_id="story-1", how="stop")
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: _parked_keys(screen) == set())
+
+
+async def test_parked_answer_keys_stay_hidden_without_parked_answers(project_tree):
+    """A park whose profile has no `[parked_answers]` (gemini) offers no keys,
+    and the Log note keeps pointing at attach only."""
+    root = project_tree.project
+    run_id = "20260611-100000-aaaa"
+    run_dir = make_run(root, run_id, alive=True)
+    (run_dir / "logs").mkdir()
+    (run_dir / "logs" / "story-1.log").write_bytes(b"working\r\n")
+    journal = Journal(run_dir)
+    journal.append("session-start", task_id="story-1", role="dev", adapter="gemini")
+    journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == run_id)
+        screen.query_one("#tabs", TabbedContent).active = "tab-log"
+        await pilot.pause()
+        screen._tick(force_rescan=False)
+        log = screen.query_one("#log", RichLog)
+        note = "⚠ parked on a permission prompt — a attach to answer"
+        await until(pilot, lambda: note in "\n".join(strip.text for strip in log.lines))
+        assert _parked_keys(screen) == set()
 
 
 # --------------------------------------------------------- text select & copy
