@@ -12536,6 +12536,50 @@ def test_timeout_parked_check_reads_the_latch_baseline(tmp_path, monkeypatch):
     assert (result.status, result.parked) == ("timeout", False)
 
 
+def test_timeout_discards_a_latch_the_transcript_moved_past(tmp_path, monkeypatch):
+    """The prompt was answered (a write after the latch), then a silent tool ran
+    past QUOTA_WAIT_IDLE_S before the clock ran out: the latch is stale, so the
+    timeout is an ordinary one. The pane still decides, so a prompt on screen
+    by then parks with its own evidence.
+
+    ABLATION: keep the latch when its key has moved and the first run reads
+    `parked` True."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    latch = _hook_event("Notification", "permission_prompt", transcript_path=str(transcript))
+    timeout_s = generic.QUOTA_WAIT_IDLE_S + 60.0
+
+    def answered(call_n):
+        if call_n == 2:
+            with transcript.open("ab") as fh:
+                fh.write(b'{"type":"assistant"}\n')
+
+    gone_dir = tmp_path / "gone"
+    gone_dir.mkdir()
+    adapter, mux, _, spec = _parked_timeout_adapter(
+        gone_dir, monkeypatch, [latch], timeout_s=timeout_s, on_call=answered
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", False)
+    assert result.parked_evidence is None
+    assert mux.captures  # the stale latch handed the verdict to the pane
+
+    shown_dir = tmp_path / "shown"
+    shown_dir.mkdir()
+    adapter, _, _, spec = _parked_timeout_adapter(
+        shown_dir,
+        monkeypatch,
+        [latch],
+        screen=f"{BYPASS_FOOTER}\n",
+        timeout_s=timeout_s,
+        on_call=answered,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", True)
+    assert result.parked_evidence is not None
+    assert BYPASS_FOOTER in result.parked_evidence
+
+
 def test_session_parked_carries_the_auto_deny_deadline(tmp_path, monkeypatch):
     """A PermissionPrompt latch journals `session-parked` with the pane, the hook
     subtype and the deadline read off the #855 countdown (wall clock 5000 + 2:00);

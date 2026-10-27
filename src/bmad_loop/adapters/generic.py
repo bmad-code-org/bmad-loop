@@ -1687,13 +1687,21 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # session that answered its prompt and worked on, so it is not
                 # parked, unless the hook latch's key is unchanged: the write
                 # that asked for the permission came before the latch, not
-                # after an answer. `still_working` is deliberately not the
+                # after an answer. A latch whose key has moved is stale at any
+                # idle age (answered, then a long silent tool), so the pane
+                # decides instead. `still_working` is deliberately not the
                 # parked test, since a live permission prompt IS an unanswered
-                # tool call. A
-                # working session's timeout (`still_working`) is never
-                # usage-limited, charged as before #610. A line a quota wait
-                # already continued from is no evidence at all.
-                parked_now = parked_evidence
+                # tool call. A working session's timeout (`still_working`) is
+                # never usage-limited, charged as before #610. A line a quota
+                # wait already continued from is no evidence at all.
+                latch_key_now = (
+                    self._transcript_activity_key(transcript_path)
+                    if parked_evidence is not None and parked_key is not None and transcript_path
+                    else None
+                )
+                # None = no baseline or no sample: the idle gate alone decides.
+                latch_moved = latch_key_now is not None and latch_key_now != parked_key
+                parked_now = None if latch_moved else parked_evidence
                 parked_hit, usage_hit = self._pane_evidence(
                     handle,
                     self._parked_prompt_patterns if parked_now is None else (),
@@ -1708,10 +1716,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     parked_now = usage_hit = None
                 latch_unmoved = (
                     parked_now is not None
-                    and parked_evidence is not None
-                    and parked_key is not None
-                    and transcript_path is not None
-                    and self._transcript_activity_key(transcript_path) == parked_key
+                    and parked_now == parked_evidence
+                    and latch_key_now is not None
+                    and latch_key_now == parked_key
                 )
                 if (
                     idle.idle_s is not None
