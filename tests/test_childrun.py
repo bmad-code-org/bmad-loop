@@ -48,6 +48,26 @@ def stop_probe(probe: Callable[[], bool]) -> Iterator[None]:
         childrun.reset_stop_probe(token)
 
 
+class _FiredAt:
+    """A stop probe that records when it first reads True, so a row's return
+    ceiling times the stop path alone — not the tree's startup, which on a loaded
+    Windows runner (two cold python starts under cmd.exe) can eat seconds."""
+
+    def __init__(self, probe: Callable[[], bool]) -> None:
+        self._probe = probe
+        self.at: float | None = None
+
+    def __call__(self) -> bool:
+        fired = self._probe()
+        if fired and self.at is None:
+            self.at = time.monotonic()
+        return fired
+
+    def elapsed(self) -> float:
+        assert self.at is not None, "the stop probe never fired"
+        return time.monotonic() - self.at
+
+
 def _pid_written(pid_file: Path) -> Callable[[], bool]:
     """A probe that flips True once the grandchild has recorded its pid — the
     point at which the tree is known to be fully formed."""
@@ -129,10 +149,10 @@ def test_hard_stop_kills_the_whole_sh_tree(tmp_path, reap_leftovers):
     Ablation: skip `_reap_descendants` in `kill_tree` and the grandchild
     survives (sh dies on SIGTERM, `sleep` is reparented and keeps running)."""
     pid_file = tmp_path / "grandchild.pid"
-    started = time.monotonic()
-    with stop_probe(_pid_written(pid_file)):
+    probe = _FiredAt(_pid_written(pid_file))
+    with stop_probe(probe):
         run = childrun.run_child(_sh_tree(pid_file), cwd=tmp_path, timeout=120)
-    elapsed = time.monotonic() - started
+    elapsed = probe.elapsed()
     grandchild = read_pid(pid_file)
     assert grandchild is not None
     reap_leftovers.append(grandchild)
@@ -269,10 +289,10 @@ def test_hard_stop_reaches_a_process_forked_in_the_roots_grace(tmp_path, reap_le
         f"trap 'sleep 60 & echo $! > \"{pid_file}\"; sleep 0.5; exit 0' TERM; "
         f"echo up > '{ready}'; while :; do sleep 0.05; done"
     )
-    started = time.monotonic()
-    with stop_probe(ready.exists):
+    probe = _FiredAt(ready.exists)
+    with stop_probe(probe):
         run = childrun.run_child(command, cwd=tmp_path, timeout=120)
-    elapsed = time.monotonic() - started
+    elapsed = probe.elapsed()
     job = read_pid(pid_file)
     assert job is not None, "the TERM trap never ran"
     reap_leftovers.append(job)
@@ -299,12 +319,12 @@ def test_hard_stop_kills_a_cmd_rooted_tree(tmp_path, reap_leftovers):
         "time.sleep(60)\n",
         encoding="utf-8",
     )
-    started = time.monotonic()
-    with stop_probe(_pid_written(pid_file)):
+    probe = _FiredAt(_pid_written(pid_file))
+    with stop_probe(probe):
         run = childrun.run_child(
             f'"{sys.executable}" "{parent}" "{pid_file}"', cwd=tmp_path, timeout=120
         )
-    elapsed = time.monotonic() - started
+    elapsed = probe.elapsed()
     grandchild = read_pid(pid_file)
     assert grandchild is not None
     reap_leftovers.append(grandchild)
