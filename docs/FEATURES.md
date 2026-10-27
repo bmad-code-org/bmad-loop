@@ -100,7 +100,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A dev attempt that fails only its verify commands keeps its tree, and the failing output is handed to the retry as feedback.
   - A session silent for `dev_stall_grace_s` (default 600) gets up to `dev_stall_nudges` wake nudges, then ends `stalled` and is charged as a failed attempt.
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
-  - A session that did no work, in any role (dev, review, fix, workflow, triage, migration), or any session parked on a prompt only a human should answer, pauses the run instead of being charged.
+  - A dev, review, fix, triage, migration or blocking-workflow session that did no work, or sat parked on a prompt only a human should answer, pauses the run instead of being charged; a non-blocking workflow's is journaled and the run continues.
   - Parked-prompt and usage-limit patterns match a pane line even when a narrow window wraps it across two or three rows, so a wrapped dialog footer still withholds the stall nudge.
   - A session whose window is alive and whose transcript is idle when the timeout fires ends `timeout` marked parked when a parked hook signal or a parked-prompt pane pattern is present, and pauses instead of retrying.
   - While the visible pane shows the coding CLI waiting out a usage-limit reset and the transcript is idle, the session timeout is frozen and the stall nudge held, for at most `[limits] quota_wait_max_min` (default 300; 0 = off) cumulative minutes per session; past the cap, or when the parsed reset lies beyond it, the session pauses with a usage-limit reason.

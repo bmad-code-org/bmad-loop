@@ -538,6 +538,10 @@ return to the agent as an error. The shipped mappings, both for `linux` and `dar
   the main repo's `.git/worktrees/` stays read-only, so git add and commit fail there;
   `validate` warns about sandboxed Codex under `scm.isolation = "worktree"`.
 
+The sandbox confines the session, not what bmad-loop later runs from the checkout. Both
+mappings leave `.git` writable, hooks and config included, and the orchestrator runs
+`[verify] commands` and its own git commits there unsandboxed.
+
 Both CLIs show a one-time workspace-trust dialog in a directory they have not seen.
 `validate` reports each role's posture as `adapter.permission-mode`.
 

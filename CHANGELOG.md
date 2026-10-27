@@ -203,8 +203,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Pause instead of retrying a review, fix, workflow, triage or migration session that
-  produced no work (#727).
+- Pause instead of retrying a review, fix, blocking-workflow, triage or migration session
+  that produced no work (#727).
 - Match parked-prompt and usage-limit patterns across wrapped pane rows, so a dialog
   footer wrapped in a narrow window still withholds the stall nudge (#727).
 - Mark a session still parked on a prompt at its timeout as parked, so it pauses instead
