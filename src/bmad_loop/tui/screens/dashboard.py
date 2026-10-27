@@ -115,6 +115,7 @@ class _PollContext:
         self.entries: list[dict[str, Any]] = []
         self.log: data.LogView | None = None
         self.log_task: str | None = None
+        self.log_parked = False  # the Log pane last rendered the parked-prompt note
         self.attention_seen = 0
         self.first_poll = True
         self.decision_toasted: str | None = None  # dw_id already announced
@@ -151,6 +152,7 @@ class _Snapshot:
     log_altscreen: bool = False  # the capture entered a fullscreen (alt-screen) TUI
     log_transcript: str | None = None  # agent JSONL transcript, when an altscreen log has one
     log_scan_fault: str | None = None  # the altscreen prefix scan could not read the log
+    log_parked: bool = False  # the log task is parked on a permission prompt (#855)
     attention_reset: bool = False
     new_attention: str = ""
     toast_attention: bool = False
@@ -825,7 +827,18 @@ class DashboardScreen(Screen[None]):
                     )
                     snap.log_reset = True
                 snap.log_task = task
-                if ctx.log is not None and (ctx.log.read_new() or snap.log_reset):
+                live = snap.agent if isinstance(snap.agent, data.ActiveAgent) else None
+                snap.log_parked = (
+                    live is not None
+                    and live.parked_since is not None
+                    and task is not None
+                    and live.task_id == task
+                )
+                # The parked note sits above the log, so a park opening or closing
+                # re-renders the pane even on a tick the log itself did not grow.
+                parked_changed = snap.log_parked != ctx.log_parked
+                ctx.log_parked = snap.log_parked
+                if ctx.log is not None and (ctx.log.read_new() or snap.log_reset or parked_changed):
                     snap.log_lines = ctx.log.render()
                     snap.log_index = ctx.log.index()
                 if ctx.log is not None and ctx.log.altscreen_seen:
@@ -932,6 +945,12 @@ class DashboardScreen(Screen[None]):
             if snap.log_task:
                 suffix = " (pinned — esc to follow)" if snap.log_pinned else ""
                 log.write(Text(f"— {snap.log_task}.log —{suffix}", style="dim"), scroll_end=False)
+            if snap.log_parked:
+                # The session is parked on a permission prompt (#855): the pane
+                # below shows the dialog, and nothing moves until it is answered
+                # in the session's window or the CLI's countdown denies it.
+                note = "⚠ parked on a permission prompt — a attach to answer"
+                log.write(Text(note, style="yellow"), scroll_end=False)
             if snap.log_altscreen:
                 # A fullscreen (alt-screen) TUI repaints in place, so the emulated
                 # pane collapses to the final frame. Flag it so the partial view is

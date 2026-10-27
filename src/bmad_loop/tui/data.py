@@ -38,6 +38,7 @@ from rich.text import Text
 from .. import (
     bmadconfig,
     deferredwork,
+    parked,
     policy,
     sprintstatus,
     stories,
@@ -737,28 +738,13 @@ def _open_session_start(journal_entries: list[dict[str, Any]]) -> dict[str, Any]
     return entry
 
 
-def _open_session_start_indexed(
-    journal_entries: list[dict[str, Any]],
-) -> tuple[dict[str, Any] | None, int]:
-    """`_open_session_start` plus the entry's index in `journal_entries` (-1 when
-    None), so a caller can scan the entries that FOLLOW the open start — the
-    #680 idle events belong to a session only from its start onward, and a
-    `session-idle` left behind by an earlier session with a reused task id must
-    not be read as this one's."""
-    open_entry: dict[str, Any] | None = None
-    open_index = -1
-    active: str | None = None
-    for index, entry in enumerate(journal_entries):
-        kind = entry.get("kind")
-        if kind == "session-start" and entry.get("task_id") is not None:
-            active = str(entry["task_id"])
-            open_entry = entry
-            open_index = index
-        elif kind == "session-end" and str(entry.get("task_id")) == active:
-            active = None
-            open_entry = None
-            open_index = -1
-    return open_entry, open_index
+# The open-session scoping and the parked-prompt projection (#855) live in the
+# stdlib-only `bmad_loop.parked`, so the core answer path reads the same answer
+# without pyte/rich; re-exported here under the TUI-facing spellings. A park, like
+# the #680 idle events, belongs to a session only from its start onward.
+_open_session_start_indexed = parked.open_session_start_indexed
+_parked_prompt = parked.parked_prompt
+ParkedPrompt = parked.ParkedPrompt
 
 
 def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> float | None:
@@ -908,6 +894,16 @@ class ActiveAgent:
     # when it did not resolve; None when the wait line named none. The header
     # appends `· resets <time>` from it. APPENDED.
     quota_resets_at: str | None = None
+    # The open session's live permission prompt (#855) — the newest
+    # `session-parked` not closed by a later `session-unparked`,
+    # `parked-answered` or `session-active` — split into its journal `ts`, the
+    # CLI's epoch auto-deny deadline (None when its countdown was not parsed) and
+    # the mux pane target it waits in. All None when no prompt is open. The
+    # header renders `· parked on permission prompt <age>` from `parked_since`
+    # AHEAD of the quota and idle notices, and the Log pane notes it. APPENDED.
+    parked_since: float | None = None
+    parked_auto_deny_at: float | None = None
+    parked_pane: str | None = None
 
 
 def _story_key_from_task_id(task_id: str, role: str) -> str:
@@ -964,6 +960,7 @@ def active_agent(
         story_raw = entry.get("story_key")
         story_key = str(story_raw) if story_raw else _story_key_from_task_id(task_id, role)
         quota_since, quota_resets = _quota_wait(journal_entries, start_index, task_id)
+        park = _parked_prompt(journal_entries, start_index, task_id)
         return ActiveAgent(
             task_id=task_id,
             story_key=story_key,
@@ -974,6 +971,9 @@ def active_agent(
             idle_tool=_idle_tool(journal_entries, start_index, task_id),
             quota_wait_since=quota_since,
             quota_resets_at=quota_resets,
+            parked_since=park.since if park else None,
+            parked_auto_deny_at=park.auto_deny_at if park else None,
+            parked_pane=park.pane if park else None,
         )
     except _MALFORMED_AGENT_FAULTS as e:
         return UnreadableAgent(error=f"malformed session-start or snapshot: {_describe(e)}")

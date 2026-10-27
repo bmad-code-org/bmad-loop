@@ -122,6 +122,8 @@ breaking changes may land in a minor release.
   events names the shared daemon in its escalation text (#901).
 - Journal `session-parked` / `session-unparked` while a session waits on a permission
   prompt, with the CLI's auto-deny deadline (`auto_deny_patterns` profile key) (#855).
+- Show a session parked on a permission prompt, and its auto-deny countdown, in the TUI
+  header and Log pane (#855).
 
 ### Changed
 
