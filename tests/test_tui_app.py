@@ -1232,6 +1232,100 @@ async def test_parked_answer_keys_stay_hidden_without_parked_answers(project_tre
         assert _parked_keys(screen) == set()
 
 
+async def test_parked_answer_drops_a_press_while_one_is_in_flight(project_tree, monkeypatch):
+    """#855: a second Y while the first answer is still running is refused with a
+    toast and never reaches `parked_answer.answer`, so it cannot capture the
+    still-open dialog and send a second key.
+
+    ABLATION: drop the `_answer_lock` acquire in `_answer_parked_worker` and the
+    second press calls `answer` again."""
+    from bmad_loop import parked_answer
+
+    root = project_tree.project
+    run_id = "20260611-100000-aaaa"
+    run_dir = make_run(root, run_id, alive=True)
+    journal = Journal(run_dir)
+    journal.append("session-start", task_id="story-1", role="dev", adapter="claude")
+    journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
+    calls: list[str] = []
+    entered, release = threading.Event(), threading.Event()
+
+    def fake_answer(project, rid, choice, *, mux):
+        calls.append(choice)
+        entered.set()
+        release.wait(10)
+        return parked_answer.AnswerOutcome(True, f"sent {choice} (Enter) to story-1")
+
+    monkeypatch.setattr(parked_answer, "answer", fake_answer)
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == run_id)
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: _parked_keys(screen) == {"Y", "N"})
+        try:
+            await pilot.press("Y")
+            await until(pilot, entered.is_set)
+            await pilot.press("Y")
+            await until(pilot, lambda: any("already being sent" in m for m in notifications(app)))
+        finally:
+            release.set()
+        await until(pilot, lambda: any("sent approve" in m for m in notifications(app)))
+        assert calls == ["approve"]
+
+
+async def test_parked_profile_fault_is_shown_and_retried(project_tree, monkeypatch):
+    """#855: a park whose profile will not resolve names the fault in the Log
+    note instead of reading like a profile without `[parked_answers]`, and the
+    next tick retries, so a transient read fault does not hide Y/N for the rest
+    of the park.
+
+    ABLATION: cache the park key on a resolve failure and the keys never
+    appear; drop `parked_fault` from the note and the first wait times out."""
+    from bmad_loop.adapters.profile import ProfileError, get_profile
+    from bmad_loop.tui.screens import dashboard as dashboard_mod
+
+    root = project_tree.project
+    run_id = "20260611-100000-aaaa"
+    run_dir = make_run(root, run_id, alive=True)
+    (run_dir / "logs").mkdir()
+    (run_dir / "logs" / "story-1.log").write_bytes(b"working\r\n")
+    journal = Journal(run_dir)
+    journal.append("session-start", task_id="story-1", role="dev", adapter="claude")
+    journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
+    broken = [True]
+
+    def flaky_profile(name, project):
+        if broken[0]:
+            raise ProfileError("profile overlay unreadable")
+        return get_profile(name, project)
+
+    monkeypatch.setattr(dashboard_mod, "get_profile", flaky_profile)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == run_id)
+        screen.query_one("#tabs", TabbedContent).active = "tab-log"
+        await pilot.pause()
+        screen._tick(force_rescan=False)
+        log = screen.query_one("#log", RichLog)
+
+        def text() -> str:
+            return "\n".join(strip.text for strip in log.lines)
+
+        await until(pilot, lambda: "answer keys off: profile 'claude' unresolved" in text())
+        assert _parked_keys(screen) == set()
+
+        broken[0] = False
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: _parked_keys(screen) == {"Y", "N"})
+        await until(pilot, lambda: "Y approve · N deny · a attach" in text())
+        assert "answer keys off" not in text()
+
+
 # --------------------------------------------------------- text select & copy
 # Use an empty project so no run is selected: the poll never rewrites #log, so
 # the lines we write directly stay put for the assertions.

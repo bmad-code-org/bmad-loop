@@ -120,11 +120,16 @@ class _PollContext:
         self.entries: list[dict[str, Any]] = []
         self.log: data.LogView | None = None
         self.log_task: str | None = None
-        self.log_parked = False  # the Log pane last rendered the parked-prompt note
+        # (parked, answerable, fault) of the parked-prompt note the Log pane last
+        # rendered: a change re-renders the pane on a tick the log did not grow
+        self.log_parked_note: tuple[bool, bool, str | None] = (False, False, None)
         # (adapter, parked_since) the answerable flag was resolved for, and that
-        # flag: the profile is read once per park, not on every tick (#855)
+        # flag: the profile is read once per park, not on every tick (#855). A
+        # profile that would not resolve leaves the key unset so the next tick
+        # retries, and its fault is shown in the Log note meanwhile.
         self.parked_key: tuple[str, float] | None = None
         self.parked_answerable = False
+        self.parked_fault: str | None = None
         self.attention_seen = 0
         self.first_poll = True
         self.decision_toasted: str | None = None  # dw_id already announced
@@ -163,6 +168,7 @@ class _Snapshot:
     log_scan_fault: str | None = None  # the altscreen prefix scan could not read the log
     log_parked: bool = False  # the log task is parked on a permission prompt (#855)
     parked_answerable: bool = False  # the live park's profile has [parked_answers] (#855)
+    parked_fault: str | None = None  # why that profile could not be resolved (#855)
     attention_reset: bool = False
     new_attention: str = ""
     toast_attention: bool = False
@@ -234,6 +240,9 @@ class DashboardScreen(Screen[None]):
         # thread workers cancelled but cannot stop them, so without this two
         # threads could feed ctx.log's pyte stream at once (crash)
         self._poll_lock = threading.Lock()
+        # one parked answer in flight at a time: a double-tapped Y/N must not
+        # capture the pane before the first answer's keys land (#855)
+        self._answer_lock = threading.Lock()
         # journal -> log jump state, all owned by the UI thread
         self._log_index: data.LogIndex | None = None
         self._displayed_log_task: str | None = None
@@ -500,13 +509,24 @@ class DashboardScreen(Screen[None]):
     @work(thread=True, exclusive=True, group="parked-answer")
     def _answer_parked_worker(self, run_id: str, choice: parked_answer.Choice) -> None:
         # Worker thread: the capture and send are mux round-trips, and notify()
-        # is marshalled back to the UI thread.
+        # is marshalled back to the UI thread. exclusive=True cannot stop a
+        # running thread, so _answer_lock drops a press made while one is in
+        # flight instead of letting it capture the still-open dialog.
+        if not self._answer_lock.acquire(blocking=False):
+            self.app.call_from_thread(
+                self.notify,
+                f"{choice} not sent: an answer is already being sent",
+                severity="warning",
+            )
+            return
         try:
             outcome = parked_answer.answer(
                 self.project, run_id, choice, mux=multiplexer.get_multiplexer()
             )
         except MultiplexerError as e:
             outcome = parked_answer.AnswerOutcome(False, str(e))
+        finally:
+            self._answer_lock.release()
         if outcome.sent:
             self.app.call_from_thread(self.notify, outcome.reason, markup=False)
         else:
@@ -893,8 +913,10 @@ class DashboardScreen(Screen[None]):
                 # The parked note sits above the log, so a park opening or closing
                 # re-renders the pane even on a tick the log itself did not grow.
                 snap.parked_answerable = self._parked_answerable_in(ctx, live)
-                parked_changed = snap.log_parked != ctx.log_parked
-                ctx.log_parked = snap.log_parked
+                snap.parked_fault = ctx.parked_fault
+                note = (snap.log_parked, snap.parked_answerable, snap.parked_fault)
+                parked_changed = note != ctx.log_parked_note
+                ctx.log_parked_note = note
                 if ctx.log is not None and (ctx.log.read_new() or snap.log_reset or parked_changed):
                     snap.log_lines = ctx.log.render()
                     snap.log_index = ctx.log.index()
@@ -925,20 +947,23 @@ class DashboardScreen(Screen[None]):
     def _parked_answerable_in(self, ctx: _PollContext, live: data.ActiveAgent | None) -> bool:
         """Whether `live` is parked on a permission prompt its profile can answer
         (`[parked_answers]`). Worker-side; the profile is resolved once per park.
-        A profile that will not resolve offers no keys, and the operator still
-        has attach."""
+        A profile that will not resolve offers no keys, records its fault in
+        `ctx.parked_fault` for the Log note, and is retried on the next tick;
+        the operator still has attach."""
         if live is None or live.parked_since is None:
-            ctx.parked_key, ctx.parked_answerable = None, False
+            ctx.parked_key, ctx.parked_answerable, ctx.parked_fault = None, False, None
             return False
         key = (live.name, live.parked_since)
         if key != ctx.parked_key:
-            ctx.parked_key = key
             try:
                 profile = get_profile(live.name, self.project)
-            except (ProfileError, OSError):
-                ctx.parked_answerable = False
+            except (ProfileError, OSError) as e:
+                ctx.parked_key, ctx.parked_answerable = None, False
+                ctx.parked_fault = f"profile {live.name!r} unresolved: {e}"
             else:
+                ctx.parked_key = key
                 ctx.parked_answerable = profile.parked_answers is not None
+                ctx.parked_fault = None
         return ctx.parked_answerable
 
     # ------------------------------------------------------------ applying
@@ -1033,11 +1058,13 @@ class DashboardScreen(Screen[None]):
                 # The session is parked on a permission prompt (#855): the pane
                 # below shows the dialog, and nothing moves until it is answered
                 # in the session's window or the CLI's countdown denies it.
-                note = "⚠ parked on a permission prompt — " + (
-                    "Y approve · N deny · a attach"
-                    if snap.parked_answerable
-                    else "a attach to answer"
-                )
+                if snap.parked_answerable:
+                    keys = "Y approve · N deny · a attach"
+                elif snap.parked_fault:
+                    keys = f"a attach to answer (answer keys off: {snap.parked_fault})"
+                else:
+                    keys = "a attach to answer"
+                note = "⚠ parked on a permission prompt — " + keys
                 log.write(Text(note, style="yellow"), scroll_end=False)
             if snap.log_altscreen:
                 # A fullscreen (alt-screen) TUI repaints in place, so the emulated
