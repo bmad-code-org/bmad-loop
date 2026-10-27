@@ -41,6 +41,18 @@ DAEMON_ENV_HINT = (
 # Launch args that leave hook discovery unchanged: the bypass switch changes
 # approvals, and NO_DAEMON_ARG changes where the app-server is hosted.
 _HOOK_DISCOVERY_SAFE_ARGS = frozenset({"--dangerously-bypass-approvals-and-sandbox", NO_DAEMON_ARG})
+# Flag/value pairs that leave it unchanged too: they pick the sandbox and the
+# approval policy (`adapter.permission_mode = "sandboxed"`, #727). A pair is safe
+# only as a whole, so its value alone (`never`) or an unlisted value is not.
+_HOOK_DISCOVERY_SAFE_PAIRS: dict[str, frozenset[str]] = {
+    "--sandbox": frozenset({"workspace-write"}),
+    "--ask-for-approval": frozenset({"never"}),
+}
+# `-c key=value` overrides whose key only defines or selects a permission
+# profile (the shipped codex sandboxed mapping); any other key may move config
+# or hook discovery.
+_CONFIG_FLAG = "-c"
+_SAFE_CONFIG_KEY_RE = re.compile(r"(?:default_permissions|permissions\.[A-Za-z0-9_.-]+)\s*=")
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 # The ``unverifiable`` reason when the ``hooks/list`` query itself failed (spawn
 # error, timeout, protocol breakage) rather than Codex returning a verdict.
@@ -65,8 +77,29 @@ def parse_codex_version(text: str) -> tuple[int, int, int] | None:
 
 
 def hook_discovery_args_safe(args: tuple[str, ...] | None) -> bool:
-    """Whether extra launch args can leave hook discovery unchanged."""
-    return args is None or all(arg in _HOOK_DISCOVERY_SAFE_ARGS for arg in args)
+    """Whether extra launch args can leave hook discovery unchanged.
+
+    Every token must be a safe single arg or part of a safe flag/value pair
+    (``--ask-for-approval never``, ``-c default_permissions=...``); anything else,
+    a dangling flag or a pair value standing alone, is unverifiable."""
+    if args is None:
+        return True
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in _HOOK_DISCOVERY_SAFE_ARGS:
+            i += 1
+            continue
+        if i + 1 >= len(args):
+            return False
+        value = args[i + 1]
+        if arg in _HOOK_DISCOVERY_SAFE_PAIRS:
+            if value not in _HOOK_DISCOVERY_SAFE_PAIRS[arg]:
+                return False
+        elif arg != _CONFIG_FLAG or not _SAFE_CONFIG_KEY_RE.match(value):
+            return False
+        i += 2
+    return True
 
 
 def resolved_codex_binary(binary: str, env: dict[str, str]) -> str | None:
@@ -222,10 +255,11 @@ def project_hook_trust(
     """Fail closed unless Codex reports every required configured hook trusted."""
     if profile.hooks.dialect != "codex-hooks-json":
         return TrustResult("unverifiable", "hook trust applies only to Codex hooks")
-    # The bypass switch changes approvals, and --no-daemon changes where the
-    # app-server is hosted; neither changes which config or hooks are discovered,
-    # and the `_hooks_list` oracle already runs its own `app-server --stdio`. Other
-    # launch arguments can select a different config and cannot be mirrored here.
+    # The bypass switch and the sandboxed mode's sandbox/approval/permission-profile
+    # args change approvals, and --no-daemon changes where the app-server is
+    # hosted; none changes which config or hooks are discovered, and the
+    # `_hooks_list` oracle already runs its own `app-server --stdio`. Other launch
+    # arguments can select a different config and cannot be mirrored here.
     if not hook_discovery_args_safe(profile.launch_args) or not hook_discovery_args_safe(
         profile.bypass_args
     ):

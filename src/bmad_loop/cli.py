@@ -381,6 +381,13 @@ def _store_extra_args_roles(pol, source: str) -> tuple[str, ...]:
     return tuple(role for role in roles if pol.adapter.resolved(role).extra_args)
 
 
+def _store_sandboxed_roles(pol, source: str) -> tuple[str, ...]:
+    """The roles a ``source`` run launches under a non-bypass
+    ``adapter.permission_mode`` — for the ``tickets.store-sandbox`` warning."""
+    roles = worksource.launch_roles(source, pol.gates.retrospective)
+    return tuple(role for role in roles if pol.adapter.resolved(role).permission_mode != "bypass")
+
+
 def _reject_under_floor_git(project: Path) -> int | None:
     """Refuse to start against a git older than `verify.GIT_FLOOR`. Returns
     `ExitCode.FAILURE` to abort, None to proceed — the `_reject_bad_run_id` shape.
@@ -1468,6 +1475,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     _bypass_dropped_message(role, mode_prof, missing, mode=cfg.permission_mode),
                     {"role": role, "profile": prof.name, "missing": list(missing)},
                 )
+            if prof is not None:
+                _report_permission_mode(report, role, cfg, prof, pol.scm.isolation)
 
     base_findings = install.missing_base_skills(project, dev_trees)
     # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
@@ -2195,6 +2204,63 @@ def _permission_profile(cfg, profile: CLIProfile) -> CLIProfile | None:
         return profile.for_permission_mode(cfg.permission_mode)
     except ProfileError:
         return None
+
+
+def _report_permission_mode(
+    report: ValidationReport, role: str, cfg, profile: CLIProfile, isolation: str
+) -> None:
+    """One `validate` finding per role for its ``adapter.permission_mode`` (#727).
+
+    A profile that cannot run the mode on this platform FAILS
+    (``adapter.permission-mode-unsupported``): the launch refuses it in
+    ``runsetup.make_adapters``. Otherwise an ok posture line
+    (``adapter.permission-mode``) whose isolation coupling is advisory only: a
+    bypass role with no worktree isolation is pointed at the sandboxed mode when
+    its profile maps one here. The one warning is a Codex-family role sandboxed
+    under worktree isolation, where git cannot write the linked worktree's gitdir
+    (it lives under the main repo's ``.git/worktrees/``, outside the sandbox's
+    writable roots), so the dev skill's preflight and commit fail."""
+    from .adapters.profile import ProfileError
+
+    mode = cfg.permission_mode
+    detail: dict[str, object] = {
+        "role": role,
+        "profile": profile.name,
+        "mode": mode,
+        "isolation": isolation,
+        "platform": sys.platform,
+    }
+    try:
+        profile.for_permission_mode(mode, platform=sys.platform)
+    except ProfileError as e:
+        report.fail(
+            "adapter.permission-mode-unsupported",
+            f"{profile.name} {role}: permission_mode {mode!r} cannot run on {sys.platform} "
+            f"without prompts: {e}",
+            {**detail, "error": str(e)},
+        )
+        return
+    if mode == "bypass":
+        message = f"{profile.name} {role}: bypass, unsandboxed (scm.isolation={isolation})"
+        if isolation != "worktree":
+            try:
+                profile.for_permission_mode("sandboxed", platform=sys.platform)
+            except ProfileError:
+                pass
+            else:
+                message += '; consider adapter.permission_mode = "sandboxed"'
+        report.ok("adapter.permission-mode", message, detail)
+    elif isolation == "worktree" and profile.hooks.dialect == "codex-hooks-json":
+        report.warn(
+            "adapter.permission-mode",
+            f"{profile.name} {role}: {mode} under scm.isolation=worktree — the sandbox "
+            "keeps a linked worktree's gitdir (under the main repo's .git/worktrees/) "
+            "read-only, so git add/commit fail in isolated sessions; use "
+            'scm.isolation = "none" or permission_mode = "bypass" for this role',
+            detail,
+        )
+    else:
+        report.ok("adapter.permission-mode", f"{profile.name} {role}: {mode}", detail)
 
 
 def _bypass_drops(cfg, profile: CLIProfile) -> tuple[str, ...]:
@@ -2978,6 +3044,9 @@ def _validate_tickets_mode_queue(
             isolation=pol.scm.isolation if pol is not None else "none",
             extra_args_roles=(
                 _store_extra_args_roles(pol, worksource.SOURCE_TICKETS) if pol is not None else ()
+            ),
+            sandboxed_roles=(
+                _store_sandboxed_roles(pol, worksource.SOURCE_TICKETS) if pol is not None else ()
             ),
         )
     )
@@ -3869,6 +3938,7 @@ def _check_tickets_preflight(paths: bmadconfig.ProjectPaths, pol) -> int | None:
         branch_per=pol.scm.branch_per,
         isolation=pol.scm.isolation,
         extra_args_roles=_store_extra_args_roles(pol, worksource.SOURCE_TICKETS),
+        sandboxed_roles=_store_sandboxed_roles(pol, worksource.SOURCE_TICKETS),
     )
     for warning in (f for f in findings if f.severity == "warning"):
         print(f"warning: {warning.message}", file=sys.stderr)

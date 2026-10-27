@@ -131,6 +131,9 @@ breaking changes may land in a minor release.
   `dontAsk` + `Edit(/**)` + the Bash sandbox; codex: a workspace-write permission profile
   with a `.git` grant + `--ask-for-approval never`; linux/macOS). Profiles declare it in
   `[permission_modes.<mode>]`; `bmad-loop resolve` sessions keep bypass (#727).
+- validate fails a role whose profile cannot run its `permission_mode` without prompts
+  (`adapter.permission-mode-unsupported`) and reports each role's permission posture
+  (`adapter.permission-mode`).
 
 ### Changed
 

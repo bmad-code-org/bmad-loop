@@ -584,6 +584,49 @@ def test_hook_discovery_args_safe_accepts_no_daemon():
     assert not codex_trust.hook_discovery_args_safe(("--no-daemon", "-c", "x=1"))
 
 
+def test_hook_discovery_args_safe_shipped_sandboxed_mapping_is_safe():
+    from bmad_loop.adapters.profile import get_profile
+
+    sandboxed = get_profile("codex").for_permission_mode("sandboxed", platform="linux")
+    assert codex_trust.hook_discovery_args_safe(sandboxed.bypass_args)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--sandbox", "workspace-write"),
+        ("--ask-for-approval", "never"),
+        ("--sandbox", "workspace-write", "--ask-for-approval", "never", "--no-daemon"),
+        ("-c", 'default_permissions="bmad_loop"'),
+        ("-c", 'permissions.bmad_loop.extends=":workspace"'),
+    ],
+)
+def test_hook_discovery_args_safe_accepts_safe_pairs(args):
+    assert codex_trust.hook_discovery_args_safe(args)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        # a pair value standing alone, or a pair flag with no value
+        ("never",),
+        ("workspace-write",),
+        ("--ask-for-approval",),
+        ("--no-daemon", "--sandbox"),
+        # a known flag with an unlisted value
+        ("--sandbox", "danger-full-access"),
+        ("--ask-for-approval", "on-request"),
+        # a config override outside the permission-profile keys
+        ("-c", "hooks.x=1"),
+        ("-c", "default_permissions_extra=1"),
+        # an unknown flag consuming a safe token as its value
+        ("--profile", "never"),
+    ],
+)
+def test_hook_discovery_args_safe_refuses_unknown_or_split_pairs(args):
+    assert not codex_trust.hook_discovery_args_safe(args)
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
