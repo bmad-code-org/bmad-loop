@@ -895,8 +895,8 @@ class ActiveAgent:
     # appends `· resets <time>` from it. APPENDED.
     quota_resets_at: str | None = None
     # The open session's live permission prompt (#855) — the newest
-    # `session-parked` not closed by a later `session-unparked`,
-    # `parked-answered` or `session-active` — split into its journal `ts`, the
+    # `session-parked` not closed by a later `session-unparked` or
+    # `parked-answered` — split into its journal `ts`, the
     # CLI's epoch auto-deny deadline (None when its countdown was not parsed) and
     # the mux pane target it waits in. All None when no prompt is open. The
     # header renders `· parked on permission prompt <age>` from `parked_since`

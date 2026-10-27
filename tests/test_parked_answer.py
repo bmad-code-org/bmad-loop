@@ -144,9 +144,9 @@ def test_other_dialogs_refuse_both_answers(tmp_path, choice, screen):
     assert mux.sends == []
 
 
-@pytest.mark.parametrize("closer", ["session-unparked", "session-active", "parked-answered"])
+@pytest.mark.parametrize("closer", ["session-unparked", "parked-answered"])
 def test_a_closed_park_refuses_before_touching_the_pane(tmp_path, closer):
-    """A newer unpark (or activity, or an earlier answer) closes the park, so
+    """A newer unpark (or an earlier answer) closes the park, so
     nothing is captured or sent even though the screen would pass.
 
     ABLATION: skip the `parked_prompt` check and the keys are sent."""

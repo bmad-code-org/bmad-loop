@@ -20,9 +20,11 @@ from dataclasses import dataclass
 from typing import Any
 
 # Journal kinds that close an open park for the same task: the adapter's own
-# `session-unparked`, an answer sent from the TUI, and the transcript moving
-# again (the CLI took the prompt down and resumed work).
-PARK_CLOSERS = frozenset({"session-unparked", "parked-answered", "session-active"})
+# `session-unparked` and an answer sent from the TUI. Not `session-active`: the
+# transcript write that raised the prompt can close an idle stretch on the next
+# heartbeat, after the latch. The adapter measures activity from a baseline
+# stat'ed at the latch and journals `session-unparked` (`how="activity"`) itself.
+PARK_CLOSERS = frozenset({"session-unparked", "parked-answered"})
 
 
 @dataclass(frozen=True)
@@ -82,10 +84,9 @@ def parked_prompt(
 ) -> ParkedPrompt | None:
     """The live parked prompt of `task_id`'s session opened at index `start`,
     or None: the newest `session-parked` for the task after `start`, unless a
-    later `session-unparked`, `parked-answered` or `session-active` for the same
-    task closed it. The newest park wins — the adapter re-journals one with the
-    deadline a tick after the first, and a re-latch re-emits without an unpark
-    between. A `session-parked` without a finite numeric `ts` is skipped without
+    later `session-unparked` or `parked-answered` for the same task closed it.
+    The newest park wins — the adapter re-journals one with the deadline a tick
+    after the first, and a re-latch re-emits without an unpark between. A `session-parked` without a finite numeric `ts` is skipped without
     erasing an earlier open park; an ill-typed `pane`/`subtype`/`auto_deny_at`
     reads as unrecorded. Never raises on a malformed entry."""
     parked: ParkedPrompt | None = None

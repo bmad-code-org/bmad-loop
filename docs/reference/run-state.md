@@ -132,7 +132,7 @@ A session parked on a permission prompt is also journaled to the run's `journal.
 | `session-unparked` | `task_id`, `how`                             | the session moves on: `stop` (a Stop event), `activity` (transcript writes) or `ended` (session over) |
 | `parked-answered`  | `task_id`, `choice`, `by`                    | the TUI sent an `approve` or `deny` answer to the prompt (`by` is `tui`)                              |
 
-`subtype` is the CLI's notification type, or null. `auto_deny_at` is an epoch time, present only when the profile's `auto_deny_patterns` matched the pane. The newest `session-parked` for a task counts as live until a later `session-unparked`, `parked-answered` or `session-active` for that task.
+`subtype` is the CLI's notification type, or null. `auto_deny_at` is an epoch time, present only when the profile's `auto_deny_patterns` matched the pane. The newest `session-parked` for a task counts as live until a later `session-unparked` or `parked-answered` for that task.
 
 `result.json` and `escalation.json` are the shared cycle artifacts (`journal.TASK_CYCLE_ARTIFACTS`). Both built-in adapters delete them before launching a session, so a reused task id never inherits a previous session's result. Adapters refuse a task directory that is a symlink or junction, and an adapter-written file (heartbeat, breadcrumb logs, `messages.json`, session logs) that is a link or special file.
 

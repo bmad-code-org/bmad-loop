@@ -1136,12 +1136,11 @@ def test_active_agent_projects_open_parked_prompt():
     [
         {"kind": "session-unparked", "how": "stop"},
         {"kind": "parked-answered", "choice": "approve"},
-        {"kind": "session-active", "idle_s": 90.0},
     ],
     ids=lambda c: c["kind"],
 )
 def test_parked_prompt_closed_by_newer_closer(closer):
-    """A `session-unparked`, `parked-answered` or `session-active` for the same
+    """A `session-unparked` or `parked-answered` for the same
     task AFTER the newest `session-parked` closes it; a park journaled after the
     closer reopens it.
 
@@ -1158,6 +1157,20 @@ def test_parked_prompt_closed_by_newer_closer(closer):
     # another task's closer leaves this task's park open
     foreign = dict(closing, task_id="2-2-beta-dev-1")
     agent = data.active_agent([_stamped_start(), _parked(), foreign], None)
+    assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5100.0
+
+
+def test_session_active_after_the_latch_leaves_the_park_open():
+    """The transcript write that raised the prompt can close an idle stretch on
+    the heartbeat after the latch: that `session-active` is not the CLI working
+    again (the adapter's latch-time baseline already holds it), so the park
+    stays open until the adapter's own `session-unparked`.
+
+    ABLATION: add `session-active` back to `parked.PARK_CLOSERS` and the park
+    reads closed."""
+    task = "1-1-alpha-dev-3"
+    active = {"kind": "session-active", "task_id": task, "idle_s": 900.0, "ts": 5200.0}
+    agent = data.active_agent([_stamped_start(), _parked(), active], None)
     assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5100.0
 
 
