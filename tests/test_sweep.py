@@ -5872,6 +5872,50 @@ def test_migration_session_parked_escalates_without_consuming_attempts(project):
     assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
 
 
+def test_triage_session_no_work_escalates_without_consuming_attempts(project):
+    """#727: a triage session that never did anything (a plain-adapter role never
+    arms the stall gate, so a prompt-blocked session times out with `parked`
+    unset) escalates on the first attempt instead of feeding a retry into the
+    same prompt; triage-decision carries `produced_work: False`.
+
+    ABLATION: delete the triage site's no-work escalate arm and a second
+    (feedback-retry) triage session is launched."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(
+        project, [SessionResult(status="timeout", produced_work=False)] * 2
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-triage"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1
+    assert engine.state.paused_reason.startswith("no work produced: triage session timeout")
+    assert "[result.json: missing; hook events: none]" in engine.state.paused_reason  # #752
+    assert len(adapter.sessions) == 1
+    dec = [e for e in engine.journal.entries() if e["kind"] == "triage-decision"][-1]
+    assert dec["produced_work"] is False
+    assert dec["parked"] is False
+
+
+def test_migration_session_no_work_escalates_without_consuming_attempts(project):
+    """The migration site's no-work sibling arm: escalates on the first attempt
+    and leaves the legacy ledger untouched."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(
+        project, [SessionResult(status="timeout", produced_work=False)] * 2
+    )
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-migrate"].attempt == 1
+    assert engine.state.paused_reason.startswith("no work produced: migration session timeout")
+    assert len(adapter.sessions) == 1
+    dec = [e for e in engine.journal.entries() if e["kind"] == "migrate-decision"][-1]
+    assert dec["produced_work"] is False
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+
 def test_triage_escalation_resume_retries_triage(project):
     write_ledger(project, {"DW-1": "open"})
     bad = triage_result(["DW-1"])

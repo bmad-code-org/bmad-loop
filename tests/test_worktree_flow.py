@@ -2173,6 +2173,22 @@ def test_escalate_unit_marks_escalated_notifies_and_pauses(tmp_path):
     assert "CRITICAL escalation: 2-3" in (tmp_path / ATTENTION_FILE).read_text()
 
 
+def test_escalate_unit_titles_a_non_critical_pause_by_its_kind(tmp_path):
+    """#727: a parked pause escalated through `escalate_unit` is titled
+    `Paused (parked prompt):`, not `CRITICAL escalation:`.
+
+    Ablation: restore the literal CRITICAL title in `escalate_unit` and this fails."""
+    flow = _make_flow(
+        tmp_path, state=SimpleNamespace(target_branch="main", run_id="run-9", tasks={})
+    )
+    task = StoryTask(story_key="2-3", epic=2)
+    with pytest.raises(_Pause):
+        flow.escalate_unit(task, "parked: dev session stalled (x)")
+    text = (tmp_path / ATTENTION_FILE).read_text(encoding="utf-8")
+    assert "Paused (parked prompt): 2-3" in text
+    assert "CRITICAL escalation" not in text
+
+
 def test_reopen_unit_escalates_when_worktree_missing(tmp_path):
     flow = _make_flow(tmp_path, state=SimpleNamespace(target_branch="main", run_id="r", tasks={}))
     task = StoryTask(story_key="1-1", epic=1)

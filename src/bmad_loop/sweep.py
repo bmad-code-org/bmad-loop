@@ -40,7 +40,9 @@ from .escalation import (
     critical_session_reason,
     display_critical_reason,
     env_fault_pause_reason,
+    no_work_pause_reason,
     parked_pause_reason,
+    pause_title,
     session_failure_reason,
 )
 from .model import PAUSE_ESCALATION, PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
@@ -3595,7 +3597,7 @@ class SweepEngine(Engine):
             gates.notify(
                 self.policy,
                 self.run_dir,
-                f"CRITICAL escalation: {task.story_key}",
+                pause_title(reason, task.story_key),
                 f"{display_critical_reason(reason, task.spec_file)} — resolve, then "
                 f"`bmad-loop resume {self.state.run_id}`",
             )
@@ -4888,6 +4890,7 @@ class SweepEngine(Engine):
                 errors=errors,
                 env_fault=result.env_fault,
                 parked=result.parked,
+                produced_work=result.produced_work,
                 diagnostic=diagnostic,
             )
             if result.status != "completed" and result.env_fault:
@@ -4907,6 +4910,15 @@ class SweepEngine(Engine):
                 self._escalate(
                     task,
                     parked_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                )
+            if result.status != "completed" and not result.produced_work:
+                # Never did anything (#727): plain-adapter roles never arm the stall
+                # gate, so a prompt-blocked session waits out the timeout with
+                # `parked` unset and this is its only route to a pause. Fresh budget
+                # on resume, as for env_fault and parked, which outrank it.
+                self._escalate(
+                    task,
+                    no_work_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
                 )
             if not errors:
                 # This record is the durable proof that validation accepted the
@@ -5291,6 +5303,7 @@ class SweepEngine(Engine):
                 errors=errors,
                 env_fault=result.env_fault,
                 parked=result.parked,
+                produced_work=result.produced_work,
                 diagnostic=diagnostic,
             )
             if result.status != "completed" and result.env_fault:
@@ -5308,6 +5321,14 @@ class SweepEngine(Engine):
                 self._escalate(
                     task,
                     parked_pause_reason("triage", result) + _diagnostic_suffix(diagnostic),
+                )
+            if result.status != "completed" and not result.produced_work:
+                # Never did anything (#727): the only route to a pause for a
+                # prompt-blocked triage session, which never arms the stall gate
+                # (see the migration twin). After env_fault and parked.
+                self._escalate(
+                    task,
+                    no_work_pause_reason("triage", result) + _diagnostic_suffix(diagnostic),
                 )
             if plan is not None:
                 advance(task, Phase.DONE)

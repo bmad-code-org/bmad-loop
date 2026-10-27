@@ -23,7 +23,9 @@ USAGE = tuple(regex.compile(p) for p in CLAUDE.usage_limit_patterns + CLAUDE.usa
 TIMEOUT = 2.0
 
 BYPASS_HEADING = "WARNING: Claude Code running in Bypass Permissions " + "mode"
-USAGE_SESSION_LINE = "⎿  You've hit your session limit · resets 7:20pm"
+# split so this file carries no line the shipped usage patterns match
+# (test_pane_capture_patterns_do_not_match_this_repo)
+USAGE_SESSION_LINE = "⎿  You've hit your session " + "limit · resets 7:20pm"
 
 
 def _match(rows, patterns=PARKED, **kw):

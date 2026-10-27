@@ -13089,6 +13089,29 @@ def test_critical_escalation_with_a_multiline_detail_keeps_attention_one_record_
     assert "\n" in load_state(engine.run_dir).paused_reason
 
 
+def test_parked_pause_is_notified_as_a_pause_not_a_critical_escalation(project):
+    """#727: `_escalate` titles its notice by the reason's kind, so a dev session
+    parked on a human prompt reads `Paused (parked prompt): <key>` in ATTENTION —
+    not `CRITICAL escalation:`, which sends the operator hunting for a spec
+    contradiction. The reason itself is unchanged in the body.
+
+    Ablation: restore the literal `CRITICAL escalation:` title in `_escalate` and
+    the title assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    evidence = "Notification(permission_prompt) -> PermissionPrompt"
+    parked = SessionResult(status="stalled", parked=True, parked_evidence=evidence)
+    engine, _ = make_engine(project, [parked])
+
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert engine.state.paused_reason.startswith("parked: dev session stalled")
+    text = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
+    (notice,) = [ln for ln in text.splitlines() if "Paused (parked prompt): 1-1-a" in ln]
+    assert evidence in notice
+    assert "CRITICAL escalation" not in text
+
+
 def test_dispatch_refuses_a_story_an_unlanded_entry_gates(project):
     """The enforcing half of `gate:`. Before this, `_pick_next` read the board
     alone: the ledger could say a story was blocked and `run` drove it anyway, and
@@ -16048,6 +16071,44 @@ def test_fix_phase_parked_session_escalates(project):
     fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
     assert fix["parked"] is True
     assert fix["parked_evidence"] == evidence
+
+
+def test_fix_phase_no_work_session_escalates(project):
+    """#727: a fix session that never did anything (no turn, no activity) escalates
+    like a parked one, instead of spending the remaining dev budget relaunching
+    repair sessions into the same wall.
+
+    ABLATION: delete the fix site's `produced_work` escalate arm and a second fix
+    session is launched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()  # ordinary fixable failure -> routes to a fix session
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    idle_fix = SessionResult(status="timeout", produced_work=False)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), _OK)),
+        limits=LimitsPolicy(max_dev_attempts=3),  # budget left -> must not be spent
+    )
+    engine, adapter = make_engine(
+        project, [dev_with_marker, breaking_review, idle_fix, idle_fix], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]  # one fix, then stop
+    assert engine.state.paused_reason.startswith("no work produced: fix session timeout (")
+    fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
+    assert fix["produced_work"] is False
+    assert fix["parked"] is False
 
 
 def test_max_stories_limit(project):

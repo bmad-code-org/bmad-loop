@@ -123,6 +123,8 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Title parked, no-work, usage-limit and environment-fault pause notifications as
+  `Paused (<kind>)` rather than `CRITICAL escalation`.
 - Read the BMAD v7 `tickets/` folder layout, where each initiative and epic keeps its
   `tickets.toml`, epics, leaf files and plans; the preview-era flat layout is still read
   when the installed `tickets.py` uses it.
@@ -183,6 +185,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Pause instead of retrying a review, fix, workflow, triage or migration session that
+  produced no work.
 - Match parked-prompt and usage-limit patterns across wrapped pane rows, so a dialog
   footer wrapped in a narrow window still withholds the stall nudge (#727).
 - Let `resolve` re-arm, adopt or abandon a story left escalated after a `resume` cleared

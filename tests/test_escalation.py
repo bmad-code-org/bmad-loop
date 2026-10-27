@@ -18,6 +18,7 @@ from bmad_loop.escalation import (
     decide_review_session,
     display_critical_reason,
     display_pause_reason,
+    pause_title,
     preference_escalations,
     review_retry_or_exhaust,
     session_failure_reason,
@@ -264,9 +265,11 @@ def test_no_work_reason_keeps_the_lost_session_suffix():
     assert decision.action == Action.PAUSE
     assert decision.reason.startswith("no work produced: dev session crashed:")
     assert "multiplexer no longer reports the session" in decision.reason
-    # the review decider does not carry the arm (a named follow-up, not this wave)
+    # the review decider carries the same arm, and the same suffix
     review = decide_review_session(task, both, POLICY)
-    assert "no work produced" not in review.reason
+    assert review.action == Action.PAUSE
+    assert review.reason.startswith("no work produced: review session crashed:")
+    assert "multiplexer no longer reports the session" in review.reason
 
 
 _PARKED_EVIDENCE = "Notification(permission_prompt) -> PermissionPrompt"
@@ -342,6 +345,64 @@ def test_review_env_fault_outranks_parked():
     decision = decide_review_session(_task(attempt=1), both, POLICY)
     assert decision.action == Action.PAUSE
     assert decision.reason.startswith("environment fault: review session stalled")
+
+
+@pytest.mark.parametrize("on_timeout", ["retry", "defer", "salvage-if-done"])
+def test_review_no_work_session_pauses_whatever_the_timeout_mode(on_timeout):
+    """#727: a review session that never did anything pauses with budget left,
+    ahead of the `review.on_timeout` routing — retrying, deferring or salvaging a
+    review that sat at a prompt changes nothing.
+
+    ABLATION: delete the `produced_work` arm in `decide_review_session` and this
+    RETRYs, DEFERs or SALVAGEs per mode."""
+    idle = SessionResult(status="timeout", produced_work=False)
+    decision = decide_review_session(_task(review_cycle=1), idle, _policy(on_timeout))
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("no work produced: review session timeout (")
+    assert not decision.budget_exhausted
+
+
+def test_review_parked_outranks_no_work():
+    both = SessionResult(
+        status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE, produced_work=False
+    )
+    decision = decide_review_session(_task(attempt=1), both, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: review session stalled")
+
+
+def test_review_env_fault_outranks_parked_and_no_work():
+    every = SessionResult(
+        status="stalled",
+        env_fault=True,
+        parked=True,
+        parked_evidence=_PARKED_EVIDENCE,
+        produced_work=False,
+    )
+    decision = decide_review_session(_task(attempt=1), every, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("environment fault: review session stalled")
+
+
+@pytest.mark.parametrize(
+    ("reason", "env_fault_site", "title"),
+    [
+        ("parked: dev session stalled (x)", None, "Paused (parked prompt): 1-1"),
+        ("no work produced: fix session timeout (x)", None, "Paused (no work): 1-1"),
+        ("usage limit: dev session stalled (x)", None, "Paused (usage limit): 1-1"),
+        ("environment fault: dev session crashed (x)", None, "Paused (environment fault): 1-1"),
+        # a verify-detected fault carries no prefix: the recorded site classifies it
+        ("verify command exited 127", "verify:dev", "Paused (environment fault): 1-1"),
+        ("CRITICAL escalation from dev session: x", None, "CRITICAL escalation: 1-1"),
+        ("review session crashed", None, "CRITICAL escalation: 1-1"),
+        # a prefix only counts at the start of the reason
+        ("dev said: parked: nope", None, "CRITICAL escalation: 1-1"),
+        # the prefix outranks the site: a parked pause keeps its own title
+        ("parked: dev session stalled (x)", "verify:dev", "Paused (parked prompt): 1-1"),
+    ],
+)
+def test_pause_title_classifies_by_reason_prefix(reason, env_fault_site, title):
+    assert pause_title(reason, "1-1", env_fault_site=env_fault_site) == title
 
 
 # The #610 credit-exhaustion pane line, split so this file carries no line the
