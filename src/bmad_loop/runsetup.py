@@ -395,7 +395,12 @@ def config_digest(
     launch: dict[str, dict[str, object]] = {}
     for role in ROLES:
         cfg = policy.adapter.resolved(role)
-        prof = profiles[role]
+        # The mode-resolved profile: under a non-bypass permission_mode its
+        # bypass_args ARE that mode's launch args, so the field below pins what
+        # is launched. "bypass" returns the profile itself (same bytes as before
+        # the field existed). An unmapped mode raises ProfileError, like an
+        # unknown profile name.
+        prof = profiles[role].for_permission_mode(cfg.permission_mode)
         launch[role] = {
             "binary": prof.binary,
             "launch_args": list(prof.launch_args),
@@ -430,6 +435,11 @@ def config_digest(
         # a host-exec change its argv never had.
         if prof.session_id_flag:
             launch[role]["session_id_flag"] = prof.session_id_flag
+        # Same byte-identity rule: the default mode adds no key. A non-default
+        # mode already moved `bypass_args`; the name is hashed beside it so the
+        # pin also records which mapping those args came from.
+        if cfg.permission_mode != "bypass":
+            launch[role]["permission_mode"] = cfg.permission_mode
     payload = {
         "verify_commands": list(policy.verify.commands),
         "plugins_enabled": sorted(policy.plugins.enabled),
@@ -491,6 +501,15 @@ def make_adapters(
                     profile = get_profile(cfg.name, project)
                 except ProfileError as e:
                     raise SystemExit(f"error: {e}") from e
+            # `adapter.permission_mode` resolved INTO the profile (its bypass_args
+            # become the mode's args) rather than handed to the adapter as a new
+            # keyword: out-of-tree classes are built with `cls(**common)` below and
+            # would refuse a keyword they predate (#569). `config_digest` applies
+            # the same resolution, so the pin and the launch agree.
+            try:
+                profile = profile.for_permission_mode(cfg.permission_mode)
+            except ProfileError as e:
+                raise SystemExit(f"error: adapter {role} session: {e}") from e
             # Which adapter class drives this CLI is pure data — `profile.adapter`
             # resolved against the registry. No adapter-name branching lives here;
             # a new family plugs in with zero edits to this function. Note this

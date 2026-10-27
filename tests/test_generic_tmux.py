@@ -39,7 +39,7 @@ from bmad_loop.adapters.base import (
 )
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
-from bmad_loop.adapters.profile import PARKED_EVENTS, get_profile
+from bmad_loop.adapters.profile import PARKED_EVENTS, PermissionModeSpec, get_profile
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS, Journal
 from bmad_loop.model import TokenUsage
@@ -444,6 +444,27 @@ def test_extra_args_replace_profile_bypass(tmp_path):
     cmd = adapter.build_command(make_spec(tmp_path))
     assert "--custom-flag" in cmd
     assert "bypassPermissions" not in cmd
+
+
+def test_a_sandboxed_profile_launches_its_mode_args_in_the_bypass_slot(tmp_path):
+    """#727: `adapter.permission_mode` is resolved INTO the profile
+    (`for_permission_mode` swaps `bypass_args` for the mode's args), so the
+    generic argv carries those args exactly where bypass_args sat, after the
+    prompt, and `build_command` quotes a JSON token as the one shell word it is."""
+    settings = '{"sandbox": {"enabled": true}}'
+    base = dataclasses.replace(
+        get_profile("claude"),
+        permission_modes={"sandboxed": PermissionModeSpec(args=("--mode-flag", settings))},
+    )
+    adapter = make_adapter(tmp_path)
+    adapter.profile = base.for_permission_mode("sandboxed", platform="linux")
+    argv = adapter.interactive_argv(make_spec(tmp_path))
+    prompt_at = next(i for i, a in enumerate(argv) if a.startswith("/bmad-dev-auto"))
+    assert argv[prompt_at + 1 : prompt_at + 3] == ["--mode-flag", settings]
+    assert "bypassPermissions" not in argv
+    cmd = adapter.build_command(make_spec(tmp_path))
+    assert shlex.quote(settings) in cmd
+    assert shlex.split(cmd)[prompt_at + 2] == settings
 
 
 def test_read_result_variants(tmp_path):

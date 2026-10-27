@@ -7079,6 +7079,36 @@ def test_resolve_echoes_the_commits_probe_failure(tmp_path, monkeypatch, capsys)
     )
 
 
+def test_resolve_session_keeps_bypass_args_under_a_sandboxed_permission_mode(tmp_path, monkeypatch):
+    """A human is present in a resolve session and its skill asks them questions,
+    so its adapters are built with every stage's permission_mode back at bypass.
+
+    ABLATION: hand `pol` straight to `_make_adapters` in `cmd_resolve` and the
+    captured dev mode reads sandboxed."""
+    from bmad_loop import resolve
+
+    _escalated_run(tmp_path, "r1")
+    policy_file = tmp_path / ".bmad-loop" / "policy.toml"
+    assert not policy_file.exists()
+    policy_file.write_text(
+        '[adapter]\nname = "claude"\npermission_mode = "sandboxed"\n'
+        '[adapter.review]\npermission_mode = "sandboxed"\n',
+        encoding="utf-8",
+    )
+    seen = {}
+
+    def make_adapters(_project, _run_dir, pol, **_k):
+        seen.update({role: pol.adapter.resolved(role).permission_mode for role in cli.ROLES})
+        return {"dev": object()}
+
+    monkeypatch.setattr(cli, "_make_adapters", make_adapters)
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (True, 0, 0))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"]) == 0
+    assert seen and set(seen.values()) == {"bypass"}
+
+
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     from bmad_loop import resolve
     from bmad_loop.journal import load_state

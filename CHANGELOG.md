@@ -126,6 +126,11 @@ breaking changes may land in a minor release.
   header and Log pane (#855).
 - Answer a parked permission prompt from the TUI (`Y` approve, `N` deny), sent only while
   a fresh pane capture still shows the prompt (`[parked_answers]` profile table) (#855).
+- Add `adapter.permission_mode` (`bypass` default, `sandboxed`): run sessions in a
+  profile's non-blocking sandboxed mode instead of a full permission bypass (claude:
+  `dontAsk` + `Edit(/**)` + the Bash sandbox; codex: a workspace-write permission profile
+  with a `.git` grant + `--ask-for-approval never`; linux/macOS). Profiles declare it in
+  `[permission_modes.<mode>]`; `bmad-loop resolve` sessions keep bypass (#727).
 
 ### Changed
 

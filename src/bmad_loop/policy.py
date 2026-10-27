@@ -37,6 +37,10 @@ REVIEW_TRIGGER_MODES = {"always", "recommended"}
 REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
 REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
 OPERATOR_ON_REVIEW_DEMOTION_MODES = {"escalate", "park"}
+# [adapter] permission_mode: "bypass" (default) launches a profile's bypass_args;
+# any other mode launches the profile's `[permission_modes.<mode>]` args instead,
+# and a profile without that table refuses the mode (`CLIProfile.for_permission_mode`).
+PERMISSION_MODES = frozenset({"bypass", "sandboxed"})
 # Session stages, in run order. Lives here rather than in the TUI because
 # settings_schema's expand_stages loop fans a template section out over it.
 STAGES = ("dev", "review", "triage", "retro")
@@ -464,6 +468,8 @@ class StageAdapterPolicy:
     # None = inherit from [adapter] (which itself falls back to the CLI profile)
     usage_grace_s: float | None = None
     stop_without_result_nudges: int | None = None
+    # None = inherit from [adapter], even across a client switch (see resolved())
+    permission_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -481,6 +487,8 @@ class ResolvedAdapter:
     # channel for it and ignores it (`bmad-loop validate` warns). Appended AFTER
     # the older fields because `resolved()` constructs this positionally.
     effort: str = ""
+    # A PERMISSION_MODES member; appended last for the same positional reason.
+    permission_mode: str = "bypass"
 
 
 @dataclass(frozen=True)
@@ -492,6 +500,9 @@ class AdapterPolicy:
     effort: str = ""
     # None = use the profile's default bypass flags; a list replaces them
     extra_args: tuple[str, ...] | None = None
+    # A PERMISSION_MODES member: "bypass" launches the profile's bypass_args,
+    # "sandboxed" its [permission_modes.sandboxed] args (extra_args still wins).
+    permission_mode: str = "bypass"
     # kill the run's bmad-loop-<id> tmux session when it finishes (False keeps
     # it around for post-run inspection)
     cleanup_session_on_finish: bool = True
@@ -521,6 +532,7 @@ class AdapterPolicy:
                 self.usage_grace_s,
                 self.stop_without_result_nudges,
                 effort=self.effort,
+                permission_mode=self.permission_mode,
             )
         name = stage.name if stage.name is not None else self.name
         # model, effort and extra_args are client-specific: inherit from the base
@@ -531,7 +543,10 @@ class AdapterPolicy:
         same_client = canonical_profile_name(name) == canonical_profile_name(self.name)
         # usage_grace_s / stop_without_result_nudges are benign timing knobs that
         # mean "fall back to the profile default" when None, so plain stage ??
-        # base inheritance is safe regardless of a client switch.
+        # base inheritance is safe regardless of a client switch. permission_mode
+        # inherits the same way: it is operator intent ("never fully bypass"), not
+        # a client flag, so a stage switching client keeps it and the new client's
+        # profile maps it (or refuses it).
         return ResolvedAdapter(
             name=name,
             model=(stage.model if stage.model is not None else (self.model if same_client else "")),
@@ -550,6 +565,9 @@ class AdapterPolicy:
             ),
             effort=(
                 stage.effort if stage.effort is not None else (self.effort if same_client else "")
+            ),
+            permission_mode=(
+                stage.permission_mode if stage.permission_mode is not None else self.permission_mode
             ),
         )
 
@@ -578,6 +596,7 @@ def _stage_from_snapshot(raw: Any) -> StageAdapterPolicy:
     name = raw.get("name")
     model = raw.get("model")
     effort = raw.get("effort")
+    permission_mode = raw.get("permission_mode")
     return StageAdapterPolicy(
         name=None if name is None else str(name),
         model=None if model is None else str(model),
@@ -585,6 +604,7 @@ def _stage_from_snapshot(raw: Any) -> StageAdapterPolicy:
         extra_args=_snapshot_extra_args(raw.get("extra_args")),
         usage_grace_s=raw.get("usage_grace_s"),
         stop_without_result_nudges=raw.get("stop_without_result_nudges"),
+        permission_mode=None if permission_mode is None else str(permission_mode),
     )
 
 
@@ -618,6 +638,8 @@ def adapter_policy_from_snapshot(snapshot: dict[str, Any] | None) -> AdapterPoli
             model=str(adapter_d.get("model", AdapterPolicy.model)),
             effort=str(adapter_d.get("effort", AdapterPolicy.effort)),
             extra_args=_snapshot_extra_args(adapter_d.get("extra_args")),
+            # A snapshot from before permission_mode existed ran with bypass.
+            permission_mode=str(adapter_d.get("permission_mode", AdapterPolicy.permission_mode)),
             cleanup_session_on_finish=bool(
                 adapter_d.get("cleanup_session_on_finish", AdapterPolicy.cleanup_session_on_finish)
             ),
@@ -811,7 +833,18 @@ def _stage_adapter(adapter_d: dict[str, Any], key: str) -> StageAdapterPolicy:
         extra_args=_typed_str_tuple(raw, f"adapter.{key}", "extra_args"),
         usage_grace_s=_opt_grace(raw, f"adapter.{key}"),
         stop_without_result_nudges=_opt_nudges(raw, f"adapter.{key}"),
+        permission_mode=_opt_permission_mode(raw, f"adapter.{key}"),
     )
+
+
+def _opt_permission_mode(d: dict[str, Any], where: str) -> str | None:
+    """`permission_mode` as a PERMISSION_MODES member, or None when unset."""
+    mode = _opt_typed_str(d, where, "permission_mode")
+    if mode is not None and mode not in PERMISSION_MODES:
+        raise PolicyError(
+            f"{where}.permission_mode must be one of {sorted(PERMISSION_MODES)}: got {mode!r}"
+        )
+    return mode
 
 
 def _validate_plugin_settings(name: str, raw: dict[str, Any], specs: Any) -> None:
@@ -1230,6 +1263,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         model=_typed_str(adapter_d, "adapter", "model", AdapterPolicy.model),
         effort=_typed_str(adapter_d, "adapter", "effort", AdapterPolicy.effort),
         extra_args=_typed_str_tuple(adapter_d, "adapter", "extra_args"),
+        permission_mode=_opt_permission_mode(adapter_d, "adapter") or AdapterPolicy.permission_mode,
         cleanup_session_on_finish=_typed_bool(
             adapter_d,
             "adapter",
@@ -1612,6 +1646,10 @@ effort = ""                  # reasoning effort, free-form (e.g. "high", "max");
 cleanup_session_on_finish = true  # kill the run's tmux session when it finishes (false keeps it for inspection)
 # extra_args replaces the profile's default permission-bypass flags when set:
 # extra_args = ["--permission-mode", "bypassPermissions"]
+# permission_mode = "sandboxed"      # bypass (default) | sandboxed: launch the profile's
+#                                    # non-blocking sandboxed args instead of bypass_args
+#                                    # (claude and codex, linux/macOS); stages inherit it
+#                                    # even when they switch client
 # Optional overrides of the CLI profile's own defaults (unset = inherit the
 # profile's shipped value; copilot ships usage_grace_s = 8 and
 # stop_without_result_nudges = 5):

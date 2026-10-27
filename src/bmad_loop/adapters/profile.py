@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import string
+import sys
 import tomllib
 from dataclasses import dataclass, field, replace
 from importlib import resources
@@ -48,7 +49,7 @@ from ..platform_util import (
     names_tree_root,
     names_win32_alias,
 )
-from ..policy import PROFILE_ALIASES
+from ..policy import PERMISSION_MODES, PROFILE_ALIASES
 from .entrypoints import record_load_error
 from .multiplexer import ALLOWED_KEYS
 
@@ -155,6 +156,25 @@ class ParkedAnswersSpec:
     deny: tuple[str, ...]
     approve_guard: tuple[str, ...]
     deny_guard: tuple[str, ...]
+
+
+# The `sys.platform` values a `[permission_modes.<mode>]` table may name.
+PERMISSION_MODE_PLATFORMS = frozenset({"linux", "darwin", "win32"})
+
+
+@dataclass(frozen=True)
+class PermissionModeSpec:
+    """The launch args of one non-bypass ``adapter.permission_mode`` (#727).
+
+    ``args`` stand in for ``bypass_args`` when the mode is selected
+    (:meth:`CLIProfile.for_permission_mode`), so ``extra_args`` replaces them
+    exactly as it replaces ``bypass_args``. ``platforms`` names the
+    ``sys.platform`` values the mapping is known to work on; empty = every
+    platform. Mode names, args and platforms are validated in
+    :func:`_validate_profile`."""
+
+    args: tuple[str, ...]
+    platforms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -320,6 +340,10 @@ class CLIProfile:
     # the CLI offers no answer keys and the operator attaches to answer. APPENDED
     # after auto_deny_patterns for the same positional-compatibility reason.
     parked_answers: ParkedAnswersSpec | None = None
+    # Non-bypass `adapter.permission_mode` mappings, keyed by mode name (#727);
+    # a mode absent here is refused for this CLI. APPENDED after parked_answers
+    # for the same positional-compatibility reason.
+    permission_modes: dict[str, PermissionModeSpec] = field(default_factory=dict)
 
     @property
     def hookless(self) -> bool:
@@ -348,14 +372,41 @@ class CLIProfile:
             skill, args = head, rest.strip()
         return self.prompt_template.format(prompt=prompt, skill=skill, args=args)
 
+    def for_permission_mode(self, mode: str, platform: str = sys.platform) -> CLIProfile:
+        """This profile with ``bypass_args`` set to ``mode``'s launch args.
+
+        ``"bypass"`` returns the profile unchanged. Any other mode swaps in its
+        ``[permission_modes.<mode>]`` args, so every reader of ``bypass_args``
+        (the launched argv, the config digest, :meth:`missing_bypass_tokens`)
+        sees the effective permission args with no second code path. Raises
+        :class:`ProfileError` when the profile has no mapping for ``mode`` or
+        the mapping excludes ``platform``."""
+        if mode == "bypass":
+            return self
+        spec = self.permission_modes.get(mode)
+        if spec is None:
+            raise ProfileError(
+                f"profile {self.name!r} has no permission_mode {mode!r} mapping "
+                f'(no [permission_modes.{mode}] table); use permission_mode = "bypass" '
+                "or another profile"
+            )
+        if spec.platforms and platform not in spec.platforms:
+            raise ProfileError(
+                f"profile {self.name!r} maps permission_mode {mode!r} only on "
+                f"{', '.join(spec.platforms)}, not {platform}"
+            )
+        return replace(self, bypass_args=spec.args)
+
     def missing_bypass_tokens(self, extra_args: tuple[str, ...] | None) -> tuple[str, ...]:
-        """The ``bypass_args`` tokens a policy ``extra_args`` override drops (DW-349).
+        """The permission args (``bypass_args``) a policy ``extra_args`` override
+        drops (DW-349).
 
         The replace rule (``GenericAdapter.interactive_argv``): a non-None
         ``extra_args`` REPLACES ``bypass_args`` rather than extending it, so any
-        bypass token that is not an exact element of ``launch_args + extra_args``
-        is absent from the launched argv. ``None`` means "inherit the profile's
-        bypass flags" and drops nothing; ``()`` is an explicit override and drops
+        permission token that is not an exact element of ``launch_args + extra_args``
+        is absent from the launched argv. On a profile resolved by
+        :meth:`for_permission_mode` these are that mode's args. ``None`` means
+        "inherit the profile's permission args" and drops nothing; ``()`` is an explicit override and drops
         them all. Order kept, duplicates collapsed."""
         if extra_args is None:
             return ()
@@ -657,6 +708,21 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 f"(missing {', '.join(missing)})"
             )
 
+    for mode, spec in profile.permission_modes.items():
+        if mode == "bypass" or mode not in PERMISSION_MODES:
+            raise fail(
+                f"permission_modes.{mode}: unknown mode (one of "
+                f"{sorted(PERMISSION_MODES - {'bypass'})}; bypass is bypass_args)"
+            )
+        if not spec.args or not all(isinstance(a, str) and a for a in spec.args):
+            raise fail(f"permission_modes.{mode}.args must list at least one non-empty string")
+        bad = [p for p in spec.platforms if p not in PERMISSION_MODE_PLATFORMS]
+        if bad:
+            raise fail(
+                f"permission_modes.{mode}.platforms must name values from "
+                f"{sorted(PERMISSION_MODE_PLATFORMS)}: got {bad!r}"
+            )
+
     answers = profile.parked_answers
     if answers is not None:
         for field_name in ("approve", "deny"):
@@ -774,6 +840,26 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             lists[key] = tuple(raw)
         parked_answers = ParkedAnswersSpec(**lists)
 
+    # `[permission_modes.<mode>]` tables of two string lists; mode names and
+    # values are checked in `_validate_profile`.
+    modes_d = doc.get("permission_modes", {})
+    if not isinstance(modes_d, dict):
+        raise fail("permission_modes must be a table of [permission_modes.<mode>] tables")
+    permission_modes: dict[str, PermissionModeSpec] = {}
+    for mode, spec_d in modes_d.items():
+        if not isinstance(spec_d, dict):
+            raise fail(f"permission_modes.{mode} must be a table")
+        unknown = sorted(set(spec_d) - {"args", "platforms"})
+        if unknown:
+            raise fail(f"permission_modes.{mode} has unknown keys: {unknown}")
+        mode_lists: dict[str, tuple[str, ...]] = {}
+        for key in ("args", "platforms"):
+            raw = spec_d.get(key, [])
+            if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+                raise fail(f"permission_modes.{mode}.{key} must be a list of strings")
+            mode_lists[key] = tuple(raw)
+        permission_modes[mode] = PermissionModeSpec(**mode_lists)
+
     # A dedicated shape check rather than the `str()` coercion the neighbouring
     # scalars get, because `adapter` has no parse-time membership test to land in
     # afterwards: `str(["x"])` would coerce a TOML array to the literal `"['x']"`
@@ -836,6 +922,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         workspace_trust=workspace_trust,
         subagent_transcript_dir=raw_subagent_dir,
         parked_answers=parked_answers,
+        permission_modes=permission_modes,
     )
     _validate_profile(profile, source)
     return profile

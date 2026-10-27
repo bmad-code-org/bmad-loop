@@ -136,7 +136,7 @@ Desktop & file notifications.
 
 ### `[adapter]`
 
-CLI client, model & bypass flags (base for all stages).
+CLI client, model & permission flags (base for all stages).
 
 | Key | Type | Default | Allowed | Description |
 | --- | --- | --- | --- | --- |
@@ -144,6 +144,7 @@ CLI client, model & bypass flags (base for all stages).
 | `model` | string | unset — CLI default model |  |  |
 | `effort` | string | unset — provider default |  | reasoning effort, free-form (provider/model-specific, e.g. high, max); sent by opencode-http as the model variant (on 2.x it must be one of the model's variants), ignored by the tmux CLIs |
 | `extra_args` | array of strings | unset |  | when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts |
+| `permission_mode` | string | `"bypass"` | `bypass` / `sandboxed` | bypass (default): launch the CLI profile's permission-bypass flags (its bypass_args) · sandboxed: launch the profile's non-blocking sandboxed flags instead — a denied action returns to the agent as an error rather than a prompt (claude and codex on linux/macOS; other profiles refuse it) · extra_args, when set, still replaces either · stages inherit it even when they switch client |
 | `cleanup_session_on_finish` | boolean | `true` |  |  |
 | `usage_grace_s` | float | unset — inherit from CLI profile (copilot ships 8s) | ≥ 0 | seconds to poll the transcript for token usage after a session ends; CLIs that flush totals on shutdown (copilot) need a grace |
 | `stop_without_result_nudges` | integer | unset — inherit (copilot profile ships 5) | ≥ 0 | result-less Stop signals tolerated before a session is called stalled; overrides the global limits value for this CLI |
@@ -158,6 +159,7 @@ Dev-stage adapter overrides.
 | `model` | string | unset — inherit / client default |  |  |
 | `effort` | string | unset — inherit / provider default |  |  |
 | `extra_args` | array of strings | unset |  | inherits from [adapter] only when the client matches (a stage that switches client falls back to that client's bypass flags); when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) |
+| `permission_mode` | string | unset | `bypass` / `sandboxed` | leave blank to inherit [adapter] permission_mode — inherited even when this stage switches client, whose profile must then map the mode |
 | `usage_grace_s` | float | unset — inherit from [adapter] | ≥ 0 |  |
 | `stop_without_result_nudges` | integer | unset — inherit from [adapter] | ≥ 0 |  |
 
@@ -171,6 +173,7 @@ Review-stage adapter overrides.
 | `model` | string | unset — inherit / client default |  |  |
 | `effort` | string | unset — inherit / provider default |  |  |
 | `extra_args` | array of strings | unset |  | inherits from [adapter] only when the client matches (a stage that switches client falls back to that client's bypass flags); when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) |
+| `permission_mode` | string | unset | `bypass` / `sandboxed` | leave blank to inherit [adapter] permission_mode — inherited even when this stage switches client, whose profile must then map the mode |
 | `usage_grace_s` | float | unset — inherit from [adapter] | ≥ 0 |  |
 | `stop_without_result_nudges` | integer | unset — inherit from [adapter] | ≥ 0 |  |
 
@@ -184,6 +187,7 @@ Triage-stage adapter overrides.
 | `model` | string | unset — inherit / client default |  |  |
 | `effort` | string | unset — inherit / provider default |  |  |
 | `extra_args` | array of strings | unset |  | inherits from [adapter] only when the client matches (a stage that switches client falls back to that client's bypass flags); when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) |
+| `permission_mode` | string | unset | `bypass` / `sandboxed` | leave blank to inherit [adapter] permission_mode — inherited even when this stage switches client, whose profile must then map the mode |
 | `usage_grace_s` | float | unset — inherit from [adapter] | ≥ 0 |  |
 | `stop_without_result_nudges` | integer | unset — inherit from [adapter] | ≥ 0 |  |
 
@@ -197,6 +201,7 @@ Retro-stage adapter overrides.
 | `model` | string | unset — inherit / client default |  |  |
 | `effort` | string | unset — inherit / provider default |  |  |
 | `extra_args` | array of strings | unset |  | inherits from [adapter] only when the client matches (a stage that switches client falls back to that client's bypass flags); when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) |
+| `permission_mode` | string | unset | `bypass` / `sandboxed` | leave blank to inherit [adapter] permission_mode — inherited even when this stage switches client, whose profile must then map the mode |
 | `usage_grace_s` | float | unset — inherit from [adapter] | ≥ 0 |  |
 | `stop_without_result_nudges` | integer | unset — inherit from [adapter] | ≥ 0 |  |
 

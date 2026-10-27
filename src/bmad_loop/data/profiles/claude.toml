@@ -212,3 +212,27 @@ quota_auto_resume_stale = "QuotaPrompt"
 quota_auto_resume_disabled = "QuotaPrompt"
 elicitation_dialog = "PermissionPrompt"
 elicitation_url_dialog = "PermissionPrompt"
+
+# `adapter.permission_mode = "sandboxed"` (#727): never prompt, deny instead.
+# `dontAsk` denies every tool call no allow rule covers, back to the model as an
+# error with no dialog; `Edit(/**)` (anchored at the working dir, and covering
+# Write) lets the session edit the project; `--settings` turns on the Bash
+# sandbox (bubblewrap on Linux, Seatbelt on macOS), refuses to start without it
+# and drops the unsandboxed retry. Sandboxed Bash is auto-allowed, so git
+# add/commit work (the sandbox lets git write .git, except hooks/ and config),
+# network is denied, and project hook settings still fire. AskUserQuestion is
+# denied outright. Per code.claude.com/docs/en/permission-modes, /permissions and
+# /sandboxing; live-checked 2026-10-27 on Claude Code 2.1.311 in a repo and in a
+# linked worktree. No native-Windows sandbox, hence the platform list.
+[permission_modes.sandboxed]
+args = [
+  "--permission-mode",
+  "dontAsk",
+  "--allowedTools",
+  "Edit(/**)",
+  "--disallowedTools",
+  "AskUserQuestion",
+  "--settings",
+  '{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}',
+]
+platforms = ["linux", "darwin"]

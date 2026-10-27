@@ -25,3 +25,28 @@ seed_files = [".codex/config.toml"]
 dialect = "codex-hooks-json"
 config_path = ".codex/hooks.json"
 events = { SessionStart = "SessionStart", Stop = "Stop" }
+
+# `adapter.permission_mode = "sandboxed"` (#727): a workspace-write sandbox with
+# approvals off (`never` returns every failure to the model; no prompt is shown).
+# Plain `--sandbox workspace-write` is NOT enough: it keeps `<root>/.git`
+# read-only, so the dev skill's `git add --refresh` preflight and its commit
+# fail. The permission profile below extends `:workspace` with a `.git` write
+# grant instead (it replaces `--sandbox`: Codex refuses `sandbox_mode` beside
+# `default_permissions`). Network stays off. Per Codex's agent-approvals-security
+# and permissions docs; live-checked 2026-10-27 on codex-cli 0.164.0.
+# KNOWN GAP: in a linked worktree (`scm.isolation = "worktree"`) the gitdir lives
+# under the main repo's `.git/worktrees/<name>` and stays read-only (Codex grants
+# only exact paths there, no globs), so git add/commit fail in that checkout.
+# Windows is unverified, hence the platform list.
+[permission_modes.sandboxed]
+args = [
+  "-c",
+  'default_permissions="bmad_loop"',
+  "-c",
+  'permissions.bmad_loop.extends=":workspace"',
+  "-c",
+  'permissions.bmad_loop.filesystem={":workspace_roots"={".git"="write"}}',
+  "--ask-for-approval",
+  "never",
+]
+platforms = ["linux", "darwin"]

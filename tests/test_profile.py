@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import re
 from importlib import resources
 from pathlib import Path
@@ -11,6 +12,7 @@ from bmad_loop.adapters.profile import (
     CLIProfile,
     HookSpec,
     ParkedAnswersSpec,
+    PermissionModeSpec,
     ProfileError,
     get_profile,
     load_profiles,
@@ -547,6 +549,101 @@ def test_malformed_parked_answers_is_a_profile_error(tmp_path, table, match):
     (profiles_dir / "mycli.toml").write_text(body, encoding="utf-8")
     with pytest.raises(ProfileError, match=match):
         load_profiles(tmp_path)
+
+
+_PERMISSION_MODES_TABLE = """
+[permission_modes.sandboxed]
+args = ["--sandbox", '{"a": 1}']
+platforms = ["linux", "darwin"]
+"""
+
+
+def _mode_profiles(tmp_path, body: str) -> dict[str, CLIProfile]:
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(body, encoding="utf-8")
+    return load_profiles(tmp_path)
+
+
+def test_permission_modes_table_parses_into_its_spec(tmp_path):
+    prof = _mode_profiles(tmp_path, MINIMAL_PROFILE + _PERMISSION_MODES_TABLE)["mycli"]
+    assert prof.permission_modes == {
+        "sandboxed": PermissionModeSpec(
+            args=("--sandbox", '{"a": 1}'), platforms=("linux", "darwin")
+        )
+    }
+    # absent table: no non-bypass mode
+    assert get_profile("gemini").permission_modes == {}
+
+
+@pytest.mark.parametrize(
+    ("table", "match"),
+    [
+        (_PERMISSION_MODES_TABLE + "allow = ['x']\n", "unknown keys"),
+        (_PERMISSION_MODES_TABLE.replace("sandboxed]", "yolo]"), "unknown mode"),
+        (_PERMISSION_MODES_TABLE.replace("sandboxed]", "bypass]"), "unknown mode"),
+        (_PERMISSION_MODES_TABLE.replace('"darwin"', '"cygwin"'), "platforms must name"),
+        (_PERMISSION_MODES_TABLE.replace('"darwin"]', '"darwin"]\nargs2 = 1'), "unknown keys"),
+        (
+            "\n[permission_modes.sandboxed]\nargs = []\n",
+            "args must list at least one",
+        ),
+        ('\n[permission_modes.sandboxed]\nargs = "--x"\n', "args must be a list"),
+        ("\n[permission_modes]\nsandboxed = 1\n", "sandboxed must be a table"),
+    ],
+)
+def test_malformed_permission_modes_is_a_profile_error(tmp_path, table, match):
+    """ABLATION: drop the matching check (`_parse_profile` unknown keys / shape,
+    the mode-name, args or platform check in `_validate_profile`) and its case loads."""
+    with pytest.raises(ProfileError, match=match):
+        _mode_profiles(tmp_path, MINIMAL_PROFILE + table)
+
+
+def test_for_permission_mode_resolves_the_mode_into_bypass_args(tmp_path):
+    prof = _mode_profiles(tmp_path, MINIMAL_PROFILE + _PERMISSION_MODES_TABLE)["mycli"]
+    assert prof.for_permission_mode("bypass") is prof
+    sandboxed = prof.for_permission_mode("sandboxed", platform="linux")
+    assert sandboxed.bypass_args == ("--sandbox", '{"a": 1}')
+    assert sandboxed.name == prof.name and sandboxed.launch_args == prof.launch_args
+    # extra_args still replaces the resolved args, so a drop is reported against them
+    assert sandboxed.missing_bypass_tokens(("--yes",)) == ("--sandbox", '{"a": 1}')
+
+
+def test_for_permission_mode_refuses_an_excluded_platform(tmp_path):
+    prof = _mode_profiles(tmp_path, MINIMAL_PROFILE + _PERMISSION_MODES_TABLE)["mycli"]
+    with pytest.raises(ProfileError, match="only on linux, darwin, not win32"):
+        prof.for_permission_mode("sandboxed", platform="win32")
+
+
+def test_for_permission_mode_with_no_platform_list_runs_everywhere(tmp_path):
+    body = MINIMAL_PROFILE + '\n[permission_modes.sandboxed]\nargs = ["--s"]\n'
+    prof = _mode_profiles(tmp_path, body)["mycli"]
+    assert prof.for_permission_mode("sandboxed", platform="win32").bypass_args == ("--s",)
+
+
+def test_shipped_sandboxed_mappings_parse_and_resolve():
+    """claude and codex ship the live-checked sandboxed args (linux/macOS only)."""
+    claude = get_profile("claude").for_permission_mode("sandboxed", platform="linux")
+    assert claude.bypass_args[:2] == ("--permission-mode", "dontAsk")
+    assert "--dangerously-skip-permissions" not in claude.bypass_args
+    settings = claude.bypass_args[claude.bypass_args.index("--settings") + 1]
+    assert json.loads(settings)["sandbox"] == {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False,
+    }
+    codex = get_profile("codex").for_permission_mode("sandboxed", platform="darwin")
+    assert codex.bypass_args[-2:] == ("--ask-for-approval", "never")
+    assert "--dangerously-bypass-approvals-and-sandbox" not in codex.bypass_args
+    for name in ("claude", "codex"):
+        with pytest.raises(ProfileError, match="not win32"):
+            get_profile(name).for_permission_mode("sandboxed", platform="win32")
+
+
+@pytest.mark.parametrize("name", ["gemini", "copilot", "antigravity", "opencode-http"])
+def test_for_permission_mode_refuses_an_unmapped_profile(name):
+    with pytest.raises(ProfileError, match="no permission_mode 'sandboxed' mapping"):
+        get_profile(name).for_permission_mode("sandboxed", platform="linux")
 
 
 def test_shipped_claude_answer_guards_match_the_captured_855_screen():
@@ -1637,6 +1734,13 @@ def test_profile_scan_failure_degrades(profile_scan):
         (
             {"parked_answers": ParkedAnswersSpec(("Enter",), ("Escape",), ("x",), ("(",))},
             "deny_guard entry is not a valid regex",
+        ),
+        # the #727 permission modes: known non-bypass names, non-empty args, platforms
+        ({"permission_modes": {"yolo": PermissionModeSpec(("--x",))}}, "unknown mode"),
+        ({"permission_modes": {"sandboxed": PermissionModeSpec(())}}, "args must list"),
+        (
+            {"permission_modes": {"sandboxed": PermissionModeSpec(("--x",), ("haiku",))}},
+            "platforms must name",
         ),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
