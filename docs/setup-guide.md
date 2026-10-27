@@ -448,7 +448,7 @@ Codex trusts hooks per directory, and an untrusted hook never fires, so a sessio
 3. If the verdict is not `trusted`:
    - `untrusted`, trust is stale: open Codex in that checkout and accept the hook prompt again.
    - `untrusted`, the relay is not usable or Codex omitted it: re-register it with `bmad-loop init --cli codex`.
-   - `unverifiable`: fix the cause it names, for example stage `extra_args` other than `--dangerously-bypass-approvals-and-sandbox`, profile `launch_args`, Codex missing from `PATH`, or an unreadable `.codex/hooks.json`. Then check again.
+   - `unverifiable`: fix the cause it names, for example stage `extra_args` other than `--dangerously-bypass-approvals-and-sandbox` or the sandboxed permission args (`--sandbox workspace-write`, `--ask-for-approval never`, and `-c` overrides of `default_permissions` or `permissions.*`), profile `launch_args`, Codex missing from `PATH`, or an unreadable `.codex/hooks.json`. Then check again.
 
 Under `[scm] isolation = "worktree"`, every unit runs in a new worktree that Codex has not trusted yet. `validate` therefore always fails `hooks.trust` under worktree isolation; that failure is expected, and `probe-adapter codex` still reports the project checkout. The run checks trust itself before each Codex session in a worktree. When a check fails, the unit escalates and the run pauses. For each such pause:
 

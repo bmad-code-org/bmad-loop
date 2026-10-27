@@ -100,11 +100,13 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A dev attempt that fails only its verify commands keeps its tree, and the failing output is handed to the retry as feedback.
   - A session silent for `dev_stall_grace_s` (default 600) gets up to `dev_stall_nudges` wake nudges, then ends `stalled` and is charged as a failed attempt.
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
-  - A dev session that did no work, or any session parked on a prompt only a human should answer, pauses the run instead of being charged.
+  - A session that did no work, in any role (dev, review, fix, workflow, triage, migration), or any session parked on a prompt only a human should answer, pauses the run instead of being charged.
+  - Parked-prompt and usage-limit patterns match a pane line even when a narrow window wraps it across two or three rows, so a wrapped dialog footer still withholds the stall nudge.
+  - A session whose window is alive and whose transcript is idle when the timeout fires ends `timeout` marked parked when a parked hook signal or a parked-prompt pane pattern is present, and pauses instead of retrying.
   - While the visible pane shows the coding CLI waiting out a usage-limit reset and the transcript is idle, the session timeout is frozen and the stall nudge held, for at most `[limits] quota_wait_max_min` (default 300; 0 = off) cumulative minutes per session; past the cap, or when the parsed reset lies beyond it, the session pauses with a usage-limit reason.
   - Before an attempt is reset, its commits go to an `attempt-preserve/<run>-<tip8>` branch and uncommitted work to a `refs/attempt-preserve-dirty/*` snapshot.
 - **Config:** `[limits] max_dev_attempts`, `[limits] max_review_cycles`, `[limits] session_timeout_min`, `[limits] dev_stall_grace_s`, `[limits] dev_stall_nudges`, `[limits] dev_stall_nudges_cap`, `[limits] quota_wait_max_min`, `[scm] preserve_keep`
-- **Tested by:** `tests/test_escalation.py`, `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_verify.py`, `tests/test_recovery_flow.py`
+- **Tested by:** `tests/test_escalation.py`, `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_panematch.py`, `tests/test_sweep.py`, `tests/test_verify.py`, `tests/test_recovery_flow.py`
 - **Docs:** [Preserved attempts](escalations-guide.md#preserved-attempts), [[limits] reference](reference/configuration.md#limits), [[scm] reference](reference/configuration.md#scm)
 
 ### Plateau-defer
@@ -127,6 +129,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, or adopting a kept branch.
 - **Properties:**
   - A CRITICAL escalation marks the story `escalated`, sends a `CRITICAL escalation: <story>` notice and pauses the run at `escalation`.
+  - A pause that is not a CRITICAL contradiction is titled by its reason: `Paused (parked prompt): <story>`, `Paused (no work): <story>`, `Paused (usage limit): <story>` or `Paused (environment fault): <story>`.
   - A PREFERENCE escalation is journaled as `preference-escalation` and the run continues.
   - Resolve also admits an unfinished story run with no pause stage and a story still escalated, as a resume whose engine exited before run end leaves it; `resume` warns of each escalated story it skips, and `status` and the TUI header name the resolve that clears it.
   - A resume that fails before its engine starts puts back the pause it cleared and journals `resume-aborted`.
@@ -340,6 +343,23 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Tested by:** `tests/test_policy.py`, `tests/test_opencode_http.py`, `tests/test_cli.py`
 - **Docs:** [Configuration reference: [adapter]](reference/configuration.md#adapter), [Configuration reference: [adapter.dev]](reference/configuration.md#adapterdev)
 
+### Permission modes
+
+- **Stability:** in-progress
+- **Description:** `[adapter] permission_mode` picks how sessions get past their CLI's permission prompts: `bypass` (the default) launches the profile's bypass flags, and `sandboxed` launches the profile's non-blocking sandboxed flags, so a denied action returns to the agent as an error instead of a prompt.
+- **Properties:**
+  - `bypass` launches exactly the argv and records exactly the config digest that a policy without the key does.
+  - `sandboxed` swaps the profile's `[permission_modes.sandboxed]` args in for its `bypass_args`; an explicit `extra_args` still replaces either.
+  - claude and codex map `sandboxed` on Linux and macOS. Other profiles, and excluded platforms, refuse it at run start, and `validate` reports it as `adapter.permission-mode-unsupported`.
+  - A stage inherits the base mode even when it switches client; `[adapter.<stage>] permission_mode` overrides it.
+  - `bmad-loop resolve` sessions, where a human is present, keep the bypass flags whatever the mode.
+  - `validate` reports each role's permission posture as `adapter.permission-mode`, suggesting `sandboxed` for an unsandboxed role without worktree isolation when the profile maps it. The note is advisory: a worktree is not a security boundary.
+  - Sandboxed Codex under `scm.isolation = "worktree"` is a warning: the sandbox keeps a linked worktree's gitdir read-only, so git add and commit fail.
+  - `tickets.store-sandbox` also warns when a sandboxed role writes a ticket store outside its cwd.
+- **Config:** `[adapter] permission_mode`, `[adapter.dev]` / `[adapter.review]` / `[adapter.triage]` / `[adapter.retro]` `permission_mode`; profile table `[permission_modes.<mode>]`
+- **Tested by:** `tests/test_policy.py`, `tests/test_profile.py`, `tests/test_runsetup.py`, `tests/test_cli.py`, `tests/test_codex_trust.py`, `tests/test_install.py`
+- **Docs:** [Configuration reference: [adapter]](reference/configuration.md#adapter), [Permission modes](adapter-authoring-guide.md#permission-modes), [validate check ids](reference/cli.md#validate-checks)
+
 ### Multiplexer and OS seams
 
 - **Stability:** stable
@@ -450,9 +470,11 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - The settings editor checks edits with the same policy parser a run uses, and will not save an invalid value.
   - Resized pane sizes are saved per project under `[tui]` in policy.toml and restored on the next launch.
   - In tickets mode the middle pane is a tickets board, read off the UI thread only when the initiative's files change, and **Request replan** goes through `tickets.py mark`.
-- **Config:** `bmad-loop tui --low-frame-rate`, `[tui] low_frame_rate`
-- **Tested by:** `tests/test_tui_app.py`, `tests/test_tui_launch.py`, `tests/test_tui_settings.py`, `tests/test_tui_data.py`
-- **Docs:** [TUI guide](tui-guide.md), [Observer/launcher architecture](tui-guide.md#architecture-observerlauncher-never-the-engine), [TUI: tickets mode](tui-guide.md#tickets-mode), [CLI: tui](reference/cli.md#tui)
+  - A session parked on a permission prompt shows in the header with its age and the CLI's auto-deny countdown, and the Log pane leads with a parked note.
+  - `Y` approves and `N` denies a parked prompt only when the session's profile declares `[parked_answers]` and a fresh pane capture still matches every guard pattern; each answer is journaled as `parked-answered`.
+- **Config:** `bmad-loop tui --low-frame-rate`, `[tui] low_frame_rate`; profile keys `auto_deny_patterns`, `[parked_answers]`
+- **Tested by:** `tests/test_tui_app.py`, `tests/test_tui_launch.py`, `tests/test_tui_settings.py`, `tests/test_tui_data.py`, `tests/test_parked_answer.py`
+- **Docs:** [TUI guide](tui-guide.md), [Observer/launcher architecture](tui-guide.md#architecture-observerlauncher-never-the-engine), [TUI: tickets mode](tui-guide.md#tickets-mode), [Answering a parked permission prompt](tui-guide.md#answering-a-parked-permission-prompt), [CLI: tui](reference/cli.md#tui)
 
 ### Session and disk cleanup
 

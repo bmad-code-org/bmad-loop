@@ -32,6 +32,17 @@ Escalations come in two severities:
 - **CRITICAL**: the story moves to `escalated`, `story-escalated` is journaled, you get a `CRITICAL escalation: <story>` notice, and the run pauses at `escalation`.
 - **PREFERENCE**: journaled as `preference-escalation`; the run continues.
 
+Some escalation pauses are not a contradiction in the spec, and their notices say so by reason:
+
+| Reason starts with                       | Notice title                          | Cause                                                        |
+| ---------------------------------------- | ------------------------------------- | ------------------------------------------------------------ |
+| `parked: `                               | `Paused (parked prompt): <story>`     | the session waited on a prompt only a human should answer    |
+| `no work produced: `                     | `Paused (no work): <story>`           | a session in any role ended without producing work           |
+| `usage limit: `                          | `Paused (usage limit): <story>`       | the coding CLI hit a [usage limit](#usage-limit-pauses)      |
+| `environment fault: `, or a verify fault | `Paused (environment fault): <story>` | an [environment fault](#environment-faults) during the story |
+
+Every other reason keeps the `CRITICAL escalation: <story>` title. Fix the cause (answer or dismiss the prompt, check the CLI's login, credits or permission mode), then resolve as below.
+
 A story stays escalated until you resolve it. A plain `bmad-loop resume` warns `story '<key>' is still escalated — resume skips it`, skips it and runs the rest of the queue, then pauses again with `story '<key>' is still escalated — run bmad-loop resolve <id>`. A run is never marked finished while a story is escalated. A resume clears the pause before its engine starts, so an engine that exits before run end (killed, stopped, crashed) leaves the run with no pause stage and the story still escalated; resolve it the same way.
 
 ## Resolving an escalation

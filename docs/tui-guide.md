@@ -209,8 +209,13 @@ profile declares) has been quiet past
 waiting on a tool call (`unknown` if the transcript could not be read). A session
 waiting out a usage-limit reset shows `· quota wait <age>` in place of `· idle <age>`,
 followed by `· resets <Ddd HH:MM>` (local time) when the limit line named a reset that
-resolved, or the reset text as printed when it did not. Between sessions it shows the run's configured
-adapters from its policy snapshot. A run with no snapshot shows no agent line;
+resolved, or the reset text as printed when it did not.
+
+A session parked on a permission prompt shows a yellow
+`· parked on permission prompt <age>` in place of the idle and quota-wait arms, followed by
+`· auto-denies in M:SS` while the CLI's countdown runs, `· auto-deny due` once it has
+passed, or `· auto-deny time unknown` when no countdown was read. Between sessions the
+agent line shows the run's configured adapters from its policy snapshot. A run with no snapshot shows no agent line;
 an unreadable session identity shows `agent unreadable — <fault>`.
 
 Situational banners below that:
@@ -280,7 +285,10 @@ One row per story (or sweep bundle and triage task) in the selected run:
   the tab follows the engine to the next session. Only the last 256 KB of a
   large log is read on first open. A session that ran a fullscreen
   (alt-screen) TUI shows a yellow note that the pane holds only the final
-  frame, with the full transcript's path when known.
+  frame, with the full transcript's path when known. When the log's session is
+  parked on a permission prompt, the tab leads with a yellow
+  `⚠ parked on a permission prompt — Y approve · N deny · a attach`, or
+  `— a attach to answer` when its profile offers no answer keys.
 - **Attention**: the run's `ATTENTION` file (escalations, gate notices). New
   lines after the first poll also raise a warning toast.
 
@@ -332,29 +340,30 @@ Journal kinds are colored by the first matching substring:
 
 ## Key bindings
 
-| Key      | Action                                                                                        |
-| -------- | --------------------------------------------------------------------------------------------- |
-| `r`      | start a run (modal)                                                                           |
-| `s`      | start a deferred-work sweep (modal)                                                           |
-| `e`      | resume the selected paused/interrupted run (confirm modal)                                    |
-| `p`      | review the selected paused run in its HITL viewer                                             |
-| `R`      | resolve a run paused at an escalation, then re-arm                                            |
-| `V`      | re-verify a story's kept work (pick target)                                                   |
-| `d`      | answer deferred-work decisions sweeps left open (modal walk)                                  |
-| `a`      | attach to the selected run's live session or window                                           |
-| `x`      | stop the selected live run, abandoning the in-flight item (confirm modal)                     |
-| `S`      | graceful stop: finish the in-flight item, then finalize and stop (confirm modal)              |
-| `D`      | delete the selected run's directory (confirm modal)                                           |
-| `A`      | archive the selected run to `.bmad-loop/archive` (confirm modal)                              |
-| `c`      | clean up multiplexer sessions of finished runs (confirm modal)                                |
-| `v`      | run `bmad-loop validate`, findings in a modal (`d` toggles detail)                            |
-| `g`      | settings editor for `.bmad-loop/policy.toml`                                                  |
-| `M`      | toggle light/dark mode                                                                        |
-| `y`      | copy the active Log/Attention pane to the clipboard                                           |
-| `escape` | unpin the log view and follow new output                                                      |
-| `ctrl+w` | enter/leave pane resize mode                                                                  |
-| `q`      | quit (running engines are unaffected)                                                         |
-| `ctrl+p` | command palette: every command above, filtered to what is live on the current screen or modal |
+| Key       | Action                                                                                        |
+| --------- | --------------------------------------------------------------------------------------------- |
+| `r`       | start a run (modal)                                                                           |
+| `s`       | start a deferred-work sweep (modal)                                                           |
+| `e`       | resume the selected paused/interrupted run (confirm modal)                                    |
+| `p`       | review the selected paused run in its HITL viewer                                             |
+| `R`       | resolve a run paused at an escalation, then re-arm                                            |
+| `V`       | re-verify a story's kept work (pick target)                                                   |
+| `d`       | answer deferred-work decisions sweeps left open (modal walk)                                  |
+| `a`       | attach to the selected run's live session or window                                           |
+| `Y` / `N` | approve / deny a parked permission prompt (only while one is live and answerable)             |
+| `x`       | stop the selected live run, abandoning the in-flight item (confirm modal)                     |
+| `S`       | graceful stop: finish the in-flight item, then finalize and stop (confirm modal)              |
+| `D`       | delete the selected run's directory (confirm modal)                                           |
+| `A`       | archive the selected run to `.bmad-loop/archive` (confirm modal)                              |
+| `c`       | clean up multiplexer sessions of finished runs (confirm modal)                                |
+| `v`       | run `bmad-loop validate`, findings in a modal (`d` toggles detail)                            |
+| `g`       | settings editor for `.bmad-loop/policy.toml`                                                  |
+| `M`       | toggle light/dark mode                                                                        |
+| `y`       | copy the active Log/Attention pane to the clipboard                                           |
+| `escape`  | unpin the log view and follow new output                                                      |
+| `ctrl+w`  | enter/leave pane resize mode                                                                  |
+| `q`       | quit (running engines are unaffected)                                                         |
+| `ctrl+p`  | command palette: every command above, filtered to what is live on the current screen or modal |
 
 In the settings editor: `ctrl+s` saves, `ctrl+e` expands or collapses all
 sections, `escape` goes back without saving. In any modal, `escape` cancels.
@@ -579,6 +588,34 @@ one-time warning toast.
 The banner clears once the sweep journals its next event. Sweeps launched
 **unattended** never prompt. What each answer does is in
 [Answering decisions](sweep-guide.md#answering-decisions).
+
+### Answering a parked permission prompt
+
+When a session waits on a permission prompt, the header shows it and the Log tab leads
+with the parked note. `Y` approves and `N` denies it, without attaching. They show in the
+footer and the palette only while the selected run's log session is parked and its
+profile declares `[parked_answers]` (the shipped `claude` profile does).
+
+Before any key goes out, the answer re-checks that:
+
+1. the run's journal still shows the prompt as live;
+2. the session's window is still alive;
+3. the session's profile declares the answer keys;
+4. a fresh capture of the pane matches every guard pattern of the chosen answer.
+
+Any failed check sends nothing and shows a toast with the reason, ending `— attach (a) to
+answer`. A sent answer is journaled as `parked-answered` and the parked note clears on the
+next poll.
+
+- **Any key cancels Claude Code's auto-deny countdown.** After that the prompt waits for
+  an answer indefinitely, which is why the guards must match first.
+- **A denial can end the session's turn.** Claude Code stops the turn on a denied prompt,
+  so the session may then end parked or with no work, and the run pauses for you.
+- **`bmad-loop resolve` sessions keep the bypass flags** whatever
+  `adapter.permission_mode` is, since you are attached and can answer prompts yourself.
+
+To answer a prompt the keys cannot (another dialog, or a guard that does not match), press
+`a` and answer it in the session's window.
 
 ### Answering missed decisions (`d`)
 

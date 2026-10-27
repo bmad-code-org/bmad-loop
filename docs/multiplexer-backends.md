@@ -323,3 +323,6 @@ Operational notes for any external backend:
   `version()`), and `validate` adds a `mux.backend-probe` warning.
 - **`mux set --force` persists a backend that is not registered here**, for a shared
   workflow where the package is installed on other machines.
+- **The TUI's parked-prompt answer keys need `send_keys`.** The method is optional: a
+  backend that does not override it refuses every answer, and the operator answers by
+  attaching instead. See the [backend contract](adapter-authoring-guide.md#the-transport-contract-for-a-backend-author).
