@@ -113,6 +113,23 @@ def test_spent_joined_line_does_not_rematch():
     assert fresh.line.strip().endswith("resets 9pm")
 
 
+def test_spent_joined_line_does_not_rematch_after_a_rewrap():
+    """A resize after the wait can rewrap a spent joined line so its matching
+    head fits one row and the reset moves to the next. The row pass skips that
+    head as part of the spent line, and the window pass skips its rejoin.
+
+    ABLATION: compare the row pass's rows by equality with ``skip`` again and the
+    head row re-matches."""
+    rows = ["working…", "⎿  You've hit your session li", "mit · resets 7:20pm", "❯ "]
+    first = _match(rows, USAGE)
+    assert isinstance(first, Hit)
+    spent = {first.line.strip()}
+    head, _, reset = USAGE_SESSION_LINE.rpartition(" ")
+    rewrapped = ["working…", head, reset, "❯ "]
+    assert isinstance(_match(rewrapped, USAGE), Hit)  # the head matches on its own
+    assert _match(rewrapped, USAGE, skip=spent) is None
+
+
 def test_spent_row_does_not_leak_into_a_window():
     """A spent single row is skipped by the row pass; a window holding it is
     skipped too, so the next row joined onto it cannot bring it back."""

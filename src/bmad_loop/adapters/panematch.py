@@ -33,10 +33,12 @@ inserts whitespace, never the bracket.
 
 ``skip`` holds lines (compared stripped) that are never a match: the usage
 gates pass the lines of quota waits the CLI already continued from
-(``_QuotaWait.spent``). A spent line may be a joined window, so a window is
-skipped when any of its rows is spent, or when any join of it contains, or is
-contained in, a spent line. A window that only extends a spent wrapped line by a
-row cannot re-match it.
+(``_QuotaWait.spent``). A spent line may be a joined window, and a resize can
+rewrap it, so a row the row pass reads is skipped when it contains, or is
+contained in, a spent line, and a window is skipped when any of its rows is
+spent, or when any join of it contains, or is contained in, a spent line. A
+window that only extends a spent wrapped line by a row cannot re-match it, and
+neither can the head of a spent line rewrapped onto a row of its own.
 
 Pure: no I/O, no adapter state. The caller captures the pane and records a
 timeout.
@@ -120,7 +122,7 @@ def match_rows(
     that exceeds ``timeout`` seconds ends the look at once as a
     ``MatchTimeout``."""
     for line in rows:
-        if line.strip() in skip:
+        if skip and _spent_join(line, skip):
             continue
         if (found := _search(line, patterns, timeout)) is not None:
             return found
