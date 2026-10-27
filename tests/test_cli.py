@@ -13106,10 +13106,11 @@ def test_validate_reports_each_role_bypass_posture_without_changing_the_exit_cod
     assert sorted(f["detail"]["role"] for f in posture) == ["dev", "retro", "review", "triage"]
     assert {f["severity"] for f in posture} == {"ok"}
     dev = next(f for f in posture if f["detail"]["role"] == "dev")
-    assert dev["message"] == (
-        "claude dev: bypass, unsandboxed (scm.isolation=none); "
-        'consider adapter.permission_mode = "sandboxed"'
+    # claude maps no native-Windows sandbox, so the suggestion is posix-only.
+    suggestion = (
+        "" if sys.platform == "win32" else '; consider adapter.permission_mode = "sandboxed"'
     )
+    assert dev["message"] == "claude dev: bypass, unsandboxed (scm.isolation=none)" + suggestion
     assert not _permission_findings(doc, "adapter.permission-mode-unsupported")
 
 
