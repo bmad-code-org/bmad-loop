@@ -12374,10 +12374,12 @@ AUTO_DENY_LINE = (
 )
 
 
-def _parked_timeout_adapter(tmp_path, monkeypatch, events, *, screen="", timeout_s=30.0):
+def _parked_timeout_adapter(
+    tmp_path, monkeypatch, events, *, screen="", timeout_s=30.0, on_call=None
+):
     """`_timeout_clock_adapter` with the stall grace off, a `_UnitMux` showing
     `screen`, a fake journal, and `events` scripted one per wait (each call
-    pushes the monotonic clock 11 s)."""
+    pushes the monotonic clock 11 s, then runs `on_call(n)` when given)."""
     adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
     adapter._stall_grace_s = 0.0
     mux = _UnitMux(screen=screen)
@@ -12386,6 +12388,8 @@ def _parked_timeout_adapter(tmp_path, monkeypatch, events, *, screen="", timeout
 
     def advance(call_n):
         clock["mono"] += 11.0
+        if on_call is not None:
+            on_call(call_n)
 
     adapter.watcher = _ScriptedWatcher(events, on_call=advance)
     return adapter, mux, clock, _short_spec(tmp_path, timeout_s=timeout_s)
@@ -12453,9 +12457,14 @@ def test_timeout_parked_check_needs_an_idle_transcript(tmp_path, monkeypatch):
     transcript.write_bytes(b'{"type":"user"}\n')
     latch = _hook_event("Notification", "permission_prompt", transcript_path=str(transcript))
 
+    def answered(call_n):
+        if call_n == 2:  # the write after the latch: the prompt was answered
+            with transcript.open("ab") as fh:
+                fh.write(b'{"type":"assistant"}\n')
+
     busy_dir = tmp_path / "busy"
     busy_dir.mkdir()
-    adapter, _, _, spec = _parked_timeout_adapter(busy_dir, monkeypatch, [latch])
+    adapter, _, _, spec = _parked_timeout_adapter(busy_dir, monkeypatch, [latch], on_call=answered)
     result = adapter.wait_for_completion(_dev_handle(), spec)
     assert result.status == "timeout"
     assert result.parked is False
@@ -12467,6 +12476,35 @@ def test_timeout_parked_check_needs_an_idle_transcript(tmp_path, monkeypatch):
     )
     result = adapter.wait_for_completion(_dev_handle(), spec)
     assert (result.status, result.parked) == ("timeout", True)
+
+
+def test_timeout_parked_check_reads_the_latch_baseline(tmp_path, monkeypatch):
+    """A prompt reached in the clock's final QUOTA_WAIT_IDLE_S: the write that
+    asked for the permission keeps the transcript fresh, but nothing was written
+    after the latch, so the prompt is still unanswered and the session parks.
+    A pane match carries no latch-time baseline and keeps the idle gate.
+
+    ABLATION: drop `latch_unmoved` from the idle gate and the latch run reads
+    `parked` False."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"assistant"}\n')
+    latch = _hook_event("Notification", "permission_prompt", transcript_path=str(transcript))
+
+    latch_dir = tmp_path / "latch"
+    latch_dir.mkdir()
+    adapter, _, _, spec = _parked_timeout_adapter(latch_dir, monkeypatch, [latch])
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", True)
+    assert result.parked_evidence == "Notification(permission_prompt) -> PermissionPrompt"
+
+    pane_dir = tmp_path / "pane"
+    pane_dir.mkdir()
+    named = _hook_event("SessionStart", transcript_path=str(transcript))
+    adapter, _, _, spec = _parked_timeout_adapter(
+        pane_dir, monkeypatch, [named], screen=f"{BYPASS_FOOTER}\n"
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", False)
 
 
 def test_session_parked_carries_the_auto_deny_deadline(tmp_path, monkeypatch):

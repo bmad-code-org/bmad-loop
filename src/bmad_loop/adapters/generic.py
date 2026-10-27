@@ -1374,6 +1374,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # latched and cleared with it: a QuotaPrompt/PermissionPrompt latch blocks
         # or ends a usage-limit quota wait, an IdlePrompt one never does (DW-396).
         parked_kind: str | None = None
+        # The transcript's activity key stat'ed at the latch, latched and cleared
+        # with it (None when no transcript was named or the stat failed): the
+        # timeout reads an unchanged key as a prompt still unanswered (#727).
+        parked_key: tuple[int, int] | None = None
         # Whether this session can enter a usage-limit quota wait at all
         # (DW-396): a cap and a profile that names the wait line. Off, the
         # heartbeat stays byte-identical and nothing below is consulted.
@@ -1675,8 +1679,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # match is confirmed alive first; a probe fault reads "not
                 # dead". A transcript written inside QUOTA_WAIT_IDLE_S is a
                 # session that answered its prompt and worked on, so it is not
-                # parked; `still_working` is deliberately not the parked test,
-                # since a live permission prompt IS an unanswered tool call. A
+                # parked, unless the hook latch's key is unchanged: the write
+                # that asked for the permission came before the latch, not
+                # after an answer. `still_working` is deliberately not the
+                # parked test, since a live permission prompt IS an unanswered
+                # tool call. A
                 # working session's timeout (`still_working`) is never
                 # usage-limited, charged as before #610. A line a quota wait
                 # already continued from is no evidence at all.
@@ -1693,7 +1700,18 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     handle, "timeout"
                 ) is False:
                     parked_now = usage_hit = None
-                if idle.idle_s is not None and idle.idle_s < QUOTA_WAIT_IDLE_S:
+                latch_unmoved = (
+                    parked_now is not None
+                    and parked_evidence is not None
+                    and parked_key is not None
+                    and transcript_path is not None
+                    and self._transcript_activity_key(transcript_path) == parked_key
+                )
+                if (
+                    idle.idle_s is not None
+                    and idle.idle_s < QUOTA_WAIT_IDLE_S
+                    and not latch_unmoved
+                ):
                     parked_now = None
                 usage_now = resets_now = None
                 if usage_hit is not None and not still_working():
@@ -2331,6 +2349,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 if evidence is not None:
                     parked_evidence = evidence
                     parked_kind = self._parked_hook_kind(event.event, event.notification_type)
+                    parked_key = (
+                        self._transcript_activity_key(transcript_path) if transcript_path else None
+                    )
                     self._note_lifecycle(handle.task_id, "parked-signal", evidence=evidence)
                     if parked_kind == "PermissionPrompt":
                         # The live parked notice (#855), opened (or re-emitted)
@@ -2349,6 +2370,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # answered: drop the parked latch before anything else (DW-348).
                 parked_evidence = None
                 parked_kind = None
+                parked_key = None
                 if notice.open:
                     self._note_session_unparked(handle, notice, "stop")
                 # A turn ENDED — the one canonical event that proves the CLI did
