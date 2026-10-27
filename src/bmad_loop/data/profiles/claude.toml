@@ -72,7 +72,9 @@ env_fault_patterns = [
 
 # Parked-prompt patterns (DW-350): regexes matched line-by-line against the
 # ANSI-stripped VISIBLE pane (`capture-pane -p`), consulted only at the instant a
-# stall wake nudge is about to be typed. A match withholds the nudge — its
+# stall wake nudge is about to be typed. When no single row matches, runs of 2-3
+# adjacent rows are joined and tried too, so a line a narrow pane wrapped still
+# matches (the footer wraps below 33 columns). A match withholds the nudge — its
 # trailing Enter can ANSWER the prompt (#727: it confirmed "No, exit" on the
 # Bypass Permissions dialog) — and ends the session as parked, which pauses the
 # run for a human instead of retrying.
@@ -93,7 +95,7 @@ parked_prompt_patterns = [
 
 # Usage-limit patterns (#610): regexes matched line-by-line against the
 # ANSI-stripped VISIBLE pane at stall-grace expiry and when the session timeout
-# fires. A live match withholds the stall nudge and ends the session parked with
+# fires, and across 2-3 wrapped rows when no single row matches. A live match withholds the stall nudge and ends the session parked with
 # a usage-limit pause reason, exempt from the token veto (the line is on screen
 # now); the same patterns also scan the post-mortem log tail as ordinary
 # env-fault families, where the veto still applies (a limit the session

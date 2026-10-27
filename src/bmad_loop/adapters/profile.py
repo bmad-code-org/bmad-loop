@@ -216,7 +216,8 @@ class CLIProfile:
     # across every tracked file. Override/extend via a project profile in
     # .bmad-loop/profiles/.
     env_fault_patterns: tuple[str, ...] = ()
-    # Patterns matched line-by-line against the ANSI-stripped VISIBLE pane
+    # Patterns matched line-by-line, then across 2-3 wrapped rows
+    # (`panematch.match_rows`), against the ANSI-stripped VISIBLE pane
     # (`mux.capture_pane`), only at the moment a stall wake nudge is about to be
     # typed into it (DW-350). A match means the CLI is parked on a prompt only a
     # human should answer — the nudge's trailing Enter could confirm it (#727:
@@ -266,7 +267,8 @@ class CLIProfile:
     # APPENDED after session_id_flag for the same positional-compatibility reason.
     subagent_transcript_dir: str | None = None
     # Patterns naming a subscription/usage limit the CLI is stopped behind (#610),
-    # matched line-by-line against the ANSI-stripped VISIBLE pane at the same live
+    # matched line-by-line (then across 2-3 wrapped rows) against the
+    # ANSI-stripped VISIBLE pane at the same live
     # decision points as parked_prompt_patterns (stall-grace expiry, and once when
     # the session timeout fires) and, as ordinary env-fault families, against the
     # post-mortem log tail. Two lists, disjoint by contract — "usage-limited" means

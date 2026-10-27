@@ -11889,6 +11889,35 @@ def test_pane_matched_prompt_withholds_the_stall_nudge(tmp_path, monkeypatch, li
     assert mux.captures == ["@1"]
 
 
+@pytest.mark.parametrize(
+    "rows",
+    [
+        # dracic's measured footer rows (#727): width 30 autowraps mid-word,
+        # width 24 word-wraps at a space capture-pane then trimmed
+        [" Enter to confirm · Esc to can", "cel"],
+        [" Enter to confirm · Esc", "to cancel"],
+    ],
+    ids=["width-30", "width-24"],
+)
+def test_wrapped_pane_prompt_withholds_the_stall_nudge(tmp_path, monkeypatch, rows):
+    """The dialog footer wrapped across two rows of a narrow pane (#727): no
+    single row matches, but the joined rows do, so the nudge due at grace expiry
+    is still withheld and the evidence quotes the joined line.
+
+    Ablation: skip the window pass in `panematch.match_rows` (return None after
+    the row pass) and this fails on the STALL_NUDGE_TEXT the mux then records."""
+    body = "\r\n".join(rows)
+    screen = f" Do you trust the files in this folder?\r\n\r\n\x1b[2m{body}\x1b[0m\r\n"
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=screen)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence is not None
+    assert result.parked_evidence.startswith("pane matched ")
+    assert result.parked_evidence.endswith(BYPASS_FOOTER)
+    assert mux.sent == []
+    assert mux.captures == ["@1"]
+
+
 # DW-339's operator capture: raw `tmux pipe-pane` bytes of a claude trust prompt
 # left parked for 80 s (Claude Code 2.1.284; provenance in the sibling .md).
 TRUST_PROMPT_LOG = Path(__file__).parent / "fixtures" / "claude-trust-prompt-parked.pipe-pane.log"
@@ -12211,6 +12240,28 @@ def test_timeout_with_usage_line_visible_is_usage_limited(tmp_path, monkeypatch)
     clean = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
     assert clean.status == "timeout"
     assert clean.usage_limited is None
+
+
+def test_timeout_with_wrapped_usage_line_is_usage_limited(tmp_path, monkeypatch):
+    """The session-window limit line wrapped across two rows of a narrow pane:
+    the timeout-fired look still records `usage_limited`, quoting the joined
+    line, and the reset clause parses from it."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    monkeypatch.setattr(generic, "_local_now", lambda: QUOTA_NOW)
+    head, tail = USAGE_SESSION_LINE[:30], USAGE_SESSION_LINE[30:]
+    mux = _UnitMux(screen=f"working…\n{head}\n{tail}\n❯ \n")
+    adapter.mux = mux
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    assert result.status == "timeout"
+    pattern = adapter.profile.usage_wait_patterns[0]
+    assert result.usage_limited == f"pane matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert mux.captures == ["@1"]
 
 
 def test_dead_window_is_never_usage_limited(tmp_path, monkeypatch):

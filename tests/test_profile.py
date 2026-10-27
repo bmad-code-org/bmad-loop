@@ -268,6 +268,27 @@ def test_shipped_claude_parked_patterns_do_not_match_their_own_profile_line():
     )
     hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
     assert hits == []
+    # ...nor when a narrow pane wraps it: the live matcher also joins 2-3 adjacent
+    # rows (#727), and joining only adds or drops whitespace, never a bracket.
+    assert _wrapped_hits(text, patterns) == []
+
+
+def _wrapped_hits(text: str, patterns) -> list[tuple[int, str]]:
+    """Every (width, line) of ``text`` that the pane matcher matches once the line
+    is wrapped at a width from 10 to 60 columns, cut mid-word (autowrap) or at
+    spaces (word-wrap)."""
+    import textwrap
+
+    from bmad_loop.adapters.panematch import match_rows
+
+    hits = []
+    for line in text.splitlines():
+        for width in range(10, 61):
+            autowrap = [line[i : i + width].rstrip() for i in range(0, len(line), width)]
+            for rows in (autowrap, textwrap.wrap(line, width=width)):
+                if match_rows(rows, patterns, timeout=2.0) is not None:
+                    hits.append((width, line))
+    return hits
 
 
 _USAGE_FIELDS = ("usage_limit_patterns", "usage_wait_patterns")
@@ -388,6 +409,7 @@ def test_shipped_claude_usage_patterns_do_not_match_their_own_profile_line():
     )
     hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
     assert hits == []
+    assert _wrapped_hits(text, patterns) == []
 
 
 def test_only_claude_seeds_usage_patterns():

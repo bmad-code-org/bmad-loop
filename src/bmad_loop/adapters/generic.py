@@ -83,8 +83,9 @@ from .env_fault import ENV_FAULT_EVIDENCE_MAX as ENV_FAULT_EVIDENCE_MAX
 from .env_fault import ENV_FAULT_MATCH_TIMEOUT_S as ENV_FAULT_MATCH_TIMEOUT_S
 from .env_fault import ENV_FAULT_STATUSES as ENV_FAULT_STATUSES
 from .env_fault import ENV_FAULT_TAIL_BYTES as ENV_FAULT_TAIL_BYTES
-from .env_fault import EnvFaultMixin, _excerpt
+from .env_fault import EnvFaultMixin
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
+from .panematch import MatchTimeout, match_rows, screen_rows
 from .profile import PARKED_EVENTS, CLIProfile
 
 if TYPE_CHECKING:
@@ -2837,8 +2838,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         skip: set[str] | frozenset[str] = frozenset(),
     ) -> tuple[tuple[str, str] | None, ...]:
         """One look at the VISIBLE pane, matched against each pattern set: per
-        set, ``(evidence, matched_line)`` for its first match (lines outer,
-        patterns inner; evidence = pattern plus quoted line), else None.
+        set, ``(evidence, matched_line)`` for its first match (evidence =
+        pattern plus quoted line), else None. Rows are tried one at a time
+        first (rows outer, patterns inner); only when no row matches are runs
+        of 2-3 adjacent rows joined and tried, so a line the pane wrapped still
+        matches, and ``matched_line`` is then the joined text
+        (``panematch.match_rows``).
 
         The shared matcher behind the parked gate (DW-350:
         ``parked_prompt_patterns``) and the usage-limit gates (#610:
@@ -2853,8 +2858,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         ``match-timeout`` + its ``pattern``; ``error``) records that the look at
         the pane failed. Empty sets and a backend without ``capture_pane`` are
         configuration, not faults: no capture, no crumb. A line in ``skip``
-        (compared stripped) is never a match: the usage gates pass the lines of
-        quota waits the CLI already continued from (``_QuotaWait.spent``)."""
+        (compared stripped) is never a match, nor is a wrapped run of rows that
+        contains one or is part of one: the usage gates pass the lines of quota
+        waits the CLI already continued from (``_QuotaWait.spent``)."""
         none: tuple[tuple[str, str] | None, ...] = tuple(None for _ in pattern_sets)
         if not any(pattern_sets):
             return none
@@ -2873,31 +2879,31 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return none
         if not isinstance(screen, str):
             return none
-        lines = _ANSI_RE.sub("", screen.replace("\r", "\n")).split("\n")
-        if skip:
-            lines = [line for line in lines if line.strip() not in skip]
-        return tuple(self._first_pane_match(handle, lines, pats) for pats in pattern_sets)
+        rows = screen_rows(screen)
+        return tuple(self._first_pane_match(handle, rows, pats, skip) for pats in pattern_sets)
 
     def _first_pane_match(
-        self, handle: SessionHandle, lines: list[str], patterns: tuple[regex.Pattern[str], ...]
+        self,
+        handle: SessionHandle,
+        rows: list[str],
+        patterns: tuple[regex.Pattern[str], ...],
+        skip: set[str] | frozenset[str],
     ) -> tuple[str, str] | None:
-        """``_pane_evidence``'s search of one pattern set over captured lines."""
-        for line in lines:
-            for pat in patterns:
-                try:
-                    hit = pat.search(line, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
-                except TimeoutError as e:
-                    self._note_lifecycle(
-                        handle.task_id,
-                        "parked-probe-failed",
-                        reason="match-timeout",
-                        pattern=pat.pattern,
-                        error=f"{type(e).__name__}: {e}",
-                    )
-                    return None
-                if hit is not None:
-                    return (f"pane matched {pat.pattern!r}: {_excerpt(line, hit.start())}", line)
-        return None
+        """``_pane_evidence``'s search of one pattern set over captured rows
+        (``panematch.match_rows``)."""
+        found = match_rows(rows, patterns, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S, skip=skip)
+        if isinstance(found, MatchTimeout):
+            self._note_lifecycle(
+                handle.task_id,
+                "parked-probe-failed",
+                reason="match-timeout",
+                pattern=found.pattern,
+                error=found.error,
+            )
+            return None
+        if found is None:
+            return None
+        return (found.evidence, found.line)
 
     @property
     def _usage_pane_patterns(self) -> tuple[regex.Pattern[str], ...]:

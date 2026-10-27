@@ -183,6 +183,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Match parked-prompt and usage-limit patterns across wrapped pane rows, so a dialog
+  footer wrapped in a narrow window still withholds the stall nudge (#727).
 - Let `resolve` re-arm, adopt or abandon a story left escalated after a `resume` cleared
   the run's pause and its engine exited before run end (#958). Warn on `resume` and hint
   in `status` and the TUI header when a story is still escalated; restore the pause
