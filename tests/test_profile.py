@@ -160,7 +160,13 @@ def test_env_fault_patterns_parse_from_overlay(tmp_path):
 
 @pytest.mark.parametrize(
     "field",
-    ["env_fault_patterns", "parked_prompt_patterns", "usage_limit_patterns", "usage_wait_patterns"],
+    [
+        "env_fault_patterns",
+        "parked_prompt_patterns",
+        "usage_limit_patterns",
+        "usage_wait_patterns",
+        "auto_deny_patterns",
+    ],
 )
 def test_deeply_nested_pattern_is_a_profile_error_not_a_bare_recursion_error(tmp_path, field):
     """DW-373: `regex.compile` answers a deeply nested pattern with RecursionError,
@@ -410,6 +416,50 @@ def test_shipped_claude_usage_patterns_do_not_match_their_own_profile_line():
     hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
     assert hits == []
     assert _wrapped_hits(text, patterns) == []
+
+
+# The countdown line in the #855 report, split so this file never holds it whole.
+_CAPTURED_AUTO_DENY_LINE = (
+    "⚠ Claude Code will automatically deny this reques"
+    + "t in 2:00, to avoid blocking progress on an unattended session"
+)
+
+
+def test_shipped_claude_auto_deny_pattern_reads_the_captured_855_countdown():
+    """The seeded pattern matches the #855 line and yields its `min`/`sec`, and
+    does not match its own claude.toml line (`reques[t]`), alone or wrapped."""
+    import regex
+
+    claude = get_profile("claude")
+    patterns = [regex.compile(p) for p in claude.auto_deny_patterns]
+    assert patterns
+    found = next(m for p in patterns if (m := p.search(_CAPTURED_AUTO_DENY_LINE)))
+    assert (found.group("min"), found.group("sec")) == ("2", "00")
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    assert [line for line in text.splitlines() if any(p.search(line) for p in patterns)] == []
+    assert _wrapped_hits(text, patterns) == []
+
+
+def test_auto_deny_pattern_without_its_named_groups_is_a_profile_error(tmp_path):
+    """A countdown pattern that cannot yield `min` and `sec` is refused at load,
+    naming the missing group, rather than reading no deadline at every latch.
+
+    ABLATION: drop the groupindex check from `_validate_profile` and this loads."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]", "auto_deny_patterns = ['deny in (?P<min>[0-9]+):[0-9]{2}']\n[hooks]"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ProfileError, match="missing sec"):
+        load_profiles(tmp_path)
 
 
 def test_only_claude_seeds_usage_patterns():
@@ -1449,6 +1499,9 @@ def test_profile_scan_failure_degrades(profile_scan):
         # the #610 usage-limit pane patterns, each list on its own
         ({"usage_limit_patterns": ("credits(unbalanced",)}, "usage_limit_patterns"),
         ({"usage_wait_patterns": ("resets(unbalanced",)}, "usage_wait_patterns"),
+        # the #855 auto-deny countdown: it must compile and name `min` + `sec`
+        ({"auto_deny_patterns": ("deny(unbalanced",)}, "auto_deny_patterns"),
+        ({"auto_deny_patterns": ("deny in (?P<min>[0-9]+)",)}, "'min' and 'sec'"),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
         ({"usage_grace_s": -1.0}, "usage_grace_s"),

@@ -287,6 +287,15 @@ class CLIProfile:
     # reason.
     usage_limit_patterns: tuple[str, ...] = ()
     usage_wait_patterns: tuple[str, ...] = ()
+    # The CLI's auto-deny countdown on a permission prompt it will answer "no"
+    # to by itself. Matched (then across 2-3 wrapped rows) against the visible
+    # pane once when a PermissionPrompt latches (and once more on the next tick
+    # when nothing matched), never on a timer; each pattern names groups `min`
+    # and `sec`, read into the `auto_deny_at` of the `session-parked` journal
+    # event. Same evidentiary bar as usage_limit_patterns. Compiled and
+    # validated at parse time; empty = no deadline is ever read. APPENDED after
+    # usage_wait_patterns for the same positional-compatibility reason.
+    auto_deny_patterns: tuple[str, ...] = ()
 
     @property
     def hookless(self) -> bool:
@@ -612,6 +621,18 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             except (regex.error, RecursionError) as e:
                 raise fail(f"{field_name} entry is not a valid regex: {pattern!r} ({e})") from e
 
+    for pattern in profile.auto_deny_patterns:
+        try:
+            compiled = regex.compile(pattern)  # same engine the parked notice matches with
+        except (regex.error, RecursionError) as e:
+            raise fail(f"auto_deny_patterns entry is not a valid regex: {pattern!r} ({e})") from e
+        missing = sorted({"min", "sec"} - compiled.groupindex.keys())
+        if missing:
+            raise fail(
+                f"auto_deny_patterns entry must name groups 'min' and 'sec': {pattern!r} "
+                f"(missing {', '.join(missing)})"
+            )
+
 
 def _legacy_adapter_default(dialect: str) -> str:
     """The adapter kind a TOML profile that predates the ``adapter`` field meant.
@@ -744,6 +765,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         parked_prompt_patterns=str_list("parked_prompt_patterns"),
         usage_limit_patterns=str_list("usage_limit_patterns"),
         usage_wait_patterns=str_list("usage_wait_patterns"),
+        auto_deny_patterns=str_list("auto_deny_patterns"),
         workspace_trust=workspace_trust,
         subagent_transcript_dir=raw_subagent_dir,
     )

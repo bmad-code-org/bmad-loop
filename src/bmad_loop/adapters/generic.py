@@ -233,6 +233,28 @@ class _QuotaWait:
         return self.closed_s + self.open_s()
 
 
+@dataclass
+class _ParkedNotice:
+    """Per-session state of the live parked notice (#855), owned by one
+    `wait_for_completion` call: the `session-parked` / `session-unparked`
+    journal pair a PermissionPrompt latch opens. Observation only; the parked
+    latch the stall and timeout gates read is the wait loop's own and is never
+    touched from here.
+
+    `open` is set while a `session-parked` awaits its `session-unparked`.
+    `baseline` is the transcript's (mtime_ns, size), stat'ed fresh at the
+    latch (None when no transcript was named or the stat failed; the first
+    heartbeat sample then adopts one); a heartbeat sample that differs from it
+    is the CLI working again. `retry_subtype` is set when the latch's capture
+    painted no auto-deny countdown: the next tick parses once more and, on a
+    hit, journals `session-parked` again with `auto_deny_at`."""
+
+    open: bool = False
+    baseline: tuple[int, int] | None = None
+    retry_subtype: str | None = None
+    retry_due: bool = False
+
+
 def _local_now() -> datetime:
     """The naive local "now" a usage-limit reset clause is resolved against
     (#610). Naive so `parse_reset` resolves the reset through the host zone's
@@ -1242,17 +1264,26 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         """`_wait_loop`, with the quota wait's total carried onto whatever it
         returns (DW-396). A wait still open at the exit (a Stop with a result,
         window death, a hard stop, the cap) is closed here, so every
-        `quota-wait-started` gets its `quota-wait-ended`."""
+        `quota-wait-started` gets its `quota-wait-ended`. A parked notice still
+        open at the exit gets its `session-unparked` (`how="ended"`) the same
+        way (#855)."""
         quota = _QuotaWait()
-        result = self._wait_loop(handle, spec, quota)
+        notice = _ParkedNotice()
+        result = self._wait_loop(handle, spec, quota, notice)
         if quota.waiting:
             self._end_quota_wait(handle, quota, "session-exit")
+        if notice.open:
+            self._note_session_unparked(handle, notice, "ended")
         if quota.closed_s > 0:
             result = dataclasses.replace(result, quota_wait_s=round(quota.closed_s, 3))
         return result
 
     def _wait_loop(
-        self, handle: SessionHandle, spec: SessionSpec, quota: _QuotaWait
+        self,
+        handle: SessionHandle,
+        spec: SessionSpec,
+        quota: _QuotaWait,
+        notice: _ParkedNotice,
     ) -> SessionResult:
         deadline = time.monotonic() + spec.timeout_s
         # Wall-clock co-bound (#157): a host suspend freezes time.monotonic(),
@@ -1634,27 +1665,42 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # rollout existed, then no further hook event): the exit's
                 # `transcript_path` argument is read before `produced_work()`.
                 try_resolve()
-                # One look at the visible pane for a usage limit (#610): a
-                # session whose clock ran out while it sat behind one is not a
-                # failed attempt. A dead window is never usage-limited (the CLI
-                # is gone, though a remain-on-exit pane still captures), so a
-                # match is confirmed alive first; a probe fault reads "not dead".
-                # A working session's timeout (`still_working`) is an ordinary
-                # one, charged as before #610. A line a quota wait already
-                # continued from is no evidence at all.
-                (usage_hit,) = self._pane_evidence(
-                    handle, self._usage_pane_patterns, skip=quota.spent
+                # One look at the visible pane, for a parked prompt (#727) and
+                # a usage limit (#610): a session whose clock ran out while it
+                # sat behind either is not a failed attempt. The parked
+                # evidence is the hook latch first, the pane match failing
+                # that, as at the stall gate; the usage match is recorded
+                # beside it either way. A dead window is neither (the CLI is
+                # gone, though a remain-on-exit pane still captures), so a
+                # match is confirmed alive first; a probe fault reads "not
+                # dead". A transcript written inside QUOTA_WAIT_IDLE_S is a
+                # session that answered its prompt and worked on, so it is not
+                # parked; `still_working` is deliberately not the parked test,
+                # since a live permission prompt IS an unanswered tool call. A
+                # working session's timeout (`still_working`) is never
+                # usage-limited, charged as before #610. A line a quota wait
+                # already continued from is no evidence at all.
+                parked_now = parked_evidence
+                parked_hit, usage_hit = self._pane_evidence(
+                    handle,
+                    self._parked_prompt_patterns if parked_now is None else (),
+                    self._usage_pane_patterns,
+                    skip=quota.spent,
                 )
+                if parked_now is None and parked_hit is not None:
+                    parked_now = parked_hit[0]
+                if (parked_now is not None or usage_hit is not None) and self._probe_liveness(
+                    handle, "timeout"
+                ) is False:
+                    parked_now = usage_hit = None
+                if idle.idle_s is not None and idle.idle_s < QUOTA_WAIT_IDLE_S:
+                    parked_now = None
                 usage_now = resets_now = None
-                if (
-                    usage_hit is not None
-                    and self._probe_liveness(handle, "timeout") is not False
-                    and not still_working()
-                ):
+                if usage_hit is not None and not still_working():
                     usage_now = usage_hit[0]
                     reset = self._usage_reset(handle, usage_hit[1], _local_now())
                     resets_now = reset.value if reset is not None else None
-                return SessionResult(
+                timed_out = SessionResult(
                     status="timeout",
                     session_id=session_id,
                     transcript_path=transcript_path,
@@ -1666,6 +1712,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     usage_limited=usage_now,
                     usage_limit_resets=resets_now,
                 )
+                if parked_now is not None:
+                    return dataclasses.replace(timed_out, parked=True, parked_evidence=parked_now)
+                return timed_out
             # Hard-stop poll (#319), per-iteration and deliberately NOT inside
             # the heartbeat throttle below: the loop's own wait is capped at 5s
             # (`watcher.wait_for(..., timeout_s=min(remaining, 5.0))`), so a stop
@@ -1702,6 +1751,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # has named the transcript.
                 if transcript_path:
                     sample_transcript(transcript_path, now)
+                if notice.open and idle.last_key is not None:
+                    # The live parked notice (#855) closes on this sample, not
+                    # on pane growth: the auto-deny countdown repaints the pane
+                    # every second while the prompt waits.
+                    if notice.baseline is None:
+                        notice.baseline = idle.last_key
+                    elif idle.last_key != notice.baseline:
+                        self._note_session_unparked(handle, notice, "activity")
                 if quota.waiting:
                     # The transcript moved: the CLI continued after the reset.
                     # The timeout resumes from the remaining time frozen at
@@ -2002,6 +2059,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     stop_seen=stop_seen,
                     produced_work=produced_work(),
                 )
+            if notice.retry_due:
+                # The latch's capture painted no auto-deny countdown: parse once
+                # more, a wait later (#855). One retry per latch, never a poll.
+                self._retry_auto_deny(handle, notice)
             if event is None:
                 try:
                     alive = self._window_alive(handle)
@@ -2271,6 +2332,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     parked_evidence = evidence
                     parked_kind = self._parked_hook_kind(event.event, event.notification_type)
                     self._note_lifecycle(handle.task_id, "parked-signal", evidence=evidence)
+                    if parked_kind == "PermissionPrompt":
+                        # The live parked notice (#855), opened (or re-emitted)
+                        # on every PermissionPrompt latch; it observes only.
+                        self._note_session_parked(
+                            handle, notice, event.notification_type, transcript_path
+                        )
                     # A CLI now asking a human is no longer waiting on a reset
                     # (DW-396): end the wait; the next stall expiry parks it.
                     # An IdlePrompt never ends one.
@@ -2282,6 +2349,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # answered: drop the parked latch before anything else (DW-348).
                 parked_evidence = None
                 parked_kind = None
+                if notice.open:
+                    self._note_session_unparked(handle, notice, "stop")
                 # A turn ENDED — the one canonical event that proves the CLI did
                 # something, and so the hook half of the #261 proof-of-work gate.
                 # Latched after the subagent filter above, which rejects a stop that
@@ -2821,6 +2890,115 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             )
         except OSError:
             pass
+
+    # The live parked notice (#855), in the quota-wait records' shape: a
+    # lifecycle crumb each, plus a best-effort run-journal event the TUI reads.
+    # No field is named `kind`: `Journal.append(kind, **fields)` owns that name.
+
+    def _note_session_parked(
+        self,
+        handle: SessionHandle,
+        notice: _ParkedNotice,
+        subtype: str | None,
+        transcript_path: str | None,
+    ) -> None:
+        """Open (or re-emit) the notice for a PermissionPrompt latch: a fresh
+        transcript stat as the activity baseline (the heartbeat's key may be
+        30 s old), then one pane capture for the auto-deny countdown. No
+        countdown on screen yet arms a single retry on the next tick."""
+        notice.open = True
+        notice.baseline = (
+            self._transcript_activity_key(transcript_path) if transcript_path else None
+        )
+        auto_deny_at = self._auto_deny_at(handle)
+        notice.retry_subtype = subtype
+        notice.retry_due = auto_deny_at is None and bool(self.profile.auto_deny_patterns)
+        self._record_session_parked(handle, subtype, auto_deny_at)
+
+    def _retry_auto_deny(self, handle: SessionHandle, notice: _ParkedNotice) -> None:
+        """The notice's one countdown retry: a hit journals `session-parked`
+        again, now with `auto_deny_at`; a miss leaves the deadline unknown. A
+        notice closed in between (a Stop) has nothing to re-emit."""
+        notice.retry_due = False
+        if not notice.open:
+            return
+        auto_deny_at = self._auto_deny_at(handle)
+        if auto_deny_at is not None:
+            self._record_session_parked(handle, notice.retry_subtype, auto_deny_at)
+
+    def _record_session_parked(
+        self, handle: SessionHandle, subtype: str | None, auto_deny_at: float | None
+    ) -> None:
+        # the parsed deadline, present-only on both records
+        deadline = {"auto_deny_at": auto_deny_at} if auto_deny_at is not None else {}
+        pane = handle.pane_target or handle.native_id
+        self._note_lifecycle(
+            handle.task_id, "session-parked", pane=pane, subtype=subtype, **deadline
+        )
+        if self.journal is None:
+            return
+        try:
+            self.journal.append(
+                "session-parked", task_id=handle.task_id, pane=pane, subtype=subtype, **deadline
+            )
+        except OSError:
+            pass
+
+    def _note_session_unparked(
+        self, handle: SessionHandle, notice: _ParkedNotice, how: str
+    ) -> None:
+        """Close the open notice: `session-unparked` (`how` = `stop` |
+        `activity` | `ended`), once per open notice."""
+        notice.open = False
+        notice.baseline = None
+        notice.retry_due = False
+        self._note_lifecycle(handle.task_id, "session-unparked", how=how)
+        if self.journal is None:
+            return
+        try:
+            self.journal.append("session-unparked", task_id=handle.task_id, how=how)
+        except OSError:
+            pass
+
+    @cached_property
+    def _auto_deny_patterns(self) -> tuple[regex.Pattern[str], ...]:
+        """``profile.auto_deny_patterns``, compiled once per adapter; validated
+        at parse time with this engine (each names ``min`` and ``sec``). Same
+        caching constraint as ``_parked_prompt_patterns``."""
+        return tuple(regex.compile(p) for p in self.profile.auto_deny_patterns)
+
+    def _auto_deny_at(self, handle: SessionHandle) -> float | None:
+        """The epoch second the CLI will auto-deny its permission prompt, read
+        from the visible pane's countdown (``auto_deny_patterns``), or None when
+        no pattern matches (or none is declared). One capture through
+        ``_pane_evidence``, so a capture fault or a runaway match is crumbed as
+        ``parked-probe-failed`` there; the matched (possibly wrap-joined) line
+        is then searched again for its ``min`` / ``sec`` groups."""
+        patterns = self._auto_deny_patterns
+        (hit,) = self._pane_evidence(handle, patterns)
+        if hit is None:
+            return None
+        for pattern in patterns:
+            try:
+                found = pattern.search(hit[1], timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
+            except TimeoutError as e:
+                self._note_lifecycle(
+                    handle.task_id,
+                    "parked-probe-failed",
+                    reason="match-timeout",
+                    pattern=pattern.pattern,
+                    error=f"{type(e).__name__}: {e}",
+                )
+                return None
+            if found is None:
+                continue
+            try:
+                left_s = int(found.group("min")) * 60 + int(found.group("sec"))
+            except (TypeError, ValueError):
+                # an overlay pattern whose group matched no digits (or nothing)
+                continue
+            return round(time.time() + left_s, 3)
+        return None
 
     @cached_property
     def _parked_prompt_patterns(self) -> tuple[regex.Pattern[str], ...]:

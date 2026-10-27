@@ -120,6 +120,8 @@ breaking changes may land in a minor release.
 - Journal `session-start-missing` when a session's CLI sends no SessionStart within
   `[limits] session_start_grace_s` (default 120 s); a Codex sweep session with no hook
   events names the shared daemon in its escalation text (#901).
+- Journal `session-parked` / `session-unparked` while a session waits on a permission
+  prompt, with the CLI's auto-deny deadline (`auto_deny_patterns` profile key) (#855).
 
 ### Changed
 
@@ -189,6 +191,8 @@ breaking changes may land in a minor release.
   produced no work.
 - Match parked-prompt and usage-limit patterns across wrapped pane rows, so a dialog
   footer wrapped in a narrow window still withholds the stall nudge (#727).
+- Mark a session still parked on a prompt at its timeout as parked, so it pauses instead
+  of retrying (#727).
 - Let `resolve` re-arm, adopt or abandon a story left escalated after a `resume` cleared
   the run's pause and its engine exited before run end (#958). Warn on `resume` and hint
   in `status` and the TUI header when a story is still escalated; restore the pause

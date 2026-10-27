@@ -651,6 +651,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # way `close` reaches this field.
         "answer_effect",
         "attempt",
+        # `session-parked` (#855): the epoch second the CLI will auto-deny its
+        # permission prompt, read off its own on-screen countdown.
+        "auto_deny_at",
         "blocked",
         "blocking",
         # DW-535: whether `replay-abandoned`'s unit branch still existed after the
@@ -781,7 +784,8 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "graceful",
         "harvest_attempt",
         # `quota-wait-ended` (DW-396): what ended the wait, a closed slug the
-        # adapter chose (`transcript-active` / `latch` / `cap` / `session-exit`).
+        # adapter chose (`transcript-active` / `latch` / `cap` / `session-exit`);
+        # `session-unparked` (#855) likewise (`stop` / `activity` / `ended`).
         "how",
         # `head` is NOT here any more: a HEAD sha (`attempt-preserve-failed`,
         # `attempt-preserve-fallthrough`) moved to `_JOURNAL_ALIAS_FIELDS` (DW-481).
@@ -893,6 +897,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # (`Notification(permission_prompt) -> PermissionPrompt`) or the matched
         # profile pattern plus the quoted pane line, the same class of excerpt
         # `env_fault_evidence` carries.
+        # `session-parked` (#855): the mux pane target the prompt waits in
+        # (`pane_target`, else the window id), as the TUI attaches to it; a
+        # transport handle, never a path or a person.
+        "pane",
         "parked",
         "parked_evidence",
         "phase",
@@ -1022,6 +1030,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # token — this field adds a surviving copy, it does not replace one.
         "stop_cause",
         "strategy",
+        # `session-parked` (#855): the hook Notification subtype that latched
+        # the prompt (`permission_prompt`, `elicitation_dialog`, ...), a CLI
+        # constant mapped by the profile; null for a direct parked event.
+        "subtype",
         "teardown_s",
         # `session-idle` (#680): the grace the crossing was judged against —
         # `limits.dev_stall_grace_s` as a float, so the record is comparable to a
@@ -1384,6 +1396,12 @@ JOURNAL_KINDS = frozenset(
         "quota-wait-cap",
         "quota-wait-ended",
         "quota-wait-started",
+        # The live parked notice (#855): `session-parked` on each PermissionPrompt
+        # latch, `session-unparked` once when it closes. `task_id` (routed), the
+        # mux `pane`, the hook `subtype`, the measured `auto_deny_at` and the
+        # closed slug `how` (declared benign).
+        "session-parked",
+        "session-unparked",
         # One `session-start-missing` when a CLI whose profile maps SessionStart
         # has sent none by `limits.session_start_grace_s`: `task_id` (routed),
         # `waited_s`/`grace_s` (declared benign), `cli` and, on a Codex profile,
