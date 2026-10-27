@@ -12478,6 +12478,35 @@ def test_timeout_parked_check_needs_an_idle_transcript(tmp_path, monkeypatch):
     assert (result.status, result.parked) == ("timeout", True)
 
 
+def test_timeout_parked_check_samples_the_transcript_fresh(tmp_path, monkeypatch):
+    """The prompt sat unanswered past QUOTA_WAIT_IDLE_S, then the transcript moved
+    in the last wait, after the final heartbeat sample: the prompt was answered.
+    The timeout samples the transcript before its verdict, so the last
+    heartbeat's stale idle age does not park a working session.
+
+    ABLATION: drop the timeout's `sample_transcript` call and this reads
+    `parked` True."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    latch = _hook_event("Notification", "permission_prompt", transcript_path=str(transcript))
+    timeout_s = generic.QUOTA_WAIT_IDLE_S + 60.0
+
+    def answered_late(call_n):
+        # the wait that crosses the deadline: no heartbeat runs after it
+        if clock["mono"] >= 1000.0 + timeout_s and not answered_late.done:
+            answered_late.done = True
+            with transcript.open("ab") as fh:
+                fh.write(b'{"type":"assistant"}\n')
+
+    answered_late.done = False
+    adapter, _, clock, spec = _parked_timeout_adapter(
+        tmp_path, monkeypatch, [latch], timeout_s=timeout_s, on_call=answered_late
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert answered_late.done
+    assert (result.status, result.parked) == ("timeout", False)
+
+
 def test_timeout_parked_check_reads_the_latch_baseline(tmp_path, monkeypatch):
     """A prompt reached in the clock's final QUOTA_WAIT_IDLE_S: the write that
     asked for the permission keeps the transcript fresh, but nothing was written

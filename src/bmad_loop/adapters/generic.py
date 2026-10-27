@@ -1669,6 +1669,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # rollout existed, then no further hook event): the exit's
                 # `transcript_path` argument is read before `produced_work()`.
                 try_resolve()
+                # A fresh transcript sample for the verdicts below: `idle.idle_s`
+                # is otherwise the last heartbeat's, up to HEARTBEAT_INTERVAL_S
+                # old, and a prompt answered inside that interval would read as
+                # still parked.
+                if transcript_path:
+                    sample_transcript(transcript_path, time.monotonic())
                 # One look at the visible pane, for a parked prompt (#727) and
                 # a usage limit (#610): a session whose clock ran out while it
                 # sat behind either is not a failed attempt. The parked
