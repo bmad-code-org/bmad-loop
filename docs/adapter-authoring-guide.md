@@ -430,8 +430,9 @@ is in [Environment faults](escalations-guide.md#environment-faults).
 - Patterns are a list of strings, compiled at load (an invalid regex is a profile error),
   and matched with the `regex` module under a per-pattern timeout.
 - Seeded for `claude` (connection loss and two captured provider 5xx errors) and
-  `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit` and
-  `provider.transport` events on 2.x, whose `provider.quota` is a usage limit instead).
+  `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit`,
+  `provider.transport`, `provider.internal`, `provider.auth` and `provider.no-route` events
+  on 2.x, whose `provider.quota` is a usage limit instead).
   Empty means inert.
 - The tail scan also covers `usage_limit_patterns` and `usage_wait_patterns` as ordinary
   pattern families, under the same token-usage overrule: a session that got past a limit

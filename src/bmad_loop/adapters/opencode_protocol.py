@@ -244,13 +244,22 @@ and a closed port:
   ``provider.rate-limit`` (``status 429``, retried 10 times, ~80–88 s); a
   quota refusal is ``provider.quota`` (``status`` 429 or 402, NOT retried —
   fails in ~0.3 s); a refused connection is ``provider.transport`` (no
-  ``status``, no ``response``; retried 10 times, ~87 s). ``error.message`` is
+  ``status``, no ``response``; retried 10 times, ~87 s). On 2.0.32 a 5xx is
+  ``provider.internal`` (retried 10 times), a 401/403 ``provider.auth``, a
+  400 ``provider.invalid-request``, a session model with no route
+  ``provider.no-route`` (no provider request; only ``session.execution.
+  failed``) and a malformed stream ``provider.invalid-output`` — none
+  retried but a stream cut before its ``finish_reason``. A hung provider
+  fires nothing unless a provider ``timeout``/``headerTimeout``/
+  ``chunkTimeout`` setting is set, then reads ``provider.transport``
+  ("Timed out waiting for response headers"/"… data"). ``error.message`` is
   the provider's own message verbatim and ``response.body`` its raw body —
   provider-written text, so the adapter copies only the bounded message, last
   on its line (:func:`format_provider_error`), never the body. The server log
   carries no line per retry; only the final give-up logs one ``level=ERROR
   message="Failed to drain Session"`` line, too late for a run killed
-  mid-retry, so it is not what the classifier reads.
+  mid-retry, so it is not what the classifier reads — and written for every
+  failed execution, whatever its cause, with no error type.
 """
 
 from __future__ import annotations

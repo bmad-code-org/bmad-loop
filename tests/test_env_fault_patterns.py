@@ -126,6 +126,36 @@ OPENCODE_REAL = [
         "provider-error event=session.execution.failed type=provider.transport status=- "
         'attempt=- message="ConnectionRefused: Unable to connect. Is the computer able to '
         'access the url?"',
+        # Captured the same way from 2.0.32 (2026-10-28): the mock provider
+        # answering HTTP 500 / 503 / 502 (provider.internal, retried), 401 / 403
+        # (provider.auth, not retried), and a session model with no route —
+        # an unconfigured provider, an unknown variant (provider.no-route,
+        # failed before any provider request).
+        "provider-error event=session.retry.scheduled type=provider.internal status=500 "
+        'attempt=2 message="The server had an error while processing your request. Sorry '
+        'about that!"',
+        "provider-error event=session.step.failed type=provider.internal status=500 "
+        'attempt=- message="The server had an error while processing your request. Sorry '
+        'about that!"',
+        "provider-error event=session.retry.scheduled type=provider.internal status=503 "
+        'attempt=2 message="The engine is currently overloaded, please try again later."',
+        "provider-error event=session.execution.failed type=provider.internal status=502 "
+        'attempt=- message="Provider request failed with HTTP 502"',
+        "provider-error event=session.step.failed type=provider.auth status=401 attempt=- "
+        'message="Incorrect API key provided: x. You can find your API key at '
+        'https://platform.openai.com/account/api-keys."',
+        "provider-error event=session.execution.failed type=provider.auth status=403 "
+        'attempt=- message="Your organization does not have access to this model."',
+        "provider-error event=session.execution.failed type=provider.no-route status=- "
+        'attempt=- message="Model unavailable: nosuch/mock-1"',
+        "provider-error event=session.execution.failed type=provider.no-route status=- "
+        'attempt=- message="Variant unavailable for mock/mock-1: bogus"',
+        # A hung provider under a `headerTimeout` / `chunkTimeout` setting reads
+        # provider.transport, not provider.timeout (unset, nothing fires at all).
+        "provider-error event=session.retry.scheduled type=provider.transport status=- "
+        'attempt=2 message="Timed out waiting for response headers"',
+        "provider-error event=session.step.failed type=provider.transport status=200 "
+        'attempt=- message="Timed out waiting for response data"',
     ),
 ]
 # OpenCode 2.x's quota refusals, captured as OPENCODE_REAL's 2.x lines were (a
@@ -162,6 +192,20 @@ _TRANSPORT_ERROR = {
     "type": "provider.transport",
     "message": "ConnectionRefused: Unable to connect. Is the computer able to access the url?",
 }
+_INTERNAL_500_MESSAGE = "The server had an error while processing your request. Sorry about that!"
+_INTERNAL_500_ERROR = {
+    "type": "provider.internal",
+    "message": _INTERNAL_500_MESSAGE,
+    "status": 500,
+    "response": {
+        "body": f'{{"error": {{"message": "{_INTERNAL_500_MESSAGE}", "type": "server_error", '
+        '"param": null, "code": null}}'
+    },
+}
+_AUTH_401_MESSAGE = (
+    "Incorrect API key provided: x. You can find your API key at "
+    "https://platform.openai.com/account/api-keys."
+)
 OPENCODE_V2_CAPTURED_FRAMES = [
     (
         "session.retry.scheduled",
@@ -195,6 +239,126 @@ OPENCODE_V2_CAPTURED_FRAMES = [
     ),
     ("session.execution.failed", {"sessionID": "ses_4", "error": _TRANSPORT_ERROR}),
     (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_5",
+            "assistantMessageID": "msg_5",
+            "attempt": 2,
+            "at": 1793222564524,
+            "error": _INTERNAL_500_ERROR,
+        },
+    ),
+    (
+        "session.step.failed",
+        {"sessionID": "ses_5", "assistantMessageID": "msg_5", "error": _INTERNAL_500_ERROR},
+    ),
+    (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_6",
+            "assistantMessageID": "msg_6",
+            "attempt": 2,
+            "at": 1793222564313,
+            "error": {
+                "type": "provider.internal",
+                "message": "The engine is currently overloaded, please try again later.",
+                "status": 503,
+                "response": {
+                    "body": '{"error": {"message": "The engine is currently overloaded, please '
+                    'try again later.", "type": "server_error", "param": null, "code": null}}'
+                },
+            },
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_7",
+            "error": {
+                "type": "provider.internal",
+                "message": "Provider request failed with HTTP 502",
+                "status": 502,
+                "response": {
+                    "body": "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+                    "<center><h1>502 Bad Gateway</h1></center>\r\n</body>\r\n</html>\r\n"
+                },
+            },
+        },
+    ),
+    (
+        "session.step.failed",
+        {
+            "sessionID": "ses_8",
+            "assistantMessageID": "msg_8",
+            "error": {
+                "type": "provider.auth",
+                "message": _AUTH_401_MESSAGE,
+                "status": 401,
+                "response": {
+                    "body": f'{{"error": {{"message": "{_AUTH_401_MESSAGE}", "type": '
+                    '"invalid_request_error", "param": null, "code": "invalid_api_key"}}'
+                },
+            },
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_9",
+            "error": {
+                "type": "provider.auth",
+                "message": "Your organization does not have access to this model.",
+                "status": 403,
+                "response": {
+                    "body": '{"error": {"message": "Your organization does not have access to '
+                    'this model.", "type": "permission_error", "param": null, "code": null}}'
+                },
+            },
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_10",
+            "error": {"type": "provider.no-route", "message": "Model unavailable: nosuch/mock-1"},
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_11",
+            "error": {
+                "type": "provider.no-route",
+                "message": "Variant unavailable for mock/mock-1: bogus",
+            },
+        },
+    ),
+    (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_15",
+            "assistantMessageID": "msg_15",
+            "attempt": 2,
+            "at": 1793222868765,
+            "error": {
+                "type": "provider.transport",
+                "message": "Timed out waiting for response headers",
+            },
+        },
+    ),
+    (
+        "session.step.failed",
+        {
+            "sessionID": "ses_16",
+            "assistantMessageID": "msg_16",
+            "error": {
+                "type": "provider.transport",
+                "message": "Timed out waiting for response data",
+                "status": 200,
+            },
+        },
+    ),
+    (
         "session.execution.failed",
         {
             "sessionID": "ses_2",
@@ -224,6 +388,66 @@ OPENCODE_V2_CAPTURED_FRAMES = [
 ]
 OPENCODE_V2_REAL = [
     line for line in OPENCODE_REAL + OPENCODE_USAGE_REAL if line.startswith("provider-error ")
+]
+# Captured from 2.0.32 with the seeded lines above, and deliberately NOT seeded:
+# what the session sent can cause both types — an HTTP 400
+# (provider.invalid-request) and a malformed or truncated stream
+# (provider.invalid-output; opencode retries the truncated one). Charging the
+# story an attempt is the right call for them, so no opencode field may match.
+OPENCODE_V2_UNSEEDED_CAPTURED_FRAMES = [
+    (
+        "session.step.failed",
+        {
+            "sessionID": "ses_12",
+            "assistantMessageID": "msg_12",
+            "error": {
+                "type": "provider.invalid-request",
+                "message": "Invalid value for 'temperature': expected a number.",
+                "status": 400,
+                "response": {
+                    "body": '{"error": {"message": "Invalid value for \'temperature\': expected '
+                    'a number.", "type": "invalid_request_error", "param": "temperature", '
+                    '"code": null}}'
+                },
+            },
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_13",
+            "error": {
+                "type": "provider.invalid-output",
+                "message": "Invalid mock/openai-compatible-chat stream event",
+                "status": 200,
+                "response": {
+                    "body": '{"id": "c1", "object": "chat.completion.chunk", "choices": ['
+                },
+            },
+        },
+    ),
+    (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_14",
+            "assistantMessageID": "msg_14",
+            "attempt": 2,
+            "at": 1793222564535,
+            "error": {
+                "type": "provider.invalid-output",
+                "message": "OpenAI Chat stream ended without finish_reason",
+                "status": 200,
+            },
+        },
+    ),
+]
+OPENCODE_V2_UNSEEDED_REAL = [
+    "provider-error event=session.step.failed type=provider.invalid-request status=400 "
+    "attempt=- message=\"Invalid value for 'temperature': expected a number.\"",
+    "provider-error event=session.execution.failed type=provider.invalid-output status=200 "
+    'attempt=- message="Invalid mock/openai-compatible-chat stream event"',
+    "provider-error event=session.retry.scheduled type=provider.invalid-output status=200 "
+    'attempt=2 message="OpenAI Chat stream ended without finish_reason"',
 ]
 
 # Claude Code surfaces provider failures behind its own "API Error" prefix, and
@@ -337,13 +561,15 @@ ANCHOR_REACHING_BAIT = [
     'provider-error event=session.step.failed type=aborted status=- attempt=- message="Step interrupted"',
     "provider-error event=session.execution.failed type=permission.rejected status=- "
     'attempt=- message="provider.quota rate-limit"',
-    "provider-error event=session.retry.scheduled type=provider.auth status=401 attempt=2 "
-    'message="quota exceeded; rate-limit; transport down"',
-    "provider-error event=session.execution.failed type=provider.no-route status=- "
+    "provider-error event=session.retry.scheduled type=provider.invalid-request status=400 "
+    'attempt=2 message="quota exceeded; rate-limit; transport down; auth; no-route"',
+    "provider-error event=session.execution.failed type=provider.content-filter status=- "
     'attempt=- message="Variant unavailable for mock/mock-1: rate-limit"',
     # A type that only STARTS like a seeded one (the pattern needs the whole
     # token), and the sanitized remains of a hostile `type` value.
     "provider-error event=session.execution.failed type=provider.quota-exceeded status=- "
+    'attempt=- message=""',
+    "provider-error event=session.execution.failed type=provider.authorization status=403 "
     'attempt=- message=""',
     "provider-error event=session.execution.failed type=provider.unknown_type_provider.quota "
     'status=- attempt=- message=""',
@@ -1024,8 +1250,24 @@ def test_v2_corpus_lines_are_what_the_adapter_writes() -> None:
     so the corpus is the real thing, not a plausible-looking string."""
     written = [format_provider_error(event, data) for event, data in OPENCODE_V2_CAPTURED_FRAMES]
     assert written == OPENCODE_V2_REAL
-    for line in written:
-        assert "response" not in line and "insufficient_quota" not in line  # body dropped
+    for (_, data), line in zip(OPENCODE_V2_CAPTURED_FRAMES, written):
+        body = data["error"].get("response", {}).get("body")
+        assert body is None or body not in line  # body dropped
+        assert "response=" not in line and "insufficient_quota" not in line
+    unseeded = [
+        format_provider_error(event, data) for event, data in OPENCODE_V2_UNSEEDED_CAPTURED_FRAMES
+    ]
+    assert unseeded == OPENCODE_V2_UNSEEDED_REAL
+
+
+@pytest.mark.parametrize("line", OPENCODE_V2_UNSEEDED_REAL)
+def test_v2_unseeded_provider_error_types_stay_unclassified(line: str) -> None:
+    """The captured 2.x types the session itself can cause — an invalid request,
+    an invalid provider output — are charged as a code failure, not read as an
+    environment fault or a usage limit. Unlike the bait above, these are REAL
+    adapter lines for real provider refusals: a widened type alternation (or a
+    type-agnostic `type=provider[.]\\S+`) reddens here first."""
+    assert not _matches("opencode", line), f"opencode classifies an unseeded type: {line[:120]}"
 
 
 @pytest.mark.parametrize(
