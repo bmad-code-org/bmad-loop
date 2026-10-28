@@ -12691,10 +12691,11 @@ def test_idle_prompt_latch_journals_no_parked_notice(tmp_path, monkeypatch):
     assert mux.captures == ["@1"]  # the timeout's own look only
 
 
-def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, monkeypatch):
-    """The notice observes only: after it closes on transcript activity, the
-    latch it rode on is untouched, so the stall gate still withholds the nudge
-    and ends the session `stalled` + `parked` on it."""
+def _approved_latch_run(tmp_path, monkeypatch, *, approved):
+    """A PermissionPrompt latch naming a transcript, then silence past the 40 s
+    stall grace (11 s per idle tick, a heartbeat every 30 s). `approved` writes
+    to the transcript on the second watcher call, after the latch: the prompt
+    was answered and the CLI is working again."""
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
     mux = _UnitMux()
@@ -12713,7 +12714,7 @@ def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, mon
 
         def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
             self.calls += 1
-            if self.calls == 2:
+            if approved and self.calls == 2:
                 _grow(transcript, b'{"type":"assistant"}\n')
             if script:
                 return script.pop(0)
@@ -12721,8 +12722,30 @@ def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, mon
             return None
 
     adapter.watcher = _Watcher()
-    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    return adapter, mux, adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+
+def test_activity_unpark_clears_a_permission_latch_the_transcript_moved_past(tmp_path, monkeypatch):
+    """An approved prompt (a transcript write after the latch) followed by a
+    silent stretch is a working session gone quiet, not a parked one: the
+    notice closes on the activity and takes the latch with it, so the stall
+    gate sends its wake nudges and the session ends an ordinary stall (DW-594).
+
+    ABLATION: drop the latch clearing beside `_note_session_unparked(...,
+    "activity")` and this ends `stalled` + `parked` with no nudge sent."""
+    adapter, mux, result = _approved_latch_run(tmp_path, monkeypatch, approved=True)
     assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["activity"]
+    assert (result.status, result.parked) == ("stalled", False)
+    assert result.parked_evidence is None
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+
+
+def test_an_unmoved_permission_latch_still_parks_the_stall(tmp_path, monkeypatch):
+    """No transcript write after the latch: the prompt is still unanswered, so
+    the heartbeat samples leave the notice open and the latch set, and the stall
+    gate withholds the nudge and ends the session `stalled` + `parked`."""
+    adapter, mux, result = _approved_latch_run(tmp_path, monkeypatch, approved=False)
+    assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["ended"]
     assert (result.status, result.parked) == ("stalled", True)
     assert result.parked_evidence == "Notification(permission_prompt) -> PermissionPrompt"
     assert _stall_nudges(mux) == []

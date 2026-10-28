@@ -203,6 +203,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Nudge a stalled session whose permission prompt was approved: a transcript write after
+  the PermissionPrompt latch now clears it, instead of the stall pausing as parked (DW-594).
 - Windows installs now depend on tzdata, so usage-limit resets that name a time zone
   resolve (DW-593).
 - validate's hooks.trust now checks the permission-mode launch args each role runs with (DW-602).

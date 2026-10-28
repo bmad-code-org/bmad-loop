@@ -239,7 +239,8 @@ class _ParkedNotice:
     `wait_for_completion` call: the `session-parked` / `session-unparked`
     journal pair a PermissionPrompt latch opens. Observation only; the parked
     latch the stall and timeout gates read is the wait loop's own and is never
-    touched from here.
+    touched from here (the loop clears it itself when this notice closes on
+    activity).
 
     `open` is set while a `session-parked` awaits its `session-unparked`.
     `baseline` is the transcript's (mtime_ns, size), stat'ed fresh at the
@@ -1365,7 +1366,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # event saying the CLI is waiting on a human (a permission/idle/quota
         # prompt), or None. Set by a parked kind — directly, or a `Notification`
         # whose subtype the profile maps — and cleared by a `Stop`, since a turn
-        # that ended proves the prompt was answered. It completes nothing and
+        # that ended proves the prompt was answered; a PermissionPrompt latch is
+        # also cleared when the live notice closes on a transcript write after it
+        # (DW-594). It completes nothing and
         # re-arms nothing: it is consulted only where the grace expiry would type
         # the stall wake nudge, which it withholds (the nudge's Enter can answer
         # the prompt, #727), ending the session `stalled` + `parked`.
@@ -1790,6 +1793,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         notice.baseline = idle.last_key
                     elif idle.last_key != notice.baseline:
                         self._note_session_unparked(handle, notice, "activity")
+                        # A write after the latch is the prompt answered (in
+                        # the window, or by the TUI's `Y`): the CLI is working
+                        # again, so the PermissionPrompt latch goes with the
+                        # notice and the stall gate nudges instead of parking
+                        # (DW-594). A latch whose key is unchanged is the
+                        # prompt itself and stays.
+                        if parked_kind == "PermissionPrompt" and (
+                            parked_key is None or idle.last_key != parked_key
+                        ):
+                            parked_evidence = parked_kind = parked_key = None
                 if quota.waiting:
                     # The transcript moved: the CLI continued after the reset.
                     # The timeout resumes from the remaining time frozen at
