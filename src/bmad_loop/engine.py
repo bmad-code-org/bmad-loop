@@ -8460,9 +8460,10 @@ class Engine:
             extras["parked"] = True
             if result.parked_evidence:
                 extras["parked_evidence"] = result.parked_evidence
-        # usage-limit diagnosis (#610): same present-only convention — the
-        # visible-pane line the adapter saw live, which exempted the env-fault
-        # verdict from the token veto.
+        # usage-limit diagnosis (#610): same present-only convention — the line
+        # the adapter saw live (claude's visible pane, or opencode's provider-error
+        # frame for this session, DW-592), which exempted the env-fault verdict
+        # from the token veto.
         if result.usage_limited:
             extras["usage_limited"] = result.usage_limited
         # the limit's reset, parsed from the same line (#610): ISO-8601, or the

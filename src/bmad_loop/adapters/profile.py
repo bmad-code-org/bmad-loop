@@ -321,10 +321,12 @@ class CLIProfile:
     # on screen now, so it is not a stale match from earlier in the session); a
     # tail-only match is still subject to it. opencode-http has no pane: its live
     # sighting is a provider-error line it formats from a typed SSE frame for the
-    # session while it runs (DW-592), matched against these same two lists. Same evidentiary bar as
-    # env_fault_patterns: seed only lines captured from the CLI's own screen, with
-    # the run cited, and single-character classes so the profile line does not
-    # match itself. Compiled and validated at parse time; empty = inert.
+    # session while it runs (DW-592), matched against these same two lists. Same
+    # evidentiary bar as env_fault_patterns: seed only lines captured live from the
+    # CLI (its own screen, or the adapter's record of the CLI's own events, as
+    # opencode's provider-error line is), with the run cited, and single-character
+    # classes so the profile line does not match itself. Compiled and validated at
+    # parse time; empty = inert.
     # APPENDED after subagent_transcript_dir for the same positional-compatibility
     # reason.
     usage_limit_patterns: tuple[str, ...] = ()

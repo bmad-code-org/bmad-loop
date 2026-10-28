@@ -363,8 +363,10 @@ class SessionResult:
     # visible pane — at stall-grace expiry (ending the session stalled + parked)
     # or the instant the session timeout fired, never on a `crashed` result — and
     # opencode-http's provider-error line, formatted from a typed SSE frame for
-    # this session while it ran (DW-592), carried onto every result its wait
-    # returns. Never from the post-mortem log tail, never on a completed result.
+    # this session while it ran (DW-592), carried onto a `timeout`, `stalled` or
+    # `crashed` result its wait returns (ENV_FAULT_STATUSES, the verdicts
+    # `_classify_env_fault` reads). Never from the post-mortem log tail, never on
+    # a completed, aborted or over_budget result.
     # A set value makes
     # `_classify_env_fault` stamp `env_fault` WITHOUT the #764 token veto (the
     # limit is on screen now, not a stale match), and both pause reasons name it

@@ -5283,6 +5283,30 @@ def test_usage_sighting_counts_only_this_sessions_frames(tmp_path):
     )
 
 
+@pytest.mark.parametrize("status", ["aborted", "over_budget"])
+def test_usage_sighting_is_not_stamped_outside_env_fault_statuses(tmp_path, status):
+    """Only an ENV_FAULT_STATUSES result reaches `_classify_env_fault` and its
+    usage-limit pause, so a sighting followed by an aborted or over_budget
+    result stamps nothing: the field would journal a pause that never happens.
+
+    ABLATION: drop the status gate in `wait_for_completion` and the sighting
+    lands on these results."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess()
+    sess.usage_sighting = ("provider-error event=x type=provider.quota", USAGE_LIMIT_BLOCKED)
+    adapter._sessions["t-1"] = sess
+    adapter._teardown = lambda _sess: None  # no real server behind the session
+    adapter._wait_loop = lambda handle, spec: SessionResult(status=status)
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_parent"), _timeout_spec(tmp_path)
+    )
+
+    assert result.status == status
+    assert result.usage_limited is None
+    assert result.usage_limit_class is None
+
+
 def test_rate_limit_and_transport_frames_are_no_sighting(tmp_path):
     """Only the profile's usage lists make a sighting: a retried rate limit or
     a transport fault stays an ordinary env fault (subject to the veto)."""

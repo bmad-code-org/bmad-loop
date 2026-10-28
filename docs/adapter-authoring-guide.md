@@ -564,7 +564,8 @@ below):
 The lists are disjoint by contract; "usage-limited" means either one matched. They follow
 the env-fault evidentiary bar: reproduce the captured sentence prefix (never a bare
 `session limit`, `resets` or `usage credits`), use single-character classes so a pattern
-cannot match its own profile line, and seed only lines captured off the CLI's screen. The
+cannot match its own profile line, and seed only lines captured live from the CLI: off its
+screen, or from the adapter's record of its own events (opencode's provider-error lines). The
 shipped `claude` profile seeds one line in each list, and `opencode` seeds
 `usage_limit_patterns` with its 2.x `provider.quota` line; every other profile leaves both
 empty, which keeps them inert.
@@ -572,10 +573,11 @@ empty, which keeps them inert.
 **opencode-http's sighting.** On OpenCode 2.x the adapter matches each provider-error line
 it writes to `<task-id>.provider-errors.log` against `usage_limit_patterns`, then
 `usage_wait_patterns`, as the frame arrives for this session. The first match is the
-session's sighting: when the session ends anything but `completed`, the result carries it
-as `usage_limited` with its class, and no `usage_limit_resets`, since the frame names no
-reset time. A frame of this session seen while it ran is live evidence, so the sighting is
-exempt from the token-usage overrule like a pane sighting. The shipped pattern matches
+session's sighting: when the session ends `timeout`, `stalled` or `crashed`, the result
+carries it as `usage_limited` with its class, and no `usage_limit_resets`, since the frame
+names no reset time; a completed, aborted or over-budget result carries none. A frame of
+this session seen while it ran is live evidence, so the sighting is exempt from the
+token-usage overrule like a pane sighting. The shipped pattern matches
 `type=provider.quota`, a blocking limit: OpenCode builds that type from billing and
 credit-exhaustion codes and never retries it. `provider.rate-limit` and
 `provider.transport`, which OpenCode retries, stay `env_fault_patterns`. A match that blows

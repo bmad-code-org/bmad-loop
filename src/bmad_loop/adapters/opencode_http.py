@@ -100,6 +100,7 @@ from .base import (
 )
 from .env_fault import (
     ENV_FAULT_MATCH_TIMEOUT_S,
+    ENV_FAULT_STATUSES,
     ENV_FAULT_TAIL_BYTES,
     EnvFaultMixin,
     _excerpt,
@@ -1252,16 +1253,19 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
         """`_wait_loop`, with the session's live usage-limit sighting (DW-592,
-        `_note_usage_sighting`) carried onto whatever it returns — one choke
-        point, as generic's `wait_for_completion` carries `quota_wait_s`,
-        rather than a stamp at each return site. Read before `run()`'s `kill`
-        pops the session. A completed result is never stamped: it did not end
-        behind the limit. ``usage_limit_resets`` stays None — the provider-error
-        frame carries no reset time."""
+        `_note_usage_sighting`) carried onto a result whose status is in
+        ``ENV_FAULT_STATUSES`` — one choke point, as generic's
+        `wait_for_completion` carries `quota_wait_s`, rather than a stamp at
+        each return site. Read before `run()`'s `kill` pops the session. Only
+        those statuses reach `_classify_env_fault` and its usage-limit pause, so
+        a completed, aborted or over_budget result is never stamped: the stamp
+        would be journaled as the evidence of a pause that never happens.
+        ``usage_limit_resets`` stays None — the provider-error frame carries no
+        reset time."""
         result = self._wait_loop(handle, spec)
         sess = self._sessions.get(handle.task_id)
         sighting = sess.usage_sighting if sess is not None else None
-        if sighting is None or result.status == "completed":
+        if sighting is None or result.status not in ENV_FAULT_STATUSES:
             return result
         evidence, limit_class = sighting
         return replace(result, usage_limited=evidence, usage_limit_class=limit_class)
