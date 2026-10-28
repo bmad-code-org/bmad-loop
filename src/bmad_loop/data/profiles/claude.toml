@@ -72,7 +72,9 @@ env_fault_patterns = [
 
 # Parked-prompt patterns (DW-350): regexes matched line-by-line against the
 # ANSI-stripped VISIBLE pane (`capture-pane -p`), consulted only at the instant a
-# stall wake nudge is about to be typed. A match withholds the nudge — its
+# stall wake nudge is about to be typed. When no single row matches, runs of 2-3
+# adjacent rows are joined and tried too, so a line a narrow pane wrapped still
+# matches (the footer wraps below 33 columns). A match withholds the nudge — its
 # trailing Enter can ANSWER the prompt (#727: it confirmed "No, exit" on the
 # Bypass Permissions dialog) — and ends the session as parked, which pauses the
 # run for a human instead of retrying.
@@ -93,7 +95,7 @@ parked_prompt_patterns = [
 
 # Usage-limit patterns (#610): regexes matched line-by-line against the
 # ANSI-stripped VISIBLE pane at stall-grace expiry and when the session timeout
-# fires. A live match withholds the stall nudge and ends the session parked with
+# fires, and across 2-3 wrapped rows when no single row matches. A live match withholds the stall nudge and ends the session parked with
 # a usage-limit pause reason, exempt from the token veto (the line is on screen
 # now); the same patterns also scan the post-mortem log tail as ordinary
 # env-fault families, where the veto still applies (a limit the session
@@ -125,6 +127,33 @@ parked_prompt_patterns = [
 # basic string rejects that escape.
 usage_limit_patterns = ["You're out of usage credit[s][.] Run /usage-credits"]
 usage_wait_patterns = ["You've hit your session limi[t] · resets"]
+
+# Auto-deny countdown: the line Claude Code prints above a permission prompt on
+# an unattended session, read once when a PermissionPrompt latches into the
+# `session-parked` journal event's `auto_deny_at`. Captured in the #855 report
+# (Claude Code 2.1.288, tmux 3.7c/macOS) as `⚠ Claude Code will automatically
+# deny this reques` + `t in 2:00, to avoid blocking progress on an unattended
+# session`. `reques[t]` keeps the pattern from matching its own line here, as
+# the usage seeds above do. A literal (single-quoted) string, so a regex escape
+# never needs doubling. The named groups `min` and `sec` are required.
+auto_deny_patterns = [
+  'automatically deny this reques[t] in (?P<min>[0-9]+):(?P<sec>[0-9]{2})',
+]
+
+# Answer keys for a parked permission prompt, offered in the TUI as Y (approve)
+# and N (deny). The keys go out only when a fresh capture of the visible pane
+# matches EVERY guard of that choice: Enter confirms whatever option is focused
+# (on the bypass startup dialog that is "No, exit") and Escape there exits
+# Claude, so both choices require the prompt's own question, and approve also
+# requires the focus marker on option 1. Guards come from the screen captured
+# in the #855 report (the question line, then the focused option 1 "Yes" over
+# option 2 "No"); the `[d]` and `[.]` brackets keep each pattern from matching
+# its own line here.
+[parked_answers]
+approve = ["Enter"]
+deny = ["Escape"]
+approve_guard = ['Do you want to procee[d]\?', '❯ 1[.] Yes']
+deny_guard = ['Do you want to procee[d]\?']
 
 # Force Claude Code's classic (inline/scrollback) renderer. The fullscreen TUI
 # (research preview, alt-screen ?1049h like vim/htop) repaints in place, so the
@@ -183,3 +212,27 @@ quota_auto_resume_stale = "QuotaPrompt"
 quota_auto_resume_disabled = "QuotaPrompt"
 elicitation_dialog = "PermissionPrompt"
 elicitation_url_dialog = "PermissionPrompt"
+
+# `adapter.permission_mode = "sandboxed"` (#727): never prompt, deny instead.
+# `dontAsk` denies every tool call no allow rule covers, back to the model as an
+# error with no dialog; `Edit(/**)` (anchored at the working dir, and covering
+# Write) lets the session edit the project; `--settings` turns on the Bash
+# sandbox (bubblewrap on Linux, Seatbelt on macOS), refuses to start without it
+# and drops the unsandboxed retry. Sandboxed Bash is auto-allowed, so git
+# add/commit work (the sandbox lets git write .git, except hooks/ and config),
+# network is denied, and project hook settings still fire. AskUserQuestion is
+# denied outright. Per code.claude.com/docs/en/permission-modes, /permissions and
+# /sandboxing; live-checked 2026-10-27 on Claude Code 2.1.311 in a repo and in a
+# linked worktree. No native-Windows sandbox, hence the platform list.
+[permission_modes.sandboxed]
+args = [
+  "--permission-mode",
+  "dontAsk",
+  "--allowedTools",
+  "Edit(/**)",
+  "--disallowedTools",
+  "AskUserQuestion",
+  "--settings",
+  '{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}',
+]
+platforms = ["linux", "darwin"]

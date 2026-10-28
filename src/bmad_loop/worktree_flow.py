@@ -44,6 +44,7 @@ from . import (
     workspace_trust,
 )
 from .adapters.profile import ProfileError
+from .escalation import pause_title
 from .install import (
     _REVIEW_LAYER_SKILLS,
     ANTIGRAVITY_HOOK_GROUP,
@@ -5194,7 +5195,7 @@ class WorktreeFlow:
         gates.notify(
             self.policy,
             self.run_dir,
-            f"CRITICAL escalation: {task.story_key}",
+            pause_title(reason, task.story_key),
             f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
         )
         self._save()

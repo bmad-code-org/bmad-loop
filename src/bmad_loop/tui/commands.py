@@ -47,6 +47,11 @@ PALETTE: dict[str, tuple[str, str]] = {
     "copy_pane": ("Copy pane", "Copy the active Log/Attention pane to the clipboard"),
     "resize_mode": ("Resize panes", "Enter/leave pane resize mode"),
     "unpin_log": ("Follow log", "Unpin the log view and follow new output"),
+    "approve_parked": (
+        "Approve parked prompt",
+        "Approve the live session's parked permission prompt",
+    ),
+    "deny_parked": ("Deny parked prompt", "Deny the live session's parked permission prompt"),
     # settings editor (SettingsScreen.BINDINGS)
     "save": ("Save settings", "Save .bmad-loop/policy.toml"),
     "toggle_all": ("Expand/collapse all sections", "Expand or collapse every settings section"),

@@ -120,9 +120,29 @@ breaking changes may land in a minor release.
 - Journal `session-start-missing` when a session's CLI sends no SessionStart within
   `[limits] session_start_grace_s` (default 120 s); a Codex sweep session with no hook
   events names the shared daemon in its escalation text (#901).
+- Journal `session-parked` / `session-unparked` while a session waits on a permission
+  prompt, with the CLI's auto-deny deadline (`auto_deny_patterns` profile key) (#855).
+- Show a parked permission prompt and its auto-deny countdown in the TUI header and Log
+  pane (#855).
+- Answer a parked permission prompt from the TUI (`Y` approve, `N` deny); keys are sent
+  only while a fresh pane capture matches the profile's `[parked_answers]` guards, and
+  journaled as `parked-answered`. Add `TerminalMultiplexer.send_keys` (#855).
+- Add `adapter.permission_mode` (`bypass` default, `sandboxed`): run sessions in a
+  profile's non-blocking sandboxed mode instead of a full permission bypass (claude:
+  `dontAsk` + `Edit(/**)` + the Bash sandbox; codex: a workspace-write permission profile
+  with a `.git` grant + `--ask-for-approval never`; linux/macOS). Profiles declare it in
+  `[permission_modes.<mode>]`; `bmad-loop resolve` sessions keep bypass (#727).
+- Fail `validate` for a role whose profile cannot run its `permission_mode` without
+  prompts (`adapter.permission-mode-unsupported`); report each role's permission posture
+  (`adapter.permission-mode`) and warn on sandboxed Codex under worktree isolation (#727).
 
 ### Changed
 
+- Title parked, no-work, usage-limit and environment-fault pause notifications as
+  `Paused (<kind>)` rather than `CRITICAL escalation` (#727).
+- Treat the sandboxed Codex permission args (`--sandbox workspace-write`,
+  `--ask-for-approval never`, `-c` permission overrides) as hook-trust safe, and fire
+  `tickets.store-sandbox` for sandboxed roles too (#727).
 - Read the BMAD v7 `tickets/` folder layout, where each initiative and epic keeps its
   `tickets.toml`, epics, leaf files and plans; the preview-era flat layout is still read
   when the installed `tickets.py` uses it.
@@ -183,6 +203,12 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Pause instead of retrying a review, fix, blocking-workflow, triage or migration session
+  that produced no work (#727).
+- Match parked-prompt and usage-limit patterns across wrapped pane rows, so a dialog
+  footer wrapped in a narrow window still withholds the stall nudge (#727).
+- Mark a session still parked on a prompt at its timeout as parked, so it pauses instead
+  of retrying (#727).
 - Let `resolve` re-arm, adopt or abandon a story left escalated after a `resume` cleared
   the run's pause and its engine exited before run end (#958). Warn on `resume` and hint
   in `status` and the TUI header when a story is still escalated; restore the pause

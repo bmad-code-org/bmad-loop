@@ -1086,6 +1086,246 @@ async def test_log_pane_shows_emulated_content(project_tree):
         assert "\x1b" not in text
 
 
+async def test_log_pane_notes_a_parked_permission_prompt(project_tree):
+    """#855: while the log task's session is parked on a permission prompt, the
+    Log pane leads with a yellow note pointing at the answer keys (claude has
+    `[parked_answers]`) and the attach key; another task's
+    park, or a log pinned to another task, leaves it out, and a `session-unparked` takes it down again even when
+    the log itself did not grow.
+
+    ABLATION: drop the `snap.log_parked` write in `_apply` and the first wait
+    times out."""
+    from test_tui_data import ink_stream
+
+    root = project_tree.project
+    run_dir = make_run(root, "20260611-100000-aaaa", alive=True)
+    (run_dir / "logs").mkdir()
+    (run_dir / "logs" / "story-1.log").write_bytes(ink_stream())
+    (run_dir / "logs" / "other-2.log").write_bytes(b"other task\r\n")
+    journal = Journal(run_dir)
+    journal.append("session-start", task_id="story-1", role="dev", adapter="claude")
+    journal.append("session-parked", task_id="other-2", pane="%9", subtype="permission_prompt")
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        screen.query_one("#tabs", TabbedContent).active = "tab-log"
+        await pilot.pause()
+        screen._tick(force_rescan=False)
+        log = screen.query_one("#log", RichLog)
+
+        def text() -> str:
+            return "\n".join(strip.text for strip in log.lines)
+
+        await until(pilot, lambda: "done in 3s" in text())
+        assert "parked on a permission prompt" not in text()  # another task's park
+
+        journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
+        screen._tick(force_rescan=False)
+        note = "⚠ parked on a permission prompt — Y approve · N deny · a attach"
+        await until(pilot, lambda: note in text())
+        lines = text().splitlines()
+        assert lines[0] == "— story-1.log —" and lines[1] == note
+        assert "done in 3s" in text()
+
+        # a log pinned to another task is not the parked one: no note there
+        screen._pin_task = "other-2"
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: "— other-2.log —" in text())
+        assert "parked on a permission prompt" not in text()
+        screen._pin_task = None
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: note in text())
+
+        journal.append("session-unparked", task_id="story-1", how="stop")
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: "parked on a permission prompt" not in text())
+        assert "done in 3s" in text()
+
+
+def _parked_keys(screen) -> set[str]:
+    return {
+        key
+        for key, active in screen.active_bindings.items()
+        if active.enabled and active.binding.action in ("approve_parked", "deny_parked")
+    }
+
+
+async def test_parked_answer_keys_follow_the_live_prompt(project_tree, monkeypatch):
+    """#855: Y/N are offered only while the live session is parked on a prompt
+    its profile can answer; Y runs `parked_answer.answer` for the selected run and
+    toasts the outcome, a refusal points at attach, and an unpark withdraws both.
+
+    ABLATION: return True from `check_action` for the parked actions and the
+    first `_parked_keys` assertion fails."""
+    from bmad_loop import parked_answer
+
+    root = project_tree.project
+    run_id = "20260611-100000-aaaa"
+    run_dir = make_run(root, run_id, alive=True)
+    journal = Journal(run_dir)
+    journal.append("session-start", task_id="story-1", role="dev", adapter="claude")
+    calls: list[tuple[object, str, str]] = []
+    outcomes = {
+        "approve": parked_answer.AnswerOutcome(True, "sent approve (Enter) to story-1"),
+        "deny": parked_answer.AnswerOutcome(False, "the pane does not show the prompt"),
+    }
+
+    def fake_answer(project, rid, choice, *, mux):
+        calls.append((project, rid, choice))
+        return outcomes[choice]
+
+    monkeypatch.setattr(parked_answer, "answer", fake_answer)
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == run_id)
+        screen._tick(force_rescan=False)
+        await pilot.pause()
+        assert _parked_keys(screen) == set()
+        assert not screen.check_action("approve_parked", ())
+
+        journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: _parked_keys(screen) == {"Y", "N"})
+
+        await pilot.press("Y")
+        await until(pilot, lambda: any("sent approve" in e.message for e in emitted(app)))
+        assert calls == [(root, run_id, "approve")]
+
+        await pilot.press("N")
+        await until(pilot, lambda: any("deny not sent" in e.message for e in emitted(app)))
+        (refused,) = (e for e in emitted(app) if "deny not sent" in e.message)
+        assert "attach (a) to answer" in refused.message
+        assert refused.severity == "warning"
+
+        journal.append("session-unparked", task_id="story-1", how="stop")
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: _parked_keys(screen) == set())
+
+
+async def test_parked_answer_keys_stay_hidden_without_parked_answers(project_tree):
+    """A park whose profile has no `[parked_answers]` (gemini) offers no keys,
+    and the Log note keeps pointing at attach only."""
+    root = project_tree.project
+    run_id = "20260611-100000-aaaa"
+    run_dir = make_run(root, run_id, alive=True)
+    (run_dir / "logs").mkdir()
+    (run_dir / "logs" / "story-1.log").write_bytes(b"working\r\n")
+    journal = Journal(run_dir)
+    journal.append("session-start", task_id="story-1", role="dev", adapter="gemini")
+    journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == run_id)
+        screen.query_one("#tabs", TabbedContent).active = "tab-log"
+        await pilot.pause()
+        screen._tick(force_rescan=False)
+        log = screen.query_one("#log", RichLog)
+        note = "⚠ parked on a permission prompt — a attach to answer"
+        await until(pilot, lambda: note in "\n".join(strip.text for strip in log.lines))
+        assert _parked_keys(screen) == set()
+
+
+async def test_parked_answer_drops_a_press_while_one_is_in_flight(project_tree, monkeypatch):
+    """#855: a second Y while the first answer is still running is refused with a
+    toast and never reaches `parked_answer.answer`, so it cannot capture the
+    still-open dialog and send a second key.
+
+    ABLATION: drop the `_answer_lock` acquire in `_answer_parked_worker` and the
+    second press calls `answer` again."""
+    from bmad_loop import parked_answer
+
+    root = project_tree.project
+    run_id = "20260611-100000-aaaa"
+    run_dir = make_run(root, run_id, alive=True)
+    journal = Journal(run_dir)
+    journal.append("session-start", task_id="story-1", role="dev", adapter="claude")
+    journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
+    calls: list[str] = []
+    entered, release = threading.Event(), threading.Event()
+
+    def fake_answer(project, rid, choice, *, mux):
+        calls.append(choice)
+        entered.set()
+        release.wait(10)
+        return parked_answer.AnswerOutcome(True, f"sent {choice} (Enter) to story-1")
+
+    monkeypatch.setattr(parked_answer, "answer", fake_answer)
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == run_id)
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: _parked_keys(screen) == {"Y", "N"})
+        try:
+            await pilot.press("Y")
+            await until(pilot, entered.is_set)
+            await pilot.press("Y")
+            await until(pilot, lambda: any("already being sent" in m for m in notifications(app)))
+        finally:
+            release.set()
+        await until(pilot, lambda: any("sent approve" in m for m in notifications(app)))
+        assert calls == ["approve"]
+
+
+async def test_parked_profile_fault_is_shown_and_retried(project_tree, monkeypatch):
+    """#855: a park whose profile will not resolve names the fault in the Log
+    note instead of reading like a profile without `[parked_answers]`, and the
+    next tick retries, so a transient read fault does not hide Y/N for the rest
+    of the park.
+
+    ABLATION: cache the park key on a resolve failure and the keys never
+    appear; drop `parked_fault` from the note and the first wait times out."""
+    from bmad_loop.adapters.profile import ProfileError, get_profile
+    from bmad_loop.tui.screens import dashboard as dashboard_mod
+
+    root = project_tree.project
+    run_id = "20260611-100000-aaaa"
+    run_dir = make_run(root, run_id, alive=True)
+    (run_dir / "logs").mkdir()
+    (run_dir / "logs" / "story-1.log").write_bytes(b"working\r\n")
+    journal = Journal(run_dir)
+    journal.append("session-start", task_id="story-1", role="dev", adapter="claude")
+    journal.append("session-parked", task_id="story-1", pane="%7", subtype="permission_prompt")
+    broken = [True]
+
+    def flaky_profile(name, project):
+        if broken[0]:
+            raise ProfileError("profile overlay unreadable")
+        return get_profile(name, project)
+
+    monkeypatch.setattr(dashboard_mod, "get_profile", flaky_profile)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == run_id)
+        screen.query_one("#tabs", TabbedContent).active = "tab-log"
+        await pilot.pause()
+        screen._tick(force_rescan=False)
+        log = screen.query_one("#log", RichLog)
+
+        def text() -> str:
+            return "\n".join(strip.text for strip in log.lines)
+
+        await until(pilot, lambda: "answer keys off: profile 'claude' unresolved" in text())
+        assert _parked_keys(screen) == set()
+
+        broken[0] = False
+        screen._tick(force_rescan=False)
+        await until(pilot, lambda: _parked_keys(screen) == {"Y", "N"})
+        await until(pilot, lambda: "Y approve · N deny · a attach" in text())
+        assert "answer keys off" not in text()
+
+
 # --------------------------------------------------------- text select & copy
 # Use an empty project so no run is selected: the poll never rewrites #log, so
 # the lines we write directly stay put for the assertions.
@@ -8172,6 +8412,62 @@ async def test_header_open_quota_wait_renders_as_quota_wait_not_idle(project_tre
         header.show_run("r1", data.RUNNING, state, agent=idle)  # quota-wait-ended
         assert "· idle 20m" in str(header.content)
         assert "quota wait" not in str(header.content)
+
+
+async def test_header_parked_prompt_outranks_quota_and_idle(project_tree, monkeypatch):
+    """#855: an open parked permission prompt renders `· parked on permission
+    prompt <age>` AHEAD of the quota-wait and idle notices the same silent
+    session also carries, followed by the CLI's countdown as `auto-denies in
+    M:SS`; a deadline already past is clamped to `auto-deny due`, and an
+    unparsed one reads `auto-deny time unknown`.
+
+    ABLATION: drop the `parked_since` branch in `show_run` and the first
+    assertion reddens (the line reads `· quota wait`)."""
+    monkeypatch.setattr(widgets.time, "time", lambda: 10_000.0)
+    state = RunState(
+        run_id="r1",
+        project=str(project_tree.project),
+        started_at="now",
+        tasks={"1-1-alpha": StoryTask(story_key="1-1-alpha", epic=1, phase=Phase.DEV_RUNNING)},
+    )
+    quiet = data.ActiveAgent(
+        task_id="1-1-alpha-dev-1",
+        story_key="1-1-alpha",
+        role="dev",
+        name="claude",
+        model="opus",
+        idle_since=10_000.0 - 20 * 60,
+        idle_tool="none",
+        quota_wait_since=10_000.0 - 17 * 60,
+    )
+    parked = dataclasses.replace(
+        quiet,
+        parked_since=10_000.0 - 3 * 60,
+        parked_auto_deny_at=10_000.0 + 95.5,
+        parked_pane="%7",
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test():
+        header = dashboard(app).query_one("#runheader", RunHeader)
+        header.show_run("r1", data.RUNNING, state, agent=parked)
+        content = str(header.content)
+        assert "claude · opus · dev · parked on permission prompt 3m · auto-denies in 1:35" in (
+            content
+        )
+        assert "quota wait" not in content and "idle" not in content
+
+        due = dataclasses.replace(parked, parked_auto_deny_at=10_000.0 - 4)
+        header.show_run("r1", data.RUNNING, state, agent=due)
+        assert "· parked on permission prompt 3m · auto-deny due" in str(header.content)
+        assert "auto-denies in" not in str(header.content)
+
+        unknown = dataclasses.replace(parked, parked_auto_deny_at=None)
+        header.show_run("r1", data.RUNNING, state, agent=unknown)
+        assert "· parked on permission prompt 3m · auto-deny time unknown" in str(header.content)
+
+        header.show_run("r1", data.RUNNING, state, agent=quiet)  # session-unparked
+        assert "· quota wait 17m" in str(header.content)
+        assert "parked" not in str(header.content)
 
 
 async def test_header_marks_stale_state_unreadable_agent_and_read_faults(project_tree):

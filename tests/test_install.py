@@ -12255,21 +12255,26 @@ def test_tickets_preflight_classifies_store_layouts(
 
 
 @pytest.mark.parametrize(
-    ("isolation", "roles", "warned"),
+    ("isolation", "roles", "sandboxed", "warned"),
     [
-        ("worktree", ("dev",), True),
-        ("worktree", (), False),
-        ("none", ("dev",), False),
+        ("worktree", ("dev",), (), True),
+        ("worktree", (), ("review",), True),
+        ("worktree", (), (), False),
+        ("none", ("dev",), (), False),
+        ("none", (), ("review",), False),
     ],
 )
 def test_tickets_preflight_warns_shared_store_extra_args(
-    project_v7, monkeypatch, isolation, roles, warned
+    project_v7, monkeypatch, isolation, roles, sandboxed, warned
 ):
     """A shared store written outside the session cwd (an ignored store under worktree
-    isolation) while a role sets `extra_args`: the `tickets.store-sandbox` warning —
-    stage `extra_args` replace the profile's sandbox-bypass flags. Silent without
-    such a role, and under isolation "none", where the store is inside the cwd.
-    Ablation (performed): drop the warning branch and the warned row FAILS."""
+    isolation) while a role sets `extra_args` or runs `permission_mode =
+    "sandboxed"`: the `tickets.store-sandbox` warning — stage `extra_args` replace
+    the profile's sandbox-bypass flags, and the sandboxed mode confines writes to
+    the cwd. Silent without such a role, and under isolation "none", where the
+    store is inside the cwd. Ablation (performed): drop the warning branch and the
+    warned rows FAIL; drop `sandboxed_roles` from its condition and the sandboxed
+    row FAILS."""
     rel = project_v7.initiative_folder.relative_to(project_v7.project).as_posix()
     git(project_v7.project, "rm", "-r", "-q", "--cached", rel)
     with (project_v7.project / ".gitignore").open("a", encoding="utf-8") as f:
@@ -12284,12 +12289,16 @@ def test_tickets_preflight_warns_shared_store_extra_args(
         probe_capability=False,
         isolation=isolation,
         extra_args_roles=roles,
+        sandboxed_roles=sandboxed,
     )
 
     sandbox = [f for f in findings if f.check == "tickets.store-sandbox"]
     assert len(sandbox) == (1 if warned else 0)
     if warned:
-        assert sandbox[0].severity == "warning" and sandbox[0].detail["roles"] == ["dev"]
+        assert sandbox[0].severity == "warning"
+        assert sandbox[0].detail["roles"] == list(roles)
+        assert sandbox[0].detail["sandboxed_roles"] == list(sandboxed)
+        assert ('permission_mode = "sandboxed"' in sandbox[0].message) == bool(sandboxed)
 
 
 @pytest.mark.parametrize(("branch_per", "warned"), [("run", True), ("story", False), (None, False)])

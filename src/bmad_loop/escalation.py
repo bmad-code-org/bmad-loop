@@ -338,6 +338,29 @@ def no_work_pause_reason(role: str, result: SessionResult) -> str:
     )
 
 
+def pause_title(reason: str, story_key: str, *, env_fault_site: str | None = None) -> str:
+    """The notification title for an escalation pause, classified by the reason's
+    prefix (#727): a parked, no-work, usage-limit or environment-fault pause is a
+    human-needed stop but not a CRITICAL contradiction, and titling it as one
+    sends the operator hunting for a spec conflict that is not there.
+
+    ``env_fault_site`` (DW-523) is the fallback for environment faults whose
+    reason carries no prefix — a verify-detected fault reads as the verify
+    reason itself. Anything unclassified keeps the CRITICAL title. Nothing parses
+    the title; it is display only."""
+    if reason.startswith("parked: "):
+        kind = "parked prompt"
+    elif reason.startswith("no work produced: "):
+        kind = "no work"
+    elif reason.startswith("usage limit: "):
+        kind = "usage limit"
+    elif reason.startswith("environment fault: ") or env_fault_site is not None:
+        kind = "environment fault"
+    else:
+        return f"CRITICAL escalation: {story_key}"
+    return f"Paused ({kind}): {story_key}"
+
+
 def session_failure_reason(role: str, result: SessionResult) -> str:
     """The reason text for a non-completed session: ``<role> session <status>``,
     plus the lost-session diagnosis (#489) and the overruled-env-fault note (#764).
@@ -469,7 +492,12 @@ def decide_reverify(task: StoryTask, outcome: VerifyOutcome) -> Decision:
 
 
 def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy) -> Decision:
-    """After a review session returns, before interpreting its done/followup status."""
+    """After a review session returns, before interpreting its done/followup status.
+
+    A non-completed session is read in the same order as `decide_dev`: env fault,
+    then parked, then no work produced (#727), each a PAUSE ahead of the
+    `review.on_timeout` routing — a review that never ran has nothing to salvage
+    and nothing a deferral or retry would change."""
     critical_reason = critical_session_reason("review", result.result_json)
     if critical_reason is not None:
         return Decision(Action.PAUSE, critical_reason)
@@ -487,6 +515,11 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
             # review cycle for a session the adapter would not type into (see
             # decide_dev). After env_fault, which outranks it.
             return Decision(Action.PAUSE, parked_pause_reason("review", result))
+        if not result.produced_work:
+            # never did anything (#727): pause rather than retry, defer or
+            # salvage a review that would relaunch into the same wall (see
+            # decide_dev). After env_fault and parked, which explain it better.
+            return Decision(Action.PAUSE, no_work_pause_reason("review", result))
         reason = session_failure_reason("review", result)
         if result.status in REVIEW_TIMEOUT_STATUSES:
             mode = policy.review.on_timeout

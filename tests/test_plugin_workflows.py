@@ -230,6 +230,9 @@ def test_workflow_injects_a_session_at_post_dev_phase(project):
     assert "workflow-start" in kinds and "workflow-end" in kinds
     starts = [e for e in engine.journal.entries() if e["kind"] == "workflow-start"]
     assert starts[0]["plugin"] == "wf" and starts[0]["workflow"] == "doc"
+    # a session that did its work leaves the no-work flag off the record (#727)
+    ends = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"]
+    assert "produced_work" not in ends[0]
     # the record names its workflow, so attempt-result lookups (DW-522) skip it;
     # the primary sessions stay unlabeled
     labels = {s.task_id: s.label for s in engine.state.tasks["1-1-a"].sessions}
@@ -332,6 +335,34 @@ def test_blocking_workflow_parked_escalates_instead_of_deferring(project):
     end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
     assert end["parked"] is True
     assert end["parked_evidence"] == evidence
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" not in kinds  # escalated, not deferred
+
+
+def test_blocking_workflow_no_work_escalates_instead_of_deferring(project):
+    """#727: a blocking workflow session that never did anything (a plain-adapter
+    session waiting out its timeout at a human-only prompt, `parked` unset)
+    escalates the run (re-arm restores the budget) instead of deferring the story;
+    the workflow-end entry carries `produced_work: False`.
+
+    ABLATION: delete the blocking-workflow no-work escalate arm in
+    `Engine._run_workflows` and the story is deferred instead — `summary.paused`
+    is False and a `story-deferred` entry lands."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    script = [
+        dev_effect(project, "1-1-a"),
+        SessionResult(status="timeout", produced_work=False),
+    ]
+    engine, adapter = make_engine(project, script, reg)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert engine.state.paused_reason.startswith("no work produced: blocking workflow 'doc'")
+    assert len(adapter.sessions) == 2  # dev + the one workflow session, no relaunch
+    end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
+    assert end["produced_work"] is False
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "story-deferred" not in kinds  # escalated, not deferred
 

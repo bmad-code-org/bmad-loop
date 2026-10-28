@@ -148,6 +148,14 @@ def _format_age(seconds: float) -> str:
     return f"{minutes // 60}h{minutes % 60:02d}m"
 
 
+def _format_countdown(seconds: float) -> str:
+    """A parked prompt's remaining auto-deny time for the header's
+    `· auto-denies in M:SS` text (#855): whole seconds, so it reads like the
+    CLI's own on-screen countdown. Callers clamp a past deadline first."""
+    whole = max(0, int(seconds))
+    return f"{whole // 60}:{whole % 60:02d}"
+
+
 def _format_reset(value: str) -> str:
     """A quota wait's reset for the header's `· resets <time>` text (#610): an
     aware ISO-8601 value as this host's local weekday and time (`Mon 12:50`),
@@ -261,7 +269,30 @@ class RunHeader(Static):
                 text.append(f" · {agent.model}", style="cyan")
             if agent.role:
                 text.append(f" · {agent.role}", style="dim")
-            if agent.quota_wait_since is not None:
+            if agent.parked_since is not None:
+                # The CLI is parked on a permission prompt (#855): nothing moves
+                # until someone answers it or the CLI's own countdown denies it,
+                # so this outranks the quota and idle notices. The countdown is
+                # the CLI's parsed deadline; one already past is clamped to
+                # `auto-deny due` (the deny lands on the CLI's next repaint), and
+                # a prompt whose countdown was never parsed says so rather than
+                # implying it waits forever.
+                text.append(
+                    " · parked on permission prompt"
+                    f" {_format_age(time.time() - agent.parked_since)}",
+                    style="yellow",
+                )
+                if agent.parked_auto_deny_at is None:
+                    text.append(" · auto-deny time unknown", style="yellow")
+                else:
+                    remaining = agent.parked_auto_deny_at - time.time()
+                    if remaining <= 0:
+                        text.append(" · auto-deny due", style="yellow")
+                    else:
+                        text.append(
+                            f" · auto-denies in {_format_countdown(remaining)}", style="yellow"
+                        )
+            elif agent.quota_wait_since is not None:
                 # A usage-limit quota wait is open (DW-396): the CLI is waiting
                 # out a usage-window reset it continues from by itself, with the
                 # session timeout frozen. Its transcript sits still by design, so

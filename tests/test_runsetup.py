@@ -392,6 +392,115 @@ def test_digest_raises_on_an_unresolvable_profile(pinned):
         _digest(pinned, '[adapter]\nname = "no-such-cli"\n')
 
 
+# ------------------------------------------------------- permission_mode (#727)
+
+_SANDBOX_TABLE = """
+[permission_modes.sandboxed]
+args = ["--sandbox", '{"sandbox": {"enabled": true}}']
+"""
+
+# `config_digest` of `POLICY` + `PROFILE` as origin/main computed it before
+# `adapter.permission_mode` existed (taken on a scratch worktree of origin/main).
+# A literal, not a rebuilt payload: it pins the bytes, so a default-mode policy
+# resumed across the upgrade cannot report a host-exec change.
+_PRE_PERMISSION_MODE_DIGEST = "175496b417501042899d2506e0661c333477738f77ed591ea99c56591d96ab3e"
+
+
+@pytest.mark.parametrize("line", ["", 'permission_mode = "bypass"'], ids=["absent", "explicit"])
+def test_default_permission_mode_keeps_the_pre_change_digest_bytes(pinned, line):
+    (pinned / PROFILE_REL).write_text(PROFILE + _SANDBOX_TABLE, encoding="utf-8")
+    text = _with_adapter_key(line) if line else POLICY
+    assert _digest(pinned, text) == _PRE_PERMISSION_MODE_DIGEST
+    assert _digest(pinned, text) == _pre_session_id_flag_digest(pinned, text)
+
+
+def test_sandboxed_permission_mode_moves_the_digest_and_hashes_its_args(pinned):
+    (pinned / PROFILE_REL).write_text(PROFILE + _SANDBOX_TABLE, encoding="utf-8")
+    sandboxed = _with_adapter_key('permission_mode = "sandboxed"')
+    before = _digest(pinned, sandboxed)
+    assert before != _PRE_PERMISSION_MODE_DIGEST
+    # the mode's args are what is launched, so rewriting them moves the pin
+    (pinned / PROFILE_REL).write_text(
+        PROFILE + _SANDBOX_TABLE.replace('"--sandbox"', '"--no-sandbox"'), encoding="utf-8"
+    )
+    assert _digest(pinned, sandboxed) != before
+
+
+def test_digest_raises_on_an_unmapped_permission_mode(pinned):
+    """The same rule as an unknown profile: the launch refuses the mode, so the
+    digest must not hash a launch surface that never runs."""
+    with pytest.raises(ProfileError, match="no permission_mode 'sandboxed' mapping"):
+        _digest(pinned, _with_adapter_key('permission_mode = "sandboxed"'))
+
+
+def _mode_adapters(project, monkeypatch, policy_text):
+    from conftest import install_bmad_config
+
+    from bmad_loop.adapters import multiplexer as mux_mod
+
+    monkeypatch.setattr(mux_mod, "_usable", lambda mux: True)
+    install_bmad_config(project)
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "mycli.toml").write_text(PROFILE + _SANDBOX_TABLE, encoding="utf-8")
+    run_dir = project.project / ".bmad-loop" / "runs" / RUN_ID
+    run_dir.mkdir(parents=True)
+    return runsetup.make_adapters(project.project, run_dir, policy_mod.loads(policy_text))
+
+
+def _launched_argv(adapter, project) -> list[str]:
+    from bmad_loop.adapters.base import SessionSpec
+
+    spec = SessionSpec(
+        task_id="1-1-a-dev-1",
+        role="dev",
+        prompt="/bmad-dev-auto 1-1-a",
+        cwd=project.project,
+        env={},
+        model="",
+        timeout_s=30.0,
+    )
+    return adapter.interactive_argv(spec)
+
+
+def test_make_adapters_launches_the_sandboxed_argv(project, monkeypatch):
+    """ABLATION: drop the `for_permission_mode` application in `make_adapters`
+    and the dev session launches `--yes` (the bypass args) instead."""
+    adapters = _mode_adapters(
+        project, monkeypatch, '[adapter]\nname = "mycli"\npermission_mode = "sandboxed"\n'
+    )
+    for role in ("dev", "triage"):
+        argv = _launched_argv(adapters[role], project)
+        assert argv[-2:] == ["--sandbox", '{"sandbox": {"enabled": true}}'], role
+        assert "--yes" not in argv
+
+
+def test_make_adapters_keeps_the_bypass_argv_by_default(project, monkeypatch):
+    adapters = _mode_adapters(project, monkeypatch, '[adapter]\nname = "mycli"\n')
+    assert _launched_argv(adapters["dev"], project)[-1] == "--yes"
+
+
+def test_extra_args_still_replace_the_sandboxed_args(project, monkeypatch):
+    adapters = _mode_adapters(
+        project,
+        monkeypatch,
+        '[adapter]\nname = "mycli"\npermission_mode = "sandboxed"\nextra_args = ["--mine"]\n',
+    )
+    argv = _launched_argv(adapters["dev"], project)
+    assert argv[-1] == "--mine"
+    assert "--sandbox" not in argv and "--yes" not in argv
+
+
+def test_make_adapters_refuses_an_unmapped_permission_mode(project, monkeypatch):
+    with pytest.raises(SystemExit, match="adapter review session: .*no permission_mode"):
+        _mode_adapters(
+            project,
+            monkeypatch,
+            '[adapter]\nname = "mycli"\n[adapter.review]\nname = "gemini"\n'
+            'permission_mode = "sandboxed"\n',
+        )
+
+
 # --------------------------------------------------------- composition unwind
 
 # A fixed, well-formed run id, so the assertions can name the two directories a

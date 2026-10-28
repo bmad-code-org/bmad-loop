@@ -39,7 +39,7 @@ from bmad_loop.adapters.base import (
 )
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
-from bmad_loop.adapters.profile import PARKED_EVENTS, get_profile
+from bmad_loop.adapters.profile import PARKED_EVENTS, PermissionModeSpec, get_profile
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS, Journal
 from bmad_loop.model import TokenUsage
@@ -444,6 +444,27 @@ def test_extra_args_replace_profile_bypass(tmp_path):
     cmd = adapter.build_command(make_spec(tmp_path))
     assert "--custom-flag" in cmd
     assert "bypassPermissions" not in cmd
+
+
+def test_a_sandboxed_profile_launches_its_mode_args_in_the_bypass_slot(tmp_path):
+    """#727: `adapter.permission_mode` is resolved INTO the profile
+    (`for_permission_mode` swaps `bypass_args` for the mode's args), so the
+    generic argv carries those args exactly where bypass_args sat, after the
+    prompt, and `build_command` quotes a JSON token as the one shell word it is."""
+    settings = '{"sandbox": {"enabled": true}}'
+    base = dataclasses.replace(
+        get_profile("claude"),
+        permission_modes={"sandboxed": PermissionModeSpec(args=("--mode-flag", settings))},
+    )
+    adapter = make_adapter(tmp_path)
+    adapter.profile = base.for_permission_mode("sandboxed", platform="linux")
+    argv = adapter.interactive_argv(make_spec(tmp_path))
+    prompt_at = next(i for i, a in enumerate(argv) if a.startswith("/bmad-dev-auto"))
+    assert argv[prompt_at + 1 : prompt_at + 3] == ["--mode-flag", settings]
+    assert "bypassPermissions" not in argv
+    cmd = adapter.build_command(make_spec(tmp_path))
+    assert shlex.quote(settings) in cmd
+    assert shlex.split(cmd)[prompt_at + 2] == settings
 
 
 def test_read_result_variants(tmp_path):
@@ -11725,9 +11746,12 @@ def test_parked_notification_withholds_the_stall_nudge(tmp_path, monkeypatch, su
     assert result.parked_evidence == f"Notification({subtype}) -> {kind}"
     assert _stall_nudges(mux) == []
     # The hook latch decides parked alone: the parked patterns are never
-    # consulted, and the one capture is the usage-limit look (#610), which a
-    # screen without a limit line leaves unset.
-    assert mux.captures == ["@1"]
+    # consulted, and the stall gate's one capture is the usage-limit look
+    # (#610), which a screen without a limit line leaves unset. A
+    # PermissionPrompt latch also reads the pane for the auto-deny countdown
+    # (#855): once at the latch, once more on the next tick when none is shown.
+    notice_reads = ["@1", "@1"] if kind == "PermissionPrompt" else []
+    assert mux.captures == [*notice_reads, "@1"]
     assert result.usage_limited is None
     # ...and the engine's dev decider pauses it with budget left (DW-348 AC).
     from bmad_loop.escalation import Action, decide_dev
@@ -11885,6 +11909,35 @@ def test_pane_matched_prompt_withholds_the_stall_nudge(tmp_path, monkeypatch, li
     assert result.parked_evidence is not None
     assert result.parked_evidence.startswith("pane matched ")
     assert result.parked_evidence.endswith(line)
+    assert mux.sent == []
+    assert mux.captures == ["@1"]
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        # dracic's measured footer rows (#727): width 30 autowraps mid-word,
+        # width 24 word-wraps at a space capture-pane then trimmed
+        [" Enter to confirm · Esc to can", "cel"],
+        [" Enter to confirm · Esc", "to cancel"],
+    ],
+    ids=["width-30", "width-24"],
+)
+def test_wrapped_pane_prompt_withholds_the_stall_nudge(tmp_path, monkeypatch, rows):
+    """The dialog footer wrapped across two rows of a narrow pane (#727): no
+    single row matches, but the joined rows do, so the nudge due at grace expiry
+    is still withheld and the evidence quotes the joined line.
+
+    Ablation: skip the window pass in `panematch.match_rows` (return None after
+    the row pass) and this fails on the STALL_NUDGE_TEXT the mux then records."""
+    body = "\r\n".join(rows)
+    screen = f" Do you trust the files in this folder?\r\n\r\n\x1b[2m{body}\x1b[0m\r\n"
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=screen)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence is not None
+    assert result.parked_evidence.startswith("pane matched ")
+    assert result.parked_evidence.endswith(BYPASS_FOOTER)
     assert mux.sent == []
     assert mux.captures == ["@1"]
 
@@ -12213,6 +12266,28 @@ def test_timeout_with_usage_line_visible_is_usage_limited(tmp_path, monkeypatch)
     assert clean.usage_limited is None
 
 
+def test_timeout_with_wrapped_usage_line_is_usage_limited(tmp_path, monkeypatch):
+    """The session-window limit line wrapped across two rows of a narrow pane:
+    the timeout-fired look still records `usage_limited`, quoting the joined
+    line, and the reset clause parses from it."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    monkeypatch.setattr(generic, "_local_now", lambda: QUOTA_NOW)
+    head, tail = USAGE_SESSION_LINE[:30], USAGE_SESSION_LINE[30:]
+    mux = _UnitMux(screen=f"working…\n{head}\n{tail}\n❯ \n")
+    adapter.mux = mux
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([], on_call=advance)
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
+    assert result.status == "timeout"
+    pattern = adapter.profile.usage_wait_patterns[0]
+    assert result.usage_limited == f"pane matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert mux.captures == ["@1"]
+
+
 def test_dead_window_is_never_usage_limited(tmp_path, monkeypatch):
     """A usage-limit line still captures off a dead (remain-on-exit) pane, but a
     CLI that is gone is not waiting on a limit: the stall re-probe finding the
@@ -12264,6 +12339,7 @@ def test_profile_without_usage_patterns_never_captures_for_them(tmp_path, monkey
     )
     adapter._usage_limit_patterns = ()
     adapter._usage_wait_patterns = ()
+    adapter._auto_deny_patterns = ()  # the #855 countdown read is another look
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(stall_dir))
     assert (result.status, result.parked) == ("stalled", True)
     assert result.usage_limited is None
@@ -12277,6 +12353,7 @@ def test_profile_without_usage_patterns_never_captures_for_them(tmp_path, monkey
     timed.mux = timed_mux
     timed._usage_limit_patterns = ()
     timed._usage_wait_patterns = ()
+    timed._parked_prompt_patterns = ()  # the timeout's parked look (#727) shares it
 
     def advance(call_n):
         clock["mono"] += 11.0
@@ -12285,6 +12362,370 @@ def test_profile_without_usage_patterns_never_captures_for_them(tmp_path, monkey
     late = timed.wait_for_completion(_dev_handle(), _short_spec(timeout_dir))
     assert (late.status, late.usage_limited) == ("timeout", None)
     assert timed_mux.captures == []
+
+
+# --- #727 timeout parked check, #855 live parked notice ---------------------
+
+# The countdown Claude Code printed above the #855 report's permission prompt,
+# split like the profile comment so this file never quotes the whole line.
+AUTO_DENY_LINE = (
+    "⚠ Claude Code will automatically deny this reques"
+    + "t in 2:00, to avoid blocking progress on an unattended session"
+)
+
+
+def _parked_timeout_adapter(
+    tmp_path, monkeypatch, events, *, screen="", timeout_s=30.0, on_call=None
+):
+    """`_timeout_clock_adapter` with the stall grace off, a `_UnitMux` showing
+    `screen`, a fake journal, and `events` scripted one per wait (each call
+    pushes the monotonic clock 11 s, then runs `on_call(n)` when given)."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+    mux = _UnitMux(screen=screen)
+    adapter.mux = mux
+    adapter.journal = _FakeJournal()
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+        if on_call is not None:
+            on_call(call_n)
+
+    adapter.watcher = _ScriptedWatcher(events, on_call=advance)
+    return adapter, mux, clock, _short_spec(tmp_path, timeout_s=timeout_s)
+
+
+def _journaled(adapter, kind):
+    return [e for e in adapter.journal.entries if e["kind"] == kind]
+
+
+def test_timeout_with_a_latched_permission_prompt_is_parked(tmp_path, monkeypatch):
+    """The session clock ran out while the CLI sat on a permission prompt the hook
+    latched (#727): the result stays `timeout` but is `parked`, naming the latch,
+    so the engine pauses it instead of retrying. A clean screen proves the latch
+    decides it, not the pane.
+
+    ABLATION: seed the timeout's `parked_now` with None instead of the latch and
+    this fails (`parked` False)."""
+    adapter, mux, _, spec = _parked_timeout_adapter(
+        tmp_path, monkeypatch, [_hook_event("Notification", "permission_prompt")]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    assert result.parked is True
+    assert result.parked_evidence == "Notification(permission_prompt) -> PermissionPrompt"
+    assert result.usage_limited is None
+
+
+def test_timeout_with_a_parked_footer_on_screen_is_parked(tmp_path, monkeypatch):
+    """No hook latch, but the dialog footer is on the visible pane when the clock
+    runs out: the timeout's one look matches the profile's parked patterns."""
+    adapter, mux, _, spec = _parked_timeout_adapter(
+        tmp_path, monkeypatch, [], screen=f"Bypass Permissions mode\n{BYPASS_FOOTER}\n"
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", True)
+    assert result.parked_evidence is not None
+    assert BYPASS_FOOTER in result.parked_evidence
+    assert mux.captures == ["@1"]  # one capture serves the parked and usage sets
+
+
+def test_timeout_parked_check_ignores_a_dead_window(tmp_path, monkeypatch):
+    """A window that died by the timeout waits on nobody: the latch and the
+    footer still on a remain-on-exit pane are no evidence."""
+    adapter, _, _, spec = _parked_timeout_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt")],
+        screen=f"{BYPASS_FOOTER}\n",
+    )
+    adapter._window_alive = lambda handle: not _lifecycle_events(adapter, "timeout-fired")
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    assert result.parked is False
+    assert result.parked_evidence is None
+
+
+def test_timeout_parked_check_needs_an_idle_transcript(tmp_path, monkeypatch):
+    """A transcript written inside QUOTA_WAIT_IDLE_S is a CLI that got past its
+    prompt and worked on, so the timeout is an ordinary one; the same latch over
+    a transcript idle past it parks. Unanswered tool calls are deliberately not
+    consulted: a live permission prompt is one.
+
+    ABLATION: drop the idle gate and the first run reads `parked` True."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    latch = _hook_event("Notification", "permission_prompt", transcript_path=str(transcript))
+
+    def answered(call_n):
+        if call_n == 2:  # the write after the latch: the prompt was answered
+            with transcript.open("ab") as fh:
+                fh.write(b'{"type":"assistant"}\n')
+
+    busy_dir = tmp_path / "busy"
+    busy_dir.mkdir()
+    adapter, _, _, spec = _parked_timeout_adapter(busy_dir, monkeypatch, [latch], on_call=answered)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    assert result.parked is False
+
+    idle_dir = tmp_path / "idle"
+    idle_dir.mkdir()
+    adapter, _, _, spec = _parked_timeout_adapter(
+        idle_dir, monkeypatch, [latch], timeout_s=generic.QUOTA_WAIT_IDLE_S + 60.0
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", True)
+
+
+def test_timeout_parked_check_samples_the_transcript_fresh(tmp_path, monkeypatch):
+    """The prompt sat unanswered past QUOTA_WAIT_IDLE_S, then the transcript moved
+    in the last wait, after the final heartbeat sample: the prompt was answered.
+    The timeout samples the transcript before its verdict, so the last
+    heartbeat's stale idle age does not park a working session.
+
+    ABLATION: drop the timeout's `sample_transcript` call and this reads
+    `parked` True."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    latch = _hook_event("Notification", "permission_prompt", transcript_path=str(transcript))
+    timeout_s = generic.QUOTA_WAIT_IDLE_S + 60.0
+
+    def answered_late(call_n):
+        # the wait that crosses the deadline: no heartbeat runs after it
+        if clock["mono"] >= 1000.0 + timeout_s and not answered_late.done:
+            answered_late.done = True
+            with transcript.open("ab") as fh:
+                fh.write(b'{"type":"assistant"}\n')
+
+    answered_late.done = False
+    adapter, _, clock, spec = _parked_timeout_adapter(
+        tmp_path, monkeypatch, [latch], timeout_s=timeout_s, on_call=answered_late
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert answered_late.done
+    assert (result.status, result.parked) == ("timeout", False)
+
+
+def test_timeout_parked_check_reads_the_latch_baseline(tmp_path, monkeypatch):
+    """A prompt reached in the clock's final QUOTA_WAIT_IDLE_S: the write that
+    asked for the permission keeps the transcript fresh, but nothing was written
+    after the latch, so the prompt is still unanswered and the session parks.
+    A pane match carries no latch-time baseline and keeps the idle gate.
+
+    ABLATION: drop `latch_unmoved` from the idle gate and the latch run reads
+    `parked` False."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"assistant"}\n')
+    latch = _hook_event("Notification", "permission_prompt", transcript_path=str(transcript))
+
+    latch_dir = tmp_path / "latch"
+    latch_dir.mkdir()
+    adapter, _, _, spec = _parked_timeout_adapter(latch_dir, monkeypatch, [latch])
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", True)
+    assert result.parked_evidence == "Notification(permission_prompt) -> PermissionPrompt"
+
+    pane_dir = tmp_path / "pane"
+    pane_dir.mkdir()
+    named = _hook_event("SessionStart", transcript_path=str(transcript))
+    adapter, _, _, spec = _parked_timeout_adapter(
+        pane_dir, monkeypatch, [named], screen=f"{BYPASS_FOOTER}\n"
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", False)
+
+
+def test_timeout_discards_a_latch_the_transcript_moved_past(tmp_path, monkeypatch):
+    """The prompt was answered (a write after the latch), then a silent tool ran
+    past QUOTA_WAIT_IDLE_S before the clock ran out: the latch is stale, so the
+    timeout is an ordinary one. The pane still decides, so a prompt on screen
+    by then parks with its own evidence.
+
+    ABLATION: keep the latch when its key has moved and the first run reads
+    `parked` True."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    latch = _hook_event("Notification", "permission_prompt", transcript_path=str(transcript))
+    timeout_s = generic.QUOTA_WAIT_IDLE_S + 60.0
+
+    def answered(call_n):
+        if call_n == 2:
+            with transcript.open("ab") as fh:
+                fh.write(b'{"type":"assistant"}\n')
+
+    gone_dir = tmp_path / "gone"
+    gone_dir.mkdir()
+    adapter, mux, _, spec = _parked_timeout_adapter(
+        gone_dir, monkeypatch, [latch], timeout_s=timeout_s, on_call=answered
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", False)
+    assert result.parked_evidence is None
+    assert mux.captures  # the stale latch handed the verdict to the pane
+
+    shown_dir = tmp_path / "shown"
+    shown_dir.mkdir()
+    adapter, _, _, spec = _parked_timeout_adapter(
+        shown_dir,
+        monkeypatch,
+        [latch],
+        screen=f"{BYPASS_FOOTER}\n",
+        timeout_s=timeout_s,
+        on_call=answered,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert (result.status, result.parked) == ("timeout", True)
+    assert result.parked_evidence is not None
+    assert BYPASS_FOOTER in result.parked_evidence
+
+
+def test_session_parked_carries_the_auto_deny_deadline(tmp_path, monkeypatch):
+    """A PermissionPrompt latch journals `session-parked` with the pane, the hook
+    subtype and the deadline read off the #855 countdown (wall clock 5000 + 2:00);
+    one capture at the latch, no retry once it parsed. The session then times out
+    with the notice still open: one `session-unparked`, `how="ended"`."""
+    adapter, mux, _, spec = _parked_timeout_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt")],
+        screen=f"{AUTO_DENY_LINE}\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n",
+    )
+    adapter.wait_for_completion(_dev_handle(), spec)
+    parked = _journaled(adapter, "session-parked")
+    assert parked == [
+        {
+            "kind": "session-parked",
+            "task_id": "3-1-dev-1",
+            "pane": "@1",
+            "subtype": "permission_prompt",
+            "auto_deny_at": 5120.0,
+        }
+    ]
+    # latch read, then the timeout's own look; no retry
+    assert mux.captures == ["@1", "@1"]
+    assert _journaled(adapter, "session-unparked") == [
+        {"kind": "session-unparked", "task_id": "3-1-dev-1", "how": "ended"}
+    ]
+    assert [c["how"] for c in _lifecycle_events(adapter, "session-unparked")] == ["ended"]
+
+
+def test_session_parked_omits_an_unpainted_deadline_and_retries_once(tmp_path, monkeypatch):
+    """No countdown on screen at the latch: `session-parked` goes out without
+    `auto_deny_at`, and the next tick parses once more. Painted by then, a second
+    `session-parked` carries it; a screen that never paints one gets exactly one
+    retry, never a poll."""
+    adapter, mux, clock, spec = _parked_timeout_adapter(
+        tmp_path, monkeypatch, [_hook_event("Notification", "permission_prompt")]
+    )
+
+    def paint(call_n):
+        clock["mono"] += 11.0
+        if call_n == 2:
+            mux.screen = f"{AUTO_DENY_LINE}\n"
+
+    adapter.watcher = _ScriptedWatcher(
+        [_hook_event("Notification", "permission_prompt")], on_call=paint
+    )
+    adapter.wait_for_completion(_dev_handle(), spec)
+    parked = _journaled(adapter, "session-parked")
+    assert len(parked) == 2
+    assert "auto_deny_at" not in parked[0]
+    assert parked[1]["auto_deny_at"] == 5120.0
+    assert len(_journaled(adapter, "session-unparked")) == 1
+
+    blank_dir = tmp_path / "blank"
+    blank_dir.mkdir()
+    adapter, mux, _, spec = _parked_timeout_adapter(
+        blank_dir, monkeypatch, [_hook_event("Notification", "permission_prompt")]
+    )
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert [("auto_deny_at" in e) for e in _journaled(adapter, "session-parked")] == [False]
+    # latch read, its one retry, then the timeout's look
+    assert mux.captures == ["@1", "@1", "@1"]
+
+
+def test_session_unparked_once_on_stop(tmp_path, monkeypatch):
+    """A Stop proves the prompt was answered: one `session-unparked`, `how="stop"`,
+    and nothing more at the exit."""
+    adapter, _, _, spec = _parked_timeout_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt"), _hook_event("Stop")],
+    )
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert len(_journaled(adapter, "session-parked")) == 1
+    assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["stop"]
+
+
+def test_session_unparked_once_on_transcript_activity(tmp_path, monkeypatch):
+    """A heartbeat transcript sample that moved off the latch-time baseline closes
+    the notice, `how="activity"`, once; the exit adds no `ended`."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    adapter, _, clock, spec = _parked_timeout_adapter(tmp_path, monkeypatch, [], timeout_s=90.0)
+
+    def work(call_n):
+        clock["mono"] += 11.0
+        if call_n == 2:
+            _grow(transcript, b'{"type":"assistant"}\n')
+
+    adapter.watcher = _ScriptedWatcher(
+        [_hook_event("Notification", "permission_prompt", transcript_path=str(transcript))],
+        on_call=work,
+    )
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert len(_journaled(adapter, "session-parked")) == 1
+    assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["activity"]
+
+
+def test_idle_prompt_latch_journals_no_parked_notice(tmp_path, monkeypatch):
+    """Only a PermissionPrompt opens the notice: an IdlePrompt latch (claude sends
+    one ~60 s after every finished turn) journals nothing and reads no screen."""
+    adapter, mux, _, spec = _parked_timeout_adapter(
+        tmp_path, monkeypatch, [_hook_event("Notification", "idle_prompt")]
+    )
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert _journaled(adapter, "session-parked") == []
+    assert _journaled(adapter, "session-unparked") == []
+    assert mux.captures == ["@1"]  # the timeout's own look only
+
+
+def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, monkeypatch):
+    """The notice observes only: after it closes on transcript activity, the
+    latch it rode on is untouched, so the stall gate still withholds the nudge
+    and ends the session `stalled` + `parked` on it."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 40.0
+    adapter._stall_nudges = 2
+    adapter._window_alive = lambda handle: True
+    adapter.journal = _FakeJournal()
+    clock = _frozen_stall_clock(monkeypatch)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    script = [_hook_event("Notification", "permission_prompt", transcript_path=str(transcript))]
+
+    class _Watcher:
+        calls = 0
+
+        def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
+            self.calls += 1
+            if self.calls == 2:
+                _grow(transcript, b'{"type":"assistant"}\n')
+            if script:
+                return script.pop(0)
+            clock["t"] += 11.0
+            return None
+
+    adapter.watcher = _Watcher()
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["activity"]
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence == "Notification(permission_prompt) -> PermissionPrompt"
+    assert _stall_nudges(mux) == []
 
 
 def test_capture_pane_argv_reads_the_visible_screen(monkeypatch, force_tmux_backend):
@@ -12366,6 +12807,54 @@ def test_send_text_types_into_a_pane_not_in_mode(monkeypatch, force_tmux_backend
         ["tmux", "-u", "send-keys", "-t", "@7.%9", "-l", "go on"],
         ["tmux", "-u", "send-keys", "-t", "@7.%9", "Enter"],
     ]
+
+
+def test_send_keys_presses_named_keys_without_l_or_enter(monkeypatch, force_tmux_backend):
+    """#855: one `send-keys -t <pane> <key>` per key, looked up as a key name (no
+    `-l`) and nothing appended — Escape alone must not become Escape + Enter.
+    Ablation: reuse send_text's `-l` + trailing Enter and this fails."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _scripted_tmux(monkeypatch, "0\n")
+    get_multiplexer().send_keys("@7.%9", "Escape")
+    assert calls == [
+        ["tmux", "-u", "display-message", "-p", "-t", "@7.%9", "#{pane_in_mode}"],
+        ["tmux", "-u", "send-keys", "-t", "@7.%9", "Escape"],
+    ]
+
+
+def test_send_keys_refuses_a_pane_in_mode(monkeypatch, force_tmux_backend):
+    """#949's refusal holds for named keys too: a mode would read Enter or Escape
+    as mode keys (Escape leaves copy mode), so nothing is pressed.
+    Ablation: drop the `#{pane_in_mode}` check and a key is pressed."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _scripted_tmux(monkeypatch, "1\n")
+    with pytest.raises(MultiplexerError, match="pane mode"):
+        get_multiplexer().send_keys("@7.%9", "Enter")
+    assert [c for c in calls if "send-keys" in c] == []
+
+
+@pytest.mark.parametrize("keys", [("y",), ("C-c",), ("Enter", "q"), ("go on",)])
+def test_send_keys_refuses_a_key_outside_the_allowed_set(monkeypatch, force_tmux_backend, keys):
+    """Only Enter and Escape: anything else is refused before tmux is asked
+    anything, so a mixed list presses none of its keys.
+    Ablation: drop the ALLOWED_KEYS check and the key is pressed."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _scripted_tmux(monkeypatch, "0\n")
+    with pytest.raises(MultiplexerError, match="refusing to send keys"):
+        get_multiplexer().send_keys("@7.%9", *keys)
+    assert calls == []
+
+
+def test_the_seam_default_send_keys_raises_the_seam_error():
+    """`TerminalMultiplexer.send_keys` is non-abstract so released backends keep
+    loading; its default refuses, which the answer path reads as "not sent"."""
+    from bmad_loop.adapters.multiplexer import TerminalMultiplexer
+
+    with pytest.raises(MultiplexerError, match="cannot send named keys"):
+        TerminalMultiplexer.send_keys(object(), "@1", "Enter")  # type: ignore[arg-type]
 
 
 class _PinningMux(_LaunchingUnitMux):

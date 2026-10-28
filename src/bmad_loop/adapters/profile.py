@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import string
+import sys
 import tomllib
 from dataclasses import dataclass, field, replace
 from importlib import resources
@@ -48,8 +49,9 @@ from ..platform_util import (
     names_tree_root,
     names_win32_alias,
 )
-from ..policy import PROFILE_ALIASES
+from ..policy import PERMISSION_MODES, PROFILE_ALIASES
 from .entrypoints import record_load_error
+from .multiplexer import ALLOWED_KEYS
 
 USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
 # The subagent transcript tree a usage parser's CLI writes beside its session
@@ -138,6 +140,44 @@ class WorkspaceTrustSpec:
 
 
 @dataclass(frozen=True)
+class ParkedAnswersSpec:
+    """The keys that answer a parked permission prompt from the dashboard (#855).
+
+    ``approve`` / ``deny`` are named keys (each one of
+    :data:`~.multiplexer.ALLOWED_KEYS`) pressed in order with no implicit Enter.
+    ``approve_guard`` / ``deny_guard`` are regexes that must ALL match a fresh
+    capture of the visible pane before that choice's keys are sent: the same
+    keys answer other dialogs differently (Enter on Claude Code's bypass startup
+    dialog chooses "No, exit"), so a screen that is not plainly the prompt sends
+    nothing. Both guard lists are non-empty and compile; validated in
+    :func:`_validate_profile`."""
+
+    approve: tuple[str, ...]
+    deny: tuple[str, ...]
+    approve_guard: tuple[str, ...]
+    deny_guard: tuple[str, ...]
+
+
+# The `sys.platform` values a `[permission_modes.<mode>]` table may name.
+PERMISSION_MODE_PLATFORMS = frozenset({"linux", "darwin", "win32"})
+
+
+@dataclass(frozen=True)
+class PermissionModeSpec:
+    """The launch args of one non-bypass ``adapter.permission_mode`` (#727).
+
+    ``args`` stand in for ``bypass_args`` when the mode is selected
+    (:meth:`CLIProfile.for_permission_mode`), so ``extra_args`` replaces them
+    exactly as it replaces ``bypass_args``. ``platforms`` names the
+    ``sys.platform`` values the mapping is known to work on; empty = every
+    platform. Mode names, args and platforms are validated in
+    :func:`_validate_profile`."""
+
+    args: tuple[str, ...]
+    platforms: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CLIProfile:
     name: str
     binary: str
@@ -216,7 +256,8 @@ class CLIProfile:
     # across every tracked file. Override/extend via a project profile in
     # .bmad-loop/profiles/.
     env_fault_patterns: tuple[str, ...] = ()
-    # Patterns matched line-by-line against the ANSI-stripped VISIBLE pane
+    # Patterns matched line-by-line, then across 2-3 wrapped rows
+    # (`panematch.match_rows`), against the ANSI-stripped VISIBLE pane
     # (`mux.capture_pane`), only at the moment a stall wake nudge is about to be
     # typed into it (DW-350). A match means the CLI is parked on a prompt only a
     # human should answer — the nudge's trailing Enter could confirm it (#727:
@@ -266,7 +307,8 @@ class CLIProfile:
     # APPENDED after session_id_flag for the same positional-compatibility reason.
     subagent_transcript_dir: str | None = None
     # Patterns naming a subscription/usage limit the CLI is stopped behind (#610),
-    # matched line-by-line against the ANSI-stripped VISIBLE pane at the same live
+    # matched line-by-line (then across 2-3 wrapped rows) against the
+    # ANSI-stripped VISIBLE pane at the same live
     # decision points as parked_prompt_patterns (stall-grace expiry, and once when
     # the session timeout fires) and, as ordinary env-fault families, against the
     # post-mortem log tail. Two lists, disjoint by contract — "usage-limited" means
@@ -285,6 +327,23 @@ class CLIProfile:
     # reason.
     usage_limit_patterns: tuple[str, ...] = ()
     usage_wait_patterns: tuple[str, ...] = ()
+    # The CLI's auto-deny countdown on a permission prompt it will answer "no"
+    # to by itself. Matched (then across 2-3 wrapped rows) against the visible
+    # pane once when a PermissionPrompt latches (and once more on the next tick
+    # when nothing matched), never on a timer; each pattern names groups `min`
+    # and `sec`, read into the `auto_deny_at` of the `session-parked` journal
+    # event. Same evidentiary bar as usage_limit_patterns. Compiled and
+    # validated at parse time; empty = no deadline is ever read. APPENDED after
+    # usage_wait_patterns for the same positional-compatibility reason.
+    auto_deny_patterns: tuple[str, ...] = ()
+    # The keys that answer a parked permission prompt from the TUI (#855); None =
+    # the CLI offers no answer keys and the operator attaches to answer. APPENDED
+    # after auto_deny_patterns for the same positional-compatibility reason.
+    parked_answers: ParkedAnswersSpec | None = None
+    # Non-bypass `adapter.permission_mode` mappings, keyed by mode name (#727);
+    # a mode absent here is refused for this CLI. APPENDED after parked_answers
+    # for the same positional-compatibility reason.
+    permission_modes: dict[str, PermissionModeSpec] = field(default_factory=dict)
 
     @property
     def hookless(self) -> bool:
@@ -313,14 +372,41 @@ class CLIProfile:
             skill, args = head, rest.strip()
         return self.prompt_template.format(prompt=prompt, skill=skill, args=args)
 
+    def for_permission_mode(self, mode: str, platform: str = sys.platform) -> CLIProfile:
+        """This profile with ``bypass_args`` set to ``mode``'s launch args.
+
+        ``"bypass"`` returns the profile unchanged. Any other mode swaps in its
+        ``[permission_modes.<mode>]`` args, so every reader of ``bypass_args``
+        (the launched argv, the config digest, :meth:`missing_bypass_tokens`)
+        sees the effective permission args with no second code path. Raises
+        :class:`ProfileError` when the profile has no mapping for ``mode`` or
+        the mapping excludes ``platform``."""
+        if mode == "bypass":
+            return self
+        spec = self.permission_modes.get(mode)
+        if spec is None:
+            raise ProfileError(
+                f"profile {self.name!r} has no permission_mode {mode!r} mapping "
+                f'(no [permission_modes.{mode}] table); use permission_mode = "bypass" '
+                "or another profile"
+            )
+        if spec.platforms and platform not in spec.platforms:
+            raise ProfileError(
+                f"profile {self.name!r} maps permission_mode {mode!r} only on "
+                f"{', '.join(spec.platforms)}, not {platform}"
+            )
+        return replace(self, bypass_args=spec.args)
+
     def missing_bypass_tokens(self, extra_args: tuple[str, ...] | None) -> tuple[str, ...]:
-        """The ``bypass_args`` tokens a policy ``extra_args`` override drops (DW-349).
+        """The permission args (``bypass_args``) a policy ``extra_args`` override
+        drops (DW-349).
 
         The replace rule (``GenericAdapter.interactive_argv``): a non-None
         ``extra_args`` REPLACES ``bypass_args`` rather than extending it, so any
-        bypass token that is not an exact element of ``launch_args + extra_args``
-        is absent from the launched argv. ``None`` means "inherit the profile's
-        bypass flags" and drops nothing; ``()`` is an explicit override and drops
+        permission token that is not an exact element of ``launch_args + extra_args``
+        is absent from the launched argv. On a profile resolved by
+        :meth:`for_permission_mode` these are that mode's args. ``None`` means
+        "inherit the profile's permission args" and drops nothing; ``()`` is an explicit override and drops
         them all. Order kept, duplicates collapsed."""
         if extra_args is None:
             return ()
@@ -610,6 +696,57 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             except (regex.error, RecursionError) as e:
                 raise fail(f"{field_name} entry is not a valid regex: {pattern!r} ({e})") from e
 
+    for pattern in profile.auto_deny_patterns:
+        try:
+            compiled = regex.compile(pattern)  # same engine the parked notice matches with
+        except (regex.error, RecursionError) as e:
+            raise fail(f"auto_deny_patterns entry is not a valid regex: {pattern!r} ({e})") from e
+        missing = sorted({"min", "sec"} - compiled.groupindex.keys())
+        if missing:
+            raise fail(
+                f"auto_deny_patterns entry must name groups 'min' and 'sec': {pattern!r} "
+                f"(missing {', '.join(missing)})"
+            )
+
+    for mode, spec in profile.permission_modes.items():
+        if mode == "bypass" or mode not in PERMISSION_MODES:
+            raise fail(
+                f"permission_modes.{mode}: unknown mode (one of "
+                f"{sorted(PERMISSION_MODES - {'bypass'})}; bypass is bypass_args)"
+            )
+        if not spec.args or not all(isinstance(a, str) and a for a in spec.args):
+            raise fail(f"permission_modes.{mode}.args must list at least one non-empty string")
+        bad = [p for p in spec.platforms if p not in PERMISSION_MODE_PLATFORMS]
+        if bad:
+            raise fail(
+                f"permission_modes.{mode}.platforms must name values from "
+                f"{sorted(PERMISSION_MODE_PLATFORMS)}: got {bad!r}"
+            )
+
+    answers = profile.parked_answers
+    if answers is not None:
+        for field_name in ("approve", "deny"):
+            keys = getattr(answers, field_name)
+            bad = [key for key in keys if key not in ALLOWED_KEYS]
+            if not keys or bad:
+                raise fail(
+                    f"parked_answers.{field_name} must list named keys from "
+                    f"{sorted(ALLOWED_KEYS)}: got {list(keys)!r}"
+                )
+        for field_name in ("approve_guard", "deny_guard"):
+            guards = getattr(answers, field_name)
+            # Empty would let the keys out on any screen, the one thing a guard
+            # exists to stop.
+            if not guards:
+                raise fail(f"parked_answers.{field_name} must list at least one pattern")
+            for pattern in guards:
+                try:
+                    regex.compile(pattern)  # same engine the answer guard matches with
+                except (regex.error, RecursionError) as e:
+                    raise fail(
+                        f"parked_answers.{field_name} entry is not a valid regex: {pattern!r} ({e})"
+                    ) from e
+
 
 def _legacy_adapter_default(dialect: str) -> str:
     """The adapter kind a TOML profile that predates the ``adapter`` field meant.
@@ -684,6 +821,45 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             raise fail("workspace_trust.settings_path and workspace_trust.key must be strings")
         workspace_trust = WorkspaceTrustSpec(settings_path=settings_path, key=key)
 
+    # Same shape-only rule as workspace_trust: four string lists, values in
+    # `_validate_profile`.
+    answers_d = doc.get("parked_answers")
+    parked_answers: ParkedAnswersSpec | None = None
+    if answers_d is not None:
+        if not isinstance(answers_d, dict):
+            raise fail("parked_answers must be a table")
+        answer_keys = ("approve", "deny", "approve_guard", "deny_guard")
+        unknown = sorted(set(answers_d) - set(answer_keys))
+        if unknown:
+            raise fail(f"parked_answers has unknown keys: {unknown}")
+        lists: dict[str, tuple[str, ...]] = {}
+        for key in answer_keys:
+            raw = answers_d.get(key, [])
+            if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+                raise fail(f"parked_answers.{key} must be a list of strings")
+            lists[key] = tuple(raw)
+        parked_answers = ParkedAnswersSpec(**lists)
+
+    # `[permission_modes.<mode>]` tables of two string lists; mode names and
+    # values are checked in `_validate_profile`.
+    modes_d = doc.get("permission_modes", {})
+    if not isinstance(modes_d, dict):
+        raise fail("permission_modes must be a table of [permission_modes.<mode>] tables")
+    permission_modes: dict[str, PermissionModeSpec] = {}
+    for mode, spec_d in modes_d.items():
+        if not isinstance(spec_d, dict):
+            raise fail(f"permission_modes.{mode} must be a table")
+        unknown = sorted(set(spec_d) - {"args", "platforms"})
+        if unknown:
+            raise fail(f"permission_modes.{mode} has unknown keys: {unknown}")
+        mode_lists: dict[str, tuple[str, ...]] = {}
+        for key in ("args", "platforms"):
+            raw = spec_d.get(key, [])
+            if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+                raise fail(f"permission_modes.{mode}.{key} must be a list of strings")
+            mode_lists[key] = tuple(raw)
+        permission_modes[mode] = PermissionModeSpec(**mode_lists)
+
     # A dedicated shape check rather than the `str()` coercion the neighbouring
     # scalars get, because `adapter` has no parse-time membership test to land in
     # afterwards: `str(["x"])` would coerce a TOML array to the literal `"['x']"`
@@ -742,8 +918,11 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         parked_prompt_patterns=str_list("parked_prompt_patterns"),
         usage_limit_patterns=str_list("usage_limit_patterns"),
         usage_wait_patterns=str_list("usage_wait_patterns"),
+        auto_deny_patterns=str_list("auto_deny_patterns"),
         workspace_trust=workspace_trust,
         subagent_transcript_dir=raw_subagent_dir,
+        parked_answers=parked_answers,
+        permission_modes=permission_modes,
     )
     _validate_profile(profile, source)
     return profile

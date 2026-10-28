@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import re
 from importlib import resources
 from pathlib import Path
@@ -10,6 +11,8 @@ from bmad_loop.adapters import profile as profile_mod
 from bmad_loop.adapters.profile import (
     CLIProfile,
     HookSpec,
+    ParkedAnswersSpec,
+    PermissionModeSpec,
     ProfileError,
     get_profile,
     load_profiles,
@@ -160,7 +163,13 @@ def test_env_fault_patterns_parse_from_overlay(tmp_path):
 
 @pytest.mark.parametrize(
     "field",
-    ["env_fault_patterns", "parked_prompt_patterns", "usage_limit_patterns", "usage_wait_patterns"],
+    [
+        "env_fault_patterns",
+        "parked_prompt_patterns",
+        "usage_limit_patterns",
+        "usage_wait_patterns",
+        "auto_deny_patterns",
+    ],
 )
 def test_deeply_nested_pattern_is_a_profile_error_not_a_bare_recursion_error(tmp_path, field):
     """DW-373: `regex.compile` answers a deeply nested pattern with RecursionError,
@@ -268,6 +277,27 @@ def test_shipped_claude_parked_patterns_do_not_match_their_own_profile_line():
     )
     hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
     assert hits == []
+    # ...nor when a narrow pane wraps it: the live matcher also joins 2-3 adjacent
+    # rows (#727), and joining only adds or drops whitespace, never a bracket.
+    assert _wrapped_hits(text, patterns) == []
+
+
+def _wrapped_hits(text: str, patterns) -> list[tuple[int, str]]:
+    """Every (width, line) of ``text`` that the pane matcher matches once the line
+    is wrapped at a width from 10 to 60 columns, cut mid-word (autowrap) or at
+    spaces (word-wrap)."""
+    import textwrap
+
+    from bmad_loop.adapters.panematch import match_rows
+
+    hits = []
+    for line in text.splitlines():
+        for width in range(10, 61):
+            autowrap = [line[i : i + width].rstrip() for i in range(0, len(line), width)]
+            for rows in (autowrap, textwrap.wrap(line, width=width)):
+                if match_rows(rows, patterns, timeout=2.0) is not None:
+                    hits.append((width, line))
+    return hits
 
 
 _USAGE_FIELDS = ("usage_limit_patterns", "usage_wait_patterns")
@@ -388,6 +418,270 @@ def test_shipped_claude_usage_patterns_do_not_match_their_own_profile_line():
     )
     hits = [line for line in text.splitlines() if any(p.search(line) for p in patterns)]
     assert hits == []
+    assert _wrapped_hits(text, patterns) == []
+
+
+# The countdown line in the #855 report, split so this file never holds it whole.
+_CAPTURED_AUTO_DENY_LINE = (
+    "⚠ Claude Code will automatically deny this reques"
+    + "t in 2:00, to avoid blocking progress on an unattended session"
+)
+
+
+def test_shipped_claude_auto_deny_pattern_reads_the_captured_855_countdown():
+    """The seeded pattern matches the #855 line and yields its `min`/`sec`, and
+    does not match its own claude.toml line (`reques[t]`), alone or wrapped."""
+    import regex
+
+    claude = get_profile("claude")
+    patterns = [regex.compile(p) for p in claude.auto_deny_patterns]
+    assert patterns
+    found = next(m for p in patterns if (m := p.search(_CAPTURED_AUTO_DENY_LINE)))
+    assert (found.group("min"), found.group("sec")) == ("2", "00")
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    assert [line for line in text.splitlines() if any(p.search(line) for p in patterns)] == []
+    assert _wrapped_hits(text, patterns) == []
+
+
+def test_auto_deny_pattern_without_its_named_groups_is_a_profile_error(tmp_path):
+    """A countdown pattern that cannot yield `min` and `sec` is refused at load,
+    naming the missing group, rather than reading no deadline at every latch.
+
+    ABLATION: drop the groupindex check from `_validate_profile` and this loads."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace(
+            "[hooks]", "auto_deny_patterns = ['deny in (?P<min>[0-9]+):[0-9]{2}']\n[hooks]"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ProfileError, match="missing sec"):
+        load_profiles(tmp_path)
+
+
+# The screen in the #855 report, the countdown line split like the profile
+# comment so this file never quotes it whole.
+_CAPTURED_855_SCREEN = (
+    'Dangerous rm operation on possibly-empty variable path: "$P/[refId]" ...\n'
+    f"{_CAPTURED_AUTO_DENY_LINE}\n"
+    "\n"
+    "Do you want to proceed?\n"
+    "❯ 1. Yes\n"
+    "  2. No\n"
+)
+# Claude Code's bypass startup dialog: Enter there confirms the focused "No, exit".
+_BYPASS_DIALOG_SCREEN = (
+    # split so this file never holds the heading claude's parked pattern matches
+    "WARNING: Claude Code running in Bypass Permissions mod" + "e\n"
+    "\n"
+    "❯ 1. No, exit\n"
+    "  2. Yes, I accept\n"
+)
+
+_PARKED_ANSWERS_TABLE = """
+[parked_answers]
+approve = ["Enter"]
+deny = ["Escape"]
+approve_guard = ['Do you want']
+deny_guard = ['Do you want']
+"""
+
+
+def test_parked_answers_table_parses_into_its_spec(tmp_path):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(
+        MINIMAL_PROFILE + _PARKED_ANSWERS_TABLE, encoding="utf-8"
+    )
+    assert load_profiles(tmp_path)["mycli"].parked_answers == ParkedAnswersSpec(
+        approve=("Enter",),
+        deny=("Escape",),
+        approve_guard=("Do you want",),
+        deny_guard=("Do you want",),
+    )
+    # absent table: no answer keys
+    assert get_profile("gemini").parked_answers is None
+
+
+@pytest.mark.parametrize(
+    ("table", "match"),
+    [
+        (_PARKED_ANSWERS_TABLE + "confirm = ['y']\n", "unknown keys"),
+        (_PARKED_ANSWERS_TABLE.replace('["Enter"]', '"Enter"'), "approve must be a list"),
+        (_PARKED_ANSWERS_TABLE.replace('["Enter"]', '["Return"]'), "approve must list named keys"),
+        (
+            _PARKED_ANSWERS_TABLE.replace('["Escape"]', '["Escape", "q"]'),
+            "deny must list named keys",
+        ),
+        (
+            _PARKED_ANSWERS_TABLE.replace("deny_guard = ['Do you want']", "deny_guard = []"),
+            "deny_guard must list at least one",
+        ),
+        (
+            _PARKED_ANSWERS_TABLE.replace(
+                "approve_guard = ['Do you want']", "approve_guard = ['(']"
+            ),
+            "approve_guard entry is not a valid regex",
+        ),
+        ("parked_answers = 1\n", "must be a table"),
+    ],
+)
+def test_malformed_parked_answers_is_a_profile_error(tmp_path, table, match):
+    """Every shape and value fault refuses the profile at load rather than
+    offering keys that would press something unvetted, or on any screen.
+
+    ABLATION: drop the matching check (`_parse_profile` unknown keys, the
+    ALLOWED_KEYS membership, the empty-guard or compile check in
+    `_validate_profile`) and its case loads."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    body = (
+        MINIMAL_PROFILE.replace("[hooks]", table + "[hooks]")
+        if table.startswith("parked_answers =")
+        else MINIMAL_PROFILE + table
+    )
+    (profiles_dir / "mycli.toml").write_text(body, encoding="utf-8")
+    with pytest.raises(ProfileError, match=match):
+        load_profiles(tmp_path)
+
+
+_PERMISSION_MODES_TABLE = """
+[permission_modes.sandboxed]
+args = ["--sandbox", '{"a": 1}']
+platforms = ["linux", "darwin"]
+"""
+
+
+def _mode_profiles(tmp_path, body: str) -> dict[str, CLIProfile]:
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(body, encoding="utf-8")
+    return load_profiles(tmp_path)
+
+
+def test_permission_modes_table_parses_into_its_spec(tmp_path):
+    prof = _mode_profiles(tmp_path, MINIMAL_PROFILE + _PERMISSION_MODES_TABLE)["mycli"]
+    assert prof.permission_modes == {
+        "sandboxed": PermissionModeSpec(
+            args=("--sandbox", '{"a": 1}'), platforms=("linux", "darwin")
+        )
+    }
+    # absent table: no non-bypass mode
+    assert get_profile("gemini").permission_modes == {}
+
+
+@pytest.mark.parametrize(
+    ("table", "match"),
+    [
+        (_PERMISSION_MODES_TABLE + "allow = ['x']\n", "unknown keys"),
+        (_PERMISSION_MODES_TABLE.replace("sandboxed]", "yolo]"), "unknown mode"),
+        (_PERMISSION_MODES_TABLE.replace("sandboxed]", "bypass]"), "unknown mode"),
+        (_PERMISSION_MODES_TABLE.replace('"darwin"', '"cygwin"'), "platforms must name"),
+        (_PERMISSION_MODES_TABLE.replace('"darwin"]', '"darwin"]\nargs2 = 1'), "unknown keys"),
+        (
+            "\n[permission_modes.sandboxed]\nargs = []\n",
+            "args must list at least one",
+        ),
+        ('\n[permission_modes.sandboxed]\nargs = "--x"\n', "args must be a list"),
+        ("\n[permission_modes]\nsandboxed = 1\n", "sandboxed must be a table"),
+    ],
+)
+def test_malformed_permission_modes_is_a_profile_error(tmp_path, table, match):
+    """ABLATION: drop the matching check (`_parse_profile` unknown keys / shape,
+    the mode-name, args or platform check in `_validate_profile`) and its case loads."""
+    with pytest.raises(ProfileError, match=match):
+        _mode_profiles(tmp_path, MINIMAL_PROFILE + table)
+
+
+def test_for_permission_mode_resolves_the_mode_into_bypass_args(tmp_path):
+    prof = _mode_profiles(tmp_path, MINIMAL_PROFILE + _PERMISSION_MODES_TABLE)["mycli"]
+    assert prof.for_permission_mode("bypass") is prof
+    sandboxed = prof.for_permission_mode("sandboxed", platform="linux")
+    assert sandboxed.bypass_args == ("--sandbox", '{"a": 1}')
+    assert sandboxed.name == prof.name and sandboxed.launch_args == prof.launch_args
+    # extra_args still replaces the resolved args, so a drop is reported against them
+    assert sandboxed.missing_bypass_tokens(("--yes",)) == ("--sandbox", '{"a": 1}')
+
+
+def test_for_permission_mode_refuses_an_excluded_platform(tmp_path):
+    prof = _mode_profiles(tmp_path, MINIMAL_PROFILE + _PERMISSION_MODES_TABLE)["mycli"]
+    with pytest.raises(ProfileError, match="only on linux, darwin, not win32"):
+        prof.for_permission_mode("sandboxed", platform="win32")
+
+
+def test_for_permission_mode_with_no_platform_list_runs_everywhere(tmp_path):
+    body = MINIMAL_PROFILE + '\n[permission_modes.sandboxed]\nargs = ["--s"]\n'
+    prof = _mode_profiles(tmp_path, body)["mycli"]
+    assert prof.for_permission_mode("sandboxed", platform="win32").bypass_args == ("--s",)
+
+
+def test_shipped_sandboxed_mappings_parse_and_resolve():
+    """claude and codex ship the live-checked sandboxed args (linux/macOS only)."""
+    claude = get_profile("claude").for_permission_mode("sandboxed", platform="linux")
+    assert claude.bypass_args[:2] == ("--permission-mode", "dontAsk")
+    assert "--dangerously-skip-permissions" not in claude.bypass_args
+    settings = claude.bypass_args[claude.bypass_args.index("--settings") + 1]
+    assert json.loads(settings)["sandbox"] == {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False,
+    }
+    codex = get_profile("codex").for_permission_mode("sandboxed", platform="darwin")
+    assert codex.bypass_args[-2:] == ("--ask-for-approval", "never")
+    assert "--dangerously-bypass-approvals-and-sandbox" not in codex.bypass_args
+    for name in ("claude", "codex"):
+        with pytest.raises(ProfileError, match="not win32"):
+            get_profile(name).for_permission_mode("sandboxed", platform="win32")
+
+
+@pytest.mark.parametrize("name", ["gemini", "copilot", "antigravity", "opencode-http"])
+def test_for_permission_mode_refuses_an_unmapped_profile(name):
+    with pytest.raises(ProfileError, match="no permission_mode 'sandboxed' mapping"):
+        get_profile(name).for_permission_mode("sandboxed", platform="linux")
+
+
+def test_shipped_claude_answer_guards_match_the_captured_855_screen():
+    """Approve (Enter) and deny (Escape) guards both match the #855 prompt; on
+    the bypass startup dialog — where Enter chooses "No, exit" and Escape exits —
+    neither does; and no guard matches its own claude.toml line, alone or
+    wrapped (`procee[d]`, `1[.]`)."""
+    import regex
+
+    from bmad_loop.adapters.panematch import Hit, match_rows, screen_rows
+
+    answers = get_profile("claude").parked_answers
+    assert answers is not None
+    assert (answers.approve, answers.deny) == (("Enter",), ("Escape",))
+
+    def all_match(screen, guards):
+        rows = screen_rows(screen)
+        return all(
+            isinstance(match_rows(rows, [regex.compile(g)], timeout=2.0), Hit) for g in guards
+        )
+
+    assert all_match(_CAPTURED_855_SCREEN, answers.approve_guard)
+    assert all_match(_CAPTURED_855_SCREEN, answers.deny_guard)
+    assert not all_match(_BYPASS_DIALOG_SCREEN, answers.approve_guard)
+    assert not all_match(_BYPASS_DIALOG_SCREEN, answers.deny_guard)
+    # focus moved to "2. No": approve's Enter would deny, so approve refuses
+    moved = _CAPTURED_855_SCREEN.replace("❯ 1. Yes", "  1. Yes").replace("  2. No", "❯ 2. No")
+    assert not all_match(moved, answers.approve_guard)
+
+    patterns = [regex.compile(g) for g in (*answers.approve_guard, *answers.deny_guard)]
+    text = (
+        resources.files("bmad_loop.data")
+        .joinpath("profiles")
+        .joinpath("claude.toml")
+        .read_text(encoding="utf-8")
+    )
+    assert [line for line in text.splitlines() if any(p.search(line) for p in patterns)] == []
+    assert _wrapped_hits(text, patterns) == []
 
 
 def test_only_claude_seeds_usage_patterns():
@@ -1427,6 +1721,27 @@ def test_profile_scan_failure_degrades(profile_scan):
         # the #610 usage-limit pane patterns, each list on its own
         ({"usage_limit_patterns": ("credits(unbalanced",)}, "usage_limit_patterns"),
         ({"usage_wait_patterns": ("resets(unbalanced",)}, "usage_wait_patterns"),
+        # the #855 auto-deny countdown: it must compile and name `min` + `sec`
+        ({"auto_deny_patterns": ("deny(unbalanced",)}, "auto_deny_patterns"),
+        ({"auto_deny_patterns": ("deny in (?P<min>[0-9]+)",)}, "'min' and 'sec'"),
+        # the #855 answer keys: allowed named keys, non-empty compiling guards
+        ({"parked_answers": ParkedAnswersSpec(("y",), ("Escape",), ("x",), ("x",))}, "approve"),
+        ({"parked_answers": ParkedAnswersSpec(("Enter",), (), ("x",), ("x",))}, "deny"),
+        (
+            {"parked_answers": ParkedAnswersSpec(("Enter",), ("Escape",), (), ("x",))},
+            "approve_guard must list",
+        ),
+        (
+            {"parked_answers": ParkedAnswersSpec(("Enter",), ("Escape",), ("x",), ("(",))},
+            "deny_guard entry is not a valid regex",
+        ),
+        # the #727 permission modes: known non-bypass names, non-empty args, platforms
+        ({"permission_modes": {"yolo": PermissionModeSpec(("--x",))}}, "unknown mode"),
+        ({"permission_modes": {"sandboxed": PermissionModeSpec(())}}, "args must list"),
+        (
+            {"permission_modes": {"sandboxed": PermissionModeSpec(("--x",), ("haiku",))}},
+            "platforms must name",
+        ),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
         ({"usage_grace_s": -1.0}, "usage_grace_s"),

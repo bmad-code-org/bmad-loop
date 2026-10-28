@@ -7,6 +7,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -378,6 +379,13 @@ def _store_extra_args_roles(pol, source: str) -> tuple[str, ...]:
     ``extra_args`` — for the ``tickets.store-sandbox`` warning."""
     roles = worksource.launch_roles(source, pol.gates.retrospective)
     return tuple(role for role in roles if pol.adapter.resolved(role).extra_args)
+
+
+def _store_sandboxed_roles(pol, source: str) -> tuple[str, ...]:
+    """The roles a ``source`` run launches under a non-bypass
+    ``adapter.permission_mode`` — for the ``tickets.store-sandbox`` warning."""
+    roles = worksource.launch_roles(source, pol.gates.retrospective)
+    return tuple(role for role in roles if pol.adapter.resolved(role).permission_mode != "bypass")
 
 
 def _reject_under_floor_git(project: Path) -> int | None:
@@ -1454,12 +1462,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
             # permission prompt. GENERIC-only for the reason above: it is the one
             # bundled kind whose argv consumes bypass_args. Advisory, like the
             # effort check — the run is still runnable, just likely to stall.
-            if prof is not None and (missing := _bypass_drops(cfg, prof)):
+            # Judged against the MODE-resolved profile: under a non-bypass
+            # permission_mode the args extra_args replaces are that mode's. An
+            # unmapped mode is not this check's finding (it fails the launch).
+            if (
+                prof is not None
+                and (mode_prof := _permission_profile(cfg, prof)) is not None
+                and (missing := _bypass_drops(cfg, mode_prof))
+            ):
                 report.warn(
                     "policy.bypass-dropped",
-                    _bypass_dropped_message(role, prof, missing),
+                    _bypass_dropped_message(role, mode_prof, missing, mode=cfg.permission_mode),
                     {"role": role, "profile": prof.name, "missing": list(missing)},
                 )
+            if prof is not None:
+                _report_permission_mode(report, role, cfg, prof, pol.scm.isolation)
 
     base_findings = install.missing_base_skills(project, dev_trees)
     # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
@@ -2177,8 +2194,78 @@ def _unknown_adapter_kinds(project: Path, pol) -> list[str]:
     return problems
 
 
+def _permission_profile(cfg, profile: CLIProfile) -> CLIProfile | None:
+    """``profile`` resolved for ``cfg.permission_mode`` (its ``bypass_args`` become
+    the mode's launch args, as ``runsetup.make_adapters`` launches them), or None
+    when the profile cannot run that mode — the launch refuses that itself."""
+    from .adapters.profile import ProfileError
+
+    try:
+        return profile.for_permission_mode(cfg.permission_mode)
+    except ProfileError:
+        return None
+
+
+def _report_permission_mode(
+    report: ValidationReport, role: str, cfg, profile: CLIProfile, isolation: str
+) -> None:
+    """One `validate` finding per role for its ``adapter.permission_mode`` (#727).
+
+    A profile that cannot run the mode on this platform FAILS
+    (``adapter.permission-mode-unsupported``): the launch refuses it in
+    ``runsetup.make_adapters``. Otherwise an ok posture line
+    (``adapter.permission-mode``) whose isolation coupling is advisory only: a
+    bypass role with no worktree isolation is pointed at the sandboxed mode when
+    its profile maps one here. The one warning is a Codex-family role sandboxed
+    under worktree isolation, where git cannot write the linked worktree's gitdir
+    (it lives under the main repo's ``.git/worktrees/``, outside the sandbox's
+    writable roots), so the dev skill's preflight and commit fail."""
+    from .adapters.profile import ProfileError
+
+    mode = cfg.permission_mode
+    detail: dict[str, object] = {
+        "role": role,
+        "profile": profile.name,
+        "mode": mode,
+        "isolation": isolation,
+        "platform": sys.platform,
+    }
+    try:
+        profile.for_permission_mode(mode, platform=sys.platform)
+    except ProfileError as e:
+        report.fail(
+            "adapter.permission-mode-unsupported",
+            f"{profile.name} {role}: permission_mode {mode!r} cannot run on {sys.platform} "
+            f"without prompts: {e}",
+            {**detail, "error": str(e)},
+        )
+        return
+    if mode == "bypass":
+        message = f"{profile.name} {role}: bypass, unsandboxed (scm.isolation={isolation})"
+        if isolation != "worktree":
+            try:
+                profile.for_permission_mode("sandboxed", platform=sys.platform)
+            except ProfileError:
+                pass
+            else:
+                message += '; consider adapter.permission_mode = "sandboxed"'
+        report.ok("adapter.permission-mode", message, detail)
+    elif isolation == "worktree" and profile.hooks.dialect == "codex-hooks-json":
+        report.warn(
+            "adapter.permission-mode",
+            f"{profile.name} {role}: {mode} under scm.isolation=worktree — the sandbox "
+            "keeps a linked worktree's gitdir (under the main repo's .git/worktrees/) "
+            "read-only, so git add/commit fail in isolated sessions; use "
+            'scm.isolation = "none" or permission_mode = "bypass" for this role',
+            detail,
+        )
+    else:
+        report.ok("adapter.permission-mode", f"{profile.name} {role}: {mode}", detail)
+
+
 def _bypass_drops(cfg, profile: CLIProfile) -> tuple[str, ...]:
-    """The bypass tokens ``cfg.extra_args`` drops from ``profile``'s argv (DW-349).
+    """The permission tokens ``cfg.extra_args`` drops from ``profile``'s argv
+    (DW-349). ``profile`` is the mode-resolved one (:func:`_permission_profile`).
 
     The one home of the predicate `validate` and every dry-run share: scoped to
     the bundled GENERIC kind — the only one whose argv consumes ``bypass_args``
@@ -2191,16 +2278,23 @@ def _bypass_drops(cfg, profile: CLIProfile) -> tuple[str, ...]:
     return profile.missing_bypass_tokens(cfg.extra_args)
 
 
-def _bypass_dropped_message(role: str, profile: CLIProfile, missing: tuple[str, ...]) -> str:
+def _bypass_dropped_message(
+    role: str, profile: CLIProfile, missing: tuple[str, ...], *, mode: str = "bypass"
+) -> str:
     """One wording for the DW-349 warning, shared by `validate` and every dry-run.
 
-    Names the dropped tokens AND the full bypass sequence to include: on a
+    Names the dropped tokens AND the full permission sequence to include: on a
     partial drop (e.g. ``--permission-mode acceptEdits``) adding only the missing
-    token would leave a still-broken argv."""
+    token would leave a still-broken argv. ``profile`` is mode-resolved, so under
+    a non-bypass ``mode`` the sequence named is that mode's args."""
+    if mode == "bypass":
+        replaced, keep = f"{profile.name}'s bypass_args", "the bypass"
+    else:
+        replaced, keep = f"{profile.name}'s {mode} permission args", f"the {mode} mode"
     return (
-        f"{role} adapter.extra_args replaces {profile.name}'s bypass_args and drops "
+        f"{role} adapter.extra_args replaces {replaced} and drops "
         f"{' '.join(missing)} — unattended sessions may stall on permission prompts; "
-        f"include `{' '.join(profile.bypass_args)}` in extra_args to keep the bypass"
+        f"include `{' '.join(profile.bypass_args)}` in extra_args to keep {keep}"
     )
 
 
@@ -2243,9 +2337,15 @@ def _warn_bypass_dropped(
                 profile = get_profile(cfg.name, project)
             except ProfileError:
                 continue
+        # The mode-resolved profile; an unmapped mode is skipped here like an
+        # unparseable profile — the composer refuses it itself.
+        profile = _permission_profile(cfg, profile)
+        if profile is None:
+            continue
         if missing := _bypass_drops(cfg, profile):
             print(
-                f"warning: {_bypass_dropped_message(role, profile, missing)}",
+                f"warning: "
+                f"{_bypass_dropped_message(role, profile, missing, mode=cfg.permission_mode)}",
                 file=sys.stderr,
             )
             if journal is not None:
@@ -2944,6 +3044,9 @@ def _validate_tickets_mode_queue(
             isolation=pol.scm.isolation if pol is not None else "none",
             extra_args_roles=(
                 _store_extra_args_roles(pol, worksource.SOURCE_TICKETS) if pol is not None else ()
+            ),
+            sandboxed_roles=(
+                _store_sandboxed_roles(pol, worksource.SOURCE_TICKETS) if pol is not None else ()
             ),
         )
     )
@@ -3835,6 +3938,7 @@ def _check_tickets_preflight(paths: bmadconfig.ProjectPaths, pol) -> int | None:
         branch_per=pol.scm.branch_per,
         isolation=pol.scm.isolation,
         extra_args_roles=_store_extra_args_roles(pol, worksource.SOURCE_TICKETS),
+        sandboxed_roles=_store_sandboxed_roles(pol, worksource.SOURCE_TICKETS),
     )
     for warning in (f for f in findings if f.severity == "warning"):
         print(f"warning: {warning.message}", file=sys.stderr)
@@ -3994,10 +4098,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
     from .adapters import registry as adapter_registry
-    from .adapters.profile import get_profile
+    from .adapters.profile import ProfileError, get_profile
 
     cfg = pol.adapter.resolved(role)
     profile = get_profile(cfg.name, project)
+    # The profile `make_adapters` launches: resolved for the role's
+    # permission_mode, refused in the same words when the profile has no mapping.
+    try:
+        profile = profile.for_permission_mode(cfg.permission_mode)
+    except ProfileError as e:
+        raise SystemExit(f"error: adapter {role} session: {e}") from e
     # Keyed on the adapter KIND, not on `hookless`: the registry decoupled the two
     # axes, so an `opencode-http` profile carrying a hook dialect still launches
     # the HTTP adapter (and sends effort), while a hookless profile of another
@@ -4025,7 +4135,10 @@ def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
         profile.binary,
         *profile.launch_args,
         f'"{profile.render_prompt(prompt)}"',
-        *extra,
+        # Shell-quoted like `build_command` launches them, so a token carrying
+        # spaces or JSON (a sandboxed mode's `--settings {...}`) previews as the
+        # one argument it is; plain flags print unchanged.
+        *(shlex.quote(a) for a in extra),
     ]
     if cfg.model:
         argv += [profile.model_flag, cfg.model]
@@ -6020,6 +6133,24 @@ def _hand_back_ctl_window(
                 _report_ctl_window_fault(run_dir, fault, state)
 
 
+def _bypass_permission_policy(pol):
+    """``pol`` with every stage's ``adapter.permission_mode`` set back to bypass."""
+    from dataclasses import replace
+
+    adapter = pol.adapter
+    return replace(
+        pol,
+        adapter=replace(
+            adapter,
+            permission_mode="bypass",
+            **{
+                stage: replace(getattr(adapter, stage), permission_mode=None)
+                for stage in policy_mod.STAGES
+            },
+        ),
+    )
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     from .model import Phase
 
@@ -6320,7 +6451,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # From the claim on, any exit without a usable session hands the record
         # back: adapter and context setup can fail too, not just the session.
         try:
-            adapters = _make_adapters(project, run_dir, pol)
+            # A human is present in a resolve session and its skill asks them
+            # questions, so it keeps the profile's bypass args whatever the
+            # run's `adapter.permission_mode`: a sandboxed mode that denies
+            # AskUserQuestion would cripple it, and prompts here get answered.
+            adapters = _make_adapters(project, run_dir, _bypass_permission_policy(pol))
             dev_cfg = pol.adapter.resolved("dev")
             model = dev_cfg.model
             effort = dev_cfg.effort

@@ -2899,3 +2899,21 @@ def test_send_text_refuses_while_a_mode_is_open(rec):
     with pytest.raises(MultiplexerError, match="pane mode"):
         PsmuxMultiplexer().send_text("s:@2.%2", "go on")
     assert [argv for argv, _ in rec.calls if "send-keys" in argv] == []
+
+
+def test_send_keys_presses_each_named_key_without_l(rec):
+    """#855 on psmux (inherited): the mode probe, then one `send-keys` per named
+    key with no `-l` and no Enter appended."""
+    rec.stdout = "0\n"
+    PsmuxMultiplexer().send_keys("s:@2.%2", "Escape")
+    sends = [argv for argv, _ in rec.calls if "send-keys" in argv]
+    assert len(sends) == 1
+    assert sends[0][-4:] == ["send-keys", "-t", "s:@2.%2", "Escape"]
+    assert "-l" not in sends[0]
+
+
+def test_send_keys_refuses_while_a_mode_is_open(rec):
+    rec.stdout = "1\n"
+    with pytest.raises(MultiplexerError, match="pane mode"):
+        PsmuxMultiplexer().send_keys("s:@2.%2", "Enter")
+    assert [argv for argv, _ in rec.calls if "send-keys" in argv] == []

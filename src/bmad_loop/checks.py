@@ -76,6 +76,11 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         # codex: `--version` accepts --no-daemon and the profile passes it (#901)
         "adapter.codex-version",
         "adapter.kind",
+        # a role's profile has no `adapter.permission_mode` mapping for this platform (#727)
+        "adapter.permission-mode-unsupported",
+        # each role's permission posture (bypass/sandboxed, scm.isolation); a
+        # warning where a mapping is known not to work under worktree isolation
+        "adapter.permission-mode",
         "adapter.external",
         "adapter.external-profile",
         "queue.sprint-status",

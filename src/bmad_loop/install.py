@@ -830,13 +830,18 @@ def _initiative_children(folder: Path) -> tuple[tuple[str, ...] | None, Path, st
 
 
 def _tickets_store_findings(
-    paths: bmadconfig.ProjectPaths, isolation: str, extra_args_roles: Sequence[str]
+    paths: bmadconfig.ProjectPaths,
+    isolation: str,
+    extra_args_roles: Sequence[str],
+    sandboxed_roles: Sequence[str] = (),
 ) -> list[Finding]:
     """The store-topology findings for the active initiative's folder (it exists):
     the classified layout (``tickets.store-topology``), or the refusal under the
     check :attr:`ticketstore.StoreRefusal.check` names, plus the
     ``tickets.store-sandbox`` warning when sessions write a shared store outside
-    their cwd while a role's ``extra_args`` replace the profile's bypass flags."""
+    their cwd while a role's ``extra_args`` replace the profile's bypass flags or
+    a role runs ``adapter.permission_mode = "sandboxed"``, whose sandbox confines
+    writes to the working directory."""
     result = ticketstore.assess_store(paths, isolation)
     if result is None:
         return []
@@ -858,17 +863,30 @@ def _tickets_store_findings(
         )
     ]
     outside_cwd = result.needs_redirect(isolation) or result.placement == "shared-outside"
-    if outside_cwd and extra_args_roles:
-        roles = ", ".join(extra_args_roles)
+    if outside_cwd and (extra_args_roles or sandboxed_roles):
+        causes: list[str] = []
+        if extra_args_roles:
+            causes.append(
+                f"`extra_args` for {', '.join(extra_args_roles)} replace the profile's "
+                "sandbox-bypass flags (keep them in `extra_args`)"
+            )
+        if sandboxed_roles:
+            causes.append(
+                f"{', '.join(sandboxed_roles)} run permission_mode = \"sandboxed\", whose "
+                'sandbox confines writes to the working directory (use "bypass" there)'
+            )
         findings.append(
             Finding(
                 "tickets.store-sandbox",
                 "warning",
                 f"sessions write the shared ticket store {result.store_root} outside their "
-                f"working directory, and `extra_args` for {roles} replace the profile's "
-                "sandbox-bypass flags — a sandboxed CLI may refuse those writes; keep the "
-                "bypass flags in `extra_args`",
-                {"store_root": str(result.store_root), "roles": list(extra_args_roles)},
+                f"working directory, and {'; '.join(causes)} — a sandboxed CLI may refuse "
+                "those writes",
+                {
+                    "store_root": str(result.store_root),
+                    "roles": list(extra_args_roles),
+                    "sandboxed_roles": list(sandboxed_roles),
+                },
             )
         )
     return findings
@@ -882,12 +900,14 @@ def tickets_preflight(
     branch_per: str | None = None,
     isolation: str = "none",
     extra_args_roles: Sequence[str] = (),
+    sandboxed_roles: Sequence[str] = (),
 ) -> list[Finding]:
     """Tickets mode's project checks, as :class:`Finding` s (``paths`` is the
     paths loaded for tickets mode, ``trees`` the dev skill trees, ``branch_per``
     the policy's ``[scm] branch_per``; None skips its check; ``isolation`` the
     policy's ``[scm] isolation``; ``extra_args_roles`` the launch roles whose
-    resolved adapter sets ``extra_args``).
+    resolved adapter sets ``extra_args``; ``sandboxed_roles`` those whose
+    ``permission_mode`` is not bypass).
 
     Static checks, in order: the script (``tickets.script-missing``), the BMad
     config reader it imports (``tickets.config-utils-missing``), ``uv`` on PATH
@@ -1012,7 +1032,9 @@ def tickets_preflight(
                         )
                     )
                 else:
-                    findings.extend(_tickets_store_findings(paths, isolation, extra_args_roles))
+                    findings.extend(
+                        _tickets_store_findings(paths, isolation, extra_args_roles, sandboxed_roles)
+                    )
     store, store_error = _ticket_store(project)
     if store != "repo":
         findings.append(

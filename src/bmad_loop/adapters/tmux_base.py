@@ -38,6 +38,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .multiplexer import (
+    ALLOWED_KEYS,
     PARKED_BANNER,
     UNSET,
     MultiplexerError,
@@ -761,6 +762,17 @@ class BaseTmuxBackend(TerminalMultiplexer):
         self._tmux("send-keys", "-t", window_id, "-l", text)
         time.sleep(0.3)  # let the TUI ingest the paste before submitting
         self._tmux("send-keys", "-t", window_id, "Enter")
+
+    def send_keys(self, target: str, *keys: str) -> None:
+        # Key names, not text: no `-l`, so tmux and psmux look each one up as a
+        # named key, and nothing is appended. Every key is checked before the
+        # first is pressed, and a pane in a mode refuses as send_text does.
+        if bad := [key for key in keys if key not in ALLOWED_KEYS]:
+            raise TmuxError(f"refusing to send keys {bad!r}; allowed: {sorted(ALLOWED_KEYS)}")
+        if self._tmux("display-message", "-p", "-t", target, "#{pane_in_mode}") == "1":
+            raise TmuxError(f"{target} is in a pane mode; not pressing keys in it")
+        for key in keys:
+            self._tmux("send-keys", "-t", target, key)
 
     def kill_window(self, target: str) -> None:
         # Best-effort teardown: a hang / missing binary is no worse than the window

@@ -215,6 +215,66 @@ name = "codex"
     assert review == policy.ResolvedAdapter("codex", "", None)
 
 
+def test_permission_mode_defaults_to_bypass_for_every_role():
+    pol = policy.loads('[adapter]\nname = "claude"\n')
+    assert pol.adapter.permission_mode == "bypass"
+    for role in (*policy.STAGES, "migration"):
+        assert pol.adapter.resolved(role).permission_mode == "bypass"
+
+
+def test_permission_mode_base_value_reaches_every_role():
+    pol = policy.loads('[adapter]\nname = "claude"\npermission_mode = "sandboxed"\n')
+    for role in (*policy.STAGES, "migration"):
+        assert pol.adapter.resolved(role).permission_mode == "sandboxed"
+
+
+def test_permission_mode_stage_override_wins_over_the_base():
+    pol = policy.loads(
+        '[adapter]\nname = "claude"\npermission_mode = "sandboxed"\n'
+        '[adapter.triage]\npermission_mode = "bypass"\n'
+    )
+    assert pol.adapter.resolved("triage").permission_mode == "bypass"
+    assert pol.adapter.resolved("dev").permission_mode == "sandboxed"
+
+
+def test_permission_mode_survives_a_stage_client_switch():
+    """Unlike model/effort/extra_args, the mode is operator intent rather than a
+    client flag: a stage that switches client keeps it, and the new client's
+    profile maps (or refuses) it."""
+    pol = policy.loads(
+        '[adapter]\nname = "claude"\nmodel = "opus"\npermission_mode = "sandboxed"\n'
+        '[adapter.review]\nname = "codex"\n'
+    )
+    review = pol.adapter.resolved("review")
+    assert review.name == "codex" and review.model == ""  # the switch still resets model
+    assert review.permission_mode == "sandboxed"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[adapter]\npermission_mode = "yolo"\n',
+        "[adapter]\npermission_mode = 1\n",
+        '[adapter]\n[adapter.dev]\npermission_mode = "auto"\n',
+    ],
+)
+def test_permission_mode_outside_the_enum_is_refused(body):
+    with pytest.raises(policy.PolicyError, match="permission_mode"):
+        policy.loads(body)
+
+
+def test_snapshot_without_permission_mode_rebuilds_as_bypass():
+    """A run stamped before the field existed launched with bypass args."""
+    snap = _roundtrip_snapshot(policy.loads('[adapter]\nname = "claude"\n'))
+    del snap["adapter"]["permission_mode"]
+    for stage in policy.STAGES:
+        del snap["adapter"][stage]["permission_mode"]
+    rebuilt = policy.adapter_policy_from_snapshot(snap)
+    assert rebuilt is not None
+    assert rebuilt.permission_mode == "bypass"
+    assert rebuilt.resolved("dev").permission_mode == "bypass"
+
+
 def test_stage_client_switch_drops_base_effort(tmp_path):
     """Effort is client-specific like `model`: its legal names belong to one
     provider's models, so a stage that switches client must NOT inherit the base
@@ -396,6 +456,10 @@ def _roundtrip_snapshot(pol):
         '[adapter]\nname = "opencode-http"\neffort = "low"\n[adapter.review]\neffort = "max"\n',
         # (f) a stage name override — the client switch resets effort to ""
         '[adapter]\nname = "opencode-http"\neffort = "max"\n[adapter.review]\nname = "claude"\n',
+        # (g) a base permission_mode, plus a stage that switches client and keeps it
+        '[adapter]\nname = "claude"\npermission_mode = "sandboxed"\n[adapter.review]\nname = "codex"\n',
+        # (h) a stage permission_mode override under the default base
+        '[adapter]\nname = "claude"\n[adapter.dev]\npermission_mode = "sandboxed"\n',
     ],
 )
 def test_adapter_policy_from_snapshot_roundtrips_resolved(body):

@@ -50,7 +50,9 @@ from .escalation import (
     display_pause_reason,
     env_fault_claim,
     env_fault_pause_reason,
+    no_work_pause_reason,
     parked_pause_reason,
+    pause_title,
     preference_escalations,
     review_exhausted,
     review_retry_or_exhaust,
@@ -3081,6 +3083,8 @@ class Engine:
                 wf_extras["parked"] = True
                 if result.parked_evidence:
                     wf_extras["parked_evidence"] = result.parked_evidence
+            if not result.produced_work:
+                wf_extras["produced_work"] = False
             if result.usage_limited:
                 wf_extras["usage_limited"] = result.usage_limited
             if result.usage_limit_resets:
@@ -3115,6 +3119,15 @@ class Engine:
                     self._escalate(
                         task,
                         parked_pause_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
+                    )
+                if not result.produced_work:
+                    # Never did anything (#727): a deferral would charge the story
+                    # for a session that sat at a prompt only a human can answer —
+                    # escalate (re-arm restores the budget). After env_fault and
+                    # parked, which explain the silence better.
+                    self._escalate(
+                        task,
+                        no_work_pause_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
                     )
                 reason = session_failure_reason(
                     f"blocking workflow {wf.name!r} ({lp.name})", result
@@ -9556,6 +9569,8 @@ class Engine:
                 # non-completed fix result to the parked escalate below.
                 parked=result.parked,
                 parked_evidence=result.parked_evidence,
+                # No work at all (#727): what routed it to the no-work escalate below.
+                produced_work=result.produced_work,
             )
             # CRITICAL routing, deliberately AFTER the emit and the journal record
             # above, and deliberately AHEAD of the env-fault/retryable arms below.
@@ -9588,6 +9603,11 @@ class Engine:
                 # stall nudge, so the repair never ran — another attempt would
                 # relaunch into the same prompt. Pause (re-arm restores the budget).
                 self._escalate(task, parked_pause_reason("fix", result))
+            if result.status != "completed" and not result.produced_work:
+                # Never did anything (#727): another attempt would launch into the
+                # same wall. Pause (re-arm restores the budget), after env_fault
+                # and parked, which explain the silence better.
+                self._escalate(task, no_work_pause_reason("fix", result))
             if outcome is not None and not outcome.ok and not outcome.retryable:
                 # escalate-grade failure (environment fault): another repair
                 # session cannot fix the run environment — stop spending the
@@ -11195,7 +11215,7 @@ class Engine:
         gates.notify(
             self.policy,
             self.run_dir,
-            f"CRITICAL escalation: {task.story_key}",
+            pause_title(reason, task.story_key, env_fault_site=task.env_fault_site),
             f"{displayed} — resolve, then `bmad-loop resume {self.state.run_id}`{reverify}",
         )
         self._save()

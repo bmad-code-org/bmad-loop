@@ -289,7 +289,7 @@ default_ref = "NotifyPolicy.file"
 
 [[section]]
 name = "adapter"
-description = "CLI client, model & bypass flags (base for all stages)"
+description = "CLI client, model & permission flags (base for all stages)"
 [[section.field]]
 key = "name"
 kind = "str"
@@ -307,6 +307,13 @@ description = "reasoning effort, free-form (provider/model-specific, e.g. high, 
 key = "extra_args"
 kind = "args"
 description = "when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts"
+[[section.field]]
+key = "permission_mode"
+kind = "select"
+options_ref = "PERMISSION_MODES"
+default_ref = "AdapterPolicy.permission_mode"
+label = "permission mode"
+description = "bypass (default): launch the CLI profile's permission-bypass flags (its bypass_args) · sandboxed: launch the profile's non-blocking sandboxed flags instead — a denied action returns to the agent as an error rather than a prompt (claude and codex on linux/macOS; other profiles refuse it) · extra_args, when set, still replaces either · stages inherit it even when they switch client"
 [[section.field]]
 key = "cleanup_session_on_finish"
 kind = "switch"
@@ -348,6 +355,13 @@ placeholder = "inherit / provider default"
 key = "extra_args"
 kind = "args"
 description = "inherits from [adapter] only when the client matches (a stage that switches client falls back to that client's bypass flags); when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions)"
+[[section.field]]
+key = "permission_mode"
+kind = "select"
+options_ref = "PERMISSION_MODES"
+default_ref = "StageAdapterPolicy.permission_mode"
+label = "permission mode"
+description = "leave blank to inherit [adapter] permission_mode — inherited even when this stage switches client, whose profile must then map the mode"
 [[section.field]]
 key = "usage_grace_s"
 kind = "float"

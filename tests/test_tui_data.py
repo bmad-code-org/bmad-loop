@@ -1100,6 +1100,114 @@ def test_open_quota_wait_never_raises_on_malformed_entry():
         assert (agent.quota_wait_since, agent.quota_resets_at) == (5090.0, None)
 
 
+def _parked(task="1-1-alpha-dev-3", ts=5100.0, **fields):
+    entry = {"kind": "session-parked", "task_id": task, "ts": ts, "pane": "%7"}
+    entry.update(subtype="permission_prompt", auto_deny_at=5220.0)
+    entry.update(fields)
+    return entry
+
+
+def test_active_agent_projects_open_parked_prompt():
+    """#855: the newest `session-parked` for the open session's task sets
+    `parked_since` (its journal `ts`), `parked_auto_deny_at` and `parked_pane`;
+    the pure projection exposes the subtype too. A re-latch (or the adapter's
+    countdown retry) re-journals without an unpark between: the newest wins."""
+    agent = data.active_agent([_stamped_start(), _parked()], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.parked_since, agent.parked_auto_deny_at, agent.parked_pane) == (
+        5100.0,
+        5220.0,
+        "%7",
+    )
+    retry = _parked(ts=5105.0, auto_deny_at=5225.0, pane="%8", subtype=None)
+    entries = [_stamped_start(), _parked(auto_deny_at=None), retry]
+    assert data._parked_prompt(entries, 0, "1-1-alpha-dev-3") == data.ParkedPrompt(
+        since=5105.0, auto_deny_at=5225.0, pane="%8", subtype=None
+    )
+    # no deadline parsed reads as unknown, not as a wrong number
+    agent = data.active_agent([_stamped_start(), _parked(auto_deny_at=None)], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert agent.parked_since == 5100.0 and agent.parked_auto_deny_at is None
+    assert data.active_agent([_stamped_start()], None).parked_since is None
+
+
+@pytest.mark.parametrize(
+    "closer",
+    [
+        {"kind": "session-unparked", "how": "stop"},
+        {"kind": "parked-answered", "choice": "approve"},
+    ],
+    ids=lambda c: c["kind"],
+)
+def test_parked_prompt_closed_by_newer_closer(closer):
+    """A `session-unparked` or `parked-answered` for the same
+    task AFTER the newest `session-parked` closes it; a park journaled after the
+    closer reopens it.
+
+    ABLATION: drop the closer arm of `parked.parked_prompt` and every case
+    reddens."""
+    task = "1-1-alpha-dev-3"
+    closing = dict(closer, task_id=task, ts=5200.0)
+    agent = data.active_agent([_stamped_start(), _parked(), closing], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert (agent.parked_since, agent.parked_auto_deny_at, agent.parked_pane) == (None,) * 3
+    reopened = _parked(ts=5300.0)
+    agent = data.active_agent([_stamped_start(), _parked(), closing, reopened], None)
+    assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5300.0
+    # another task's closer leaves this task's park open
+    foreign = dict(closing, task_id="2-2-beta-dev-1")
+    agent = data.active_agent([_stamped_start(), _parked(), foreign], None)
+    assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5100.0
+
+
+def test_session_active_after_the_latch_leaves_the_park_open():
+    """The transcript write that raised the prompt can close an idle stretch on
+    the heartbeat after the latch: that `session-active` is not the CLI working
+    again (the adapter's latch-time baseline already holds it), so the park
+    stays open until the adapter's own `session-unparked`.
+
+    ABLATION: add `session-active` back to `parked.PARK_CLOSERS` and the park
+    reads closed."""
+    task = "1-1-alpha-dev-3"
+    active = {"kind": "session-active", "task_id": task, "idle_s": 900.0, "ts": 5200.0}
+    agent = data.active_agent([_stamped_start(), _parked(), active], None)
+    assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5100.0
+
+
+def test_parked_prompt_ignores_earlier_session_and_other_task():
+    """A park left behind by an EARLIER session with the same task id (before
+    this session-start), or one for another task, is not this session's; a
+    session-end closes the session outright."""
+    task = "1-1-alpha-dev-3"
+    for entries in (
+        [_parked(ts=4000.0), _stamped_start()],
+        [_stamped_start(), _parked(task="2-2-beta-dev-1")],
+    ):
+        agent = data.active_agent(entries, None)
+        assert isinstance(agent, data.ActiveAgent) and agent.parked_since is None
+    ended = {"kind": "session-end", "task_id": task}
+    assert data.active_agent([_stamped_start(), _parked(), ended], None) is None
+
+
+def test_parked_prompt_skips_malformed_entry():
+    """A `session-parked` without a finite numeric `ts` is skipped without
+    erasing an earlier open park; ill-typed fields read as unrecorded; a
+    non-dict entry is skipped. Never raises."""
+    task = "1-1-alpha-dev-3"
+    good = _parked()
+    for ts in (None, "soon", True, float("nan"), float("inf"), 10**1000):
+        bad = _parked(ts=ts)
+        agent = data.active_agent([_stamped_start(), bad], None)
+        assert isinstance(agent, data.ActiveAgent) and agent.parked_since is None
+        agent = data.active_agent([_stamped_start(), good, bad], None)
+        assert isinstance(agent, data.ActiveAgent) and agent.parked_since == 5100.0
+    odd = _parked(pane=7, subtype=["x"], auto_deny_at="2:00")
+    assert data._parked_prompt([_stamped_start(), odd], 0, task) == data.ParkedPrompt(
+        since=5100.0, auto_deny_at=None, pane=None, subtype=None
+    )
+    assert data._parked_prompt([_stamped_start(), good, "junk", 3], 0, task) is not None
+
+
 def test_active_agent_idle_since_never_raises_on_malformed_entry():
     """A `session-idle` without a numeric `since_ts` is skipped (the TUI ages the
     text from it); the agent itself is still derived."""

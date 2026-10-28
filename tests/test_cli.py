@@ -7079,6 +7079,36 @@ def test_resolve_echoes_the_commits_probe_failure(tmp_path, monkeypatch, capsys)
     )
 
 
+def test_resolve_session_keeps_bypass_args_under_a_sandboxed_permission_mode(tmp_path, monkeypatch):
+    """A human is present in a resolve session and its skill asks them questions,
+    so its adapters are built with every stage's permission_mode back at bypass.
+
+    ABLATION: hand `pol` straight to `_make_adapters` in `cmd_resolve` and the
+    captured dev mode reads sandboxed."""
+    from bmad_loop import resolve
+
+    _escalated_run(tmp_path, "r1")
+    policy_file = tmp_path / ".bmad-loop" / "policy.toml"
+    assert not policy_file.exists()
+    policy_file.write_text(
+        '[adapter]\nname = "claude"\npermission_mode = "sandboxed"\n'
+        '[adapter.review]\npermission_mode = "sandboxed"\n',
+        encoding="utf-8",
+    )
+    seen = {}
+
+    def make_adapters(_project, _run_dir, pol, **_k):
+        seen.update({role: pol.adapter.resolved(role).permission_mode for role in cli.ROLES})
+        return {"dev": object()}
+
+    monkeypatch.setattr(cli, "_make_adapters", make_adapters)
+    monkeypatch.setattr(resolve, "build_context", lambda *a, **k: (True, 0, 0))
+    monkeypatch.setattr(resolve, "run_session", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--resume"]) == 0
+    assert seen and set(seen.values()) == {"bypass"}
+
+
 def test_resolve_interactive_runs_session_then_rearms(tmp_path, monkeypatch):
     from bmad_loop import resolve
     from bmad_loop.journal import load_state
@@ -13028,6 +13058,139 @@ def test_validate_bypass_message_names_the_full_include_sequence(project, capsys
     (dev,) = findings
     assert "drops bypassPermissions" in dev["message"]
     assert "include `--permission-mode bypassPermissions` in extra_args" in dev["message"]
+
+
+def _permission_findings(doc: dict, check: str) -> list[dict]:
+    return [f for f in doc["findings"] if f["check"] == check]
+
+
+def test_validate_fails_a_role_whose_profile_has_no_permission_mode_mapping(project, capsys):
+    """#727: gemini ships no `[permission_modes.sandboxed]` table, so a sandboxed
+    role would be refused at launch — validate fails it, naming role, profile,
+    mode and platform.
+
+    ABLATION: drop the `report.fail` arm of `_report_permission_mode` and this
+    reddens (no unsupported finding)."""
+    install_bmad_config(project)
+    _write_policy(
+        project.project,
+        '[adapter]\nname = "claude"\n[adapter.review]\nname = "gemini"\n'
+        'permission_mode = "sandboxed"\n',
+    )
+    write_sprint(project, {"epic-1": "backlog"})
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+
+    (failed,) = _permission_findings(doc, "adapter.permission-mode-unsupported")
+    assert failed["severity"] == "problem"
+    assert failed["detail"]["role"] == "review"
+    assert failed["detail"]["profile"] == "gemini"
+    assert failed["detail"]["mode"] == "sandboxed"
+    assert failed["detail"]["platform"] == sys.platform
+    assert failed["message"].startswith("gemini review: permission_mode 'sandboxed' cannot run")
+    # the other roles still get their posture line; both ids land in one --json doc
+    posture = _permission_findings(doc, "adapter.permission-mode")
+    assert sorted(f["detail"]["role"] for f in posture) == ["dev", "retro", "triage"]
+
+
+def test_validate_reports_each_role_bypass_posture_without_changing_the_exit_code(
+    project, capsys, monkeypatch
+):
+    """The default config: one ok posture line per role naming bypass and the
+    isolation, pointing at the sandboxed mode claude maps — and no warning or
+    failure, so an otherwise-clean project still validates."""
+    _make_validate_pass(project, monkeypatch, capsys)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    assert doc["ok"] is True
+    posture = _permission_findings(doc, "adapter.permission-mode")
+    assert sorted(f["detail"]["role"] for f in posture) == ["dev", "retro", "review", "triage"]
+    assert {f["severity"] for f in posture} == {"ok"}
+    dev = next(f for f in posture if f["detail"]["role"] == "dev")
+    # claude maps no native-Windows sandbox, so the suggestion is posix-only.
+    suggestion = (
+        "" if sys.platform == "win32" else '; consider adapter.permission_mode = "sandboxed"'
+    )
+    assert dev["message"] == "claude dev: bypass, unsandboxed (scm.isolation=none)" + suggestion
+    assert not _permission_findings(doc, "adapter.permission-mode-unsupported")
+
+
+def test_validate_text_mode_prints_the_permission_posture(project, capsys, monkeypatch):
+    _make_validate_pass(project, monkeypatch, capsys)
+    assert cli.main(["validate", "--project", str(project.project)]) == 0
+    assert "claude dev: bypass, unsandboxed (scm.isolation=none)" in capsys.readouterr().out
+
+
+def _posture(monkeypatch, platform: str, profile: str, mode: str, isolation: str = "none"):
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.checks import ValidationReport
+
+    report = ValidationReport()
+    monkeypatch.setattr(sys, "platform", platform)
+    cli._report_permission_mode(
+        report,
+        "dev",
+        types.SimpleNamespace(permission_mode=mode),
+        get_profile(profile),
+        isolation,
+    )
+    monkeypatch.undo()
+    return report.findings
+
+
+def test_permission_posture_reports_a_sandboxed_claude_role(monkeypatch):
+    (finding,) = _posture(monkeypatch, "linux", "claude", "sandboxed")
+    assert (finding.check, finding.severity) == ("adapter.permission-mode", "ok")
+    assert finding.message == "claude dev: sandboxed"
+
+
+def test_permission_posture_fails_a_platform_excluded_mapping(monkeypatch):
+    """claude maps sandboxed on linux/darwin only: on win32 the role fails. The
+    platform is read at call time, not frozen into a default argument.
+
+    ABLATION: drop `platform=sys.platform` from the call and this reddens on a
+    non-Windows host."""
+    (finding,) = _posture(monkeypatch, "win32", "claude", "sandboxed")
+    assert (finding.check, finding.severity) == ("adapter.permission-mode-unsupported", "problem")
+    assert finding.detail is not None and finding.detail["platform"] == "win32"
+    assert "not win32" in finding.message
+
+
+def test_permission_posture_bypass_under_worktree_isolation_does_not_suggest(monkeypatch):
+    (finding,) = _posture(monkeypatch, "linux", "claude", "bypass", isolation="worktree")
+    assert finding.severity == "ok"
+    assert finding.message == "claude dev: bypass, unsandboxed (scm.isolation=worktree)"
+
+
+def test_permission_posture_bypass_on_an_unmapped_profile_does_not_suggest(monkeypatch):
+    (finding,) = _posture(monkeypatch, "linux", "gemini", "bypass")
+    assert finding.message == "gemini dev: bypass, unsandboxed (scm.isolation=none)"
+
+
+def test_store_sandboxed_roles_names_the_non_bypass_launch_roles(tmp_path):
+    """The `tickets.store-sandbox` warning's sandboxed roles: the tickets launch
+    roles whose resolved permission_mode is not bypass, a stage value included."""
+    policy = tmp_path / "policy.toml"
+    policy.write_text(
+        '[adapter]\nname = "claude"\n[adapter.review]\npermission_mode = "sandboxed"\n',
+        encoding="utf-8",
+    )
+    pol = policy_mod.load(policy)
+    assert cli._store_sandboxed_roles(pol, cli.worksource.SOURCE_TICKETS) == ("review",)
+    policy.write_text('[adapter]\nname = "claude"\n', encoding="utf-8")
+    assert cli._store_sandboxed_roles(policy_mod.load(policy), cli.worksource.SOURCE_TICKETS) == ()
+
+
+def test_permission_posture_warns_sandboxed_codex_under_worktree_isolation(monkeypatch):
+    """Codex's sandbox keeps a linked worktree's gitdir read-only, so git
+    add/commit fail there: a warning, not the ok line. Claude's sandbox passes in
+    a linked worktree and keeps the ok line."""
+    (codex,) = _posture(monkeypatch, "linux", "codex", "sandboxed", isolation="worktree")
+    assert (codex.check, codex.severity) == ("adapter.permission-mode", "warning")
+    assert ".git/worktrees/" in codex.message
+    (claude,) = _posture(monkeypatch, "linux", "claude", "sandboxed", isolation="worktree")
+    assert claude.severity == "ok"
+    (codex_main,) = _posture(monkeypatch, "linux", "codex", "sandboxed")
+    assert codex_main.severity == "ok"
 
 
 def test_validate_bypass_silent_for_a_stage_that_switches_client(project, capsys):

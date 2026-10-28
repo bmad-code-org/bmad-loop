@@ -22,11 +22,13 @@ from bmad_loop.policy import (
     ISOLATION_MODES,
     MERGE_STRATEGIES,
     OPERATOR_ON_REVIEW_DEMOTION_MODES,
+    PERMISSION_MODES,
     POLICY_TEMPLATE,
     RETRO_MODES,
     REVIEW_ON_STATUS_CONTRADICTION_MODES,
     REVIEW_TRIGGER_MODES,
     SESSION_BUDGET_MODES,
+    STAGES,
     STORIES_SOURCES,
     SWEEP_AUTO_MODES,
     TICKETS_MARK_DONE_MODES,
@@ -99,6 +101,8 @@ OPTIONS_ENUM = {
     ("scm", "isolation"): ISOLATION_MODES,
     ("scm", "branch_per"): BRANCH_PER_MODES,
     ("scm", "merge_strategy"): MERGE_STRATEGIES,
+    ("adapter", "permission_mode"): PERMISSION_MODES,
+    **{(f"adapter.{stage}", "permission_mode"): PERMISSION_MODES for stage in STAGES},
 }
 
 # Policy fields with no settings-screen control, by design. Each maps to a whole
