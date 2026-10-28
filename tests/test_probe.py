@@ -155,6 +155,59 @@ def test_infer_antigravity_transcript_has_no_token_fields(tmp_path):
     assert "step_index:int" in schema.key_paths
 
 
+# Captured from a live Cursor Agent CLI turn (agent 2026.10.22-27dcf5f,
+# `agent --print --trust --force "Reply with exactly: OK"`). Shape pinned
+# deliberately: the JSONL carries NO usage block, which is why the profile's
+# usage_parser is "none" permanently rather than pending a parser.
+CURSOR_AGENT_ROWS = [
+    {
+        "role": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "<timestamp>Wednesday, Oct 28, 2026, 7:41 AM (UTC)</timestamp>\n"
+                        "<user_query>\nReply with exactly: OK\n</user_query>"
+                    ),
+                }
+            ]
+        },
+    },
+    {
+        "role": "assistant",
+        "message": {"content": [{"type": "text", "text": "OK"}]},
+    },
+    {"type": "turn_ended", "status": "success"},
+]
+
+
+def test_infer_cursor_agent_transcript_has_no_token_fields(tmp_path):
+    """Cursor Agent exposes no usage in its transcript — evidence for usage_parser="none".
+
+    If this ever starts finding candidates, Cursor began emitting usage and the
+    profile should be revisited (see cursor-agent.toml).
+    """
+    path = _write_jsonl(tmp_path / "conversation.jsonl", CURSOR_AGENT_ROWS)
+    schema = probe.infer_token_schema("none", path)
+    assert schema.entries_scanned == 3
+    assert schema.token_field_candidates == []
+    assert "role:str" in schema.key_paths
+    assert "type:str" in schema.key_paths
+
+
+def test_discover_cursor_agent_family_glob(tmp_path, monkeypatch):
+    """FAMILY_GLOBS['cursor-agent'] matches the sessionEnd transcript_path shape."""
+    home = tmp_path / "home"
+    slug = home / ".cursor" / "projects" / "tmp-probe" / "agent-transcripts"
+    cid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    path = _write_jsonl(slug / cid / f"{cid}.jsonl", CURSOR_AGENT_ROWS)
+    monkeypatch.setenv("HOME", str(home))
+    found = probe.discover_transcript("none", cli="cursor-agent", hints=probe.Hints())
+    assert found.real_path == path
+    assert "agent-transcripts" in (found.glob or "")
+
+
 # ----------------------------------------------------------- discovery
 
 
@@ -302,7 +355,9 @@ def test_scan_codex_rollout_honours_profile_codex_home(tmp_path, monkeypatch):
 # ----------------------------------------------------------- registration
 
 
-@pytest.mark.parametrize("dialect_cli", ["claude", "codex", "gemini", "copilot", "antigravity"])
+@pytest.mark.parametrize(
+    "dialect_cli", ["claude", "codex", "gemini", "copilot", "antigravity", "cursor-agent"]
+)
 def test_probe_hook_registers_under_native_events(dialect_cli):
     from bmad_loop.install import ANTIGRAVITY_HOOK_GROUP, merge_hooks
 

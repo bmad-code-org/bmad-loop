@@ -38,7 +38,7 @@ bmad-loop init [--project PROJECT] [--cli PROFILE] [--no-skills] [--force-skills
 
 | Option           | Description                                                                                                                                                                                                                                   |
 | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--cli PROFILE`  | Profile to register hooks for; repeatable. A packaged profile (`claude`, `codex`, `gemini`, `copilot`, `antigravity`, `opencode-http`) or an overlay profile name. Default: the profiles `policy.toml` names across all roles, else `claude`. |
+| `--cli PROFILE`  | Profile to register hooks for; repeatable. A packaged profile (`claude`, `codex`, `gemini`, `copilot`, `antigravity`, `cursor-agent`, `opencode-http`) or an overlay profile name. Default: the profiles `policy.toml` names across all roles, else `claude`. |
 | `--no-skills`    | Skip the skill copy; write only hooks, policy and `.gitignore`.                                                                                                                                                                               |
 | `--force-skills` | Replace `bmad-loop-*` skill directories that already exist (default: keep them and print a hint).                                                                                                                                             |
 

@@ -98,6 +98,11 @@ FAMILY_GLOBS = {
     "antigravity": (
         "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl"
     ),
+    # Cursor Agent CLI writes one JSONL per conversation under the project
+    # slug (workspace path with separators turned to dashes). Verified against
+    # agent 2026.10.22-27dcf5f: sessionEnd hook transcript_path is exactly
+    # ~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl.
+    "cursor-agent": "~/.cursor/projects/*/agent-transcripts/*/*.jsonl",
 }
 # Codex relocates its whole state root with CODEX_HOME. The live tally resolves
 # that root through `tokens.codex_home`, so the convention globs above that are

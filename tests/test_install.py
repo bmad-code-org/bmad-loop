@@ -361,7 +361,7 @@ def test_registered_relay_paths_reads_installed_relay_from_either_os(
 
 
 _RELAY_EXE = "/opt/bmad/bin/bmad-loop"
-_FLAT_DIALECTS = {"copilot-settings-json", "antigravity-hooks-json"}
+_FLAT_DIALECTS = {"copilot-settings-json", "antigravity-hooks-json", "cursor-hooks-json"}
 
 
 def _relay_handler(profile, command, handler_type="command"):
@@ -387,7 +387,9 @@ def _registered(profile, config):
     return relay_registered(config, profile.hooks.dialect, profile.hooks.events)
 
 
-@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+@pytest.mark.parametrize(
+    "name", ["claude", "codex", "gemini", "copilot", "antigravity", "cursor-agent"]
+)
 def test_relay_registered_after_fresh_init(tmp_path, name):
     profile = get_profile(name)
     assert install_into(tmp_path, clis=(name,), skills=False) == 0
@@ -395,7 +397,7 @@ def test_relay_registered_after_fresh_init(tmp_path, name):
     assert _registered(profile, config)
 
 
-@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity"])
+@pytest.mark.parametrize("name", ["claude", "copilot", "antigravity", "cursor-agent"])
 def test_relay_registered_accepts_command_stop(name):
     profile = get_profile(name)
     stop = _native_for(profile, "Stop")
@@ -1240,7 +1242,9 @@ def test_install_into_full(tmp_path):
     assert final_gitignore.count(f"{RENDER_DIR_REL}/") == 1
 
 
-@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+@pytest.mark.parametrize(
+    "name", ["claude", "codex", "gemini", "copilot", "antigravity", "cursor-agent"]
+)
 def test_fresh_init_registers_installed_command_for_each_dialect(tmp_path, name):
     profile = get_profile(name)
     assert install_into(tmp_path, clis=(name,), skills=False) == 0
@@ -1252,7 +1256,8 @@ def test_fresh_init_registers_installed_command_for_each_dialect(tmp_path, name)
         handlers = container[native]
         command = (
             handlers[0]["command"]
-            if profile.hooks.dialect in {"copilot-settings-json", "antigravity-hooks-json"}
+            if profile.hooks.dialect
+            in {"copilot-settings-json", "antigravity-hooks-json", "cursor-hooks-json"}
             else handlers[0]["hooks"][0]["command"]
         )
         assert command.endswith(_installed_relay_suffix(canonical))

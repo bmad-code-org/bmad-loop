@@ -9525,7 +9525,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="PROFILE",
         help="CLI profile(s) to register hooks for (claude | codex | gemini | copilot | "
-        "antigravity | opencode-http (alias: opencode) | custom; "
+        "antigravity | cursor-agent | opencode-http (alias: opencode) | custom; "
         "repeatable; default: profiles referenced by .bmad-loop/policy.toml, or claude)",
     )
     init_p.add_argument(
@@ -9619,8 +9619,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     probe_p.add_argument(
         "cli",
-        help="CLI profile name (claude | codex | gemini | copilot | antigravity | custom; "
-        "opencode-http is HTTP-driven — nothing to probe)",
+        help="CLI profile name (claude | codex | gemini | copilot | antigravity | "
+        "cursor-agent | custom; opencode-http is HTTP-driven — nothing to probe)",
     )
     probe_p.add_argument(
         "--probe",
