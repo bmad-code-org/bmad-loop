@@ -58,7 +58,8 @@ first_run_note = "run `opencode auth login` once on this machine; headless serve
 # error: nothing before `message=` is provider- or model-sourced, and an
 # escaped message cannot begin a line, so this one is position-anchored on
 # purpose — unlike the stream above, this file is adapter-authored whole lines.
-# Only the types captured live are listed: against 2.0.27 (2026-10-12, zero
+# Only the types captured live are listed (across this list and
+# usage_limit_patterns below): against 2.0.27 (2026-10-12, zero
 # tokens, a local mock OpenAI-compatible provider) an HTTP 429 rate limit read
 # provider.rate-limit, a 429 or 402 `insufficient_quota` read provider.quota,
 # and a refused connection read provider.transport. The lines, as written:
@@ -66,11 +67,25 @@ first_run_note = "run `opencode auth login` once on this machine; headless serve
 #   provider-error event=session.execution.failed type=provider.quota status=402 attempt=- message="You exceeded your current quota, please check your plan and billing details."
 #   provider-error event=session.retry.scheduled type=provider.transport status=- attempt=2 message="ConnectionRefused: Unable to connect. Is the computer able to access the url?"
 # The schema's other provider.* types (timeout, auth, no-route, …) are not seeded.
+# provider.rate-limit and provider.transport stay env faults: opencode retries
+# both. provider.quota is a usage limit instead (usage_limit_patterns below).
 env_fault_patterns = [
   'error[.]error="AI_APICallError: [^"]{0,400}?(?i:usage limit reached|429|too many requests|rate[ _-]?limit|quota|overloaded)',
   'error[.]error="AI_APICallError: [^"]{0,400}?(?i:cannot connect to api|socket connection was closed|connection ?(error|refused|reset|timed ?out)|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN)',
-  '^provider-error event=\S+ type=provider[.](?:rate-limit|quota|transport) ',
+  '^provider-error event=\S+ type=provider[.](?:rate-limit|transport) ',
 ]
+# usage_limit_patterns — BLOCKED, no auto-continue: an operator must add credit
+# or switch model. The adapter matches each provider-error line against this
+# list as it writes it, so a match is a LIVE sighting (the frame was this
+# session's, seen while it ran) and exempts the verdict from the token veto; the
+# post-mortem tail scan reads it too, as an ordinary family. Verified in the
+# opencode 2.0.32 binary: its QuotaExceeded reason maps to provider.quota, is
+# built from the provider codes insufficient_quota, usage_not_included,
+# billing_error, gousagelimiterror, freeusagelimiterror and creditlimitexceeded,
+# and its retry predicate answers false for QuotaExceeded (true for RateLimit) —
+# credit or billing exhaustion, never a window that resets. The frame carries no
+# reset time. No usage_wait_patterns: no 2.x type is a resetting window.
+usage_limit_patterns = ['^provider-error event=\S+ type=provider[.]quota ']
 # AI_RetryError (ai-sdk's wrapper once its own retries are exhausted) is
 # deliberately NOT seeded. ai-sdk documents the class
 # (https://ai-sdk.dev/docs/reference/ai-sdk-errors/ai-retry-error — properties

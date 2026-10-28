@@ -48,11 +48,13 @@ rationale that already excludes ``over_budget``. Untracked usage (``None``), a
 tracked zero, or a fault reading usage keep today's verdict: only a measurement
 can overrule.
 
-A usage-limit line the wait loop saw LIVE on the visible pane (#610,
-``SessionResult.usage_limited``) is the one verdict the veto does not touch: a
-session that billed tokens and then hit its subscription limit is exactly the
-case the limit pause exists for, and the sighting is of the screen as it stood,
-not a stale line from earlier in the log. The same usage patterns also scan the
+A usage-limit line the adapter saw LIVE (#610, ``SessionResult.usage_limited``)
+is the one verdict the veto does not touch: a session that billed tokens and then
+hit its subscription limit is exactly the case the limit pause exists for. Live
+means one of two sources: the tmux adapters' visible pane, a sighting of the
+screen as it stood rather than a stale line from earlier in the log; or
+opencode-http's provider-error line, formatted from a typed SSE frame for this
+session while it ran (DW-592). The same usage patterns also scan the
 log TAIL as ordinary families, and there the veto applies — a limit the session
 recovered from must not excuse a later real stall.
 """
@@ -248,8 +250,9 @@ class EnvFaultMixin:
         if result.status not in ENV_FAULT_STATUSES or result.result_json is not None:
             return result
         if result.usage_limited is not None:
-            # Veto-exempt by design: the line was on the visible pane at the
-            # verdict, so tokens spent BEFORE the limit cannot disprove it.
+            # Veto-exempt by design: the line was seen live (on the visible pane
+            # at the verdict, or as this session's provider-error frame), so
+            # tokens spent BEFORE the limit cannot disprove it.
             self._note_lifecycle(
                 handle.task_id,
                 "env-fault-classified",

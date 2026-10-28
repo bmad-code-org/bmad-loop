@@ -691,10 +691,15 @@ def test_shipped_claude_answer_guards_match_the_captured_855_screen():
     assert _wrapped_hits(text, patterns) == []
 
 
-def test_only_claude_seeds_usage_patterns():
-    # the other built-ins opt in on their own captured evidence; none has yet
+def test_only_claude_and_opencode_seed_usage_patterns():
+    # the other built-ins opt in on their own captured evidence; none has yet.
+    # opencode-http seeds the blocked list only: its 2.x quota refusal is never
+    # retried, and no 2.x provider error is a window that resets (DW-592).
     for name, prof in load_profiles().items():
-        if name != "claude":
+        if name == "opencode-http":
+            assert prof.usage_limit_patterns != (), name
+            assert prof.usage_wait_patterns == (), name
+        elif name != "claude":
             assert prof.usage_limit_patterns == (), name
             assert prof.usage_wait_patterns == (), name
 

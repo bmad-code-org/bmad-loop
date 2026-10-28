@@ -40,6 +40,7 @@ from bmad_loop import runs
 from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import generic, opencode_http
 from bmad_loop.adapters.base import (
+    USAGE_LIMIT_BLOCKED,
     ZERO_TOKEN_TIMEOUT_EVIDENCE,
     AdapterTaskDirectoryError,
     SessionHandle,
@@ -114,6 +115,8 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #   provider-quota-settling  provider-quota in 2.0.27's real order: the session
 #                      stays on `/api/session/active` ~0.5s AFTER its
 #                      `session.execution.failed` is published
+#   provider-quota-after-work  provider-quota, but Session.Info reports the
+#                      tokens of work already done (the #764 veto's measurement)
 # FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind;
 # FAKE_OPENCODE_START_FAILURE_LINE is printed to stdout just before each such exit.
 # FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
@@ -238,7 +241,7 @@ def turn_tokens():
                 "cache": {"read": 0, "write": 0}}
     with LOCK:
         done = STATE["completed_ms"]
-    if done or SCENARIO == "provider-outage-after-work":
+    if done or SCENARIO in ("provider-outage-after-work", "provider-quota-after-work"):
         return {"input": 100, "output": 50, "reasoning": 5, "cache": {"read": 7, "write": 3}}
     return {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
 
@@ -308,7 +311,7 @@ def run_turn():
         finish_turn(); push_idle()
     elif SCENARIO in ("busy-forever", "busy-big-usage", "busy-zero-errored", "busy-zero-aborted"):
         write_spec()  # visible only post-kill: the turn never ends or idles
-    elif SCENARIO in ("provider-quota", "provider-quota-settling"):
+    elif SCENARIO in ("provider-quota", "provider-quota-settling", "provider-quota-after-work"):
         error = {"type": "provider.quota", "status": 402,
                  "message": "You exceeded your current quota, please check your plan "
                             "and billing details.",
@@ -320,7 +323,7 @@ def run_turn():
             time.sleep(0.5)
         with LOCK:
             STATE["busy"] = False  # the turn is over; nothing was spent
-        if SCENARIO == "provider-quota":
+        if SCENARIO in ("provider-quota", "provider-quota-after-work"):
             push(v2_frame("session.execution.failed", sessionID=SESSION_ID, error=error))
     elif SCENARIO in ("provider-outage", "provider-outage-after-work"):
         for attempt in (2, 3, 4):  # live, the first retry is attempt 2
@@ -5219,6 +5222,85 @@ def test_v2_provider_outage_after_work_is_overruled(tmp_path, v2_fake):
     events = _lifecycle(tmp_path)
     assert [e["event"] for e in events][-1:] == ["env-fault-overruled"]
     assert_server_gone(rec)
+
+
+def test_v2_provider_quota_after_work_is_a_live_sighting(tmp_path, v2_fake):
+    """DW-592: a quota frame for this session, seen while it ran, is a LIVE
+    usage-limit sighting — class blocked (opencode never retries a quota
+    refusal), no reset — so tokens spent before it cannot overrule the env
+    fault the way they overrule a tail-only match.
+
+    ABLATION: drop the stamp in `wait_for_completion` and the #764 veto
+    overrules the tail match (env_fault False, env_fault_overruled set)."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-quota-after-work", timeout_s=5.0))
+
+    assert result.status in ("timeout", "stalled", "crashed"), result.status
+    assert adapter.read_usage(result).total > 0
+    assert result.usage_limited is not None
+    assert result.usage_limited.startswith(
+        "provider-error event=session.step.failed type=provider.quota status=402"
+    )
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert result.usage_limit_resets is None
+    assert result.env_fault is True
+    assert result.env_fault_evidence == result.usage_limited
+    assert result.env_fault_overruled is None
+    (crumb,) = [e for e in _lifecycle(tmp_path) if e["event"] == "env-fault-classified"]
+    assert crumb["usage_limited"] is True
+    assert_server_gone(rec)
+
+
+def test_usage_sighting_counts_only_this_sessions_frames(tmp_path):
+    """A child session's quota frame shares the stream but is not this
+    session's: no sighting, no provider-errors line. The parent's own frame
+    is the sighting, and the first one sticks."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess()
+    sess.lifecycle_task = "t-1"
+    sess.provider_errors_path = tmp_path / "t-1.provider-errors.log"
+    sess.provider_errors_path.touch()
+
+    def quota(session_id: str, message: str) -> dict:
+        return _v2_frame(
+            "session.execution.failed",
+            sessionID=session_id,
+            error={"type": "provider.quota", "status": 402, "message": message},
+        )
+
+    adapter._dispatch_sse(sess, quota("ses_child", "child"))
+    assert sess.usage_sighting is None
+    assert sess.provider_errors_path.read_bytes() == b""
+
+    adapter._dispatch_sse(sess, quota("ses_parent", "first"))
+    adapter._dispatch_sse(sess, quota("ses_parent", "second"))
+    assert sess.usage_sighting == (
+        "provider-error event=session.execution.failed type=provider.quota status=402 "
+        'attempt=- message="first"',
+        USAGE_LIMIT_BLOCKED,
+    )
+
+
+def test_rate_limit_and_transport_frames_are_no_sighting(tmp_path):
+    """Only the profile's usage lists make a sighting: a retried rate limit or
+    a transport fault stays an ordinary env fault (subject to the veto)."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess()
+    sess.provider_errors_path = tmp_path / "t-1.provider-errors.log"
+    for error_type in ("provider.rate-limit", "provider.transport"):
+        adapter._dispatch_sse(
+            sess,
+            _v2_frame(
+                "session.retry.scheduled",
+                sessionID="ses_parent",
+                attempt=2,
+                error={"type": error_type, "status": 429, "message": "quota"},
+            ),
+        )
+    assert sess.usage_sighting is None
+    assert len(sess.provider_errors_path.read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_provider_errors_log_is_created_at_spawn_on_v1(tmp_path, fake_opencode):

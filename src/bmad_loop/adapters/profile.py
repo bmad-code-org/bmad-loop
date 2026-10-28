@@ -319,7 +319,9 @@ class CLIProfile:
     #     continues from on its own (a session-window limit).
     # A LIVE pane sighting exempts the verdict from the #764 token veto (the line is
     # on screen now, so it is not a stale match from earlier in the session); a
-    # tail-only match is still subject to it. Same evidentiary bar as
+    # tail-only match is still subject to it. opencode-http has no pane: its live
+    # sighting is a provider-error line it formats from a typed SSE frame for the
+    # session while it runs (DW-592), matched against these same two lists. Same evidentiary bar as
     # env_fault_patterns: seed only lines captured from the CLI's own screen, with
     # the run cited, and single-character classes so the profile line does not
     # match itself. Compiled and validated at parse time; empty = inert.

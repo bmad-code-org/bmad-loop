@@ -417,6 +417,9 @@ def test_v2_provider_error_line_formats_structured_fields():
     # Other frames write nothing; neither does V1.
     assert v2.provider_error_line("session.text.ended", {"text": "x"}) is None
     assert V1Protocol().provider_error_line("session.error", {"error": {}}) is None
+    # No V1 frame type formats a line at all, so V1 never makes the adapter's
+    # live usage-limit sighting (DW-592): its quota stays a tail-scan match.
+    assert V1Protocol().provider_error_types == frozenset()
 
 
 def test_v2_provider_error_line_is_model_free_shape():

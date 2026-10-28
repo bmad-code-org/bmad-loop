@@ -358,11 +358,14 @@ class SessionResult:
     # in `session_failure_reason`. Diagnostic only: never read by routing.
     # APPENDED.
     env_fault_overruled: str | None = None
-    # Usage-limit evidence (#610): the visible-pane line a `usage_limit_patterns`
-    # / `usage_wait_patterns` match found LIVE — at stall-grace expiry (ending
-    # the session stalled + parked) or the instant the session timeout fired.
-    # Set only from a live pane sighting, never from the post-mortem log tail and
-    # never on a `crashed` or completed result. A set value makes
+    # Usage-limit evidence (#610): the line a `usage_limit_patterns` /
+    # `usage_wait_patterns` match found LIVE. Two sources: the tmux adapters'
+    # visible pane — at stall-grace expiry (ending the session stalled + parked)
+    # or the instant the session timeout fired, never on a `crashed` result — and
+    # opencode-http's provider-error line, formatted from a typed SSE frame for
+    # this session while it ran (DW-592), carried onto every result its wait
+    # returns. Never from the post-mortem log tail, never on a completed result.
+    # A set value makes
     # `_classify_env_fault` stamp `env_fault` WITHOUT the #764 token veto (the
     # limit is on screen now, not a stale match), and both pause reasons name it
     # as a usage limit. APPENDED.

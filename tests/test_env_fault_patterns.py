@@ -17,8 +17,8 @@ to rediscover, so the corpora below are the gate: add a line here before
 loosening a pattern.
 
 Only two profiles seed patterns, and only because captured output exists for
-them: opencode seeds env_fault_patterns, claude seeds all three fields
-(SEEDED_PANE_FIELDS). The other four stay inert deliberately — see
+them: opencode seeds env_fault_patterns and usage_limit_patterns, claude seeds
+all three fields (SEEDED_PANE_FIELDS). The other four stay inert deliberately — see
 test_unseeded_profiles_stay_inert.
 
 WHAT BAIT IS FOR. The tmux adapters match against a tmux pane capture, which
@@ -88,6 +88,7 @@ PANE_PATTERN_FIELDS = ("env_fault_patterns", "usage_limit_patterns", "usage_wait
 # shrinking every parametrization keyed on this.
 SEEDED_PANE_FIELDS = (
     ("opencode", "env_fault_patterns"),
+    ("opencode", "usage_limit_patterns"),
     ("claude", "env_fault_patterns"),
     ("claude", "usage_limit_patterns"),
     ("claude", "usage_wait_patterns"),
@@ -112,19 +113,13 @@ OPENCODE_REAL = [
         # OpenCode 2.x: the `provider-errors.log` lines the adapter writes
         # (`format_provider_error`) for frames captured live from 2.0.27
         # (2026-10-12, zero tokens, a local mock provider answering a 429 rate
-        # limit, a 429 and a 402 `insufficient_quota`, and a closed port). Every
-        # byte is reproduced — test_v2_corpus_lines_are_what_the_adapter_writes
+        # limit and a closed port; the quota refusals are OPENCODE_USAGE_REAL).
+        # Every byte is reproduced — test_v2_corpus_lines_are_what_the_adapter_writes
         # rebuilds them from those frames' payloads.
         "provider-error event=session.retry.scheduled type=provider.rate-limit status=429 "
         'attempt=2 message="Rate limit reached for requests"',
         "provider-error event=session.step.failed type=provider.rate-limit status=429 "
         'attempt=- message="Rate limit reached for requests"',
-        "provider-error event=session.execution.failed type=provider.quota status=429 "
-        'attempt=- message="You exceeded your current quota, please check your plan and '
-        'billing details."',
-        "provider-error event=session.step.failed type=provider.quota status=402 "
-        'attempt=- message="You exceeded your current quota, please check your plan and '
-        'billing details."',
         "provider-error event=session.retry.scheduled type=provider.transport status=- "
         'attempt=2 message="ConnectionRefused: Unable to connect. Is the computer able to '
         'access the url?"',
@@ -132,6 +127,17 @@ OPENCODE_REAL = [
         'attempt=- message="ConnectionRefused: Unable to connect. Is the computer able to '
         'access the url?"',
     ),
+]
+# OpenCode 2.x's quota refusals, captured as OPENCODE_REAL's 2.x lines were (a
+# 429 and a 402 `insufficient_quota`): a usage limit, not an env fault — opencode
+# never retries one (DW-592), so they are seeded in usage_limit_patterns.
+OPENCODE_USAGE_REAL = [
+    "provider-error event=session.execution.failed type=provider.quota status=429 "
+    'attempt=- message="You exceeded your current quota, please check your plan and '
+    'billing details."',
+    "provider-error event=session.step.failed type=provider.quota status=402 "
+    'attempt=- message="You exceeded your current quota, please check your plan and '
+    'billing details."',
 ]
 
 # The captured 2.x frames behind the provider-errors lines above: `(event,
@@ -178,6 +184,17 @@ OPENCODE_V2_CAPTURED_FRAMES = [
         },
     ),
     (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_4",
+            "assistantMessageID": "msg_4",
+            "attempt": 2,
+            "at": 1791830566207,
+            "error": _TRANSPORT_ERROR,
+        },
+    ),
+    ("session.execution.failed", {"sessionID": "ses_4", "error": _TRANSPORT_ERROR}),
+    (
         "session.execution.failed",
         {
             "sessionID": "ses_2",
@@ -204,19 +221,10 @@ OPENCODE_V2_CAPTURED_FRAMES = [
             "files": [],
         },
     ),
-    (
-        "session.retry.scheduled",
-        {
-            "sessionID": "ses_4",
-            "assistantMessageID": "msg_4",
-            "attempt": 2,
-            "at": 1791830566207,
-            "error": _TRANSPORT_ERROR,
-        },
-    ),
-    ("session.execution.failed", {"sessionID": "ses_4", "error": _TRANSPORT_ERROR}),
 ]
-OPENCODE_V2_REAL = [line for line in OPENCODE_REAL if line.startswith("provider-error ")]
+OPENCODE_V2_REAL = [
+    line for line in OPENCODE_REAL + OPENCODE_USAGE_REAL if line.startswith("provider-error ")
+]
 
 # Claude Code surfaces provider failures behind its own "API Error" prefix, and
 # claude.toml reproduces each message's first sentence WHOLE (as a prefix match —
@@ -290,6 +298,7 @@ REAL_BY_PROFILE = [
     (name, field, line)
     for name, field, corpus in (
         ("opencode", "env_fault_patterns", OPENCODE_REAL),
+        ("opencode", "usage_limit_patterns", OPENCODE_USAGE_REAL),
         ("claude", "env_fault_patterns", CLAUDE_REAL),
         *(("claude", field, lines) for field, lines in CLAUDE_USAGE_REAL.items()),
     )
@@ -1010,7 +1019,7 @@ def test_unseeded_profiles_stay_inert(name: str) -> None:
 
 
 def test_v2_corpus_lines_are_what_the_adapter_writes() -> None:
-    """Provenance for the 2.x half of OPENCODE_REAL: each line is exactly what
+    """Provenance for the 2.x lines of OPENCODE_REAL and OPENCODE_USAGE_REAL: each line is exactly what
     the adapter writes (`format_provider_error`) for a frame captured live —
     so the corpus is the real thing, not a plausible-looking string."""
     written = [format_provider_error(event, data) for event, data in OPENCODE_V2_CAPTURED_FRAMES]
@@ -1019,19 +1028,23 @@ def test_v2_corpus_lines_are_what_the_adapter_writes() -> None:
         assert "response" not in line and "insufficient_quota" not in line  # body dropped
 
 
-@pytest.mark.parametrize("line", OPENCODE_V2_REAL)
-def test_v2_provider_error_line_is_model_free_shape(line: str) -> None:
+@pytest.mark.parametrize(
+    ("field", "line"),
+    [
+        (field, line)
+        for name, field, line in REAL_BY_PROFILE
+        if name == "opencode" and line.startswith("provider-error ")
+    ],
+)
+def test_v2_provider_error_line_is_model_free_shape(field: str, line: str) -> None:
     """The 2.x pattern matches only the structured head of an adapter-written
     line: cut the line at `message=` and it still classifies, so nothing
     provider- or model-sourced is what made it match; and the same line behind
-    any leading text — quoted in the transcript, a doc, a fixture — does not."""
+    any leading text — quoted in the transcript, a doc, a fixture — does not.
+    Held per field: the env-fault and usage-limit lists each ship one."""
     head = line.split(' message="', 1)[0] + " "
-    v2 = [
-        p
-        for p in _patterns("opencode", ("env_fault_patterns",))
-        if p.pattern.startswith("^provider-error")
-    ]
-    assert len(v2) == 1, "the opencode profile should ship one 2.x provider-error pattern"
+    v2 = [p for p in _patterns("opencode", (field,)) if p.pattern.startswith("^provider-error")]
+    assert len(v2) == 1, f"the opencode profile should ship one 2.x provider-error {field} entry"
     assert v2[0].search(head)
     assert v2[0].search(line)
     assert not v2[0].search("  " + line)
