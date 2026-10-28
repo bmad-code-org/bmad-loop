@@ -102,8 +102,25 @@ def test_builtin_profiles_load():
     # tests/test_env_fault_patterns.py; here we only pin which profiles are seeded.
     for name in ("claude", "opencode-http"):
         assert profiles[name].env_fault_patterns, f"{name} ships no env_fault_patterns"
-    for name in ("codex", "gemini", "copilot", "antigravity"):
+    for name in ("codex", "gemini", "copilot", "antigravity", "cursor-agent"):
         assert profiles[name].env_fault_patterns == ()
+    # cursor-agent: Cursor Agent CLI (`agent`). Flat hooks.json v1 dialect;
+    # sessionEnd is the --print turn-complete signal (camelCase `stop` does not
+    # fire); transcript has no usage fields.
+    cursor = profiles["cursor-agent"]
+    assert cursor.binary == "agent"
+    assert cursor.launch_args == ("--print", "--trust", "--approve-mcps")
+    assert cursor.bypass_args == ("--force",)
+    assert cursor.usage_parser == "none"
+    assert cursor.hooks.dialect == "cursor-hooks-json"
+    assert cursor.hooks.config_path == ".cursor/hooks.json"
+    assert cursor.hooks.events == {
+        "sessionStart": "SessionStart",
+        "sessionEnd": "Stop",
+    }
+    assert cursor.skill_tree == ".agents/skills"
+    assert ".cursor/hooks.json" in cursor.seed_files
+    assert ".cursor/mcp.json" in cursor.seed_files
     # opencode-http is hookless (HTTP/SSE transport): no hook dialect surfaces,
     # skills read from the claude tree, usage comes over HTTP (no transcript parser)
     opencode = profiles["opencode-http"]

@@ -239,7 +239,8 @@ time or retro the epic before its runs are deleted.
 ## Choosing which CLIs to drive
 
 The supported adapters are `claude` (the default), `codex`, `gemini`, `copilot`,
-`antigravity` (Google's `agy`, experimental — worktree isolation needs the project root trusted; see [First-run notes](#first-run-notes)), and `opencode`
+`antigravity` (Google's `agy`, experimental — worktree isolation needs the project root trusted; see [First-run notes](#first-run-notes)), `cursor-agent`
+(Cursor Agent CLI `agent` — launches with `--print --trust --approve-mcps --force`; see [First-run notes](#first-run-notes)), and `opencode`
 (OpenCode 1.x ≥ 1.18 or 2.x ≥ 2.0.21 over HTTP/SSE, profile `opencode-http` — no tmux
 window; needs the `bmad-loop[opencode]` extra and `model` set as `provider/model`). You can pick more
 than one — register every CLI you intend to use for dev, review, or sweep triage.
@@ -346,10 +347,10 @@ bmad-loop init --project <project-root> --cli claude --cli codex --cli gemini
 
 Run with no `--cli` and `init` registers hooks for every CLI the `policy.toml` references,
 so a dual-client setup that's already configured in policy needs no extra flags. Names must
-be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, or `opencode-http` (alias
-`opencode`) — `init` errors on an unknown profile and lists the valid ones. A hookless
-profile like `opencode-http` installs its skills but registers no hooks (it signals over
-HTTP/SSE).
+be exactly `claude`, `codex`, `gemini`, `copilot`, `antigravity`, `cursor-agent`, or
+`opencode-http` (alias `opencode`) — `init` errors on an unknown profile and lists the
+valid ones. A hookless profile like `opencode-http` installs its skills but registers no
+hooks (it signals over HTTP/SSE).
 
 ### First-run notes
 
@@ -368,6 +369,13 @@ them to whoever owns the machine:
   subscription). Requires the Copilot **CLI** GA (≥ 2026-02) — _not_ the VS Code extension.
   **Pin a capable model**: the free default (GPT-5 mini) silently skips steps in the
   multi-step dev/review skills; set `[adapter] model = "claude-sonnet-4-6"` (→ `--model`).
+- **cursor-agent** — run `agent login` once (or set `CURSOR_API_KEY`) if needed. Requires
+  the Cursor Agent CLI (`agent`). Launches always pass `--print --trust --approve-mcps
+  --force` so workspace-trust / MCP / permission dialogs do not block spawned sessions.
+  Hooks live in `.cursor/hooks.json` (flat schema version 1; Claude-nested entries are
+  ignored). Turn completion is `sessionEnd` → Stop on `--print` turns (`stop` does not
+  fire). Token usage is not recorded (`usage_parser = "none"`) — the JSONL transcript has
+  no usage fields.
 - **antigravity** — run `agy` once in the project, authenticate, and answer
   **"Yes, I trust this folder"** before `bmad-loop run`; spawned sessions can't answer that
   dialog, and a pending one reads as a session timeout. Requires Antigravity CLI
@@ -468,8 +476,8 @@ By default, Codex attaches to a shared background app-server daemon, which may h
 
 ### Skill location
 
-`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, and `antigravity`
-read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
+`claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, `antigravity`, and
+`cursor-agent` read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
 for each CLI you pass via `--cli`, so selecting any of the `.agents/skills/` CLIs populates it automatically. It skips skill
 dirs that already exist — pass `--force-skills` to overwrite a stale copy, or `--no-skills` to
 manage them yourself.
@@ -577,6 +585,7 @@ that hook event):
 - **gemini** — `.gemini/settings.json`
 - **copilot** — `.github/copilot/settings.json`
 - **antigravity** — `.agents/hooks.json` (the `bmad-loop` hook group)
+- **cursor-agent** — `.cursor/hooks.json`
 
 Edit only the registered CLIs. Match the full relay command and event; leave every
 other hook in place. The installed `bmad-loop` executable is shared with other projects,

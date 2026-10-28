@@ -1639,7 +1639,7 @@ mark_done = "auto"           # auto | never
 thorough_review = "high-risk"  # never | high-risk | always
 
 [adapter]
-name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
+name = "claude"              # claude | codex | gemini | copilot | antigravity | cursor-agent | opencode-http (alias: opencode) | <custom .bmad-loop/profiles/*.toml>
 model = ""                   # empty = CLI default model (opencode-http wants "provider/model")
 effort = ""                  # reasoning effort, free-form (e.g. "high", "max"); empty = provider default.
                              # Sent by opencode-http as the per-prompt `variant`; the tmux CLIs ignore it

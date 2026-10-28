@@ -56,6 +56,7 @@ PROBE_MARKER = "bmad_loop_probe_hook"
 GEMINI_HOOK_TIMEOUT_MS = 60_000
 COPILOT_HOOK_TIMEOUT_SEC = 60
 ANTIGRAVITY_HOOK_TIMEOUT_SEC = 60  # agy hook timeouts are seconds (default 30)
+CURSOR_HOOK_TIMEOUT_SEC = 60  # Cursor hooks.json timeouts are seconds
 # agy's .agents/hooks.json keys by hook NAME at the top level (not a "hooks"
 # wrapper); bmad-loop registers all its handlers under this single group.
 ANTIGRAVITY_HOOK_GROUP = "bmad-loop"
@@ -2043,6 +2044,12 @@ def _hook_entry(dialect: str, command: str) -> dict:
         # sits directly in the event list, with no matcher/hooks wrapper (unlike
         # gemini's grouped shape).
         return handler
+    if dialect == "cursor-hooks-json":
+        handler["timeout"] = CURSOR_HOOK_TIMEOUT_SEC  # Cursor timeouts are seconds
+        # Cursor `.cursor/hooks.json` v1 stores flat handlers in the event list
+        # (same shape as copilot/agy). Claude-nested `{"hooks":[...]}` wrappers
+        # are ignored by the agent CLI — verified against 2026.10.22-27dcf5f.
+        return handler
     # claude-settings-json and codex-hooks-json share the schema
     return {"hooks": [handler]}
 
@@ -2349,6 +2356,8 @@ def merge_hooks(config: dict, registrations: dict[str, str], dialect: str) -> tu
         return config, changed
     if dialect == "copilot-settings-json":
         config.setdefault("version", 1)  # Copilot hook configs are versioned
+    if dialect == "cursor-hooks-json":
+        config.setdefault("version", 1)  # Cursor hooks.json schema version 1
     hooks = config.setdefault("hooks", {})
     for native_event, command in registrations.items():
         matchers = hooks.setdefault(native_event, [])

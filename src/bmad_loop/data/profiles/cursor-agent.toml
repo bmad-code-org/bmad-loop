@@ -1,0 +1,51 @@
+# Cursor Agent CLI (`agent`). `--print` runs non-interactively for tmux/probe;
+# `--trust` skips the Workspace Trust TUI (exact-path; a fresh /tmp probe dir
+# always prompts without it); `--approve-mcps` skips MCP approval prompts.
+# `--force` (bypass_args) covers tool/command approval only — it does NOT
+# replace `--trust`. Verified against agent 2026.10.22-27dcf5f via
+# `bmad-loop probe-adapter cursor-agent --probe` and live hook dumps.
+#
+# Hook config is `.cursor/hooks.json` schema version 1 with FLAT handlers
+# (`{"command": "..."}` directly in the event list). Claude-nested
+# `{"hooks":[{"type":"command",...}]}` entries are IGNORED by the CLI — that is
+# why dialect is cursor-hooks-json, not claude-settings-json.
+#
+# Events (verified on `agent --print`): `sessionStart` and `sessionEnd` fire;
+# camelCase `stop` does NOT fire on a one-shot --print turn, and PascalCase
+# event names never fire. `sessionEnd` carries `transcript_path` +
+# `conversation_id` / `session_id` (snake_case) and `workspace_roots`. Map
+# `sessionEnd` -> Stop so the orchestrator sees turn completion; keep
+# `sessionStart` -> SessionStart. Optional `stop` / `preCompact` stays unmapped
+# until a build is shown to fire them on this CLI.
+#
+# usage_parser is "none" DELIBERATELY — not a deferral. The transcript at
+# ~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl (the path
+# sessionEnd reports as transcript_path; slug is the workspace path with
+# separators turned to dashes) carries role/message/turn_ended rows only.
+# No usage / token fields anywhere — verified by capturing a live turn and
+# scanning every key. Revisit only if Cursor starts emitting usage in the
+# JSONL.
+#
+# TRUST: every workspace (including probe mkdtemps) hits "Workspace Trust
+# Required" until `--trust` or a prior grant for that exact path. Spawned
+# sessions cannot answer the TUI; always pass `--trust` in launch_args.
+name = "cursor-agent"
+binary = "agent"
+prompt_template = "{prompt}"
+launch_args = ["--print", "--trust", "--approve-mcps"]
+bypass_args = ["--force"]
+model_flag = "--model"
+session_id_flag = "--resume"
+usage_parser = "none"
+first_run_note = "run `agent login` once (or set CURSOR_API_KEY) if needed; hooks: `bmad-loop init --cli cursor-agent` (writes .cursor/hooks.json). Every launch passes --print --trust --approve-mcps --force so trust/MCP/permission dialogs should not block spawned sessions."
+skill_tree = ".agents/skills"
+# .cursor/hooks.json is Cursor's lifecycle-hook config; .cursor/mcp.json holds
+# MCP server defs. Both are often gitignored, so seed them for worktree checkouts.
+seed_files = [".cursor/hooks.json", ".cursor/mcp.json"]
+
+[hooks]
+dialect = "cursor-hooks-json"
+config_path = ".cursor/hooks.json"
+events = { sessionStart = "SessionStart", sessionEnd = "Stop" }
+
+platforms = ["linux", "darwin"]

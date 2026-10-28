@@ -159,7 +159,7 @@ To upgrade, run `claude "/bmad-loop-setup upgrade"`, or by hand `uv tool upgrade
 [gates]
 mode = "per-epic"            # none | per-epic | per-story-spec-approval
 [adapter]
-name = "claude"              # claude | codex | gemini | copilot | antigravity | opencode-http
+name = "claude"              # claude | codex | gemini | copilot | antigravity | cursor-agent | opencode-http
 [adapter.review]
 name = "codex"               # optional: review on a different CLI
 [verify]
