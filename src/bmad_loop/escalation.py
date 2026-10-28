@@ -22,6 +22,7 @@ from .model import (
     VerifyOutcome,
 )
 from .policy import Policy
+from .usagereset import resolved_reset
 from .worksource import SOURCE_STORIES, SOURCE_TICKETS
 
 SEVERITY_CRITICAL = "CRITICAL"
@@ -53,6 +54,16 @@ REVIEW_TIMEOUT_STATUSES = frozenset({"timeout", "stalled", "over_budget"})
 
 
 @dataclass(frozen=True)
+class UsageLimitPause:
+    """The structured facts of a pause on a usage limit (DW-591), recorded on
+    ``RunState.paused_reset_at`` / ``paused_limit_class`` so no reader parses
+    the pause reason. Built only by :func:`usage_limit_pause`."""
+
+    reset_at: str | None
+    limit_class: str | None
+
+
+@dataclass(frozen=True)
 class Decision:
     action: Action
     reason: str = ""
@@ -64,6 +75,9 @@ class Decision:
     # Set only by the engine's environment seam (DW-523), never by a decider: the
     # `StoryTask.env_fault_site` a PAUSE it produced must record on escalation.
     env_site: str | None = None
+    # Set by a decider whose PAUSE reason is the usage-limit reason (DW-591):
+    # the facts the engine records with the pause. None on every other decision.
+    usage_limit: UsageLimitPause | None = None
 
 
 def _escalation_list(result_json: dict[str, Any] | None) -> list[Any]:
@@ -300,6 +314,20 @@ def parked_pause_reason(role: str, result: SessionResult) -> str:
     )
 
 
+def usage_limit_pause(result: SessionResult) -> UsageLimitPause | None:
+    """The facts a pause on ``result`` records, or None when ``result`` was not
+    seen behind a usage limit — exactly when ``env_fault_pause_reason`` and
+    ``parked_pause_reason`` give the usage-limit reason. ``reset_at`` is the
+    reset only when it resolved (:func:`usagereset.resolved_reset`): an
+    unresolved clause's raw text stays in the reason alone."""
+    if not result.usage_limited:
+        return None
+    return UsageLimitPause(
+        reset_at=resolved_reset(result.usage_limit_resets),
+        limit_class=result.usage_limit_class,
+    )
+
+
 def usage_limit_pause_reason(role: str, result: SessionResult) -> str:
     """The pause reason for a session seen LIVE behind a usage limit (#610):
     ``usage limit: <role> session <status> (<evidence>; ...)``.
@@ -421,6 +449,7 @@ def decide_dev(
             return Decision(
                 Action.PAUSE,
                 env_fault_pause_reason("dev", result),
+                usage_limit=usage_limit_pause(result),
             )
         if result.parked:
             # The CLI was parked on a prompt only a human should answer (DW-348/
@@ -431,7 +460,11 @@ def decide_dev(
             # `env_fault` (a transport failure outranks it), ahead of the #727
             # no-work arm: a named prompt explains the silence better than the
             # silence does.
-            return Decision(Action.PAUSE, parked_pause_reason("dev", result))
+            return Decision(
+                Action.PAUSE,
+                parked_pause_reason("dev", result),
+                usage_limit=usage_limit_pause(result),
+            )
         if not result.produced_work:
             # The session never did anything (#727): no turn ended and the pane
             # never changed after its first frame — a CLI parked on a permission
@@ -509,12 +542,17 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
             return Decision(
                 Action.PAUSE,
                 env_fault_pause_reason("review", result),
+                usage_limit=usage_limit_pause(result),
             )
         if result.parked:
             # parked on a human prompt (DW-348/DW-350): pause rather than charge a
             # review cycle for a session the adapter would not type into (see
             # decide_dev). After env_fault, which outranks it.
-            return Decision(Action.PAUSE, parked_pause_reason("review", result))
+            return Decision(
+                Action.PAUSE,
+                parked_pause_reason("review", result),
+                usage_limit=usage_limit_pause(result),
+            )
         if not result.produced_work:
             # never did anything (#727): pause rather than retry, defer or
             # salvage a review that would relaunch into the same wall (see

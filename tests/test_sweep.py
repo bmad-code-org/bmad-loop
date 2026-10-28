@@ -53,7 +53,7 @@ from bmad_loop import artifact_publication, deferredwork, platform_util, runs
 from bmad_loop import sweep as sweep_mod
 from bmad_loop import ticketstore, verify
 from bmad_loop import worktree_flow as worktree_flow_mod
-from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.base import USAGE_LIMIT_WAIT, SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths, load_paths
 from bmad_loop.engine import RunPaused, _LedgerAnchor, _session_task_id
@@ -5870,6 +5870,46 @@ def test_migration_session_parked_escalates_without_consuming_attempts(project):
     dec = [e for e in engine.journal.entries() if e["kind"] == "migrate-decision"][-1]
     assert dec["parked"] is True
     assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+
+
+def _usage_limited(env_fault: bool) -> SessionResult:
+    evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
+    return SessionResult(
+        status="stalled",
+        parked=True,
+        parked_evidence=evidence,
+        usage_limited=evidence,
+        env_fault=env_fault,
+        env_fault_evidence=evidence if env_fault else None,
+        usage_limit_resets="2026-10-25T19:20:00+00:00",
+        usage_limit_class=USAGE_LIMIT_WAIT,
+    )
+
+
+@pytest.mark.parametrize("env_fault", [True, False], ids=["env-fault-arm", "parked-arm"])
+def test_triage_usage_limit_pause_records_reset_and_class(project, env_fault):
+    """DW-591: the triage site's usage-limit pause records both facts.
+    ABLATION: escalate the triage site's arm with `self._escalate` and this
+    fails."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [_usage_limited(env_fault)] * 2)
+    assert engine.run().paused
+
+    assert engine.state.paused_reason.startswith("usage limit: triage session stalled")
+    assert engine.state.paused_reset_at == "2026-10-25T19:20:00+00:00"
+    assert engine.state.paused_limit_class == USAGE_LIMIT_WAIT
+
+
+@pytest.mark.parametrize("env_fault", [True, False], ids=["env-fault-arm", "parked-arm"])
+def test_migration_usage_limit_pause_records_reset_and_class(project, env_fault):
+    """DW-591: the migration site's usage-limit pause records both facts."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, _ = make_sweep(project, [_usage_limited(env_fault)] * 2)
+    assert engine.run().paused
+
+    assert engine.state.paused_reason.startswith("usage limit: migration session stalled")
+    assert engine.state.paused_reset_at == "2026-10-25T19:20:00+00:00"
+    assert engine.state.paused_limit_class == USAGE_LIMIT_WAIT
 
 
 def test_triage_session_no_work_escalates_without_consuming_attempts(project):

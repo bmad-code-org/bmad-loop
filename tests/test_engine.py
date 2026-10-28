@@ -58,6 +58,7 @@ from bmad_loop import deferredwork, devcontract, gates
 from bmad_loop import journal as journal_mod
 from bmad_loop import platform_util, runs, verify
 from bmad_loop.adapters.base import (
+    USAGE_LIMIT_BLOCKED,
     USAGE_LIMIT_WAIT,
     ZERO_TOKEN_TIMEOUT_EVIDENCE,
     SessionResult,
@@ -15590,6 +15591,110 @@ def test_usage_limited_session_end_is_journaled_and_paused(project):
     assert "usage_limited" not in plain_end
 
 
+def _usage_limited(
+    *, env_fault: bool, resets: str | None = None, limit_class: str = USAGE_LIMIT_WAIT
+) -> SessionResult:
+    """A session seen live behind a usage limit (#610), as it reaches the pause
+    sites: parked, or parked and stamped env_fault by `_classify_env_fault`."""
+    evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
+    return SessionResult(
+        status="stalled",
+        parked=True,
+        parked_evidence=evidence,
+        usage_limited=evidence,
+        env_fault=env_fault,
+        env_fault_evidence=evidence if env_fault else None,
+        usage_limit_resets=resets,
+        usage_limit_class=limit_class,
+    )
+
+
+@pytest.mark.parametrize("env_fault", [True, False], ids=["env-fault-arm", "parked-arm"])
+def test_usage_limit_pause_records_reset_and_class_in_state(project, env_fault):
+    """DW-591: a dev usage-limit pause records its resolved reset and limit class
+    on the run state with the pause, persisted to state.json and carried by the
+    `run-paused` entry, so `resolve --at-reset` never parses the reason.
+    ABLATION: escalate the dev pause with `self._escalate` instead of
+    `_escalate_session` and both state fields read None."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    reset = "2026-10-25T19:20:00+00:00"
+    engine, _ = make_engine(project, [_usage_limited(env_fault=env_fault, resets=reset)])
+    assert engine.run().paused
+
+    assert engine.state.paused_reason is not None
+    assert engine.state.paused_reason.startswith("usage limit: dev session stalled")
+    assert engine.state.paused_reset_at == reset
+    assert engine.state.paused_limit_class == USAGE_LIMIT_WAIT
+    on_disk = load_state(engine.run_dir)
+    assert (on_disk.paused_reset_at, on_disk.paused_limit_class) == (reset, USAGE_LIMIT_WAIT)
+    paused = [e for e in engine.journal.entries() if e["kind"] == "run-paused"][-1]
+    assert paused["usage_limit_reset_at"] == reset
+    assert paused["usage_limit_class"] == USAGE_LIMIT_WAIT
+
+
+def test_usage_limit_pause_with_an_unresolved_reset_keeps_only_the_class(project):
+    """DW-591: an unresolved clause stores no reset (its raw text stays in the
+    reason alone); the limit class is still recorded."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    raw = "7:20pm (Mars/Olympus_Mons)"
+    engine, _ = make_engine(
+        project, [_usage_limited(env_fault=True, resets=raw, limit_class=USAGE_LIMIT_BLOCKED)]
+    )
+    assert engine.run().paused
+
+    assert engine.state.paused_reason is not None
+    assert f"; resets {raw}" in engine.state.paused_reason
+    assert engine.state.paused_reset_at is None
+    assert engine.state.paused_limit_class == USAGE_LIMIT_BLOCKED
+    paused = [e for e in engine.journal.entries() if e["kind"] == "run-paused"][-1]
+    assert "usage_limit_reset_at" not in paused
+    assert paused["usage_limit_class"] == USAGE_LIMIT_BLOCKED
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        SessionResult(status="timeout", env_fault=True, env_fault_evidence="ECONNRESET"),
+        SessionResult(status="stalled", parked=True, parked_evidence="PermissionPrompt"),
+    ],
+    ids=["env-fault", "parked"],
+)
+def test_non_usage_pause_records_no_usage_facts(project, result):
+    """DW-591: a plain env-fault or parked pause records neither fact, and its
+    `run-paused` entry carries neither key."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [result])
+    assert engine.run().paused
+
+    assert engine.state.paused_reason is not None
+    assert not engine.state.paused_reason.startswith("usage limit")
+    assert engine.state.paused_reset_at is None
+    assert engine.state.paused_limit_class is None
+    paused = [e for e in engine.journal.entries() if e["kind"] == "run-paused"][-1]
+    assert "usage_limit_reset_at" not in paused
+    assert "usage_limit_class" not in paused
+
+
+def test_review_usage_limit_pause_records_reset_and_class(project):
+    """DW-591: the review leg's usage-limit pause (through `_escalate_decision`)
+    records both facts too.
+    ABLATION: escalate with `self._escalate` in `_escalate_decision` and this
+    fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    reset = "2026-10-25T19:20:00+00:00"
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), _usage_limited(env_fault=True, resets=reset)],
+    )
+    assert engine.run().paused
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    assert engine.state.paused_reason is not None
+    assert engine.state.paused_reason.startswith("usage limit: review session stalled")
+    assert engine.state.paused_reset_at == reset
+    assert engine.state.paused_limit_class == USAGE_LIMIT_WAIT
+
+
 def test_session_end_carries_quota_wait_s_only_when_positive(project):
     """DW-396: the engine hands every session it drives the quota-wait cap
     (`limits.quota_wait_max_min * 60`), and `session-end` carries the seconds the
@@ -16079,6 +16184,41 @@ def test_fix_phase_parked_session_escalates(project):
     fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
     assert fix["parked"] is True
     assert fix["parked_evidence"] == evidence
+
+
+@pytest.mark.parametrize("env_fault", [True, False], ids=["env-fault-arm", "parked-arm"])
+def test_fix_phase_usage_limit_pause_records_reset_and_class(project, env_fault):
+    """DW-591: the fix site's usage-limit pause records both facts.
+    ABLATION: escalate the fix site's arm with `self._escalate` and this fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()  # ordinary fixable failure -> routes to a fix session
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    reset = "2026-10-25T19:20:00+00:00"
+    limited = _usage_limited(env_fault=env_fault, resets=reset)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), _OK)),
+        limits=LimitsPolicy(max_dev_attempts=3),
+    )
+    engine, adapter = make_engine(
+        project, [dev_with_marker, breaking_review, limited, limited], policy=policy
+    )
+    assert engine.run().paused
+
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]
+    assert engine.state.paused_reason is not None
+    assert engine.state.paused_reason.startswith("usage limit: fix session stalled")
+    assert engine.state.paused_reset_at == reset
+    assert engine.state.paused_limit_class == USAGE_LIMIT_WAIT
 
 
 def test_fix_phase_no_work_session_escalates(project):

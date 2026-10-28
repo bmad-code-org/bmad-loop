@@ -276,3 +276,31 @@ def test_adapter_local_now_resolves_through_dst(
     monkeypatch.setattr(time, "time", lambda: datetime(2026, 3, 28, 23, 30, tzinfo=UTC).timestamp())
     at = _at("resets 6am", generic._local_now())
     assert at.astimezone(UTC) == datetime(2026, 3, 29, 4, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["resets 7:20pm", "resets 12:50pm (Asia/Ho_Chi_Minh)", "resets Sep 15 at 7pm"],
+)
+def test_resolved_reset_accepts_every_resolved_value(line: str) -> None:
+    """DW-591: what `UsageReset.value` emits for a resolved reset is recognised."""
+    reset = parse_reset(line, NOW)
+    assert reset is not None and reset.at is not None
+    assert usagereset.resolved_reset(reset.value) == reset.value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "7:20pm (Mars/Olympus_Mons)",  # zone-unavailable raw text
+        "soon",  # unparsed raw text
+        "2026-10-25T19:20:00",  # ISO but naive: no instant
+        "2026-10-25 19:20+00:00",  # ISO but not the form `value` emits
+    ],
+)
+def test_resolved_reset_refuses_raw_or_naive_text(value: str | None) -> None:
+    """Raw clause text, and anything that is not an aware `isoformat()`, is not
+    a resolved reset."""
+    assert usagereset.resolved_reset(value) is None

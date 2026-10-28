@@ -39,7 +39,7 @@ from datetime import time as dtime
 from datetime import timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-__all__ = ["UsageReset", "parse_reset"]
+__all__ = ["UsageReset", "parse_reset", "resolved_reset"]
 
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -109,6 +109,25 @@ def parse_reset(line: str, now: datetime) -> UsageReset | None:
     if at is None:
         return _unresolved(raw, "unparsed")
     return UsageReset(raw=raw, at=at, unresolved=None)
+
+
+def resolved_reset(value: str | None) -> str | None:
+    """``value`` when it is a :attr:`UsageReset.value` that resolved, else None.
+
+    A resolved value is ``datetime.isoformat()`` of an aware datetime, so it
+    round-trips exactly through ``datetime.fromisoformat`` with an offset; raw
+    clause text (an unresolved reset) does not. Lets a consumer of the carried
+    string (``SessionResult.usage_limit_resets``) tell the two apart without a
+    second field."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.utcoffset() is None or parsed.isoformat() != value:
+        return None
+    return value
 
 
 def _unresolved(raw: str, why: str) -> UsageReset:

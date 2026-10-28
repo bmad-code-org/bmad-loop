@@ -42,6 +42,7 @@ from .escalation import (
     REVIEW_TIMEOUT_STATUSES,
     Action,
     Decision,
+    UsageLimitPause,
     critical_session_reason,
     decide_dev,
     decide_reverify,
@@ -58,6 +59,7 @@ from .escalation import (
     review_retry_or_exhaust,
     session_failure_reason,
     unresolved_escalation_keys,
+    usage_limit_pause,
 )
 from .frontmatter import FrontmatterWriteError
 from .install import dev_primitive_or_default
@@ -291,6 +293,9 @@ class RunPaused(Exception):
         self.reason = reason
         self.stage = stage
         self.story_key = story_key
+        # The usage-limit facts of a pause whose reason is the usage-limit reason
+        # (DW-591), attached by `Engine._escalate_session`; None on every other.
+        self.usage_limit: UsageLimitPause | None = None
 
 
 SpecWriteReason = Literal["salvage", "reconcile", "adoption", "repair"]
@@ -1254,14 +1259,26 @@ class Engine:
                 if self._owns_signals and self.policy.adapter.cleanup_session_on_finish:
                     self._kill_run_session()
             except RunPaused as pause:
-                self.state.paused_reason = pause.reason
-                self.state.paused_stage = pause.stage
-                self.state.paused_story_key = pause.story_key
+                usage = pause.usage_limit
+                self.state.record_pause(
+                    pause.reason,
+                    pause.stage,
+                    pause.story_key,
+                    reset_at=usage.reset_at if usage is not None else None,
+                    limit_class=usage.limit_class if usage is not None else None,
+                )
+                # Present-only, like `session-end`'s usage-limit fields.
+                pause_extras: dict = {}
+                if self.state.paused_reset_at:
+                    pause_extras["usage_limit_reset_at"] = self.state.paused_reset_at
+                if self.state.paused_limit_class:
+                    pause_extras["usage_limit_class"] = self.state.paused_limit_class
                 self.journal.append(
                     "run-paused",
                     reason=pause.reason,
                     stage=pause.stage,
                     story_key=pause.story_key,
+                    **pause_extras,
                 )
             except RunStopped as stop:
                 if stop.graceful:
@@ -3108,19 +3125,21 @@ class Engine:
                     # deferring the story on a transport failure. Non-blocking
                     # workflows keep continuing (journaled only): the next story
                     # session will classify and pause if the outage persists.
-                    self._escalate(
+                    self._escalate_session(
                         task,
                         env_fault_pause_reason(
                             f"blocking workflow {wf.name!r} ({lp.name})", result
                         ),
+                        usage_limit_pause(result),
                     )
                 if result.parked:
                     # Parked on a human prompt (DW-348/DW-350): the adapter withheld
                     # the stall nudge, so the workflow never got a chance to run —
                     # escalate (re-arm restores the budget) instead of deferring.
-                    self._escalate(
+                    self._escalate_session(
                         task,
                         parked_pause_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
+                        usage_limit_pause(result),
                     )
                 if not result.produced_work:
                     # Never did anything (#727): a deferral would charge the story
@@ -3825,7 +3844,7 @@ class Engine:
             ):
                 self._escalate_env(task, decision.reason, site="verify:dev")
             else:
-                self._escalate(task, decision.reason)
+                self._escalate_session(task, decision.reason, decision.usage_limit)
 
     def _journal_dev_decision(
         self, task: StoryTask, result: SessionResult, decision: Decision, *, env_fault: bool
@@ -9600,15 +9619,18 @@ class Engine:
                 # pause (re-arm restores the budget) instead of burning the dev
                 # budget. A completed-but-env-fault-grade verify failure is handled
                 # by the retryable check just below (its own escalate path).
-                self._escalate(
+                self._escalate_session(
                     task,
                     env_fault_pause_reason("fix", result),
+                    usage_limit_pause(result),
                 )
             if result.status != "completed" and result.parked:
                 # Parked on a human prompt (DW-348/DW-350): the adapter withheld the
                 # stall nudge, so the repair never ran — another attempt would
                 # relaunch into the same prompt. Pause (re-arm restores the budget).
-                self._escalate(task, parked_pause_reason("fix", result))
+                self._escalate_session(
+                    task, parked_pause_reason("fix", result), usage_limit_pause(result)
+                )
             if result.status != "completed" and not result.produced_work:
                 # Never did anything (#727): another attempt would launch into the
                 # same wall. Pause (re-arm restores the budget), after env_fault
@@ -11245,11 +11267,27 @@ class Engine:
 
     def _escalate_decision(self, task: StoryTask, decision: Decision) -> None:
         """Escalate a PAUSE decision, recording its ``env_site`` when the
-        environment seam (:meth:`_env_gate_decision`) produced it."""
+        environment seam (:meth:`_env_gate_decision`) produced it, else its
+        usage-limit facts (:meth:`_escalate_session`)."""
         if decision.env_site is not None:
             self._escalate_env(task, decision.reason, site=decision.env_site)
         else:
-            self._escalate(task, decision.reason)
+            self._escalate_session(task, decision.reason, decision.usage_limit)
+
+    def _escalate_session(
+        self, task: StoryTask, reason: str, usage_limit: UsageLimitPause | None
+    ) -> None:
+        """Escalate a pause whose reason came from a session result, attaching
+        that result's usage-limit facts (``escalation.usage_limit_pause``, None
+        unless the reason is the usage-limit reason) to the ``RunPaused`` so
+        ``run()`` records them with the pause (DW-591). Attached on the way out
+        rather than threaded through ``_escalate``, so the sweep engine's
+        override keeps its signature."""
+        try:
+            self._escalate(task, reason)
+        except RunPaused as pause:
+            pause.usage_limit = usage_limit
+            raise
 
     def _record_sweep_refusal(self, trigger: str, reason: str) -> None:
         """Record, durably, that this trigger's auto-sweep did not deliver.

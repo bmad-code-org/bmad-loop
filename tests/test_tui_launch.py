@@ -1340,7 +1340,7 @@ def test_a_refused_resume_leaves_the_record_with_the_driving_window(
 
     def prepare(_project, _run_dir, *, accept_baseline=False):
         engine["live"] = True  # the pid this child publishes under the lock
-        return (*(None,) * 8, PauseSnapshot(None, None, None, False, False, None))
+        return (*(None,) * 8, PauseSnapshot(None, None, None, None, None, False, False, None))
 
     def compose(**_kwargs):
         raise Drove

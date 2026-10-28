@@ -44,6 +44,7 @@ from .escalation import (
     parked_pause_reason,
     pause_title,
     session_failure_reason,
+    usage_limit_pause,
 )
 from .model import PAUSE_ESCALATION, PAUSE_STORY_GATE, Phase, StoryTask, result_mapping
 from .platform_util import (
@@ -4899,17 +4900,19 @@ class SweepEngine(Engine):
                 # task.attempt to 0 — fresh budget) instead of charging a migration
                 # attempt. Escalate BEFORE the _safe_reset/attempt-cap path; that
                 # resume also restores the ledger if the worktree is dirty.
-                self._escalate(
+                self._escalate_session(
                     task,
                     env_fault_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                    usage_limit_pause(result),
                 )
             if result.status != "completed" and result.parked:
                 # Parked on a human prompt (DW-348/DW-350): the stall nudge was
                 # withheld, so no rewrite ran — pause (fresh budget on resume)
                 # rather than charge a migration attempt, like the env-fault arm.
-                self._escalate(
+                self._escalate_session(
                     task,
                     parked_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                    usage_limit_pause(result),
                 )
             if result.status != "completed" and not result.produced_work:
                 # Never did anything (#727): plain-adapter roles never arm the stall
@@ -5310,17 +5313,19 @@ class SweepEngine(Engine):
                 # transport/API failure (#194): pause rather than charge a triage
                 # attempt for a session that never reached the API. The
                 # ESCALATED-resume above resets task.attempt to 0 (fresh budget).
-                self._escalate(
+                self._escalate_session(
                     task,
                     env_fault_pause_reason("triage", result) + _diagnostic_suffix(diagnostic),
+                    usage_limit_pause(result),
                 )
             if result.status != "completed" and result.parked:
                 # Parked on a human prompt (DW-348/DW-350): pause rather than charge
                 # a triage attempt the adapter would not type into (fresh budget on
                 # resume, as for env_fault).
-                self._escalate(
+                self._escalate_session(
                     task,
                     parked_pause_reason("triage", result) + _diagnostic_suffix(diagnostic),
+                    usage_limit_pause(result),
                 )
             if result.status != "completed" and not result.produced_work:
                 # Never did anything (#727): the only route to a pause for a

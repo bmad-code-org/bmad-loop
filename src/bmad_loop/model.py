@@ -1270,7 +1270,7 @@ def env_fault_site_reverifiable(task: StoryTask) -> bool:
 
 @dataclass(frozen=True)
 class PauseSnapshot:
-    """The six fields :meth:`RunState.clear_pause` clears, captured just before a
+    """The eight fields :meth:`RunState.clear_pause` clears, captured just before a
     resume clears them so a resume that fails before its engine starts can put
     them back (:meth:`RunState.restore_pause`). Without it that failure left an
     escalated story behind a run with no pause stage, which ``resolve`` refused."""
@@ -1278,6 +1278,8 @@ class PauseSnapshot:
     paused_reason: str | None
     paused_stage: str | None
     paused_story_key: str | None
+    paused_reset_at: str | None
+    paused_limit_class: str | None
     stopped: bool
     crashed: bool
     crash_error: str | None
@@ -1375,6 +1377,15 @@ class RunState:
     paused_reason: str | None = None
     paused_stage: str | None = None
     paused_story_key: str | None = None
+    # A usage-limit pause's structured facts (DW-591), recorded with the pause by
+    # :meth:`record_pause` so `resolve --at-reset` never parses the reason prose.
+    # `paused_reset_at`: the limit's reset as ISO-8601, only when it resolved
+    # (an unresolved clause keeps its raw text in `paused_reason` alone).
+    # `paused_limit_class`: the list the live sighting matched
+    # (`SessionResult.usage_limit_class`, "blocked" | "wait"). Both None on every
+    # other pause and on state written before they existed.
+    paused_reset_at: str | None = None
+    paused_limit_class: str | None = None
     finished: bool = False
     # deliberately stopped (bmad-loop stop / engine SIGTERM); distinct from a
     # crash. Resume clears it via clear_pause(), so a stopped run is resumable.
@@ -1563,10 +1574,30 @@ class RunState:
         """Story keys this run already drove to a terminal phase."""
         return {k for k, t in self.tasks.items() if t.terminal}
 
+    def record_pause(
+        self,
+        reason: str,
+        stage: str,
+        story_key: str | None,
+        *,
+        reset_at: str | None = None,
+        limit_class: str | None = None,
+    ) -> None:
+        """Record a pause. The usage-limit facts are written on every pause, so a
+        pause that is not a usage limit stores None rather than inheriting a
+        previous pause's values."""
+        self.paused_reason = reason
+        self.paused_stage = stage
+        self.paused_story_key = story_key
+        self.paused_reset_at = reset_at
+        self.paused_limit_class = limit_class
+
     def clear_pause(self) -> None:
         self.paused_reason = None
         self.paused_stage = None
         self.paused_story_key = None
+        self.paused_reset_at = None
+        self.paused_limit_class = None
         self.stopped = False
         self.crashed = False
         self.crash_error = None
@@ -1577,6 +1608,8 @@ class RunState:
             paused_reason=self.paused_reason,
             paused_stage=self.paused_stage,
             paused_story_key=self.paused_story_key,
+            paused_reset_at=self.paused_reset_at,
+            paused_limit_class=self.paused_limit_class,
             stopped=self.stopped,
             crashed=self.crashed,
             crash_error=self.crash_error,
@@ -1587,6 +1620,8 @@ class RunState:
         self.paused_reason = snapshot.paused_reason
         self.paused_stage = snapshot.paused_stage
         self.paused_story_key = snapshot.paused_story_key
+        self.paused_reset_at = snapshot.paused_reset_at
+        self.paused_limit_class = snapshot.paused_limit_class
         self.stopped = snapshot.stopped
         self.crashed = snapshot.crashed
         self.crash_error = snapshot.crash_error
@@ -1628,6 +1663,8 @@ class RunState:
             "paused_reason": self.paused_reason,
             "paused_stage": self.paused_stage,
             "paused_story_key": self.paused_story_key,
+            "paused_reset_at": self.paused_reset_at,
+            "paused_limit_class": self.paused_limit_class,
             "finished": self.finished,
             "stopped": self.stopped,
             "crashed": self.crashed,
@@ -1678,6 +1715,8 @@ class RunState:
             paused_reason=d.get("paused_reason"),
             paused_stage=d.get("paused_stage"),
             paused_story_key=d.get("paused_story_key"),
+            paused_reset_at=d.get("paused_reset_at"),
+            paused_limit_class=d.get("paused_limit_class"),
             finished=bool(d.get("finished", False)),
             stopped=bool(d.get("stopped", False)),
             crashed=bool(d.get("crashed", False)),

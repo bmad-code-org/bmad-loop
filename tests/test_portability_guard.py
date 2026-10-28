@@ -1065,6 +1065,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `session-end` / `workflow-end` (DW-591): which usage-limit list the live
         # sighting matched — one of two literal enum strings (`blocked`, `wait`).
         "usage_limit_class",
+        # `run-paused` (DW-591): a usage-limit pause's resolved reset — always an
+        # ISO-8601 instant (`usagereset.resolved_reset`), never the raw clause.
+        "usage_limit_reset_at",
         "verification_sequence",
         "verification_stage",
         "via",
