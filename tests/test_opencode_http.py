@@ -4563,6 +4563,24 @@ def test_v2_dispatch_filters_child_sessions_and_maps_execution_events(tmp_path):
         assert sess.events.get_nowait() == queued, etype
 
 
+def test_v2_dispatch_renders_form_created_of_this_session_only(tmp_path):
+    """`form.created` names its session only inside the nested form: it must
+    pass the session filter into both sinks for our session, and a child
+    session's form must still be filtered out."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    sess.protocol = V2Protocol()
+    fields = [{"key": "q0", "title": "Database", "description": "Which one?"}]
+    for sid in ("ses_child", "ses_test"):
+        form = {"id": "frm_1", "sessionID": sid, "title": "Questions", "fields": fields}
+        adapter._dispatch_sse(sess, _v2_frame("form.created", form=form))
+    adapter._dispatch_sse(sess, _v2_frame("form.cancelled", id="frm_1", sessionID="ses_test"))
+    log = _log_text(log_path)
+    assert log.count("[bmad] form ask:") == 1
+    assert '[bmad] form ask: Questions ["Database: Which one?"]\n' in log
+    assert "[bmad] form cancelled\n" in log
+    assert [r["type"] for r in read_jsonl(event_path)] == ["form.created", "form.cancelled"]
+
+
 def test_v2_html_health_reports_protocol_mismatch(tmp_path, v2_fake):
     """`--version` said 2.x but `/api/info` answers the web-UI HTML shell: the
     give-up error names the mismatch on the 2.x health endpoint."""

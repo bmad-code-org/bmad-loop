@@ -235,7 +235,21 @@ and a closed port:
   /api/session/{id}/permission/{requestID}/reply {"decision":
   "once"|"always"|"reject", "message"?}`` → 204, then ``permission.replied
   {sessionID, requestID, reply}``. No ``form.*`` frame fired (the adapter's
-  ``question`` deny keeps forms away); none is rendered.
+  ``question`` deny keeps forms away).
+- Forms — pinned live against 2.0.32 (2026-10-28) by lifting that deny in a
+  probe and having the mock call the ``question`` tool. The call parks on
+  ``form.created {form: {id, sessionID, title, metadata {kind: "question",
+  tool {messageID, id}}, fields}}``, the one frame whose session id is
+  nested (``data.form.sessionID``, no top-level ``sessionID``). The tool maps
+  each question to a field ``{key: "q<n>", title: <header>, description:
+  <question>, type: "string"|"multiselect", options [{value, label,
+  description}], custom}``. The reply is ``POST /api/session/{id}/form/
+  {formID}/reply {"answer": {<key>: value}}`` → 204, then ``form.replied {id,
+  sessionID, answer}`` and the tool's ``session.tool.success``. ``DELETE
+  /api/session/{id}/form/{formID}`` → 204 and an interrupt both end it
+  ``form.cancelled {id, sessionID}``, then ``session.tool.failed`` with
+  ``error.type aborted`` ("The user dismissed this question" / "Tool
+  execution interrupted"). The adapter renders all three and never replies.
 - A provider failure surfaces ONLY as frames, each with a structured
   ``error {type, message, status?, response? {body}}``: ``session.retry.
   scheduled {attempt, at, error}`` per backoff (attempts 2..11, ~2/4/8 s then
@@ -890,6 +904,22 @@ def _error_summary(error: Any) -> str:
     return _sum_args(text)
 
 
+def _form_asks(fields: Any) -> list[str]:
+    """``<title>: <description>`` per field of a V2 ``form.created`` form (the
+    ``question`` tool maps each question's ``header`` to ``title`` and its text
+    to ``description``) — what the form asks, without its options."""
+    if not isinstance(fields, list):
+        return []
+    asks: list[str] = []
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        label = field.get("title") or field.get("key") or "?"
+        description = field.get("description")
+        asks.append(f"{label}: {description}" if description else str(label))
+    return asks
+
+
 # `GET /api/session/{id}/message` page size for the transcript walk: the
 # server's maximum — `limit=201` is a 400, never clamped (pinned 2.0.27).
 _V2_PAGE_LIMIT = 200
@@ -1104,7 +1134,13 @@ class V2Protocol(OpencodeProtocol):
 
     def frame_payload(self, event: dict[str, Any]) -> tuple[Any, Any]:
         data = event.get("data") or {}
-        return data, data.get("sessionID")
+        session_id = data.get("sessionID")
+        if session_id is None and event.get("type") == "form.created":
+            # The one frame that nests its session id: `form.created` carries
+            # the whole `Form.Info` under `data.form` (pinned 2.0.32).
+            form = data.get("form")
+            session_id = form.get("sessionID") if isinstance(form, dict) else None
+        return data, session_id
 
     def render_line(self, msg_roles: dict[Any, Any], etype: str, props: Any) -> str | None:
         """The inline-log line for one V2 frame, or None for a frame that
@@ -1135,6 +1171,24 @@ class V2Protocol(OpencodeProtocol):
             )
         if etype == "permission.replied":
             return f"{_TOOL_COLOR}[bmad] perm reply: {props.get('reply') or '?'}{_RESET}\n"
+        if etype == "form.created":
+            # A form parks the turn until it is replied or cancelled, so this
+            # line is what explains the stall. Any other `form.*` type renders
+            # nothing (the fall-through below).
+            form = props.get("form")
+            form = form if isinstance(form, dict) else {}
+            asks = _sum_args(_form_asks(form.get("fields")))
+            return (
+                f"{_TOOL_COLOR}[bmad] form ask: {form.get('title') or '?'}"
+                f"{(' ' + asks) if asks else ''}{_RESET}\n"
+            )
+        if etype == "form.replied":
+            answer = _sum_args(props.get("answer"))
+            return f"{_TOOL_COLOR}[bmad] form reply:{(' ' + answer) if answer else ''}{_RESET}\n"
+        if etype == "form.cancelled":
+            # The payload is only `id` / `sessionID`; the reason is on the
+            # parked tool's `session.tool.failed` line that follows.
+            return f"{_TOOL_COLOR}[bmad] form cancelled{_RESET}\n"
         if etype == "session.retry.scheduled":
             detail = _error_summary(props.get("error"))
             return (

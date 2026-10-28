@@ -122,6 +122,8 @@ breaking changes may land in a minor release.
 - Write each OpenCode 2.x provider-error event to `logs/<task-id>.provider-errors.log`;
   classify rate-limit and transport outages there as environment faults and quota
   failures as a blocking usage limit (#847).
+- Render OpenCode 2.x forms in the `[bmad]` transcript: a `form ask` line naming the form
+  and its questions when one parks the turn, then `form reply` or `form cancelled`.
 - Add the `subagent_transcript_dir` CLI profile field: a subagent transcript tree whose
   writes count as session activity for the idle notice (#858).
 - Name the tool call an idle Claude session is waiting on: `session-idle` carries
