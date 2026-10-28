@@ -2268,10 +2268,15 @@ def _report_permission_mode(
     ``runsetup.make_adapters``. Otherwise an ok posture line
     (``adapter.permission-mode``) whose isolation coupling is advisory only: a
     bypass role with no worktree isolation is pointed at the sandboxed mode when
-    its profile maps one here. The one warning is a Codex-family role sandboxed
-    under worktree isolation, where git cannot write the linked worktree's gitdir
-    (it lives under the main repo's ``.git/worktrees/``, outside the sandbox's
-    writable roots), so the dev skill's preflight and commit fail."""
+    its profile maps one here. A Codex-family role sandboxed under worktree
+    isolation needs the mode's ``linked_worktree_args`` grant: its sandbox keeps the
+    linked worktree's gitdir (under the main repo's ``.git/worktrees/``) and the
+    common dir read-only otherwise, so the dev skill's preflight and commit fail.
+    The role is ok when its launch carries that grant (the resolved profile
+    declares it and ``cfg.extra_args`` is None). It warns when the grant cannot
+    ride: the resolved profile declares none, or a non-None ``extra_args`` (``()``
+    included) replaces the mode's args, and the grant with them, as
+    ``GenericAdapter.interactive_argv`` does."""
     from .adapters.profile import ProfileError
 
     mode = cfg.permission_mode
@@ -2283,7 +2288,7 @@ def _report_permission_mode(
         "platform": sys.platform,
     }
     try:
-        profile.for_permission_mode(mode, platform=sys.platform)
+        resolved = profile.for_permission_mode(mode, platform=sys.platform)
     except ProfileError as e:
         report.fail(
             "adapter.permission-mode-unsupported",
@@ -2303,12 +2308,30 @@ def _report_permission_mode(
                 message += '; consider adapter.permission_mode = "sandboxed"'
         report.ok("adapter.permission-mode", message, detail)
     elif isolation == "worktree" and profile.hooks.dialect == "codex-hooks-json":
+        fallback = 'use scm.isolation = "none" or permission_mode = "bypass"'
+        if not resolved.linked_worktree_args:
+            why = f"its [permission_modes.{mode}] declares no linked_worktree_args grant"
+            fix = fallback
+        elif cfg.extra_args is not None:
+            why = (
+                "adapter.extra_args replaces the mode's args, dropping their "
+                "linked_worktree_args grant"
+            )
+            fix = f"drop extra_args, or {fallback}"
+        else:
+            report.ok(
+                "adapter.permission-mode",
+                f"{profile.name} {role}: {mode} under scm.isolation=worktree, with write "
+                "grants for the linked worktree's gitdir and the main repo's .git",
+                detail,
+            )
+            return
         report.warn(
             "adapter.permission-mode",
-            f"{profile.name} {role}: {mode} under scm.isolation=worktree — the sandbox "
-            "keeps a linked worktree's gitdir (under the main repo's .git/worktrees/) "
-            "read-only, so git add/commit fail in isolated sessions; use "
-            'scm.isolation = "none" or permission_mode = "bypass" for this role',
+            f"{profile.name} {role}: {mode} under scm.isolation=worktree — {why}, so the "
+            "sandbox keeps the linked worktree's gitdir (under the main repo's "
+            f".git/worktrees/) and the main repo's .git read-only and git add/commit fail "
+            f"in isolated sessions; {fix} for this role",
             detail,
         )
     else:

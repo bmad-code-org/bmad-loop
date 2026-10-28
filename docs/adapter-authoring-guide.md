@@ -519,10 +519,25 @@ deny_guard = ['Do you want to procee[d]\?']
 default) launches `bypass_args`. Any other mode launches the args of the profile's
 `[permission_modes.<mode>]` table in their place:
 
-| Field       | Required | Meaning                                                                                                  |
-| ----------- | -------- | -------------------------------------------------------------------------------------------------------- |
-| `args`      | ✅       | Launch args that stand in for `bypass_args`. A policy `extra_args` still replaces them.                  |
-| `platforms` |          | `sys.platform` values the mapping works on (`linux`, `darwin`, `win32`). Empty or unset: every platform. |
+| Field                  | Required | Meaning                                                                                                                                    |
+| ---------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `args`                 | ✅       | Launch args that stand in for `bypass_args`. A policy `extra_args` still replaces them.                                                    |
+| `platforms`            |          | `sys.platform` values the mapping works on (`linux`, `darwin`, `win32`). Empty or unset: every platform.                                   |
+| `linked_worktree_args` |          | Args appended after `args` when the session runs in a linked worktree, with `{gitdir}` and `{common_dir}` filled in. Empty or unset: none. |
+
+`linked_worktree_args` is for a sandbox that must be granted a linked worktree's git
+directories explicitly. When the session's cwd is in a linked worktree (as under
+`scm.isolation = "worktree"`), the generic adapter asks git for that worktree's gitdir
+(`<main>/.git/worktrees/<name>`) and the common dir (`<main>/.git`), resolves both, and
+appends the list after the mode's `args` with each `{gitdir}` / `{common_dir}` replaced by
+that path written as a TOML basic string, quotes included. In a main checkout nothing is
+appended. Under `bypass`, or when a policy `extra_args` replaces the mode's args, nothing is
+appended and git is not asked.
+
+If git cannot answer, or a path cannot be written as TOML, the session refuses to launch
+rather than start without the grant. Each entry must be a non-empty string, and at least one
+entry must use a placeholder: an arg with no path in it belongs in `args`. The config digest
+hashes the unfilled list, so a resumed run's digest does not depend on the worktree path.
 
 A profile without the table, or on an excluded platform, refuses the mode at run start and
 in `validate` (`adapter.permission-mode-unsupported`). `opencode-http` never launches
@@ -537,14 +552,21 @@ return to the agent as an error. The shipped mappings, both for `linux` and `dar
   sandbox with no unsandboxed retry. Sandboxed Bash can run git and write `.git`; network is
   denied. On Linux the Bash sandbox needs bubblewrap and socat installed, or the session
   refuses to start.
-- **codex:** a `-c` permission profile extending `:workspace` with a `.git` write grant,
-  plus `--ask-for-approval never`. Network is off. In a linked worktree the gitdir under
-  the main repo's `.git/worktrees/` stays read-only, so git add and commit fail there;
-  `validate` warns about sandboxed Codex under `scm.isolation = "worktree"`.
+- **codex:** a `-c` permission profile `bmad_loop` extending `:workspace` with a `.git`
+  write grant, plus `--ask-for-approval never`. Network is off. Its `linked_worktree_args`
+  define a child profile `bmad_loop_worktree` that extends `bmad_loop` with write grants
+  for the linked worktree's gitdir and the common dir, and select it with a later
+  `default_permissions`, so git add and commit work in a worktree checkout. `validate`
+  warns about sandboxed Codex under `scm.isolation = "worktree"` only when that grant
+  cannot ride: an `extra_args` override, or a profile whose mode declares no
+  `linked_worktree_args`.
 
 The sandbox confines the session, not what bmad-loop later runs from the checkout. Both
 mappings leave `.git` writable, hooks and config included, and the orchestrator runs
-`[verify] commands` and its own git commits there unsandboxed.
+`[verify] commands` and its own git commits there unsandboxed. In a linked worktree,
+Codex's common-dir grant opens the main repo's `.git` (hooks, config, the main index and
+refs) to the session, the same exposure a sandboxed session in the main checkout already
+has through the `.git` grant.
 
 Both CLIs show a one-time workspace-trust dialog in a directory they have not seen.
 `validate` reports each role's posture as `adapter.permission-mode`.

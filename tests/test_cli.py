@@ -73,6 +73,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import probe as probe_mod
 from bmad_loop import runs, runsetup, verify
 from bmad_loop.adapters import multiplexer as mux_mod
+from bmad_loop.adapters.profile import CLIProfile
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.plugins import GrantSet
 from bmad_loop.plugins.store import load_grants
@@ -13409,7 +13410,14 @@ def test_validate_text_mode_prints_the_permission_posture(project, capsys, monke
     assert "claude dev: bypass, unsandboxed (scm.isolation=none)" in capsys.readouterr().out
 
 
-def _posture(monkeypatch, platform: str, profile: str, mode: str, isolation: str = "none"):
+def _posture(
+    monkeypatch,
+    platform: str,
+    profile: str | CLIProfile,
+    mode: str,
+    isolation: str = "none",
+    extra_args: tuple[str, ...] | None = None,
+):
     from bmad_loop.adapters.profile import get_profile
     from bmad_loop.checks import ValidationReport
 
@@ -13418,8 +13426,8 @@ def _posture(monkeypatch, platform: str, profile: str, mode: str, isolation: str
     cli._report_permission_mode(
         report,
         "dev",
-        types.SimpleNamespace(permission_mode=mode),
-        get_profile(profile),
+        types.SimpleNamespace(permission_mode=mode, extra_args=extra_args),
+        get_profile(profile) if isinstance(profile, str) else profile,
         isolation,
     )
     monkeypatch.undo()
@@ -13469,17 +13477,72 @@ def test_store_sandboxed_roles_names_the_non_bypass_launch_roles(tmp_path):
     assert cli._store_sandboxed_roles(policy_mod.load(policy), cli.worksource.SOURCE_TICKETS) == ()
 
 
-def test_permission_posture_warns_sandboxed_codex_under_worktree_isolation(monkeypatch):
-    """Codex's sandbox keeps a linked worktree's gitdir read-only, so git
-    add/commit fail there: a warning, not the ok line. Claude's sandbox passes in
-    a linked worktree and keeps the ok line."""
+def test_permission_posture_sandboxed_codex_under_worktree_isolation_carries_the_grant(
+    monkeypatch,
+):
+    """Codex's sandboxed mode declares `linked_worktree_args`, which grant a linked
+    worktree's gitdir and the main repo's .git, so a sandboxed Codex role under
+    worktree isolation can commit: the ok line, naming the grant. Claude's sandbox
+    needs no grant and keeps its plain ok line.
+
+    ABLATION: warn unconditionally in the codex-hooks-json arm and this reddens."""
     (codex,) = _posture(monkeypatch, "linux", "codex", "sandboxed", isolation="worktree")
-    assert (codex.check, codex.severity) == ("adapter.permission-mode", "warning")
-    assert ".git/worktrees/" in codex.message
+    assert (codex.check, codex.severity) == ("adapter.permission-mode", "ok")
+    assert codex.message == (
+        "codex dev: sandboxed under scm.isolation=worktree, with write grants for the "
+        "linked worktree's gitdir and the main repo's .git"
+    )
+    assert codex.detail == {
+        "role": "dev",
+        "profile": "codex",
+        "mode": "sandboxed",
+        "isolation": "worktree",
+        "platform": "linux",
+    }
     (claude,) = _posture(monkeypatch, "linux", "claude", "sandboxed", isolation="worktree")
-    assert claude.severity == "ok"
+    assert (claude.severity, claude.message) == ("ok", "claude dev: sandboxed")
     (codex_main,) = _posture(monkeypatch, "linux", "codex", "sandboxed")
-    assert codex_main.severity == "ok"
+    assert (codex_main.severity, codex_main.message) == ("ok", "codex dev: sandboxed")
+
+
+@pytest.mark.parametrize("extra_args", [("--custom",), ()], ids=["override", "empty"])
+def test_permission_posture_warns_when_extra_args_drops_the_worktree_grant(monkeypatch, extra_args):
+    """A non-None `extra_args` (an empty one included) replaces the mode's args,
+    and the linked-worktree grant rides with them: git add/commit fail again."""
+    (finding,) = _posture(
+        monkeypatch, "linux", "codex", "sandboxed", isolation="worktree", extra_args=extra_args
+    )
+    assert (finding.check, finding.severity) == ("adapter.permission-mode", "warning")
+    assert "adapter.extra_args replaces the mode's args" in finding.message
+    assert ".git/worktrees/" in finding.message
+    assert finding.message.endswith(
+        'drop extra_args, or use scm.isolation = "none" or permission_mode = "bypass" '
+        "for this role"
+    )
+    # Without worktree isolation the same override needs no grant.
+    (main,) = _posture(monkeypatch, "linux", "codex", "sandboxed", extra_args=extra_args)
+    assert main.severity == "ok"
+
+
+def test_permission_posture_warns_a_codex_mode_without_a_worktree_grant(monkeypatch):
+    """A Codex-family profile (a user overlay, say) whose sandboxed mode declares no
+    `linked_worktree_args` cannot open the linked worktree's gitdir: a warning."""
+    from bmad_loop.adapters.profile import get_profile
+
+    codex = get_profile("codex")
+    bare = dataclasses.replace(
+        codex,
+        permission_modes={
+            "sandboxed": dataclasses.replace(
+                codex.permission_modes["sandboxed"], linked_worktree_args=()
+            )
+        },
+    )
+    (finding,) = _posture(monkeypatch, "linux", bare, "sandboxed", isolation="worktree")
+    assert (finding.check, finding.severity) == ("adapter.permission-mode", "warning")
+    assert "declares no linked_worktree_args grant" in finding.message
+    assert ".git/worktrees/" in finding.message
+    assert "drop extra_args" not in finding.message
 
 
 def _stub_launch_probe(monkeypatch, *results):

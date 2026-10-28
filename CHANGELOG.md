@@ -218,6 +218,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Let sandboxed Codex sessions commit under worktree isolation: grant them write access to
+  the linked worktree's gitdir and the main repo's `.git`. `validate` no longer warns
+  unless `extra_args` drops the grant.
 - Pause a tickets resume at `ticket-tree` (`binding-moved`) when an in-flight unit's ticket
   was moved with `tickets.py move` or its plan is gone, naming the old and new ref and plan,
   instead of re-dispatching a ref the tree no longer holds (DW-575).

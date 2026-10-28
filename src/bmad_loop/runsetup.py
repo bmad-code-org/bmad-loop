@@ -169,8 +169,9 @@ def config_digest(
       keeps this complete: walk ``GenericAdapter.interactive_argv`` and
       ``interactive_env`` and every token there traces back to one of
       ``binary`` / ``launch_args`` / ``bypass_args`` / ``linked_worktree_args``
-      (its paths filled in) / ``model_flag`` / ``prompt_template`` / ``env`` on
-      the *resolved* profile, or to
+      (hashed as the UNFILLED template, placeholders and all, so a resumed run's
+      digest does not depend on its worktree's path) / ``model_flag`` /
+      ``prompt_template`` / ``env`` on the *resolved* profile, or to
       ``extra_args`` on the resolved adapter — plus ``session_id_flag``, which
       ``build_command`` appends (with a minted id) to the launched argv only.
       The opencode-http builder reads a strict SUBSET of those — ``_serve_argv``

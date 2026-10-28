@@ -358,7 +358,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A stage inherits the base mode even when it switches client; `[adapter.<stage>] permission_mode` overrides it.
   - `bmad-loop resolve` sessions, where a human is present, keep the bypass flags whatever the mode.
   - `validate` reports each role's permission posture as `adapter.permission-mode`, suggesting `sandboxed` for an unsandboxed role without worktree isolation when the profile maps it. The note is advisory: a worktree is not a security boundary.
-  - Sandboxed Codex under `scm.isolation = "worktree"` is a warning: the sandbox keeps a linked worktree's gitdir read-only, so git add and commit fail.
+  - A sandboxed Codex session in a linked worktree (`scm.isolation = "worktree"`) gets exact-path write grants for that worktree's gitdir and the main repo's shared `.git`, so git add and commit work. `validate` warns only when the grant cannot ride: an `extra_args` override replaces the mode's args and drops it, or the profile's mode declares no `linked_worktree_args`.
   - `tickets.store-sandbox` also warns when a sandboxed role writes a ticket store outside its cwd.
 - **Config:** `[adapter] permission_mode`, `[adapter.dev]` / `[adapter.review]` / `[adapter.triage]` / `[adapter.retro]` `permission_mode`; profile table `[permission_modes.<mode>]`
 - **Tested by:** `tests/test_policy.py`, `tests/test_profile.py`, `tests/test_runsetup.py`, `tests/test_cli.py`, `tests/test_codex_trust.py`, `tests/test_install.py`
