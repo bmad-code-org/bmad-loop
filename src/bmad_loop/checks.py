@@ -83,6 +83,9 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         # each role's permission posture (bypass/sandboxed, scm.isolation); a
         # warning where a mapping is known not to work under worktree isolation
         "adapter.permission-mode",
+        # `--probes`: one launch per distinct role launch, its first screen
+        # matched against the profile's parked-prompt patterns (#727)
+        "adapter.launch-probe",
         "adapter.external",
         "adapter.external-profile",
         "queue.sprint-status",

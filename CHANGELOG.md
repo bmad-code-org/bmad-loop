@@ -9,6 +9,10 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add the `adapter.launch-probe` check to `validate --probes`: launch each role's coding
+  CLI once (roles with the same argv share a launch) with no prompt, and fail when its
+  first screen shows a startup dialog an unattended session would park on. A screen the
+  probe could not see is a warning.
 - Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
   Claude Code waiting out a usage-window reset and the transcript is idle, freeze the
   session timeout and hold the stall nudge, so the session finishes after the CLI's own

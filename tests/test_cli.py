@@ -13193,6 +13193,179 @@ def test_permission_posture_warns_sandboxed_codex_under_worktree_isolation(monke
     assert codex_main.severity == "ok"
 
 
+def _stub_launch_probe(monkeypatch, *results):
+    """Replace the launch-screen probe (the seam: no multiplexer, no CLI) with one
+    answering ``results`` in turn; returns the recorded calls."""
+    calls: list[dict] = []
+    answers = list(results)
+
+    def fake(profile, **kwargs):
+        calls.append({"profile": profile, **kwargs})
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    monkeypatch.setattr(probe_mod, "launch_screen_probe", fake)
+    return calls
+
+
+def test_validate_probes_fails_a_launch_parked_on_a_startup_dialog(project, capsys, monkeypatch):
+    """A dialog seen on the first screen fails validate: an unattended session
+    would park there. All four default roles launch claude identically, so the
+    probe runs once and the one finding names every role with its mode."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    calls = _stub_launch_probe(
+        monkeypatch,
+        probe_mod.LaunchScreenResult(
+            probe_mod.LAUNCH_PARKED,
+            "a parked prompt is on the launch screen",
+            "Do you trust the files in this folder?",
+            "│ Do you trust the files in this folder? │",
+        ),
+    )
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    assert len(calls) == 1
+    assert calls[0]["project"] == project.project and calls[0]["model"] == "opus"
+    (finding,) = _permission_findings(doc, "adapter.launch-probe")
+    assert finding["severity"] == "problem"
+    assert finding["detail"]["verdict"] == "parked"
+    assert finding["detail"]["profile"] == "claude"
+    assert finding["detail"]["roles"] == [
+        {"role": role, "mode": "bypass"} for role in ("dev", "review", "triage", "retro")
+    ]
+    assert "Do you trust the files in this folder?" in finding["message"]
+    assert "accept or configure it once by hand" in finding["message"]
+    assert [f["check"] for f in doc["findings"] if f["severity"] == "problem"] == [
+        "adapter.launch-probe"
+    ]
+
+
+def test_validate_probes_launch_clean_is_ok_and_each_distinct_launch_runs_once(
+    project, capsys, monkeypatch
+):
+    """Roles sharing a launch share one probe; a role whose permission mode swaps
+    the launch args is its own launch. ABLATION: key the launches on the role
+    and this reddens (four calls)."""
+    if sys.platform == "win32":
+        pytest.skip("claude maps the sandboxed mode on linux/darwin only")
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=CLAUDE_ONLY_POLICY + '[adapter.review]\npermission_mode = "sandboxed"\n',
+    )
+    calls = _stub_launch_probe(
+        monkeypatch,
+        probe_mod.LaunchScreenResult(probe_mod.LAUNCH_CLEAN, "no parked prompt within 15s"),
+    )
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys)
+
+    assert len(calls) == 2
+    assert calls[0]["profile"].bypass_args != calls[1]["profile"].bypass_args
+    findings = _permission_findings(doc, "adapter.launch-probe")
+    assert {f["severity"] for f in findings} == {"ok"}
+    assert [[r["role"] for r in f["detail"]["roles"]] for f in findings] == [
+        ["dev", "triage", "retro"],
+        ["review"],
+    ]
+    assert findings[1]["detail"]["roles"] == [{"role": "review", "mode": "sandboxed"}]
+
+
+def test_validate_probes_skips_a_role_whose_permission_mode_is_unmapped(
+    project, capsys, monkeypatch
+):
+    """gemini maps no sandboxed mode: that role is
+    `adapter.permission-mode-unsupported`'s finding, and nothing launches it."""
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=CLAUDE_ONLY_POLICY
+        + '[adapter.review]\nname = "gemini"\npermission_mode = "sandboxed"\n',
+    )
+    calls = _stub_launch_probe(
+        monkeypatch, probe_mod.LaunchScreenResult(probe_mod.LAUNCH_CLEAN, "fixture")
+    )
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys, rc=1)
+
+    assert [c["profile"].name for c in calls] == ["claude"]
+    (finding,) = _permission_findings(doc, "adapter.launch-probe")
+    assert [r["role"] for r in finding["detail"]["roles"]] == ["dev", "triage", "retro"]
+    assert _permission_findings(doc, "adapter.permission-mode-unsupported")
+
+
+def test_validate_without_probes_never_launches_the_cli(project, capsys, monkeypatch):
+    """The opt-in, with no "not run" line: plain validate output is unchanged.
+
+    ABLATION: drop the `--probes` gate before `_report_launch_probes` and this
+    reddens (a call and a finding)."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    calls = _stub_launch_probe(
+        monkeypatch, probe_mod.LaunchScreenResult(probe_mod.LAUNCH_PARKED, "", "x", "x")
+    )
+
+    doc = machine_json(_validate_argv(project), capsys)
+
+    assert calls == []
+    assert not [f for f in doc["findings"] if f["check"] == "adapter.launch-probe"]
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        probe_mod.LAUNCH_DIED,
+        probe_mod.LAUNCH_FAILED,
+        probe_mod.LAUNCH_CAPTURE_FAILED,
+        probe_mod.LAUNCH_UNAVAILABLE,
+    ],
+)
+def test_validate_probes_an_unseen_screen_is_a_warning(project, capsys, monkeypatch, verdict):
+    """A probe that could not see the screen is no proof of a dialog, so the
+    exit code stays 0; the log tail's last line rides on the message."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    _stub_launch_probe(
+        monkeypatch,
+        probe_mod.LaunchScreenResult(verdict, "why", log_tail="booting\nError: no tty\n"),
+    )
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys)
+
+    (finding,) = _permission_findings(doc, "adapter.launch-probe")
+    assert finding["severity"] == "warning"
+    assert finding["detail"]["log_tail"] == "booting\nError: no tty\n"
+    assert finding["message"].endswith(f"({verdict}): why — Error: no tty")
+
+
+def test_launch_probe_skipped_is_ok_and_worktree_isolation_is_noted(tmp_path, monkeypatch):
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.checks import ValidationReport
+
+    policy = tmp_path / "policy.toml"
+    policy.write_text(
+        '[adapter]\nname = "claude"\n[adapter.review]\nname = "gemini"\n'
+        '[scm]\nisolation = "worktree"\n',
+        encoding="utf-8",
+    )
+    pol = policy_mod.load(policy)
+    answers = {
+        "claude": probe_mod.LaunchScreenResult(probe_mod.LAUNCH_CLEAN, "fixture"),
+        "gemini": probe_mod.LaunchScreenResult(probe_mod.LAUNCH_SKIPPED, "no patterns"),
+    }
+    report = ValidationReport()
+    monkeypatch.setattr(
+        probe_mod, "launch_screen_probe", lambda profile, **_kw: answers[profile.name]
+    )
+    cli._report_launch_probes(
+        report, pol, {"claude": get_profile("claude"), "gemini": get_profile("gemini")}, tmp_path
+    )
+    by_profile = {f.detail["profile"]: f for f in report.findings if f.detail}
+    assert {f.severity for f in report.findings} == {"ok"}
+    assert by_profile["claude"].message.endswith("not inside a session worktree")
+    assert "nothing launched" in by_profile["gemini"].message
+
+
 def test_validate_bypass_silent_for_a_stage_that_switches_client(project, capsys):
     """A stage that switches client inherits no `extra_args` (policy resolves it to
     None), so it launches with its own client's bypass flags — no dev finding.
@@ -14338,6 +14511,13 @@ def _make_validate_pass(
     git(project.project, "commit", "-q", "-m", "validate fixture")
     monkeypatch.setattr(cli.shutil, "which", lambda tool: f"/usr/bin/{tool}")
     monkeypatch.setattr(probe_mod, "binary_runs", lambda *_a, **_kw: 0)
+    # `--probes` launches the CLI in a multiplexer: a host property too. The
+    # probe itself is tests/test_launch_probe.py's.
+    monkeypatch.setattr(
+        probe_mod,
+        "launch_screen_probe",
+        lambda *_a, **_kw: probe_mod.LaunchScreenResult(probe_mod.LAUNCH_CLEAN, "fixture"),
+    )
     # A sandbox created during the test has no Codex trust grant, even when its
     # registration is valid. Trust classification itself is tested separately.
     from bmad_loop import codex_trust

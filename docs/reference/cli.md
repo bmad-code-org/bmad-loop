@@ -54,15 +54,15 @@ Runs the preflight checks.
 bmad-loop validate [--project PROJECT] [--spec FOLDER] [--render-probe] [--probes] [--json]
 ```
 
-| Option           | Description                                                                                                                                                                                            |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--spec FOLDER`  | Validate stories mode against `FOLDER/stories.yaml`. Overrides `[stories] source` and skips the sprint-status gate.                                                                                    |
-| `--render-probe` | Also run each dev skill's render command in a throwaway copy of `_bmad/` (needs network access).                                                                                                       |
-| `--probes`       | Also run every `[environment]` probe on this host. All probes run, each bounded by `probe_timeout_s`; any failure is a problem. In tickets mode, also run the project's `tickets.py` capability probe. |
-| `--json`         | Print the findings as one JSON document.                                                                                                                                                               |
+| Option           | Description                                                                                                                                                                                                                                                                                                          |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--spec FOLDER`  | Validate stories mode against `FOLDER/stories.yaml`. Overrides `[stories] source` and skips the sprint-status gate.                                                                                                                                                                                                  |
+| `--render-probe` | Also run each dev skill's render command in a throwaway copy of `_bmad/` (needs network access).                                                                                                                                                                                                                     |
+| `--probes`       | Also run every `[environment]` probe on this host. All probes run, each bounded by `probe_timeout_s`; any failure is a problem. Also launch each role's coding CLI once, with no prompt, and fail on a startup dialog its first screen shows. In tickets mode, also run the project's `tickets.py` capability probe. |
+| `--json`         | Print the findings as one JSON document.                                                                                                                                                                                                                                                                             |
 
 - Exit 0 when no finding has severity `problem`, else 1. Warnings do not change the exit code.
-- Runs no project-controlled commands unless `--render-probe` or `--probes` is given. One exception: in tickets mode, when an unlanded deferred-work entry declares a `gate:` token, it runs the project's `tickets.py next` to compare the gate against the startable tickets.
+- Runs no project-controlled commands, and launches no coding CLI, unless `--render-probe` or `--probes` is given. One exception: in tickets mode, when an unlanded deferred-work entry declares a `gate:` token, it runs the project's `tickets.py next` to compare the gate against the startable tickets.
 - Checks are chained: when an earlier gate fails (for example the policy does not load), the checks that depend on it emit nothing. A missing check id means the check did not run, not that it passed. Every id is listed under [validate checks](#validate-checks).
 
 JSON: [`validate --json`](#validate---json).
@@ -626,6 +626,7 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `policy.bypass-dropped`                | warning                | an explicit `extra_args` drops the profile's `bypass_args`                                                                                              |
 | `adapter.permission-mode-unsupported`  | problem                | a role's profile cannot run its `permission_mode` on this platform                                                                                      |
 | `adapter.permission-mode`              | ok / warning           | each role's permission posture; a warning for sandboxed Codex under worktree isolation                                                                  |
+| `adapter.launch-probe`                 | ok / warning / problem | `--probes`: each distinct role launch's first screen; a startup dialog is a problem, a screen it could not see a warning                                |
 | `adapter.profile`                      | problem                | a role's adapter name does not resolve to a loadable profile                                                                                            |
 | `adapter.binary`                       | ok / problem           | the profile binary is on `PATH`                                                                                                                         |
 | `adapter.binary-unrunnable`            | warning                | a packaged profile's binary is on `PATH` but `--version` fails                                                                                          |

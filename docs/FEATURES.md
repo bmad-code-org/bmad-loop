@@ -103,6 +103,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
   - A dev, review, fix, triage, migration or blocking-workflow session that did no work, or sat parked on a prompt only a human should answer, pauses the run instead of being charged; a non-blocking workflow's is journaled and the run continues.
   - Parked-prompt and usage-limit patterns match a pane line even when a narrow window wraps it across two or three rows, so a wrapped dialog footer still withholds the stall nudge.
+  - `validate --probes` launches each role's coding CLI once with its permission args and no prompt, never types into it, and fails when the first screen shows a startup dialog that would park an unattended session.
   - A permission-prompt latch clears once the transcript is written after it, so a session that was approved and then went silent gets the stall nudge instead of ending `stalled` and parked.
   - A session whose window is alive when the timeout fires ends `timeout` marked parked, and pauses instead of retrying, when a parked hook signal is latched and the transcript has not been written since it, or when a parked-prompt pane pattern is present and the transcript is idle. A latch the transcript has been written past is no evidence, at any idle age.
   - While the visible pane shows the coding CLI waiting out a usage-limit reset and the transcript is idle, the session timeout is frozen and the stall nudge held, for at most `[limits] quota_wait_max_min` (default 300; 0 = off) cumulative minutes per session; past the cap, or when the parsed reset lies beyond it, the session pauses with a usage-limit reason.
@@ -501,7 +502,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `init` appends only the `.gitignore` lines that are missing, so running it again changes nothing.
   - `validate` exits 1 only when a finding has severity `problem`. Warnings never change the exit code.
   - Every finding carries a stable check id taken from a fixed, documented registry.
-  - `validate` runs no project-controlled commands unless `--render-probe` or `--probes` is given. The one exception is tickets mode, which runs `tickets.py next` while an unlanded ledger entry declares a `gate:`.
+  - `validate` runs no project-controlled commands, and launches no coding CLI, unless `--render-probe` or `--probes` is given. The one exception is tickets mode, which runs `tickets.py next` while an unlanded ledger entry declares a `gate:`.
   - On a BMAD v7 project `validate` reports the era, the active initiative, the ticket-store layout and the `tickets.*` preflight.
 - **Config:** `bmad-loop init --cli PROFILE --no-skills --force-skills`; `bmad-loop validate --spec FOLDER --render-probe --probes --json`
 - **Tested by:** `tests/test_cli.py`, `tests/test_install.py`

@@ -1520,6 +1520,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 )
             if prof is not None:
                 _report_permission_mode(report, role, cfg, prof, pol.scm.isolation)
+        # Opt-in only, like the environment probes: it launches the coding CLI.
+        # Unlike `environment.probes-not-run` there is no "not run" line — the
+        # default claude profile declares parked-prompt patterns, so that line
+        # would print on every plain validate.
+        if getattr(args, "probes", False):
+            _report_launch_probes(report, pol, profile_by_name, project)
 
     base_findings = install.missing_base_skills(project, dev_trees)
     # gated on PROBLEMS, not on any finding: an advisory review layer (a `when`
@@ -2304,6 +2310,93 @@ def _report_permission_mode(
         )
     else:
         report.ok("adapter.permission-mode", f"{profile.name} {role}: {mode}", detail)
+
+
+def _report_launch_probes(
+    report: ValidationReport,
+    pol: policy_mod.Policy,
+    profile_by_name: dict[str, CLIProfile],
+    project: Path,
+) -> None:
+    """``validate --probes``: one ``adapter.launch-probe`` finding per distinct
+    launch (#727).
+
+    Roles whose mode-resolved profile launches the same argv (profile, model,
+    ``launch_args``, ``bypass_args``) share one :func:`probe.launch_screen_probe`
+    call. A role whose mode is unmapped is skipped —
+    ``adapter.permission-mode-unsupported`` is its finding — as is any adapter
+    kind but GENERIC, the one family whose first screen is a tmux pane.
+
+    Only a dialog actually seen fails validate (``parked``). A probe that could
+    not see the screen (died, launch-failed, capture-failed, unavailable) is a
+    warning: no proof of a dialog, and validate's exit code is a contract."""
+    from . import probe as probe_mod
+    from .adapters import registry as adapter_registry
+
+    launches: dict[tuple[object, ...], tuple[CLIProfile, str | None, list[dict[str, str]]]] = {}
+    for role in ROLES:
+        cfg = pol.adapter.resolved(role)
+        prof = profile_by_name.get(cfg.name)
+        if prof is None or prof.adapter != adapter_registry.GENERIC:
+            continue
+        resolved = _permission_profile(cfg, prof)
+        if resolved is None:
+            continue
+        model = cfg.model or None
+        key = (resolved.name, model, resolved.launch_args, resolved.bypass_args)
+        launches.setdefault(key, (resolved, model, []))[2].append(
+            {"role": role, "mode": cfg.permission_mode}
+        )
+
+    isolation = pol.scm.isolation
+    for resolved, model, roles in launches.values():
+        result = probe_mod.launch_screen_probe(
+            resolved, binary=resolved.binary, project=project, model=model
+        )
+        named = ", ".join(f"{r['role']} {r['mode']}" for r in roles)
+        label = f"{resolved.name} ({named})"
+        detail: dict[str, object] = {
+            "profile": resolved.name,
+            "roles": roles,
+            "verdict": result.verdict,
+            "reason": result.detail,
+            "evidence": result.evidence,
+            "line": result.line,
+            "log_tail": result.log_tail,
+            "cwd": str(project),
+            "isolation": isolation,
+        }
+        where = (
+            "; launched at the project root, not inside a session worktree"
+            if isolation == "worktree"
+            else ""
+        )
+        if result.verdict == probe_mod.LAUNCH_PARKED:
+            report.fail(
+                "adapter.launch-probe",
+                f"{label}: the CLI showed a startup dialog an unattended session would "
+                f"park on ({result.evidence!r}) — accept or configure it once by hand{where}",
+                detail,
+            )
+        elif result.verdict == probe_mod.LAUNCH_CLEAN:
+            report.ok("adapter.launch-probe", f"{label}: launch screen clean{where}", detail)
+        elif result.verdict == probe_mod.LAUNCH_SKIPPED:
+            report.ok(
+                "adapter.launch-probe",
+                f"{label}: no parked_prompt_patterns declared — nothing launched",
+                detail,
+            )
+        else:
+            tail = next(
+                (ln.strip() for ln in reversed((result.log_tail or "").splitlines()) if ln.strip()),
+                "",
+            )
+            report.warn(
+                "adapter.launch-probe",
+                f"{label}: launch probe could not see the screen ({result.verdict}): "
+                f"{result.detail}" + (f" — {tail}" if tail else "") + where,
+                detail,
+            )
 
 
 def _bypass_drops(cfg, profile: CLIProfile) -> tuple[str, ...]:
@@ -9594,8 +9687,10 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also execute every [environment] probe from .bmad-loop/policy.toml on this "
         "host (all of them, not fail-fast; each bounded by probe_timeout_s); a probe "
-        "that fails, times out or cannot be started fails validate. In tickets mode, "
-        "also probe the project's tickets.py for the commands bmad-loop needs",
+        "that fails, times out or cannot be started fails validate. Also launch each "
+        "role's coding CLI once, with no prompt, and fail on a startup dialog its first "
+        "screen shows. In tickets mode, also probe the project's tickets.py for the "
+        "commands bmad-loop needs",
     )
     machine.add_json_flag(validate_p, "check findings")
 
