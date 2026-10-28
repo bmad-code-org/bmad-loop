@@ -532,7 +532,7 @@ def test_legacy_engine_fold_does_not_grant_a_project_unity_override(tmp_path):
     )
     policy_path = tmp_path / "policy.toml"
     policy_path.write_text('[engine]\nname = "unity"\n')
-    with pytest.warns(DeprecationWarning, match=r"\[engine\]"):
+    with pytest.warns(policy_mod.PolicyDeprecationWarning, match=r"\[engine\]"):
         pol = policy_mod.load(policy_path)
     assert "unity" in pol.plugins.enabled
     with pytest.raises(PluginTrustError, match="plugins enable unity"):

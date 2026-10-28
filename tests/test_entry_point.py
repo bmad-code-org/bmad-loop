@@ -17,6 +17,7 @@ Two things every other CLI test leaves uncovered:
 """
 
 import json
+import os
 import subprocess
 import sys
 
@@ -27,7 +28,7 @@ from bmad_loop import policy as policy_mod
 from bmad_loop import sprintstatus, verify
 
 
-def _run_module(*args, cwd):
+def _run_module(*args, cwd, env=None):
     """Spawn ``python -m bmad_loop`` under the test interpreter.
 
     ``cwd`` is a per-test temp dir (never the repo root), so ``-m``'s implicit
@@ -42,7 +43,23 @@ def _run_module(*args, cwd):
         encoding="utf-8",
         timeout=60,
         cwd=str(cwd),
+        env=env,
     )
+
+
+def _clean_warning_env():
+    """The ambient env minus the knobs that widen Python's warning filters: an
+    inherited ``-W``-style setting would show a hidden category and mask #835."""
+    env = dict(os.environ)
+    env.pop("PYTHONWARNINGS", None)
+    env.pop("PYTHONDEVMODE", None)
+    return env
+
+
+def _engine_policy_project(tmp_path):
+    (tmp_path / ".bmad-loop").mkdir()
+    (tmp_path / ".bmad-loop" / "policy.toml").write_text('[engine]\nname = ""\n', encoding="utf-8")
+    return tmp_path
 
 
 # ----------------------------------------------------------------- packaging smoke
@@ -71,6 +88,43 @@ def test_module_validate_json_smoke(tmp_path):
     doc = json.loads(proc.stdout)  # whole-stdout parse == stdout-purity assertion
     assert doc["schema_version"] == 1
     assert doc["ok"] is False
+
+
+def test_module_prints_policy_deprecation_once_on_stderr(tmp_path):
+    """A legacy ``[engine]`` block reaches a CLI user as one clean stderr line
+    (#835). It was a ``DeprecationWarning``, which Python hides outside
+    ``__main__``, so a real run printed nothing. ``init`` loads policy without
+    needing a BMAD install (``plugins list`` fails on the bmad-config gate first).
+
+    Ablations: revert ``PolicyDeprecationWarning`` to a ``DeprecationWarning``
+    base → the count is 0; drop ``main()``'s ``warnings.formatwarning``
+    assignment → the stdlib form names ``FutureWarning`` and ``policy.py``."""
+    project = _engine_policy_project(tmp_path)
+    proc = _run_module("init", "--project", str(project), cwd=tmp_path, env=_clean_warning_env())
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.count("bmad-loop: warning: [engine] in policy.toml is deprecated") == 1
+    assert "FutureWarning" not in proc.stderr
+    assert "policy.py" not in proc.stderr
+
+
+def test_module_validate_reports_policy_deprecation_as_finding(tmp_path):
+    """``validate`` reports the ``[engine]`` deprecation as a ``policy.deprecated``
+    warning finding and does not also print it on stderr (#835): the incidental
+    ``_configure_mux`` load ignores it, and validate's own load records it.
+
+    Ablations: drop ``_configure_mux``'s ignore → the stderr assert fails; drop
+    validate's ``policy.deprecated`` emission → the finding assert fails."""
+    project = _engine_policy_project(tmp_path)
+    proc = _run_module(
+        "validate", "--json", "--project", str(project), cwd=tmp_path, env=_clean_warning_env()
+    )
+    assert proc.returncode == 1, proc.stderr  # bmad-config fails in an empty project
+    doc = json.loads(proc.stdout)
+    deprecated = [f for f in doc["findings"] if f["check"] == "policy.deprecated"]
+    assert len(deprecated) == 1, doc["findings"]
+    assert deprecated[0]["severity"] == "warning"
+    assert "[engine]" in deprecated[0]["message"]
+    assert "bmad-loop: warning:" not in proc.stderr
 
 
 # The child of test_extra_less_install_core_works_and_tui_hints. Kept as a module

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -211,7 +212,11 @@ def _configure_mux(project: Path) -> None:
 
     path = _policy_path(project)
     try:
-        mux_policy = policy_mod.load(path).mux
+        # Incidental, and ahead of every command: the command's own load reports a
+        # deprecation (validate as a finding, everything else on stderr), once.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", policy_mod.PolicyDeprecationWarning)
+            mux_policy = policy_mod.load(path).mux
     except (policy_mod.PolicyError, OSError):
         mux_policy = policy_mod.MuxPolicy()
     configure_multiplexer(mux_policy.backend or None, origin=path)
@@ -817,10 +822,19 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # sprint-status.yaml.
     loaded_pol = None
     policy_error: policy_mod.PolicyError | None = None
-    try:
-        loaded_pol = policy_mod.load(_policy_path(project))
-    except policy_mod.PolicyError as e:
-        policy_error = e
+    with warnings.catch_warnings(record=True) as policy_warnings:
+        # the once-per-location default would drop a repeat
+        warnings.simplefilter("always", policy_mod.PolicyDeprecationWarning)
+        try:
+            loaded_pol = policy_mod.load(_policy_path(project))
+        except policy_mod.PolicyError as e:
+            policy_error = e
+    deprecations: list[str] = []
+    for w in policy_warnings:
+        if issubclass(w.category, policy_mod.PolicyDeprecationWarning):
+            deprecations.append(str(w.message))
+        else:
+            warnings.showwarning(w.message, w.category, w.filename, w.lineno, w.file, w.line)
     source, spec_folder = _resolve_source(args, loaded_pol)
 
     try:
@@ -838,6 +852,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
     pol = None
     if policy_error is not None:
         report.fail("policy", str(policy_error))
+        for message in deprecations:
+            report.warn("policy.deprecated", message)
     elif loaded_pol is not None:
         pol = loaded_pol
         role_names = {role: pol.adapter.resolved(role).name for role in ROLES}
@@ -848,6 +864,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
             f"triage={role_names['triage']}, retro={role_names['retro']}",
             {"gates_mode": pol.gates.mode, "adapters": dict(role_names)},
         )
+        for message in deprecations:
+            report.warn("policy.deprecated", message)
         for name in dict.fromkeys(role_names.values()):
             try:
                 profile = get_profile(name, project)
@@ -9454,7 +9472,27 @@ def cmd_relay(args: argparse.Namespace) -> int:
         return ExitCode.OK
 
 
+_python_formatwarning = warnings.formatwarning
+
+
+def _format_warning(
+    message: Warning | str,
+    category: type[Warning],
+    filename: str,
+    lineno: int,
+    line: str | None = None,
+) -> str:
+    """A ``PolicyDeprecationWarning`` reaches a CLI user as one
+    ``bmad-loop: warning: <message>`` line, not Python's ``path:lineno`` plus
+    source-line form, which points into site-packages. Every other category keeps
+    the stdlib format (#835)."""
+    if issubclass(category, policy_mod.PolicyDeprecationWarning):
+        return f"bmad-loop: warning: {message}\n"
+    return _python_formatwarning(message, category, filename, lineno, line)
+
+
 def main(argv: list[str] | None = None) -> int:
+    warnings.formatwarning = _format_warning
     parser = argparse.ArgumentParser(
         prog="bmad-loop",
         description="Deterministic orchestrator for the BMAD implementation phase",

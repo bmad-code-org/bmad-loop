@@ -54,6 +54,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         # BMAD v7 resolved under tickets mode past leftover v6 artifact keys
         "bmad-config.v6-keys-ignored",
         "policy",
+        # a deprecated policy.toml key still loads (#835)
+        "policy.deprecated",
         "policy.model-qualified",
         "policy.effort-unsupported",
         "policy.bypass-dropped",

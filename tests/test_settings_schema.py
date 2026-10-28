@@ -416,7 +416,7 @@ def test_unity_plugin_is_trust_gated_and_renders_settings():
 def test_deprecated_engine_block_folds_into_unity_plugin():
     """A legacy [engine] block loads (with a deprecation warning) by folding onto
     [plugins] enabled + [plugins.unity]; explicit [plugins.unity] values win."""
-    with pytest.warns(DeprecationWarning):
+    with pytest.warns(policy_mod.PolicyDeprecationWarning):
         pol = policy_mod.loads(
             '[engine]\nname = "unity"\neditor_mode = "per_worktree"\nmcp = "coplaydev"\n'
             '[scm]\nisolation = "worktree"\n'

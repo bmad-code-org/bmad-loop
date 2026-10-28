@@ -14383,6 +14383,27 @@ def test_validate_json_failing_check_emits_whole_document_at_rc_1(project, capsy
     assert "bmad-config" in {f["check"] for f in failed}
 
 
+def test_validate_reshows_non_policy_warnings_from_policy_load(project, capsys, monkeypatch):
+    """validate records its policy load to turn a `PolicyDeprecationWarning` into a
+    `policy.deprecated` finding (#835); any other warning raised during that load
+    (a dependency's, say) is re-shown, never swallowed by the recorder. The stub
+    warns only for validate's own load: `_configure_mux`'s earlier load would
+    otherwise surface it and keep this green with the re-show removed.
+
+    Ablation: drop the `warnings.showwarning` re-show in `cmd_validate` → fails."""
+    _write_policy(project.project, CLAUDE_ONLY_POLICY)
+    real_load = cli.policy_mod.load
+
+    def load_warning_in_validate(path, *args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "cmd_validate":
+            warnings.warn("unrelated", UserWarning)
+        return real_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli.policy_mod, "load", load_warning_in_validate)
+    with pytest.warns(UserWarning, match="unrelated"):
+        machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+
+
 def test_validate_reports_an_undecodable_policy_instead_of_crashing(project, capsys):
     """`read_text` raises `UnicodeDecodeError` on a policy.toml saved as UTF-16 or
     latin-1 — a ValueError, not an OSError, so it used to escape every
