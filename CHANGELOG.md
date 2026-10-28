@@ -220,6 +220,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Count OpenCode 2.x subagent (child) session tokens, at every nesting depth, in recorded
+  usage and the budget guard's samples; a failed child walk is a `usage-capture-failed`
+  (`stage=children`) fault, never a parent-only figure. A child still running at capture
+  is journaled as `usage-child-active` (DW-540).
 - Ignore an Antigravity `Stop` sent with `fullyIdle: false` (a yield to a foreground
   subagent) instead of completing the session while the subagent still works; the
   relay forwards `fully_idle`, and `hook-stop-yield-ignored` journals the skip.

@@ -52,10 +52,11 @@ Transport shape (the settled design drivers):
   #48/#53 artifact-distrust invariant, unchanged.
 - **Usage is read over HTTP before teardown** (server state is sqlite, not a
   readable file tree): V1 sums assistant-message tokens, V2 reads the
-  session's own token aggregate; stashed by session id, the raw messages
-  (V2: every page, oldest first) dumped to ``tasks/<task_id>/messages.json``
-  as the transcript. Child-session (subagent) tokens are not counted — the
-  API scopes messages and usage per session.
+  session's token aggregate plus every descendant (subagent) session's;
+  stashed by session id, the raw messages (V2: every page, oldest first)
+  dumped to ``tasks/<task_id>/messages.json`` as the transcript. V1 counts no
+  child-session tokens — its API scopes messages per session. A V2 child
+  still running at capture is journaled as ``usage-child-active``.
 - ``opencode serve`` survives parent death, so teardown is
   authoritative: kill in ``run()``'s finally plus an atexit sweep. On Windows
   the binary is an npm ``.cmd`` shim, so the kill goes straight to the
@@ -1783,7 +1784,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         unwritable transcript no longer costs the usage; nor does a failed
         transcript read on a protocol whose usage is read apart from it (V2) —
         that usage is still read, without the transcript (a zero total then
-        stays untracked), and only the dump is skipped."""
+        stays untracked), and only the dump is skipped.
+
+        A read usage counts each child session as far as it has landed; the
+        children still running (a V2 background subagent) are crumbed as
+        `usage-child-active` with their ``sessions`` ids, and a failure to
+        tell is crumbed as `usage-child-active-failed` with ``error``."""
         if sess.client is None or not sess.session_id:
             return None
         messages, fault = sess.protocol.transcript(sess.client, sess.session_id)
@@ -1796,6 +1802,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             self._stash_usage(sess.session_id, usage)
         elif usage_fault is not None:
             self._note_usage_capture_failed(handle, usage_fault.stage, usage_fault.error)
+        if usage_fault is None:
+            self._note_active_children(handle, sess.protocol, sess.client, sess.session_id)
         if fault is not None:
             return None
         try:
@@ -1808,6 +1816,15 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def _note_usage_capture_failed(self, handle: SessionHandle, stage: str, error: str) -> None:
         self._note_lifecycle(handle.task_id, "usage-capture-failed", stage=stage, error=error)
+
+    def _note_active_children(
+        self, handle: SessionHandle, protocol: OpencodeProtocol, client: Any, session_id: str
+    ) -> None:
+        active, fault = protocol.active_descendants(client, session_id)
+        if active is None:
+            self._note_lifecycle(handle.task_id, "usage-child-active-failed", error=fault)
+        elif active:
+            self._note_lifecycle(handle.task_id, "usage-child-active", sessions=active)
 
     def _stash_usage(self, session_id: str, usage: TokenUsage) -> None:
         """Write into the capacity-bounded `_usage` stash (see USAGE_STASH_CAP).

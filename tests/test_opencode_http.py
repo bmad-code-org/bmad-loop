@@ -444,6 +444,8 @@ class Handler(BaseHTTPRequestHandler):
             self._message_page(parse_qs(urlsplit(self.path).query))
         elif path == f"/api/session/{SESSION_ID}":
             self._json(200, {"data": session_info()})
+        elif path == "/api/session":
+            self._json(200, {"data": [], "cursor": {"previous": None, "next": None}})
         elif path in ("/api/model", "/api/model/default"):
             query = parse_qs(urlsplit(self.path).query)
             directory = (query.get("location[directory]") or [""])[0]
@@ -4619,12 +4621,18 @@ def test_v2_session_env_and_config_are_the_v2_dialect(tmp_path, monkeypatch):
 class _V2RouteClient:
     """A V2 control client answering GETs off a per-route script (the path
     before any query): an int is a bare status code, an Exception is raised,
+    a callable is called with the params and its result read the same way,
     anything else is a 200 whose JSON body is that value. A route's last entry
-    repeats; an unscripted route is a 404. Every GET is recorded with its
-    params."""
+    repeats; an unscripted route is a 404, except the child list and the
+    active map, which default to a server with no subagents and nothing
+    running. Every GET is recorded with its params."""
 
     def __init__(self, **routes):
-        self.routes = {path: list(answers) for path, answers in routes.items()}
+        self.routes = {
+            _V2_LIST: [_v2_children()],
+            _V2_ACTIVE: [{"data": {}}],
+            **{path: list(answers) for path, answers in routes.items()},
+        }
         self.gets: list[tuple[str, dict | None]] = []
         self.posts: list[str] = []
 
@@ -4632,6 +4640,8 @@ class _V2RouteClient:
         self.gets.append((path, params))
         answers = self.routes.get(path) or [404]
         answer = answers.pop(0) if len(answers) > 1 else answers[0]
+        if callable(answer):
+            answer = answer(params)
         if isinstance(answer, Exception):
             raise answer
 
@@ -4661,12 +4671,40 @@ _V2_SID = "ses_1"
 _V2_ACTIVE = "/api/session/active"
 _V2_MESSAGES = f"/api/session/{_V2_SID}/message"
 _V2_INFO = f"/api/session/{_V2_SID}"
+_V2_LIST = "/api/session"
 
 
 def _v2_info(**tokens) -> dict:
     full = {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
     full.update(tokens)
     return {"data": {"id": _V2_SID, "tokens": full}}
+
+
+def _v2_child(session_id: str, parent_id: str, **tokens) -> dict:
+    """A listed child `Session.Info`: `parentID` names its parent."""
+    return {**_v2_info(**tokens)["data"], "id": session_id, "parentID": parent_id}
+
+
+def _v2_children(*infos, next_cursor=None) -> dict:
+    """One `GET /api/session` page."""
+    return {"data": list(infos), "cursor": {"previous": None, "next": next_cursor}}
+
+
+def _v2_tree(tree: dict):
+    """A child-list answer off ``{parent id: [page, ...]}``: the first page by
+    ``parentID``, a later one by ``cursor`` (``"<parent id>#<n>"``, the page
+    index); a page is a child list body, a status code or an Exception, and a
+    parent not in the tree has no children."""
+
+    def answer(params):
+        params = params or {}
+        if "cursor" in params:
+            parent, _, index = params["cursor"].partition("#")
+            return tree[parent][int(index)]
+        pages = tree.get(params.get("parentID"))
+        return pages[0] if pages else _v2_children()
+
+    return answer
 
 
 def _v2_assistant(completed: int | None, **extra) -> dict:
@@ -4909,7 +4947,225 @@ def test_v2_sample_usage_separates_faults_from_inert(tmp_path):
     assert weighted is None and fault and fault.startswith("KeyError")
     sess.client = _V2RouteClient(**{_V2_INFO: [_v2_info(input=3, output=1)]})
     assert adapter._sample_weighted_usage(sess, spec) == (4, None)
-    assert [path for path, _ in sess.client.gets] == [_V2_INFO]  # never the walk
+    # never the transcript walk: the aggregate plus the (empty) child list
+    assert [path for path, _ in sess.client.gets] == [_V2_INFO, _V2_LIST]
+
+
+# A parent with two children over two list pages, a grandchild under the first,
+# and two entries the walk must not count: a session naming another parent (a
+# server ignoring the filter) and the parent itself listed under the grandchild
+# (a cycle).
+_V2_TREE = {
+    _V2_SID: [
+        _v2_children(_v2_child("ses_a", _V2_SID, input=20, output=2), next_cursor=f"{_V2_SID}#1"),
+        _v2_children(
+            _v2_child("ses_b", _V2_SID, input=300, reasoning=30),
+            _v2_child("ses_stray", "ses_elsewhere", input=9999),
+            next_cursor=f"{_V2_SID}#2",
+        ),
+        _v2_children(),
+    ],
+    "ses_a": [
+        _v2_children(_v2_child("ses_a1", "ses_a", input=4000, cache={"read": 7, "write": 0}))
+    ],
+    "ses_a1": [_v2_children(_v2_child(_V2_SID, "ses_a1", input=50000))],
+}
+
+
+def test_v2_usage_sums_every_descendant_session(tmp_path):
+    """DW-540: a 2.x session counts only its own steps, so recorded usage is
+    the parent's aggregate plus every descendant's — the children list paged on
+    its cursor, the walk recursing to the grandchild, a stray or cyclic entry
+    never counted. Through `_capture_usage` the sum is what is stashed.
+
+    ABLATION: make `V2Protocol.descendants` answer `([], None)` and this
+    reddens (the parent alone, 100/10)."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9))],
+            _V2_INFO: [_v2_info(input=100, output=10)],
+            _V2_LIST: [_v2_tree(_V2_TREE)],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    assert adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID)) == (
+        TokenUsage(input_tokens=4420, output_tokens=42, cache_read_tokens=7)
+    )
+    lists = [params for path, params in sess.client.gets if path == _V2_LIST]
+    assert lists[:3] == [
+        {"parentID": _V2_SID, "limit": 200},
+        {"cursor": f"{_V2_SID}#1", "limit": 200},  # the cursor carries the parentID
+        {"cursor": f"{_V2_SID}#2", "limit": 200},
+    ]
+    assert {"parentID": "ses_a1", "limit": 200} in lists
+    assert {"parentID": "ses_stray", "limit": 200} not in lists
+    assert _lifecycle_lines(adapter, "t-cap") == []
+
+
+def test_v2_sample_usage_counts_children_while_the_parent_reads_zero():
+    """Mid-turn, a parent blocked on a foreground subagent reads all zeros
+    while its child spends: the budget sample is the child's, not inert.
+
+    ABLATION: make `V2Protocol.descendants` answer `([], None)` and the sample
+    reads `(None, None)`."""
+    client = _V2RouteClient(
+        **{
+            _V2_INFO: [_v2_info()],
+            _V2_LIST: [_v2_tree({_V2_SID: [_v2_children(_v2_child("ses_a", _V2_SID, input=7))]})],
+        }
+    )
+    assert V2Protocol().sample_usage(client, _V2_SID) == (TokenUsage(input_tokens=7), None)
+
+
+@pytest.mark.parametrize(
+    "tree, error",
+    [
+        pytest.param({_V2_SID: [503]}, f"child list of {_V2_SID}: HTTP 503", id="child-list"),
+        pytest.param(
+            {**_V2_TREE, "ses_a": [RuntimeError("boom")]},
+            "RuntimeError: boom",
+            id="grandchild-list",
+        ),
+        pytest.param(
+            {_V2_SID: [{"data": "x"}]},
+            f"child list of {_V2_SID} is str, not a list",
+            id="malformed",
+        ),
+        pytest.param(
+            {_V2_SID: [_v2_children({"parentID": _V2_SID})]},
+            f"a child of {_V2_SID} has no session id",
+            id="no-id",
+        ),
+        pytest.param(
+            {_V2_SID: [_v2_children({**_v2_child("ses_a", _V2_SID), "tokens": "n/a"})]},
+            "malformed child session ses_a: TypeError",
+            id="child-tokens",
+        ),
+        pytest.param(
+            {_V2_SID: [_v2_children(next_cursor=f"{_V2_SID}#1"), _v2_children(next_cursor="x")]},
+            None,
+            id="empty-page-ends",
+        ),
+        pytest.param(
+            {_V2_SID: [_v2_children(_v2_child("ses_a", _V2_SID), next_cursor=f"{_V2_SID}#0")]},
+            "child sessions did not end within 1000 pages",
+            id="runaway-cursor",
+        ),
+    ],
+)
+def test_v2_child_walk_fault_is_never_a_parent_only_figure(tmp_path, tree, error):
+    """DW-461 for the descendant walk: a child list failing at any depth, a
+    malformed page, an id-less child, a child's malformed aggregate or a
+    cursor that never runs dry stashes nothing and is crumbed
+    `stage=children` — the parent's own 100 tokens never stand in for the
+    tree. (An empty page ends a listing even with a `next`.)"""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [_v2_tree(tree)],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    usage = adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID))
+    if error is None:
+        assert usage == TokenUsage(input_tokens=100) and _capture_crumbs(adapter) == []
+        return
+    assert usage is None
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "children" and crumb["error"].startswith(error)
+    sess.client.routes[_V2_INFO] = [_v2_info(input=100)]
+    sample, fault = V2Protocol().sample_usage(sess.client, _V2_SID)
+    assert sample is None and fault and fault.startswith(error)
+
+
+def _child_active_crumbs(adapter):
+    return [
+        ln
+        for ln in _lifecycle_lines(adapter, "t-cap")
+        if ln["event"].startswith("usage-child-active")
+    ]
+
+
+def test_v2_capture_journals_a_still_active_background_child(tmp_path):
+    """A `background: true` subagent can outlive its parent's turn: capture
+    counts what it has landed and journals `usage-child-active` naming it —
+    never a session outside the tree, never the parent itself.
+
+    ABLATION: drop the `_note_active_children` call in `_capture_usage` and
+    the crumb is gone."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    running = {"type": "running"}
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [_v2_tree(_V2_TREE)],
+            _V2_ACTIVE: [{"data": {_V2_SID: running, "ses_a1": running, "ses_other": running}}],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    usage = adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID))
+    assert usage is not None and usage.input_tokens == 4420
+    (crumb,) = _child_active_crumbs(adapter)
+    assert crumb["event"] == "usage-child-active" and crumb["sessions"] == ["ses_a1"]
+
+
+@pytest.mark.parametrize(
+    "active, error",
+    [
+        (500, "HTTP 500"),
+        (RuntimeError("gone"), "RuntimeError: gone"),
+        ({"data": []}, "active map is list, not an object"),
+        ({"data": {"ses_a": {"type": "running"}}}, f"child list of {_V2_SID}: HTTP 502"),
+    ],
+    ids=["non-200", "transport", "malformed", "walk"],
+)
+def test_v2_capture_crumbs_an_unread_active_map(tmp_path, active, error):
+    """Not knowing whether a child is still running is crumbed
+    (`usage-child-active-failed`), never read as "none active"; the usage
+    itself, read fine, is still stashed. The walk case fails only the second
+    walk, the one the active check makes.
+
+    ABLATION: answer `([], None)` on a non-200 in `active_descendants` and the
+    non-200 case reddens."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [_v2_children(), 502],
+            _V2_ACTIVE: [active],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    assert adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID)) == (
+        TokenUsage(input_tokens=100)
+    )
+    (crumb,) = _child_active_crumbs(adapter)
+    assert crumb["event"] == "usage-child-active-failed" and crumb["error"] == error
 
 
 def test_v2_transcript_walks_all_pages(tmp_path, v2_fake, monkeypatch):
