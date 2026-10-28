@@ -2032,6 +2032,85 @@ def test_wait_for_completion_skips_transcriptless_subagent_stop(tmp_path):
     assert result.session_id == "main-sess"  # the subagent's toolu_ id is never recorded
 
 
+def _agy_stop(session_id, transcript_path, fully_idle):
+    return HookEvent(
+        ts=1,
+        event="Stop",
+        task_id="3-1-dev-1",
+        session_id=session_id,
+        transcript_path=transcript_path,
+        path=Path("x"),
+        fully_idle=fully_idle,
+    )
+
+
+def test_wait_for_completion_skips_a_fully_idle_false_yield_stop(tmp_path):
+    """DW-548 (pinned on agy 1.4.9): a parent that spawns a foreground subagent
+    fires Stop with `fullyIdle: false` while it yields, then Stop with
+    `fullyIdle: true` when it really finishes. The yield is no turn end. The
+    terminal spec is already on disk here, so a yield read as a turn end would
+    complete on the first event; the session must complete on the FINAL Stop,
+    and the yield is journaled once with its count.
+
+    Ablation, performed: delete the `fully_idle is False` branch in the wait
+    loop and this fails — the result completes on the yield, with its transcript."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_stop("agy-parent", "/yield.jsonl", False),
+            _agy_stop("agy-parent", "/yield.jsonl", False),
+            _agy_stop("agy-parent", "/final.jsonl", True),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert result.transcript_path == "/final.jsonl"
+    assert adapter.watcher.calls == 3  # completion waited for the final Stop
+    yields = [e for e in _lifecycle_lines(adapter) if e["event"] == "hook-stop-yield-ignored"]
+    assert yields == [
+        {
+            "ts": yields[0]["ts"],
+            "event": "hook-stop-yield-ignored",
+            "session_id": "agy-parent",
+            "ignored_so_far": 1,
+        }
+    ]
+
+
+def test_a_lone_fully_idle_false_stop_never_completes(tmp_path, monkeypatch):
+    """DW-548: a yield Stop with no final Stop after it leaves the session
+    running, so it takes the timeout path with no stop seen, and the yield count
+    is on the `timeout-fired` crumb where an operator looks.
+
+    Ablation, performed: delete the `fully_idle is False` branch and this fails
+    — the yield sets stop_seen, and the result-less Stop ends the dev session as
+    stalled instead of timing out."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+
+    def advance(call_n):
+        if call_n > 1:
+            clock["mono"] += 1000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_agy_stop("agy-parent", None, False)],
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=100.0))
+
+    assert result.status == "timeout"
+    assert result.stop_seen is False
+    assert result.session_id == "agy-parent"  # the session's own event: tracked
+    (fired,) = _lifecycle_events(adapter, "timeout-fired")
+    assert fired["stop_yields_ignored"] == 1
+
+
 def test_wait_for_completion_ignores_foreign_identified_lifecycle_events(tmp_path):
     """A nested CLI inherits the relay environment and writes into the parent's
     stream (#767). Its announced SessionStart marks its id foreign, so neither
@@ -4099,6 +4178,7 @@ def test_heartbeat_written_and_throttled(tmp_path, monkeypatch):
         "probe_failures": 0,
         "usage_sample_failures": 0,
         "foreign_hook_events": 0,  # no nested CLI's events were dropped (#767)
+        "stop_yields_ignored": 0,  # no Stop was a subagent yield (DW-548)
     }
     assert [w["remaining_s"] for w in writes] == [100.0, 59.0]  # tick 2 was throttled
     hb = json.loads((adapter.tasks_dir / "3-1-dev-1" / "heartbeat.json").read_text())

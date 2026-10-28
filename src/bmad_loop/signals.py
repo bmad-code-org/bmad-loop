@@ -53,6 +53,11 @@ class HookEvent:
     # older vendored relay that predates the field, and for a non-string value.
     # APPENDED with a default, like the fields above.
     payload_error: str | None = None
+    # agy's Stop `fullyIdle` (DW-548), forwarded by the relay only as a boolean:
+    # False marks a yield to a foreground subagent, not a turn end. None for every
+    # other CLI, on an older vendored relay that predates the field, and for a
+    # non-boolean value. APPENDED with a default, like the fields above.
+    fully_idle: bool | None = None
 
 
 # The relays' lineage tags (DW-507, events._lineage). Anything else parses as None.
@@ -84,6 +89,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
     source = data.get("source")
     lineage = data.get("lineage")
     payload_error = data.get("payload_error")
+    fully_idle = data.get("fully_idle")
     # Payload values are forwarded from the CLI unvalidated, so a non-string one
     # reads as absent rather than reaching attribution's set arithmetic (#767).
     return HookEvent(
@@ -97,6 +103,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
         source=source if isinstance(source, str) else None,
         lineage=lineage if isinstance(lineage, str) and lineage in LINEAGE_TAGS else None,
         payload_error=payload_error if isinstance(payload_error, str) else None,
+        fully_idle=fully_idle if isinstance(fully_idle, bool) else None,
     )
 
 

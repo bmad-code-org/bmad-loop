@@ -8,7 +8,8 @@ orchestrator only ever sees canonical events. Payload keys vary too: snake_case
 (claude/codex), conversation_id (cursor), or camelCase (copilot's sessionId/
 transcriptPath, agy's conversationId/transcriptPath — protojson encoding); the
 field extraction below tries each. agy alone carries no cwd, sending the
-workspacePaths list instead. Reads the hook payload
+workspacePaths list instead, and alone sends `fullyIdle`, forwarded as
+`fully_idle` only when it is a boolean. Reads the hook payload
 from stdin and writes one event file
 into the orchestrator's events directory. No-ops (exit 0) unless the session was
 spawned by bmad-loop (detected via env vars set on the tmux window), so
@@ -82,6 +83,15 @@ def _source(payload):
     # string is forwarded, like the notification subtype above.
     value = payload.get("source")
     return value if isinstance(value, str) else None
+
+
+def _fully_idle(payload):
+    # An agy Stop payload's `fullyIdle` (DW-548): false when the parent only
+    # yielded to a foreground subagent, true at the real turn end. Only a JSON
+    # boolean is forwarded, and the key is written only then, so every other
+    # CLI's event stays unchanged.
+    value = payload.get("fullyIdle")
+    return value if isinstance(value, bool) else None
 
 
 # How long after the launched CLI the rest of its launch chain may start
@@ -423,6 +433,11 @@ def main() -> int:
         # a filter — the orchestrator decides what a "mismatch" means.
         "lineage": _lineage(event_name, ("bmad_loop_hook.py",)),
     }
+    # Only when the payload carries a boolean `fullyIdle` (agy, DW-548): a Stop
+    # with false is a subagent yield, not a turn end. Absent for every other CLI.
+    fully_idle = _fully_idle(payload)
+    if fully_idle is not None:
+        event["fully_idle"] = fully_idle
     # Only when set, so a readable payload's event is unchanged.
     if payload_error:
         event["payload_error"] = payload_error

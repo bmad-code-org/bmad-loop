@@ -220,6 +220,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Ignore an Antigravity `Stop` sent with `fullyIdle: false` (a yield to a foreground
+  subagent) instead of completing the session while the subagent still works; the
+  relay forwards `fully_idle`, and `hook-stop-yield-ignored` journals the skip.
 - Classify OpenCode 2.x provider 5xx errors (`provider.internal`), rejected credentials
   (`provider.auth`) and unroutable models (`provider.no-route`) as environment faults
   instead of charging the session as a code failure.

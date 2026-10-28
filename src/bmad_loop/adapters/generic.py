@@ -1363,6 +1363,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # once for all id-less drops, under the None key (DW-507).
         foreign_hook_events = 0
         crumbed_foreign: set[str | None] = set()
+        # DW-548: admitted Stops that carried `fully_idle: false` — agy's yield
+        # to a foreground subagent, not a turn end. Crumbed once per attempt;
+        # heartbeat + timeout-fired carry the running count.
+        stop_yields_ignored = 0
         # DW-507: the one-shot crumb for a lineage the first SessionStart could
         # not calibrate ("miscalibrated"/"unavailable"), so the degrade to the
         # #767 rules alone is visible in session-lifecycle.jsonl.
@@ -1732,6 +1736,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # nonzero = a nested CLI's events were dropped (the parent's
                     # own Stop may have been read as foreign)
                     foreign_hook_events=foreign_hook_events,
+                    # nonzero = agy Stops read as subagent yields (DW-548)
+                    stop_yields_ignored=stop_yields_ignored,
                 )
                 # Every exit resolves first (a SessionStart that came before its
                 # rollout existed, then no further hook event): the exit's
@@ -1973,6 +1979,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         "usage_sample_failures": usage_failures,
                         # hook events dropped as a nested CLI's (#767)
                         "foreign_hook_events": foreign_hook_events,
+                        # Stops ignored as subagent yields (DW-548)
+                        "stop_yields_ignored": stop_yields_ignored,
                         # the usage-limit quota wait (DW-396): present only when
                         # this session can enter one.
                         **(
@@ -2464,6 +2472,22 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # An IdlePrompt never ends one.
                     if quota.waiting and parked_kind in QUOTA_WAIT_BLOCKING_KINDS:
                         self._end_quota_wait(handle, quota, "latch")
+                continue
+            if event.event == "Stop" and event.fully_idle is False:
+                # agy fires Stop with `fullyIdle: false` when the parent yields
+                # to a foreground subagent (DW-548): the session's own event, so
+                # the identity/transcript tracking above took it, but no turn
+                # ended. It must not set stop_seen, drop the parked latch or
+                # complete. Not profile-gated: only a CLI that sends the key
+                # carries it.
+                stop_yields_ignored += 1
+                if stop_yields_ignored == 1:
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "hook-stop-yield-ignored",
+                        session_id=event.session_id,
+                        ignored_so_far=stop_yields_ignored,
+                    )
                 continue
             if event.event == "Stop":
                 # A completed turn proves any prompt the CLI was parked on got

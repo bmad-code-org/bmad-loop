@@ -39,6 +39,7 @@ TWINNED = (
     "_first_workspace",
     "_notification_type",
     "_source",
+    "_fully_idle",
     # DW-507's lineage block: the tag both relays stamp on every event.
     "_LAUNCH_SHIM_WINDOW_S",
     "_proc_stat",
@@ -262,6 +263,50 @@ def test_both_relay_twins_forward_the_session_start_source(
     from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text())
     assert from_hook["source"] == expected
     assert from_relay["source"] == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"fullyIdle": False}, False),
+        ({"fullyIdle": True}, True),
+        # only a JSON boolean is forwarded; anything else writes no key at all
+        ({"fullyIdle": "false"}, None),
+        ({"fullyIdle": 0}, None),
+        ({"fullyIdle": None}, None),
+        ({}, None),
+    ],
+)
+def test_both_relay_twins_forward_a_boolean_fully_idle(tmp_path, monkeypatch, payload, expected):
+    """DW-548: agy's Stop `fullyIdle` reaches the event file from BOTH writers as
+    `fully_idle`, and only as a boolean. Without one the key is ABSENT, not null,
+    so every other CLI's event stays exactly what it was.
+
+    Ablation: drop the `fully_idle` write from either writer and the boolean
+    rows fail on that side; write it unconditionally and the absent rows fail."""
+    hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
+    proc = subprocess.run(
+        [sys.executable, str(HOOK), "Stop"],
+        input=json.dumps(payload),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            **({"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")} if os.name == "nt" else {}),
+            "BMAD_LOOP_RUN_DIR": str(hook_run),
+            "BMAD_LOOP_TASK_ID": "1-1-a-dev-1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _relay("Stop", payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
+    from_hook = json.loads(next((hook_run / "events").glob("*.json")).read_text())
+    from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text())
+    for event in (from_hook, from_relay):
+        if expected is None:
+            assert "fully_idle" not in event
+        else:
+            assert event["fully_idle"] is expected
 
 
 # ---------------------------------------------------------- lineage (DW-507)

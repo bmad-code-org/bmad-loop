@@ -100,6 +100,28 @@ def test_parse_event_keeps_string_payload_error_only(tmp_path, extra, expected):
     assert event.payload_error == expected
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"fully_idle": True}, True),
+        ({"fully_idle": False}, False),
+        ({"fully_idle": "false"}, None),  # a non-boolean is dropped, not coerced
+        ({"fully_idle": 0}, None),  # 0 is falsy, but not False: still dropped
+        ({}, None),  # every CLI but agy (or an older relay) carries no key
+    ],
+)
+def test_parse_event_keeps_boolean_fully_idle_only(tmp_path, extra, expected):
+    """DW-548: agy's forwarded `fullyIdle` lands on the HookEvent only as a bool,
+    so the wait loop's `is False` yield test never matches a stray value.
+
+    Ablation: drop the `isinstance(fully_idle, bool)` check and the "false"/0
+    rows fail."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "Stop", **extra)
+    (event,) = watcher.poll()
+    assert event.fully_idle is expected
+
+
 @pytest.mark.parametrize("value", [["A", "B"], {"id": "A"}, 3], ids=["list", "dict", "int"])
 def test_parse_event_drops_a_non_string_session_id(tmp_path, value):
     """#767: a non-string id reads as absent, so attribution never hashes it —

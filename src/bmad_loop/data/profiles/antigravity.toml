@@ -4,6 +4,15 @@
 # hooks, so only Stop is registered. Skills live in .agents/skills/, hooks in
 # .agents/hooks.json. Verified against agy 1.1.3.
 #
+# Stop is not always a turn end (DW-548, pinned on agy 1.4.9): a parent that
+# spawns a foreground subagent fires Stop with `fullyIdle: false` while it
+# yields, and `fullyIdle: true` once it really finishes; a child's own
+# background-command yield also sends false. `fullyIdle` is the only payload
+# field that tells them apart (`terminationReason` is NO_TOOL_CALL in both). The
+# relay forwards it as `fully_idle`, and bmad-loop ignores a Stop carrying false.
+# Known gap: a CHILD conversation's final `fullyIdle: true` Stop still reads as
+# the parent's turn end and can complete the session early.
+#
 # usage_parser is "none" DELIBERATELY AND PERMANENTLY — not a deferral. agy's
 # transcript (~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/
 # logs/transcript_full.jsonl, the path its Stop hook reports as `transcriptPath`)
