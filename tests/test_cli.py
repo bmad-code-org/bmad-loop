@@ -13338,6 +13338,85 @@ def test_validate_probes_an_unseen_screen_is_a_warning(project, capsys, monkeypa
     assert finding["message"].endswith(f"({verdict}): why — Error: no tty")
 
 
+EXTRA_ARGS = ("--permission-mode", "acceptEdits")
+
+
+def test_validate_probes_launches_a_roles_extra_args_in_place_of_bypass_args(
+    project, capsys, monkeypatch
+):
+    """A non-None `extra_args` replaces the mode's `bypass_args` in a real launch
+    (`GenericAdapter.interactive_argv`), so the probe launches it too, and the
+    finding says which roles' args came from it. A role without `extra_args`
+    launches the mode's args unchanged, as its own probe.
+
+    ABLATION: drop the `replace(..., bypass_args=...)` in `_report_launch_probes`
+    and this reddens (one call, with claude's bypass args)."""
+    from bmad_loop.adapters.profile import get_profile
+
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=CLAUDE_ONLY_POLICY
+        + '[adapter.review]\nextra_args = ["--permission-mode", "acceptEdits"]\n',
+    )
+    calls = _stub_launch_probe(
+        monkeypatch, probe_mod.LaunchScreenResult(probe_mod.LAUNCH_CLEAN, "fixture")
+    )
+
+    doc = machine_json(_validate_argv(project, "--probes"), capsys)
+
+    by_args = {c["profile"].bypass_args: c for c in calls}
+    assert len(calls) == 2
+    assert set(by_args) == {EXTRA_ARGS, get_profile("claude").bypass_args}
+    findings = {
+        tuple(f["detail"]["args"]): f for f in _permission_findings(doc, "adapter.launch-probe")
+    }
+    extra = findings[EXTRA_ARGS]
+    assert [r["role"] for r in extra["detail"]["roles"]] == ["review"]
+    assert extra["detail"]["extra_args_roles"] == ["review"]
+    assert "review bypass via extra_args" in extra["message"]
+    plain = findings[get_profile("claude").bypass_args]
+    assert [r["role"] for r in plain["detail"]["roles"]] == ["dev", "triage", "retro"]
+    assert plain["detail"]["extra_args_roles"] == []
+
+
+def test_launch_probe_groups_on_effective_args_and_empty_extra_args_launch_none(
+    tmp_path, monkeypatch
+):
+    """`extra_args = []` is an override, not "inherit": it launches NO permission
+    args, unlike an unset one. `extra_args` equal to the mode's args launches the
+    same argv as no `extra_args`, so those roles share one probe."""
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.checks import ValidationReport
+
+    claude = get_profile("claude")
+    same = ", ".join(f'"{a}"' for a in claude.bypass_args)
+    policy = tmp_path / "policy.toml"
+    policy.write_text(
+        '[adapter]\nname = "claude"\n'
+        "[adapter.review]\nextra_args = []\n"
+        f"[adapter.triage]\nextra_args = [{same}]\n",
+        encoding="utf-8",
+    )
+    pol = policy_mod.load(policy)
+    calls = _stub_launch_probe(
+        monkeypatch, probe_mod.LaunchScreenResult(probe_mod.LAUNCH_CLEAN, "fixture")
+    )
+    report = ValidationReport()
+    cli._report_launch_probes(report, pol, {"claude": claude}, tmp_path)
+
+    assert [c["profile"].bypass_args for c in calls] == [claude.bypass_args, ()]
+    by_args = {tuple(f.detail["args"]): f.detail for f in report.findings if f.detail}
+    assert [r["role"] for r in by_args[claude.bypass_args]["roles"]] == [
+        "dev",
+        "triage",
+        "retro",
+    ]
+    assert by_args[claude.bypass_args]["extra_args_roles"] == ["triage"]
+    assert by_args[()]["extra_args_roles"] == ["review"]
+
+
 def test_launch_probe_skipped_is_ok_and_worktree_isolation_is_noted(tmp_path, monkeypatch):
     from bmad_loop.adapters.profile import get_profile
     from bmad_loop.checks import ValidationReport

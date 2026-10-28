@@ -2321,19 +2321,27 @@ def _report_launch_probes(
     """``validate --probes``: one ``adapter.launch-probe`` finding per distinct
     launch (#727).
 
-    Roles whose mode-resolved profile launches the same argv (profile, model,
-    ``launch_args``, ``bypass_args``) share one :func:`probe.launch_screen_probe`
-    call. A role whose mode is unmapped is skipped —
+    Each role is probed with the argv its session launches: a non-None
+    ``extra_args`` REPLACES the mode-resolved profile's ``bypass_args``, exactly
+    as ``GenericAdapter.interactive_argv`` does (``()`` launches no permission
+    args at all; ``None`` inherits them), so the probe gets the profile with its
+    ``bypass_args`` swapped for them. Roles launching the same effective argv
+    (profile, model, ``launch_args``, effective args) share one
+    :func:`probe.launch_screen_probe` call. A role whose mode is unmapped is skipped —
     ``adapter.permission-mode-unsupported`` is its finding — as is any adapter
     kind but GENERIC, the one family whose first screen is a tmux pane.
 
     Only a dialog actually seen fails validate (``parked``). A probe that could
     not see the screen (died, launch-failed, capture-failed, unavailable) is a
     warning: no proof of a dialog, and validate's exit code is a contract."""
+    from dataclasses import replace
+
     from . import probe as probe_mod
     from .adapters import registry as adapter_registry
 
-    launches: dict[tuple[object, ...], tuple[CLIProfile, str | None, list[dict[str, str]]]] = {}
+    launches: dict[
+        tuple[object, ...], tuple[CLIProfile, str | None, list[dict[str, str]], list[str]]
+    ] = {}
     for role in ROLES:
         cfg = pol.adapter.resolved(role)
         prof = profile_by_name.get(cfg.name)
@@ -2342,22 +2350,32 @@ def _report_launch_probes(
         resolved = _permission_profile(cfg, prof)
         if resolved is None:
             continue
+        if cfg.extra_args is not None:
+            resolved = replace(resolved, bypass_args=tuple(cfg.extra_args))
         model = cfg.model or None
         key = (resolved.name, model, resolved.launch_args, resolved.bypass_args)
-        launches.setdefault(key, (resolved, model, []))[2].append(
-            {"role": role, "mode": cfg.permission_mode}
-        )
+        _, _, roles, from_extra = launches.setdefault(key, (resolved, model, [], []))
+        roles.append({"role": role, "mode": cfg.permission_mode})
+        if cfg.extra_args is not None:
+            from_extra.append(role)
 
     isolation = pol.scm.isolation
-    for resolved, model, roles in launches.values():
+    for resolved, model, roles, from_extra in launches.values():
         result = probe_mod.launch_screen_probe(
             resolved, binary=resolved.binary, project=project, model=model
         )
-        named = ", ".join(f"{r['role']} {r['mode']}" for r in roles)
+        named = ", ".join(
+            f"{r['role']} {r['mode']}" + (" via extra_args" if r["role"] in from_extra else "")
+            for r in roles
+        )
         label = f"{resolved.name} ({named})"
         detail: dict[str, object] = {
             "profile": resolved.name,
             "roles": roles,
+            # The args the probe launched in the permission slot, and which of
+            # `roles` got them from `adapter.extra_args` rather than the mode.
+            "args": list(resolved.bypass_args),
+            "extra_args_roles": from_extra,
             "verdict": result.verdict,
             "reason": result.detail,
             "evidence": result.evidence,
