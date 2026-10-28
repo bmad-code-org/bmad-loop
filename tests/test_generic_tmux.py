@@ -11583,6 +11583,212 @@ def test_subagent_activity_in_the_final_interval_closes_the_stretch(tmp_path, mo
     assert [e["kind"] for e in adapter.journal.entries] == ["session-idle", "session-active"]
 
 
+# DW-548: agy runs a foreground subagent as a SIBLING conversation and writes
+# nothing to the parent's folder meanwhile; the children the parent lists
+# through its spawn marker are walked like the subagent tree.
+
+
+def _agy_idle_run(tmp_path, monkeypatch, *, session_ids=("agy-parent",), on_call=None):
+    """An antigravity idle adapter over `_agy_brain`'s store, named by the
+    parent's `fullyIdle: false` yield Stops, one per tick from tick 1 with the
+    ids in `session_ids` (agy's only id-bearing event), with the pane
+    repainting from tick 2. The child's transcript grows
+    from tick 2 unless `on_call` replaces that; the loop ends on tick 7.
+    Returns (adapter, heartbeats, brain)."""
+    adapter, _, log, _t, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, profile_name="antigravity"
+    )
+    assert adapter.profile.subagent_transcript_root == ""  # children only
+    parent_t, child_t = _agy_brain(tmp_path)
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+            if on_call is None:
+                _grow(Path(child_t), b'{"step_index":1}\n')
+        if on_call is not None:
+            on_call(call_n)
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    stops = [_agy_stop(sid, parent_t, False) for sid in session_ids]
+    adapter.watcher = _ScriptedWatcher(stops, on_call=script)
+    return adapter, heartbeats, tmp_path / "brain"
+
+
+def test_spawned_child_activity_keeps_a_silent_agy_parent_active(tmp_path, monkeypatch):
+    """The parent's transcript sits still while the child it listed through the
+    spawn marker keeps writing: the idle clock reads the child's writes, so no
+    stretch opens.
+
+    ABLATION, performed: drop the `_spawned_children` roots from
+    `_sample_subagent_tree` and a `session-idle` opens."""
+    adapter, heartbeats, _ = _agy_idle_run(tmp_path, monkeypatch)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    assert adapter.journal.entries == []
+    assert all(hb["transcript_idle_s"] == 0.0 for hb in heartbeats[1:])
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "3-1-dev-1")]
+    assert not [c for c in crumbs if c.startswith("subagent-scan-")]
+
+
+@pytest.mark.parametrize("case", ["no-marker-key", "no-marker-file", "unjudged"])
+def test_spawned_child_is_not_watched_without_a_listing(tmp_path, monkeypatch, case):
+    """The same growing child is no activity when the parent does not list it:
+    a profile without `subagent_spawn_marker` (unchanged behaviour), a parent
+    folder holding no marker, or a Stop whose id names no ancestor folder of its
+    transcript (the parent's folder cannot be judged, so no child is guessed).
+    The silent parent opens its stretch at the grace crossing."""
+    adapter, _, brain = _agy_idle_run(
+        tmp_path, monkeypatch, session_ids=("elsewhere" if case == "unjudged" else "agy-parent",)
+    )
+    if case == "no-marker-key":
+        adapter.profile = dataclasses.replace(adapter.profile, subagent_spawn_marker=None)
+    elif case == "no-marker-file":
+        (brain / "agy-parent" / _AGY_MARKER.format(session_id="agy-child")).unlink()
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "3-1-dev-1")]
+    assert not [c for c in crumbs if c.startswith("subagent-scan-")]
+
+
+def test_spawned_child_appearing_mid_run_closes_the_stretch(tmp_path, monkeypatch):
+    """No child is listed when the parent goes quiet, so the stretch opens at
+    the grace crossing; the spawn then writes the marker and the child's
+    transcript, which reads as movement from the empty children's (0, 0, 0):
+    one `session-active` carrying the stretch's full length.
+
+    ABLATION: drop `or sub_moved` and the `session-active` is missing."""
+    marker = tmp_path / "brain" / "agy-parent" / _AGY_MARKER.format(session_id="agy-child")
+    child_dir = tmp_path / "brain" / "agy-child"
+    stash = tmp_path / "stash"
+
+    def script(call_n):
+        if call_n == 1:  # the store before the spawn: the parent alone
+            stash.mkdir()
+            marker.rename(stash / "marker.json")
+            child_dir.rename(stash / "agy-child")
+        if call_n == 5:  # heartbeat 5: 120 s
+            (stash / "marker.json").rename(marker)
+            (stash / "agy-child").rename(child_dir)
+        if call_n > 5:
+            _grow(child_dir / ".system_generated/logs/transcript_full.jsonl", b"{}\n")
+
+    adapter, _, _ = _agy_idle_run(tmp_path, monkeypatch, on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle", "session-active"]
+    assert entries[0]["since_ts"] == 5000.0
+    assert entries[1]["idle_s"] == 120.0
+
+
+def test_children_coming_into_view_rebaseline_the_subagent_key(tmp_path, monkeypatch):
+    """A profile declaring both a tree and a spawn marker, named first by an
+    id-less Stop (the parent's folder cannot be judged: the tree alone is
+    watched) and then by the parent's id: the static children now in view
+    change what the key covers, which is a baseline, not movement, so the
+    stretch still opens from the naming.
+
+    ABLATION: drop the `sub_children_judged` rebaseline and the newly watched
+    children read as movement on tick 2, moving `since_ts`."""
+    adapter, _, _ = _agy_idle_run(
+        tmp_path, monkeypatch, session_ids=(None, "agy-parent"), on_call=lambda n: None
+    )
+    adapter.profile = dataclasses.replace(
+        adapter.profile, subagent_transcript_dir="{stem}/subagents"
+    )
+    parent_t = tmp_path / "brain/agy-parent/.system_generated/logs/transcript_full.jsonl"
+    _subagent_file(parent_t, "agent-a.jsonl")
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+
+
+def test_spawn_marker_listing_fault_is_crumbed_and_degrades_to_the_parent(tmp_path, monkeypatch):
+    """A marker listing that raises is never "no children": it joins the
+    `subagent-scan-failed` streak (`path` = the parent's conversation folder),
+    and the tick degrades to the parent alone, so the silent parent still opens
+    its stretch on time although the child writes.
+
+    ABLATION: swallow the fault into `[]` and the crumb is never written."""
+    calls: list[Path] = []
+
+    def denied(template, conversation):
+        calls.append(conversation)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(generic, "_spawned_children", denied)
+    adapter, _, brain = _agy_idle_run(tmp_path, monkeypatch)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert len(calls) > 3
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+    (failed,) = _lifecycle_events(adapter, "subagent-scan-failed")
+    assert failed["path"] == str(brain / "agy-parent")
+    assert failed["error"] == "PermissionError: [Errno 13] Permission denied"
+    assert _lifecycle_events(adapter, "subagent-scan-recovered") == []
+
+
+# `_spawned_children` directly: the marker listing's match/skip/raise rules.
+
+
+def test_spawned_children_lists_each_marked_sibling(tmp_path):
+    """A listed child's folder is named whether or not it exists yet; the
+    parent's own id, names the template does not match, and an empty listing
+    directory's absence are not children."""
+    _agy_brain(tmp_path)
+    brain = tmp_path / "brain"
+    parent = brain / "agy-parent"
+    subagents = parent / ".system_generated" / "subagents"
+    (subagents / "agy-late.json").write_text("{}")  # spawned, folder not yet written
+    (subagents / "agy-parent.json").write_text("{}")  # its own id never counts
+    (subagents / "notes.txt").write_text("x")
+    assert generic._spawned_children(_AGY_MARKER, parent) == [
+        brain / "agy-child",
+        brain / "agy-late",
+    ]
+    assert generic._spawned_children(_AGY_MARKER, brain / "agy-child") == []
+
+
+def test_spawned_children_matches_the_id_in_a_middle_component(tmp_path):
+    """The id may sit in a directory component: a candidate counts only when
+    the whole filled-in marker stats, and literal braces stay literal."""
+    template = "kids/{session_id}/{{spawned}}.json"
+    conversation = tmp_path / "store" / "p"
+    (conversation / "kids" / "c1").mkdir(parents=True)
+    (conversation / "kids" / "c1" / "{spawned}.json").write_text("{}")
+    (conversation / "kids" / "c2").mkdir()  # no marker inside: not a child
+    assert generic._spawned_children(template, conversation) == [tmp_path / "store" / "c1"]
+
+
+def test_spawned_children_propagates_a_listing_or_stat_fault(tmp_path, monkeypatch):
+    """Only an absent listing directory or marker reads as absent; every other
+    fault propagates for the caller to crumb."""
+    _agy_brain(tmp_path)
+    parent = tmp_path / "brain" / "agy-parent"
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(generic.os, "scandir", denied)
+    with pytest.raises(PermissionError):
+        generic._spawned_children(_AGY_MARKER, parent)
+    monkeypatch.undo()
+    monkeypatch.setattr(generic.os, "stat", denied)
+    with pytest.raises(PermissionError):
+        generic._spawned_children(_AGY_MARKER, parent)
+
+
 # `_subagent_tree_key` directly: the stat-only walk's skip/raise rules.
 
 

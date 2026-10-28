@@ -162,8 +162,9 @@ class _IdleTracker:
     declares a subagent tree: the wait loop's `sample_transcript` reads
     `last_key[1]` as the parent's byte size — the #727 growth test and the scan
     offset for `_transcript_has_assistant_activity` — so a folded key would credit
-    subagent bytes as parent growth and scan from a wrong offset. The tree gets
-    its own `sub_key`, OR-ed only into the idle clock's change test.
+    subagent bytes as parent growth and scan from a wrong offset. The tree (and
+    any spawned child conversations) gets its own `sub_key`, OR-ed only into the
+    idle clock's change test.
 
     `tool_scan_failures` is the streak of `session-idle` `in_tool` reads that
     raised; it never moves the clock, only the `tool-scan-*` crumbs."""
@@ -189,6 +190,11 @@ class _IdleTracker:
     # Reset on a re-point; kept through a failed walk, so writes made during a
     # fault count as movement once the walk recovers.
     sub_key: tuple[int, int, int] | None = None
+    # Whether the last walk watched the spawned children (DW-548): their
+    # parent's conversation folder could be judged. A flip changes what the key
+    # covers, so it rebaselines `sub_key` rather than reading as movement. None
+    # = not walked on this path yet; reset on a re-point.
+    sub_children_judged: bool | None = None
     # The running streak of subagent-tree walks that raised: crumbed at its
     # transitions (`subagent-scan-failed` / `subagent-scan-recovered`). NOT reset
     # on a re-point, so a streak open across one still gets its recovery crumb.
@@ -421,6 +427,60 @@ def _is_regular_file(path: str | None) -> bool:
         return False
 
 
+def _conversation_folder(session_id: str | None, transcript_path: str | None) -> Path | None:
+    """The conversation folder a transcript sits in under a spawn-marker layout
+    (DW-548): its nearest ancestor named by the session id, or None when there
+    is no id, no transcript path, or no such ancestor — nothing to judge."""
+    if (
+        not session_id
+        or not transcript_path
+        or session_id in (".", "..")
+        or "\0" in transcript_path
+    ):
+        return None
+    return next((p for p in Path(transcript_path).parents if p.name == session_id), None)
+
+
+def _spawned_children(template: str, conversation: Path) -> list[Path]:
+    """The child conversation folders ``conversation`` lists through the spawn
+    marker its CLI writes there at each spawn (DW-548; the profile's
+    ``subagent_spawn_marker``, ``{session_id}`` read as the wildcard): each
+    child's folder is ``<store root>/<childId>/``, a sibling of
+    ``conversation``, whether or not it exists yet.
+
+    The component holding ``{session_id}`` is matched against a listing of its
+    directory; a candidate id counts only when the whole marker it fills in
+    stats, so a template with the id in a middle component holds too. The
+    conversation's own id and "."/".." never count. Stat-only, nothing is
+    opened. ``FileNotFoundError``/``NotADirectoryError`` on the listed
+    directory (no spawn yet) or on a candidate marker read as absent; every
+    other ``OSError`` propagates for the caller to crumb, so a fault never
+    reads as "no children"."""
+    parts = Path(template.format(session_id="\0")).parts
+    index = next(i for i, part in enumerate(parts) if "\0" in part)
+    head, *tail = parts[index].split("\0")
+    pattern = regex.escape(head)
+    for n, piece in enumerate(tail):
+        pattern += ("(?P<id>.+)" if n == 0 else "(?P=id)") + regex.escape(piece)
+    matcher = regex.compile(pattern)
+    try:
+        with os.scandir(conversation.joinpath(*parts[:index])) as entries:
+            names = [entry.name for entry in entries]
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    children: list[Path] = []
+    for name in sorted(names):
+        match = matcher.fullmatch(name)
+        if match is None or match["id"] in (".", "..", conversation.name):
+            continue
+        try:
+            os.stat(conversation / template.format(session_id=match["id"]))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        children.append(conversation.parent / match["id"])
+    return children
+
+
 def _spawn_marker_verdict(
     template: str, session_id: str | None, transcript_path: str | None
 ) -> Literal["child", "own", "unjudged"]:
@@ -439,15 +499,8 @@ def _spawn_marker_verdict(
     on a candidate marker read as absent; every other ``OSError`` — the store
     root's listing included — propagates for the caller to crumb, so a fault
     never reads as "own"."""
-    if (
-        not session_id
-        or not transcript_path
-        or session_id in (".", "..")
-        or "\0" in transcript_path
-    ):
-        return "unjudged"
-    conversation = next((p for p in Path(transcript_path).parents if p.name == session_id), None)
-    if conversation is None:
+    conversation = _conversation_folder(session_id, transcript_path)
+    if conversation is None or session_id is None:
         return "unjudged"
     marker = template.format(session_id=session_id)
     with os.scandir(conversation.parent) as entries:
@@ -1561,8 +1614,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 frame_key = tick_key
 
         # Idle detection (#680): the live transcript's (mtime_ns, size) — plus the
-        # profile's subagent transcript tree, whose writes also count as activity
-        # — sampled on the heartbeat cadence from the first tick that knows
+        # profile's subagent transcript tree and spawned child conversations, whose
+        # writes also count as activity — sampled on the heartbeat cadence from the first tick that knows
         # `transcript_path`; see `_sample_transcript_idle`. Observes only: nothing here nudges,
         # stalls or kills (#680 item 2 stays open), and `stall_deadline` is
         # neither consulted nor touched.
@@ -1590,7 +1643,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             same_path = idle.path == path
             prior_key = idle.last_key if same_path else None
             was_absent = idle.seen_absent if same_path else False
-            sampled = self._sample_transcript_idle(handle.task_id, path, idle, now)
+            sampled = self._sample_transcript_idle(handle.task_id, path, idle, now, session_id)
             current_key = idle.last_key
             # A same-size rewrite or truncation does not append a new record.
             # Scanning from byte zero in that case would credit an old assistant
@@ -2748,29 +2801,66 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return path.parent / template.format(stem=path.stem)
 
     def _sample_subagent_tree(
-        self, task_id: str, transcript_path: str, idle: _IdleTracker
+        self,
+        task_id: str,
+        transcript_path: str,
+        idle: _IdleTracker,
+        session_id: str | None = None,
     ) -> tuple[int, int, int] | None:
-        """The subagent tree's `_subagent_tree_key` this tick, or None when there
-        is no tree to watch or the walk raised. A raising walk degrades the tick
-        to parent-only (the pre-subagent behaviour) and is crumbed at the streak's
-        transitions, as the wait loop's transcript scan is:
-        `subagent-scan-failed` (`path`, `error`) at failure 1,
-        `subagent-scan-recovered` (`failures`) at the next clean walk."""
+        """The subagent activity key this tick: `_subagent_tree_key` summed over
+        every root watched — (count, total_bytes, newest_mtime_ns) — or None when
+        there is nothing to watch or a walk raised.
+
+        The roots are the declared tree (`_subagent_root`) plus, when the
+        profile sets `subagent_spawn_marker`, every child conversation folder the
+        parent's own folder lists through it (`_spawned_children`, DW-548): agy
+        writes nothing to the parent while a foreground subagent runs, only to
+        the child's sibling folder. The parent's folder is the transcript's
+        ancestor named by `session_id` (`_conversation_folder`); when it cannot
+        be judged, no children are watched this tick — never guessed. A child
+        folder is walked with the same `*.jsonl` rule as the tree, so its
+        transcript (`.system_generated/logs/transcript_full.jsonl` on agy) is
+        activity and its other files are not. A change in whether children are
+        watched rebaselines the key.
+
+        A raising walk or marker listing degrades the tick to parent-only (the
+        pre-subagent behaviour) and is crumbed at the streak's transitions, as
+        the wait loop's transcript scan is: `subagent-scan-failed` (`path` =
+        the root walked, or the parent's conversation folder for a listing
+        fault; `error`) at failure 1, `subagent-scan-recovered` (`failures`) at
+        the next clean walk."""
         root = self._subagent_root(transcript_path)
-        if root is None:
+        marker = self.profile.subagent_spawn_marker
+        conversation = _conversation_folder(session_id, transcript_path) if marker else None
+        if root is None and conversation is None:
             return None
+        if idle.sub_children_judged != (conversation is not None):
+            idle.sub_children_judged = conversation is not None
+            idle.sub_key = None
+        roots = [] if root is None else [root]
+        where = root
         try:
-            key = _subagent_tree_key(root)
+            if marker and conversation is not None:
+                where = conversation
+                roots.extend(_spawned_children(marker, conversation))
+            keys: list[tuple[int, int, int]] = []
+            for where in roots:
+                keys.append(_subagent_tree_key(where))
         except OSError as e:
             idle.sub_scan_failures += 1
             if idle.sub_scan_failures == 1:
                 self._note_lifecycle(
                     task_id,
                     "subagent-scan-failed",
-                    path=str(root),
+                    path=str(where),
                     error=f"{type(e).__name__}: {e}",
                 )
             return None
+        key = (
+            sum(k[0] for k in keys),
+            sum(k[1] for k in keys),
+            max((k[2] for k in keys), default=0),
+        )
         if idle.sub_scan_failures:
             self._note_lifecycle(
                 task_id, "subagent-scan-recovered", failures=idle.sub_scan_failures
@@ -2813,7 +2903,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return "none" if name is None else _idle_tool_slug(name)
 
     def _sample_transcript_idle(
-        self, task_id: str, transcript_path: str, idle: _IdleTracker, now: float
+        self,
+        task_id: str,
+        transcript_path: str,
+        idle: _IdleTracker,
+        now: float,
+        session_id: str | None = None,
     ) -> bool:
         """One heartbeat-cadence sample of the #680 idle detector: advance `idle`
         from the transcript's current stat key and journal the stretch boundaries.
@@ -2836,10 +2931,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         an unwritable journal must not end a session that is, by this very
         evidence, alive.
 
-        The profile's subagent transcript tree (`_sample_subagent_tree`) counts
-        too: a parent blocked on a foreground subagent writes nothing to its own
-        transcript, so a tree that moved since the last clean walk is a change
-        like a parent key that moved. Its first walk on a path is a baseline. A
+        The profile's subagent transcript tree, and the child conversations a
+        `subagent_spawn_marker` lists in the folder `session_id` names
+        (`_sample_subagent_tree`), count too: a parent blocked on a foreground
+        subagent writes nothing to its own transcript, so subagent activity that
+        moved since the last clean walk is a change like a parent key that moved.
+        Its first walk on a path is a baseline. A
         walk that raises degrades the tick to parent-only, crumbed as
         `subagent-scan-failed` / `subagent-scan-recovered`; `idle.last_key` stays
         the parent's key either way.
@@ -2876,13 +2973,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             idle.open_since = None
             idle.seen_absent = False
             idle.sub_key = None
+            idle.sub_children_judged = None
         key = self._transcript_activity_key(transcript_path)
         flush_active()
         if key is None:
             if idle.last_key is None:
                 idle.seen_absent = True
             return False
-        sub = self._sample_subagent_tree(task_id, transcript_path, idle)
+        sub = self._sample_subagent_tree(task_id, transcript_path, idle, session_id)
         sub_moved = sub is not None and idle.sub_key is not None and sub != idle.sub_key
         if sub is not None:
             idle.sub_key = sub

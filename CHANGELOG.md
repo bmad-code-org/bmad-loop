@@ -226,6 +226,9 @@ breaking changes may land in a minor release.
 - Ignore an Antigravity subagent conversation's `Stop` instead of letting its final turn end
   complete the parent early: the new profile key `subagent_spawn_marker` identifies a child
   by the spawn file its parent wrote, and `subagent-stop-ignored` journals each child.
+- Count an Antigravity subagent's writes as its parent's activity, so a parent blocked on a
+  long foreground subagent no longer journals a false `session-idle`: the idle notice walks
+  each child conversation the parent's `subagent_spawn_marker` files list.
 - Classify OpenCode 2.x provider 5xx errors (`provider.internal`), rejected credentials
   (`provider.auth`) and unroutable models (`provider.no-route`) as environment faults
   instead of charging the session as a code failure.
