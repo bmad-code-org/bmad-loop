@@ -1062,6 +1062,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `session-end` / `workflow-end` (#610): the usage limit's reset parsed
         # from the same pane line — ISO-8601, or the raw clause text.
         "usage_limit_resets",
+        # `session-end` / `workflow-end` (DW-591): which usage-limit list the live
+        # sighting matched — one of two literal enum strings (`blocked`, `wait`).
+        "usage_limit_class",
         "verification_sequence",
         "verification_stage",
         "via",
@@ -1242,6 +1245,7 @@ JOURNAL_SPLAT_FIELDS = {
             "usage_limited",
             "quota_wait_s",
             "usage_limit_resets",
+            "usage_limit_class",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys

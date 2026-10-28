@@ -57,7 +57,12 @@ from conftest import (
 from bmad_loop import deferredwork, devcontract, gates
 from bmad_loop import journal as journal_mod
 from bmad_loop import platform_util, runs, verify
-from bmad_loop.adapters.base import ZERO_TOKEN_TIMEOUT_EVIDENCE, SessionResult, SessionSpec
+from bmad_loop.adapters.base import (
+    USAGE_LIMIT_WAIT,
+    ZERO_TOKEN_TIMEOUT_EVIDENCE,
+    SessionResult,
+    SessionSpec,
+)
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import (
     _UNREADABLE_LEDGER_DIGEST,
@@ -15608,9 +15613,9 @@ def test_session_end_carries_quota_wait_s_only_when_positive(project):
 
 def test_session_end_carries_usage_limit_resets_only_when_set(project):
     """#610: the usage limit's parsed reset rides `session-end` present-only and
-    names itself in the pause reason.
-    ABLATION: drop the `usage_limit_resets` extras line from `_session_end_extras`
-    and the session-end assertion fails."""
+    names itself in the pause reason; so does the list it matched (DW-591).
+    ABLATION: drop the `usage_limit_resets` (or `usage_limit_class`) extras line
+    from `_session_end_extras` and the session-end assertion fails."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
     engine, _ = make_engine(
@@ -15622,18 +15627,21 @@ def test_session_end_carries_usage_limit_resets_only_when_set(project):
                 parked_evidence=evidence,
                 usage_limited=evidence,
                 usage_limit_resets="2026-10-25T19:20:00+00:00",
+                usage_limit_class=USAGE_LIMIT_WAIT,
             )
         ],
     )
     engine.run()
     end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
     assert end["usage_limit_resets"] == "2026-10-25T19:20:00+00:00"
+    assert end["usage_limit_class"] == USAGE_LIMIT_WAIT
     assert engine.state.paused_reason is not None
     assert "; resets 2026-10-25T19:20:00+00:00" in engine.state.paused_reason
     engine2, _ = make_engine(project, [SessionResult(status="stalled")])
     engine2.run()
     plain_end = [e for e in engine2.journal.entries() if e["kind"] == "session-end"][-1]
     assert "usage_limit_resets" not in plain_end
+    assert "usage_limit_class" not in plain_end
 
 
 def test_session_env_fault_pauses_dev_without_burning_budget(project):

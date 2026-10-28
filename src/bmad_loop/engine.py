@@ -3089,6 +3089,8 @@ class Engine:
                 wf_extras["usage_limited"] = result.usage_limited
             if result.usage_limit_resets:
                 wf_extras["usage_limit_resets"] = result.usage_limit_resets
+            if result.usage_limit_class:
+                wf_extras["usage_limit_class"] = result.usage_limit_class
             if result.quota_wait_s > 0:
                 wf_extras["quota_wait_s"] = round(result.quota_wait_s, 1)
             self.journal.append(
@@ -8448,6 +8450,10 @@ class Engine:
         # raw clause when it did not resolve.
         if result.usage_limit_resets:
             extras["usage_limit_resets"] = result.usage_limit_resets
+        # which usage-limit list matched (DW-591): `blocked` or `wait`,
+        # present-only like the reset.
+        if result.usage_limit_class:
+            extras["usage_limit_class"] = result.usage_limit_class
         # usage-limit quota wait (DW-396): present-only — the seconds the session
         # sat behind a usage-window reset with its timeout frozen.
         if result.quota_wait_s > 0:

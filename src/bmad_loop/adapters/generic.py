@@ -55,6 +55,8 @@ from ..tokens import read_usage as tally_usage
 from ..usagereset import UsageReset, parse_reset
 from ..verify import read_frontmatter, status_of
 from .base import (
+    USAGE_LIMIT_BLOCKED,
+    USAGE_LIMIT_WAIT,
     CodingCLIAdapter,
     SessionHandle,
     SessionResult,
@@ -1572,7 +1574,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return self._quota_wait_tool_open(handle, path)
 
         def stall_exit(
-            parked_now: str | None, usage_now: str | None, resets_now: str | None = None
+            parked_now: str | None,
+            usage_now: str | None,
+            resets_now: str | None = None,
+            class_now: str | None = None,
         ) -> SessionResult:
             """The non-completion exit of a stalled session (DW-348, #610):
             resolve, then re-probe liveness. A now-dead window is ``crashed``
@@ -1580,7 +1585,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             is gone). Otherwise ``stalled`` with ``accept_result=False``: an
             artifact on disk cannot upgrade the stall to completed (it may be
             stale or mid-write; only a Stop or window death vouches for it), and
-            ``parked_now`` / ``usage_now`` / ``resets_now`` label it. Both exits
+            ``parked_now`` / ``usage_now`` / ``resets_now`` / ``class_now``
+            label it. Both exits
             carry the rollout."""
             try_resolve()
             if self._probe_liveness(handle, "stall") is False:
@@ -1612,6 +1618,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     parked_evidence=parked_now,
                     usage_limited=usage_now,
                     usage_limit_resets=resets_now if usage_now is not None else None,
+                    usage_limit_class=class_now if usage_now is not None else None,
                 )
             return stalled
 
@@ -1636,7 +1643,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                     evidence = quota.evidence
                     self._end_quota_wait(handle, quota, "cap")
-                    return stall_exit(evidence, evidence, quota.resets)
+                    return stall_exit(evidence, evidence, quota.resets, USAGE_LIMIT_WAIT)
                 # The freeze runs on EVERY tick, not only on heartbeats: a wait
                 # admitted with less than a heartbeat interval left would
                 # otherwise time out between samples. This is the one sanctioned
@@ -1706,12 +1713,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # None = no baseline or no sample: the idle gate alone decides.
                 latch_moved = latch_key_now is not None and latch_key_now != parked_key
                 parked_now = None if latch_moved else parked_evidence
-                parked_hit, usage_hit = self._pane_evidence(
+                parked_hit, blocked_hit, waiting_hit = self._pane_evidence(
                     handle,
                     self._parked_prompt_patterns if parked_now is None else (),
-                    self._usage_pane_patterns,
+                    self._usage_limit_patterns,
+                    self._usage_wait_patterns,
                     skip=quota.spent,
                 )
+                usage_hit = self._usage_hit(blocked_hit, waiting_hit)
                 if parked_now is None and parked_hit is not None:
                     parked_now = parked_hit[0]
                 if (parked_now is not None or usage_hit is not None) and self._probe_liveness(
@@ -1730,9 +1739,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     and not latch_unmoved
                 ):
                     parked_now = None
-                usage_now = resets_now = None
+                usage_now = resets_now = class_now = None
                 if usage_hit is not None and not still_working():
-                    usage_now = usage_hit[0]
+                    usage_now, class_now = usage_hit[0], usage_hit[2]
                     reset = self._usage_reset(handle, usage_hit[1], _local_now())
                     resets_now = reset.value if reset is not None else None
                 timed_out = SessionResult(
@@ -1746,6 +1755,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     produced_work=produced_work(),
                     usage_limited=usage_now,
                     usage_limit_resets=resets_now,
+                    usage_limit_class=class_now,
                 )
                 if parked_now is not None:
                     return dataclasses.replace(timed_out, parked=True, parked_evidence=parked_now)
@@ -1863,7 +1873,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 resets_at=resets,
                                 cap_left_s=round(cap_left, 3),
                             )
-                            return stall_exit(wait_hit[0], wait_hit[0], resets)
+                            return stall_exit(wait_hit[0], wait_hit[0], resets, USAGE_LIMIT_WAIT)
                         frozen = max(
                             min(remaining, wall_deadline - time.time()),
                             QUOTA_WAIT_MIN_REMAINING_S,
@@ -2205,17 +2215,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # a silent foreground tool past the grace, say), which
                     # stalls as before #610 rather than pausing uncharged.
                     parked_now = parked_evidence
-                    parked_hit, usage_hit = self._pane_evidence(
+                    parked_hit, blocked_hit, waiting_hit = self._pane_evidence(
                         handle,
                         self._parked_prompt_patterns if parked_now is None else (),
-                        self._usage_pane_patterns,
+                        self._usage_limit_patterns,
+                        self._usage_wait_patterns,
                         skip=quota.spent,
                     )
+                    usage_hit = self._usage_hit(blocked_hit, waiting_hit)
                     if parked_now is None and parked_hit is not None:
                         parked_now = parked_hit[0]
-                    usage_now = resets_now = None
+                    usage_now = resets_now = class_now = None
                     if usage_hit is not None and not still_working():
-                        usage_now = usage_hit[0]
+                        usage_now, class_now = usage_hit[0], usage_hit[2]
                         reset = self._usage_reset(handle, usage_hit[1], _local_now())
                         resets_now = reset.value if reset is not None else None
                     if parked_now is None:
@@ -2261,7 +2273,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # persistent failure. A dead window is never labelled parked:
                     # nothing is waiting on a human once the CLI is gone. The
                     # probe fault is crumbed (`site="stall"`, DW-454).
-                    return stall_exit(parked_now, usage_now, resets_now)
+                    return stall_exit(parked_now, usage_now, resets_now, class_now)
                 continue
             # Drop a nested CLI's events before they can re-point the identity
             # or transcript, set stop_seen, spend nudges or re-arm the stall
@@ -3138,11 +3150,22 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return None
         return (found.evidence, found.line)
 
-    @property
-    def _usage_pane_patterns(self) -> tuple[regex.Pattern[str], ...]:
-        """Both usage-limit lists (#610) as the live gates consult them: disjoint
-        by contract, so either one matching means usage-limited."""
-        return self._usage_limit_patterns + self._usage_wait_patterns
+    @staticmethod
+    def _usage_hit(
+        blocked: tuple[str, str] | None, waiting: tuple[str, str] | None
+    ) -> tuple[str, str, str] | None:
+        """The live usage-limit sighting (#610) from one ``_pane_evidence`` look
+        that matched both lists as separate sets: ``(evidence, matched_line,
+        usage_limit_class)``, else None. Either list matching means
+        usage-limited; the set it came from is the class (DW-591). The lists are
+        disjoint by contract, but should one screen match both, ``blocked`` wins:
+        a CLI that will not continue by itself needs an operator, and reading it
+        as a wait would let a resume-at-reset relaunch into the same wall."""
+        if blocked is not None:
+            return (blocked[0], blocked[1], USAGE_LIMIT_BLOCKED)
+        if waiting is not None:
+            return (waiting[0], waiting[1], USAGE_LIMIT_WAIT)
+        return None
 
     def _session_vanished(self, task_id: str) -> bool:
         # The disambiguating probe (#489): `list_window_ids` returns [] for a

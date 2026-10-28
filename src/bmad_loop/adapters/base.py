@@ -39,6 +39,12 @@ ZERO_TOKEN_TIMEOUT_EVIDENCE = (  # nosec B105 - diagnostic prose, not a credenti
     "the CLI never got a usable response from the provider"
 )
 
+# `SessionResult.usage_limit_class` values (DW-591): which profile list a live
+# usage-limit sighting matched — `usage_limit_patterns` (blocked: an operator
+# must act) or `usage_wait_patterns` (waiting on a reset the CLI continues from).
+USAGE_LIMIT_BLOCKED = "blocked"
+USAGE_LIMIT_WAIT = "wait"
+
 
 class AdapterTaskDirectoryError(ValueError):
     """A built-in adapter refused an unsafe or redirected task directory."""
@@ -372,6 +378,12 @@ class SessionResult:
     # `usage-reset-unparsed`). None = no `resets` clause on the line, or not
     # usage-limited. Named by the pause reason; journaled present-only. APPENDED.
     usage_limit_resets: str | None = None
+    # Which usage-limit list the live sighting in `usage_limited` matched
+    # (DW-591): USAGE_LIMIT_BLOCKED for `usage_limit_patterns` (the CLI will not
+    # continue by itself, e.g. credit exhaustion), USAGE_LIMIT_WAIT for
+    # `usage_wait_patterns` (it continues after the reset). None exactly when
+    # `usage_limited` is None. Journaled present-only. APPENDED.
+    usage_limit_class: str | None = None
 
 
 class CodingCLIAdapter(ABC):

@@ -30,6 +30,8 @@ from bmad_loop import devcontract, runs
 from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import env_fault, generic, tmux_base
 from bmad_loop.adapters.base import (
+    USAGE_LIMIT_BLOCKED,
+    USAGE_LIMIT_WAIT,
     ZERO_TOKEN_TIMEOUT_EVIDENCE,
     AdapterTaskDirectoryError,
     SessionHandle,
@@ -5547,11 +5549,16 @@ def test_usage_limited_env_fault_is_not_overruled_by_tokens(tmp_path, status):
     evidence = _usage_evidence(adapter)
     handle = SessionHandle(task_id=_ENV_FAULT_TASK, native_id="@1")
     live = SessionResult(
-        status=status, parked=True, parked_evidence=evidence, usage_limited=evidence
+        status=status,
+        parked=True,
+        parked_evidence=evidence,
+        usage_limited=evidence,
+        usage_limit_class=USAGE_LIMIT_BLOCKED,
     )
     spec = make_spec(adapter.run_dir, task_id=_ENV_FAULT_TASK)
     result = adapter._classify_env_fault(handle, spec, live)
     assert result.env_fault is True
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED  # the live class survives
     assert result.env_fault_evidence == evidence
     assert result.env_fault_overruled is None
     assert reads == []
@@ -5588,6 +5595,7 @@ def test_tail_only_usage_match_is_still_overruled(tmp_path):
     assert kept.env_fault is True
     assert "Run /usage-credits" in kept.env_fault_evidence
     assert kept.usage_limited is None  # the tail never sets the live field
+    assert kept.usage_limit_class is None  # ...nor its class (DW-591)
 
 
 def test_run_overruled_timeout_is_plain_timeout(tmp_path):
@@ -12175,25 +12183,25 @@ def test_profile_without_parked_patterns_never_captures(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("line", "field"),
+    ("line", "field", "usage_class"),
     [
-        (USAGE_CREDITS_LINE, "usage_limit_patterns"),
-        (USAGE_SESSION_LINE, "usage_wait_patterns"),
+        (USAGE_CREDITS_LINE, "usage_limit_patterns", USAGE_LIMIT_BLOCKED),
+        (USAGE_SESSION_LINE, "usage_wait_patterns", USAGE_LIMIT_WAIT),
     ],
 )
 @pytest.mark.parametrize("nudges", [0, 2])
 def test_stall_expiry_on_usage_limit_line_is_parked_and_usage_limited(
-    tmp_path, monkeypatch, line, field, nudges
+    tmp_path, monkeypatch, line, field, usage_class, nudges
 ):
     """No hook latch, a usage-limit line on the visible pane: the stall-grace
     expiry ends the session `stalled` + `parked`, with `usage_limited` naming
     the matched pattern and quoting the line — whether a nudge was due (2) or
-    none is configured (0). Either list counts; one capture serves both the
-    parked and the usage patterns.
+    none is configured (0). Either list counts, and `usage_limit_class` names
+    which one (DW-591); one capture serves the parked and both usage sets.
 
-    Ablation: drop `self._usage_pane_patterns` from the stall gate's
-    `_pane_evidence` call (usage_now stays None) and this fails on an unparked
-    stall with `usage_limited` None."""
+    Ablation: drop the usage sets from the stall gate's `_pane_evidence` call
+    (usage_now stays None) and this fails on an unparked stall with
+    `usage_limited` None."""
     screen = f"\x1b[2m{line}\x1b[0m\r\n\r\n❯ \r\n"
     adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=screen, nudges=nudges)
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
@@ -12201,9 +12209,47 @@ def test_stall_expiry_on_usage_limit_line_is_parked_and_usage_limited(
     assert result.usage_limited is not None
     pattern = getattr(adapter.profile, field)[0]
     assert result.usage_limited == f"pane matched {pattern!r}: {line.strip()}"
+    assert result.usage_limit_class == usage_class
     assert result.parked_evidence == result.usage_limited  # no latch: the limit IS the park
     assert mux.sent == []
     assert mux.captures == ["@1"]
+
+
+def test_blocked_line_outranks_a_wait_line_on_one_screen(tmp_path, monkeypatch):
+    """The two lists are disjoint by contract, but a screen showing both a
+    session-window wait line and, BELOW it, a credit-exhaustion line is
+    `blocked` (DW-591): an operator must act. The wait line comes first in row
+    order, so a merged search would have picked it. Same at the stall-expiry
+    gate and the timeout-fired look, each still one capture.
+
+    Ablation: swap `_usage_hit`'s order (wait checked first) and this fails
+    on `wait`."""
+    both = f"{USAGE_SESSION_LINE}\n{USAGE_CREDITS_LINE}\n❯ \n"
+    stall_dir = tmp_path / "stall"
+    stall_dir.mkdir()
+    adapter, mux = _parked_adapter(stall_dir, monkeypatch, [], screen=both, nudges=0)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(stall_dir))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert result.usage_limited == _usage_evidence(adapter)
+    assert result.usage_limit_resets is None  # the credits line names no reset
+    assert mux.captures == ["@1"]
+
+    timeout_dir = tmp_path / "timeout"
+    timeout_dir.mkdir()
+    timed, clock = _timeout_clock_adapter(timeout_dir, monkeypatch)
+    timed_mux = _UnitMux(screen=both)
+    timed.mux = timed_mux
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    timed.watcher = _ScriptedWatcher([], on_call=advance)
+    late = timed.wait_for_completion(_dev_handle(), _short_spec(timeout_dir))
+    assert late.status == "timeout"
+    assert late.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert late.usage_limited == _usage_evidence(timed)
+    assert timed_mux.captures == ["@1"]
 
 
 @pytest.mark.parametrize(
@@ -12218,8 +12264,8 @@ def test_usage_line_withholds_the_stall_nudge(tmp_path, monkeypatch, events):
     `idle_prompt` latch already supplying the parked evidence, the usage look
     still runs and is still recorded.
 
-    Ablation: drop `self._usage_pane_patterns` from the stall gate's
-    `_pane_evidence` call and the no-latch case sends two STALL_NUDGE_TEXTs; the
+    Ablation: drop the usage sets from the stall gate's `_pane_evidence` call
+    and the no-latch case sends two STALL_NUDGE_TEXTs; the
     latched case loses `usage_limited` from the crumb and the result."""
     adapter, mux = _parked_adapter(
         tmp_path, monkeypatch, events, screen=f"{USAGE_CREDITS_LINE}\n", nudges=2
@@ -12229,6 +12275,7 @@ def test_usage_line_withholds_the_stall_nudge(tmp_path, monkeypatch, events):
     assert _stall_nudges(mux) == []
     assert (result.status, result.parked) == ("stalled", True)
     assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
     (withheld,) = _lifecycle_events(adapter, "stall-nudge-withheld")
     assert withheld["usage_limited"] == evidence
     assert withheld["nudge_due"] is True
@@ -12256,6 +12303,7 @@ def test_timeout_with_usage_line_visible_is_usage_limited(tmp_path, monkeypatch)
     assert result.status == "timeout"
     pattern = adapter.profile.usage_wait_patterns[0]
     assert result.usage_limited == f"pane matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
     assert mux.captures == ["@1"]
 
     mux.screen = "working…\n❯ \n"
@@ -12264,6 +12312,7 @@ def test_timeout_with_usage_line_visible_is_usage_limited(tmp_path, monkeypatch)
     clean = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
     assert clean.status == "timeout"
     assert clean.usage_limited is None
+    assert clean.usage_limit_class is None
 
 
 def test_timeout_with_wrapped_usage_line_is_usage_limited(tmp_path, monkeypatch):
@@ -12304,6 +12353,7 @@ def test_dead_window_is_never_usage_limited(tmp_path, monkeypatch):
     assert result.status == "crashed"
     assert result.parked is False
     assert result.usage_limited is None
+    assert result.usage_limit_class is None
     assert _stall_nudges(mux) == []
     assert mux.captures == ["@1"]  # the line WAS seen: the probe is what declined it
 
@@ -12321,6 +12371,7 @@ def test_dead_window_is_never_usage_limited(tmp_path, monkeypatch):
     late = timed.wait_for_completion(_dev_handle(), _short_spec(timeout_dir))
     assert late.status == "timeout"
     assert late.usage_limited is None
+    assert late.usage_limit_class is None
     assert timed_mux.captures == ["@1"]
 
 
@@ -13840,6 +13891,7 @@ def test_reset_beyond_cap_skips_the_wait(tmp_path, monkeypatch):
     assert (result.status, result.parked) == ("stalled", True)
     assert result.parked_evidence == result.usage_limited == q.wait_evidence()
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
     assert result.result_json is None
     assert result.quota_wait_s == 0.0
     assert q.quota_kinds() == []
@@ -13879,6 +13931,7 @@ def test_reset_within_cap_waits(tmp_path, monkeypatch):
     )
     assert result.status == "completed"
     assert result.usage_limit_resets is None  # it continued: no usage verdict
+    assert result.usage_limit_class is None
     assert _lifecycle_events(q.adapter, "quota-wait-skipped") == []
     assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
     started = next(e for e in q.adapter.journal.entries if e["kind"] == "quota-wait-started")
@@ -13896,7 +13949,7 @@ def test_reset_within_cap_waits(tmp_path, monkeypatch):
 def test_usage_limited_result_carries_the_parsed_reset(tmp_path, monkeypatch):
     """Every usage-limited exit carries the reset parsed from the matched line:
     the stall-expiry gate (quota wait off, silent pane), the timeout-fired look,
-    and the quota-wait cap."""
+    and the quota-wait cap; each also names the wait list it matched (DW-591)."""
     for sub in ("stall", "timeout", "cap"):
         (tmp_path / sub).mkdir()
     stall = _quota_adapter(tmp_path / "stall", monkeypatch, grace=120.0)
@@ -13904,18 +13957,21 @@ def test_usage_limited_result_carries_the_parsed_reset(tmp_path, monkeypatch):
     assert (result.status, result.parked) == ("stalled", True)
     assert result.usage_limited == stall.wait_evidence()
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT  # the session-window line
 
     timeout = _quota_adapter(tmp_path / "timeout", monkeypatch)
     result = _drive_quota(timeout, _quota_spec(tmp_path, cap_s=0.0))
     assert result.status == "timeout"
     assert result.usage_limited == timeout.wait_evidence()
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT  # the session-window line
 
     cap = _quota_adapter(tmp_path / "cap", monkeypatch)
     result = _drive_quota(cap, _quota_spec(tmp_path, cap_s=600.0))
     assert (result.status, result.parked) == ("stalled", True)
     assert _lifecycle_events(cap.adapter, "quota-wait-cap")
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT  # the session-window line
     for q in (stall, timeout, cap):
         assert _lifecycle_events(q.adapter, "usage-reset-unparsed") == []
 
