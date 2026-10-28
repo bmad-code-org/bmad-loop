@@ -66,6 +66,13 @@ def test_builtin_profiles_load():
         "sessionEnd": "SessionEnd",
     }
     assert profiles["copilot"].usage_parser == "copilot-events"
+    # copilot confirms tool calls, file paths and URL fetches separately; an
+    # unattended session needs all three bypassed, or a URL fetch parks it
+    assert profiles["copilot"].bypass_args == (
+        "--allow-all-tools",
+        "--allow-all-paths",
+        "--allow-all-urls",
+    )
     # copilot writes token totals only on shutdown (poll grace) and fires
     # agentStop per turn (multi-turn reviews need more nudges)
     assert profiles["copilot"].usage_grace_s == 8.0

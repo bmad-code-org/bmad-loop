@@ -195,6 +195,8 @@ breaking changes may land in a minor release.
 - Refuse `delete` (even `--force`), the TUI delete and `clean` on a run whose state
   cannot be read, or on an isolated v7 sweep run still holding shared-store ledger
   closes for unlanded code; a new sweep warns while such a run exists (DW-571).
+- Pass `--allow-all-urls` in copilot's `bypass_args` so unattended sessions fetch URLs
+  without a permission prompt; this changes the copilot default config digest (DW-598).
 
 ### Removed
 

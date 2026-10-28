@@ -21,7 +21,13 @@ name = "copilot"
 binary = "copilot"
 prompt_template = "LOAD the FULL .agents/skills/{skill}/SKILL.md, read its entire contents and follow its directions exactly, using subagents as needed: {args}"
 launch_args = ["-i"]
-bypass_args = ["--allow-all-tools", "--allow-all-paths"]
+# Three separate confirmations, each its own flag
+# (https://docs.github.com/en/copilot/reference/cli-command-reference): tool
+# calls, file path checks, and URL access. Without --allow-all-urls a
+# session that fetches a URL parks on a permission prompt. `--allow-all` (alias
+# `--yolo`) is all three; they are spelled out so the launched argv says what it
+# grants.
+bypass_args = ["--allow-all-tools", "--allow-all-paths", "--allow-all-urls"]
 model_flag = "--model"
 usage_parser = "copilot-events"
 # Copilot writes its token totals (modelMetrics) only in the trailing
