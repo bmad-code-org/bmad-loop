@@ -1530,10 +1530,18 @@ def _fold_deprecated_engine(
     its ``name`` is empty (the old "disabled" state)."""
     if not engine_d:
         return
+    # Advice names the configured engine; an empty name (the old "disabled" state)
+    # enables nothing, so the only migration is deleting the block. Read leniently:
+    # a wrong-typed name still warns before `_typed_str` refuses it below.
+    raw_name = engine_d.get("name", "")
+    advised = raw_name.strip() if isinstance(raw_name, str) else ""
+    if advised:
+        advice = f'Use [plugins] enabled = ["{advised}"] with a [plugins.{advised}] table.'
+    else:
+        advice = "Its empty name enables nothing; remove the [engine] section."
     warnings.warn(
         "[engine] in policy.toml is deprecated; the game-engine layer is now a "
-        'plugin. Use [plugins] enabled = ["unity"] with a [plugins.unity] table. '
-        "[engine] will be removed in a future release.",
+        f"plugin. {advice} [engine] will be removed in a future release.",
         PolicyDeprecationWarning,
         stacklevel=3,
     )

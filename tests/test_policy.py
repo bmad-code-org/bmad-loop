@@ -1627,7 +1627,7 @@ unity_path = "/opt/Unity/Editor/Unity"
 ready_timeout_sec = 120
 ready_grace_sec = 90
 """)
-    with pytest.warns(policy.PolicyDeprecationWarning):
+    with pytest.warns(policy.PolicyDeprecationWarning, match=r'enabled = \["unity"\]'):
         pol = policy.load(p)
     assert "unity" in pol.plugins.enabled
     assert pol.plugin_setting("unity", "mcp") == "coplaydev"
@@ -1637,12 +1637,19 @@ ready_grace_sec = 90
 
 
 def test_deprecated_engine_disabled_when_name_empty(tmp_path):
-    # name = "" was the old "disabled" state: warn, but enable nothing.
+    """name = "" was the old "disabled" state: warn, but enable nothing, and advise
+    deleting the block rather than enabling Unity.
+
+    Ablation: restore the fixed Unity advice → the message asserts fail."""
     p = tmp_path / "policy.toml"
     p.write_text('[engine]\neditor_mode = "shared"\n[scm]\nisolation = "worktree"\n')
-    with pytest.warns(policy.PolicyDeprecationWarning):
+    with pytest.warns(policy.PolicyDeprecationWarning) as caught:
         pol = policy.load(p)
     assert pol.plugins.enabled == ()
+    # Following the notice must not enable a plugin the block never enabled.
+    (msg,) = [str(w.message) for w in caught]
+    assert "remove the [engine] section" in msg
+    assert "unity" not in msg
 
 
 def test_explicit_plugin_settings_win_over_folded_engine(tmp_path):
