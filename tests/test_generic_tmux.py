@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 import regex
-from conftest import REAL_MUX_HANG_CEILING_S, json_recursion_payload, real_mux_e2e
+from conftest import REAL_MUX_HANG_CEILING_S, git, json_recursion_payload, real_mux_e2e
 
 from bmad_loop import devcontract, runs
 from bmad_loop.adapters import base as adapter_base
@@ -41,12 +41,18 @@ from bmad_loop.adapters.base import (
 )
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
-from bmad_loop.adapters.profile import PARKED_EVENTS, PermissionModeSpec, get_profile
+from bmad_loop.adapters.profile import (
+    PARKED_EVENTS,
+    PermissionModeSpec,
+    get_profile,
+    toml_basic_string,
+)
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS, Journal
 from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.signals import HookEvent
+from bmad_loop.verify import GitTimeoutError
 
 # A bump the filesystem can actually record. NTFS stores ~100ns ticks (FAT, 2s),
 # so a 1ns increment rounds away on Windows and the rewritten marker never reads
@@ -467,6 +473,102 @@ def test_a_sandboxed_profile_launches_its_mode_args_in_the_bypass_slot(tmp_path)
     cmd = adapter.build_command(make_spec(tmp_path))
     assert shlex.quote(settings) in cmd
     assert shlex.split(cmd)[prompt_at + 2] == settings
+
+
+def _grant_adapter(tmp_path, profile_name="codex", mode="sandboxed", extra_args=None):
+    adapter = make_adapter(tmp_path, profile_name=profile_name, extra_args=extra_args)
+    adapter.profile = get_profile(profile_name).for_permission_mode(mode, platform="linux")
+    return adapter
+
+
+def _linked_worktree(project) -> Path:
+    wt = project.project.parent / "wt"
+    git(project.project, "worktree", "add", "-q", "--detach", str(wt), "HEAD")
+    (wt / "nested").mkdir()  # a nested project's sessions run below the worktree root
+    return wt
+
+
+def test_sandboxed_codex_in_a_linked_worktree_is_granted_its_gitdir_and_common_dir(
+    tmp_path, project
+):
+    """DW-599: Codex's sandbox keeps a linked worktree's gitdir and the shared
+    common dir read-only, so the sandboxed launch appends the mode's
+    `linked_worktree_args` with both exact paths, after the mode args (its later
+    `default_permissions` must win) and before the model flag.
+
+    ABLATION: return () from `_linked_worktree_grant` and this reddens."""
+    wt = _linked_worktree(project)
+    adapter = _grant_adapter(tmp_path)
+    mode_args = list(adapter.profile.bypass_args)
+    gitdir = toml_basic_string(str((project.project / ".git" / "worktrees" / "wt").resolve()))
+    common = toml_basic_string(str((project.project / ".git").resolve()))
+    grant = [
+        "-c",
+        'permissions.bmad_loop_worktree.extends="bmad_loop"',
+        "-c",
+        f'permissions.bmad_loop_worktree.filesystem={{{gitdir}="write",{common}="write"}}',
+        "-c",
+        'default_permissions="bmad_loop_worktree"',
+    ]
+    for cwd in (wt, wt / "nested"):
+        argv = adapter.interactive_argv(dataclasses.replace(make_spec(tmp_path), cwd=cwd))
+        start = argv.index(mode_args[0])
+        assert argv[start:] == [*mode_args, *grant, "--model", "sonnet"]
+
+
+def test_no_linked_worktree_grant_in_a_main_checkout(tmp_path, project):
+    adapter = _grant_adapter(tmp_path)
+    argv = adapter.interactive_argv(dataclasses.replace(make_spec(tmp_path), cwd=project.project))
+    assert argv[-4:-2] == ["--ask-for-approval", "never"]  # the mode args end the slot
+    assert not any("bmad_loop_worktree" in a for a in argv)
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "mode", "extra_args"),
+    [
+        ("codex", "bypass", None),
+        ("claude", "sandboxed", None),  # a sandbox that needs no grant declares none
+        ("codex", "sandboxed", ("--custom",)),  # extra_args replaces the mode args, grant too
+    ],
+    ids=["bypass", "non-codex", "extra-args"],
+)
+def test_no_linked_worktree_grant_without_a_declaring_mode(
+    tmp_path, project, monkeypatch, profile_name, mode, extra_args
+):
+    """No grant, and git is not even asked: a broken git must not fail a launch
+    that owes no grant."""
+    wt = _linked_worktree(project)
+
+    def no_git(*_a, **_k):
+        raise AssertionError("git asked for a launch that owes no grant")
+
+    monkeypatch.setattr(generic, "git_bytes", no_git)
+    adapter = _grant_adapter(tmp_path, profile_name, mode, extra_args)
+    argv = adapter.interactive_argv(dataclasses.replace(make_spec(tmp_path), cwd=wt))
+    assert not any("bmad_loop_worktree" in a for a in argv)
+
+
+def test_a_linked_worktree_grant_fault_refuses_the_launch(tmp_path, monkeypatch):
+    """A git fault while resolving the paths raises rather than launching a
+    session that could not commit. Covers a cwd git disowns (rc != 0) and a git
+    that raises (timeout / spawn failure).
+
+    ABLATION: return None from `_linked_worktree_git_dirs` on a fault and both
+    cases launch."""
+    adapter = _grant_adapter(tmp_path)
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    spec = dataclasses.replace(make_spec(tmp_path), cwd=plain)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    with pytest.raises(generic.LinkedWorktreeGrantError, match="could not read the git dirs"):
+        adapter.build_command(spec)
+
+    def hung(*_a, **_k):
+        raise GitTimeoutError("git timed out")
+
+    monkeypatch.setattr(generic, "git_bytes", hung)
+    with pytest.raises(generic.LinkedWorktreeGrantError, match="git timed out"):
+        adapter.interactive_argv(spec)
 
 
 def test_read_result_variants(tmp_path):

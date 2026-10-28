@@ -53,7 +53,7 @@ from ..process_host import ProcessHostError, get_process_host
 from ..signals import REBIND_SOURCES, SessionAttribution, SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..usagereset import UsageReset, parse_reset
-from ..verify import read_frontmatter, status_of
+from ..verify import GitError, git_bytes, read_frontmatter, status_of
 from .base import (
     USAGE_LIMIT_BLOCKED,
     USAGE_LIMIT_WAIT,
@@ -508,6 +508,43 @@ def _idle_tool_slug(name: str) -> str:
     if name.startswith("mcp__"):
         return "mcp"
     return "other"
+
+
+class LinkedWorktreeGrantError(RuntimeError):
+    """A sandboxed launch that owes a linked worktree's gitdir grant (DW-599)
+    could not resolve the paths to grant. Raised out of ``start_session``
+    rather than launching without the grant: such a session could not
+    `git add`/`commit`, and would fail its unit only after spending its turn."""
+
+
+def _linked_worktree_git_dirs(cwd: Path) -> tuple[Path, Path] | None:
+    """``(gitdir, common dir)`` of the linked worktree ``cwd`` is in, both
+    resolved; None in a main checkout, whose gitdir IS its common dir. Every
+    fault raises :class:`LinkedWorktreeGrantError`: the caller has already
+    decided a grant is owed, and a session run without it cannot commit."""
+    try:
+        answer = git_bytes(
+            cwd, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"
+        )
+    except GitError as e:
+        raise LinkedWorktreeGrantError(f"could not ask git for the git dirs of {cwd}: {e}") from e
+    try:
+        # fsdecode can raise on Windows (utf-8/surrogatepass refuses a lone byte).
+        stdout, stderr = os.fsdecode(answer.stdout), os.fsdecode(answer.stderr)
+    except UnicodeError as e:
+        raise LinkedWorktreeGrantError(f"could not decode the git dirs of {cwd}: {e}") from e
+    if answer.returncode != 0:
+        detail = stderr.strip() or f"git exited {answer.returncode}"
+        raise LinkedWorktreeGrantError(f"could not read the git dirs of {cwd}: {detail}")
+    # One path per line; removesuffix, not strip: every other byte is the path's.
+    lines = stdout.removesuffix("\n").split("\n")
+    if len(lines) != 2 or not all(lines):
+        raise LinkedWorktreeGrantError(f"unexpected git dirs for {cwd}: {lines!r}")
+    try:
+        git_dir, common_dir = Path(lines[0]).resolve(), Path(lines[1]).resolve()
+    except (OSError, RuntimeError) as e:
+        raise LinkedWorktreeGrantError(f"could not resolve the git dirs of {cwd}: {e}") from e
+    return None if git_dir == common_dir else (git_dir, common_dir)
 
 
 class _ResultFileMixin:
@@ -1145,7 +1182,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     def interactive_argv(self, spec: SessionSpec) -> list[str]:
         extra = self.extra_args
         if extra is None:
-            extra = self.profile.bypass_args
+            # The linked-worktree grant rides with the mode args it extends, so an
+            # `extra_args` override (which replaces them) drops it too.
+            extra = (*self.profile.bypass_args, *self._linked_worktree_grant(spec.cwd))
         binary = self.binary
         if self.profile.hooks.dialect == "codex-hooks-json":
             from ..codex_trust import resolved_codex_binary
@@ -1160,6 +1199,24 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if spec.model:
             argv += [self.profile.model_flag, spec.model]
         return argv
+
+    def _linked_worktree_grant(self, cwd: Path) -> tuple[str, ...]:
+        """The permission mode's ``linked_worktree_args`` filled in with the
+        gitdir and common dir of the linked worktree ``cwd`` is in (DW-599); ()
+        when the mode declares none (bypass, or a CLI whose sandbox needs no
+        grant) or ``cwd`` is a main checkout. Git is asked only when a grant
+        could be owed; a fault raises :class:`LinkedWorktreeGrantError`."""
+        if not self.profile.linked_worktree_args:
+            return ()
+        dirs = _linked_worktree_git_dirs(cwd)
+        if dirs is None:
+            return ()
+        try:
+            return self.profile.render_linked_worktree_args(*dirs)
+        except ValueError as e:
+            raise LinkedWorktreeGrantError(
+                f"cannot write the git dirs of {cwd} into {self.profile.name}'s grant: {e}"
+            ) from e
 
     def interactive_env(self, spec: SessionSpec) -> dict[str, str]:
         # The pin chokepoint (runs.pin_state_root): the profile's [env] table

@@ -36,10 +36,11 @@ import importlib.metadata
 import string
 import sys
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from importlib import resources
 from importlib.resources.abc import Traversable
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import regex
 
@@ -161,6 +162,13 @@ class ParkedAnswersSpec:
 # The `sys.platform` values a `[permission_modes.<mode>]` table may name.
 PERMISSION_MODE_PLATFORMS = frozenset({"linux", "darwin", "win32"})
 
+# The placeholders a `linked_worktree_args` entry may carry (DW-599), each
+# rendered as a TOML basic string, quotes included, of the resolved path.
+LINKED_WORKTREE_PLACEHOLDERS = ("{gitdir}", "{common_dir}")
+_LINKED_WORKTREE_PLACEHOLDER_RE = regex.compile(
+    "|".join(regex.escape(p) for p in LINKED_WORKTREE_PLACEHOLDERS)
+)
+
 
 @dataclass(frozen=True)
 class PermissionModeSpec:
@@ -170,11 +178,31 @@ class PermissionModeSpec:
     (:meth:`CLIProfile.for_permission_mode`), so ``extra_args`` replaces them
     exactly as it replaces ``bypass_args``. ``platforms`` names the
     ``sys.platform`` values the mapping is known to work on; empty = every
-    platform. Mode names, args and platforms are validated in
+    platform. ``linked_worktree_args`` (DW-599) are appended after ``args`` when
+    the session's cwd is a linked worktree, with :data:`LINKED_WORKTREE_PLACEHOLDERS`
+    filled in, for a sandbox that must be granted that worktree's gitdir and
+    common dir explicitly. Mode names, args and platforms are validated in
     :func:`_validate_profile`."""
 
     args: tuple[str, ...]
     platforms: tuple[str, ...] = ()
+    linked_worktree_args: tuple[str, ...] = ()
+
+
+def toml_basic_string(value: str) -> str:
+    """``value`` as a TOML basic string, quotes included. Raises ValueError for a
+    value TOML cannot carry: a lone surrogate (a non-UTF-8 path byte under
+    ``os.fsdecode``) has no TOML spelling."""
+    value.encode("utf-8")  # UnicodeEncodeError (a ValueError) on a lone surrogate
+    out: list[str] = []
+    for ch in value:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 @dataclass(frozen=True)
@@ -348,6 +376,10 @@ class CLIProfile:
     # a mode absent here is refused for this CLI. APPENDED after parked_answers
     # for the same positional-compatibility reason.
     permission_modes: dict[str, PermissionModeSpec] = field(default_factory=dict)
+    # The selected mode's `linked_worktree_args` (DW-599), set beside
+    # `bypass_args` by `for_permission_mode`; empty under bypass. APPENDED after
+    # permission_modes for the same positional-compatibility reason.
+    linked_worktree_args: tuple[str, ...] = ()
 
     @property
     def hookless(self) -> bool:
@@ -384,7 +416,8 @@ class CLIProfile:
         (the launched argv, the config digest, :meth:`missing_bypass_tokens`)
         sees the effective permission args with no second code path. Raises
         :class:`ProfileError` when the profile has no mapping for ``mode`` or
-        the mapping excludes ``platform``."""
+        the mapping excludes ``platform``. The mode's ``linked_worktree_args``
+        ride along the same way, for the adapter to fill in per session."""
         if mode == "bypass":
             return self
         spec = self.permission_modes.get(mode)
@@ -399,7 +432,22 @@ class CLIProfile:
                 f"profile {self.name!r} maps permission_mode {mode!r} only on "
                 f"{', '.join(spec.platforms)}, not {platform}"
             )
-        return replace(self, bypass_args=spec.args)
+        return replace(self, bypass_args=spec.args, linked_worktree_args=spec.linked_worktree_args)
+
+    def render_linked_worktree_args(
+        self, gitdir: PurePath, common_dir: PurePath
+    ) -> tuple[str, ...]:
+        """``linked_worktree_args`` with each placeholder replaced by its path as a
+        TOML basic string. Raises ValueError for a path TOML cannot carry."""
+        values = {
+            "{gitdir}": toml_basic_string(str(gitdir)),
+            "{common_dir}": toml_basic_string(str(common_dir)),
+        }
+        # One pass, so a path that itself spells a placeholder is not rewritten.
+        return tuple(
+            _LINKED_WORKTREE_PLACEHOLDER_RE.sub(lambda m: values[m.group()], arg)
+            for arg in self.linked_worktree_args
+        )
 
     def missing_bypass_tokens(self, extra_args: tuple[str, ...] | None) -> tuple[str, ...]:
         """The permission args (``bypass_args``) a policy ``extra_args`` override
@@ -416,6 +464,19 @@ class CLIProfile:
             return ()
         present = {*self.launch_args, *extra_args}
         return tuple(t for t in dict.fromkeys(self.bypass_args) if t not in present)
+
+
+def _check_linked_worktree_args(
+    args: tuple[str, ...], where: str, fail: Callable[[str], ProfileError]
+) -> None:
+    """Non-empty strings, and at least one placeholder across the list: an arg
+    with no path in it belongs in the mode's ``args``."""
+    if not args:
+        return
+    if not all(isinstance(a, str) and a for a in args):
+        raise fail(f"{where} must list non-empty strings")
+    if not any(p in a for a in args for p in LINKED_WORKTREE_PLACEHOLDERS):
+        raise fail(f"{where} must use at least one of {', '.join(LINKED_WORKTREE_PLACEHOLDERS)}")
 
 
 def _validate_profile(profile: CLIProfile, source: str) -> None:
@@ -726,6 +787,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 f"permission_modes.{mode}.platforms must name values from "
                 f"{sorted(PERMISSION_MODE_PLATFORMS)}: got {bad!r}"
             )
+        _check_linked_worktree_args(
+            spec.linked_worktree_args, f"permission_modes.{mode}.linked_worktree_args", fail
+        )
+    # A provider-built profile may set the resolved field directly.
+    _check_linked_worktree_args(profile.linked_worktree_args, "linked_worktree_args", fail)
 
     answers = profile.parked_answers
     if answers is not None:
@@ -844,7 +910,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             lists[key] = tuple(raw)
         parked_answers = ParkedAnswersSpec(**lists)
 
-    # `[permission_modes.<mode>]` tables of two string lists; mode names and
+    # `[permission_modes.<mode>]` tables of string lists; mode names and
     # values are checked in `_validate_profile`.
     modes_d = doc.get("permission_modes", {})
     if not isinstance(modes_d, dict):
@@ -853,11 +919,12 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
     for mode, spec_d in modes_d.items():
         if not isinstance(spec_d, dict):
             raise fail(f"permission_modes.{mode} must be a table")
-        unknown = sorted(set(spec_d) - {"args", "platforms"})
+        mode_keys = ("args", "platforms", "linked_worktree_args")
+        unknown = sorted(set(spec_d) - set(mode_keys))
         if unknown:
             raise fail(f"permission_modes.{mode} has unknown keys: {unknown}")
         mode_lists: dict[str, tuple[str, ...]] = {}
-        for key in ("args", "platforms"):
+        for key in mode_keys:
             raw = spec_d.get(key, [])
             if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
                 raise fail(f"permission_modes.{mode}.{key} must be a list of strings")

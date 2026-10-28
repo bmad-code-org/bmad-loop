@@ -168,8 +168,9 @@ def config_digest(
       what flags and environment**. That rule, not a hand-picked list, is what
       keeps this complete: walk ``GenericAdapter.interactive_argv`` and
       ``interactive_env`` and every token there traces back to one of
-      ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
-      ``prompt_template`` / ``env`` on the *resolved* profile, or to
+      ``binary`` / ``launch_args`` / ``bypass_args`` / ``linked_worktree_args``
+      (its paths filled in) / ``model_flag`` / ``prompt_template`` / ``env`` on
+      the *resolved* profile, or to
       ``extra_args`` on the resolved adapter — plus ``session_id_flag``, which
       ``build_command`` appends (with a minted id) to the launched argv only.
       The opencode-http builder reads a strict SUBSET of those — ``_serve_argv``
@@ -440,6 +441,10 @@ def config_digest(
         # pin also records which mapping those args came from.
         if cfg.permission_mode != "bypass":
             launch[role]["permission_mode"] = cfg.permission_mode
+        # Argv tokens `interactive_argv` appends after the mode's args in a linked
+        # worktree (DW-599), placeholders unfilled; same byte-identity rule.
+        if prof.linked_worktree_args:
+            launch[role]["linked_worktree_args"] = list(prof.linked_worktree_args)
     payload = {
         "verify_commands": list(policy.verify.commands),
         "plugins_enabled": sorted(policy.plugins.enabled),

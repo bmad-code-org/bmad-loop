@@ -426,6 +426,24 @@ def test_sandboxed_permission_mode_moves_the_digest_and_hashes_its_args(pinned):
     assert _digest(pinned, sandboxed) != before
 
 
+def test_linked_worktree_args_are_hashed_only_when_declared(pinned):
+    """DW-599: the grant template adds argv tokens in a linked worktree, so it is
+    pinned; a mode that declares none hashes no key (its digest is unchanged)."""
+    sandboxed = _with_adapter_key('permission_mode = "sandboxed"')
+    (pinned / PROFILE_REL).write_text(PROFILE + _SANDBOX_TABLE, encoding="utf-8")
+    without = _digest(pinned, sandboxed)
+    grant = 'linked_worktree_args = ["-g", "{gitdir}"]\n'
+    (pinned / PROFILE_REL).write_text(PROFILE + _SANDBOX_TABLE + grant, encoding="utf-8")
+    declared = _digest(pinned, sandboxed)
+    assert declared != without
+    (pinned / PROFILE_REL).write_text(
+        PROFILE + _SANDBOX_TABLE + grant.replace('"-g"', '"-G"'), encoding="utf-8"
+    )
+    assert _digest(pinned, sandboxed) not in (without, declared)
+    # bypass never resolves the mode, so the declared template is not launched
+    assert _digest(pinned, POLICY) == _PRE_PERMISSION_MODE_DIGEST
+
+
 def test_digest_raises_on_an_unmapped_permission_mode(pinned):
     """The same rule as an unknown profile: the launch refuses the mode, so the
     digest must not hash a launch surface that never runs."""
