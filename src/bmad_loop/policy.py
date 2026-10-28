@@ -79,6 +79,14 @@ class PolicyError(Exception):
     pass
 
 
+class PolicyDeprecationWarning(FutureWarning):
+    """A policy.toml key or value that still loads but is going away.
+
+    A ``FutureWarning`` because Python shows that category to application end
+    users by default, while ``DeprecationWarning`` is hidden outside
+    ``__main__`` (#835). The CLI formats it in ``cli._format_warning``."""
+
+
 @dataclass(frozen=True)
 class GatesPolicy:
     mode: str = "per-epic"
@@ -1526,7 +1534,7 @@ def _fold_deprecated_engine(
         "[engine] in policy.toml is deprecated; the game-engine layer is now a "
         'plugin. Use [plugins] enabled = ["unity"] with a [plugins.unity] table. '
         "[engine] will be removed in a future release.",
-        DeprecationWarning,
+        PolicyDeprecationWarning,
         stacklevel=3,
     )
     name = _typed_str(engine_d, "engine", "name", "").strip()

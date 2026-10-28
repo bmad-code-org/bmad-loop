@@ -203,6 +203,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Show the legacy `[engine]` deprecation notice to CLI users: it was a `DeprecationWarning`,
+  which Python hides outside `__main__`. It is now `policy.PolicyDeprecationWarning` (a
+  `FutureWarning`), printed once on stderr as `bmad-loop: warning: …`, and `validate` reports
+  it as `policy.deprecated` (#835).
 - Pause instead of retrying a review, fix, blocking-workflow, triage or migration session
   that produced no work (#727).
 - Match parked-prompt and usage-limit patterns across wrapped pane rows, so a dialog

@@ -62,7 +62,8 @@ mcp = "ivanmurzak"
 ```
 
 > **Legacy `[engine]` still works.** A pre-migration `[engine] name = "unity"`
-> block loads with a deprecation warning, folded into the `[plugins]` allowlist
+> block loads, printing a `bmad-loop: warning:` deprecation line on stderr (and a
+> `policy.deprecated` warning in `validate`), folded into the `[plugins]` allowlist
 > plus a `[plugins.unity]` table. The _policy block_ is the only thing folded,
 > though — project-local plugin overrides are now discovered under
 > `.bmad-loop/plugins/<name>/`, so move an old `.bmad-loop/engines/unity/`

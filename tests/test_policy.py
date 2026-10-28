@@ -1021,16 +1021,26 @@ def test_plugins_enabled_entries_reject_non_strings(bad):
         policy.loads(f"[plugins]\nenabled = [{bad}]\n")
 
 
+def test_policy_deprecation_warning_is_shown_to_end_users():
+    """A policy.toml deprecation must reach the person running bmad-loop (#835).
+    Python's default filters hide ``DeprecationWarning`` outside ``__main__`` and
+    show ``FutureWarning``, and policy loads run in library code.
+
+    Ablation: revert the base to ``DeprecationWarning`` → both asserts fail."""
+    assert issubclass(policy.PolicyDeprecationWarning, FutureWarning)
+    assert not issubclass(policy.PolicyDeprecationWarning, DeprecationWarning)
+
+
 @pytest.mark.parametrize("bad", ["5", "true"])
 def test_deprecated_engine_name_rejects_non_string(bad):
     """The deprecated `[engine]` fold reads `name` to decide which plugin to enable,
     so a wrong-typed one stringified into a bogus plugin name on the way out of a
-    block that is already warning the user it is going away. The DeprecationWarning
+    block that is already warning the user it is going away. The deprecation warning
     still fires: the type check runs after it, not instead of it.
 
     Ablation: delete `_typed_str`'s conditional and raise; both rows fail because the
     name is stringified and enables a plugin named "5"/"True"."""
-    with pytest.warns(DeprecationWarning):
+    with pytest.warns(policy.PolicyDeprecationWarning):
         with pytest.raises(policy.PolicyError, match=r"engine\.name must be a string"):
             policy.loads(f"[engine]\nname = {bad}\n")
 
@@ -1617,7 +1627,7 @@ unity_path = "/opt/Unity/Editor/Unity"
 ready_timeout_sec = 120
 ready_grace_sec = 90
 """)
-    with pytest.warns(DeprecationWarning):
+    with pytest.warns(policy.PolicyDeprecationWarning):
         pol = policy.load(p)
     assert "unity" in pol.plugins.enabled
     assert pol.plugin_setting("unity", "mcp") == "coplaydev"
@@ -1630,7 +1640,7 @@ def test_deprecated_engine_disabled_when_name_empty(tmp_path):
     # name = "" was the old "disabled" state: warn, but enable nothing.
     p = tmp_path / "policy.toml"
     p.write_text('[engine]\neditor_mode = "shared"\n[scm]\nisolation = "worktree"\n')
-    with pytest.warns(DeprecationWarning):
+    with pytest.warns(policy.PolicyDeprecationWarning):
         pol = policy.load(p)
     assert pol.plugins.enabled == ()
 
@@ -1640,7 +1650,7 @@ def test_explicit_plugin_settings_win_over_folded_engine(tmp_path):
     p.write_text(
         '[engine]\nname = "unity"\nmcp = "ivanmurzak"\n' '[plugins.unity]\nmcp = "coplaydev"\n'
     )
-    with pytest.warns(DeprecationWarning):
+    with pytest.warns(policy.PolicyDeprecationWarning):
         pol = policy.load(p)
     assert pol.plugin_setting("unity", "mcp") == "coplaydev"
 
