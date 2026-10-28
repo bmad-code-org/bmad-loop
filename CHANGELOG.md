@@ -203,6 +203,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- validate's hooks.trust now checks the permission-mode launch args each role runs with (DW-602).
 - Show the legacy `[engine]` deprecation notice to CLI users: it was a `DeprecationWarning`,
   which Python hides outside `__main__`. It is now `policy.PolicyDeprecationWarning` (a
   `FutureWarning`), printed once on stderr as `bmad-loop: warning: …`, and `validate` reports

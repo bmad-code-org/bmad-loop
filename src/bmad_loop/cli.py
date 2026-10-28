@@ -1277,8 +1277,33 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"discovery for {', '.join(unsafe_roles)}"
                 )
             else:
-                trust = project_hook_trust(project, profile)
-                trust_message = None if trust.status == "trusted" else trust.reason
+                # Query the profile each role launches: its permission_mode's
+                # args, as runsetup.make_adapters resolves them. Roles sharing
+                # a launch share one query; a role that cannot run its mode is
+                # adapter.permission-mode-unsupported's finding, not this one's.
+                launches: dict[tuple[object, ...], tuple[CLIProfile, list[str]]] = {}
+                if pol is not None:
+                    for role in ROLES:
+                        cfg = pol.adapter.resolved(role)
+                        if cfg.name != profile.name:
+                            continue
+                        resolved = _permission_profile(cfg, profile)
+                        if resolved is None:
+                            continue
+                        key = (resolved.launch_args, resolved.bypass_args)
+                        launches.setdefault(key, (resolved, []))[1].append(
+                            f"{role} ({cfg.permission_mode})"
+                        )
+                if not launches:
+                    launches[()] = (profile, [])
+                trust_message = None
+                for resolved, roles in launches.values():
+                    trust = project_hook_trust(project, resolved)
+                    if trust.status != "trusted":
+                        trust_message = trust.reason
+                        if len(launches) > 1:
+                            trust_message += f" (launch for {', '.join(roles)})"
+                        break
             if trust_message is None:
                 report.ok(
                     "hooks.trust",
