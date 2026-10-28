@@ -1313,3 +1313,127 @@ def test_cmd_clean_dry_run_plans_a_held_closes_run_as_protected(project_v7_store
     assert engine.run_dir.name not in doc["deleted"]
     assert doc["deleted"] == [plain.name]
     assert engine.run_dir.is_dir() and plain.is_dir()
+
+
+@pytest.mark.parametrize("force", [False, True], ids=["plain", "force"])
+def test_cmd_archive_refuses_a_run_holding_unlanded_sweep_closes(
+    project_v7_store_repo, monkeypatch, capsys, force
+):
+    """DW-572: `archive` on a held run exits FAILURE with the refusal naming DW-1
+    and `bmad-loop resume`, and writes no tarball. Under `--force` a live holder
+    is refused before the live-engine stop, as on `delete`.
+
+    Ablation: delete the `refuse_held_sweep_closes` call in `archive_run` and the
+    plain row fails (the run is archived); delete the `--force` pre-check in
+    `cmd_archive` and the force row fails (the engine is stopped first)."""
+    engine, paths, _plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    stopped: list[Path] = []
+    monkeypatch.setattr(runs, "stop_run", lambda rd, *_a, **_k: stopped.append(rd))
+    if force:
+        monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    args = argparse.Namespace(project=str(paths.project), run_id=engine.run_dir.name, force=force)
+
+    assert cli.cmd_archive(args) == cli.ExitCode.FAILURE
+
+    err = capsys.readouterr().err
+    assert f"run {engine.run_dir.name}: refusing to archive it" in err
+    assert "DW-1" in err and f"bmad-loop resume {engine.run_dir.name}" in err
+    assert engine.run_dir.is_dir() and not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert stopped == []
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+def test_cmd_clean_archive_arm_skips_a_held_closes_run(project_v7_store_repo, capsys, mode):
+    """DW-572: the default archive arm leaves a held run whole and untrimmed and
+    reports it protected, while its sibling is archived.
+
+    Ablation: narrow the pre-check in `cmd_clean` back to the delete arm and this
+    fails (the holder is trimmed, then `archive_run` refuses it)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    heavy = engine.run_dir / VERIFY_DIR
+    heavy.mkdir()
+    (heavy / "verify.log").write_text("kept\n", encoding="utf-8")
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    archive_dir = paths.project / runs.ARCHIVE_DIR
+
+    if mode == "json":
+        doc = _clean_json(paths.project, capsys, "--retain", "0")
+        assert doc["protected"] == [engine.run_dir.name]
+        assert doc["archived"] == [plain.name]
+        assert doc["trimmed"] == []
+    else:
+        assert cli.cmd_clean(_clean_args(paths.project, retain=0)) == 0
+        err = capsys.readouterr().err
+        line = next(ln for ln in err.splitlines() if ln.startswith(f"run {engine.run_dir.name}:"))
+        assert "DW-1" in line and line.endswith("— not removed")
+
+    assert not plain.exists() and (archive_dir / f"{plain.name}.tar.gz").is_file()
+    assert not (archive_dir / f"{engine.run_dir.name}.tar.gz").exists()
+    assert engine.run_dir.is_dir() and heavy.is_dir()
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+
+
+def _held_run_unit_worktree(engine, paths):
+    """Mount a real git worktree under the held run's `worktrees/` dir, the shape a
+    paused isolated unit leaves, plus a trimmable verifier store. Returns both."""
+    wt = engine.run_dir / "worktrees" / "u"
+    wt.parent.mkdir()
+    verify.worktree_add(paths.repo_root, wt, "held-unit")
+    heavy = engine.run_dir / VERIFY_DIR
+    heavy.mkdir()
+    (heavy / "verify.log").write_text("kept\n", encoding="utf-8")
+    assert {wt.parent, heavy} <= set(runs.heavy_run_entries(engine.run_dir))  # premise
+    return wt, heavy
+
+
+@pytest.mark.parametrize(
+    "trim, extra",
+    [
+        (True, ()),
+        (True, ("--dry-run",)),
+        (False, ()),
+    ],
+    ids=["trim", "trim-dry-run", "reconcile-only"],
+)
+def test_cmd_clean_leaves_a_held_runs_worktree_and_artifacts_alone(
+    project_v7_store_repo, capsys, trim, extra
+):
+    """DW-573: inside retention, `clean` neither force-removes a held run's unit
+    worktree (`reconcile_orphan_worktrees`) nor trims it (`trim_run_dir`), with
+    `[cleanup] trim_artifacts` on or off and under `--dry-run`. The run is
+    reported protected, and its sibling is still trimmed.
+
+    Ablation: narrow the pre-check in `cmd_clean` back to the delete arm and
+    every row fails (the worktree is reconciled and the run listed as such)."""
+    engine, paths, plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    wt, heavy = _held_run_unit_worktree(engine, paths)
+    (plain / VERIFY_DIR).mkdir()
+    if not trim:
+        policy = paths.project / ".bmad-loop" / "policy.toml"
+        policy.write_text("[cleanup]\ntrim_artifacts = false\n", encoding="utf-8")
+
+    doc = _clean_json(paths.project, capsys, *extra)
+
+    assert doc["protected"] == [engine.run_dir.name]
+    assert doc["worktrees"] == []
+    assert doc["trimmed"] == ([plain.name] if trim else [])
+    assert doc["archived"] == [] and doc["deleted"] == []
+    assert wt.is_dir() and heavy.is_dir()
+    assert wt.resolve() in [p.resolve() for p in verify.worktree_list(paths.repo_root)]
+
+
+def test_cmd_clean_text_reports_a_held_run_inside_retention_as_untouched(
+    project_v7_store_repo, capsys
+):
+    """The text line for a held run kept inside retention names DW-1 and says it
+    was left untouched (nothing of it was due for removal)."""
+    engine, paths, _plain = _held_and_plain_stopped_runs(project_v7_store_repo)
+    wt, heavy = _held_run_unit_worktree(engine, paths)
+
+    assert cli.cmd_clean(_clean_args(paths.project)) == 0
+
+    out, err = capsys.readouterr()
+    assert str(wt) not in out
+    line = next(ln for ln in err.splitlines() if ln.startswith(f"run {engine.run_dir.name}:"))
+    assert "DW-1" in line and line.endswith("— left untouched")
+    assert wt.is_dir() and heavy.is_dir()

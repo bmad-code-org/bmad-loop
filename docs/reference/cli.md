@@ -380,7 +380,7 @@ Compresses a run into `.bmad-loop/archive/<run-id>.tar.gz`, then removes the run
 bmad-loop archive [--project PROJECT] [--force] run_id
 ```
 
-- `--force` and the live-engine and live-session refusals are the same as `delete`. `archive` does not refuse a run that holds unlanded sweep ledger closes. The tarball holds the in-tree run directory only.
+- `--force` and the live-engine and live-session refusals are the same as `delete`, and so is the refusal (exit 1, even with `--force` and before `--force` stops anything) of a sweep run that holds unlanded sweep ledger closes or cannot be checked for them: nothing restores an archive, so `resume` could never land or reopen them. The tarball holds the in-tree run directory only.
 
 ### `cleanup`
 
@@ -416,7 +416,7 @@ bmad-loop clean [--project PROJECT] [--dry-run] [--keep RUN_ID] [--retain N] [--
 | `--json`        | Emit one JSON document instead of text.                                                                                                                                     |
 
 - Exits 0 once the policy loads; per-run faults are warnings on stderr or fields in the JSON document.
-- A run past retention that `delete` would refuse because it holds unlanded sweep ledger closes is skipped on the delete arm (`--hard`, or `[cleanup] archive_old = false`) before anything of it is trimmed. Stderr names it and the entries; `--json` lists it under `protected`. The archive arm keeps the run in its tarball and is not affected.
+- A run that `delete` would refuse because it holds unlanded sweep ledger closes (or cannot be checked for them) is skipped on every arm before anything of it is touched: it is never archived, deleted, trimmed or worktree-reconciled, so its unit worktree survives. Stderr names it and the entries; `--json` (and `--dry-run`) lists it under `protected`.
 
 JSON: [`clean --json`](#clean---json).
 

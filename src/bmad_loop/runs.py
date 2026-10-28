@@ -3625,11 +3625,19 @@ class HeldClosesUnknownError(Exception):
 
 
 class HeldSweepClosesError(Exception):
-    """:func:`delete_run` refused a run that holds unlanded sweep ledger closes,
-    or one where that could not be told. ``dw_ids`` lists the held ids (empty
-    when ``reason`` names the fault that stopped the check)."""
+    """:func:`delete_run` or :func:`archive_run` (``action``) refused a run that
+    holds unlanded sweep ledger closes, or one where that could not be told.
+    ``dw_ids`` lists the held ids (empty when ``reason`` names the fault that
+    stopped the check)."""
 
-    def __init__(self, run_id: str, dw_ids: list[str], reason: str | None = None) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        dw_ids: list[str],
+        reason: str | None = None,
+        *,
+        action: str = "delete",
+    ) -> None:
         self.run_id = run_id
         self.dw_ids = list(dw_ids)
         self.reason = reason
@@ -3650,7 +3658,7 @@ class HeldSweepClosesError(Exception):
                 f"{run_id}` once it reads to land or reopen any closes it holds; a run "
                 "you have confirmed holds none can be removed by hand"
             )
-        super().__init__(f"run {run_id}: refusing to delete it — {what}. {remedy}")
+        super().__init__(f"run {run_id}: refusing to {action} it — {what}. {remedy}")
 
 
 def _bundle_code_landed(task: StoryTask) -> bool:
@@ -3689,8 +3697,9 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
 
     Read-only. An absent ``state.json`` or ledger answers ``[]``: there is no
     record of a close. Any other fault raises :class:`HeldClosesUnknownError`
-    and is never folded into ``[]``. Used by the :func:`delete_run` refusal and
-    the sweep-start warning (:func:`prior_sweep_closes`)."""
+    and is never folded into ``[]``. Used by the :func:`delete_run` and
+    :func:`archive_run` refusals, ``clean``, and the sweep-start warning (:func:`prior_sweep_closes`).
+    """
     try:
         state = load_state(run_dir)
     except (FileNotFoundError, NotADirectoryError):
@@ -3798,16 +3807,17 @@ def prior_sweep_closes(project: Path, *, exclude: str) -> list[PriorSweepCloses]
     return rows
 
 
-def refuse_held_sweep_closes(project: Path, run_dir: Path) -> None:
+def refuse_held_sweep_closes(project: Path, run_dir: Path, action: str = "delete") -> None:
     """Raise :class:`HeldSweepClosesError` when ``run_dir`` holds unlanded sweep
     closes or could not be checked (:func:`held_sweep_closes`). This is the
-    :func:`delete_run` gate. ``clean`` also calls it before it trims anything."""
+    :func:`delete_run` and :func:`archive_run` gate. ``clean`` also calls it once
+    per run, before it reconciles, trims or removes anything of that run."""
     try:
         held = held_sweep_closes(project, run_dir)
     except HeldClosesUnknownError as e:
-        raise HeldSweepClosesError(run_dir.name, [], str(e)) from e
+        raise HeldSweepClosesError(run_dir.name, [], str(e), action=action) from e
     if held:
-        raise HeldSweepClosesError(run_dir.name, held)
+        raise HeldSweepClosesError(run_dir.name, held, action=action)
 
 
 def delete_run(
@@ -4003,7 +4013,13 @@ def archive_run(
     declines a contended run with :class:`platform_util.LockUnavailableError`
     rather than queueing behind its holder, and refuses before the tarball is
     written, so a decline — like the guards above it — leaves nothing behind.
-    ``warn`` carries the session guard's degrade as on :func:`delete_run`."""
+    ``warn`` carries the session guard's degrade as on :func:`delete_run`.
+
+    A run that holds unlanded sweep ledger closes, or could not be checked,
+    raises :class:`HeldSweepClosesError` as on :func:`delete_run`, under the lock
+    and before any archive path is created. ``force`` does not waive it: nothing
+    restores an archive, and ``resume`` resolves runs only under the runs dir, so
+    an archived holder could never land or reopen its closes (DW-572)."""
     _refuse_uncontained_run_dir(project, run_dir, "archive")
     with state_lock(run_dir, blocking=wait_for_lock):
         if engine_liveness(run_dir) == "alive":
@@ -4012,6 +4028,7 @@ def archive_run(
             )
         if not force:
             _refuse_live_session(project, run_dir.name, "archive", warn=warn)
+        refuse_held_sweep_closes(project, run_dir, "archive")
         return _archive_run_locked(project, run_dir)
 
 

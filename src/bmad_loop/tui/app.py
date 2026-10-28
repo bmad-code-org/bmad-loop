@@ -2284,7 +2284,13 @@ class BmadLoopApp(App[None]):
         guard_notes: list[str] = []
         try:
             dest = runs.archive_run(self.project, run_dir, warn=guard_notes.append)
-        except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
+        except (
+            OSError,
+            runs.StateRootError,
+            runs.LiveEngineError,
+            runs.LiveSessionError,
+            runs.HeldSweepClosesError,
+        ) as e:
             # Same worker boundary as delete: report the authoritative transaction,
             # not the earlier modal sample.
             self._notify_guard_notes(guard_notes)

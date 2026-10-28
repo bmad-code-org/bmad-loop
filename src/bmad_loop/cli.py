@@ -8518,12 +8518,20 @@ def cmd_archive(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 1
     args.run_id = run_dir.name
+    if args.force:
+        try:
+            # As on `delete`: refuse a held run before `--force` can stop it.
+            runs.refuse_held_sweep_closes(project, run_dir, "archive")
+        except runs.HeldSweepClosesError as e:
+            print(str(e), file=sys.stderr)
+            return 1
     rc = _stop_or_block_live_engine(run_dir, args.run_id, args.force)
     if rc is not None:
         return rc
     try:
         dest = runs.archive_run(project, run_dir, force=args.force)
-    except runs.LiveEngineError as e:
+    except (runs.LiveEngineError, runs.HeldSweepClosesError) as e:
+        # `--force` waives neither, as on `delete`.
         print(str(e), file=sys.stderr)
         return 1
     except runs.LiveSessionError as e:
@@ -8918,7 +8926,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     mid-flight stop, trim heavy scaffolding from runs kept for history, and
     archive/delete runs past the retention window. Only terminal (finished or
     stopped) runs are touched; running, unknown-host, paused and interrupted
-    runs are always left intact.
+    runs, and sweep runs holding unlanded ledger closes, are always left intact.
 
     Every per-candidate refusal is DATA, never an abort: this is a sweep, so one
     busy run must not cost the operator the report of the runs already reclaimed
@@ -8985,22 +8993,24 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             continue
-        if run_dir.name in past and (args.hard or not pol.cleanup.archive_old):
-            # A sweep run that holds ledger closes whose code never landed (or
-            # cannot be checked) is the only record that can land or reopen them.
-            # `delete_run` refuses it; asking first, before any trim or worktree
-            # removal, leaves it whole instead of half-reclaimed. The archive arm
-            # keeps the run's record in its tarball and is not gated.
-            try:
-                runs.refuse_held_sweep_closes(project, run_dir)
-            except runs.HeldSweepClosesError as e:
-                protected.append(run_dir.name)
-                if not args.json:
-                    print(
-                        f"run {run_dir.name}: {_held_closes_reason(e)} — not removed",
-                        file=sys.stderr,
-                    )
-                continue
+        # A sweep run that holds ledger closes whose code never landed (or cannot
+        # be checked) is the only record that can land or reopen them, and its
+        # unit worktree may be where that code still sits. So on every arm it is
+        # left whole: asked once here, ahead of the worktree reconcile, the trim
+        # and the removal, it is reported protected rather than half-reclaimed
+        # (DW-572/DW-573). `delete_run` and `archive_run` still refuse it under
+        # the lock, which the removal's handler below reports.
+        try:
+            runs.refuse_held_sweep_closes(project, run_dir)
+        except runs.HeldSweepClosesError as e:
+            protected.append(run_dir.name)
+            if not args.json:
+                outcome = "not removed" if run_dir.name in past else "left untouched"
+                print(
+                    f"run {run_dir.name}: {_held_closes_reason(e)} — {outcome}",
+                    file=sys.stderr,
+                )
+            continue
         if runs.engine_liveness(run_dir) == "unknown":
             # warn-only: unknown never blocks cleanup, but say so before removal.
             # In JSON mode this lives in the document instead (unverifiable_pid),

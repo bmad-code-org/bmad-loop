@@ -203,6 +203,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Refuse to archive a sweep run holding unlanded ledger closes, and leave such a run's unit
+  worktree and artifacts alone on every `clean` arm, reporting it protected (DW-572, DW-573).
 - Show policy.toml deprecation notices in the TUI dashboard as a warning toast (DW-603).
 - Nudge a stalled session whose permission prompt was approved: a transcript write after
   the PermissionPrompt latch now clears it, instead of the stall pausing as parked (DW-594).

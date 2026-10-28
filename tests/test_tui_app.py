@@ -7700,6 +7700,12 @@ _LIFECYCLE_WORKERS = {"D": "_delete_run_worker", "A": "_archive_run_worker"}
             runs_mod.StateRootError("no usable state root"),
             "archive failed",
         ),
+        (
+            "A",
+            "archive_run",
+            runs_mod.HeldSweepClosesError("20260611-100000-aaaa", ["DW-1"], action="archive"),
+            "archive failed",
+        ),
     ],
 )
 def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_visible(
@@ -7713,7 +7719,7 @@ def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_visibl
     Ablation: omit either new exception type from the worker catch and its rows
     raise out of the worker body instead of posting the toast. Verified. The same
     holds for `HeldSweepClosesError` (a sweep run holding unlanded ledger closes,
-    DW-571) in the delete worker's catch."""
+    DW-571, DW-572) in the delete and archive workers' catches."""
 
     def fail(*_args, **_kwargs):
         raise failure

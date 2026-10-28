@@ -11905,6 +11905,86 @@ def test_delete_run_removes_a_sweep_run_that_holds_nothing(project_v7_store_repo
     assert not engine.run_dir.exists()
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_archive_run_refuses_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, force):
+    """DW-572: `archive_run` refuses a held run as `delete_run` does, since nothing
+    restores an archive for `resume` to land or reopen the closes from. The error
+    names the run, DW-1, `archive` and `bmad-loop resume`. No archive dir or
+    tarball is created, and the run dir, its state and the ledger are untouched.
+    `force` waives only the session guard.
+
+    Ablation: delete the `refuse_held_sweep_closes` call in `archive_run` and
+    both rows fail (the run is archived)."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.archive_run(paths.project, engine.run_dir, force=force)
+
+    assert info.value.run_id == ts.HELD_RUN_ID and info.value.dw_ids == ["DW-1"]
+    message = str(info.value)
+    assert "refusing to archive it" in message and "DW-1" in message
+    assert f"bmad-loop resume {ts.HELD_RUN_ID}" in message
+    assert not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+
+
+def test_archive_run_refuses_a_run_it_cannot_check_for_held_closes(project_v7_store_repo):
+    """Fail safe, as on delete: an unreadable `state.json` might hold closes, so
+    `archive_run` refuses it, names the fault and writes no tarball."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    (engine.run_dir / "state.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.archive_run(paths.project, engine.run_dir)
+
+    assert info.value.dw_ids == [] and "could not be read" in (info.value.reason or "")
+    assert not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert (engine.run_dir / "state.json").read_text(encoding="utf-8") == "{not json"
+
+
+def test_archive_run_checks_held_closes_under_the_lock_after_the_liveness_guard(
+    project_v7_store_repo, monkeypatch
+):
+    """The archive gate runs under the run's state lock, after the liveness guard."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    real = runs.held_sweep_closes
+    checked: list[Path] = []
+
+    def held(project, run_dir):
+        assert_run_state_lock_held(run_dir)
+        checked.append(run_dir)
+        return real(project, run_dir)
+
+    monkeypatch.setattr(runs, "held_sweep_closes", held)
+    with pytest.raises(runs.HeldSweepClosesError):
+        runs.archive_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    with pytest.raises(runs.LiveEngineError):
+        runs.archive_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]  # the liveness guard refused first
+    assert engine.run_dir.is_dir()
+
+
+def test_archive_run_archives_a_sweep_run_that_holds_nothing(project_v7_store_repo):
+    """A sweep run whose bundle landed holds no close, so it is archived as before."""
+    ts = _seam()
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, phase=Phase.DONE)
+    task.isolated_ledger_carried = True  # the merge-back's latch
+    engine._save()
+
+    dest = runs.archive_run(paths.project, engine.run_dir, warn=lambda _note: None)
+
+    assert dest.is_file() and not engine.run_dir.exists()
+
+
 def test_delete_run_failed_launch_unwind_skips_the_held_closes_check(
     project_v7_store_repo, monkeypatch
 ):

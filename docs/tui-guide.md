@@ -468,7 +468,8 @@ orphaned worktrees; it has no TUI key. See
 [Reclaiming sessions and disk](reference/run-state.md#reclaiming-sessions-and-disk).
 
 `D` (delete) and `A` (archive) act on one run directory and refuse a live run
-with `run <id> is live — stop it first`.
+with `run <id> is live — stop it first`. Both also refuse a sweep run holding
+unlanded ledger closes, with an error toast naming the entries.
 
 ## Resolving an escalation (`R`)
 
