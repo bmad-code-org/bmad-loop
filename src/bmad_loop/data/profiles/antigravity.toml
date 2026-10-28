@@ -10,8 +10,17 @@
 # background-command yield also sends false. `fullyIdle` is the only payload
 # field that tells them apart (`terminationReason` is NO_TOOL_CALL in both). The
 # relay forwards it as `fully_idle`, and bmad-loop ignores a Stop carrying false.
-# Known gap: a CHILD conversation's final `fullyIdle: true` Stop still reads as
-# the parent's turn end and can complete the session early.
+#
+# A subagent is its own conversation, a sibling folder brain/<childId>/ beside the
+# parent's brain/<parentId>/. Its Stops fire through the same .agents/hooks.json
+# and env, so they land in the parent session's events with conversationId =
+# <childId> and transcriptPath under brain/<childId>/; with no SessionStart,
+# attribution admits them, and the child's FINAL Stop (`fullyIdle: true`, sent
+# after it hands its result back while the parent still works) would complete
+# the parent early. At spawn agy writes
+# brain/<parentId>/.system_generated/subagents/<childId>.json (in the 1.4.9 probe,
+# ~14 s before the child's first Stop), so `subagent_spawn_marker` drops a Stop
+# whose id has that marker in a sibling folder (DW-548).
 #
 # usage_parser is "none" DELIBERATELY AND PERMANENTLY — not a deferral. agy's
 # transcript (~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/
@@ -58,6 +67,8 @@ skill_tree = ".agents/skills"
 # relay is merged in, so a worktree checkout keeps any user/plugin hook groups
 # already present instead of starting from an empty file.
 seed_files = [".agents/hooks.json"]
+# The file a parent conversation writes when it spawns a child (see above).
+subagent_spawn_marker = ".system_generated/subagents/{session_id}.json"
 
 [hooks]
 dialect = "antigravity-hooks-json"

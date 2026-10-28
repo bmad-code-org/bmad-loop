@@ -223,6 +223,9 @@ breaking changes may land in a minor release.
 - Ignore an Antigravity `Stop` sent with `fullyIdle: false` (a yield to a foreground
   subagent) instead of completing the session while the subagent still works; the
   relay forwards `fully_idle`, and `hook-stop-yield-ignored` journals the skip.
+- Ignore an Antigravity subagent conversation's `Stop` instead of letting its final turn end
+  complete the parent early: the new profile key `subagent_spawn_marker` identifies a child
+  by the spawn file its parent wrote, and `subagent-stop-ignored` journals each child.
 - Classify OpenCode 2.x provider 5xx errors (`provider.internal`), rejected credentials
   (`provider.auth`) and unroutable models (`provider.no-route`) as environment faults
   instead of charging the session as a code failure.

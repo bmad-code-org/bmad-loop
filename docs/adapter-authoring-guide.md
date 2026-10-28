@@ -320,6 +320,7 @@ a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` reso
 | `usage_grace_s`                    |          | `0.0`                                                                          | Seconds to keep polling the transcript for token totals after the session ends; `0` reads once. Must be ≥ 0.                                                                                                      |
 | `stop_without_result_nudges`       |          | unset                                                                          | Per-profile default for Stop-without-result nudges. An `[adapter]` / `[adapter.<stage>]` value overrides it; unset inherits `[limits] stop_without_result_nudges`. Must be ≥ 0.                                   |
 | `subagent_stop_without_transcript` |          | `false`                                                                        | When `true`, a `Stop` with no transcript path is a subagent turn-end and is ignored.                                                                                                                              |
+| `subagent_spawn_marker`            |          | unset                                                                          | File a parent conversation writes when it spawns a child, relative to a conversation folder, with `{session_id}` as the child's id. A `Stop` whose id has this marker in a sibling folder is ignored.             |
 | `first_run_note`                   |          | `""`                                                                           | Note `init` prints about a manual first-run or auth step.                                                                                                                                                         |
 | `seed_files`                       |          | `[]`                                                                           | Project-relative gitignored files copied into each provisioned worktree. Must stay inside the project.                                                                                                            |
 | `env_fault_patterns`               |          | `[]`                                                                           | Regexes that classify a non-completed session as an environment fault. See [Environment-fault patterns](#environment-fault-patterns).                                                                             |
@@ -339,6 +340,14 @@ passed.
 
 An overlay that changes `usage_parser` away from `claude-jsonl` must set
 `subagent_transcript_dir` itself; it is refused on hookless profiles.
+
+`subagent_spawn_marker` applies to a `Stop` whose transcript sits under a folder named by its
+session id; that folder's parent holds the conversation folders searched for the marker. A
+`Stop` it cannot judge (no id, no transcript path, no such folder) or a marker it cannot read
+is admitted and journaled once (`subagent-marker-unjudged`, `subagent-marker-unreadable`); a
+dropped child is journaled once per id (`subagent-stop-ignored`). Like
+`subagent_transcript_dir`, it must contain its placeholder (here `{session_id}`), stay relative
+with no `..`, and is refused on hookless profiles.
 
 ### `HookSpec` (the `[hooks]` table)
 

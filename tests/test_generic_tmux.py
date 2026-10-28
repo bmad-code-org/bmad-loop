@@ -2111,6 +2111,190 @@ def test_a_lone_fully_idle_false_stop_never_completes(tmp_path, monkeypatch):
     assert fired["stop_yields_ignored"] == 1
 
 
+_AGY_MARKER = ".system_generated/subagents/{session_id}.json"
+
+
+def _agy_brain(tmp_path, parent="agy-parent", child="agy-child"):
+    """A brain store as agy 1.4.9 lays it out: one folder per conversation, the
+    parent's holding the spawn marker it wrote for the child. Returns the two
+    transcript paths (strings, as a hook reports them)."""
+    brain = tmp_path / "brain"
+    transcripts = []
+    for conv in (parent, child):
+        logs = brain / conv / ".system_generated" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "transcript_full.jsonl").write_text("")
+        transcripts.append(str(logs / "transcript_full.jsonl"))
+    marker = brain / parent / _AGY_MARKER.format(session_id=child)
+    marker.parent.mkdir(parents=True)
+    marker.write_text("{}")
+    return transcripts[0], transcripts[1]
+
+
+def test_spawn_marker_verdict_reads_a_sibling_marker_as_a_child(tmp_path):
+    parent_t, child_t = _agy_brain(tmp_path)
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-child", child_t) == "child"
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t) == "own"
+
+
+def test_spawn_marker_verdict_ignores_a_marker_in_the_conversations_own_folder(tmp_path):
+    """Only a SIBLING folder's marker names a child: a conversation never spawns
+    itself, so its own folder is skipped."""
+    parent_t, _ = _agy_brain(tmp_path)
+    own = tmp_path / "brain" / "agy-parent" / _AGY_MARKER.format(session_id="agy-parent")
+    own.write_text("{}")
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t) == "own"
+
+
+@pytest.mark.parametrize(
+    ("session_id", "transcript"),
+    [
+        (None, "brain/agy-child/t.jsonl"),
+        ("", "brain/agy-child/t.jsonl"),
+        ("agy-child", None),
+        ("agy-child", ""),
+        ("agy-child", "brain/elsewhere/t.jsonl"),  # no ancestor named by the id
+        ("..", "brain/../t.jsonl"),
+        ("agy-child", "brain/agy-child/t\0.jsonl"),
+    ],
+)
+def test_spawn_marker_verdict_is_unjudged_without_a_conversation_folder(
+    tmp_path, session_id, transcript
+):
+    _agy_brain(tmp_path)
+    if transcript:
+        transcript = str(tmp_path / transcript)
+    assert generic._spawn_marker_verdict(_AGY_MARKER, session_id, transcript) == "unjudged"
+
+
+def test_spawn_marker_verdict_propagates_a_store_read_fault(tmp_path, monkeypatch):
+    """A fault listing the store or statting a marker propagates for the caller
+    to crumb; only an absent marker reads as absent."""
+    parent_t, _ = _agy_brain(tmp_path)
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(generic.os, "scandir", denied)
+    with pytest.raises(PermissionError):
+        generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t)
+    monkeypatch.undo()
+    monkeypatch.setattr(generic.os, "stat", denied)
+    with pytest.raises(PermissionError):
+        generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t)
+
+
+def _agy_child_run(tmp_path, adapter, impl):
+    """parent yield -> child yield -> child final -> parent final, with the
+    terminal spec already on disk: whichever Stop is first read as a turn end
+    completes the session."""
+    parent_t, child_t = _agy_brain(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_stop("agy-parent", parent_t, False),
+            _agy_stop("agy-child", child_t, False),
+            _agy_stop("agy-child", child_t, True),
+            _agy_stop("agy-parent", parent_t, True),
+        ]
+    )
+    return parent_t, child_t
+
+
+def test_wait_for_completion_drops_a_spawned_child_conversations_stop(tmp_path):
+    """DW-548 (pinned on agy 1.4.9): a subagent is a sibling conversation whose
+    Stops reach the parent's stream unannounced. Its final `fully_idle: true`
+    Stop must not complete the parent: the session completes on the PARENT's
+    final Stop, with the parent's id and transcript, and the child is journaled
+    once however many of its Stops arrive.
+
+    Ablation, performed: delete the spawn-marker branch in the wait loop and
+    this fails — the result completes on the child's final Stop, with its id."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    assert adapter.profile.subagent_spawn_marker == _AGY_MARKER
+    parent_t, _ = _agy_child_run(tmp_path, adapter, impl)
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert result.transcript_path == parent_t
+    assert adapter.watcher.calls == 4
+    ignored = _lifecycle_events(adapter, "subagent-stop-ignored")
+    assert ignored == [
+        {
+            "ts": ignored[0]["ts"],
+            "event": "subagent-stop-ignored",
+            "child_session_id": "agy-child",
+            "fully_idle": False,
+        }
+    ]
+    assert _lifecycle_events(adapter, "subagent-marker-unjudged") == []
+    assert _lifecycle_events(adapter, "subagent-marker-unreadable") == []
+
+
+def test_wait_for_completion_without_a_spawn_marker_is_unchanged(tmp_path):
+    """Gating: a profile without the key reads the child's final Stop as the
+    turn end, exactly as before — the rule must not leak to other CLIs."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    adapter.profile = dataclasses.replace(adapter.profile, subagent_spawn_marker=None)
+    _, child_t = _agy_child_run(tmp_path, adapter, impl)
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-child"
+    assert result.transcript_path == child_t
+    assert adapter.watcher.calls == 3
+    assert _lifecycle_events(adapter, "subagent-stop-ignored") == []
+
+
+def test_an_unjudged_stop_is_admitted_and_crumbed_once(tmp_path):
+    """A Stop the rule cannot judge (no folder named by its id) is admitted as
+    before, never silently read as own: the crumb fires once per attempt."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [_agy_stop("agy-parent", "/yield.jsonl", False), _agy_stop("agy-parent", None, True)]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert adapter.watcher.calls == 2
+    (crumb,) = _lifecycle_events(adapter, "subagent-marker-unjudged")
+    assert crumb["session_id"] == "agy-parent"
+    assert crumb["transcript_path"] == "/yield.jsonl"
+
+
+def test_an_unreadable_marker_store_admits_the_stop_and_crumbs_once(tmp_path, monkeypatch):
+    """A store read fault admits the Stop as before (failing toward acceptance)
+    and is journaled once with the error — never folded into "not a child"."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    _, child_t = _agy_child_run(tmp_path, adapter, impl)
+    real_scandir = os.scandir
+
+    def denied(path):
+        if Path(path).name == "brain":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(generic.os, "scandir", denied)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-child"  # admitted: the fault judged nothing
+    assert result.transcript_path == child_t
+    (crumb,) = _lifecycle_events(adapter, "subagent-marker-unreadable")
+    assert crumb["session_id"] == "agy-parent"
+    assert crumb["error"].startswith("PermissionError")
+    assert _lifecycle_events(adapter, "subagent-stop-ignored") == []
+
+
 def test_wait_for_completion_ignores_foreign_identified_lifecycle_events(tmp_path):
     """A nested CLI inherits the relay environment and writes into the parent's
     stream (#767). Its announced SessionStart marks its id foreign, so neither
@@ -2529,7 +2713,9 @@ def test_wait_for_completion_copilot_bound_subagent_stop_not_crumbed(tmp_path):
 
 def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_path):
     """A Stop-only profile (no SessionStart) never binds, so attribution admits
-    every event and its established identified-Stop completion stays intact."""
+    every event and its established identified-Stop completion stays intact. The
+    transcript sits under no folder named by the id, so the spawn-marker rule
+    (DW-548) cannot judge it: admitted, with that one crumb."""
     adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
     (impl / "spec-3-1-foo.md").write_text(
         "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
@@ -2543,7 +2729,7 @@ def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_pat
     assert result.status == "completed"
     assert result.session_id == "stop-only-session"
     assert result.transcript_path == "/legacy.jsonl"
-    assert _lifecycle_lines(adapter) == []
+    assert [e["event"] for e in _lifecycle_lines(adapter)] == ["subagent-marker-unjudged"]
 
 
 CODEX_SESSION = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"

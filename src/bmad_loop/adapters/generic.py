@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import regex
 
@@ -419,6 +419,47 @@ def _is_regular_file(path: str | None) -> bool:
         return stat.S_ISREG(Path(path).stat().st_mode)
     except (OSError, ValueError):
         return False
+
+
+def _spawn_marker_verdict(
+    template: str, session_id: str | None, transcript_path: str | None
+) -> Literal["child", "own", "unjudged"]:
+    """Whether a Stop is a child conversation's, by the spawn marker its parent
+    wrote (DW-548; the profile's ``subagent_spawn_marker``).
+
+    agy runs a subagent as its own conversation: a folder named by its id,
+    beside the parent's under one store root (``brain/<id>/``), holding the
+    transcript its Stop reports. The conversation folder is the transcript's
+    nearest ancestor named by the session id; the Stop is a child's ("child")
+    when any OTHER folder under the store root holds ``template`` with the id
+    filled in, else "own". "unjudged" when there is no id, no transcript path,
+    or no ancestor named by the id: there is nowhere to look.
+
+    Stat-only, nothing is opened. ``FileNotFoundError``/``NotADirectoryError``
+    on a candidate marker read as absent; every other ``OSError`` — the store
+    root's listing included — propagates for the caller to crumb, so a fault
+    never reads as "own"."""
+    if (
+        not session_id
+        or not transcript_path
+        or session_id in (".", "..")
+        or "\0" in transcript_path
+    ):
+        return "unjudged"
+    conversation = next((p for p in Path(transcript_path).parents if p.name == session_id), None)
+    if conversation is None:
+        return "unjudged"
+    marker = template.format(session_id=session_id)
+    with os.scandir(conversation.parent) as entries:
+        for entry in entries:
+            if entry.name == session_id:
+                continue
+            try:
+                os.stat(Path(entry.path, marker))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            return "child"
+    return "own"
 
 
 def _subagent_tree_files(root: Path) -> list[tuple[Path, os.stat_result]]:
@@ -1367,6 +1408,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # to a foreground subagent, not a turn end. Crumbed once per attempt;
         # heartbeat + timeout-fired carry the running count.
         stop_yields_ignored = 0
+        # DW-548: child-conversation ids whose Stops are dropped (crumbed once
+        # each), and the one-shot crumbs for a Stop the spawn-marker rule could
+        # not read or could not judge — both admitted as before.
+        spawned_children: set[str] = set()
+        marker_unreadable_crumbed = False
+        marker_unjudged_crumbed = False
         # DW-507: the one-shot crumb for a lineage the first SessionStart could
         # not calibrate ("miscalibrated"/"unavailable"), so the degrade to the
         # #767 rules alone is visible in session-lifecycle.jsonl.
@@ -2422,6 +2469,48 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # result-less completion -> false stall, and the main session's
                 # real transcript is preserved for usage tallying.
                 continue
+            spawn_marker = self.profile.subagent_spawn_marker
+            if event.event == "Stop" and spawn_marker:
+                # agy runs a subagent as a sibling conversation whose Stops reach
+                # this stream unannounced, so attribution admits them; its final
+                # `fully_idle: true` Stop would complete the parent while the
+                # parent still works (DW-548). A Stop whose id has a spawn marker
+                # in a sibling folder is the child's: dropped before it can
+                # re-point the identity or transcript. A fault or an unjudgeable
+                # Stop is admitted as before, crumbed once — never read as own.
+                if event.session_id in spawned_children:
+                    continue
+                try:
+                    verdict = _spawn_marker_verdict(
+                        spawn_marker, event.session_id, event.transcript_path
+                    )
+                except OSError as e:
+                    if not marker_unreadable_crumbed:
+                        marker_unreadable_crumbed = True
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "subagent-marker-unreadable",
+                            session_id=event.session_id,
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                else:
+                    if verdict == "child" and event.session_id:
+                        spawned_children.add(event.session_id)
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "subagent-stop-ignored",
+                            child_session_id=event.session_id,
+                            fully_idle=event.fully_idle,
+                        )
+                        continue
+                    if verdict == "unjudged" and not marker_unjudged_crumbed:
+                        marker_unjudged_crumbed = True
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "subagent-marker-unjudged",
+                            session_id=event.session_id,
+                            transcript_path=event.transcript_path,
+                        )
             session_id = event.session_id or session_id
             hook_transcript_path = event.transcript_path or hook_transcript_path
             hook_path = event.transcript_path

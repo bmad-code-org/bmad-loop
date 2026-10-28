@@ -1054,6 +1054,58 @@ def test_hookless_profile_cannot_set_a_subagent_transcript_dir(tmp_path):
         load_profiles(tmp_path)
 
 
+def test_subagent_spawn_marker_defaults_off_and_agy_ships_one(tmp_path):
+    """Unset is off; the packaged agy profile names its spawn file (DW-548)."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    profiles = load_profiles(tmp_path)
+    assert profiles["mycli"].subagent_spawn_marker is None
+    assert profiles["claude"].subagent_spawn_marker is None
+    assert (
+        profiles["antigravity"].subagent_spawn_marker
+        == ".system_generated/subagents/{session_id}.json"
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        # shape: never `str()`-coerced into a path template
+        ("5", "subagent_spawn_marker must be a string"),
+        # value: relative, under a conversation folder
+        ('"/abs/{session_id}.json"', "relative path"),
+        ('"../{session_id}.json"', "relative path"),
+        ('"x/../{session_id}.json"', "relative path"),
+        # value: exactly the {session_id} placeholder, so the marker names one child
+        ('"subagents/child.json"', "{session_id}"),
+        ('"{stem}.json"', "{session_id}"),
+        ('"{session_id!r}.json"', "{session_id}"),
+        ('"{session_id"', "not a valid template"),
+        ('"{session_id}\\u0000.json"', "NUL"),
+    ],
+)
+def test_malformed_subagent_spawn_marker_is_a_profile_error(tmp_path, value, match):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"subagent_spawn_marker = {value}\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(tmp_path)
+
+
+def test_hookless_profile_cannot_set_a_subagent_spawn_marker(tmp_path):
+    """The marker drops a child's Stop hook, and a hookless profile has none."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'subagent_spawn_marker = "{session_id}.json"\n[hooks]')
+    )
+    with pytest.raises(ProfileError, match="must not set subagent_spawn_marker"):
+        load_profiles(tmp_path)
+
+
 def test_claude_subagent_root_matches_the_tally_anchor(tmp_path):
     """The idle notice watches the same tree tokens.tally sums for claude."""
     transcript = tmp_path / "x.jsonl"

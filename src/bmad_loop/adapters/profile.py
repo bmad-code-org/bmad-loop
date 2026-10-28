@@ -380,6 +380,14 @@ class CLIProfile:
     # `bypass_args` by `for_permission_mode`; empty under bypass. APPENDED after
     # permission_modes for the same positional-compatibility reason.
     linked_worktree_args: tuple[str, ...] = ()
+    # Template, relative to a conversation folder, of the file a parent writes
+    # when it spawns a subagent conversation ("{session_id}" = the child's id),
+    # e.g. agy's ".system_generated/subagents/{session_id}.json" (DW-548). When
+    # set, a Stop whose transcript sits in a folder named by its session id is a
+    # CHILD's, and is dropped, if any sibling folder holds that file. Stat-only;
+    # None = off. APPENDED after linked_worktree_args for the same
+    # positional-compatibility reason.
+    subagent_spawn_marker: str | None = None
 
     @property
     def hookless(self) -> bool:
@@ -674,6 +682,35 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 "transcript path"
             )
 
+    # Same shape rules as subagent_transcript_dir, keyed on "{session_id}": the
+    # marker names one child, so a template without the id would read every
+    # Stop as a child's once any subagent was spawned.
+    marker = profile.subagent_spawn_marker
+    if marker:
+        if "\0" in marker:
+            raise fail(f"subagent_spawn_marker must not contain a NUL character: got {marker!r}")
+        try:
+            parts = list(string.Formatter().parse(marker))
+        except ValueError as e:
+            raise fail(f"subagent_spawn_marker is not a valid template: {e}: got {marker!r}")
+        fields = [(name, spec, conv) for _, name, spec, conv in parts if name is not None]
+        if not fields or any(name != "session_id" or spec or conv for name, spec, conv in fields):
+            raise fail(
+                'subagent_spawn_marker must use exactly the placeholder "{session_id}" (the '
+                "child conversation's id), with no other field, format spec or conversion: "
+                f"got {marker!r}"
+            )
+        if is_absolute_path(marker) or has_parent_ref(marker):
+            raise fail(
+                "subagent_spawn_marker must be a relative path under a conversation "
+                f"folder, with no '..': got {marker!r}"
+            )
+        if profile.hookless:
+            raise fail(
+                'hookless profiles (dialect = "none") must not set subagent_spawn_marker: '
+                "it drops a child's Stop hook, and a hookless profile has no hook events"
+            )
+
     if profile.usage_parser not in USAGE_PARSERS:
         raise fail(
             f"usage_parser must be one of {sorted(USAGE_PARSERS)}: got {profile.usage_parser!r}"
@@ -956,6 +993,9 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         raise fail(
             f"subagent_transcript_dir must be a string: got {type(raw_subagent_dir).__name__}"
         )
+    raw_spawn_marker = doc.get("subagent_spawn_marker")
+    if raw_spawn_marker is not None and not isinstance(raw_spawn_marker, str):
+        raise fail(f"subagent_spawn_marker must be a string: got {type(raw_spawn_marker).__name__}")
 
     profile = CLIProfile(
         name=str(doc.get("name", "")).strip(),
@@ -994,6 +1034,7 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         subagent_transcript_dir=raw_subagent_dir,
         parked_answers=parked_answers,
         permission_modes=permission_modes,
+        subagent_spawn_marker=raw_spawn_marker,
     )
     _validate_profile(profile, source)
     return profile
