@@ -220,22 +220,26 @@ Resolves an escalated story, then re-arms it and resumes the run. Without a mode
 
 ```text
 bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
-                  [--restore-patch PATH | --adopt-branch | --reverify | --abandon] [--resume | --no-resume] [--force] run_id
+                  [--restore-patch PATH | --adopt-branch | --reverify | --abandon] [--resume | --no-resume] [--force]
+                  [--at-reset [--margin-min N]] run_id
 ```
 
-| Option                     | Description                                                                                                                                  |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--story STORY`            | Story to resolve. Default: the paused story, or with no pause stage the first escalated story.                                               |
-| `--no-interactive`         | Skip the resolve agent (the spec was fixed by hand), then re-arm and resume. With `--abandon`: skip the confirm prompt.                      |
-| `--restore-patch PATH`     | Re-arm the spec to `in-review` and re-apply this saved patch, so review resumes on the attempted change.                                     |
-| `--adopt-branch`           | Commit and merge the kept worktree branch as-is and mark the story done. Worktree isolation only; not for sweeps.                            |
-| `--reverify`               | Keep a DEFERRED (or environment-fault ESCALATED) story's attempt, replay `[verify]`, then review and commit. No dev session; not for sweeps. |
-| `--abandon`                | Close an escalated replay run unmerged: park dirty work on a preserve ref, remove the worktree, keep the branch.                             |
-| `--resume` / `--no-resume` | Resume without prompting / only re-arm. Default: prompt, then resume. Not with `--abandon` (exit 2).                                         |
-| `--force`                  | Proceed when engine liveness cannot be verified. A provably live engine still blocks.                                                        |
+| Option                     | Description                                                                                                                                               |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--story STORY`            | Story to resolve. Default: the paused story, or with no pause stage the first escalated story.                                                            |
+| `--no-interactive`         | Skip the resolve agent (the spec was fixed by hand), then re-arm and resume. With `--abandon`: skip the confirm prompt.                                   |
+| `--restore-patch PATH`     | Re-arm the spec to `in-review` and re-apply this saved patch, so review resumes on the attempted change.                                                  |
+| `--adopt-branch`           | Commit and merge the kept worktree branch as-is and mark the story done. Worktree isolation only; not for sweeps.                                         |
+| `--reverify`               | Keep a DEFERRED (or environment-fault ESCALATED) story's attempt, replay `[verify]`, then review and commit. No dev session; not for sweeps.              |
+| `--abandon`                | Close an escalated replay run unmerged: park dirty work on a preserve ref, remove the worktree, keep the branch.                                          |
+| `--resume` / `--no-resume` | Resume without prompting / only re-arm. Default: prompt, then resume. Not with `--abandon` (exit 2).                                                      |
+| `--force`                  | Proceed when engine liveness cannot be verified. A provably live engine still blocks.                                                                     |
+| `--at-reset`               | For a usage limit the coding CLI waits out: wait in the foreground until the recorded reset plus `--margin-min`, then act as `--no-interactive --resume`. |
+| `--margin-min N`           | With `--at-reset`: minutes to wait past the reset, an integer of 0 or more. Default: 2.                                                                   |
 
 - `--restore-patch`, `--adopt-branch`, `--reverify` and `--abandon` are mutually exclusive.
 - Tickets mode: `--story` takes a ticket ref. The re-arm moves the plan through `tickets.py mark` to `ready-for-dev`, or `in-review` for a restore, and a refused move aborts it. Refused with exit 1 when the ticket store's layout changed since the run started. See the [tickets guide](../tickets-guide.md#parking-and-resolve).
+- `--at-reset` reads the pause's recorded `paused_limit_class` and `paused_reset_at`, never the reason text. It takes resolve's other refusals first, then refuses with exit 1, leaving the run unchanged, when the run is not paused on a usage limit, the limit is a blocking one (credit exhaustion: add credits, then resolve without `--at-reset`), the reset did not resolve to a time, or the reset is more than `[limits] quota_wait_max_min` minutes away (0 = no cap). With `--no-resume`, `--abandon`, `--restore-patch`, `--adopt-branch` or `--reverify`, or `--margin-min` without `--at-reset` or below 0, it exits 2. It prints the wake time and journals `at-reset-wait-start` / `at-reset-wait-end`. With the wake time already past it resolves at once. After the wait every check is taken again on the run as it then stands. Ctrl-C during the wait exits 130 and leaves the run paused, with nothing re-armed.
 - `--reverify --story KEY` on a finished sprint run creates a new replay run for a kept DEFERRED worktree unit; the finished run is not modified.
 - Acts on a run paused at `escalation`, or on an unfinished story run with no pause stage and a story still escalated (a resume whose engine exited before run end leaves this). With no pause stage, `--story` must name an escalated story.
 - Refuses with exit 1, leaving the run unchanged, in this order: the engine is live (`still live`; stop it first), the run is neither of the shapes above (any other pause stage, a finished run, a sweep with no pause stage; `--reverify --story` accepts any pause), there is no escalated story, or a DEFERRED story is targeted without `--reverify`. Declining the confirm prompt exits 0 and leaves the run paused.

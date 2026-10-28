@@ -140,7 +140,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Re-arming resets the story to `pending` with fresh dev-attempt and review-cycle budgets.
   - `--reverify` re-runs `[verify]` on a deferred or environment-fault story's kept work without a dev session; on a finished run it replays a kept worktree unit in a new run.
   - In tickets mode the re-arm moves the ticket's plan through `tickets.py mark` and clears its `blocked_*` fields; a refused move puts the plan back byte for byte.
-- **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`
+- **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`, `--at-reset`, `--margin-min`
 - **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`, `tests/test_runs.py`, `tests/test_tui_app.py`
 - **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [resolve CLI reference](reference/cli.md#resolve)
 
@@ -173,8 +173,9 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A pattern match is overruled when the session's tracked token usage is nonzero; that session is charged like any failure.
   - A session whose visible pane shows a usage-limit line from its profile's `usage_limit_patterns` or `usage_wait_patterns`, on an idle session at stall-grace expiry or when the timeout fires, pauses with a `usage limit:` reason and is never charged, whatever its token usage; the same line found only in the log tail stays subject to the overrule.
   - When the usage-limit line names a reset time, the pause reason ends its evidence with `; resets <time>` (ISO-8601 when the time resolves, the raw text otherwise).
+  - `bmad-loop resolve --at-reset` on a usage-limit pause the CLI waits out waits in the foreground until the recorded reset plus `--margin-min` (default 2), then re-arms and resumes; a credit-exhaustion pause, an unresolved reset or one past `[limits] quota_wait_max_min` is refused before any wait.
 - **Config:** `[environment] probes`, `[environment] probe_timeout_s`, `[verify] env_fault_rc`, `[limits] quota_wait_max_min`; profile keys `env_fault_patterns`, `usage_limit_patterns`, `usage_wait_patterns`
-- **Tested by:** `tests/test_engine.py`, `tests/test_escalation.py`, `tests/test_env_fault_patterns.py`, `tests/test_env_fault.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`, `tests/test_usagereset.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_env_fault_patterns.py`, `tests/test_env_fault.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`, `tests/test_usagereset.py`
 - **Docs:** [Environment faults](escalations-guide.md#environment-faults), [Usage-limit pauses](escalations-guide.md#usage-limit-pauses), [Usage-limit signals](adapter-authoring-guide.md#usage-limit-signals), [[environment] reference](reference/configuration.md#environment), [[verify] reference](reference/configuration.md#verify), [Profile field reference](adapter-authoring-guide.md#cliprofile)
 
 ### Resumable runs and graceful stop

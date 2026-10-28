@@ -260,6 +260,8 @@ To recover:
 1. Clear the limit: add credits, switch the session's model (`[adapter] model`, or the stage's `[adapter.<stage>]`), or wait until the reset time.
 2. `bmad-loop resolve <run-id> --no-interactive` re-arms the story with a fresh attempt budget and resumes. The spec needs no fix.
 
+To wait out a session-window reset instead of watching the clock, run `bmad-loop resolve <run-id> --at-reset`. It prints the wake time, waits in that terminal until the recorded reset plus `--margin-min` minutes (default 2), then re-arms and resumes as `--no-interactive --resume` does. Ctrl-C during the wait leaves the run paused. It refuses (exit 1, the run unchanged) a pause it cannot time: credit exhaustion never resets on its own, a reset that did not resolve to a time names no wake time, and a reset more than `[limits] quota_wait_max_min` minutes away is past the cap. For those, clear the limit or wait, then use a plain `resolve`. See the [resolve reference](reference/cli.md#resolve).
+
 A session-window limit the CLI waits out by itself does not pause at all at first. While the pane shows that wait and the transcript is idle, the session timeout stands still and no stall nudge is sent, so the session finishes after the CLI continues. `[limits] quota_wait_max_min` (default 300, one five-hour window; 0 = off) caps the minutes one session may spend waiting. Past the cap, or when the parsed reset already lies beyond what is left of it, the session pauses with the reason above. A heartbeat shows the wait as `quota_waiting` / `quota_wait_s` / `quota_resets_at`, and the TUI header as `quota wait`.
 
 ## Worktree merge-back failures

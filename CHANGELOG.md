@@ -9,6 +9,11 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add `resolve --at-reset [--margin-min N]`: for a usage-limit pause the coding CLI waits
+  out, wait in the foreground until the recorded reset plus the margin (default 2 min),
+  then re-arm and resume as `--no-interactive --resume`. Refuse (exit 1) credit
+  exhaustion, an unresolved reset and a reset past `[limits] quota_wait_max_min`; Ctrl-C
+  leaves the run paused (exit 130). Journal the wait as `at-reset-wait-start` / `-end`.
 - Add the `adapter.launch-probe` check to `validate --probes`: for each distinct role
   launch (roles with the same argv share one) whose `generic`-adapter profile declares
   `parked_prompt_patterns`, launch the coding CLI once with no prompt, and fail when its
