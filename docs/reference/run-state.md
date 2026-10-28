@@ -91,16 +91,16 @@ A tickets run's `state.json` also records `initiative` and `initiative_folder`, 
 
 A v7 sweep records `initiative` and `initiative_folder` too, and its resume, `resolve` and the dashboard's re-arm refuse while the live `[core] active_initiative` names another, because its ledger and pre-answers belong to the initiative it started on.
 
-A pick pause journals `ticket-pick-halt` with its `cause` and `stage`:
+A pick pause, and a resume's stale-binding pause (`binding-moved`: an in-flight unit's ref no longer names its plan, or its verified plan is gone), journal `ticket-pick-halt` with its `cause` and `stage`:
 
-| `cause`                                                                                       | `paused_stage`    |
-| --------------------------------------------------------------------------------------------- | ----------------- |
-| `hitl`                                                                                        | `ticket-hitl`     |
-| `refine`                                                                                      | `ticket-refine`   |
-| `plan-checkpoint`                                                                             | `plan-checkpoint` |
-| `awaiting-closure`, `epic-closure`, `epic-rejected`                                           | `epic-boundary`   |
-| `blocked-plan`                                                                                | `escalation`      |
-| `foreign-active`, `stalled`, `tree-fault`, `pin-mismatch`, `dirty-initiative`, `ignored-plan` | `ticket-tree`     |
+| `cause`                                                                                                        | `paused_stage`    |
+| -------------------------------------------------------------------------------------------------------------- | ----------------- |
+| `hitl`                                                                                                         | `ticket-hitl`     |
+| `refine`                                                                                                       | `ticket-refine`   |
+| `plan-checkpoint`                                                                                              | `plan-checkpoint` |
+| `awaiting-closure`, `epic-closure`, `epic-rejected`                                                            | `epic-boundary`   |
+| `blocked-plan`                                                                                                 | `escalation`      |
+| `foreign-active`, `stalled`, `tree-fault`, `pin-mismatch`, `dirty-initiative`, `ignored-plan`, `binding-moved` | `ticket-tree`     |
 
 `store_topology` is the ticket store classified at the start of a tickets run or a v7 sweep: `layout`, `placement`, `versioning`, `store_root` and `store_repo`. Resume, resolve and the TUI re-classify the store and refuse when it differs, or when the initiative folder is gone. When no checkout carries the store, every artifact dir under it stays at the main checkout for a worktree unit, and the mount's `_bmad/custom/config.user.toml` is rewritten so `[core] output_folder` names that store.
 

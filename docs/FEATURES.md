@@ -54,6 +54,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A hitl ticket pauses at `ticket-hitl` and a ticket that needs refining at `ticket-refine`, both before any session runs for it.
   - bmad-loop writes a plan's `status` and `blocked_*` only through `tickets.py mark`, under a lock, read back afterwards and checked against one plan transition table; it never writes `dropped` or an epic file.
   - Tickets this run did not start are never dispatched or marked.
+  - A resume never rebinds a unit it started: a ticket moved with `tickets.py move`, or a plan gone, while the run was paused pauses it at `ticket-tree`, naming the old and new ref and plan.
   - A store tracked in the checkout is marked inside the unit's commit; a shared store's mark is latched and made after the code lands, and a store with its own repository gets a plan-only commit.
   - `run` refuses a tracker store and the multi-repo workspace layout before creating a run directory; resume and resolve refuse a store whose layout changed.
   - When a run without `--story` finishes an epic, it runs the retrospective and pauses once at `epic-boundary` for a person to close the epic; a `rejected` verdict pauses every later pick while the epic stays open, and an epic gated on an open one waits for its closure.

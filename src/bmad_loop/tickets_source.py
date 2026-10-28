@@ -122,6 +122,12 @@ HALT_IGNORED_PLAN: Final = "ignored-plan"
 picked ticket's plan lies in a tracked initiative folder (T1) but the code repo
 ignores it, so its mark could not ride the unit's commit
 (``TicketsEngine._gate_ignored_plan``)."""
+HALT_BINDING_MOVED: Final = "binding-moved"
+"""Raised by the engine on resume, not :func:`decide_pick`: an in-flight unit's
+recorded ref no longer names its recorded plan, or the plan its dev leg wrote is
+gone — the ticket was moved (``tickets.py move``) or deleted while the run was
+paused. The unit is not driven and nothing is marked
+(``TicketsEngine._gate_stale_binding``)."""
 
 HALT_STAGES: Final[Mapping[str, str]] = {
     HALT_REFINE: PAUSE_TICKET_REFINE,
@@ -137,6 +143,7 @@ HALT_STAGES: Final[Mapping[str, str]] = {
     HALT_PIN_MISMATCH: PAUSE_TICKET_TREE,
     HALT_DIRTY_INITIATIVE: PAUSE_TICKET_TREE,
     HALT_IGNORED_PLAN: PAUSE_TICKET_TREE,
+    HALT_BINDING_MOVED: PAUSE_TICKET_TREE,
 }
 """The pause stage each :class:`Halt` cause raises."""
 

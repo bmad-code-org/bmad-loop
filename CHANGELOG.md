@@ -203,6 +203,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Pause a tickets resume at `ticket-tree` (`binding-moved`) when an in-flight unit's ticket
+  was moved with `tickets.py move` or its plan is gone, naming the old and new ref and plan,
+  instead of re-dispatching a ref the tree no longer holds (DW-575).
 - Refuse to archive a sweep run holding unlanded ledger closes, and leave such a run's unit
   worktree and artifacts alone on every `clean` arm, reporting it protected (DW-572, DW-573).
 - Show policy.toml deprecation notices in the TUI dashboard as a warning toast (DW-603).

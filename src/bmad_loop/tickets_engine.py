@@ -27,6 +27,11 @@ Pick-time pauses (``_halt_pick``), all raised before a ticket is recorded in
   ``bmad-loop resolve`` acts on. Like a stories wedge it is re-derived from the
   tree every pick; an in-run escalation re-pauses before the pick instead.
 
+A resume pauses at ``ticket-tree`` (``binding-moved``) before it drives an
+in-flight unit whose binding went stale while the run was paused — its ref no
+longer names its plan, or its verified plan is gone, as ``tickets.py move``
+leaves it (:meth:`TicketsEngine._gate_stale_binding`); it never rebinds.
+
 Rows the pick passed over are journaled once per process (``ticket-skipped``,
 ``ticket-foreign-active``).
 
@@ -124,13 +129,14 @@ from .model import (
 from .recovery_flow import OwnedPlanRefused, OwnedPlanWriter
 from .runs import graceful_stop_requested, live_store_topology, rebase_recorded_project_path
 from .statemachine import OPERATOR_PARK_PREFIX, PlanWriteReason, advance
-from .ticketmodel import StatusView, TicketRow
+from .ticketmodel import FindResult, StatusView, TicketRow
 from .tickets_source import (
     BOUNDARY_ACK,
     BOUNDARY_PAUSE,
     BOUNDARY_REJECTED,
     BOUNDARY_RETRO,
     CLOSURE_REJECTED,
+    HALT_BINDING_MOVED,
     HALT_BLOCKED_PLAN,
     HALT_DIRTY_INITIATIVE,
     HALT_EPIC_CLOSURE,
@@ -158,6 +164,7 @@ from .tickets_source import (
 )
 from .tickettree import (
     TicketsError,
+    TicketsNoMatch,
     TicketsV6KeyUnreadable,
     TicketTree,
     TicketTreeLike,
@@ -189,6 +196,13 @@ PLAN_WRITE_REASONS: Mapping[tuple[SpecWriteReason, str], PlanWriteReason] = {
 """The engine status writes tickets mode makes, as ``(engine reason, target) →
 plan-transition reason``; every other pair is refused
 (:meth:`TicketsEngine._spec_status_write`)."""
+
+PLAN_WRITTEN_PHASES: frozenset[Phase] = frozenset(
+    {Phase.DEV_VERIFY, Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY, Phase.COMMITTING}
+)
+"""The phases of a unit whose dev leg has verified its plan on disk (with a
+recorded ``spec_file``), so a resume finding that plan gone reads it as a stale
+binding (:meth:`TicketsEngine._gate_stale_binding`)."""
 
 
 @dataclass(frozen=True)
@@ -927,7 +941,8 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _pause_ticket_pick(self, halt: Halt) -> NoReturn:
         """Every other pick halt: a refined plan checkpoint (named story file), an
-        epic boundary, or the tree itself. ``key`` "" (a tree fault) pauses with
+        epic boundary, or the tree itself — and a resumed unit's stale binding
+        (:meth:`_gate_stale_binding`). ``key`` "" (a tree fault) pauses with
         no story key. A ``find`` fault naming the plan checkpoint's story file
         pauses at ``ticket-tree`` with the fault instead."""
         if halt.cause == HALT_PLAN_CHECKPOINT:
@@ -1148,7 +1163,95 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                         Path(recorded), self.state, self.paths.project
                     )
                     setattr(task, name, str(live))
+        for task in self.state.tasks.values():
+            if not task.terminal:
+                self._gate_stale_binding(task)
         super()._finish_inflight()
+
+    def _gate_stale_binding(self, task: StoryTask) -> None:
+        """Pause at ``ticket-tree`` (``binding-moved``), on resume and before an
+        in-flight unit is driven, when its binding went stale while the run was
+        paused: ``find`` of the recorded ref no longer names the recorded plan
+        (moved with a renamed project, :meth:`_recorded_plan`), or the plan its
+        dev leg verified is gone. ``tickets.py move`` renumbers the entry and
+        moves its plan, so the driven unit would re-dispatch a ref the tree no
+        longer holds and rewrite its plan at the old path.
+
+        The detail names the ticket's new ref and plan when the live tree holds
+        it (:meth:`_moved_to`), else the missing plan. Nothing is rebound or
+        marked, so a resume after the move is undone drives the unit. A ``find``
+        fault pauses at ``ticket-tree`` too: the gate fails closed. The plan's
+        presence is asked only in :data:`PLAN_WRITTEN_PHASES`, and not of a
+        worktree unit's plan outside the shared store, which lives in its mount."""
+        binding = task.ticket
+        if binding is None:
+            return
+        recorded = self._recorded_plan(binding)
+        try:
+            found = self.ticket_tree.find(binding.ref)
+        except TicketsNoMatch as e:
+            why = f"tickets.py find {binding.ref}: {e}"
+        except TicketsError as e:
+            self._pause_ticket_pick(
+                Halt("tree-fault", task.story_key, None, f"tickets.py {e.kind}: {e}")
+            )
+        else:
+            if not _same_file(Path(found.plan), recorded):
+                why = f"{binding.ref} now names the plan {found.plan}"
+            elif (fault := self._written_plan_fault(task, recorded)) is not None:
+                why = fault
+            else:
+                return
+        moved, search_fault = self._moved_to(binding, recorded)
+        if moved is not None and moved.row.ref is not None:
+            detail = (
+                f"ticket {binding.ref} ({binding.title}) was moved while the run was paused: "
+                f"{binding.ref} → {moved.row.ref}, plan {recorded} → {moved.plan}; "
+                f"undo the move (the entry back at {binding.ref}, its plan at {recorded}) "
+                "to drive this unit"
+            )
+        else:
+            detail = (
+                f"the bound plan of ticket {binding.ref} ({binding.title}) is missing: "
+                f"{recorded} ({why}{search_fault}); restore the ticket and its plan "
+                "to drive this unit"
+            )
+        self._pause_ticket_pick(Halt(HALT_BINDING_MOVED, task.story_key, None, detail))
+
+    def _written_plan_fault(self, task: StoryTask, plan: Path) -> str | None:
+        """Why ``task``'s verified plan cannot be found at ``plan``, or None when
+        it is there or not yet owed (:meth:`_gate_stale_binding`). A plan that
+        cannot be stat'ed reads as missing, with the error."""
+        if task.phase not in PLAN_WRITTEN_PHASES or not task.spec_file:
+            return None
+        if task.worktree_path and not self.paths.in_shared_store(plan):
+            return None
+        try:
+            plan.stat()
+        except FileNotFoundError:
+            return "the file is gone"
+        except OSError as e:
+            return f"cannot read it: {type(e).__name__}: {e}"
+        return None
+
+    def _moved_to(self, binding: TicketBinding, plan: Path) -> tuple[FindResult | None, str]:
+        """The live ticket that holds ``binding``'s plan under another ref, or
+        None: a ``status`` row of the same title whose ``find`` names a plan of
+        the bound plan's file name (``tickets.py move`` renumbers the entry and
+        keeps both). With None, the tree fault that cut the search short, as a
+        clause of the halt detail ("" when there was none)."""
+        try:
+            view = self.ticket_tree.status()
+            rows = [*view.tickets, *(view.backlog.tickets if view.backlog is not None else ())]
+            for row in rows:
+                if row.ref is None or row.ref == binding.ref or row.title != binding.title:
+                    continue
+                found = self.ticket_tree.find(row.ref)
+                if Path(found.plan).name == plan.name:
+                    return found, ""
+        except TicketsError as e:
+            return None, f"; the tree could not be searched for it: tickets.py {e.kind}: {e}"
+        return None, ""
 
     def _plan_halt_now(self, task: StoryTask) -> bool:
         """Leg 1 of an unrefined ``plan_checkpoint``, read from the binding and the
