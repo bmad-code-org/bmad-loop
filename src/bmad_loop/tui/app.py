@@ -68,7 +68,7 @@ from ..policy import POLICY_FILE
 from ..process_host import ProcessHostError
 from ..runs import RUNS_DIR, RearmError, StopRunError
 from . import commands, data, launch, widgets
-from .screens.dashboard import DashboardScreen
+from .screens.dashboard import DashboardScreen, load_policy_noting_deprecations
 from .screens.modals import (
     ConfirmModal,
     ConfirmResumeModal,
@@ -255,6 +255,14 @@ class BmadLoopApp(App[None]):
         self.push_screen(self._dashboard)
         self.note_policy_deprecations(self._dashboard.policy_deprecations)
 
+    def _load_policy(self) -> policy.Policy:
+        """``policy.load`` of the project's policy.toml for an in-session read on
+        the message loop, toasting any deprecation notice it raises that this
+        session has not shown (DW-603). Raises exactly what ``policy.load`` does."""
+        pol, deprecations = load_policy_noting_deprecations(self.project / POLICY_FILE)
+        self.note_policy_deprecations(deprecations)
+        return pol
+
     def note_policy_deprecations(self, messages: Iterable[str]) -> None:
         """Toast each policy.toml deprecation notice this app session has not shown
         yet, with the advice text the CLI prints (DW-603). The toast stays up until
@@ -348,7 +356,7 @@ class BmadLoopApp(App[None]):
         try:
             conflict = None
             if loaded is not None:
-                pol = policy.load(self.project / POLICY_FILE)
+                pol = self._load_policy()
                 conflict = bmadconfig.worktree_isolation_conflict(loaded, pol.scm.isolation)
                 if conflict is None:
                     # the ticket-store topology `cmd_run` refuses next (tickets mode)
@@ -417,7 +425,7 @@ class BmadLoopApp(App[None]):
         the tomlkit error can only arrive from the `PolicyDoc` path in
         :meth:`action_settings`, which catches it there."""
         try:
-            pol = policy.load(self.project / POLICY_FILE)
+            pol = self._load_policy()
         except (policy.PolicyError, OSError):
             return worksource.SOURCE_SPRINT, ""
         return pol.stories.source, pol.stories.spec_folder
@@ -1408,7 +1416,9 @@ class BmadLoopApp(App[None]):
         `tickets.py` is run. Every UI update marshals through `call_from_thread`."""
         ref = binding.ref
         try:
-            isolation = policy.load(self.project / POLICY_FILE).scm.isolation
+            pol, deprecations = load_policy_noting_deprecations(self.project / POLICY_FILE)
+            self.call_from_thread(self.note_policy_deprecations, deprecations)
+            isolation = pol.scm.isolation
             recorded = load_state(run_dir)
         except (policy.PolicyError, OSError, KeyError, ValueError) as e:
             self.call_from_thread(
@@ -1590,7 +1600,7 @@ class BmadLoopApp(App[None]):
         # silently, and unrecoverably, since a re-arm consumes the escalation.
         # `cli.cmd_resolve` raises on the same unreadable file before it re-arms.
         try:
-            live_policy = policy.load(self.project / POLICY_FILE)
+            live_policy = self._load_policy()
         except (policy.PolicyError, OSError) as e:
             self.notify(
                 f"cannot read policy.toml to determine the re-drive's isolation mode "

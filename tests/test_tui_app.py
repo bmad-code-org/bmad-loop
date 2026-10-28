@@ -600,17 +600,52 @@ async def test_policy_deprecation_toasts_once_on_mount(project_tree):
         assert not shown.markup  # "[engine]" is advice text, not markup
 
 
-async def test_policy_deprecation_toast_never_repeats_in_a_session(project_tree):
-    """A later reload's notices toast only the ones this session has not shown."""
+async def _open_and_cancel_start_run(pilot, app) -> None:
+    """Drive the start-run gesture, whose `_stories_defaults` reads policy.toml
+    in-session, then cancel back to the dashboard."""
+    await pilot.press("r")
+    await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+    await pilot.press("escape")
+    await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+    await pilot.pause()
+
+
+async def test_policy_deprecation_toast_never_repeats_in_a_session(project_tree, monkeypatch):
+    """The in-session re-read of a policy whose notice the mount already toasted
+    shows it again on no later read."""
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
     _write_policy(project_tree.project, _DEPRECATED_POLICY)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
-        (first,) = dashboard(app).policy_deprecations
-        app.note_policy_deprecations([first, "[gates] old_key is deprecated"])
         await pilot.pause()
+        (first,) = dashboard(app).policy_deprecations
+        await _open_and_cancel_start_run(pilot, app)
         toasts = [e.message for e in emitted(app) if "deprecated" in e.message]
-        assert toasts == [first, "[gates] old_key is deprecated"]
+        assert toasts == [first]
+
+
+async def test_policy_deprecation_added_mid_session_toasts_on_next_read(project_tree, monkeypatch):
+    """A key deprecated after the dashboard mounted toasts on the next in-session
+    policy read, once: a second read adds none.
+
+    ABLATION: revert `_stories_defaults` to a bare `policy.load` and no toast is
+    shown at all."""
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    _write_policy(project_tree.project, '[adapter]\nname = "claude"\n')
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.pause()
+        assert not [e for e in emitted(app) if "deprecated" in e.message]
+        _write_policy(project_tree.project, _DEPRECATED_POLICY)
+        await _open_and_cancel_start_run(pilot, app)
+        toasts = [(e.message, e.severity) for e in emitted(app) if "deprecated" in e.message]
+        assert len(toasts) == 1 and toasts[0][1] == "warning"
+        await _open_and_cancel_start_run(pilot, app)
+        assert [
+            (e.message, e.severity) for e in emitted(app) if "deprecated" in e.message
+        ] == toasts
 
 
 @pytest.mark.parametrize(
