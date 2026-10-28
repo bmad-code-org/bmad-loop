@@ -430,12 +430,14 @@ is in [Environment faults](escalations-guide.md#environment-faults).
 - Patterns are a list of strings, compiled at load (an invalid regex is a profile error),
   and matched with the `regex` module under a per-pattern timeout.
 - Seeded for `claude` (connection loss and two captured provider 5xx errors) and
-  `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit`,
-  `provider.quota` and `provider.transport` events on 2.x). Empty means inert.
+  `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit` and
+  `provider.transport` events on 2.x, whose `provider.quota` is a usage limit instead).
+  Empty means inert.
 - The tail scan also covers `usage_limit_patterns` and `usage_wait_patterns` as ordinary
   pattern families, under the same token-usage overrule: a session that got past a limit
-  and later failed for another reason is charged. Only a live pane sighting of a usage
-  line exempts a session from the overrule; see [Usage-limit signals](#usage-limit-signals).
+  and later failed for another reason is charged. Only a live sighting of a usage line
+  (on the visible pane, or an opencode 2.x provider-error line written while the session
+  runs) exempts a session from the overrule; see [Usage-limit signals](#usage-limit-signals).
 
 ### Parked-session signals
 
@@ -552,7 +554,9 @@ Both CLIs show a one-time workspace-trust dialog in a directory they have not se
 A CLI stopped by a subscription or credit limit either stays blocked until someone acts
 (credit exhaustion) or waits for the limit's reset and continues by itself (a
 session-window limit under Claude Code's auto-continue). Two opt-in profile lists name
-those lines, both matched line by line against the ANSI-stripped visible pane:
+those lines. The tmux adapters match both line by line against the ANSI-stripped visible
+pane; `opencode-http` has no pane and matches them against its provider-error lines (see
+below):
 
 - **`usage_limit_patterns`**: the CLI is blocked and will not continue on its own.
 - **`usage_wait_patterns`**: the CLI is blocked and waiting for a reset it continues from.
@@ -561,8 +565,22 @@ The lists are disjoint by contract; "usage-limited" means either one matched. Th
 the env-fault evidentiary bar: reproduce the captured sentence prefix (never a bare
 `session limit`, `resets` or `usage credits`), use single-character classes so a pattern
 cannot match its own profile line, and seed only lines captured off the CLI's screen. The
-shipped `claude` profile seeds one line in each list; every other profile leaves both
+shipped `claude` profile seeds one line in each list, and `opencode` seeds
+`usage_limit_patterns` with its 2.x `provider.quota` line; every other profile leaves both
 empty, which keeps them inert.
+
+**opencode-http's sighting.** On OpenCode 2.x the adapter matches each provider-error line
+it writes to `<task-id>.provider-errors.log` against `usage_limit_patterns`, then
+`usage_wait_patterns`, as the frame arrives for this session. The first match is the
+session's sighting: when the session ends anything but `completed`, the result carries it
+as `usage_limited` with its class, and no `usage_limit_resets`, since the frame names no
+reset time. A frame of this session seen while it ran is live evidence, so the sighting is
+exempt from the token-usage overrule like a pane sighting. The shipped pattern matches
+`type=provider.quota`, a blocking limit: OpenCode builds that type from billing and
+credit-exhaustion codes and never retries it. `provider.rate-limit` and
+`provider.transport`, which OpenCode retries, stay `env_fault_patterns`. A match that blows
+the per-pattern timeout counts as no match and leaves a `usage-limit-match-failed`
+lifecycle crumb. OpenCode 1.x writes no provider-error lines and has no sighting.
 
 **At stall-grace expiry** the pane is captured once and checked against the parked
 patterns and both usage lists. A usage match withholds the nudge (even when a hook latch

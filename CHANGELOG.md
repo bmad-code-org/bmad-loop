@@ -118,8 +118,9 @@ breaking changes may land in a minor release.
   with a clear error, and `validate` reports it as `adapter.opencode-version` (#847).
 - On OpenCode 2.x, send `effort` as the session model's variant, and refuse a session
   start whose effort is not one of the model's variants (#847).
-- Write each OpenCode 2.x provider-error event to `logs/<task-id>.provider-errors.log`
-  and classify rate-limit, quota and transport outages there as environment faults (#847).
+- Write each OpenCode 2.x provider-error event to `logs/<task-id>.provider-errors.log`;
+  classify rate-limit and transport outages there as environment faults and quota
+  failures as a blocking usage limit (#847).
 - Add the `subagent_transcript_dir` CLI profile field: a subagent transcript tree whose
   writes count as session activity for the idle notice (#858).
 - Name the tool call an idle Claude session is waiting on: `session-idle` carries
@@ -247,6 +248,9 @@ breaking changes may land in a minor release.
   a live pane sighting is exempt from the token veto. Add the profile fields
   `usage_limit_patterns` and `usage_wait_patterns`, seeded from lines captured in
   community reports (#610).
+- Pause an OpenCode 2.x session that fails on a provider quota as a usage limit, never
+  charged, even after it did work: the adapter matches each provider-error line against
+  the profile's usage lists as it writes it, a live sighting exempt from the token veto.
 - Read an epic the initiative declares but has not sliced yet: `status` no longer
   faults the board on its folderless row, and it triggers no retrospective or closure.
 - Name the T1 ticket plan an interrupted commit window left `done` or `blocked` when

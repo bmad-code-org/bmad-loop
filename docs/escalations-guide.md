@@ -253,7 +253,7 @@ A session the adapter saw blocked by a coding-CLI usage limit (out of credits, o
 usage limit: dev session stalled (<pane line>; resets <time>; the coding CLI is blocked by a usage limit — add credits, switch model or wait for the reset, then bmad-loop resolve <run>)
 ```
 
-The attempt is not charged, whatever tokens the session used before the limit hit: the line was on screen when the session ended. `<pane line>` is the matched line from the CLI's screen. `; resets <time>` appears only when that line names a reset: an ISO-8601 time when it resolves, otherwise the text as printed (for example when the host has no time-zone data for the zone the CLI named).
+The attempt is not charged, whatever tokens the session used before the limit hit: the adapter saw the limit live, on screen when the session ended or, for opencode 2.x, as a provider-error event during the session. `<pane line>` is the matched line from the CLI's screen, or opencode's `provider-error …` line. `; resets <time>` appears only when that line names a reset: an ISO-8601 time when it resolves, otherwise the text as printed (for example when the host has no time-zone data for the zone the CLI named).
 
 To recover:
 
