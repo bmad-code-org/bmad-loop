@@ -448,7 +448,8 @@ generic adapter tell them apart:
   its subtypes in `[hooks.notification_types]`. The shipped `claude` profile parks
   `permission_prompt`, `idle_prompt`, `quota_auto_resume_stale`,
   `quota_auto_resume_disabled`, `elicitation_dialog` and `elicitation_url_dialog`; every
-  other subtype is ignored. The adapter latches the signal, and a `Stop` clears it.
+  other subtype is ignored. The adapter latches the signal, and a `Stop` clears it; a
+  `PermissionPrompt` latch also clears once the transcript is written after it.
 - **Pane-matched.** `parked_prompt_patterns` are matched against the visible pane
   (`mux.capture_pane`) at every stall-grace expiry with no latch set, including the final
   one. A backend that cannot capture, a capture failure, or a regex timeout reads as no
@@ -465,7 +466,8 @@ patterns against their own lines wrapped at widths 10 to 60.
 
 Neither signal acts on arrival. At the stall-grace expiry, a parked signal suppresses the
 nudge and ends the session `stalled` with `SessionResult.parked` / `parked_evidence` set (a
-window already dead still ends `crashed`). At the timeout, a latched signal or a
+window already dead still ends `crashed`), except a `PermissionPrompt` latch the transcript
+has moved past, which gets the nudge. At the timeout, a latched signal or a
 pane-matched prompt marks the `timeout` result parked, but only while the window is alive
 and the transcript is idle. The engine and sweep then pause for a human; an `env_fault`
 outranks it. Re-arm restores the attempt without charging it.
