@@ -203,6 +203,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Windows installs now depend on tzdata, so usage-limit resets that name a time zone
+  resolve (DW-593).
 - validate's hooks.trust now checks the permission-mode launch args each role runs with (DW-602).
 - Show the legacy `[engine]` deprecation notice to CLI users: it was a `DeprecationWarning`,
   which Python hides outside `__main__`. It is now `policy.PolicyDeprecationWarning` (a

@@ -22,6 +22,10 @@ dependencies = [
   # win32 liveness needs psutil (no /proc; os.kill(pid,0) is destructive there);
   # without it the TUI shows every run as `?`. Hard dep so no install path misses it.
   "psutil>=7.2.2; sys_platform == 'win32'",
+  # Windows has no system tz database, so zoneinfo can resolve a usage-limit reset's
+  # `(<Area/City>)` zone (usagereset.py) only through this first-party fallback.
+  # Linux/macOS ship the system database.
+  "tzdata>=2026.5; sys_platform == 'win32'",
 ]
 
 [project.scripts]

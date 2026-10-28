@@ -1,6 +1,7 @@
 """Parse the ``resets …`` clause of a coding CLI's usage-limit line (#610).
 
-Pure: no clock reads, no I/O beyond the stdlib zone database and the host's
+Pure: no clock reads, no I/O beyond the zone database (the system's, or the
+``tzdata`` package zoneinfo falls back to, a Windows dependency) and the host's
 local-time rules. The caller passes ``now`` and the full pane line that a
 ``usage_limit_patterns`` / ``usage_wait_patterns`` entry matched; the result
 feeds the pause reason, ``heartbeat.json`` (``quota_resets_at``), the
@@ -22,8 +23,8 @@ across a DST change would get an hour wrong.
 
 Degrade contract: :func:`parse_reset` never raises. A line with no clause is
 ``None``. A clause it cannot resolve keeps its raw text with ``at=None`` and
-names why in ``unresolved``: ``"zone-unavailable"`` when the named zone is not
-in this host's zone database (Windows without the ``tzdata`` package, say), and
+names why in ``unresolved``: ``"zone-unavailable"`` only when neither the
+system zone database nor the ``tzdata`` package provides the named zone, and
 ``"unparsed"`` for any other shape. The caller makes that degrade visible (the
 generic adapter writes a ``usage-reset-unparsed`` crumb and carries the raw
 text); it is never read as "no reset".
