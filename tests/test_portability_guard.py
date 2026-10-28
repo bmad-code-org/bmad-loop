@@ -284,6 +284,9 @@ RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resolve_adopt"),
     ("cli.py", "_resolve_reverify"),
     ("cli.py", "_resolve_abandon"),
+    # DW-591: `resolve --at-reset`'s two wait rows, under the hold cleanup removes
+    # the run in, so neither append recreates a removed run dir
+    ("cli.py", "_resolve_at_reset"),
     # #925: a refused TUI-launched child's journal row, under the hold cleanup
     # removes the run in, so the append never recreates a removed run dir
     ("cli.py", "_journal_unaccepted_launch"),
@@ -849,6 +852,8 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # least"); none is authored text or an identifier, and the refused path
         # remains inside dropped `error`.
         "limit_bytes",
+        # `at-reset-wait-start` (DW-591): `resolve --margin-min`, whole minutes.
+        "margin_min",
         "measured_bytes",
         "measurement_is_lower_bound",
         # `bypass-dropped` (DW-410): the profile bypass tokens an explicit
@@ -983,6 +988,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # kept unit to (`unit-replay-handoff`).
         "replay_of",
         "replay_run",
+        # `at-reset-wait-start` (DW-591): the pause's recorded reset — always an
+        # ISO-8601 instant (`usagereset.resolved_reset` admitted it).
+        "reset_at",
         "reset_from",
         "restore",
         "returncode",
@@ -1074,6 +1082,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `session-start-missing`: whole seconds the session had run without a
         # SessionStart when the notice fired — a measured integer.
         "waited_s",
+        # `at-reset-wait-start` / `at-reset-wait-end` (DW-591): the reset plus the
+        # margin, an ISO-8601 instant `resolve --at-reset` computed.
+        "wake_at",
         "weighted",
         "workflow",
         "worktree",
@@ -1430,6 +1441,11 @@ JOURNAL_KINDS = frozenset(
         # profile's bypass tokens — one per affected launched role. `role`,
         # `profile` and `missing` are config names/flags from the resolved profile.
         "bypass-dropped",
+        # DW-591: `resolve --at-reset`'s wait for a usage-limit reset — its start
+        # (`reset_at`, `margin_min`, `wake_at`) and end (`wake_at`, `interrupted`,
+        # `waited_s`); every field declared benign.
+        "at-reset-wait-end",
+        "at-reset-wait-start",
         # #920: the accepting process could not publish its control window;
         # `error` is a drop field.
         "ctl-window-claim-failed",

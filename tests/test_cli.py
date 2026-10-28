@@ -5727,6 +5727,256 @@ def test_resolve_no_interactive_rearms_and_resumes(tmp_path, monkeypatch, capsys
     assert "ready-for-dev" in spec.read_text()
 
 
+# `resolve --at-reset` (DW-591): the clock every at-reset test fakes.
+_AT_RESET_NOW = "2026-10-28T12:00:00+00:00"
+
+
+def _usage_limit_run(tmp_path, *, limit_class="wait", reset_at="2026-10-28T13:00:00+00:00"):
+    """`_escalated_run` paused on a usage limit: the step-2 facts set on the pause."""
+    from bmad_loop.journal import load_state, save_state
+
+    spec = tmp_path / "spec.md"
+    spec.write_text("---\nstatus: in-review\n---\n", encoding="utf-8")
+    run_dir = _escalated_run(tmp_path, "r1", spec_file=str(spec))
+    state = load_state(run_dir)
+    state.paused_reason = "usage limit: dev session stalled (limit reached)"
+    state.paused_limit_class = limit_class
+    state.paused_reset_at = reset_at
+    save_state(run_dir, state)
+    return run_dir
+
+
+class _FakeAtResetClock:
+    """`cli._at_reset_now` / `cli._at_reset_sleep`: sleeping advances the clock,
+    and the sleep that `interrupt_on` counts to raises KeyboardInterrupt."""
+
+    def __init__(self, monkeypatch, *, now=_AT_RESET_NOW, interrupt_on=None):
+        import datetime as dt
+
+        self.now = dt.datetime.fromisoformat(now)
+        self.sleeps: list[float] = []
+        self.interrupt_on = interrupt_on
+        monkeypatch.setattr(cli, "_at_reset_now", lambda: self.now)
+        monkeypatch.setattr(cli, "_at_reset_sleep", self.sleep)
+
+    def sleep(self, seconds):
+        import datetime as dt
+
+        self.sleeps.append(seconds)
+        if self.interrupt_on is not None and len(self.sleeps) == self.interrupt_on:
+            raise KeyboardInterrupt
+        self.now += dt.timedelta(seconds=seconds)
+
+
+def _journal_bytes(run_dir):
+    journal = run_dir / "journal.jsonl"
+    return journal.read_bytes() if journal.exists() else None
+
+
+def _at_reset_journal(run_dir):
+    raw = _journal_bytes(run_dir) or b""
+    return [
+        row
+        for row in map(json.loads, raw.decode("utf-8").splitlines())
+        if row["kind"].startswith("at-reset-")
+    ]
+
+
+def test_resolve_at_reset_waits_until_reset_plus_margin_then_resumes(tmp_path, monkeypatch, capsys):
+    """The wait ends at reset + margin, journals its start and end, and then takes
+    plain `--no-interactive --resume`'s path: the story re-armed, the run resumed."""
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir = _usage_limit_run(tmp_path)
+    clock = _FakeAtResetClock(monkeypatch)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--at-reset", "--margin-min", "5"])
+
+    assert rc == 0
+    assert clock.now.isoformat() == "2026-10-28T13:05:00+00:00"
+    assert sum(clock.sleeps) == 65 * 60 and max(clock.sleeps) <= 1.0
+    assert resumed == [run_dir]
+    assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING
+    start, end = _at_reset_journal(run_dir)
+    assert start["kind"] == "at-reset-wait-start"
+    assert start["reset_at"] == "2026-10-28T13:00:00+00:00"
+    assert start["margin_min"] == 5
+    assert start["wake_at"] == "2026-10-28T13:05:00+00:00"
+    assert end["kind"] == "at-reset-wait-end"
+    assert end["wake_at"] == start["wake_at"] and end["interrupted"] is False
+    assert end["waited_s"] == 65 * 60
+    err = capsys.readouterr().err
+    assert "2026-10-28T13:05:00+00:00" in err and "Ctrl-C leaves it paused" in err
+
+
+def test_resolve_at_reset_default_margin_is_two_minutes(tmp_path, monkeypatch):
+    run_dir = _usage_limit_run(tmp_path)
+    clock = _FakeAtResetClock(monkeypatch)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: 0)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--at-reset"]) == 0
+
+    assert clock.now.isoformat() == "2026-10-28T13:02:00+00:00"
+    assert _at_reset_journal(run_dir)[0]["margin_min"] == 2
+
+
+def test_resolve_at_reset_past_reset_resumes_without_waiting(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state
+    from bmad_loop.model import Phase
+
+    run_dir = _usage_limit_run(tmp_path, reset_at="2026-10-28T11:00:00+00:00")
+    clock = _FakeAtResetClock(monkeypatch)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--at-reset"]) == 0
+
+    assert clock.sleeps == []
+    assert _at_reset_journal(run_dir) == []
+    assert resumed == [run_dir]
+    assert load_state(run_dir).tasks["s1"].phase == Phase.PENDING
+    assert "has passed" in capsys.readouterr().err
+
+
+def test_resolve_at_reset_interrupt_leaves_the_run_paused(tmp_path, monkeypatch, capsys):
+    """Ctrl-C mid-wait exits 130 with state.json byte-identical; the only write is
+    the journal's interrupted `at-reset-wait-end` row.
+
+    Ablation, performed: drop the `return ExitCode.INTERRUPTED` after the
+    interrupted wait (falling through to the re-arm) and this reddens on rc,
+    on the state bytes and on `resumed`."""
+    run_dir = _usage_limit_run(tmp_path)
+    _FakeAtResetClock(monkeypatch, interrupt_on=3)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+    before = _state_bytes(run_dir)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--at-reset"])
+
+    assert rc == cli.ExitCode.INTERRUPTED
+    assert _state_bytes(run_dir) == before
+    assert resumed == []
+    start, end = _at_reset_journal(run_dir)
+    assert start["kind"] == "at-reset-wait-start"
+    assert end["kind"] == "at-reset-wait-end" and end["interrupted"] is True
+    assert "still paused" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("limit_class", "reset_at", "msg"),
+    [
+        (None, "2026-10-28T13:00:00+00:00", "not paused on a usage limit"),
+        # Ablation, performed: delete the USAGE_LIMIT_BLOCKED arm of
+        # `_at_reset_refusal` and this case waits and resumes (rc 0).
+        ("blocked", "2026-10-28T13:00:00+00:00", "credit exhaustion never auto-resumes"),
+        ("wait", None, "did not resolve to a time"),
+        # unresolved raw clause text is not a recorded reset either
+        ("wait", "3pm (Mars/Olympus)", "did not resolve to a time"),
+        # 301 min past now, over the default 300-min cap
+        ("wait", "2026-10-28T17:01:00+00:00", "past the 300-min cap"),
+    ],
+)
+def test_resolve_at_reset_refusals_leave_the_run_unchanged(
+    tmp_path, monkeypatch, capsys, limit_class, reset_at, msg
+):
+    run_dir = _usage_limit_run(tmp_path, limit_class=limit_class, reset_at=reset_at)
+    clock = _FakeAtResetClock(monkeypatch)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+    before = _state_bytes(run_dir)
+    journal_before = _journal_bytes(run_dir)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--at-reset"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert msg in err and "cannot resolve r1 --at-reset" in err
+    assert _state_bytes(run_dir) == before
+    assert _journal_bytes(run_dir) == journal_before
+    assert clock.sleeps == [] and resumed == []
+
+
+def test_resolve_at_reset_cap_zero_is_no_cap(tmp_path, monkeypatch):
+    _write_policy(tmp_path, "[limits]\nquota_wait_max_min = 0\n")
+    run_dir = _usage_limit_run(tmp_path, reset_at="2026-10-30T12:00:00+00:00")
+    clock = _FakeAtResetClock(monkeypatch)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--at-reset"]) == 0
+
+    assert clock.now.isoformat() == "2026-10-30T12:02:00+00:00"
+    assert resumed == [run_dir]
+
+
+def test_resolve_at_reset_takes_resolves_refusals_before_waiting(tmp_path, monkeypatch, capsys):
+    """A live engine refuses at once, not after the wait."""
+    run_dir = _usage_limit_run(tmp_path)
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    clock = _FakeAtResetClock(monkeypatch)
+    before = _state_bytes(run_dir)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--at-reset"]) == 1
+
+    assert "is still live" in capsys.readouterr().err
+    assert clock.sleeps == [] and _at_reset_journal(run_dir) == []
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_at_reset_rechecks_after_the_wait(tmp_path, monkeypatch, capsys):
+    """The post-wait pass re-takes resolve's checks on the state as it then is: a run
+    resolved by someone else during the wait is refused, not re-armed again."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase
+
+    run_dir = _usage_limit_run(tmp_path)
+    clock = _FakeAtResetClock(monkeypatch)
+
+    def sleep_and_resolve_elsewhere(seconds):
+        clock.sleep(seconds)
+        if len(clock.sleeps) == 1:
+            state = load_state(run_dir)
+            state.clear_pause()
+            state.tasks["s1"].phase = Phase.PENDING
+            save_state(run_dir, state)
+
+    monkeypatch.setattr(cli, "_at_reset_sleep", sleep_and_resolve_elsewhere)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--at-reset"]) == 1
+
+    assert resumed == []
+    assert "not paused at an escalation" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--no-resume"],
+        ["--abandon"],
+        ["--restore-patch", "x.patch"],
+        ["--adopt-branch"],
+        ["--reverify"],
+        ["--margin-min", "-1"],
+    ],
+)
+def test_resolve_at_reset_usage_errors(tmp_path, capsys, extra):
+    """Refused before the run lookup: no run exists, and the usage error still wins."""
+    rc = cli.main(["resolve", "--project", str(tmp_path), "missing", "--at-reset", *extra])
+    assert rc == cli.ExitCode.USAGE
+    assert "no such run" not in capsys.readouterr().err
+
+
+def test_resolve_margin_min_without_at_reset_is_a_usage_error(tmp_path, capsys):
+    rc = cli.main(["resolve", "--project", str(tmp_path), "missing", "--margin-min", "3"])
+    assert rc == cli.ExitCode.USAGE
+    assert "--margin-min applies only with --at-reset" in capsys.readouterr().err
+
+
 def _adoptable_run(tmp_path, run_id="r1", *, run_type="story", worktree=True, spec=True):
     """An escalation-paused run whose ESCALATED task keeps a worktree + branch (DW-386)."""
     from bmad_loop.journal import load_state, save_state

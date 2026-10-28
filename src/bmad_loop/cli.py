@@ -14,6 +14,7 @@ import sys
 import time
 import warnings
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import IntEnum
 from pathlib import Path
 from stat import S_ISREG
@@ -46,9 +47,11 @@ from . import (
     tickets_source,
     ticketstore,
     tickettree,
+    usagereset,
     verify,
     worksource,
 )
+from .adapters.base import USAGE_LIMIT_BLOCKED, USAGE_LIMIT_WAIT
 
 # Re-exported for the test suite, which stubs `_platform_preflight` with
 # `cli.Finding(...)`; no longer referenced within this module (the preflight body
@@ -6317,6 +6320,14 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return ExitCode.USAGE
+    # DW-591: `--at-reset` is `--no-interactive --resume` on a timer, so every flag
+    # that answers otherwise is a usage error, refused before the run lookup too.
+    if (usage := _at_reset_usage_error(args)) is not None:
+        print(f"error: {usage}", file=sys.stderr)
+        return ExitCode.USAGE
+    if getattr(args, "at_reset", False):
+        args.interactive = False
+        args.resume = True
     project = _project(args)
     try:
         run_dir = runs.resolve_run_dir(project, args.run_id)
@@ -6506,6 +6517,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # gates, and likewise ahead of the interactive session it never runs.
     if getattr(args, "abandon", False):
         return _resolve_abandon(args, project, run_dir, state, task, story_key)
+
+    # DW-591: wait out a usage-limit reset, then take this same path again. Behind
+    # every entry refusal above, so an operator is refused now, not hours later.
+    if getattr(args, "at_reset", False):
+        return _resolve_at_reset(args, project, run_dir, state)
 
     pol = policy_mod.load(_policy_path(project))
 
@@ -6924,6 +6940,145 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         launch.detach_client()
     return _resume_paused_run(project, run_dir)
+
+
+# `resolve --at-reset`'s default margin past the reset (DW-591): long enough for the
+# provider's usage window to have rolled over when the resume's first session starts.
+AT_RESET_DEFAULT_MARGIN_MIN = 2
+# The longest one sleep of the wait runs, so Ctrl-C ends it promptly.
+_AT_RESET_SLICE_S = 1.0
+
+
+def _at_reset_now() -> datetime:
+    """The wall clock `resolve --at-reset` waits against (a test seam)."""
+    return datetime.now(timezone.utc)
+
+
+_at_reset_sleep = time.sleep  # a test seam, beside `_at_reset_now`
+
+
+def _at_reset_usage_error(args: argparse.Namespace) -> str | None:
+    """Why ``resolve``'s ``--at-reset``/``--margin-min`` flags cannot go together
+    with the rest of the command line, or None (DW-591)."""
+    margin = getattr(args, "margin_min", None)
+    if not getattr(args, "at_reset", False):
+        return "--margin-min applies only with --at-reset" if margin is not None else None
+    if margin is not None and margin < 0:
+        return f"--margin-min must be >= 0: got {margin}"
+    for flag, given in (
+        ("--no-resume", args.resume is False),
+        ("--abandon", getattr(args, "abandon", False)),
+        ("--restore-patch", args.restore_patch is not None),
+        ("--adopt-branch", getattr(args, "adopt_branch", False)),
+        ("--reverify", getattr(args, "reverify", False)),
+    ):
+        if given:
+            return (
+                f"--at-reset re-arms and resumes with no resolve agent once the reset "
+                f"passes, so it cannot be combined with {flag}"
+            )
+    return None
+
+
+def _at_reset_refusal(state: RunState, pol: policy_mod.Policy, now: datetime) -> str | None:
+    """Why ``resolve --at-reset`` cannot wait on this run's pause, or None. Read from
+    the facts the pause recorded (``paused_limit_class``, ``paused_reset_at``),
+    never from the pause reason's prose."""
+    run_id = state.run_id
+    limit_class = state.paused_limit_class
+    if limit_class is None:
+        return f"run {run_id} is not paused on a usage limit (no paused_limit_class recorded)"
+    if limit_class == USAGE_LIMIT_BLOCKED:
+        return (
+            f"run {run_id} is paused on a blocking usage limit (paused_limit_class: "
+            f"{USAGE_LIMIT_BLOCKED}) — credit exhaustion never auto-resumes; add credits "
+            f"or switch model, then: bmad-loop resolve {run_id} --no-interactive"
+        )
+    if limit_class != USAGE_LIMIT_WAIT:
+        return f"run {run_id} has an unrecognized paused_limit_class {limit_class!r}"
+    reset = usagereset.resolved_reset(state.paused_reset_at)
+    if reset is None:
+        return (
+            f"run {run_id}'s usage-limit reset did not resolve to a time (no "
+            "paused_reset_at recorded; the pause reason carries the raw text) — wait it "
+            f"out, then: bmad-loop resolve {run_id} --no-interactive"
+        )
+    cap = pol.limits.quota_wait_max_min
+    ahead = datetime.fromisoformat(reset) - now
+    if cap and ahead > timedelta(minutes=cap):
+        return (
+            f"run {run_id}'s usage-limit reset {reset} is {ahead.total_seconds() / 60:.0f} "
+            f"min away, past the {cap}-min cap ([limits] quota_wait_max_min)"
+        )
+    return None
+
+
+def _resolve_at_reset(
+    args: argparse.Namespace, project: Path, run_dir: Path, state: RunState
+) -> int:
+    """``resolve --at-reset`` (DW-591), past every entry refusal ``cmd_resolve``
+    makes: refuse a pause it cannot time, wait in this foreground process until
+    the recorded reset plus ``--margin-min`` (no wait once that has passed), then
+    run ``cmd_resolve`` again as ``--no-interactive --resume`` so every check is
+    re-taken on the state after the wait. The wait writes nothing but its two
+    journal rows; Ctrl-C leaves the run paused and exits ``INTERRUPTED``."""
+    now = _at_reset_now()
+    if (
+        refusal := _at_reset_refusal(state, policy_mod.load(_policy_path(project)), now)
+    ) is not None:
+        print(f"cannot resolve {args.run_id} --at-reset: {refusal}", file=sys.stderr)
+        return 1
+    margin_min = AT_RESET_DEFAULT_MARGIN_MIN if args.margin_min is None else args.margin_min
+    reset_at = state.paused_reset_at
+    assert reset_at is not None  # `_at_reset_refusal` refused an unresolved reset
+    wake = datetime.fromisoformat(reset_at) + timedelta(minutes=margin_min)
+    if wake > now:
+        print(
+            f"waiting for the usage-limit reset: resolving run {args.run_id} at "
+            f"{wake.astimezone():%Y-%m-%d %H:%M:%S %Z} ({wake.isoformat()}); "
+            "Ctrl-C leaves it paused",
+            file=sys.stderr,
+        )
+        # Under the hold cleanup removes a run in, so a removed run is not recreated.
+        with state_lock(run_dir):
+            if not runs.is_run(run_dir):
+                print(f"no such run: {run_dir.name}", file=sys.stderr)
+                return 1
+            Journal(run_dir, pin=state).append(
+                "at-reset-wait-start",
+                reset_at=reset_at,
+                margin_min=margin_min,
+                wake_at=wake.isoformat(),
+            )
+        interrupted = False
+        try:
+            while (left := (wake - _at_reset_now()).total_seconds()) > 0:
+                _at_reset_sleep(min(left, _AT_RESET_SLICE_S))
+        except KeyboardInterrupt:
+            interrupted = True
+        with state_lock(run_dir):
+            if runs.is_run(run_dir):
+                Journal(run_dir, pin=state).append(
+                    "at-reset-wait-end",
+                    wake_at=wake.isoformat(),
+                    interrupted=interrupted,
+                    waited_s=round((_at_reset_now() - now).total_seconds(), 3),
+                )
+        if interrupted:
+            print(
+                f"interrupted — run {args.run_id} is still paused; nothing was re-armed",
+                file=sys.stderr,
+            )
+            return ExitCode.INTERRUPTED
+    else:
+        print(
+            f"the usage-limit reset {reset_at} (+{margin_min} min margin) has passed — "
+            f"resolving run {args.run_id} now",
+            file=sys.stderr,
+        )
+    args.at_reset = False
+    args.margin_min = None
+    return cmd_resolve(args)
 
 
 def _resolve_adopt(
@@ -9957,6 +10112,31 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="proceed when engine liveness is unverifiable (unknown); "
         "a provably-live engine still blocks",
+    )
+    resolve_p.add_argument(
+        "--at-reset",
+        action="store_true",
+        help="for a run paused on a usage limit the coding CLI waits out (a session-"
+        "window reset): wait in this terminal until the recorded reset plus "
+        "--margin-min, then re-arm and resume as `--no-interactive --resume` does, "
+        "re-taking every check on the run as it then stands. Prints the wake time and "
+        "journals the wait (at-reset-wait-start / at-reset-wait-end); no wait when that "
+        "time has already passed. Refused with exit 1 before any wait when the run is "
+        "not paused on a usage limit, when the limit is a blocking one (credit "
+        "exhaustion never auto-resumes: add credits, then resolve), when its reset did "
+        "not resolve to a time, or when the reset lies more than [limits] "
+        "quota_wait_max_min minutes away (0 = no cap); resolve's other refusals are "
+        "also taken before the wait. Ctrl-C during the wait leaves the run paused and "
+        "exits 130. Not combinable with --no-resume, --abandon, --restore-patch, "
+        "--adopt-branch or --reverify (exit 2)",
+    )
+    resolve_p.add_argument(
+        "--margin-min",
+        type=int,
+        metavar="N",
+        help="with --at-reset: minutes to wait past the reset before resuming, an int "
+        f">= 0 (default: {AT_RESET_DEFAULT_MARGIN_MIN}, so the provider's usage window "
+        "has rolled over when the first session starts)",
     )
 
     decisions_p = add(
