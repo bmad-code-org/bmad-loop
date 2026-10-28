@@ -106,6 +106,10 @@ def _replan_ticket_tree(
     return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative)
 
 
+# Textual has no unlimited toast lifetime (`timeout=None` is the 5s default), and
+# Windows' timer sleep cannot take `inf`, so "until clicked" is a day.
+_PERSISTENT_TOAST_S = 24 * 60 * 60.0
+
 # Pause stages whose payload is the pause reason, never a spec: the viewer is
 # `PauseReasonModal`. The three ticket stages are raised at pick time, before the
 # ticket is recorded in state.tasks, or (ticket-tree) about the tree itself.
@@ -245,9 +249,27 @@ class BmadLoopApp(App[None]):
         self.project = resolve_or_lexical(project)
         self.sub_title = str(self.project)
         self._dashboard = DashboardScreen(self.project)
+        self._policy_deprecations_shown: set[str] = set()
 
     def on_mount(self) -> None:
         self.push_screen(self._dashboard)
+        self.note_policy_deprecations(self._dashboard.policy_deprecations)
+
+    def note_policy_deprecations(self, messages: Iterable[str]) -> None:
+        """Toast each policy.toml deprecation notice this app session has not shown
+        yet, with the advice text the CLI prints (DW-603). The toast stays up until
+        clicked: the fix is an edit the operator has to go and make."""
+        for message in messages:
+            if message in self._policy_deprecations_shown:
+                continue
+            self._policy_deprecations_shown.add(message)
+            self.notify(
+                message,
+                title="policy.toml",
+                severity="warning",
+                timeout=_PERSISTENT_TOAST_S,
+                markup=False,
+            )
 
     def action_toggle_dark(self) -> None:
         self.theme = "textual-light" if self.theme == "textual-dark" else "textual-dark"

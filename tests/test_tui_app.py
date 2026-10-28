@@ -568,6 +568,70 @@ async def test_empty_project_shows_hint(project_tree):
         assert "no runs found" in header
 
 
+def _write_policy(project: Path, text: str) -> Path:
+    path = project / ".bmad-loop" / "policy.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+_DEPRECATED_POLICY = '[engine]\neditor_mode = "shared"\n'
+
+
+async def test_policy_deprecation_toasts_once_on_mount(project_tree):
+    """DW-603: a deprecated policy.toml key reaches the dashboard user as one
+    persistent warning toast carrying the CLI's advice text, not as a warning
+    lost in Textual's stderr capture.
+
+    ABLATION: drop the `notify` in `note_policy_deprecations` and the
+    single-toast assertion fails."""
+    policy_file = _write_policy(project_tree.project, _DEPRECATED_POLICY)
+    with pytest.warns(policy_mod.PolicyDeprecationWarning) as caught:
+        policy_mod.load(policy_file)
+    (message,) = [str(w.message) for w in caught]
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.pause()
+        toasts = [e for e in emitted(app) if "deprecated" in e.message]
+        assert [(e.message, e.severity) for e in toasts] == [(message, "warning")]
+        (shown,) = [n for n in app._notifications if n.message == message]
+        assert shown.timeout >= 60 * 60  # stays up, not the 5s default
+        assert not shown.markup  # "[engine]" is advice text, not markup
+
+
+async def test_policy_deprecation_toast_never_repeats_in_a_session(project_tree):
+    """A later reload's notices toast only the ones this session has not shown."""
+    _write_policy(project_tree.project, _DEPRECATED_POLICY)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        (first,) = dashboard(app).policy_deprecations
+        app.note_policy_deprecations([first, "[gates] old_key is deprecated"])
+        await pilot.pause()
+        toasts = [e.message for e in emitted(app) if "deprecated" in e.message]
+        assert toasts == [first, "[gates] old_key is deprecated"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[adapter]\nname = "claude"\n',
+        # warns, then refuses the wrong-typed name: the dashboard keeps its defaults
+        "[engine]\nname = 5\n",
+    ],
+    ids=["clean", "broken"],
+)
+async def test_policy_without_a_loadable_deprecation_raises_no_toast(project_tree, text):
+    _write_policy(project_tree.project, text)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.pause()
+        assert dashboard(app).policy_deprecations == ()
+        assert not [e for e in emitted(app) if "deprecated" in e.message]
+
+
 async def test_dashboard_survives_project_root_resolve_refusal(project_tree, monkeypatch):
     """The app mounts and completes a poll while the project root is unavailable.
 

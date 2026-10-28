@@ -203,6 +203,7 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Show policy.toml deprecation notices in the TUI dashboard as a warning toast (DW-603).
 - Nudge a stalled session whose permission prompt was approved: a transcript write after
   the PermissionPrompt latch now clears it, instead of the stall pausing as parked (DW-594).
 - Windows installs now depend on tzdata, so usage-limit resets that name a time zone
