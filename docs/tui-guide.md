@@ -351,7 +351,7 @@ Journal kinds are colored by the first matching substring:
 | `s`       | start a deferred-work sweep (modal)                                                           |
 | `e`       | resume the selected paused/interrupted run (confirm modal)                                    |
 | `p`       | review the selected paused run in its HITL viewer                                             |
-| `R`       | resolve a run paused at an escalation, then re-arm                                            |
+| `R`       | resolve a run paused at an escalation, then re-arm; close a tickets epic                      |
 | `V`       | re-verify a story's kept work (pick target)                                                   |
 | `d`       | answer deferred-work decisions sweeps left open (modal walk)                                  |
 | `a`       | attach to the selected run's live session or window                                           |
@@ -503,6 +503,13 @@ story), and refuses a run whose engine may still be live. A CRITICAL escalation 
    For every resolve mode, see
    [Resolving an escalation](escalations-guide.md#resolving-an-escalation).
 
+At a tickets `epic-boundary` pause, `R` confirms `open bmad-agent-po for epic
+<slug>?` and launches the [epic-close resolve](escalations-guide.md#epic-closure-in-tickets-mode)
+in a control window: close and commit the epic there, and the run resumes in
+that window once bmad-loop has checked the closure. When the epic's
+retrospective has not run or is not committed, or the pause names no epic, `R`
+shows the step to take instead.
+
 At an `environment` pause, `R` refuses: fix the environment, then resume with
 `e`. At a pause whose
 story was **deferred** rather than escalated, `R` and `p` open the re-verify
@@ -564,7 +571,7 @@ run `tickets.py`, always off the UI thread.
 | `ticket-hitl`     | `hitl`   | The pause reason: the next ticket needs a person in the loop. Build it, then **Resume**.                                                                                                                                                                                                                                                                     |
 | `ticket-refine`   | `refine` | The pause reason: the next ticket needs refining with `bmad-agent-po`. Refine it, then **Resume**.                                                                                                                                                                                                                                                           |
 | `ticket-tree`     | `tree`   | The pause reason: the pinned initiative changed, `tickets.py` failed, the initiative folder is dirty, or only other tickets block progress.                                                                                                                                                                                                                  |
-| `epic-boundary`   | `epic`   | The epic-closure viewer: the retrospective verdict the run recorded, the retrospective's path, and the closure steer.                                                                                                                                                                                                                                        |
+| `epic-boundary`   | `epic`   | The epic-closure viewer: the retrospective verdict the run recorded, the retrospective's path, and the closure steer. **Close with bmad-agent-po** launches the same epic-close resolve as `R`; it is absent when `R` would show a step instead.                                                                                                             |
 | `plan-checkpoint` | `plan`   | The plan viewer. **Request replan** marks the plan `draft` through `tickets.py mark` (reason `replan`), never by editing frontmatter, then resumes. The run stays paused on a refused or no-op mark, a changed ticket store, an isolation layout resume would refuse, a swapped worktree mount, or a run another controller moved to a different checkpoint. |
 
 The run header labels an `epic-boundary` pause `epic closure` in tickets mode.

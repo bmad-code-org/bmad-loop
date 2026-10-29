@@ -131,7 +131,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 ### Typed escalations and resolve
 
 - **Stability:** stable
-- **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, or adopting a kept branch.
+- **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, or adopting a kept branch, and closes a tickets epic at an `epic-boundary` pause.
 - **Properties:**
   - A CRITICAL escalation marks the story `escalated`, sends a `CRITICAL escalation: <story>` notice and pauses the run at `escalation`.
   - A pause that is not a CRITICAL contradiction is titled by its reason: `Paused (parked prompt): <story>`, `Paused (no work): <story>`, `Paused (usage limit): <story>` or `Paused (environment fault): <story>`.
@@ -142,9 +142,10 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Re-arming resets the story to `pending` with fresh dev-attempt and review-cycle budgets.
   - `--reverify` re-runs `[verify]` on a deferred or environment-fault story's kept work without a dev session; on a finished run it replays a kept worktree unit in a new run.
   - In tickets mode the re-arm moves the ticket's plan through `tickets.py mark` and clears its `blocked_*` fields; a refused move puts the plan back byte for byte.
+  - On a tickets `epic-boundary` pause, resolve opens bmad-agent-po on the paused epic (`--no-interactive`: no session), then resumes only when the epic reads `done` or `dropped` and its epic folder has no uncommitted change; the session's exit code is never trusted, and a failed check exits 1 with the run still paused.
 - **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`, `--at-reset`, `--margin-min`
-- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`, `tests/test_runs.py`, `tests/test_tui_app.py`
-- **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [resolve CLI reference](reference/cli.md#resolve)
+- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`, `tests/test_runs.py`, `tests/test_tui_app.py`, `tests/test_tickets_source.py`, `tests/test_tickets_e2e.py`
+- **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [Epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [resolve CLI reference](reference/cli.md#resolve)
 
 ### Human-only actions
 
@@ -223,9 +224,9 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - An auto retro succeeds only if the session completed, result.json says done, the board reads done and a retro doc exists. It is then committed as `chore(retro): epic N retrospective`.
   - A failed or refused auto retro (unless already done) tells you to run it by hand and never fails the run. If it leaves uncommitted changes, the run pauses at the epic boundary.
   - The retro doc's verdict is reported in the done notice. A `rejected` verdict sends an extra attention notice, and the run continues.
-  - Tickets mode keys the epic by slug. Once this run finishes an epic, `auto` runs `/bmad-retrospective -H <epic-slug>` and commits only `<epic-slug>-retrospective.md`; a valid document already there counts as done. Whatever the mode, the run records the verdict and pauses at `epic-boundary` for you to close the epic with bmad-agent-po. A `rejected` verdict pauses again at every pick while the epic stays open; any other pauses once.
+  - Tickets mode keys the epic by slug. Once this run finishes an epic, `auto` runs `/bmad-retrospective -H <epic-slug>` and commits only `<epic-slug>-retrospective.md`; a valid document already there counts as done. Whatever the mode, the run records the verdict and pauses at `epic-boundary` for you to close the epic with bmad-agent-po, which `bmad-loop resolve` opens and then verifies before it resumes. A `rejected` verdict pauses again at every pick while the epic stays open; any other pauses once.
 - **Config:** `[gates] retrospective`, `[adapter.retro] name` / `model` / `effort` / `extra_args`
-- **Tested by:** `tests/test_engine.py`, `tests/test_policy.py`, `tests/test_tickets_engine.py`, `tests/test_tickets_e2e.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_policy.py`, `tests/test_tickets_engine.py`, `tests/test_tickets_e2e.py`, `tests/test_cli.py`
 - **Docs:** [Escalations: epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [Tickets guide: retrospective and closure](tickets-guide.md#epic-retrospective-and-closure), [Configuration: [gates]](reference/configuration.md#gates), [Configuration: [adapter.retro]](reference/configuration.md#adapterretro), [Pointing retrospectives at run journals](setup-guide.md#pointing-retrospectives-at-run-journals), [Roadmap: automate epic retro action items](ROADMAP.md#automate-epic-retro-action-items)
 
 ## Deferred work

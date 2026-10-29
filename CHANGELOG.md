@@ -9,6 +9,14 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add an epic-close `resolve` for tickets runs paused at `epic-boundary`: open
+  bmad-agent-po on the paused epic's closure check (`--no-interactive`: no session),
+  then resume only when the epic reads `done` or `dropped` and its epic folder has no
+  uncommitted change; never trust the session's exit code. Exit 1, still paused, on a
+  failed check (`epic-close-unverified`), a retrospective still owed, a missing
+  bmad-agent-po skill or a dev CLI with no interactive mode. Journal
+  `epic-close-session-start` / `-end` and `epic-close-verified`. TUI: `R`, and **Close
+  with bmad-agent-po** in the epic-closure viewer.
 - Add `resolve --at-reset [--margin-min N]`: for a usage-limit pause the coding CLI waits
   out, wait in the foreground until the recorded reset plus the margin (default 2 min),
   then re-arm and resume as `--no-interactive --resume`. Refuse (exit 1) credit
