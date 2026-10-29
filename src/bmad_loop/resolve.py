@@ -18,6 +18,7 @@ import json
 import math
 import os
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from stat import S_ISREG
 from typing import Any
@@ -38,6 +39,7 @@ from .runs import (
     task_spec_path,
     validate_restore_latch,
 )
+from .tickets_source import EPIC_CLOSED, path_overlaps
 
 RESOLVE_DIR = "resolve"
 
@@ -607,6 +609,83 @@ def _tickets_context(
     ctx["plan_status"] = frontmatter.status_of(fm) or None
     ctx["blocked_reason"] = str(reason) if reason not in (None, "") else None
     return ctx
+
+
+EPIC_CLOSE_SKILL = "bmad-agent-po"
+
+
+def epic_close_prompt(
+    *,
+    slug: str,
+    initiative: str,
+    initiative_folder: Path,
+    epic_file: Path,
+    retrospective: Path,
+    verdict: str | None,
+    parent: str | None,
+    rejected: bool,
+    versioning: str,
+    repo: Path | None,
+) -> str:
+    """The one-line canonical first prompt of an epic-close session: bmad-agent-po's
+    closure check for epic ``slug``, with the absolute paths it works on, the
+    recorded retrospective ``verdict``, the parent clause of a chained run, the
+    rejected clause, and where the closed epic file is committed — ``repo`` is the
+    code repo for ``code-repo`` and the store repo for ``store-repo``, unused for
+    ``none``. Pure: it reads no file. Raises ValueError on an unknown
+    ``versioning``, or on a versioned store with no ``repo``."""
+    if versioning == "none":
+        commit = "; the store is unversioned, so there is nothing to commit"
+        clean = ""
+    elif versioning in ("code-repo", "store-repo") and repo is not None:
+        where = "the repo" if versioning == "code-repo" else "the store repo"
+        commit = f", then commit the epic file in {where} at {repo.as_posix()}"
+        clean = " and its epic folder has no uncommitted change"
+    else:
+        raise ValueError(f"no epic-close commit hint for versioning {versioning!r} (repo {repo})")
+    parts = [
+        f"/{EPIC_CLOSE_SKILL} Run your epic closure check for epic {slug} of initiative "
+        f"{initiative}.",
+        f"Initiative folder: {initiative_folder.as_posix()}.",
+        f"Epic file: {epic_file.as_posix()}.",
+        f"Retrospective: {retrospective.as_posix()} "
+        f"(verdict: {verdict if verdict else 'none recorded by this run'}).",
+    ]
+    if parent:
+        parts.append(
+            f"{initiative} is a child of parent {parent}, which [core] active_initiative "
+            f"names; work in the child folder above."
+        )
+    if rejected:
+        parts.append("The run stays held until this epic is closed.")
+    parts.append(f"If ready, set its status to done (or dropped){commit}.")
+    parts.append(f"bmad-loop resumes only when the epic file reads done or dropped{clean}.")
+    return " ".join(parts)
+
+
+def epic_close_missing(
+    epic_status: str, dirty_paths: Iterable[str], epic_prefix: str, versioning: str
+) -> list[str]:
+    """What an epic-close session left undone, deterministically: the epic's
+    status when it is not ``done``/``dropped``, and the dirty repo-relative paths
+    in or containing ``epic_prefix`` (the epic folder, the
+    ``tickets_source.path_overlaps`` rule). Dirt outside the epic folder is not
+    the session's to answer, and ``versioning == "none"`` checks no dirt at all.
+    An empty list means verified."""
+    missing: list[str] = []
+    if epic_status not in EPIC_CLOSED:
+        missing.append(f"the epic reads {epic_status or 'no status'}")
+    if versioning == "none":
+        return missing
+    touched = sorted(
+        {path.rstrip("/") for path in dirty_paths if path_overlaps(path.rstrip("/"), epic_prefix)}
+    )
+    if touched:
+        shown = ", ".join(touched[:5]) + (
+            f" and {len(touched) - 5} more" if len(touched) > 5 else ""
+        )
+        missing.append(f"{epic_prefix}: uncommitted {shown}")
+    return missing
 
 
 def run_session(

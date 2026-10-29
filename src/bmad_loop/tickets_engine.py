@@ -166,8 +166,10 @@ from .tickets_source import (
     Skip,
     TicketRef,
     TicketsWorkSource,
+    committed_epics,
     dispatch_invocation,
     epic_boundary,
+    path_overlaps,
     plan_planned,
     ticket_binding,
     wants_thorough,
@@ -258,15 +260,6 @@ def _same_file(a: Path, b: Path) -> bool:
         return a.resolve() == b.resolve()
     except (OSError, RuntimeError):
         return False
-
-
-def _overlaps(path: str, folder: str) -> bool:
-    """Whether repo-relative ``path`` lies in ``folder`` (``"."`` is the whole
-    checkout), or contains it: an untracked nested repository is one dirty
-    entry for its whole directory."""
-    if folder == ".":
-        return True
-    return path == folder or path.startswith(folder + "/") or folder.startswith(path + "/")
 
 
 # A rolled-back attempt's plan re-routed to `ready-for-dev` (the recovery flow's
@@ -527,7 +520,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         touched = sorted(
             path
             for path in dirty
-            if _overlaps(path.rstrip("/"), prefix) and path.rstrip("/") not in owned
+            if path_overlaps(path.rstrip("/"), prefix) and path.rstrip("/") not in owned
         )
         if not touched:
             return
@@ -614,14 +607,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _committed_epics(self) -> frozenset[str]:
         """Epic slugs this run committed at least one ticket of."""
-        return frozenset(
-            task.ticket.epic_slug
-            for task in self.state.tasks.values()
-            if task.ticket is not None
-            and task.ticket.epic_slug
-            and task.phase == Phase.DONE
-            and task.commit_sha
-        )
+        return committed_epics(self.state)
 
     def _ticket_epic_boundary_check(self, status_view: StatusView) -> None:
         """The epic boundary, run before every pick (on the pick's own ``status``

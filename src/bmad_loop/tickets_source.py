@@ -324,6 +324,29 @@ def epic_boundary(
     return out
 
 
+def committed_epics(state: RunState) -> frozenset[str]:
+    """Epic slugs this run committed at least one ticket of: a task bound to a
+    ticket of the epic, ``DONE`` with a commit. :func:`epic_boundary` owes such an
+    epic its retrospective before any closure."""
+    return frozenset(
+        task.ticket.epic_slug
+        for task in state.tasks.values()
+        if task.ticket is not None
+        and task.ticket.epic_slug
+        and task.phase == Phase.DONE
+        and task.commit_sha
+    )
+
+
+def path_overlaps(path: str, folder: str) -> bool:
+    """Whether repo-relative ``path`` lies in ``folder`` (``"."`` is the whole
+    checkout), or contains it: an untracked nested repository is one dirty
+    entry for its whole directory."""
+    if folder == ".":
+        return True
+    return path == folder or path.startswith(folder + "/") or folder.startswith(path + "/")
+
+
 # ------------------------------------------------------------------- the pick
 
 
@@ -395,6 +418,84 @@ def resume_epic_closure(state: RunState) -> str | None:
         return None
     state.ticket_epic_closure_resumed.append(slug)
     return slug
+
+
+# ------------------------------------------------------------ epic-close resolve
+
+EPIC_CLOSE_NOT_APPLICABLE: Final = "not-epic-close"
+"""Not a tickets run's ``epic-boundary`` pause (another source, a sweep, another
+stage, or no pause): ``resolve`` takes its other paths."""
+EPIC_CLOSE_NO_EPIC: Final = "no-epic"
+"""An ``epic-boundary`` pause on no epic: the retrospective's leftovers stopped the
+run (``Engine._settle_retro_tree``)."""
+EPIC_CLOSE_RETRO_PENDING: Final = "retro-pending"
+"""An ``epic-boundary`` pause on an epic this run committed a ticket of with no
+closure recorded: the retrospective refused or its store commit failed, and the
+next boundary check runs it again before any closure."""
+
+
+@dataclass(frozen=True)
+class EpicCloseTarget:
+    """An ``epic-boundary`` pause a person answers by closing epic ``slug`` with
+    bmad-agent-po. ``verdict`` is the closure this run recorded for it, or None
+    when it recorded none (an epic this run committed no ticket of)."""
+
+    slug: str
+    verdict: str | None
+
+    @property
+    def rejected(self) -> bool:
+        """Whether the recorded verdict holds the run until the epic is closed."""
+        return self.verdict == CLOSURE_REJECTED
+
+
+@dataclass(frozen=True)
+class EpicCloseRefusal:
+    """No epic-close session for this pause: ``code`` (an ``EPIC_CLOSE_*`` token),
+    the manual ``step`` that clears it (``""`` for
+    :data:`EPIC_CLOSE_NOT_APPLICABLE`), and the pause's own ``paused_reason``,
+    quoted back to the operator, never parsed."""
+
+    code: str
+    step: str
+    paused_reason: str | None
+    slug: str | None = None
+
+
+def epic_close_target(state: RunState) -> EpicCloseTarget | EpicCloseRefusal:
+    """Classify a paused run for ``resolve`` from its state alone: a tickets
+    run's ``epic-boundary`` pause on an epic with a recorded closure (closure
+    awaited, rejected, or a later ticket waiting on it), or on an epic this run
+    committed nothing of (the pick's ``awaiting-closure``), is an
+    :class:`EpicCloseTarget`. A pause on no epic, or on an epic this run committed
+    a ticket of with no closure recorded, is a refusal: the retrospective has not
+    run or not been committed, and a resume runs it again before any closure."""
+    if (
+        state.source != SOURCE_TICKETS
+        or state.run_type == "sweep"
+        or state.paused_stage != PAUSE_EPIC_BOUNDARY
+    ):
+        return EpicCloseRefusal(EPIC_CLOSE_NOT_APPLICABLE, "", state.paused_reason)
+    slug = state.paused_story_key
+    resume = f"`bmad-loop resume {state.run_id}`"
+    if not slug:
+        return EpicCloseRefusal(
+            EPIC_CLOSE_NO_EPIC,
+            f"commit or clean the retrospective's leftovers, then {resume}",
+            state.paused_reason,
+        )
+    verdict = state.ticket_epic_closures.get(slug)
+    if verdict is not None:
+        return EpicCloseTarget(slug, verdict)
+    if slug in committed_epics(state):
+        return EpicCloseRefusal(
+            EPIC_CLOSE_RETRO_PENDING,
+            f"the retrospective of {slug} has not run or is not committed: clear what "
+            f"the pause names, then {resume}",
+            state.paused_reason,
+            slug,
+        )
+    return EpicCloseTarget(slug, None)
 
 
 THOROUGH_ALWAYS: Final = "always"

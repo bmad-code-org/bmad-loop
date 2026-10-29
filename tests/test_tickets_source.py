@@ -30,6 +30,7 @@ from bmad_loop.model import (
     Phase,
     RunState,
     StoryTask,
+    TicketBinding,
 )
 from bmad_loop.platform_util import safe_segment
 from bmad_loop.ticketmodel import EpicRow, NextView, StatusView, TicketRow
@@ -865,3 +866,99 @@ def test_source_decide_gates_on_the_pick_status_view(tmp_path: Path):
 
     assert seen == [tree.status_view]
     assert [c[0] for c in tree.calls] == ["next", "status"]
+
+
+def _ticket_task(ref: str, epic: str, phase: Phase, sha: str | None) -> StoryTask:
+    binding = TicketBinding(
+        ref=ref,
+        id=ref.rpartition(".")[2],
+        epic_slug=epic,
+        epic_id="1",
+        title=ref,
+        plan=f"/p/{epic}/{ref}-plan.md",
+        risk="",
+        refined=True,
+        plan_checkpoint=False,
+        done_checkpoint=False,
+        hitl=False,
+    )
+    return StoryTask(story_key=ref, epic=0, phase=phase, commit_sha=sha, ticket=binding)
+
+
+def test_committed_epics():
+    """An epic counts once one of its tickets is DONE with a commit: a DONE task
+    with no commit, an unfinished one, an unbound one and a binding with no epic
+    count nothing."""
+    state = RunState(run_id="r", project="/p", started_at="now", source="tickets")
+    state.tasks = {
+        "1.1": _ticket_task("1.1", CART, Phase.DONE, "abc"),
+        "1.2": _ticket_task("1.2", CART, Phase.DONE, "def"),
+        "2.1": _ticket_task("2.1", CHECKOUT, Phase.DONE, None),
+        "2.2": _ticket_task("2.2", CHECKOUT, Phase.DEV_RUNNING, "abc"),
+        "3.1": _ticket_task("3.1", "", Phase.DONE, "abc"),
+        "x": StoryTask(story_key="x", epic=0, phase=Phase.DONE, commit_sha="abc"),
+    }
+
+    assert ts.committed_epics(state) == frozenset({CART})
+
+
+_PAUSED = "every ticket of epic-cart is done; close epic-cart"
+
+
+@pytest.mark.parametrize(
+    ("source", "run_type", "stage", "key", "closures", "committed", "expected"),
+    [
+        # A: closure awaited after the retro (accepted verdict recorded)
+        ("tickets", "story", PAUSE_EPIC_BOUNDARY, CART, {CART: "accepted"}, True,
+         ts.EpicCloseTarget(CART, "accepted")),
+        # B: the rejected verdict holds the run
+        ("tickets", "story", PAUSE_EPIC_BOUNDARY, CART, {CART: "rejected"}, True,
+         ts.EpicCloseTarget(CART, "rejected")),
+        # C1: a later ticket waits on an epic whose closure was recorded (and acked)
+        ("tickets", "story", PAUSE_EPIC_BOUNDARY, CART, {CART: "unknown"}, False,
+         ts.EpicCloseTarget(CART, "unknown")),
+        # C2 / C1 without a closure: an epic this run committed nothing of
+        ("tickets", "story", PAUSE_EPIC_BOUNDARY, CART, {}, False,
+         ts.EpicCloseTarget(CART, None)),
+        # D/E: committed, no closure — the retro has not run or not been committed
+        ("tickets", "story", PAUSE_EPIC_BOUNDARY, CART, {}, True,
+         ts.EpicCloseRefusal(
+             ts.EPIC_CLOSE_RETRO_PENDING,
+             f"the retrospective of {CART} has not run or is not committed: clear what "
+             "the pause names, then `bmad-loop resume r`",
+             _PAUSED,
+             CART,
+         )),
+        # F: the retro's leftovers paused on no epic
+        ("tickets", "story", PAUSE_EPIC_BOUNDARY, None, {CART: "accepted"}, True,
+         ts.EpicCloseRefusal(
+             ts.EPIC_CLOSE_NO_EPIC,
+             "commit or clean the retrospective's leftovers, then `bmad-loop resume r`",
+             _PAUSED,
+         )),
+        ("tickets", "sweep", PAUSE_EPIC_BOUNDARY, CART, {CART: "accepted"}, False,
+         ts.EpicCloseRefusal(ts.EPIC_CLOSE_NOT_APPLICABLE, "", _PAUSED)),
+        ("stories", "story", PAUSE_EPIC_BOUNDARY, CART, {CART: "accepted"}, False,
+         ts.EpicCloseRefusal(ts.EPIC_CLOSE_NOT_APPLICABLE, "", _PAUSED)),
+        ("tickets", "story", PAUSE_TICKET_TREE, CART, {CART: "accepted"}, False,
+         ts.EpicCloseRefusal(ts.EPIC_CLOSE_NOT_APPLICABLE, "", _PAUSED)),
+    ],
+    ids=["A-closure", "B-rejected", "C1-recorded", "C-unrecorded", "DE-retro-pending",
+         "F-no-key", "sweep", "stories-run", "other-stage"],
+)  # fmt: skip
+def test_epic_close_target(source, run_type, stage, key, closures, committed, expected):
+    """The epic-close classifier reads the pause from `RunState` alone and never
+    parses `paused_reason` (every row quotes the same text). Ablations
+    (performed): drop the committed-epic arm and the DE row classifies as a
+    target — this FAILS; drop the `run_type` test and the sweep row does."""
+    state = RunState(run_id="r", project="/p", started_at="now", source=source, run_type=run_type)
+    state.record_pause(_PAUSED, stage, key)
+    state.ticket_epic_closures = dict(closures)
+    if committed:
+        state.tasks["1.1"] = _ticket_task("1.1", CART, Phase.DONE, "abc")
+
+    got = ts.epic_close_target(state)
+
+    assert got == expected
+    if isinstance(got, ts.EpicCloseTarget):
+        assert got.rejected is (got.verdict == "rejected")

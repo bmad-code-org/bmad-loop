@@ -6206,3 +6206,130 @@ def test_ticket_context_journal_is_pinned_to_the_run_state(tmp_path, recorded):
         assert kinds == ["resolve-ticket-context-unreadable"]
     else:
         assert kinds == ["journal-unpinned", "resolve-ticket-context-unreadable"]
+
+
+_INIT = Path("/w/_bmad-output/initiatives/shop")
+_EPIC = _INIT / "epics" / "epic-cart"
+
+
+def _close_prompt(**kw) -> str:
+    args = {
+        "slug": "epic-cart",
+        "initiative": "shop",
+        "initiative_folder": _INIT,
+        "epic_file": _EPIC / "epic-cart.md",
+        "retrospective": _EPIC / "epic-cart-retrospective.md",
+        "verdict": "accepted",
+        "parent": None,
+        "rejected": False,
+        "versioning": "code-repo",
+        "repo": Path("/w"),
+    } | kw
+    return resolve.epic_close_prompt(**args)
+
+
+def test_epic_close_prompt_names_the_epic_and_its_paths():
+    """One canonical `/bmad-agent-po` line naming the epic, the initiative, the
+    absolute epic file and retrospective with its verdict; a run with no recorded
+    verdict says so, and a plain run carries neither the chained nor the rejected
+    clause."""
+    prompt = _close_prompt()
+
+    assert prompt.startswith("/bmad-agent-po Run your epic closure check for epic epic-cart ")
+    assert "\n" not in prompt
+    assert "of initiative shop." in prompt
+    assert f"Initiative folder: {_INIT.as_posix()}." in prompt
+    assert f"Epic file: {(_EPIC / 'epic-cart.md').as_posix()}." in prompt
+    assert (
+        f"Retrospective: {(_EPIC / 'epic-cart-retrospective.md').as_posix()} "
+        "(verdict: accepted)."
+    ) in prompt
+    assert "parent" not in prompt and "stays held" not in prompt
+    assert "(verdict: none recorded by this run)" in _close_prompt(verdict=None)
+
+
+def test_epic_close_prompt_chained_and_rejected_clauses():
+    """A chained child names its parent and points the agent at the child folder;
+    a rejected verdict says the run stays held. Ablation (performed): drop the
+    chained clause and its assertion FAILS."""
+    prompt = _close_prompt(parent="platform", rejected=True, verdict="rejected")
+
+    assert (
+        "shop is a child of parent platform, which [core] active_initiative names; "
+        "work in the child folder above."
+    ) in prompt
+    assert "The run stays held until this epic is closed." in prompt
+
+
+@pytest.mark.parametrize(
+    ("versioning", "repo", "commit", "clean"),
+    [
+        ("code-repo", Path("/w"), "then commit the epic file in the repo at /w.", True),
+        (
+            "store-repo",
+            Path("/store"),
+            "then commit the epic file in the store repo at /store.",
+            True,
+        ),
+        ("none", None, "the store is unversioned, so there is nothing to commit.", False),
+    ],
+    ids=["T1", "T3", "T2"],
+)
+def test_epic_close_prompt_versioning_hint(versioning, repo, commit, clean):
+    """Where the closed epic file is committed follows the store's versioning, and
+    only a versioned store is told its epic folder must be clean."""
+    prompt = _close_prompt(versioning=versioning, repo=repo)
+
+    assert commit in prompt
+    assert ("epic folder has no uncommitted change" in prompt) is clean
+    assert prompt.endswith(".")
+
+
+@pytest.mark.parametrize(
+    ("versioning", "repo"), [("code-repo", None), ("store-repo", None), ("git", Path("/w"))]
+)
+def test_epic_close_prompt_refuses_an_unknown_commit_target(versioning, repo):
+    with pytest.raises(ValueError, match="no epic-close commit hint"):
+        _close_prompt(versioning=versioning, repo=repo)
+
+
+_PREFIX = "_bmad-output/initiatives/shop/epics/epic-cart"
+_DIRT = {
+    "inside": [f"{_PREFIX}/epic-cart.md", "src/app.py"],
+    "outside": ["src/app.py", "_bmad-output/initiatives/shop/epics/epic-cartography/x.md"],
+    "clean": [],
+}
+
+
+@pytest.mark.parametrize("versioning", ["code-repo", "store-repo", "none"])
+@pytest.mark.parametrize("dirt", ["inside", "outside", "clean"])
+@pytest.mark.parametrize("status", ["in-progress", "done", "dropped"])
+def test_epic_close_missing(status, dirt, versioning):
+    """Verified is an empty list: a closed epic (`done`/`dropped`) and, on a
+    versioned store, no dirt in or around the epic folder. Dirt elsewhere —
+    including a sibling folder sharing the prefix's spelling — is not the
+    session's. Ablation (performed): treat `none` like `code-repo` and the
+    T2 dirty-inside rows FAIL."""
+    missing = resolve.epic_close_missing(status, _DIRT[dirt], _PREFIX, versioning)
+
+    expected = [] if status in ("done", "dropped") else [f"the epic reads {status}"]
+    if dirt == "inside" and versioning != "none":
+        expected.append(f"{_PREFIX}: uncommitted {_PREFIX}/epic-cart.md")
+    assert missing == expected
+
+
+def test_epic_close_missing_reads_a_nested_repo_and_a_blank_status():
+    """An untracked nested repository above the folder (`dirty_paths` spells it with
+    a trailing slash) is dirt on it, and an epic with no status is not closed; more
+    than five dirty paths are summarized."""
+    nested = resolve.epic_close_missing("", ["_bmad-output/"], _PREFIX, "code-repo")
+    many = resolve.epic_close_missing(
+        "done", [f"{_PREFIX}/t{i}.md" for i in range(7)], _PREFIX, "store-repo"
+    )
+
+    assert nested == ["the epic reads no status", f"{_PREFIX}: uncommitted _bmad-output"]
+    assert many == [
+        f"{_PREFIX}: uncommitted "
+        + ", ".join(f"{_PREFIX}/t{i}.md" for i in range(5))
+        + " and 2 more"
+    ]
