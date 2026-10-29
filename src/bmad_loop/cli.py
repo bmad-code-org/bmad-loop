@@ -4876,9 +4876,13 @@ def _drive_initiative_chain(
 
     Each next run launches with no ``--run-id`` (it mints its own; ``run``'s names
     the first child's run alone), the budget left as its ``--max-stories``, and
-    the finished run's spec folder. Like a fresh ``run`` it does not claim the
-    control window (``_claim_ctl_window``): that claim settles which of several
-    windows named for one run id drives it, and a new run id has none.
+    the finished run's spec folder. It runs in this process, so in the control
+    window the TUI opened for the first run, named for that run: once composed,
+    the next run renames that window for itself and claims it
+    (``_claim_ctl_window`` with ``renamed``), so the TUI's attach and stop on the
+    next run reach the window and those on the finished run no longer do. A
+    claim that does not land is printed and journaled ``ctl-window-claim-failed``
+    in the next run, which goes on regardless.
 
     Returns 0, 1 for a tree fault or a close that could not be committed, or the
     refusal rc of the next launch."""
@@ -4954,6 +4958,21 @@ def _drive_initiative_chain(
             previous_run=state.run_id,
             previous_child=state.initiative,
         )
+        # Under the run's state lock, as every claim is: the record's writers
+        # and cleanup's removal of the run serialize on it. The claim's other
+        # precondition, no live engine but this one, holds by construction:
+        # compose_run published this process's pid under the same lock, so no
+        # rival resume can accept the new run.
+        try:
+            with state_lock(launched.run_dir):
+                _claim_ctl_window(project, launched.run_dir, launched.state, renamed=True)
+        except OSError as exc:
+            _report_ctl_window_fault(
+                launched.run_dir,
+                f"could not lock run {launched.run_id} to claim this window as its "
+                f"control window: {exc}",
+                launched.state,
+            )
         print(launched.engine.run().render())
         finished = launched
 
@@ -6631,10 +6650,19 @@ _ctl_launch: _CtlLaunch | None = None
 _CTL_REFUSAL_MAX_CHARS = 4000
 
 
-def _claim_ctl_window(project: Path, run_dir: Path, state: RunState) -> None:
+def _claim_ctl_window(
+    project: Path, run_dir: Path, state: RunState, *, renamed: bool = False
+) -> None:
     """Publish the control window this process runs in as the run's, once this
     process has accepted the run (`tui.launch.claim_ctl_window`). The caller holds
     the run's state lock and has just found no live engine under it (#920).
+
+    ``renamed`` claims it for the next run of a parent-initiative chain
+    (:func:`_drive_initiative_chain`), whose window still carries the name of the
+    run before: the window is renamed for this run first
+    (`tui.launch.claim_renamed_ctl_window`). That leaves the launch's accepted
+    flag alone: it is the launched command's acceptance of its own run, settled
+    before any chain switch.
 
     A claim that did not land is journaled as well as printed: a TUI-launched
     resume prints into a detached window nobody is looking at, while the
@@ -6649,10 +6677,11 @@ def _claim_ctl_window(project: Path, run_dir: Path, state: RunState) -> None:
     from .tui import launch  # import-safe: launch.py has no textual imports
 
     ctl = _ctl_launch
-    if ctl is not None:
+    if ctl is not None and not renamed:
         ctl.accepted = True
+    claim = launch.claim_renamed_ctl_window if renamed else launch.claim_ctl_window
     try:
-        warning = launch.claim_ctl_window(project, run_dir.name, launched=ctl is not None)
+        warning = claim(project, run_dir.name, launched=ctl is not None)
     except (MultiplexerError, OSError) as exc:
         warning = f"could not record this window as run {run_dir.name}'s control window: {exc}"
     if warning is not None:

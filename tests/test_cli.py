@@ -16505,6 +16505,39 @@ def test_run_on_a_parent_builds_each_child_in_turn(project, monkeypatch, capsys)
     assert verify.worktree_clean(project.project, project=project.project)
 
 
+def test_a_chain_switch_claims_the_window_for_the_next_run(project, monkeypatch, capsys):
+    """BILLING's run starts in the window AUTH's run was launched in, so the switch
+    claims it for BILLING's new run id (`claim_renamed_ctl_window`) once that run is
+    composed and before its engine runs; AUTH's run, the one the window was minted
+    for, claims nothing. A claim that did not land is printed and journaled
+    `ctl-window-claim-failed` in BILLING's run, which still runs. Ablation
+    (performed): drop the driver's claim and no claim is made — this FAILS."""
+    from bmad_loop.tui import launch
+
+    built = _chain_project(project, monkeypatch, capsys, ["drain", "drain"])
+    claims: list = []
+
+    def claim(project_root, run_id, *, launched=False):
+        _, state, run_dir = built[-1]
+        claims.append((project_root, run_id, run_dir.name, state.finished, launched))
+        return "this window could not be renamed for run X"
+
+    monkeypatch.setattr(launch, "claim_renamed_ctl_window", claim)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    (_, _, first), (_, second_state, second) = built
+    # the new run's id, before its engine ran, from a `run` no TUI resume drives
+    assert claims == [(project.project, second.name, second.name, False, False)]
+    assert second_state.finished
+    assert "warning: this window could not be renamed for run X" in capsys.readouterr().err
+    from bmad_loop.journal import Journal
+
+    faults = [e for e in Journal(second).entries() if e["kind"] == "ctl-window-claim-failed"]
+    assert [e["error"] for e in faults] == ["this window could not be renamed for run X"]
+    assert not [e for e in Journal(first).entries() if e["kind"] == "ctl-window-claim-failed"]
+
+
 def test_run_on_a_parent_with_nothing_to_build_says_why(project, monkeypatch, capsys):
     """Both children already done: `run` launches nothing, prints why the chain
     ends (`all-done`) and exits 0, with no run dir. Ablation (performed): drop the

@@ -293,6 +293,9 @@ RUN_STATE_TRANSACTIONS = {
     # #925: a refused TUI-launched child's journal row, under the hold cleanup
     # removes the run in, so the append never recreates a removed run dir
     ("cli.py", "_journal_unaccepted_launch"),
+    # a chain switch's claim of its control window for the next run, under the
+    # hold every claim is made under (the record's writers, cleanup's removal)
+    ("cli.py", "_drive_initiative_chain"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
     ("runs.py", "rearm_for_reverify"),
