@@ -309,6 +309,15 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     # namespace so one initiative gets one alias. Kind-scoped: `parent` and `slug`
     # are generic names.
     "initiative-mark": {"parent": "initiative", "slug": "initiative"},
+    # `cli._drive_initiative_chain`: the parent and the children it switches
+    # between, in the same `initiative` namespace.
+    "initiative-chain-next": {
+        "parent": "initiative",
+        "from_child": "initiative",
+        "to_child": "initiative",
+    },
+    "initiative-chain-end": {"parent": "initiative"},
+    "initiative-chain": {"parent": "initiative", "previous_child": "initiative"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
@@ -497,6 +506,11 @@ _JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
     # ship verbatim, `scrub_json` being the identity on a list of
     # identifier-shaped strings.
     "sweep-bundle-dwids-adopted": {"previous_dw_ids": "dw"},
+    # `cli._drive_initiative_chain`: child initiative slugs passed over, or still
+    # waiting on a prerequisite, aliased in the `initiative` namespace the
+    # kind-scoped `parent`/`*_child` rows use.
+    "initiative-chain-next": {"passed_over": "initiative"},
+    "initiative-chain-end": {"passed_over": "initiative", "waiting": "initiative"},
 }
 _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-preflight-refused": frozenset({"tolerated"}),
@@ -606,6 +620,13 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # collapses to `file_present`. `before`, `after` and `outcome` are closed
     # status/outcome tokens; `parent`/`slug` are kind-aliased, which runs first.
     "initiative-mark": frozenset({"before", "after", "outcome"}),
+    # `cli._drive_initiative_chain`: `passed_over_why` holds closed pass-over
+    # tokens (`no-folder`, `drained`), `end` a closed chain-end token, and
+    # `previous_run` a run id; the slugs are kind-aliased or kind-keylisted, which
+    # runs first, and `error` is dropped by name.
+    "initiative-chain-next": frozenset({"passed_over_why"}),
+    "initiative-chain-end": frozenset({"end", "passed_over_why"}),
+    "initiative-chain": frozenset({"previous_run"}),
 }
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced

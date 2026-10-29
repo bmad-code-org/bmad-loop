@@ -60,6 +60,7 @@ from conftest import (
     v7_layout,
     write_gated_ledger,
     write_ledger,
+    write_plan,
     write_repo_root_override,
     write_script_launcher,
     write_spec,
@@ -15952,6 +15953,302 @@ def test_launch_run_judges_a_chained_childs_store_and_hands_on_the_parent(
     assert kw["parent_initiative"] == V7_DEFAULT_INITIATIVE
     assert kw["paths"] is paths
     assert calls["factory"] == [(paths, V7_DEFAULT_INITIATIVE)]
+
+
+# ---- `run` on a parent initiative: one run per child (DW-574). The parent lists
+# AUTH, then BILLING after AUTH; both hold `DEFAULT_TREE`. The real `tickets.py`
+# answers every tree read and closes the child; a scripted engine plays each run.
+
+CHAIN_PARENT = "initiative-platform"
+CHAIN_AUTH, CHAIN_BILLING = "initiative-auth", "initiative-billing"
+CHAIN_POLICY = TICKETS_POLICY + '\n[scm]\nisolation = "worktree"\n'
+CHAIN_PLANS = (
+    ("epic-cart", "story-cart-model-plan", 1),
+    ("epic-cart", "story-cart-rules-plan", 2),
+    ("epic-checkout", "story-checkout-form-plan", 1),
+    ("epic-checkout", "bug-checkout-crash-plan", 2),
+)
+
+
+def _chain_config(sandbox):
+    """A v7 install whose active initiative is the parent `CHAIN_PARENT` over the
+    sliced children AUTH and BILLING (after AUTH), each holding `DEFAULT_TREE`."""
+    root = sandbox.project
+    install_bmad_v7(root, initiative=CHAIN_PARENT)
+    parent = v7_layout(root, initiative=CHAIN_PARENT).initiative_folder
+    (parent / "tickets").mkdir(parents=True, exist_ok=True)
+    (parent / f"{CHAIN_PARENT}.md").write_text(
+        "---\ntype: initiative\ntitle: Platform\nparent: none\n---\n\n# Platform\n",
+        encoding="utf-8",
+    )
+    (parent / "tickets" / "tickets.toml").write_text(
+        f'[[initiative]]\nid = 1\nslug = "{CHAIN_AUTH}"\ntitle = "Auth"\n\n'
+        f'[[initiative]]\nid = 2\nslug = "{CHAIN_BILLING}"\ntitle = "Billing"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+    for slug in (CHAIN_AUTH, CHAIN_BILLING):
+        write_ticket_tree(v7_layout(root, initiative=slug), DEFAULT_TREE)
+    # a worktree mount's config rewrite names the child: the user layer stays untracked
+    ignore_before_commit(sandbox, "_bmad/custom/*.user.toml")
+
+
+def _chain_project(project, monkeypatch, capsys, outcomes):
+    """Every gate green on the parent layout, and `cli.TicketsEngine` playing one of
+    ``outcomes`` per run, in order (a run past the script fails the test):
+
+    * ``drain`` — every ticket and epic of the run's child closed and committed,
+      one task landed, the run finished;
+    * ``idle`` — finished with nothing dispatched;
+    * ``pause`` — paused, so not finished;
+    * ``stop-lodged`` / ``stop-discarded`` — ``drain``, with a stop request left in
+      the run dir, or discarded by the engine (its journal row).
+
+    Returns the list each built engine appends ``(paths, state, run_dir)`` to."""
+    from bmad_loop.journal import save_state
+    from bmad_loop.model import Phase, StoryTask
+
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=CHAIN_POLICY,
+        skills=install_build_auto_v7_skill,
+        bmad_config=_chain_config,
+    )
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    root = project.project
+    built: list = []
+    script = list(outcomes)
+
+    class Engine(_StubEngine):
+        def __init__(self, **kwargs):
+            self.state, self.run_dir, self.journal = (
+                kwargs["state"],
+                kwargs["run_dir"],
+                kwargs["journal"],
+            )
+            built.append((kwargs["paths"], self.state, self.run_dir))
+
+        def run(self):
+            assert script, f"run {len(built)} of the chain was never scripted"
+            outcome = script.pop(0)
+            if outcome == "pause":
+                self.state.record_pause("scripted pause", "ticket-tree", None)
+            else:
+                self.state.finished = True
+            if outcome in ("drain", "stop-lodged", "stop-discarded"):
+                child = v7_layout(root, initiative=self.state.initiative)
+                closed = tuple(dataclasses.replace(e, status="done") for e in DEFAULT_TREE)
+                write_ticket_tree(child, closed)
+                for epic, stem, ticket in CHAIN_PLANS:
+                    write_plan(child, epic, stem, ticket, "done")
+                git(root, "add", "-A")
+                git(root, "commit", "-q", "-m", f"build {self.state.initiative}")
+                self.state.tasks["1.1"] = StoryTask("1.1", 0, Phase.DONE)
+            if outcome == "stop-lodged":
+                (self.run_dir / runs.STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
+            if outcome == "stop-discarded":
+                self.journal.append("stop-request-discarded")
+            save_state(self.run_dir, self.state)
+            return super().run()
+
+    monkeypatch.setattr(cli, "TicketsEngine", Engine)
+    capsys.readouterr()
+    return built
+
+
+def _chain_rows(run_dir):
+    from bmad_loop.journal import Journal
+
+    kinds = ("initiative-mark", "store-committed", "initiative-chain", "initiative-chain-next")
+    kinds += ("initiative-chain-end",)
+    return [e for e in Journal(run_dir).entries() if e["kind"] in kinds]
+
+
+def _row(entry, *fields):
+    return {f: entry[f] for f in ("kind", *fields)}
+
+
+def _initiative_status(project, slug):
+    text = (v7_layout(project.project, initiative=slug).initiative_folder / f"{slug}.md").read_text(
+        encoding="utf-8"
+    )
+    return "status: done" in text
+
+
+def test_run_on_a_parent_builds_each_child_in_turn(project, monkeypatch, capsys):
+    """`run` on a parent builds AUTH; AUTH drains, so it is marked done (and the
+    close committed) before the pick, which makes BILLING ready; BILLING launches as
+    a chained run on its own paths, drains, and the chain ends `all-done`. Each run
+    dir journals its side of each switch.
+
+    Ablation (performed): skip `mark_initiative_done` and BILLING stays waiting on
+    AUTH (passed over `drained`), so the chain ends `waiting` after one run — this
+    FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, ["drain", "drain"])
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert [(p.active_initiative, s.initiative, s.parent_initiative) for p, s, _ in built] == [
+        (CHAIN_AUTH, CHAIN_AUTH, CHAIN_PARENT),
+        (CHAIN_BILLING, CHAIN_BILLING, CHAIN_PARENT),
+    ]
+    (_, _, first), (billing_paths, second_state, second) = built
+    assert billing_paths.initiative_folder == (
+        v7_layout(project.project, initiative=CHAIN_BILLING).initiative_folder
+    )
+    assert f"initiative chain {CHAIN_PARENT}: building {CHAIN_AUTH}" in out
+    assert f"initiative chain {CHAIN_PARENT}: {CHAIN_AUTH} -> {CHAIN_BILLING}" in out
+    assert f"initiative chain {CHAIN_PARENT}: ends (all-done)" in out
+    first_rows = _chain_rows(first)
+    assert [e["kind"] for e in first_rows] == [
+        "initiative-mark",
+        "store-committed",
+        "initiative-chain-next",
+    ]
+    mark, committed, nxt = first_rows
+    assert (mark["slug"], mark["parent"], mark["outcome"]) == (CHAIN_AUTH, CHAIN_PARENT, "written")
+    assert committed["story_key"] == CHAIN_AUTH
+    assert _row(nxt, "parent", "from_child", "to_child", "passed_over", "passed_over_why") == {
+        "kind": "initiative-chain-next",
+        "parent": CHAIN_PARENT,
+        "from_child": CHAIN_AUTH,
+        "to_child": CHAIN_BILLING,
+        "passed_over": [],
+        "passed_over_why": [],
+    }
+    link, mark2, _committed2, end = _chain_rows(second)
+    assert _row(link, "parent", "previous_run", "previous_child") == {
+        "kind": "initiative-chain",
+        "parent": CHAIN_PARENT,
+        "previous_run": first.name,
+        "previous_child": CHAIN_AUTH,
+    }
+    assert (mark2["slug"], mark2["outcome"]) == (CHAIN_BILLING, "written")
+    assert _row(end, "parent", "end", "waiting") == {
+        "kind": "initiative-chain-end",
+        "parent": CHAIN_PARENT,
+        "end": "all-done",
+        "waiting": [],
+    }
+    assert second_state.run_id == second.name != first.name
+    assert _initiative_status(project, CHAIN_AUTH) and _initiative_status(project, CHAIN_BILLING)
+    # both closes are committed: the tree is clean for the next launch
+    assert verify.worktree_clean(project.project, project=project.project)
+
+
+def test_run_on_a_parent_with_nothing_to_build_says_why(project, monkeypatch, capsys):
+    """Both children already done: `run` launches nothing, prints why the chain
+    ends (`all-done`) and exits 0, with no run dir. Ablation (performed): drop the
+    no-child return and this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, [])
+    for slug in (CHAIN_AUTH, CHAIN_BILLING):
+        file = v7_layout(project.project, initiative=slug).initiative_folder / f"{slug}.md"
+        file.write_text(
+            file.read_text(encoding="utf-8").replace(
+                "parent: none\n", "parent: none\nstatus: done\n"
+            ),
+            encoding="utf-8",
+        )
+    git(project.project, "commit", "-qam", "children done")
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    assert f"initiative chain {CHAIN_PARENT}: ends (all-done)" in capsys.readouterr().out
+    assert built == [] and not (project.project / runs.RUNS_DIR).exists()
+
+
+@pytest.mark.parametrize("selector", [["--epic", "epic-cart"], ["--story", "1.1"]])
+def test_run_on_a_parent_refuses_epic_and_story(project, monkeypatch, capsys, selector):
+    """`--epic` and `--story` select within one initiative: on a parent they exit 1
+    before any run dir exists. Ablation (performed): drop the refusal and the chain
+    launches its first child, the selector ignored — this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, [])
+
+    assert cli.main(["run", "--project", str(project.project), *selector]) == 1
+
+    err = capsys.readouterr().err
+    assert f"initiative {CHAIN_PARENT!r} is a parent initiative" in err
+    assert "--epic and --story select within one initiative" in err
+    assert built == [] and not (project.project / runs.RUNS_DIR).exists()
+
+
+def test_run_on_a_parent_ends_stalled_when_a_child_dispatches_nothing(project, monkeypatch, capsys):
+    """A child whose run finished landing no ticket while the pick still takes it
+    would only be built again to the same end: the chain ends `stalled`, with no
+    second run. Ablation (performed): drop the stall guard and AUTH is launched
+    again — an unscripted run — so this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, ["idle"])
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    ((_, _, run_dir),) = built
+    rows = _chain_rows(run_dir)
+    assert [_row(e, "end") for e in rows] == [{"kind": "initiative-chain-end", "end": "stalled"}]
+    assert f"initiative chain {CHAIN_PARENT}: ends (stalled)" in capsys.readouterr().out
+    assert not _initiative_status(project, CHAIN_AUTH)
+
+
+def test_run_on_a_parent_stops_at_a_child_that_did_not_finish(project, monkeypatch, capsys):
+    """A paused child run stops the chain: nothing is marked, picked or launched,
+    and no chain row is journaled — resuming it is the operator's. Ablation
+    (performed): drop the finished-only condition and the chain goes on to pick
+    (and end `stalled`) — this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, ["pause"])
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    ((_, state, run_dir),) = built
+    assert _chain_rows(run_dir) == []
+    out = capsys.readouterr().out
+    assert f"stops at {CHAIN_AUTH} — run {state.run_id} did not finish" in out
+
+
+@pytest.mark.parametrize("how", ["stop-lodged", "stop-discarded"])
+def test_run_on_a_parent_stops_on_a_stop_request(project, monkeypatch, capsys, how):
+    """A stop asked of a child run ends the chain at the switch, ahead of the close
+    and the pick: whether the request is still lodged or the engine discarded it
+    because the run had already drained. Ablation (performed): drop the stop check
+    and AUTH is closed and BILLING launched — an unscripted run — so this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, [how])
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    ((_, _, run_dir),) = built
+    assert [_row(e, "end") for e in _chain_rows(run_dir)] == [
+        {"kind": "initiative-chain-end", "end": "stop-requested"}
+    ]
+    assert not _initiative_status(project, CHAIN_AUTH)
+
+
+def test_initiative_chain_drained_reads_an_open_child_with_every_ticket_closed():
+    """`drained` is the close's own condition: an open child (folder, not done or
+    dropped) with at least one ticket and all of them done or dropped."""
+    from bmad_loop import initiativechain
+    from bmad_loop.ticketmodel import ChildInitiative
+
+    def child(status="", folder="c", **counts):
+        return ChildInitiative(
+            id="1",
+            slug="c",
+            title="c",
+            after=(),
+            folder=folder,
+            status=status,
+            counts=counts,
+            waiting_on=(),
+            ready=True,
+        )
+
+    assert initiativechain.drained(child(total=3, done=2, dropped=1))
+    assert initiativechain.drained(child("in-progress", total=1, done=1))
+    assert not initiativechain.drained(child(total=3, done=2))
+    assert not initiativechain.drained(child(total=0))
+    assert not initiativechain.drained(child("done", total=1, done=1))
+    assert not initiativechain.drained(child("dropped", total=1, done=1))
+    assert not initiativechain.drained(child(folder=None, total=1, done=1))
 
 
 def test_epic_selector_keeps_ints_and_passes_text():

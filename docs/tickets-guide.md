@@ -41,6 +41,15 @@ bmad-loop reads each folder the way the installed `tickets.py` does: a folder wi
 
 A parent initiative, whose `tickets.toml` lists child initiatives in `[[initiative]]` tables, holds no tickets of its own, and each child's folder sits beside the parent's. The preflight refuses a parent (`tickets.initiative-parent`) under `[scm] isolation = "none"`, because sessions in the main checkout read the parent from `config.user.toml`, and under `gates.retrospective = "auto"`, whose session also runs in the main checkout. Set `active_initiative` to one child, or switch to worktree isolation without the auto retrospective. There the parent is an ok line naming its children, and the store checks run once for each child that has a folder: a child declared but not sliced yet is skipped. Each child is held to the `config.user.toml` rule of a shared store whatever its layout (`tickets.own-repo-isolation`). An epic the initiative declares but has not sliced yet has no folder; it holds no tickets, and the tickets gated after it wait for it.
 
+`bmad-loop run` on a parent builds its children one run at a time, taking the first child `next <parent>` lists as ready. It passes over a ready child that has no folder yet (`no-folder`) and one whose first pick finds nothing to dispatch (`drained`). Each child's run records the parent as `parent_initiative`. When a child's run finishes with every ticket done or dropped, bmad-loop writes `status: done` into the child's `<child>.md` before it picks the next child, so the children waiting on it become ready. Where the store is versioned, that write is committed as `chore(tickets): <child> done [bmad-loop <run>]`, in the code repo (T1) or in the store's own repository (T3/T4). One line per switch names the next child or why the chain ended. The chain ends when:
+
+- a child's run does not finish (paused, escalated, stopped or crashed). Resuming that run builds that child only.
+- a stop was asked of the run.
+- it would build the same child again after a run that landed no ticket (`stalled`).
+- no child can start: some still wait on a prerequisite (`waiting`), every child left was passed over (`passed-over`), or every child is done or dropped (`all-done`).
+
+`--epic` and `--story` select within one initiative, so `run` on a parent refuses them with exit 1. `--run-id` names the first child's run, and `--max-stories` applies to each child's run.
+
 ## Store layouts
 
 The ticket store is the initiative folder and its plans. Where it lives decides where a ticket's `done` mark lands. `validate --json` reports the layout as `ticket_store`, and every run records it. Resume, resolve and the TUI refuse a store whose layout changed since the run started.

@@ -1206,6 +1206,58 @@ def test_initiative_mark_aliases_slugs_and_drops_the_file_path():
     assert "acme" not in json.dumps(scrubbed)
 
 
+def test_initiative_chain_rows_alias_every_slug_and_keep_their_tokens():
+    """The chain's three kinds name the parent and child initiatives as scalars and
+    as lists: every slug aliases in the one `initiative` namespace (so the parent
+    and `initiative-mark`'s `parent` read alike), the pass-over and end tokens and
+    the previous run id stay readable, and `error` is dropped.
+
+    Ablation: drop the kinds' alias rows and the scalars ship verbatim; drop their
+    keylist rows and the slug lists do."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    parent, auth, billing = (
+        "initiative-acme-platform",
+        "initiative-acme-auth",
+        "initiative-acme-billing",
+    )
+    rows = [
+        {
+            "kind": "initiative-chain-next",
+            "parent": parent,
+            "from_child": auth,
+            "to_child": billing,
+            "passed_over": [auth],
+            "passed_over_why": ["drained"],
+        },
+        {
+            "kind": "initiative-chain-end",
+            "parent": parent,
+            "end": "fault",
+            "waiting": [billing],
+            "passed_over": [auth],
+            "passed_over_why": ["no-folder"],
+            "error": f"tickets.py fault: /home/acme/{auth}",
+        },
+        {
+            "kind": "initiative-chain",
+            "parent": parent,
+            "previous_run": "20261028-000000-beef",
+            "previous_child": auth,
+        },
+        {"kind": "initiative-mark", "parent": parent, "slug": auth, "outcome": "written"},
+    ]
+
+    nxt, end, link, mark = (diagnostics._scrub_entry(r, pseudo, {}, None) for r in rows)
+
+    assert "acme" not in json.dumps([nxt, end, link, mark])
+    assert nxt["parent"] == end["parent"] == link["parent"] == mark["parent"]
+    assert nxt["from_child"] == nxt["passed_over"][0] == link["previous_child"] == mark["slug"]
+    assert nxt["to_child"] == end["waiting"][0] != nxt["from_child"]
+    assert (nxt["passed_over_why"], end["passed_over_why"]) == (["drained"], ["no-folder"])
+    assert (end["end"], link["previous_run"]) == ("fault", "20261028-000000-beef")
+    assert "error" not in end and end["error_present"] is True
+
+
 @pytest.mark.parametrize(
     "kind",
     [

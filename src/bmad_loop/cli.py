@@ -30,6 +30,7 @@ from . import (
     events,
     frontmatter,
     gates,
+    initiativechain,
     install,
     machine,
     operatoractions,
@@ -91,7 +92,7 @@ from .escalation import (
     resume_skipped_escalation_keys,
 )
 from .journal import Journal, load_state, save_state, state_lock
-from .model import PauseSnapshot, RunState, StoryTask
+from .model import PauseSnapshot, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
     LockUnavailableError,
@@ -4227,21 +4228,53 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if (rc := _RUN_PREFLIGHTS[source](paths, pol, args, spec_folder)) is not None:
         return rc
+    parent = _chain_parent(paths) if tickets else None
+    if isinstance(parent, int):
+        return parent
     scope = tickets_source.EVERYTHING
-    if tickets:
+    launch_paths = paths
+    if parent is not None:
+        # A parent initiative has no tickets of its own: the run builds its children,
+        # one run each, starting with the first one `next <parent>` can start.
+        if args.epic is not None or args.story:
+            print(
+                f"error: initiative {parent!r} is a parent initiative: --epic and --story "
+                "select within one initiative — set `[core] active_initiative` to the "
+                "child to scope a run",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            pick = _chain_pick(project, paths, parent)
+        except (tickettree.TicketsError, ValueError) as e:
+            print(f"tickets mode: initiative chain {parent}: {e}", file=sys.stderr)
+            return 1
+        if pick.child is None:
+            print(_chain_end_line(parent, pick.end or "", pick))
+            return 0
+        print(f"initiative chain {parent}: building {pick.child.slug}{_passed_over_note(pick)}")
+        launch_paths = paths.with_initiative(pick.child.slug)
+    elif tickets:
         resolved = _resolve_ticket_scope(_selector_ticket_tree(paths.project), args)
         if isinstance(resolved, int):
             return resolved
         scope = resolved
 
     launched = _launch_run(
-        project, paths, pol, args, source=source, spec_folder=spec_folder, scope=scope
+        project,
+        launch_paths,
+        pol,
+        args,
+        source=source,
+        spec_folder=spec_folder,
+        scope=scope,
+        parent_initiative=parent,
     )
     if isinstance(launched, int):
         return launched
     summary = launched.engine.run()
     print(summary.render())
-    return 0
+    return _drive_initiative_chain(project, paths, pol, args, launched, spec_folder=spec_folder)
 
 
 def _launch_run(
@@ -4354,6 +4387,272 @@ def _launch_run(
     )
     print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
     return composed
+
+
+def _chain_parent(paths: bmadconfig.ProjectPaths) -> str | int | None:
+    """The active initiative when it is a parent initiative — its ``tickets.toml``
+    lists ``[[initiative]]`` children, read as the tickets preflight reads it
+    (``install._initiative_children``) — else None; exit 1 when the read faults."""
+    folder = paths.initiative_folder
+    if paths.era != "v7" or folder is None or not paths.active_initiative:
+        return None
+    children, breakdown, fault = install._initiative_children(folder)
+    if fault:
+        print(f"tickets mode: cannot read {breakdown}: {fault}", file=sys.stderr)
+        return 1
+    return None if children is None else paths.active_initiative
+
+
+def _chain_ticket_tree(
+    project: Path, parent: str, folder: Path | None = None
+) -> tickettree.TicketTree:
+    """A main-checkout tree pinned to the parent initiative ``parent`` (the live
+    ``[core] active_initiative``), reading through a child's ``folder`` when given."""
+    return tickettree.TicketTree(project, pinned_initiative=parent, folder=folder)
+
+
+def _fresh_pick(
+    next_view: ticketmodel.NextView,
+    status_view: ticketmodel.StatusView,
+    scope: tickets_source.PickScope = tickets_source.EVERYTHING,
+) -> tickets_source.PickDecision:
+    """The pick a fresh tickets run makes first: no ticket touched, no closure,
+    approval or acknowledgement recorded. The dry run previews it; the initiative
+    chain reads a ``Skip`` as a child with nothing left to dispatch."""
+    return tickets_source.decide_pick(next_view, status_view, {}, {}, (), scope)
+
+
+def _chain_pick(
+    project: Path, paths: bmadconfig.ProjectPaths, parent: str
+) -> initiativechain.ChildPick:
+    """The next child of the parent initiative ``parent`` (``paths`` are the
+    parent's): :func:`initiativechain.next_child` over ``next <parent>``, passing
+    over as ``drained`` a ready child whose fresh pick (:func:`_fresh_pick`) finds
+    nothing to dispatch. Raises :class:`tickettree.TicketsError` on a tree fault and
+    ValueError on a child slug that is no folder name."""
+    folder = paths.initiative_folder
+    assert folder is not None  # _chain_parent
+    view = _chain_ticket_tree(project, parent).parent_next(folder)
+
+    def drained(child: ticketmodel.ChildInitiative) -> str | None:
+        tree = _chain_ticket_tree(
+            project, parent, paths.with_initiative(child.slug).initiative_folder
+        )
+        decision = _fresh_pick(tree.next(), tree.status())
+        return initiativechain.DRAINED if isinstance(decision, tickets_source.Skip) else None
+
+    return initiativechain.next_child(view, drained)
+
+
+def _passed_over_note(pick: initiativechain.ChildPick) -> str:
+    """`` (passed over: a (drained), b (no-folder))``, or ``""``."""
+    if not pick.passed_over:
+        return ""
+    return " (passed over: " + ", ".join(f"{p.slug} ({p.why})" for p in pick.passed_over) + ")"
+
+
+def _chain_end_line(parent: str, end: str, pick: initiativechain.ChildPick | None) -> str:
+    """The human line for a chain that ends: why, what still waits, what was
+    passed over."""
+    line = f"initiative chain {parent}: ends ({end})"
+    if pick is not None and pick.waiting:
+        line += f" — waiting: {', '.join(pick.waiting)}"
+    return line + ("" if pick is None else _passed_over_note(pick))
+
+
+def _journal_chain_end(
+    journal: Journal,
+    parent: str,
+    end: str,
+    pick: initiativechain.ChildPick | None = None,
+    error: str | None = None,
+) -> None:
+    """``initiative-chain-end`` in the finished run's journal. ``end`` is a
+    :data:`initiativechain.ChainEnd`, ``stalled``, ``stop-requested``,
+    ``store-commit-failed`` or ``fault``."""
+    # S3c: name each waiting child's unmet prerequisite here.
+    extras = {} if error is None else {"error": error}
+    journal.append(
+        "initiative-chain-end",
+        parent=parent,
+        end=end,
+        waiting=[] if pick is None else list(pick.waiting),
+        passed_over=[] if pick is None else [p.slug for p in pick.passed_over],
+        passed_over_why=[] if pick is None else [p.why for p in pick.passed_over],
+        **extras,
+    )
+
+
+def _chain_end(
+    finished: runsetup.ComposedRun,
+    parent: str,
+    end: str,
+    pick: initiativechain.ChildPick | None = None,
+    *,
+    error: str | None = None,
+) -> int:
+    """End the chain after ``finished``: journal it there, print why, and return
+    the rc (0 for an orderly end, 1 for a fault)."""
+    _journal_chain_end(finished.journal, parent, end, pick, error)
+    if error is None:
+        print(_chain_end_line(parent, end, pick))
+        return 0
+    print(f"initiative chain {parent}: ends ({end}): {error}", file=sys.stderr)
+    return 1
+
+
+def _chain_stop_requested(finished: runsetup.ComposedRun) -> bool:
+    """Whether a stop was asked of the finished run: a request still lodged
+    (``runs.graceful_stop_requested``, what ``bmad-loop stop`` writes), or one the
+    engine discarded because the run had nothing left to stop
+    (``stop-request-discarded``) — it was a fresh run, so the request was made
+    while it built and was meant for the chain."""
+    if runs.graceful_stop_requested(finished.run_dir):
+        return True
+    return any(e.get("kind") == "stop-request-discarded" for e in finished.journal.entries())
+
+
+def _landed_a_ticket(state: RunState) -> bool:
+    """Whether the run landed at least one ticket (a unit DONE or AWAITING_OPERATOR)."""
+    landed = (Phase.DONE, Phase.AWAITING_OPERATOR)
+    return any(task.phase in landed for task in state.tasks.values())
+
+
+def _close_drained_child(
+    project: Path, paths: bmadconfig.ProjectPaths, finished: runsetup.ComposedRun, parent: str
+) -> str | None:
+    """Mark the child the finished run built ``status: done`` when ``next
+    <parent>`` reads it drained (``initiativechain.drained``), through
+    ``TicketTree.mark_initiative_done`` on a main-checkout tree pinned as
+    ``runs.tree_pin`` pins the run, journaled into its journal; then commit the
+    file where its store is versioned (the code repo for T1, the store's own repo
+    for T3/T4), through ``ticketstore.StoreCommitter`` and journaled as the
+    engine's store commits are. Returns None, or the reason the chain cannot go
+    on: ``store-commit-failed`` (also journaled). Tree faults raise."""
+    state = finished.state
+    slug = state.initiative
+    parent_folder = paths.initiative_folder
+    assert parent_folder is not None  # _chain_parent
+    pin, _folder = runs.tree_pin(state, runs.paths_for_state(paths, state))
+    assert pin is not None  # a chained run pins its parent
+    tree = _chain_ticket_tree(project, pin)
+    child = tree.parent_next(parent_folder).child(slug)
+    if child is None or not initiativechain.drained(child):
+        return None
+    mark = tree.mark_initiative_done(parent_folder, slug, journal=finished.journal)
+    if mark.outcome != "written":
+        return None
+    recorded = runs.live_store_topology(state, project)
+    topology = ticketstore.StoreTopology.from_dict(recorded) if recorded else None
+    if topology is None or topology.versioning == "none":
+        return None
+    repo = topology.store_repo if topology.store_repo is not None else paths.repo_root
+    committer = ticketstore.StoreCommitter(repo, paths.repo_root)
+    message = f"chore(tickets): {slug} done [bmad-loop {state.run_id}]"
+    try:
+        result = committer.commit(slug, [mark.file], message)
+    except ticketstore.StoreCommitError as e:
+        finished.journal.append("store-commit-failed", story_key=slug, error=str(e))
+        return "store-commit-failed"
+    if result.foreign:
+        finished.journal.append(
+            "store-commit-foreign-dirt", story_key=slug, count=len(result.foreign)
+        )
+        return "store-commit-failed"
+    finished.journal.append("store-committed", story_key=slug, commit=result.sha)
+    return None
+
+
+def _drive_initiative_chain(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    args: argparse.Namespace,
+    finished: runsetup.ComposedRun,
+    *,
+    spec_folder: str,
+) -> int:
+    """Build a parent initiative's children one run after another, after the run
+    ``finished`` (``paths`` are the parent's, as ``run`` loaded them). Goes on only
+    while the run just built finished (``RunState.finished``: not paused,
+    escalated, stopped or crashed), is a chained child run (``parent_initiative``
+    set) and replays nothing (``replay_of`` empty); otherwise returns 0 at once.
+
+    Per switch, in order: a stop asked of the finished run ends the chain
+    (:func:`_chain_stop_requested`); a drained child is marked done
+    (:func:`_close_drained_child`) so its dependents become ready; the next child
+    is picked (:func:`_chain_pick`); picking the child just built again when its
+    run landed no ticket ends the chain as ``stalled``, since another run would
+    do the same. The finished run's journal gets ``initiative-chain-next``
+    (``parent``, ``from_child``, ``to_child``, the passed-over slugs and why) or
+    ``initiative-chain-end`` (``parent``, ``end``, the waiting slugs); the next
+    run, once composed, ``initiative-chain`` (``parent``, ``previous_run``,
+    ``previous_child``). One line per switch is printed.
+
+    Returns 0, 1 for a tree fault or a close that could not be committed, or the
+    refusal rc of the next launch."""
+    # `--run-id` names the first child's run alone; each later run mints its own.
+    args = argparse.Namespace(**{**vars(args), "run_id": None})
+    while True:
+        state = finished.state
+        parent = state.parent_initiative
+        if parent is None or state.replay_of or not state.finished:
+            if parent is not None and not state.finished:
+                print(
+                    f"initiative chain {parent}: stops at {state.initiative} — run "
+                    f"{state.run_id} did not finish"
+                )
+            return 0
+        if _chain_stop_requested(finished):
+            return _chain_end(finished, parent, "stop-requested")
+        try:
+            if (owed := _close_drained_child(project, paths, finished, parent)) is not None:
+                return _chain_end(
+                    finished,
+                    parent,
+                    owed,
+                    error=f"closing {state.initiative} could not be committed (see the "
+                    f"journal of run {state.run_id}) — commit it, then run again",
+                )
+            pick = _chain_pick(project, paths, parent)
+        except (tickettree.TicketsError, ValueError, bmadconfig.BmadConfigError) as e:
+            return _chain_end(finished, parent, "fault", error=str(e))
+        if pick.child is None:
+            return _chain_end(finished, parent, pick.end or "", pick)
+        child = pick.child.slug
+        if child == state.initiative and not _landed_a_ticket(state):
+            return _chain_end(finished, parent, "stalled", pick)
+        finished.journal.append(
+            "initiative-chain-next",
+            parent=parent,
+            from_child=state.initiative,
+            to_child=child,
+            passed_over=[p.slug for p in pick.passed_over],
+            passed_over_why=[p.why for p in pick.passed_over],
+        )
+        print(f"initiative chain {parent}: {state.initiative} -> {child}{_passed_over_note(pick)}")
+        # S3c: hold `--max-stories` across the chain (each run takes the full cap
+        # today) and claim the control window per run (`_claim_ctl_window`).
+        launched = _launch_run(
+            project,
+            paths.with_initiative(child),
+            pol,
+            args,
+            source=worksource.SOURCE_TICKETS,
+            spec_folder=spec_folder,
+            scope=tickets_source.EVERYTHING,
+            parent_initiative=parent,
+        )
+        if isinstance(launched, int):
+            return launched
+        launched.journal.append(
+            "initiative-chain",
+            parent=parent,
+            previous_run=state.run_id,
+            previous_child=state.initiative,
+        )
+        print(launched.engine.run().render())
+        finished = launched
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:
@@ -4692,7 +4991,7 @@ def _dry_run_tickets(
     scope = _resolve_ticket_scope(tree, args, (next_view, status_view))
     if isinstance(scope, int):
         return scope
-    decision = tickets_source.decide_pick(next_view, status_view, {}, {}, (), scope)
+    decision = _fresh_pick(next_view, status_view, scope)
     rank = tickets_source.build_order(status_view)
     last = len(rank)
     ready = sorted(

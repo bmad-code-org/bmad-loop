@@ -602,6 +602,13 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # `diagnostics._JOURNAL_KIND_ALIAS_FIELDS`; `file` collapses to presence under
     # `diagnostics._JOURNAL_KIND_SCHEMAS`.
     "initiative-mark": frozenset({"before", "after", "outcome"}),
+    # cli.py, the initiative chain: closed pass-over tokens (`no-folder`,
+    # `drained`), a closed chain-end token, and the previous run's id. The slugs
+    # are aliased or keylisted by `diagnostics`' kind-scoped tables; `error` is
+    # dropped by name.
+    "initiative-chain-next": frozenset({"passed_over_why"}),
+    "initiative-chain-end": frozenset({"end", "passed_over_why"}),
+    "initiative-chain": frozenset({"previous_run"}),
     # runs.py: whether the re-arm moved its restore latch onto the evacuated copy.
     # `patch` and `stashed_to` are dropped by name.
     "restore-patch-evacuated": frozenset({"latched"}),
@@ -2253,6 +2260,11 @@ JOURNAL_KINDS = frozenset(
         "ticket-mark",
         "ticket-plan-restored",
         "initiative-mark",
+        # cli.py — the initiative chain: per switch, the next child or the end in
+        # the finished run, and the chain link in the next run.
+        "initiative-chain-next",
+        "initiative-chain-end",
+        "initiative-chain",
         # worktree_flow.py
         "accepted-spec-delivery-unreachable",
         "accepted-spec-write-unreachable",

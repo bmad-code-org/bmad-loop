@@ -18,6 +18,9 @@ why.
 * Children that are not ready and not done or dropped are ``waiting`` on a
   prerequisite (a folder-less one included).
 
+:func:`drained` says whether a child is open with every ticket closed — the child
+whose initiative a chain marks ``done`` before it picks again.
+
 When no child is taken the pick says why the chain ends: ``waiting`` when some
 child still waits on a prerequisite (a drained child whose initiative is not
 marked done keeps its dependents here), ``passed-over`` when every child left
@@ -31,10 +34,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, Literal
 
+from .statemachine import TICKET_CLOSED_STATES
 from .ticketmodel import ChildInitiative, ParentView
 
 NO_FOLDER: Final = "no-folder"
 """The pass-over reason for a ready child whose folder does not exist yet."""
+
+DRAINED: Final = "drained"
+"""The pass-over reason for a ready child with nothing left to dispatch."""
 
 _CLOSED: Final[frozenset[str]] = frozenset(("done", "dropped"))
 
@@ -60,6 +67,17 @@ class ChildPick:
     passed_over: tuple[PassedOver, ...]
     waiting: tuple[str, ...]
     end: ChainEnd | None
+
+
+def drained(child: ChildInitiative) -> bool:
+    """Whether ``child`` is open with every ticket closed: it has a folder, is not
+    done or dropped, and counts at least one ticket, all done or dropped — the
+    child ``statemachine.check_initiative_close`` writes ``done``."""
+    if child.folder is None or child.status in _CLOSED:
+        return False
+    total = child.counts.get("total", 0)
+    closed = sum(child.counts.get(state, 0) for state in TICKET_CLOSED_STATES)
+    return total > 0 and closed == total
 
 
 def next_child(
