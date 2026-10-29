@@ -5954,6 +5954,45 @@ def test_resolve_at_reset_rechecks_after_the_wait(tmp_path, monkeypatch, capsys)
 
 
 @pytest.mark.parametrize(
+    "limit_class, reset_at",
+    [
+        # credit exhaustion now: a pause `_at_reset_refusal` would have refused outright
+        ("blocked", None),
+        # the same window class, but a later reset than the one waited out
+        ("wait", "2026-10-28T18:00:00+00:00"),
+    ],
+)
+def test_resolve_at_reset_refuses_a_replacement_pause(
+    tmp_path, monkeypatch, capsys, limit_class, reset_at
+):
+    """Resumed and paused again during the wait: the post-wait pass finds a pause
+    other than the one it waited on, and re-arms nothing."""
+    from bmad_loop.journal import load_state, save_state
+    from bmad_loop.model import Phase
+
+    run_dir = _usage_limit_run(tmp_path)
+    clock = _FakeAtResetClock(monkeypatch)
+
+    def sleep_and_repause_elsewhere(seconds):
+        clock.sleep(seconds)
+        if len(clock.sleeps) == 1:
+            state = load_state(run_dir)
+            state.paused_limit_class = limit_class
+            state.paused_reset_at = reset_at
+            save_state(run_dir, state)
+
+    monkeypatch.setattr(cli, "_at_reset_sleep", sleep_and_repause_elsewhere)
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", "--at-reset"]) == 1
+
+    assert resumed == []
+    assert "changed while --at-reset was waiting" in capsys.readouterr().err
+    assert load_state(run_dir).tasks["s1"].phase == Phase.ESCALATED
+
+
+@pytest.mark.parametrize(
     "extra",
     [
         ["--no-resume"],

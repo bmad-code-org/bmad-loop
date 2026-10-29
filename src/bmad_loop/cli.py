@@ -6856,6 +6856,15 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+            waited_on = getattr(args, "at_reset_pause", None)
+            if waited_on is not None and _at_reset_pause_identity(fresh_state) != waited_on:
+                print(
+                    f"the pause on run {args.run_id} changed while --at-reset was waiting "
+                    f"(now: story {fresh_state.paused_story_key!r}, paused_limit_class "
+                    f"{fresh_state.paused_limit_class!r}) — not re-arming",
+                    file=sys.stderr,
+                )
+                return 1
             fresh_live = runs.engine_liveness(run_dir)
             if fresh_live == "alive":
                 print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
@@ -7078,7 +7087,16 @@ def _resolve_at_reset(
         )
     args.at_reset = False
     args.margin_min = None
+    # The pause this process waited on. Another resolve or resume during the wait can
+    # leave a different pause in its place (another story, a later reset, a blocking
+    # limit), so the post-wait pass re-arms only when the pause is still this one.
+    args.at_reset_pause = _at_reset_pause_identity(state)
     return cmd_resolve(args)
+
+
+def _at_reset_pause_identity(state: RunState) -> tuple[str | None, str | None, str | None]:
+    """The facts that name the usage-limit pause ``resolve --at-reset`` waits on."""
+    return (state.paused_story_key, state.paused_limit_class, state.paused_reset_at)
 
 
 def _resolve_adopt(
