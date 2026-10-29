@@ -584,6 +584,11 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # aliased by name.
     "ticket-epic-closure": frozenset({"verdict"}),
     "epic-closure-not-recorded": frozenset({"verdict"}),
+    # cli.py: the interactive epic-close session's launch — the run's recorded
+    # closure verdict for the epic (the same closed token, or null) and `cli`, the
+    # dev CLI profile name as on `session-start-missing`. `epic_ref` is aliased by
+    # name.
+    "epic-close-session-start": frozenset({"verdict", "cli"}),
     # DW-527: the literal `post-proceed`, marking the row `_finish_inflight`'s
     # post-replay arm writes (a re-latched `--reverify` replay) apart from the
     # ordinary reverify arm's. Kind-scoped because `replay` is generic.
@@ -1476,6 +1481,11 @@ JOURNAL_KINDS = frozenset(
         # which `scrub_json` redacts as non-identifiers) are benign by name.
         "epic-close-unverified",
         "epic-close-verified",
+        # cli.py: an interactive `resolve` on that pause — the bmad-agent-po
+        # session's launch and its exit code (`rc`, benign by name, journaled
+        # and never trusted). `verdict` and `cli` are declared on the start kind.
+        "epic-close-session-end",
+        "epic-close-session-start",
         # #920: the accepting process could not publish its control window;
         # `error` is a drop field.
         "ctl-window-claim-failed",

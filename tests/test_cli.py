@@ -17401,29 +17401,11 @@ def test_resolve_epic_close_refusal_causes(project, capsys, monkeypatch, cause):
     and the quoted pause, nothing journaled, no tree read. Ablation (performed):
     route the retro-pending refusal to the verify and that row FAILS (it verifies
     and resumes)."""
-    from bmad_loop.model import Phase, StoryTask, TicketBinding
-
     if cause == "no-epic":
         kwargs = {"paused_story_key": None}
         step = "commit or clean the retrospective's leftovers"
     else:
-        binding = TicketBinding(
-            ref="1.1",
-            id="1",
-            epic_slug="epic-cart",
-            epic_id="1",
-            title="Cart model",
-            plan="/p/plan.md",
-            risk="",
-            refined=True,
-            plan_checkpoint=False,
-            done_checkpoint=False,
-            hitl=False,
-        )
-        task = StoryTask(
-            story_key="1.1", epic=0, phase=Phase.DONE, commit_sha="abc", ticket=binding
-        )
-        kwargs = {"ticket_epic_closures": {}, "tasks": {"1.1": task}}
+        kwargs = _retro_pending_kwargs()
         step = "the retrospective of epic-cart has not run or is not committed"
     run_dir, resumed = _epic_close_run(project, monkeypatch, capsys, **kwargs)
     pins = _fake_epic_tree(monkeypatch, project, "done")
@@ -17436,16 +17418,218 @@ def test_resolve_epic_close_refusal_causes(project, capsys, monkeypatch, cause):
     assert resumed == [] and pins == [] and _epic_close_kinds(run_dir) == []
 
 
-@pytest.mark.parametrize("gesture", ["interactive", "stories-run"])
+# A plain (interactive) `resolve` on the same pause: the bmad-agent-po session, then
+# the same verify. `resolve.run_epic_close_session` is stubbed; real-spawn budget: 1
+# vendored `tickets.py` spawn (the session-closes row reads the real tree).
+
+
+def _retro_pending_kwargs():
+    """State kwargs for a pause on an epic this run committed a ticket of with no
+    closure recorded: the classifier's retro-pending refusal."""
+    from bmad_loop.model import Phase, StoryTask, TicketBinding
+
+    binding = TicketBinding(
+        ref="1.1",
+        id="1",
+        epic_slug="epic-cart",
+        epic_id="1",
+        title="Cart model",
+        plan="/p/plan.md",
+        risk="",
+        refined=True,
+        plan_checkpoint=False,
+        done_checkpoint=False,
+        hitl=False,
+    )
+    task = StoryTask(story_key="1.1", epic=0, phase=Phase.DONE, commit_sha="abc", ticket=binding)
+    return {"ticket_epic_closures": {}, "tasks": {"1.1": task}}
+
+
+def _epic_close_session(project, monkeypatch, session=None, *, skill=True):
+    """Stub the interactive epic-close seams: `_make_adapters` (a dev adapter whose
+    profile is `claude`), the control-window claim, and
+    `resolve.run_epic_close_session` (``session(prompt)``, else `pytest.fail`); write
+    bmad-agent-po's SKILL.md into the dev profile's skill tree when ``skill``.
+    Returns ``(prompts, claims)``: each session's prompt and each claim's run id."""
+    from bmad_loop import resolve
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.tui import launch
+
+    skill_md = (
+        project.project
+        / get_profile("claude", project.project).skill_tree
+        / resolve.EPIC_CLOSE_SKILL
+        / "SKILL.md"
+    )
+    if skill:
+        skill_md.parent.mkdir(parents=True, exist_ok=True)
+        skill_md.write_text("---\nname: bmad-agent-po\n---\n", encoding="utf-8")
+    else:
+        assert not skill_md.exists()
+    adapter = types.SimpleNamespace(profile=types.SimpleNamespace(name="claude"))
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {"dev": adapter})
+    claims: list[str] = []
+
+    def claim(project_root, run_id, **_kw):
+        claims.append(run_id)
+        launch._record_ctl_window(project_root, run_id, "@7")
+
+    monkeypatch.setattr(launch, "claim_ctl_window", claim)
+    prompts: list[str] = []
+
+    def run_epic_close_session(adapter_, _project, _run_dir, slug, prompt, **_kw):
+        assert (adapter_, slug) == (adapter, "epic-cart")
+        prompts.append(prompt)
+        if session is None:
+            pytest.fail("the epic-close session ran")
+        return session(prompt)
+
+    monkeypatch.setattr(resolve, "run_epic_close_session", run_epic_close_session)
+    return prompts, claims
+
+
+def _resolve_epic_interactive(project, *extra):
+    return cli.main(["resolve", "--project", str(project.project), _EPIC_CLOSE_RUN, *extra])
+
+
+def test_resolve_epic_close_session_closes_the_epic_and_resumes(project, capsys, monkeypatch):
+    """A plain `resolve --resume` opens bmad-agent-po on the epic file; the session
+    closes and commits it and exits 1, and the verify — not the exit code — resumes
+    the run. 1 real spawn. Ablation (performed): skip the `_epic_close_check` call
+    after the session and `test_resolve_epic_close_session_exit_zero_is_not_trusted`
+    resumes the open epic and FAILS."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys, closed=False)
+    epic_file = project.project / _EPIC_CART_DIR / "epic-cart.md"
+
+    def close(_prompt):
+        text = epic_file.read_text(encoding="utf-8")
+        epic_file.write_text(text.replace("status: in-progress", "status: done"), encoding="utf-8")
+        git(project.project, "commit", "-q", "-am", "close epic-cart")
+        return 1
+
+    prompts, claims = _epic_close_session(project, monkeypatch, close)
+
+    assert _resolve_epic_interactive(project, "--resume") == 0, capsys.readouterr().err
+
+    assert resumed == [run_dir] and claims == [_EPIC_CLOSE_RUN]
+    (prompt,) = prompts
+    assert prompt.startswith("/bmad-agent-po ")
+    assert f"Epic file: {epic_file.resolve().as_posix()}." in prompt
+    start, end, verified = _epic_close_kinds(run_dir)
+    assert (start["kind"], start["epic_ref"], start["verdict"], start["cli"]) == (
+        "epic-close-session-start",
+        "epic-cart",
+        "accepted",
+        "claude",
+    )
+    assert (end["kind"], end["rc"]) == ("epic-close-session-end", 1)
+    assert (verified["kind"], verified["status"]) == ("epic-close-verified", "done")
+    assert "launching bmad-agent-po for epic epic-cart" in capsys.readouterr().out
+
+
+def test_resolve_epic_close_session_exit_zero_is_not_trusted(project, capsys, monkeypatch):
+    """A session that exits 0 with the epic still open is unverified: exit 1, no
+    resume, the run still paused. No real spawn."""
+    from bmad_loop.journal import load_state
+
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys, closed=False)
+    _fake_epic_tree(monkeypatch, project, "in-progress")
+    prompts, _claims = _epic_close_session(project, monkeypatch, lambda _prompt: 0)
+
+    assert _resolve_epic_interactive(project, "--resume") == 1
+
+    assert resumed == [] and len(prompts) == 1
+    kinds = _epic_close_kinds(run_dir)
+    assert [row["kind"] for row in kinds] == [
+        "epic-close-session-start",
+        "epic-close-session-end",
+        "epic-close-unverified",
+    ]
+    assert kinds[1]["rc"] == 0
+    assert kinds[2]["missing"] == ["epic epic-cart: the epic reads in-progress"]
+    assert load_state(run_dir).paused_stage == "epic-boundary"
+
+
+def test_resolve_epic_close_refuses_without_the_skill(project, capsys, monkeypatch):
+    """No bmad-agent-po SKILL.md in the dev profile's skill tree: exit 1 before the
+    window is claimed, naming the path and `--no-interactive`. No real spawn.
+    Ablation (performed): drop the skill probe and the session stub is called and
+    this FAILS."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    _fake_epic_tree(monkeypatch, project, "done")
+    _prompts, claims = _epic_close_session(project, monkeypatch, skill=False)
+
+    assert _resolve_epic_interactive(project, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "bmad-agent-po/SKILL.md" in err
+    assert f"bmad-loop resolve {_EPIC_CLOSE_RUN} --no-interactive" in err
+    assert resumed == [] and claims == [] and _epic_close_kinds(run_dir) == []
+
+
+def test_resolve_epic_close_session_mode_missing_hands_the_window_back(
+    project, capsys, monkeypatch
+):
+    """A dev adapter with no interactive session mode: exit 1, the control-window
+    record goes back to the window it named before the claim, and the message
+    points at `--no-interactive`. No real spawn."""
+    from bmad_loop.tui import launch
+
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    (run_dir / launch._CTL_WINDOW_FILE).write_text("@2", encoding="utf-8")
+
+    def unsupported(_prompt):
+        assert launch.recorded_ctl_window(project.project, _EPIC_CLOSE_RUN) == "@7"
+        raise NotImplementedError
+
+    _prompts, claims = _epic_close_session(project, monkeypatch, unsupported)
+
+    assert _resolve_epic_interactive(project, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "the dev adapter has no interactive session mode" in err
+    assert f"bmad-loop resolve {_EPIC_CLOSE_RUN} --no-interactive" in err
+    assert claims == [_EPIC_CLOSE_RUN] and resumed == []
+    assert launch.recorded_ctl_window(project.project, _EPIC_CLOSE_RUN) == "@2"
+
+
+def test_resolve_epic_close_session_skips_a_retro_pending_pause(project, capsys, monkeypatch):
+    """A plain resolve on a retro-pending pause takes the classifier's refusal and
+    never opens the session. No real spawn. Ablation (performed): route the
+    retro-pending refusal to the session and this FAILS."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys, **_retro_pending_kwargs())
+    _prompts, claims = _epic_close_session(project, monkeypatch)
+
+    assert _resolve_epic_interactive(project, "--resume") == 1
+
+    assert "the retrospective of epic-cart has not run or is not committed" in (
+        capsys.readouterr().err
+    )
+    assert resumed == [] and claims == [] and _epic_close_kinds(run_dir) == []
+
+
+def test_resolve_epic_close_session_refuses_a_moved_chain_config(project, capsys, monkeypatch):
+    """A chained run whose config no longer names its parent is refused before the
+    session: no conversation is spent on a run the verify cannot judge. No real
+    spawn."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys, parent_initiative=CHAIN_PARENT)
+    _prompts, claims = _epic_close_session(project, monkeypatch)
+
+    assert _resolve_epic_interactive(project, "--resume") == 1
+
+    assert f"set it back to {CHAIN_PARENT!r}" in capsys.readouterr().err
+    assert resumed == [] and claims == [] and _epic_close_kinds(run_dir) == []
+
+
+@pytest.mark.parametrize("gesture", ["interactive", "no-interactive"])
 def test_resolve_epic_boundary_other_gestures_keep_the_refusal(tmp_path, capsys, gesture):
-    """Only `--no-interactive` on a tickets run takes the epic-close branch: a plain
-    (interactive) resolve on the same pause, and a stories run's `epic-boundary`
-    pause, keep the not-an-escalation refusal."""
-    source = "tickets" if gesture == "interactive" else "stories"
+    """Only a tickets run takes the epic-close branch: a stories run's
+    `epic-boundary` pause keeps the not-an-escalation refusal under either
+    gesture."""
     _make_run_with_state(
         tmp_path,
         "r1",
-        source=source,
+        source="stories",
         paused_reason="close epic-cart",
         paused_stage="epic-boundary",
         paused_story_key="epic-cart",

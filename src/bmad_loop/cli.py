@@ -7308,15 +7308,14 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     # A tickets run's epic-boundary pause, answered by closing the epic: routed ahead
-    # of the escalation gate, which refuses it. Only a flagless `--no-interactive`
-    # resolve takes it; every other gesture on that pause keeps the refusal below.
+    # of the escalation gate, which refuses it. Only a resolve with no mode flag takes
+    # it (interactive or not); a mode flag on that pause keeps the refusal below.
     if (
         args.restore_patch is None
         and not getattr(args, "adopt_branch", False)
         and not getattr(args, "reverify", False)
         and not getattr(args, "abandon", False)
         and not getattr(args, "at_reset", False)
-        and not args.interactive
     ):
         target = tickets_source.epic_close_target(state)
         if not (
@@ -7801,20 +7800,32 @@ class _EpicCloseUnverifiable(Exception):
     cannot be read. ``resolve`` exits 1 and the run stays paused."""
 
 
-def _epic_close_check(
-    project: Path, state: RunState, paths: bmadconfig.ProjectPaths, slug: str
-) -> tuple[str, list[str]]:
-    """``(status, missing)`` for epic ``slug`` of the paused tickets run ``state``:
-    the epic file's status from the run's pinned tree (``"absent"`` when the tree
-    lists no such epic) and :func:`resolve.epic_close_missing` over the dirt of the
-    repo the run's recorded store topology versions — the epic folder only, never
-    the rest of that repo. Each missing line names the epic; empty means verified.
+@dataclass(frozen=True)
+class _EpicCloseLocation:
+    """Where the epic-close of a paused tickets run works, located once before the
+    session so the session's prompt and the verify read the same folders: the
+    run's tree pin (``pin``, ``folder``), its rebased ``initiative`` folder, the
+    epic's folder, the recorded store ``versioning`` and the ``repo`` it commits in
+    (None for ``none``), and ``prefix``, the epic folder relative to that repo."""
 
-    A git status that cannot be read is one missing line, not clean. Raises
-    :class:`_EpicCloseUnverifiable` for what no closure answers: an unrecorded or
-    unknown versioning (a tickets run with no initiative folder at its start
-    records none), an epic folder outside the repo whose dirt is read, a tree read
-    fault, or a chained run whose config no longer names its parent."""
+    pin: str | None
+    folder: Path | None
+    initiative: Path
+    epic_folder: Path
+    versioning: str
+    repo: Path | None
+    prefix: str
+
+
+def _locate_epic_close(
+    project: Path, state: RunState, paths: bmadconfig.ProjectPaths, slug: str
+) -> _EpicCloseLocation:
+    """Locate epic ``slug`` of the paused tickets run ``state`` for its close.
+    Raises :class:`_EpicCloseUnverifiable` for what no closure answers: a chained
+    run whose config no longer names its parent, an unrecorded or unknown
+    versioning (a tickets run with no initiative folder at its start records
+    none), no recorded initiative folder, or an epic folder that cannot be located
+    or sits outside the repo whose dirt is read."""
     try:
         pin, folder = runs.recorded_tree_pin(state, project, project)
     except bmadconfig.BmadConfigError as e:
@@ -7857,8 +7868,22 @@ def _epic_close_check(
                 f"epic folder {epic_folder.as_posix()} is not inside the repo at "
                 f"{repo.as_posix()} whose changes it is checked against ({e})"
             ) from e
+    return _EpicCloseLocation(pin, folder, initiative, epic_folder, versioning, repo, prefix)
+
+
+def _epic_close_check(
+    project: Path, located: _EpicCloseLocation, slug: str
+) -> tuple[str, list[str]]:
+    """``(status, missing)`` for epic ``slug`` at ``located``: the epic file's
+    status from the run's pinned tree (``"absent"`` when the tree lists no such
+    epic) and :func:`resolve.epic_close_missing` over the dirt of the repo the
+    run's recorded store topology versions — the epic folder only, never the rest
+    of that repo. Each missing line names the epic; empty means verified.
+
+    A git status that cannot be read is one missing line, not clean. A tree read
+    fault raises :class:`_EpicCloseUnverifiable`."""
     try:
-        view = _status_ticket_tree(project, pin, folder=folder).status()
+        view = _status_ticket_tree(project, located.pin, folder=located.folder).status()
     except tickettree.TicketsError as e:
         raise _EpicCloseUnverifiable(
             f"cannot read the ticket tree: tickets.py {e.kind}: {e}"
@@ -7867,12 +7892,12 @@ def _epic_close_check(
     status = row.status if row is not None else "absent"
     dirty: list[str] = []
     git_fault: str | None = None
-    if repo is not None:
+    if located.repo is not None:
         try:
-            dirty = list(verify.dirty_paths(repo))
+            dirty = list(verify.dirty_paths(located.repo))
         except verify.GitError as e:
-            git_fault = f"cannot read the git status of {repo.as_posix()}: {e}"
-    missing = resolve.epic_close_missing(status, dirty, prefix, versioning)
+            git_fault = f"cannot read the git status of {located.repo.as_posix()}: {e}"
+    missing = resolve.epic_close_missing(status, dirty, located.prefix, located.versioning)
     if git_fault is not None:
         missing.append(git_fault)
     return status, [f"epic {slug}: {line}" for line in missing]
@@ -7885,13 +7910,17 @@ def _resolve_epic_close(
     state: RunState,
     target: tickets_source.EpicCloseTarget | tickets_source.EpicCloseRefusal,
 ) -> int:
-    """``resolve --no-interactive`` on a tickets run's ``epic-boundary`` pause:
-    verify that the person closed the epic (:func:`_epic_close_check`), journal the
-    outcome and resume the run. ``cmd_resolve`` has run the alias, source and
-    liveness gates; this takes the classification's refusal causes, the shared
-    pre-session and configuration gates, then the verify, the confirm, a locked
-    re-check of the pause and the post-confirm plugin-trust refusal. An unverified
-    epic stays paused with only its journal row written."""
+    """``resolve`` on a tickets run's ``epic-boundary`` pause: an interactive
+    resolve first opens bmad-agent-po for the person to close and commit the epic
+    (:func:`resolve.run_epic_close_session`); either gesture then verifies that the
+    epic is closed (:func:`_epic_close_check`), journals the outcome and resumes the
+    run. ``cmd_resolve`` has run the alias, source and liveness gates; this takes
+    the classification's refusal causes, the shared pre-session and configuration
+    gates, then the skill probe, the locate and the session (interactive only, the
+    configuration gates again after it), the verify, the confirm, a locked re-check
+    of the pause and the post-confirm plugin-trust refusal. The session's exit code
+    is journaled, never trusted. An unverified epic stays paused with only its
+    journal rows written."""
     run_id = args.run_id
     if isinstance(target, tickets_source.EpicCloseRefusal):
         print(f"cannot resolve {run_id}: {target.step}", file=sys.stderr)
@@ -7912,9 +7941,128 @@ def _resolve_epic_close(
         return 1
     if (rc := _resolve_config_refusal(project, pol, state, paths)) is not None:
         return rc
-    # The interactive epic-close session slots in here, ahead of the verify.
+    if args.interactive:
+        # The skill probe the tickets engine takes before its retrospective session,
+        # taken before anything is claimed: a session with no bmad-agent-po skill
+        # is a conversation that cannot close the epic.
+        from .adapters.profile import ProfileError, get_profile
+
+        try:
+            tree = get_profile(pol.adapter.resolved("dev").name, project).skill_tree
+        except ProfileError as e:
+            print(
+                f"cannot resolve {run_id}: cannot load the dev adapter profile: {e}",
+                file=sys.stderr,
+            )
+            return 1
+        skill = project / tree / resolve.EPIC_CLOSE_SKILL / "SKILL.md"
+        if tree and not skill.is_file():
+            print(
+                f"cannot resolve {run_id}: the dev adapter's skill tree has no "
+                f"{skill.as_posix()} — close epic {slug} by hand and commit it, then: "
+                f"bmad-loop resolve {run_id} --no-interactive",
+                file=sys.stderr,
+            )
+            return 1
+    # Located before the session, so no conversation is spent on a run the verify
+    # cannot judge, and the session's prompt names the folders the verify reads.
     try:
-        status, missing = _epic_close_check(project, state, paths, slug)
+        located = _locate_epic_close(project, state, paths, slug)
+    except _EpicCloseUnverifiable as e:
+        print(f"cannot resolve {run_id}: {e} — run is still paused at epic {slug}", file=sys.stderr)
+        return 1
+    if args.interactive:
+        try:
+            prompt = resolve.epic_close_prompt(
+                slug=slug,
+                initiative=state.initiative,
+                initiative_folder=located.initiative,
+                epic_file=ticketlayout.epic_file(located.initiative, slug),
+                retrospective=ticketlayout.retrospective_doc(located.initiative, slug),
+                verdict=target.verdict,
+                parent=state.parent_initiative,
+                rejected=target.rejected,
+                versioning=located.versioning,
+                repo=located.repo,
+            )
+        except (OSError, ValueError) as e:
+            print(
+                f"cannot resolve {run_id}: cannot build the epic-close prompt for {slug}: {e}",
+                file=sys.stderr,
+            )
+            return 1
+        # This window now hosts the epic-close session, so it becomes the run's
+        # control window (#920), claimed as `cmd_resolve`'s escalation arm claims it.
+        from .tui import launch  # import-safe: launch.py has no textual imports
+
+        with state_lock(run_dir):
+            live = runs.engine_liveness(run_dir)
+            if live == "alive":
+                print(f"run {run_id} is still live — stop it first", file=sys.stderr)
+                return 1
+            if live == "unknown" and not args.force:
+                print(
+                    f"run {run_id}: engine may still be live (unverifiable pid) — "
+                    "refusing to resolve; re-run with --force once it is gone",
+                    file=sys.stderr,
+                )
+                return 1
+            predecessor = launch.recorded_ctl_window(project, run_dir.name)
+            _claim_ctl_window(project, run_dir, state)
+            claimed = launch.recorded_ctl_window(project, run_dir.name)
+        try:
+            # A human is present and the skill asks them questions, so the session
+            # keeps the profile's bypass args, as the resolve session does.
+            adapter = _make_adapters(project, run_dir, _bypass_permission_policy(pol))["dev"]
+            dev_cfg = pol.adapter.resolved("dev")
+            cli_name = getattr(getattr(adapter, "profile", None), "name", None) or getattr(
+                adapter, "name", ""
+            )
+            with state_lock(run_dir):
+                Journal(run_dir, pin=state).append(
+                    "epic-close-session-start", epic_ref=slug, verdict=target.verdict, cli=cli_name
+                )
+            print(f"launching bmad-agent-po for epic {slug} — close and commit it, then exit…")
+            # Only the session call answers "no interactive mode", as in the
+            # escalation arm.
+            try:
+                session_rc = resolve.run_epic_close_session(
+                    adapter,
+                    project,
+                    run_dir,
+                    slug,
+                    prompt,
+                    model=dev_cfg.model,
+                    effort=dev_cfg.effort,
+                )
+            except NotImplementedError:
+                print(
+                    f"the dev adapter has no interactive session mode — close {slug} with "
+                    f"bmad-agent-po and commit it, then: bmad-loop resolve {run_id} "
+                    "--no-interactive",
+                    file=sys.stderr,
+                )
+                _hand_back_ctl_window(project, run_dir, state, predecessor, claimed)
+                return 1
+        except BaseException:
+            _hand_back_ctl_window(project, run_dir, state, predecessor, claimed)
+            raise
+        with state_lock(run_dir):
+            Journal(run_dir, pin=state).append(
+                "epic-close-session-end", epic_ref=slug, rc=session_rc
+            )
+        # The conversation may have edited the config: judge it again, as
+        # `cmd_resolve` does after its session.
+        pol = policy_mod.load(_policy_path(project))
+        try:
+            paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+        except (bmadconfig.BmadConfigError, OSError) as e:
+            print(f"cannot resolve {run_id}: cannot read the BMAD config: {e}", file=sys.stderr)
+            return 1
+        if (rc := _resolve_config_refusal(project, pol, state, paths)) is not None:
+            return rc
+    try:
+        status, missing = _epic_close_check(project, located, slug)
     except _EpicCloseUnverifiable as e:
         print(f"cannot resolve {run_id}: {e} — run is still paused at epic {slug}", file=sys.stderr)
         return 1
