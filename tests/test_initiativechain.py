@@ -242,3 +242,51 @@ def test_after_close_asks_closes_about_drained_children_only():
     assert asked == ["auth"]
     assert pick.child is None and pick.end == "waiting" and pick.closed == ()
     assert pick.passed_over == (PassedOver("auth", DRAINED),)
+
+
+def test_after_close_carries_the_rejudged_children():
+    """AUTH drained, BILLING and REPORTS both after it: the pick takes BILLING,
+    and ``children`` holds the view it was judged on — AUTH read ``done``, REPORTS
+    ready with no wait left — so a tagger reads REPORTS ready, not waiting.
+
+    Ablation (performed): carry ``view.initiatives`` (the parent as ``next`` read
+    it) in ``next_child_after_close``'s ``children`` and this FAILS."""
+    auth = _child("auth", ready=True, status="", closed=4)
+    billing = _child("billing", after=("auth",), waiting_on=("auth",), closed=0)
+    reports = _child("reports", after=("auth",), waiting_on=("auth",), closed=0)
+
+    pick = next_child_after_close(_view(auth, billing, reports), _passes_drained)
+
+    assert pick.child is not None and pick.child.slug == "billing"
+    assert pick.closed == ("auth",) and pick.waiting == ()
+    assert [(c.slug, c.status, c.ready, c.waiting_on) for c in pick.children] == [
+        ("auth", "done", False, ()),
+        ("billing", "in-progress", True, ()),
+        ("reports", "in-progress", True, ()),
+    ]
+
+
+def test_after_close_readies_a_folder_less_dependent():
+    """REPORTS, declared without a folder, after drained AUTH: once AUTH closes it
+    is ready (a tagger reads it as having no folder, not waiting), and the pick
+    passes it over ``no-folder`` on the way to nothing else."""
+    auth = _child("auth", ready=True, status="", closed=4)
+    reports = _child("reports", folder=None, after=("auth",), waiting_on=("auth",))
+
+    pick = next_child_after_close(_view(auth, reports), _passes_drained)
+
+    assert pick.child is None and pick.end == "passed-over"
+    assert pick.passed_over == (PassedOver("reports", NO_FOLDER),)
+    rejudged = pick.children[1]
+    assert (rejudged.slug, rejudged.ready, rejudged.folder) == ("reports", True, None)
+
+
+def test_next_child_carries_the_view_children():
+    """Without a close, ``children`` is the view's own children, as ``next`` read
+    them."""
+    auth = _child("auth", ready=True)
+    billing = _child("billing", after=("auth",), waiting_on=("auth",))
+    view = _view(auth, billing)
+
+    assert next_child(view).children == view.initiatives
+    assert next_child_after_close(view).children == view.initiatives

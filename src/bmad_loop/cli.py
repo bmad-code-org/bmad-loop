@@ -5235,16 +5235,17 @@ def _dry_run_tickets(
 
 
 def _chain_child_tag(child: ticketmodel.ChildInitiative, pick: initiativechain.ChildPick) -> str:
-    """The dry run's tag for one child of a parent initiative: ``next`` (the child
-    the run builds first), ``done``/``dropped``, ``drained (the run closes it
-    first)`` (in ``pick.closed``), ``waiting``, ``no folder``, or ``ready``
-    (with why the pick passed it over, when it did)."""
+    """The dry run's tag for one child of a parent initiative, read from the
+    re-judged child (``pick.children``): ``next`` (the child the run builds
+    first), ``drained (the run closes it first)`` (in ``pick.closed``),
+    ``done``/``dropped``, ``waiting``, ``no folder``, or ``ready`` (with why the
+    pick passed it over, when it did)."""
     if pick.child is not None and child.slug == pick.child.slug:
         return "next"
-    if child.status in ("done", "dropped"):
-        return child.status
     if child.slug in pick.closed:
         return "drained (the run closes it first)"
+    if child.status in ("done", "dropped"):
+        return child.status
     if not child.ready:
         return "waiting"
     if child.folder is None:
@@ -5267,7 +5268,9 @@ def _dry_run_chain(
     (:func:`_close_drained_children`), is not taken but re-judged — the pick is
     the one the tree would read once each drained child whose fresh pick finds
     nothing is closed (``_chain_pick(after_close=True)``), and the predicted line
-    names those children. A close the run skips for a live or unfinished run or
+    names those children. Each child's tag and waits come from that re-judged
+    view (``pick.children``); its status and counts are the tree as it reads
+    now. A close the run skips for a live or unfinished run or
     a refused store is not predicted. ``--max-stories`` caps the first child's
     listing; the cap's spend across later children is not predicted."""
     if args.epic is not None or args.story:
@@ -5290,15 +5293,13 @@ def _dry_run_chain(
         f"tickets mode: parent initiative {parent} — {len(view.initiatives)} children "
         "in build order:"
     )
-    for position, child in enumerate(view.initiatives, 1):
+    for position, child in enumerate(pick.children, 1):
         status = initiativechain.prerequisite_status(view, child.slug)
         if child.folder is not None:
             closed, total = initiativechain.closed_tickets(child), child.counts.get("total", 0)
             status += f"; {closed} of {total} tickets closed"
         waits = ", ".join(
-            f"{p} ({initiativechain.prerequisite_status(view, p)})"
-            for p in child.waiting_on
-            if p not in pick.closed
+            f"{p} ({initiativechain.prerequisite_status(view, p)})" for p in child.waiting_on
         )
         line = f"  {position}. {child.slug}  ({status})  [{_chain_child_tag(child, pick)}]"
         print(line + (f"  waits on: {waits}" if waits else ""))

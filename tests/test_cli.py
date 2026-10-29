@@ -16018,6 +16018,63 @@ def test_dry_run_tickets_parent_keeps_a_drained_child_with_work_left_open(
     )
 
 
+CHAIN_REPORTS = "initiative-reports"
+
+
+def _chain_second_dependent(root, *, folder=True):
+    """Add REPORTS after AUTH beside BILLING — sliced holding `DEFAULT_TREE`, or
+    declared with no folder — drain AUTH, and commit it."""
+    parent = v7_layout(root, initiative=CHAIN_PARENT).initiative_folder
+    toml = parent / "tickets" / "tickets.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8")
+        + f'\n[[initiative]]\nid = 3\nslug = "{CHAIN_REPORTS}"\ntitle = "Reports"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+    if folder:
+        write_ticket_tree(v7_layout(root, initiative=CHAIN_REPORTS), DEFAULT_TREE)
+    _drain_child(root, CHAIN_AUTH)
+
+
+@pytest.mark.parametrize(
+    ("folder", "reports"),
+    [
+        (True, f"  3. {CHAIN_REPORTS}  (open; 0 of 4 tickets closed)  [ready]"),
+        (False, f"  3. {CHAIN_REPORTS}  (no-folder)  [no folder]"),
+    ],
+    ids=["sliced", "no-folder"],
+)
+def test_dry_run_tickets_parent_tags_each_dependent_of_a_closed_child(
+    project, monkeypatch, capsys, folder, reports
+):
+    """AUTH drained, BILLING and REPORTS both after it: the run closes AUTH and
+    builds BILLING, and REPORTS — no longer waiting — is tagged as the tree reads
+    once AUTH is closed: `ready` with no waits, or `no folder` when it is declared
+    but not sliced. AUTH's status column stays the tree as it reads now (`open`).
+
+    Ablation (performed): tag and print from `view.initiatives` (the unclosed
+    tree) in `_dry_run_chain` and REPORTS reads `waiting` — both rows FAIL."""
+    _chain_project(project, monkeypatch, capsys, [])
+    _chain_second_dependent(project.project, folder=folder)
+
+    rc, out, err, written = _chain_dry_run(project, monkeypatch, capsys)
+
+    assert rc == 0, err
+    assert written == ""
+    lines = out.splitlines()
+    assert lines[:4] == [
+        f"tickets mode: parent initiative {CHAIN_PARENT} — 3 children in build order:",
+        f"  1. {CHAIN_AUTH}  (open; 4 of 4 tickets closed)  [drained (the run closes it first)]",
+        f"  2. {CHAIN_BILLING}  (open; 0 of 4 tickets closed)  [next]",
+        reports,
+    ]
+    assert lines[-1] == (
+        f"predicted: chain starts with {CHAIN_BILLING}; later children are chosen as each "
+        f"finishes; the run closes drained {CHAIN_AUTH} before its first pick"
+    )
+
+
 @pytest.mark.parametrize("selector", [["--epic", "epic-cart"], ["--story", "1.1"]])
 def test_dry_run_tickets_parent_refuses_epic_and_story(project, monkeypatch, capsys, selector):
     """`--epic`/`--story` on a parent: the dry run refuses with `run`'s own text and

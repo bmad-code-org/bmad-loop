@@ -84,7 +84,11 @@ class ChildPick:
     children still waiting on a prerequisite, whether or not one was taken, and
     ``waiting_on`` one row per prerequisite each of them waits on, in the same
     order. ``closed`` names the drained children :func:`next_child_after_close`
-    judged as closed, in build order (empty from :func:`next_child`)."""
+    judged as closed, in build order (empty from :func:`next_child`), and
+    ``children`` holds every child of the view the pick was judged on, in build
+    order: the parent's as ``next`` read them from :func:`next_child`, re-judged
+    (each closed child ``done``, its dependents' ``waiting_on`` and ``ready``
+    re-derived) from :func:`next_child_after_close`."""
 
     child: ChildInitiative | None
     passed_over: tuple[PassedOver, ...]
@@ -92,6 +96,7 @@ class ChildPick:
     end: ChainEnd | None
     waiting_on: tuple[WaitingOn, ...] = ()
     closed: tuple[str, ...] = ()
+    children: tuple[ChildInitiative, ...] = ()
 
 
 def closed_tickets(child: ChildInitiative) -> int:
@@ -142,10 +147,12 @@ def next_child(
         if why is None and passes_over is not None:
             why = passes_over(child)
         if why is None:
-            return ChildPick(child, tuple(passed), waiting, None, waiting_on)
+            return ChildPick(
+                child, tuple(passed), waiting, None, waiting_on, children=view.initiatives
+            )
         passed.append(PassedOver(child.slug, why))
     end: ChainEnd = "waiting" if waiting else "passed-over" if passed else "all-done"
-    return ChildPick(None, tuple(passed), waiting, end, waiting_on)
+    return ChildPick(None, tuple(passed), waiting, end, waiting_on, children=view.initiatives)
 
 
 def next_child_after_close(
@@ -164,7 +171,8 @@ def next_child_after_close(
     closed child reads ``done`` and not ready, every ``waiting_on`` loses the
     closed children, and a child whose ``waiting_on`` changed is ready when it
     empties and the child is not done or dropped; every other child keeps the
-    answer ``next`` gave. The pick's ``closed`` names the closed children."""
+    answer ``next`` gave. The pick's ``closed`` names the closed children and its
+    ``children`` are the re-judged ones, so a caller tags each child from them."""
     closing = tuple(
         c.slug for c in view.initiatives if drained(c) and (closes is None or closes(c))
     )

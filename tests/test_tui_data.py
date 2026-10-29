@@ -1737,9 +1737,9 @@ def test_project_tickets_overview_resolves_a_mixed_install_as_tickets_mode(tmp_p
 # ------------------------------------------------------------- initiative chains
 # A v7 parent initiative over the sliced children AUTH and BILLING (after AUTH),
 # each holding `DEFAULT_TREE`, read by the real vendored `tickets.py`. Real-spawn
-# budget: 6 (`next <parent>` + the first child's `status` for the preview and for
-# the drained preview, one `next <parent>` for the blocked preview, one `status` for
-# the chained run's board).
+# budget: 10 (`next <parent>` + the first child's `status` for the preview, for the
+# drained preview and for each of the two second-dependent rows, one `next <parent>`
+# for the blocked preview, one `status` for the chained run's board).
 
 CHAIN_PARENT = "initiative-platform"
 CHAIN_AUTH, CHAIN_BILLING = "initiative-auth", "initiative-billing"
@@ -1868,6 +1868,44 @@ def test_project_tickets_overview_closes_a_drained_child_first(tmp_path, monkeyp
     assert board.chain_end is None
     assert board.initiative == CHAIN_BILLING
     assert sorted(r.ref for r in board.rows) == ["1.1", "1.2", "2.1", "2.2"]
+
+
+@pytest.mark.parametrize(("folder", "tag"), [(True, "ready"), (False, "no folder")])
+def test_project_tickets_overview_tags_each_dependent_of_a_closed_child(
+    tmp_path, monkeypatch, folder, tag
+):
+    """AUTH drained, BILLING and REPORTS both after it: the preview shows BILLING's
+    board, and REPORTS — no longer waiting once a run closes AUTH — is tagged
+    `ready` with no waits, or `no folder` when it is declared but not sliced.
+    AUTH's status stays the tree as it reads now (`open`), as in `run --dry-run`.
+
+    Ablation (performed): build the children from `view.initiatives` (the
+    unclosed tree) in `_parent_board` and REPORTS reads `waiting` — both rows
+    FAIL."""
+    root = tmp_path / "proj"
+    parent = _chain_project(root, monkeypatch)
+    toml = parent / "tickets" / "tickets.toml"
+    toml.write_text(
+        toml.read_text(encoding="utf-8")
+        + '\n[[initiative]]\nid = 3\nslug = "initiative-reports"\ntitle = "Reports"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+    if folder:
+        write_ticket_tree(v7_layout(root, initiative="initiative-reports"), DEFAULT_TREE)
+    auth = v7_layout(root, initiative=CHAIN_AUTH)
+    write_ticket_tree(auth, tuple(dataclasses.replace(e, status="done") for e in DEFAULT_TREE))
+    for epic, stem, ticket in CHAIN_PLANS:
+        write_plan(auth, epic, stem, ticket, "done")
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert [(c.slug, c.status, c.tag, c.waiting_on) for c in board.children] == [
+        (CHAIN_AUTH, "open", "closes first", ()),
+        (CHAIN_BILLING, "open", "first ready", ()),
+        ("initiative-reports", "open" if folder else "no-folder", tag, ()),
+    ]
+    assert board.initiative == CHAIN_BILLING and board.chain_end is None
 
 
 def test_project_tickets_overview_keeps_a_blocked_chain_blocked(tmp_path, monkeypatch):

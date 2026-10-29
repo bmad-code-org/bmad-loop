@@ -1340,16 +1340,17 @@ def project_tickets_overview(project: Path) -> TicketsBoard:
 
 
 def _chain_tag(child: ticketmodel.ChildInitiative, pick: initiativechain.ChildPick) -> str:
-    """The start-run preview's tag for one child of a parent initiative:
-    ``first ready`` (the child :func:`_parent_board` shows the board of),
-    ``done``/``dropped``, ``closes first`` (drained, so a run marks it done
-    before its first pick), ``waiting``, ``no folder``, or ``ready``."""
+    """The start-run preview's tag for one child of a parent initiative, read from
+    the re-judged child (``pick.children``): ``first ready`` (the child
+    :func:`_parent_board` shows the board of), ``closes first`` (drained, so a run
+    marks it done before its first pick), ``done``/``dropped``, ``waiting``,
+    ``no folder``, or ``ready``."""
     if pick.child is not None and child.slug == pick.child.slug:
         return "first ready"
-    if child.status in ("done", "dropped"):
-        return child.status
     if child.slug in pick.closed:
         return "closes first"
+    if child.status in ("done", "dropped"):
+        return child.status
     if not child.ready:
         return "waiting"
     if child.folder is None:
@@ -1362,7 +1363,9 @@ def _parent_board(project: Path, paths: bmadconfig.ProjectPaths) -> TicketsBoard
     children (``tickets.py next <parent>``, pinned to the parent) and the board of
     the first ready child once a run has closed every drained child, as it does
     before its first pick (:func:`~bmad_loop.initiativechain.next_child_after_close`),
-    read through that child's folder with the tree pinned to the parent.
+    read through that child's folder with the tree pinned to the parent. Each
+    child's tag and waits come from the re-judged view; its status and counts
+    are the tree as it reads now.
 
     An approximation of the chain ``bmad-loop run`` builds: its pick also passes
     over a ready child whose fresh pick dispatches nothing, and it leaves open a
@@ -1385,7 +1388,7 @@ def _parent_board(project: Path, paths: bmadconfig.ProjectPaths) -> TicketsBoard
             tag=_chain_tag(c, pick),
             waiting_on=tuple(w for w in pick.waiting_on if w.slug == c.slug),
         )
-        for c in view.initiatives
+        for c in pick.children
     )
     if pick.child is None:
         return TicketsBoard((), None, "", parent=parent, children=children, chain_end=pick.end)
