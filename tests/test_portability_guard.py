@@ -5649,6 +5649,43 @@ def test_store_topology_refusal_sites_are_enumerated():
     )
 
 
+def test_cmd_resolve_takes_the_config_refusal_before_the_session_and_after_the_confirm():
+    """`cmd_resolve` reaches the isolation and store refusals through
+    `_resolve_config_refusal` at BOTH points: before the interactive session (the
+    `96aa09a9` arm — no conversation spent on a config knowable up front) and after
+    the confirm, on the re-read config the re-arm acts on. The caller tables count
+    the helper's own predicate calls once, so they cannot see either call drop
+    out; this pins both by position against the session and the confirm.
+
+    Ablation (performed): delete the pre-session `_resolve_config_refusal` call in
+    `cmd_resolve` and this reddens."""
+    tree = ast.parse((SRC / "cli.py").read_text(encoding="utf-8"), filename="cli.py")
+    (fn,) = (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_resolve"
+    )
+
+    def lines(name: str) -> list[int]:
+        return sorted(
+            node.lineno
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and _called_name(node.func) == name
+        )
+
+    refusals = lines("_resolve_config_refusal")
+    (session,) = lines("run_session")
+    (confirm,) = lines("_confirm")
+    assert [line < session for line in refusals] == [True, False], (
+        "cmd_resolve must call _resolve_config_refusal once before the interactive "
+        f"session (run_session at line {session}) and once after it: {refusals}"
+    )
+    assert refusals[1] > confirm, (
+        f"cmd_resolve's second _resolve_config_refusal (line {refusals[1]}) must "
+        f"follow the confirm (line {confirm})"
+    )
+
+
 @pytest.mark.parametrize(
     ("label", "source", "fn"),
     [

@@ -6296,6 +6296,63 @@ def test_resolve_early_dispatch_judges_a_chained_childs_own_store(
     assert _state_bytes(run_dir) == before
 
 
+@pytest.mark.parametrize("refused", ["child", "parent"])
+@pytest.mark.parametrize("mode", ["interactive", "--no-interactive"])
+def test_resolve_config_refusal_judges_a_chained_childs_own_store(
+    project, monkeypatch, capsys, mode, refused
+):
+    """`_resolve_config_refusal` — the re-arm's store gate before the interactive
+    session and after the confirm — judges a chained child's OWN store
+    (`initiative=<child>`): a refused child store refuses ahead of the session or
+    the re-arm, a refused parent store beside an acceptable child one does not.
+    The early `--adopt-branch` / `--reverify` gate has its own row above. Ablation
+    (performed): drop `initiative=` in `_resolve_config_refusal` and every row
+    FAILS."""
+    from bmad_loop import resolve as resolve_mod
+    from bmad_loop import ticketstore
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, rearms = _resolve_gate_run(project, monkeypatch, run_type="story", ledger_bytes=None)
+    child, parent = "initiative-child", "initiative-platform"
+    state = load_state(run_dir)
+    state.source = "tickets"
+    state.initiative, state.parent_initiative = child, parent
+    save_state(run_dir, state)
+    before = load_state(run_dir)
+    real = bmadconfig.load_paths(project.project)
+    loaded = dataclasses.replace(
+        real, era="v7", active_initiative=parent, initiative_folder=real.output_folder / parent
+    )
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda _p, *, want_tickets=False: loaded)
+    refused_store = child if refused == "child" else parent
+    judged: list[str | None] = []
+
+    def conflict(_project, _source, _isolation, *, recorded=None, initiative=None):
+        judged.append(initiative)
+        store = parent if initiative is None else initiative  # unset: the live parent's
+        return "the ticket store is not supported" if store == refused_store else None
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: pytest.fail("built adapters"))
+    monkeypatch.setattr(resolve_mod, "run_session", lambda *a, **k: pytest.fail("conversed"))
+
+    argv = ["resolve", "--project", str(project.project), "r1", "--resume"]
+    if mode == "--no-interactive":
+        argv.append(mode)
+    if refused == "child":
+        assert cli.main(argv) == 1
+        assert "error: the ticket store is not supported" in capsys.readouterr().err
+        assert rearms == []
+        _assert_escalation_intact(run_dir, before)
+    elif mode == "interactive":
+        with pytest.raises(pytest.fail.Exception, match="built adapters"):
+            cli.main(argv)  # past the pre-session store gate, into the session
+    else:
+        assert cli.main(argv) == 0, capsys.readouterr().err
+        assert rearms == ["s1"]
+    assert judged == [child]
+
+
 def test_resolve_adopt_branch_refuses_a_task_with_no_recorded_worktree(tmp_path, capsys):
     from bmad_loop.journal import load_state, save_state
 
@@ -17601,6 +17658,39 @@ def test_resolve_epic_close_refuses_when_the_pause_moves(project, capsys, monkey
     assert _resolve_epic(project) == 1
 
     assert resumed == []
+    assert (
+        "the pause for epic-cart changed while resolve was in progress — not resuming"
+        in capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("closed", [True, False], ids=["verified", "unverified"])
+def test_resolve_epic_close_journals_no_verdict_on_a_pause_a_rival_took(
+    project, capsys, monkeypatch, closed
+):
+    """The verify runs lock-free, so a rival `resume` can take the run before the
+    verdict is journaled: the pause is re-read under the lock that journals it, and
+    a pause that is gone gets no `epic-close-*` row, rc 1 and the moved-pause
+    refusal. No real spawn. Ablation (performed): drop that re-read and both rows
+    FAIL (the verdict row lands on the resumed run)."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    _fake_epic_tree(monkeypatch, project, "done" if closed else "in-progress")
+    real_check = cli._epic_close_check
+
+    def check_then_rival_resume(*a, **k):
+        verdict = real_check(*a, **k)
+        state = load_state(run_dir)
+        state.paused_stage = state.paused_reason = state.paused_story_key = None
+        save_state(run_dir, state)
+        return verdict
+
+    monkeypatch.setattr(cli, "_epic_close_check", check_then_rival_resume)
+
+    assert _resolve_epic(project, "--resume") == 1
+
+    assert resumed == [] and _epic_close_kinds(run_dir) == []
     assert (
         "the pause for epic-cart changed while resolve was in progress — not resuming"
         in capsys.readouterr().err

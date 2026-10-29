@@ -7976,6 +7976,12 @@ def _epic_close_check(
     return status, [f"epic {slug}: {line}" for line in missing]
 
 
+def _epic_pause_moved(state: RunState, slug: str) -> bool:
+    """Whether ``state`` (re-read under the run lock) is no longer paused at epic
+    ``slug``'s closure: a rival resume took the run, or it paused elsewhere."""
+    return state.paused_stage != PAUSE_EPIC_BOUNDARY or state.paused_story_key != slug
+
+
 def _resolve_epic_close(
     args: argparse.Namespace,
     project: Path,
@@ -8166,6 +8172,15 @@ def _resolve_epic_close(
         if not runs.is_run(run_dir):
             print(f"no such run: {run_dir.name}", file=sys.stderr)
             return 1
+        # The verify ran lock-free (it spawns tickets.py and git), so a rival resume
+        # may have taken the run meanwhile: a verdict on a pause that is gone is not
+        # this run's record. The resume below re-checks again after the confirm.
+        if _epic_pause_moved(load_state(run_dir, pin=state), slug):
+            print(
+                f"the pause for {slug} changed while resolve was in progress — not resuming",
+                file=sys.stderr,
+            )
+            return 1
         if missing:
             Journal(run_dir, pin=state).append(
                 "epic-close-unverified", epic_ref=slug, missing=missing
@@ -8186,8 +8201,7 @@ def _resolve_epic_close(
         return 0
     with state_lock(run_dir):
         # The checks above ran lock-free: repeat them against the last writer's state.
-        fresh_state = load_state(run_dir, pin=state)
-        if fresh_state.paused_stage != PAUSE_EPIC_BOUNDARY or fresh_state.paused_story_key != slug:
+        if _epic_pause_moved(load_state(run_dir, pin=state), slug):
             print(
                 f"the pause for {slug} changed while resolve was in progress — not resuming",
                 file=sys.stderr,
