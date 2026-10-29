@@ -318,6 +318,8 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     },
     "initiative-chain-end": {"parent": "initiative"},
     "initiative-chain": {"parent": "initiative", "previous_child": "initiative"},
+    # `cli._close_drained_children`: a drained child left open, and its parent.
+    "initiative-close-skipped": {"parent": "initiative", "slug": "initiative"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
@@ -631,10 +633,13 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # `waiting_on_status` closed prerequisite-status tokens (an initiative status,
     # `open`, `no-folder`, `?`), and `previous_run` a run id; the slugs are
     # kind-aliased or kind-keylisted, which runs first, and `error` is dropped by
-    # name.
+    # name. `initiative-close-skipped`'s `why` is a closed skip token (`run-live`,
+    # `run-unfinished`, `runs-unread`, `work-left`, `store-refused`) and
+    # `blocking_run` a run id (or empty); `detail` is dropped by name.
     "initiative-chain-next": frozenset({"passed_over_why"}),
     "initiative-chain-end": frozenset({"end", "passed_over_why", "waiting_on_status"}),
     "initiative-chain": frozenset({"previous_run"}),
+    "initiative-close-skipped": frozenset({"why", "blocking_run"}),
 }
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced

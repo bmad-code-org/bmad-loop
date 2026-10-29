@@ -397,6 +397,7 @@ STORE_TOPOLOGY_CALLERS = {
     ("cli.py", "_reject_store_topology"): 1,  # the wrapper's own predicate call
     ("cli.py", "cmd_run"): 1,
     ("cli.py", "_launch_run"): 1,  # a chained child's own store, per child launch
+    ("cli.py", "_child_store"): 1,  # a drained child's store, ahead of its close
     ("cli.py", "cmd_sweep"): 1,
     # pre-session + post-confirm, as the #414 pair, + ahead of --reverify/--adopt-branch
     ("cli.py", "cmd_resolve"): 3,
@@ -609,6 +610,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     "initiative-chain-next": frozenset({"passed_over_why"}),
     "initiative-chain-end": frozenset({"end", "passed_over_why", "waiting_on_status"}),
     "initiative-chain": frozenset({"previous_run"}),
+    # cli.py, the chain's pre-pick close: a closed skip token and the blocking run's
+    # id. `parent`/`slug` are kind-aliased; `detail` is dropped by name.
+    "initiative-close-skipped": frozenset({"why", "blocking_run"}),
     # runs.py: whether the re-arm moved its restore latch onto the evacuated copy.
     # `patch` and `stashed_to` are dropped by name.
     "restore-patch-evacuated": frozenset({"latched"}),
@@ -2261,10 +2265,12 @@ JOURNAL_KINDS = frozenset(
         "ticket-plan-restored",
         "initiative-mark",
         # cli.py — the initiative chain: per switch, the next child or the end in
-        # the finished run, and the chain link in the next run.
+        # the finished run, the chain link in the next run, and each drained child
+        # the pre-pick close leaves open.
         "initiative-chain-next",
         "initiative-chain-end",
         "initiative-chain",
+        "initiative-close-skipped",
         # worktree_flow.py
         "accepted-spec-delivery-unreachable",
         "accepted-spec-write-unreachable",

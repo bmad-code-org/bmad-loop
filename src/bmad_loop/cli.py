@@ -4245,9 +4245,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
             return 1
         try:
-            pick = _chain_pick(project, paths, parent)
+            # A child a stopped, interrupted or crashed chain left drained and open,
+            # or one drained outside the chain, is closed first so its dependents
+            # are ready for the pick.
+            owed = _close_drained_children(project, paths, pol, parent, _ChainStartLog())
+            pick = None if owed is not None else _chain_pick(project, paths, parent)
         except (tickettree.TicketsError, ValueError) as e:
             print(f"tickets mode: initiative chain {parent}: {e}", file=sys.stderr)
+            return 1
+        if pick is None:
+            print(
+                f"initiative chain {parent}: ends (store-commit-failed): {owed} — commit "
+                "it, then run again",
+                file=sys.stderr,
+            )
             return 1
         if pick.child is None:
             print(_chain_end_line(parent, pick.end or "", pick))
@@ -4539,48 +4550,168 @@ def _landed_a_ticket(state: RunState) -> bool:
     return any(task.phase in landed for task in state.tasks.values())
 
 
-def _close_drained_child(
-    project: Path, paths: bmadconfig.ProjectPaths, finished: runsetup.ComposedRun, parent: str
+class _ChainStartLog(Journal):
+    """Where the closes before a chain's first run journal: no run dir exists yet
+    (the start pick journals nothing either), so the rows are kept in memory and
+    nothing is written, while each close and skip is printed — the
+    :class:`_ConfirmMarkLog` shape."""
+
+    def __init__(self) -> None:  # no run dir: nothing is written
+        self.rows: list[dict[str, object]] = []
+
+    def append(self, kind: str, **fields: Any) -> None:
+        self.rows.append({"kind": kind, **fields})
+
+
+def _child_runs_holding(project: Path) -> tuple[dict[str, tuple[str, str, str]], str | None]:
+    """The child initiatives a recorded run of ``project`` still holds, as ``{slug:
+    (why, run_id, status)}`` with the first such run (oldest first), and what of
+    the runs dir could not be read, or None.
+
+    A run holds its initiative while it is not finished: ``run-live`` when its
+    engine is running or may be (``runs.RUNNING``, ``runs.UNKNOWN``), else
+    ``run-unfinished`` — a paused, stopped, crashed or interrupted run, which a
+    resume drives on (and a chained one's resume closes its child itself). A sweep
+    holds its initiative only while live: it works the child's ledger, writes no
+    ticket or initiative status, and its resume does not go on with the chain. A
+    run whose state cannot be read joins the fault: it may hold any child."""
+    infos, fault = runs.discover_runs(project)
+    faults = [] if fault is None else [fault]
+    held: dict[str, tuple[str, str, str]] = {}
+    for info in infos:
+        if info.status == runs.FINISHED:
+            continue
+        live = info.status in (runs.RUNNING, runs.UNKNOWN)
+        if info.run_type == "sweep" and not live:
+            continue
+        try:
+            state = load_state(info.run_dir)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            faults.append(f"run {info.run_id}: cannot read its state ({type(e).__name__}: {e})")
+            continue
+        if state.initiative and state.initiative not in held:
+            why = "run-live" if live else "run-unfinished"
+            held[state.initiative] = (why, info.run_id, info.status)
+    return held, "; ".join(faults) or None
+
+
+def _child_store(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    slug: str,
+    built: RunState | None,
+) -> ticketstore.StoreTopology | str | None:
+    """The store topology a close of child ``slug`` commits in: the one the run
+    ``built`` recorded when it built ``slug``, else ``slug``'s store classified now
+    (``ticketstore.assess_store``, as a chained launch judges it). None when there
+    is nothing to classify; the refusal message for a store tickets runs refuse."""
+    if built is not None and built.initiative == slug:
+        recorded = runs.live_store_topology(built, project)
+        return ticketstore.StoreTopology.from_dict(recorded) if recorded else None
+    result = ticketstore.assess_store(paths.with_initiative(slug), pol.scm.isolation, chained=True)
+    if isinstance(result, ticketstore.StoreRefusal):
+        return ticketstore.store_topology_conflict(result) or result.code
+    return result
+
+
+def _close_drained_children(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    parent: str,
+    journal: Journal,
+    built: RunState | None = None,
 ) -> str | None:
-    """Mark the child the finished run built ``status: done`` when ``next
-    <parent>`` reads it drained (``initiativechain.drained``), through
-    ``TicketTree.mark_initiative_done`` on a main-checkout tree pinned as
-    ``runs.tree_pin`` pins the run, journaled into its journal; then commit the
-    file where its store is versioned (the code repo for T1, the store's own repo
-    for T3/T4), through ``ticketstore.StoreCommitter`` and journaled as the
-    engine's store commits are. Returns None, or the reason the chain cannot go
-    on: ``store-commit-failed`` (also journaled). Tree faults raise."""
-    state = finished.state
-    slug = state.initiative
+    """Mark every child of the parent initiative ``parent`` that ``next <parent>``
+    reads drained (``initiativechain.drained``) ``status: done``, so its
+    dependents become ready before the chain picks (``paths`` are the parent's).
+    ``built`` is the finished child run the driver closes after, or None before a
+    chain's first run.
+
+    Each close goes through ``TicketTree.mark_initiative_done`` on a main-checkout
+    tree pinned to ``parent``, journaled into ``journal``; then the file is
+    committed where its store is versioned (the code repo for T1, the store's own
+    repo for T3/T4), through ``ticketstore.StoreCommitter`` and journaled as the
+    engine's store commits are. A drained child is left open, journaled as
+    ``initiative-close-skipped`` (``parent``, ``slug``, ``why``, ``blocking_run``,
+    ``detail``) and printed, when:
+
+    * ``run-live`` / ``run-unfinished``: a recorded run still holds it
+      (:func:`_child_runs_holding`), or ``runs-unread``: the runs dir could not be
+      read whole, so one may;
+    * ``work-left``: it is not the child ``built`` built and its fresh pick
+      (:func:`_fresh_pick`) still finds work — an epic awaiting closure or not yet
+      broken down, which a run of the child does; a finished run vouches for its
+      own child;
+    * ``store-refused``: its store is one tickets runs refuse.
+
+    Returns None, or why the chain cannot go on: a close that could not be
+    committed (``store-commit-failed`` / ``store-commit-foreign-dirt`` journaled).
+    Tree faults raise."""
     parent_folder = paths.initiative_folder
     assert parent_folder is not None  # _chain_parent
-    pin, _folder = runs.tree_pin(state, runs.paths_for_state(paths, state))
-    assert pin is not None  # a chained run pins its parent
-    tree = _chain_ticket_tree(project, pin)
-    child = tree.parent_next(parent_folder).child(slug)
-    if child is None or not initiativechain.drained(child):
+    tree = _chain_ticket_tree(project, parent)
+    drained = [c for c in tree.parent_next(parent_folder).initiatives if initiativechain.drained(c)]
+    if not drained:
         return None
-    mark = tree.mark_initiative_done(parent_folder, slug, journal=finished.journal)
-    if mark.outcome != "written":
-        return None
-    recorded = runs.live_store_topology(state, project)
-    topology = ticketstore.StoreTopology.from_dict(recorded) if recorded else None
-    if topology is None or topology.versioning == "none":
-        return None
-    repo = topology.store_repo if topology.store_repo is not None else paths.repo_root
-    committer = ticketstore.StoreCommitter(repo, paths.repo_root)
-    message = f"chore(tickets): {slug} done [bmad-loop {state.run_id}]"
-    try:
-        result = committer.commit(slug, [mark.file], message)
-    except ticketstore.StoreCommitError as e:
-        finished.journal.append("store-commit-failed", story_key=slug, error=str(e))
-        return "store-commit-failed"
-    if result.foreign:
-        finished.journal.append(
-            "store-commit-foreign-dirt", story_key=slug, count=len(result.foreign)
-        )
-        return "store-commit-failed"
-    finished.journal.append("store-committed", story_key=slug, commit=result.sha)
+    held, fault = _child_runs_holding(project)
+    label = built.run_id if built is not None else f"chain {parent}"
+    for child in drained:
+        slug = child.slug
+        skip: tuple[str, str, str] | None = None
+        if fault is not None:
+            skip = ("runs-unread", "", fault)
+        elif slug in held:
+            why, run_id, status = held[slug]
+            skip = (why, run_id, f"run {run_id} is {status}")
+        elif built is None or built.initiative != slug:
+            child_tree = _chain_ticket_tree(
+                project, parent, paths.with_initiative(slug).initiative_folder
+            )
+            decision = _fresh_pick(child_tree.next(), child_tree.status())
+            if not isinstance(decision, tickets_source.Skip):
+                skip = ("work-left", "", "its first pick still finds work")
+        topology = None
+        if skip is None:
+            store = _child_store(project, paths, pol, slug, built)
+            if isinstance(store, str):
+                skip = ("store-refused", "", store)
+            else:
+                topology = store
+        if skip is not None:
+            why, run_id, detail = skip
+            journal.append(
+                "initiative-close-skipped",
+                parent=parent,
+                slug=slug,
+                why=why,
+                blocking_run=run_id,
+                detail=detail,
+            )
+            print(f"initiative chain {parent}: leaves {slug} open ({why}: {detail})")
+            continue
+        mark = tree.mark_initiative_done(parent_folder, slug, journal=journal)
+        if mark.outcome != "written":
+            continue
+        print(f"initiative chain {parent}: closed {slug} (drained)")
+        if topology is None or topology.versioning == "none":
+            continue
+        repo = topology.store_repo if topology.store_repo is not None else paths.repo_root
+        committer = ticketstore.StoreCommitter(repo, paths.repo_root)
+        message = f"chore(tickets): {slug} done [bmad-loop {label}]"
+        try:
+            result = committer.commit(slug, [mark.file], message)
+        except ticketstore.StoreCommitError as e:
+            journal.append("store-commit-failed", story_key=slug, error=str(e))
+            return f"closing {slug} could not be committed: {e}"
+        if result.foreign:
+            journal.append("store-commit-foreign-dirt", story_key=slug, count=len(result.foreign))
+            return (
+                f"closing {slug} could not be committed: {len(result.foreign)} path(s) "
+                "hold changes staged by someone else"
+            )
+        journal.append("store-committed", story_key=slug, commit=result.sha)
     return None
 
 
@@ -4611,8 +4742,10 @@ def _drive_initiative_chain(
     returns 0 at once.
 
     Per switch, in order: a stop asked of the finished run ends the chain
-    (:func:`_chain_stop_requested`); a drained child is marked done
-    (:func:`_close_drained_child`) so its dependents become ready; the next child
+    (:func:`_chain_stop_requested`); every drained child — the one just built, and
+    any other a stopped chain or a hand left open — is marked done
+    (:func:`_close_drained_children`, which ``run`` also calls before its first
+    pick) so its dependents become ready; the next child
     is picked (:func:`_chain_pick`); a spent ``--max-stories`` budget
     (:func:`_chain_budget`) ends the chain as ``max-stories``; picking the child
     just built again when its run landed no ticket ends it as ``stalled``, since
@@ -4644,13 +4777,14 @@ def _drive_initiative_chain(
         if _chain_stop_requested(finished):
             return _chain_end(finished, parent, "stop-requested")
         try:
-            if (owed := _close_drained_child(project, paths, finished, parent)) is not None:
+            owed = _close_drained_children(project, paths, pol, parent, finished.journal, state)
+            if owed is not None:
                 return _chain_end(
                     finished,
                     parent,
-                    owed,
-                    error=f"closing {state.initiative} could not be committed (see the "
-                    f"journal of run {state.run_id}) — commit it, then run again",
+                    "store-commit-failed",
+                    error=f"{owed} (see the journal of run {state.run_id}) — commit it, "
+                    "then run again",
                 )
             pick = _chain_pick(project, paths, parent)
         except (tickettree.TicketsError, ValueError, bmadconfig.BmadConfigError) as e:

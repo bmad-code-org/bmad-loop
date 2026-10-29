@@ -15994,6 +15994,18 @@ def _chain_config(sandbox):
     ignore_before_commit(sandbox, "_bmad/custom/*.user.toml")
 
 
+def _drain_child(root, slug, *, epics=True):
+    """Close every ticket of child ``slug`` — and every epic, unless ``epics`` is
+    False — and commit it: drained, open."""
+    child = v7_layout(root, initiative=slug)
+    tree = tuple(dataclasses.replace(e, status="done") for e in DEFAULT_TREE)
+    write_ticket_tree(child, tree if epics else DEFAULT_TREE)
+    for epic, stem, ticket in CHAIN_PLANS:
+        write_plan(child, epic, stem, ticket, "done")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", f"build {slug}")
+
+
 def _chain_project(project, monkeypatch, capsys, outcomes):
     """Every gate green on the parent layout, and `cli.TicketsEngine` playing one of
     ``outcomes`` per run, in order (a run past the script fails the test):
@@ -16040,13 +16052,7 @@ def _chain_project(project, monkeypatch, capsys, outcomes):
             else:
                 self.state.finished = True
             if outcome in ("drain", "stop-lodged", "stop-discarded"):
-                child = v7_layout(root, initiative=self.state.initiative)
-                closed = tuple(dataclasses.replace(e, status="done") for e in DEFAULT_TREE)
-                write_ticket_tree(child, closed)
-                for epic, stem, ticket in CHAIN_PLANS:
-                    write_plan(child, epic, stem, ticket, "done")
-                git(root, "add", "-A")
-                git(root, "commit", "-q", "-m", f"build {self.state.initiative}")
+                _drain_child(root, self.state.initiative)
                 self.state.tasks["1.1"] = StoryTask("1.1", 0, Phase.DONE)
             if outcome == "stop-lodged":
                 (self.run_dir / runs.STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
@@ -16355,6 +16361,182 @@ def test_run_on_a_parent_ends_naming_what_each_waiting_child_waits_on(project, m
         f"{CHAIN_SEARCH} (dropped), {CHAIN_LEDGER} (no-folder) (passed over: "
         f"{CHAIN_LEDGER} (no-folder))"
     ) in capsys.readouterr().out
+
+
+def test_run_after_a_stopped_chain_closes_the_child_it_left_open(project, monkeypatch, capsys):
+    """A stop asked of AUTH's run ends the chain ahead of the close, so AUTH is left
+    drained and open and BILLING waits on it. The next `run` on the parent closes
+    AUTH before its first pick — committed, with no run dir to journal into — and
+    launches BILLING. Ablation (performed): drop the pre-pick close in `cmd_run`
+    and AUTH is passed over `drained`, BILLING still waits, and the run ends
+    `waiting` launching nothing — this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, ["stop-lodged", "drain"])
+    root = project.project
+    assert cli.main(["run", "--project", str(root)]) == 0
+    assert not _initiative_status(project, CHAIN_AUTH)
+    capsys.readouterr()
+
+    assert cli.main(["run", "--project", str(root)]) == 0
+
+    out = capsys.readouterr().out
+    assert [s.initiative for _, s, _ in built] == [CHAIN_AUTH, CHAIN_BILLING]
+    assert f"initiative chain {CHAIN_PARENT}: closed {CHAIN_AUTH} (drained)" in out
+    assert f"initiative chain {CHAIN_PARENT}: building {CHAIN_BILLING}" in out
+    assert _initiative_status(project, CHAIN_AUTH) and _initiative_status(project, CHAIN_BILLING)
+    subjects = git(root, "log", "--format=%s").splitlines()
+    assert f"chore(tickets): {CHAIN_AUTH} done [bmad-loop chain {CHAIN_PARENT}]" in subjects
+    # the start close journals nothing: BILLING's run carries only its own close
+    rows = _chain_rows(built[1][2])
+    assert [e["kind"] for e in rows] == [
+        "initiative-mark",
+        "store-committed",
+        "initiative-chain-end",
+    ]
+    assert rows[0]["slug"] == CHAIN_BILLING
+
+
+def test_run_closes_a_sibling_drained_outside_the_chain(project, monkeypatch, capsys):
+    """AUTH was drained by hand and never built by the chain: `run` on the parent
+    closes it before the pick instead of passing it over `drained`, so BILLING is
+    built. Ablation (performed): drop the pre-pick close in `cmd_run` and the run
+    ends `waiting` launching nothing — this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, ["drain"])
+    _drain_child(project.project, CHAIN_AUTH)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    assert [s.initiative for _, s, _ in built] == [CHAIN_BILLING]
+    assert _initiative_status(project, CHAIN_AUTH)
+    assert f"initiative chain {CHAIN_PARENT}: ends (all-done)" in capsys.readouterr().out
+
+
+def test_run_builds_a_drained_child_whose_epics_are_still_open(project, monkeypatch, capsys):
+    """AUTH's tickets are all done but its epics are open: drained by its counts,
+    yet its first pick halts at the epic closure, which a run of AUTH does. The
+    pre-pick close leaves it open (`work-left`) and the chain builds it, then
+    closes it after its run. Ablation (performed): drop the fresh-pick check and
+    AUTH is closed unbuilt, only BILLING launching — this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, ["drain", "drain"])
+    _drain_child(project.project, CHAIN_AUTH, epics=False)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    out = capsys.readouterr().out
+    assert (
+        f"initiative chain {CHAIN_PARENT}: leaves {CHAIN_AUTH} open (work-left: its first "
+        "pick still finds work)"
+    ) in out
+    assert [s.initiative for _, s, _ in built] == [CHAIN_AUTH, CHAIN_BILLING]
+    assert _initiative_status(project, CHAIN_AUTH) and _initiative_status(project, CHAIN_BILLING)
+
+
+def _record_child_run(root, run_id, *, run_type="story", paused=False):
+    """A recorded, unfinished run of AUTH under the parent."""
+    from bmad_loop.journal import save_state
+    from bmad_loop.model import RunState
+
+    state = RunState(
+        run_id=run_id,
+        project=str(root),
+        started_at="2099-01-01T00:00:00",
+        run_type=run_type,
+        initiative=CHAIN_AUTH,
+        parent_initiative=CHAIN_PARENT,
+    )
+    if paused:
+        state.record_pause("scripted pause", "ticket-tree", None)
+    save_state(root / runs.RUNS_DIR / run_id, state)
+
+
+@pytest.mark.parametrize(
+    ("run_type", "paused", "live", "why", "status"),
+    [
+        ("story", False, "alive", "run-live", "running"),
+        ("story", False, "unknown", "run-live", "unknown"),
+        ("sweep", False, "alive", "run-live", "running"),
+        ("story", True, "dead", "run-unfinished", "paused"),
+        ("story", False, "dead", "run-unfinished", "interrupted"),
+    ],
+    ids=["live", "maybe-live", "live-sweep", "paused", "interrupted"],
+)
+def test_run_leaves_a_drained_child_open_while_a_run_holds_it(
+    project, monkeypatch, capsys, run_type, paused, live, why, status
+):
+    """A drained AUTH whose recorded run is live — or a build run of it that is
+    paused or interrupted, which a resume drives on — is not closed: the skip is
+    printed, AUTH is passed over `drained`, and BILLING still waits on it.
+    Ablation (performed): drop the held-run check and AUTH is closed and BILLING
+    launched — an unscripted run — so this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, [])
+    root = project.project
+    _drain_child(root, CHAIN_AUTH)
+    run_id = "20990101-000000-0001"
+    _record_child_run(root, run_id, run_type=run_type, paused=paused)
+    monkeypatch.setattr(runs, "liveness", lambda _run_dir: live)
+
+    assert cli.main(["run", "--project", str(root)]) == 0
+
+    out = capsys.readouterr().out
+    assert built == [] and not _initiative_status(project, CHAIN_AUTH)
+    assert (
+        f"initiative chain {CHAIN_PARENT}: leaves {CHAIN_AUTH} open ({why}: run {run_id} "
+        f"is {status})"
+    ) in out
+    assert f"initiative chain {CHAIN_PARENT}: ends (waiting)" in out
+
+
+@pytest.mark.parametrize("stage", ["paused", "stopped"])
+def test_run_closes_a_drained_child_whose_only_unfinished_run_is_a_dead_sweep(
+    project, monkeypatch, capsys, stage
+):
+    """A sweep of AUTH that is not live holds nothing: it works the ledger and its
+    resume does not go on with the chain, so AUTH is closed and BILLING built.
+    Ablation (performed): let every unfinished sweep hold its child and BILLING
+    never launches — this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, ["drain"])
+    root = project.project
+    _drain_child(root, CHAIN_AUTH)
+    _record_child_run(root, "20990101-000000-0001", run_type="sweep", paused=stage == "paused")
+    if stage == "stopped":
+        state_file = root / runs.RUNS_DIR / "20990101-000000-0001" / "state.json"
+        doc = json.loads(state_file.read_text(encoding="utf-8"))
+        state_file.write_text(json.dumps({**doc, "stopped": True}), encoding="utf-8")
+    monkeypatch.setattr(runs, "liveness", lambda _run_dir: "dead")
+
+    assert cli.main(["run", "--project", str(root)]) == 0
+
+    assert [s.initiative for _, s, _ in built] == [CHAIN_BILLING]
+    assert _initiative_status(project, CHAIN_AUTH)
+
+
+def test_pre_pick_close_skips_a_drained_child_whose_store_is_refused(project, monkeypatch, capsys):
+    """A drained child whose store tickets runs now refuse is left open with the
+    refusal journaled (`store-refused`) rather than written into a store the chain
+    could not launch or commit in. Ablation (performed): drop the store judgement
+    and AUTH is marked — this FAILS."""
+    from bmad_loop import ticketstore
+
+    _chain_project(project, monkeypatch, capsys, [])
+    root = project.project
+    _drain_child(root, CHAIN_AUTH)
+    paths = bmadconfig.load_paths(root, want_tickets=True)
+    pol = cli.policy_mod.load(cli._policy_path(root))
+    refusal = ticketstore.StoreRefusal("partial-tracking", root, "x.md")
+    monkeypatch.setattr(ticketstore, "assess_store", lambda *_a, **_k: refusal)
+    log = cli._ChainStartLog()
+
+    assert cli._close_drained_children(root, paths, pol, CHAIN_PARENT, log) is None
+
+    (row,) = log.rows
+    assert _row(row, "parent", "slug", "why", "blocking_run") == {
+        "kind": "initiative-close-skipped",
+        "parent": CHAIN_PARENT,
+        "slug": CHAIN_AUTH,
+        "why": "store-refused",
+        "blocking_run": "",
+    }
+    assert row["detail"] == ticketstore.store_topology_conflict(refusal)
+    assert not _initiative_status(project, CHAIN_AUTH)
 
 
 def test_chain_driver_ignores_a_chained_childs_sweep(project, monkeypatch):

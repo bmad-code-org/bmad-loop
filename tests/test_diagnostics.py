@@ -1207,7 +1207,7 @@ def test_initiative_mark_aliases_slugs_and_drops_the_file_path():
 
 
 def test_initiative_chain_rows_alias_every_slug_and_keep_their_tokens():
-    """The chain's three kinds name the parent and child initiatives as scalars and
+    """The chain's kinds name the parent and child initiatives as scalars and
     as lists: every slug aliases in the one `initiative` namespace (so the parent
     and `initiative-mark`'s `parent` read alike), the pass-over and end tokens and
     the prerequisite statuses and the previous run id stay readable, and `error`
@@ -1249,11 +1249,22 @@ def test_initiative_chain_rows_alias_every_slug_and_keep_their_tokens():
             "previous_child": auth,
         },
         {"kind": "initiative-mark", "parent": parent, "slug": auth, "outcome": "written"},
+        {
+            "kind": "initiative-close-skipped",
+            "parent": parent,
+            "slug": auth,
+            "why": "run-unfinished",
+            "blocking_run": "20261028-000000-cafe",
+            "detail": f"run in /home/acme/{auth} is paused",
+        },
     ]
 
-    nxt, end, link, mark = (diagnostics._scrub_entry(r, pseudo, {}, None) for r in rows)
+    nxt, end, link, mark, skipped = (diagnostics._scrub_entry(r, pseudo, {}, None) for r in rows)
 
-    assert "acme" not in json.dumps([nxt, end, link, mark])
+    assert "acme" not in json.dumps([nxt, end, link, mark, skipped])
+    assert (skipped["parent"], skipped["slug"]) == (mark["parent"], mark["slug"])
+    assert (skipped["why"], skipped["blocking_run"]) == ("run-unfinished", "20261028-000000-cafe")
+    assert "detail" not in skipped
     assert nxt["parent"] == end["parent"] == link["parent"] == mark["parent"]
     assert nxt["from_child"] == nxt["passed_over"][0] == link["previous_child"] == mark["slug"]
     assert nxt["to_child"] == end["waiting"][0] != nxt["from_child"]
