@@ -2677,7 +2677,10 @@ def _warn_preflight_would_abort(
     ``require_sweep`` (the sweep dry-run) also mirrors `_require_sweep_skill`:
     the triage tree's ``bmad-loop-sweep`` is a sweep-only gate, so a story-run
     preview must not promise an abort over it. ``require_tickets`` (the tickets
-    dry-run) mirrors `_require_base_skills`' ``require_tickets`` finding set.
+    dry-run) mirrors `_require_base_skills`' ``require_tickets`` finding set and
+    the tickets preflight's refusal of a parent initiative
+    (`install.tickets_parent_problems`: one the isolation or retrospective setting
+    cannot chain, or a child store it refuses).
     Both mirror the store-topology refusal (`_reject_store_topology`) the real
     command applies: a tickets run's store, and the store of the source a sweep
     works.
@@ -2700,6 +2703,13 @@ def _warn_preflight_would_abort(
         )
         if p.severity == "problem"
     ]
+    if require_tickets:
+        problems += [
+            p.message
+            for p in install.tickets_parent_problems(
+                paths, pol.scm.isolation, pol.gates.retrospective
+            )
+        ]
     # the store the launch judges: a tickets run's, or the one a sweep works
     store_source = (
         worksource.SOURCE_TICKETS
@@ -4245,12 +4255,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # A parent initiative has no tickets of its own: the run builds its children,
         # one run each, starting with the first one `next <parent>` can start.
         if args.epic is not None or args.story:
-            print(
-                f"error: initiative {parent!r} is a parent initiative: --epic and --story "
-                "select within one initiative — set `[core] active_initiative` to the "
-                "child to scope a run",
-                file=sys.stderr,
-            )
+            print(_chain_selector_refusal(parent), file=sys.stderr)
             return 1
         try:
             # A child a stopped, interrupted or crashed chain left drained and open,
@@ -4422,6 +4427,16 @@ def _chain_parent(paths: bmadconfig.ProjectPaths) -> str | int | None:
     return None if children is None else paths.active_initiative
 
 
+def _chain_selector_refusal(parent: str) -> str:
+    """Why ``run`` (and its dry run) refuses ``--epic``/``--story`` on the parent
+    initiative ``parent``."""
+    return (
+        f"error: initiative {parent!r} is a parent initiative: --epic and --story "
+        "select within one initiative — set `[core] active_initiative` to the "
+        "child to scope a run"
+    )
+
+
 def _chain_ticket_tree(
     project: Path, parent: str, folder: Path | None = None
 ) -> tickettree.TicketTree:
@@ -4442,16 +4457,21 @@ def _fresh_pick(
 
 
 def _chain_pick(
-    project: Path, paths: bmadconfig.ProjectPaths, parent: str
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    parent: str,
+    view: ticketmodel.ParentView | None = None,
 ) -> initiativechain.ChildPick:
     """The next child of the parent initiative ``parent`` (``paths`` are the
-    parent's): :func:`initiativechain.next_child` over ``next <parent>``, passing
-    over as ``drained`` a ready child whose fresh pick (:func:`_fresh_pick`) finds
-    nothing to dispatch. Raises :class:`tickettree.TicketsError` on a tree fault and
-    ValueError on a child slug that is no folder name."""
+    parent's): :func:`initiativechain.next_child` over ``next <parent>`` (``view``
+    when the caller already read it), passing over as ``drained`` a ready child
+    whose fresh pick (:func:`_fresh_pick`) finds nothing to dispatch. Reads only.
+    Raises :class:`tickettree.TicketsError` on a tree fault and ValueError on a
+    child slug that is no folder name."""
     folder = paths.initiative_folder
     assert folder is not None  # _chain_parent
-    view = _chain_ticket_tree(project, parent).parent_next(folder)
+    if view is None:
+        view = _chain_ticket_tree(project, parent).parent_next(folder)
 
     def drained(child: ticketmodel.ChildInitiative) -> str | None:
         tree = _chain_ticket_tree(
@@ -5187,13 +5207,114 @@ def _predicted_pause(decision: tickets_source.PickDecision, max_stories: int | N
 def _dry_run_tickets(
     paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, spec_folder: str
 ) -> int:
-    """Print what a tickets run would dispatch from the active initiative: the
-    startable tickets in build order with their dispatch lines, the pause a fresh
-    run would reach first, the group counts and the tree's problems. Reads the
-    tree with ``tickets.py next``/``status`` only — it never marks a ticket."""
+    """Print what a tickets run would dispatch from the active initiative
+    (:func:`_dry_run_ticket_block`), or, on a parent initiative, the chain it
+    would build (:func:`_dry_run_chain`). Reads only — it never marks a ticket."""
     _warn_preflight_would_abort(paths, pol, require_tickets=True)
     _warn_bypass_dropped(pol, paths.project, ("dev", "review"))
-    tree = tickettree.TicketTree(paths.project)
+    parent = _chain_parent(paths)
+    if isinstance(parent, int):
+        return parent
+    if parent is not None:
+        return _dry_run_chain(paths, pol, args, parent)
+    return _dry_run_ticket_block(paths, pol, args, tickettree.TicketTree(paths.project))
+
+
+def _chain_child_tag(child: ticketmodel.ChildInitiative, pick: initiativechain.ChildPick) -> str:
+    """The dry run's tag for one child of a parent initiative: ``next`` (the child
+    the run builds first), ``done``/``dropped``, ``drained (the run closes it
+    first)`` (``initiativechain.drained``), ``waiting``, ``no folder``, or
+    ``ready`` (with why the pick passed it over, when it did)."""
+    if pick.child is not None and child.slug == pick.child.slug:
+        return "next"
+    if child.status in ("done", "dropped"):
+        return child.status
+    if initiativechain.drained(child):
+        return "drained (the run closes it first)"
+    if not child.ready:
+        return "waiting"
+    if child.folder is None:
+        return "no folder"
+    why = next((p.why for p in pick.passed_over if p.slug == child.slug), None)
+    return "ready" if why is None else f"ready, passed over ({why})"
+
+
+def _dry_run_chain(
+    paths: bmadconfig.ProjectPaths, pol, args: argparse.Namespace, parent: str
+) -> int:
+    """Print the chain a run of the parent initiative ``parent`` would build: its
+    children in build order, each with its status, ticket counts, what it waits on
+    and its tag (:func:`_chain_child_tag`); the first child's tickets block
+    (:func:`_dry_run_ticket_block`, read through that child's folder); and the
+    chain's predicted line. When no child can start, the line ``cmd_run`` ends the
+    chain with stands in for the block.
+
+    Never writes: the run's first step, closing drained children
+    (:func:`_close_drained_children`), is not taken or simulated, so the pick is
+    the one the tree reads now, and the predicted line names the children the run
+    closes before its first pick. ``--max-stories`` caps the first child's
+    listing; the cap's spend across later children is not predicted."""
+    if args.epic is not None or args.story:
+        print(_chain_selector_refusal(parent), file=sys.stderr)
+        return 1
+    project = paths.project
+    folder = paths.initiative_folder
+    assert folder is not None  # _chain_parent
+    try:
+        view = _chain_ticket_tree(project, parent).parent_next(folder)
+        pick = _chain_pick(project, paths, parent, view)
+        child_paths = None if pick.child is None else paths.with_initiative(pick.child.slug)
+    except tickettree.TicketsError as e:
+        print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f"tickets mode: initiative chain {parent}: {e}", file=sys.stderr)
+        return 1
+    print(
+        f"tickets mode: parent initiative {parent} — {len(view.initiatives)} children "
+        "in build order:"
+    )
+    for position, child in enumerate(view.initiatives, 1):
+        status = initiativechain.prerequisite_status(view, child.slug)
+        if child.folder is not None:
+            closed, total = initiativechain.closed_tickets(child), child.counts.get("total", 0)
+            status += f"; {closed} of {total} tickets closed"
+        waits = ", ".join(
+            f"{p} ({initiativechain.prerequisite_status(view, p)})" for p in child.waiting_on
+        )
+        line = f"  {position}. {child.slug}  ({status})  [{_chain_child_tag(child, pick)}]"
+        print(line + (f"  waits on: {waits}" if waits else ""))
+    closing = [c.slug for c in view.initiatives if initiativechain.drained(c)]
+    closes = (
+        f"; the run closes drained {', '.join(closing)} before its first pick, "
+        "which this preview does not simulate"
+        if closing
+        else ""
+    )
+    if pick.child is None or child_paths is None:
+        print(f"\npredicted: {_chain_end_line(parent, pick.end or '', pick)}{closes}")
+        return 0
+    print()
+    tree = _chain_ticket_tree(project, parent, child_paths.initiative_folder)
+    if (rc := _dry_run_ticket_block(child_paths, pol, args, tree)) != 0:
+        return rc
+    print(
+        f"predicted: chain starts with {pick.child.slug}; later children are chosen "
+        f"as each finishes{closes}"
+    )
+    return 0
+
+
+def _dry_run_ticket_block(
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    args: argparse.Namespace,
+    tree: tickettree.TicketTreeLike,
+) -> int:
+    """Print what a tickets run of ``paths``' active initiative would dispatch,
+    read through ``tree``: the startable tickets in build order with their
+    dispatch lines, the pause a fresh run would reach first, the group counts and
+    the tree's problems. Reads the tree with ``tickets.py next``/``status`` only."""
     try:
         next_view = tree.next()
         status_view = tree.status()

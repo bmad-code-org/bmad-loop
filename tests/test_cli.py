@@ -15906,6 +15906,151 @@ def test_dry_run_tickets_never_writes(project, capsys, monkeypatch):
     assert not runs_dir.exists() or not any(runs_dir.iterdir())
 
 
+def _chain_dry_run(project, monkeypatch, capsys, *argv):
+    """`run --dry-run` on the chain project with every write path refused: the tree's
+    write verbs and the drained-child close. Returns ``(rc, out, err, written)``,
+    ``written`` the ``git status --porcelain`` after (the initiative files, a
+    child's closure and its commit included)."""
+    from bmad_loop import tickettree
+
+    def refuse(*_a, **_k):
+        raise AssertionError("the dry run reached a write")
+
+    for verb in ("mark", "mark_initiative_done", "discard_unbuilt_plan", "restore_preimage"):
+        monkeypatch.setattr(tickettree.TicketTree, verb, refuse)
+    monkeypatch.setattr(cli, "_close_drained_children", refuse)
+    files = [
+        v7_layout(project.project, initiative=slug).initiative_folder / f"{slug}.md"
+        for slug in (CHAIN_PARENT, CHAIN_AUTH, CHAIN_BILLING)
+    ]
+    before = [f.read_bytes() for f in files]
+    head = git(project.project, "rev-parse", "HEAD")
+    rc = cli.main(["run", "--project", str(project.project), "--dry-run", *argv])
+    assert [f.read_bytes() for f in files] == before
+    assert git(project.project, "rev-parse", "HEAD") == head
+    assert not (project.project / runs.RUNS_DIR).exists()
+    out, err = capsys.readouterr()
+    return rc, out, err, git(project.project, "status", "--porcelain")
+
+
+def test_dry_run_tickets_parent_previews_the_chain(project, monkeypatch, capsys):
+    """`run --dry-run` on a parent initiative lists its children in build order —
+    AUTH tagged `next`, BILLING `waiting` on it — then AUTH's own tickets block,
+    read through AUTH's folder by the same printer a one-initiative dry run uses,
+    and the chain's predicted line; it writes nothing (real `tickets.py`).
+    Ablation (performed): drop `_dry_run_tickets`' parent branch and the unpinned
+    tree refuses the parent — exit 1 — so this FAILS."""
+    _chain_project(project, monkeypatch, capsys, [])
+
+    rc, out, err, written = _chain_dry_run(project, monkeypatch, capsys)
+
+    assert rc == 0, err
+    assert written == ""
+    lines = out.splitlines()
+    assert lines[:3] == [
+        f"tickets mode: parent initiative {CHAIN_PARENT} — 2 children in build order:",
+        f"  1. {CHAIN_AUTH}  (open; 0 of 4 tickets closed)  [next]",
+        f"  2. {CHAIN_BILLING}  (open; 0 of 4 tickets closed)  [waiting]  "
+        f"waits on: {CHAIN_AUTH} (open)",
+    ]
+    assert f"tickets mode: initiative {CHAIN_AUTH} — 1 ready of 4 tickets" in out
+    assert '"/bmad-build-auto ticket 1.1 Halt after planning."' in out
+    assert "predicted: run would pause after planning 1.1 (plan-checkpoint)" in out
+    assert "groups: ready_to_refine=0 ready_to_start=1" in out
+    assert lines[-1] == (
+        f"predicted: chain starts with {CHAIN_AUTH}; later children are chosen as each " "finishes"
+    )
+
+
+def test_dry_run_tickets_parent_tags_a_drained_child_and_closes_nothing(
+    project, monkeypatch, capsys
+):
+    """AUTH drained but its initiative not yet `done`: the real run would close it
+    and then build BILLING. The dry run never writes, so it tags AUTH `drained (the
+    run closes it first)`, picks as the unclosed tree reads — BILLING still waits,
+    so the chain ends `waiting` with no tickets block — and says the run closes AUTH
+    before its first pick. Ablation (performed): drop the `drained` tag and AUTH
+    reads `ready, passed over (drained)` — this FAILS."""
+    _chain_project(project, monkeypatch, capsys, [])
+    _drain_child(project.project, CHAIN_AUTH)
+
+    rc, out, err, written = _chain_dry_run(project, monkeypatch, capsys)
+
+    assert rc == 0, err
+    assert written == ""
+    assert (
+        f"  1. {CHAIN_AUTH}  (open; 4 of 4 tickets closed)  [drained (the run closes it first)]\n"
+        in out
+    )
+    assert f"  2. {CHAIN_BILLING}  (open; 0 of 4 tickets closed)  [waiting]" in out
+    assert "build order (" not in out
+    end = (
+        f"initiative chain {CHAIN_PARENT}: ends (waiting) — waiting: {CHAIN_BILLING} on "
+        f"{CHAIN_AUTH} (open) (passed over: {CHAIN_AUTH} (drained))"
+    )
+    assert out.splitlines()[-1] == (
+        f"predicted: {end}; the run closes drained {CHAIN_AUTH} before its first pick, "
+        "which this preview does not simulate"
+    )
+    assert not _initiative_status(project, CHAIN_AUTH)
+
+
+@pytest.mark.parametrize("selector", [["--epic", "epic-cart"], ["--story", "1.1"]])
+def test_dry_run_tickets_parent_refuses_epic_and_story(project, monkeypatch, capsys, selector):
+    """`--epic`/`--story` on a parent: the dry run refuses with `run`'s own text and
+    exit 1, printing no preview. Ablation (performed): drop the dry run's refusal
+    and it previews the chain with exit 0 — this FAILS."""
+    _chain_project(project, monkeypatch, capsys, [])
+
+    rc, out, err, _ = _chain_dry_run(project, monkeypatch, capsys, *selector)
+
+    assert rc == 1
+    assert cli._chain_selector_refusal(CHAIN_PARENT) + "\n" in err
+    assert out == ""
+
+
+def test_dry_run_tickets_parent_with_nothing_to_build_prints_the_end(project, monkeypatch, capsys):
+    """Both children done: the predicted line is the end line `run` prints
+    (`all-done`), with no tickets block, and exit 0. Ablation (performed): drop the
+    no-child branch and the preview reads a child that is not there — this FAILS."""
+    _chain_project(project, monkeypatch, capsys, [])
+    for slug in (CHAIN_AUTH, CHAIN_BILLING):
+        file = v7_layout(project.project, initiative=slug).initiative_folder / f"{slug}.md"
+        file.write_text(
+            file.read_text(encoding="utf-8").replace(
+                "parent: none\n", "parent: none\nstatus: done\n"
+            ),
+            encoding="utf-8",
+        )
+    git(project.project, "commit", "-qam", "children done")
+
+    rc, out, err, written = _chain_dry_run(project, monkeypatch, capsys)
+
+    assert rc == 0, err
+    assert written == ""
+    assert f"  1. {CHAIN_AUTH}  (done; 0 of 4 tickets closed)  [done]" in out
+    assert "build order (" not in out
+    assert out.splitlines()[-1] == f"predicted: initiative chain {CHAIN_PARENT}: ends (all-done)"
+
+
+def test_dry_run_tickets_parent_warns_without_worktree_isolation(project, monkeypatch, capsys):
+    """Under `isolation = "none"` the real run refuses a parent at preflight
+    (`tickets.initiative-parent`); the dry run still previews the chain and its
+    banner names that refusal. Ablation (performed): drop the banner's
+    `tickets_parent_problems` mirror and the warning is absent — this FAILS."""
+    _chain_project(project, monkeypatch, capsys, [], policy=TICKETS_POLICY)
+
+    rc, out, err, _ = _chain_dry_run(project, monkeypatch, capsys)
+
+    assert rc == 0
+    assert "note: this preview is NOT runnable as-is" in err
+    assert (
+        f"  FAIL: active initiative {CHAIN_PARENT!r} is a parent initiative (children: "
+        f'{CHAIN_AUTH}, {CHAIN_BILLING}) and `[scm] isolation = "none"`' in err
+    )
+    assert f"predicted: chain starts with {CHAIN_AUTH}" in out
+
+
 def test_run_tickets_launches_tickets_engine(project, capsys, monkeypatch):
     """A tickets project that validates runs: the tickets preflight passes (its
     capability probe executes the vendored script — 2 real spawns), and `run`
@@ -16078,9 +16223,10 @@ def _drain_child(root, slug, *, epics=True):
     git(root, "commit", "-q", "-m", f"build {slug}")
 
 
-def _chain_project(project, monkeypatch, capsys, outcomes):
-    """Every gate green on the parent layout, and `cli.TicketsEngine` playing one of
-    ``outcomes`` per run, in order (a run past the script fails the test):
+def _chain_project(project, monkeypatch, capsys, outcomes, *, policy=None):
+    """Every gate green on the parent layout (under ``policy``, default
+    `CHAIN_POLICY`), and `cli.TicketsEngine` playing one of ``outcomes`` per run,
+    in order (a run past the script fails the test):
 
     * ``drain`` — every ticket and epic of the run's child closed and committed,
       one task landed, the run finished;
@@ -16098,7 +16244,7 @@ def _chain_project(project, monkeypatch, capsys, outcomes):
         project,
         monkeypatch,
         capsys,
-        policy=CHAIN_POLICY,
+        policy=CHAIN_POLICY if policy is None else policy,
         skills=install_build_auto_v7_skill,
         bmad_config=_chain_config,
     )

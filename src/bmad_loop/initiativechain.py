@@ -90,6 +90,11 @@ class ChildPick:
     waiting_on: tuple[WaitingOn, ...] = ()
 
 
+def closed_tickets(child: ChildInitiative) -> int:
+    """How many of ``child``'s tickets are done or dropped (0 without a folder)."""
+    return sum(child.counts.get(state, 0) for state in TICKET_CLOSED_STATES)
+
+
 def drained(child: ChildInitiative) -> bool:
     """Whether ``child`` is open with every ticket closed: it has a folder, is not
     done or dropped, and counts at least one ticket, all done or dropped — the
@@ -97,8 +102,7 @@ def drained(child: ChildInitiative) -> bool:
     if child.folder is None or child.status in _CLOSED:
         return False
     total = child.counts.get("total", 0)
-    closed = sum(child.counts.get(state, 0) for state in TICKET_CLOSED_STATES)
-    return total > 0 and closed == total
+    return total > 0 and closed_tickets(child) == total
 
 
 def prerequisite_status(view: ParentView, slug: str) -> str:

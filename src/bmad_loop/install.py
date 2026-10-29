@@ -993,6 +993,26 @@ def _tickets_parent_findings(
     ]
 
 
+def tickets_parent_problems(
+    paths: bmadconfig.ProjectPaths, isolation: str, retrospective: str | None
+) -> list[Finding]:
+    """The problems :func:`tickets_preflight` refuses a parent active initiative
+    with (:func:`_tickets_parent_findings`: ``tickets.initiative-parent`` and the
+    store of a child it refuses), or the fault that kept the parent read from
+    answering — for a caller that does not run the whole preflight (the dry-run
+    banner). Empty when the active initiative is no parent."""
+    folder = paths.initiative_folder
+    if paths.era != "v7" or folder is None or not paths.active_initiative:
+        return []
+    children, breakdown, fault = _initiative_children(folder)
+    if fault:
+        return [_probe_unreadable("tickets.initiative-parent", str(breakdown), fault)]
+    if children is None:
+        return []
+    findings = _tickets_parent_findings(paths, children, isolation, retrospective, (), ())
+    return [f for f in findings if f.severity == "problem"]
+
+
 def tickets_preflight(
     paths: bmadconfig.ProjectPaths,
     trees: Sequence[str],
