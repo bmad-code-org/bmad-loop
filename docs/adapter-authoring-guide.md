@@ -572,7 +572,8 @@ return to the agent as an error. The shipped mappings, both for `linux` and `dar
   `default_permissions`, so git add and commit work in a worktree checkout. `validate`
   warns about sandboxed Codex under `scm.isolation = "worktree"` only when that grant
   cannot ride: an `extra_args` override, or a profile whose mode declares no
-  `linked_worktree_args`.
+  `linked_worktree_args` or a grant that names only one of `{gitdir}` and `{common_dir}`
+  (Codex needs both to commit).
 
 The sandbox confines the session, not what bmad-loop later runs from the checkout. Both
 mappings leave `.git` writable, hooks and config included, and the orchestrator runs

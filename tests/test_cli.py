@@ -13545,6 +13545,52 @@ def test_permission_posture_warns_a_codex_mode_without_a_worktree_grant(monkeypa
     assert "drop extra_args" not in finding.message
 
 
+@pytest.mark.parametrize(
+    ("grant", "unnamed", "read_only"),
+    [
+        (
+            ("-c", "filesystem={{gitdir}=1}"),
+            "{common_dir}",
+            "sandbox keeps the main repo's .git read-only",
+        ),
+        (
+            ("-c", "filesystem={{common_dir}=1}"),
+            "{gitdir}",
+            "sandbox keeps the linked worktree's gitdir (under the main repo's "
+            ".git/worktrees/) read-only",
+        ),
+    ],
+    ids=["gitdir-only", "common-dir-only"],
+)
+def test_permission_posture_warns_a_codex_grant_missing_a_placeholder(
+    monkeypatch, grant, unnamed, read_only
+):
+    """Codex commits in a linked worktree only with both the gitdir and the common
+    dir writable, and profile validation accepts a grant naming just one: a warning
+    naming the missing placeholder and the path left read-only, not the ok line.
+
+    ABLATION: drop the `unnamed` arm and both rows report ok."""
+    from bmad_loop.adapters.profile import get_profile
+
+    codex = get_profile("codex")
+    partial = dataclasses.replace(
+        codex,
+        permission_modes={
+            "sandboxed": dataclasses.replace(
+                codex.permission_modes["sandboxed"], linked_worktree_args=grant
+            )
+        },
+    )
+    (finding,) = _posture(monkeypatch, "linux", partial, "sandboxed", isolation="worktree")
+    assert (finding.check, finding.severity) == ("adapter.permission-mode", "warning")
+    assert f"linked_worktree_args grant names no {unnamed}," in finding.message
+    assert read_only in finding.message
+    assert finding.message.endswith(
+        'grant both {gitdir} and {common_dir}, or use scm.isolation = "none" or '
+        'permission_mode = "bypass" for this role'
+    )
+
+
 def _stub_launch_probe(monkeypatch, *results):
     """Replace the launch-screen probe (the seam: no multiplexer, no CLI) with one
     answering ``results`` in turn; returns the recorded calls."""

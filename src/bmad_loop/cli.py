@@ -2273,11 +2273,14 @@ def _report_permission_mode(
     linked worktree's gitdir (under the main repo's ``.git/worktrees/``) and the
     common dir read-only otherwise, so the dev skill's preflight and commit fail.
     The role is ok when its launch carries that grant (the resolved profile
-    declares it and ``cfg.extra_args`` is None). It warns when the grant cannot
-    ride: the resolved profile declares none, or a non-None ``extra_args`` (``()``
-    included) replaces the mode's args, and the grant with them, as
-    ``GenericAdapter.interactive_argv`` does."""
-    from .adapters.profile import ProfileError
+    declares it, naming both ``{gitdir}`` and ``{common_dir}``, and
+    ``cfg.extra_args`` is None). It warns when the grant cannot ride: the resolved
+    profile declares none, or a non-None ``extra_args`` (``()`` included) replaces
+    the mode's args, and the grant with them, as
+    ``GenericAdapter.interactive_argv`` does. It also warns when the grant omits
+    either placeholder: Codex needs both paths writable to commit, while profile
+    validation accepts one, as other CLIs may need less."""
+    from .adapters.profile import LINKED_WORKTREE_PLACEHOLDERS, ProfileError
 
     mode = cfg.permission_mode
     detail: dict[str, object] = {
@@ -2309,9 +2312,27 @@ def _report_permission_mode(
         report.ok("adapter.permission-mode", message, detail)
     elif isolation == "worktree" and profile.hooks.dialect == "codex-hooks-json":
         fallback = 'use scm.isolation = "none" or permission_mode = "bypass"'
+        gitdir_ro = "the linked worktree's gitdir (under the main repo's .git/worktrees/)"
+        common_ro = "the main repo's .git"
+        read_only = f"{gitdir_ro} and {common_ro}"
+        unnamed = [
+            p
+            for p in LINKED_WORKTREE_PLACEHOLDERS
+            if not any(p in arg for arg in resolved.linked_worktree_args)
+        ]
         if not resolved.linked_worktree_args:
             why = f"its [permission_modes.{mode}] declares no linked_worktree_args grant"
             fix = fallback
+        elif unnamed:
+            why = (
+                f"its [permission_modes.{mode}] linked_worktree_args grant names no "
+                f"{' or '.join(unnamed)}"
+            )
+            fix = f"grant both {{gitdir}} and {{common_dir}}, or {fallback}"
+            if unnamed == ["{common_dir}"]:
+                read_only = common_ro
+            elif unnamed == ["{gitdir}"]:
+                read_only = gitdir_ro
         elif cfg.extra_args is not None:
             why = (
                 "adapter.extra_args replaces the mode's args, dropping their "
@@ -2329,9 +2350,8 @@ def _report_permission_mode(
         report.warn(
             "adapter.permission-mode",
             f"{profile.name} {role}: {mode} under scm.isolation=worktree — {why}, so the "
-            "sandbox keeps the linked worktree's gitdir (under the main repo's "
-            f".git/worktrees/) and the main repo's .git read-only and git add/commit fail "
-            f"in isolated sessions; {fix} for this role",
+            f"sandbox keeps {read_only} read-only and git add/commit fail in isolated "
+            f"sessions; {fix} for this role",
             detail,
         )
     else:

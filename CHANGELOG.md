@@ -237,8 +237,8 @@ breaking changes may land in a minor release.
   (`provider.auth`) and unroutable models (`provider.no-route`) as environment faults
   instead of charging the session as a code failure.
 - Let sandboxed Codex sessions commit under worktree isolation: grant them write access to
-  the linked worktree's gitdir and the main repo's `.git`. `validate` no longer warns
-  unless `extra_args` drops the grant.
+  the linked worktree's gitdir and the main repo's `.git`. `validate` warns only when
+  `extra_args` drops the grant or the profile's grant misses either path.
 - Pause a tickets resume at `ticket-tree` (`binding-moved`) when an in-flight unit's ticket
   was moved with `tickets.py move` or its plan is gone, naming the old and new ref and plan,
   instead of re-dispatching a ref the tree no longer holds (DW-575).
