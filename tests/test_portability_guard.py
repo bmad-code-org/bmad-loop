@@ -596,6 +596,11 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # by name.
     "ticket-mark": frozenset({"before", "after", "outcome", "created"}),
     "ticket-plan-restored": frozenset({"before", "after", "outcome"}),
+    # tickettree.py: a child initiative's `status` tokens (`?` when unreadable)
+    # and a closed outcome slug. `parent`/`slug` are aliased by
+    # `diagnostics._JOURNAL_KIND_ALIAS_FIELDS`; `file` collapses to presence under
+    # `diagnostics._JOURNAL_KIND_SCHEMAS`.
+    "initiative-mark": frozenset({"before", "after", "outcome"}),
     # runs.py: whether the re-arm moved its restore latch onto the evacuated copy.
     # `patch` and `stashed_to` are dropped by name.
     "restore-patch-evacuated": frozenset({"latched"}),
@@ -2243,9 +2248,10 @@ JOURNAL_KINDS = frozenset(
         "ticket-status-write-refused",
         # tickettree.py — the ticket-plan chokepoint: one `ticket-mark` per
         # mark/discard call (any outcome), one `ticket-plan-restored` per
-        # byte-exact restore.
+        # byte-exact restore, one `initiative-mark` per child-initiative close.
         "ticket-mark",
         "ticket-plan-restored",
+        "initiative-mark",
         # worktree_flow.py
         "accepted-spec-delivery-unreachable",
         "accepted-spec-write-unreachable",
@@ -10353,9 +10359,11 @@ def test_journal_routing_tables_are_read_from_diagnostics():
         # can neither name a field nothing produces nor quietly introduce one that
         # bypassed the routed/benign decision. `type` and `severity` reach the
         # journal only through the allowlisted splat, so the inventory there is
-        # where they are declared.
+        # where they are declared. A benign row on this kind alone accounts for the
+        # name on this kind's schema only.
         unaccounted = names - JOURNAL_ROUTED_FIELDS - JOURNAL_BENIGN_FIELDS
         unaccounted -= frozenset().union(*JOURNAL_SPLAT_FIELDS.values())
+        unaccounted -= JOURNAL_KIND_BENIGN_FIELDS.get(kind, frozenset())
         assert unaccounted == set(), (
             f"{kind}'s declared schema names fields the guard does not account for: "
             f"{sorted(unaccounted)}"

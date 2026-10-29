@@ -7,11 +7,14 @@ from bmad_loop.statemachine import (
     PLAN_AWAITING_OPERATOR,
     PLAN_STATUS_ORDER,
     PLAN_TRANSITIONS,
+    TICKET_CLOSED_STATES,
     TRANSITIONS,
     IllegalTransition,
+    InitiativeCloseRefused,
     PlanTransitionRefused,
     advance,
     check_board_regression,
+    check_initiative_close,
     check_plan_transition,
 )
 from bmad_loop.ticketmodel import PLAN_STATUSES
@@ -428,3 +431,70 @@ def test_unknown_reason_is_refused():
         check_plan_transition(
             "1.1", "built", "done", "promote", has_plan=True, blocked_reason=""  # type: ignore[arg-type]
         )
+
+
+# ---- child initiative close ---------------------------------------------------
+
+
+def _close(current: str, total: int, closed: int) -> str:
+    try:
+        return (
+            "write"
+            if check_initiative_close("auth", current, total=total, closed=closed)
+            else "noop"
+        )
+    except InitiativeCloseRefused:
+        return "refuse"
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [("", "write"), ("in-progress", "write"), ("done", "noop"), ("dropped", "refuse")],
+)
+def test_initiative_close_from_each_container_status(current, expected):
+    """A drained child closes from unset or in-progress, is a no-op when done, and
+    a dropped one is never reopened. Which rule refuses `dropped` is pinned by
+    the next row."""
+    assert _close(current, 4, 4) == expected
+
+
+def test_dropped_tickets_count_as_closed():
+    """A drain counts dropped tickets with done ones: the caller sums these."""
+    assert TICKET_CLOSED_STATES == {"done", "dropped"}
+
+
+def test_dropped_initiative_refused_as_final():
+    """Ablation: delete the dropped arm and the refusal comes from the open-status
+    check, so the `final` match reddens."""
+    with pytest.raises(InitiativeCloseRefused, match="a dropped initiative is final"):
+        check_initiative_close("auth", "dropped", total=4, closed=4)
+
+
+@pytest.mark.parametrize("current", ["", "in-progress"])
+@pytest.mark.parametrize(("total", "closed"), [(4, 3), (4, 0), (0, 0)])
+def test_initiative_close_refused_until_drained(current, total, closed):
+    """An open child with a ticket left open, or with no tickets at all, is not
+    drained. Ablation: delete the drained check and every row reddens."""
+    assert _close(current, total, closed) == "refuse"
+
+
+def test_initiative_close_done_is_a_noop_even_when_not_drained():
+    """`done` is answered before the drain: a closed child stays a no-op."""
+    assert _close("done", 4, 1) == "noop"
+
+
+@pytest.mark.parametrize("current", ["blocked", "built", "draft", "ready-for-dev", "none"])
+def test_initiative_close_refuses_any_other_status(current):
+    assert _close(current, 4, 4) == "refuse"
+
+
+def test_initiative_close_refused_is_an_illegal_transition():
+    with pytest.raises(IllegalTransition) as caught:
+        check_initiative_close("billing", "in-progress", total=3, closed=2)
+    err = caught.value
+    assert isinstance(err, InitiativeCloseRefused)
+    assert (err.slug, err.current) == ("billing", "in-progress")
+    assert str(err) == (
+        "billing: initiative in-progress -> done is not a legal close: "
+        "not drained: 2 of 3 tickets done or dropped"
+    )

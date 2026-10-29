@@ -304,6 +304,11 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     "ticket-refine-pause": {"ref": "ticket"},
     "ticket-pick-halt": {"ref": "ticket"},
     "ticket-story-approved": {"ref": "ticket"},
+    # A BMAD v7 initiative slug (the parent's and the closed child's folder names):
+    # the customer's initiative name, identifier-shaped, aliased in its own
+    # namespace so one initiative gets one alias. Kind-scoped: `parent` and `slug`
+    # are generic names.
+    "initiative-mark": {"parent": "initiative", "slug": "initiative"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
@@ -595,6 +600,12 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # recovery withhold) write `cycle` and `bundles_not_run`; `reason` is a DROP
     # field and `story_keys` a `_JOURNAL_KEYLIST_FIELDS` name, both reached first.
     "sweep-bundles-withheld": frozenset({"cycle", "bundles_not_run", "reason", "story_keys"}),
+    # `tickettree.TicketTree.mark_initiative_done`: `file` is the child initiative
+    # file's absolute host path, which the by-name benign `file` (a code-constant
+    # basename elsewhere) would ship through `scrub_json`; left off the schema, it
+    # collapses to `file_present`. `before`, `after` and `outcome` are closed
+    # status/outcome tokens; `parent`/`slug` are kind-aliased, which runs first.
+    "initiative-mark": frozenset({"before", "after", "outcome"}),
 }
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced

@@ -265,6 +265,25 @@ def test_set_frontmatter_field_inserts_without_introducing_a_foreign_line_ending
     assert verify.read_frontmatter(spec)["baseline_revision"] == "abc123"
 
 
+def test_set_frontmatter_field_keep_bom_edits_behind_a_byte_order_mark(tmp_path):
+    """A leading BOM hides the block unless `keep_bom` (a v7 file read as
+    `utf-8-sig`): then the key is inserted behind it and the BOM is kept.
+
+    Ablation: drop the BOM peel and the `keep_bom` call returns False."""
+    spec = tmp_path / "initiative.md"
+    original = "\ufeff---\ntype: initiative\n---\n\nbody\n".encode("utf-8")
+    spec.write_bytes(original)
+    assert verify.set_frontmatter_field(spec, "status", "done", confine_root=tmp_path) is False
+    assert spec.read_bytes() == original
+    assert (
+        verify.set_frontmatter_field(spec, "status", "done", confine_root=tmp_path, keep_bom=True)
+        is True
+    )
+    assert spec.read_bytes().decode("utf-8") == (
+        "\ufeff---\ntype: initiative\nstatus: done\n---\n\nbody\n"
+    )
+
+
 # --- set_frontmatter_field: atomic write (#379) ---
 #
 # Three rows for the three distinct choices at this call site — that it routes

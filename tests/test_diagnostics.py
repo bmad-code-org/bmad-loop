@@ -1173,6 +1173,39 @@ def test_ticket_mark_ref_is_pseudonymized():
     assert pseudo.entries() == [("ticket", "story-acme-vault-rotation", scrubbed["ref"])]
 
 
+def test_initiative_mark_aliases_slugs_and_drops_the_file_path():
+    """`initiative-mark` names two initiative folders and the closed child's file:
+    both slugs alias in one `initiative` namespace, the path collapses to presence,
+    and the status/outcome tokens stay readable.
+
+    Ablation: drop the kind's `_JOURNAL_KIND_SCHEMAS` row and `file` ships through
+    `scrub_json`; drop its alias row and the slugs ship verbatim."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    raw = {
+        "kind": "initiative-mark",
+        "parent": "initiative-acme-platform",
+        "slug": "initiative-acme-auth",
+        "file": "/home/acme/store/initiative-acme-auth/initiative-acme-auth.md",
+        "before": "in-progress",
+        "after": "done",
+        "outcome": "written",
+    }
+
+    scrubbed = diagnostics._scrub_entry(raw, pseudo, {}, None)
+
+    assert scrubbed["parent"].startswith("initiative-") and scrubbed["slug"].startswith(
+        "initiative-"
+    )
+    assert scrubbed["parent"] != scrubbed["slug"]
+    assert "file" not in scrubbed and scrubbed["file_present"] is True
+    assert (scrubbed["before"], scrubbed["after"], scrubbed["outcome"]) == (
+        "in-progress",
+        "done",
+        "written",
+    )
+    assert "acme" not in json.dumps(scrubbed)
+
+
 @pytest.mark.parametrize(
     "kind",
     [

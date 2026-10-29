@@ -62,28 +62,33 @@ token for journals and pauses:
   ``status``/``next`` view (its child initiatives, no tickets).
 
 Writes. :meth:`TicketTree.mark` is bmad-loop's sole write path to a plan's
-``status`` and ``blocked_*`` fields, and :meth:`TicketTree.restore_preimage`
-the sole byte-exact restore of a pre-image the same transaction captured
-(:meth:`TicketTree.discard_unbuilt_plan` deletes a plan that holds only
-frontmatter, for a rollback). All three hold the plan's advisory sidecar lock
-(``runs.lock_path_for(plan)``) for their whole read-decide-write-read-back,
-and every status write is decided by ``statemachine.check_plan_transition``
-under a :data:`~bmad_loop.statemachine.PlanWriteReason`. The lock is held across
-bounded child processes only (one ``find`` and at most one ``mark``, each under
+``status`` and ``blocked_*`` fields, :meth:`TicketTree.mark_initiative_done` the
+sole write path to a child initiative file's ``status`` (``done``, for a
+drained child of a chained run — no ``tickets.py`` verb writes it), and
+:meth:`TicketTree.restore_preimage` the sole byte-exact restore of a pre-image
+the same transaction captured, of either file (:meth:`TicketTree.discard_unbuilt_plan`
+deletes a plan that holds only frontmatter, for a rollback). All four hold the
+file's advisory sidecar lock (``runs.lock_path_for(<file>)``) for their whole
+read-decide-write-read-back. Every plan status write is decided by
+``statemachine.check_plan_transition`` under a
+:data:`~bmad_loop.statemachine.PlanWriteReason`, and an initiative close by
+``statemachine.check_initiative_close``. The lock is held across bounded child
+processes only (one ``find`` or ``next`` and at most one ``mark``, each under
 :data:`TICKETS_TIMEOUT_S`) and never across a session or a pause: the build
-skill writes plan status itself, so bmad-loop never marks while a session for
-that ticket is live. Two more errors belong to writes:
+skill writes plan status itself, so bmad-loop never marks a ticket, or closes
+a child, while a session for it is live. More errors belong to writes:
 
 - :class:`TicketsLockBusy` — the plan lock could not be acquired (Windows gives
   up after about 10 s; POSIX waits).
 - :class:`TicketsPlanMismatch` — ``find`` names a different plan than the one
   the caller expected, so the write could land on the wrong file.
 - :class:`TicketsTransitionRefused` — the transition table refused the write
-  (also a ``statemachine.PlanTransitionRefused``).
+  (also a ``statemachine.PlanTransitionRefused``); :class:`TicketsInitiativeRefused`
+  is the initiative-close twin (also a ``statemachine.InitiativeCloseRefused``).
 - :class:`TicketsReadBackMismatch` — the plan read back after a write does not
   hold what was written.
 - :class:`TicketsPlanIOError` — bmad-loop's own read, write or delete of the
-  plan file raised ``OSError``.
+  plan file raised ``OSError`` (or its edit of an initiative file failed).
 
 ``v6_key`` claims. :func:`read_v6_key_entries` is a native read of a field
 ``tickets.py`` ignores, not a reimplementation of the script: the v6→v7
@@ -125,7 +130,15 @@ from . import (
     ticketmodel,
 )
 from .process_host import ProcessHostError
-from .statemachine import PlanTransitionRefused, PlanWriteReason, check_plan_transition
+from .statemachine import (
+    INITIATIVE_DONE,
+    TICKET_CLOSED_STATES,
+    InitiativeCloseRefused,
+    PlanTransitionRefused,
+    PlanWriteReason,
+    check_initiative_close,
+    check_plan_transition,
+)
 from .ticketmodel import Capability, FindResult, NextView, ParentView, StatusView
 
 if TYPE_CHECKING:
@@ -238,6 +251,13 @@ class TicketsTransitionRefused(TicketsError, PlanTransitionRefused):
     kind = "refused"
 
 
+class TicketsInitiativeRefused(TicketsError, InitiativeCloseRefused):
+    """The initiative-close rule refused a write; nothing was written. Also an
+    instance of :class:`statemachine.InitiativeCloseRefused`."""
+
+    kind = "refused"
+
+
 class TicketsReadBackMismatch(TicketsError):
     """The plan read back after a write does not hold what was written."""
 
@@ -245,7 +265,9 @@ class TicketsReadBackMismatch(TicketsError):
 
 
 class TicketsPlanIOError(TicketsError):
-    """bmad-loop's own native read, write or delete of a plan raised ``OSError``."""
+    """bmad-loop's own native read, write or delete of a plan raised ``OSError``,
+    or of an initiative file failed (``OSError``, undecodable bytes, or a
+    ``status`` no line edit can safely move)."""
 
     kind = "plan-io"
 
@@ -277,6 +299,21 @@ class PlanMark:
     after: str
     outcome: str
     created: bool = False
+
+
+@dataclass(frozen=True)
+class InitiativeMark:
+    """What one :meth:`TicketTree.mark_initiative_done` did. ``before``/``after``
+    are the child's ``status`` (``""`` when unset); ``outcome`` is ``written`` or
+    ``noop``; ``preimage`` is the file's bytes before a ``written`` close (None on
+    a no-op), for :meth:`TicketTree.restore_preimage` to undo it."""
+
+    slug: str
+    file: Path
+    before: str
+    after: str
+    outcome: str
+    preimage: bytes | None = None
 
 
 @runtime_checkable
@@ -670,13 +707,108 @@ class TicketTree:
         )
         return result
 
+    def mark_initiative_done(self, parent: Path, slug: str, *, journal: Journal) -> InitiativeMark:
+        """Close the drained child initiative ``slug`` of the parent initiative
+        folder ``parent``: write ``status: done`` into the child's own file
+        ``<parent>/../<slug>/<slug>.md``, which no ``tickets.py`` verb writes —
+        bmad-loop's sole write path to a child initiative's ``status``.
+
+        Under the file's sidecar lock (``runs.lock_path_for``, as :meth:`mark`):
+        ``next <parent>`` (:meth:`parent_next`, pin-checked) must list ``slug``
+        with its folder, else :class:`TicketsPlanMismatch` (the cross-check
+        :meth:`mark` makes with ``find``); the child's ``status`` and ticket
+        ``counts`` from that view go to ``statemachine.check_initiative_close``
+        (:class:`TicketsInitiativeRefused` on a refusal); a write captures the
+        file's bytes, sets ``status`` natively, and reads it back, which must say
+        ``done`` (:class:`TicketsReadBackMismatch`). The result carries the
+        pre-image for :meth:`restore_preimage`. Every call journals one
+        ``initiative-mark`` (outcome ``written``, ``noop``, ``refused`` or
+        ``failed``) and every failure raises a :class:`TicketsError`.
+
+        Decision record — the edit and its confinement. The write goes through
+        ``verify.set_frontmatter_field``, not ``set_frontmatter_status``: an
+        unset child may carry no ``status:`` line at all, and only the former
+        inserts a missing key. ``keep_bom=True`` because the script reads the
+        file as ``utf-8-sig``: a BOM must neither hide the block nor be dropped.
+        ``confine_root`` is the folder holding the parent and its children
+        (``parent.parent``, where upstream's ``parent_view`` looks for each
+        child), not the project root: it contains the child file in the repo
+        store and in an external store alike, so both take the confined arm,
+        which walks ``<slug>/<slug>.md`` without following a link and refuses a
+        ``..``. The root itself is not pinned (no ``root_identity``): it is the
+        folder ``tickets.py`` just read, with the same trust."""
+        from . import verify  # lazy: verify carries the whole git surface
+
+        parent = Path(parent)
+        file = parent.parent / slug / f"{slug}.md"
+        before = after = ""
+        try:
+            with self._plan_lock(file):
+                child = self.parent_next(parent).child(slug)
+                if child is None or child.folder != slug:
+                    shown = "no such child" if child is None else "the child has no folder"
+                    raise TicketsPlanMismatch(f"{slug}: next {parent} lists {shown}")
+                before = after = child.status
+                closed = sum(child.counts.get(state, 0) for state in TICKET_CLOSED_STATES)
+                try:
+                    write = check_initiative_close(
+                        slug, before, total=child.counts.get("total", 0), closed=closed
+                    )
+                except InitiativeCloseRefused as e:
+                    raise TicketsInitiativeRefused(e.slug, e.current, e.why) from e
+                if not write:
+                    result = InitiativeMark(slug, file, before, before, "noop")
+                else:
+                    try:
+                        preimage = file.read_bytes()
+                        verify.set_frontmatter_field(
+                            file,
+                            "status",
+                            INITIATIVE_DONE,
+                            confine_root=parent.parent,
+                            keep_bom=True,
+                        )
+                    except (OSError, ValueError, frontmatter.FrontmatterWriteError) as e:
+                        raise TicketsPlanIOError(f"{slug}: cannot close {file}: {e}") from e
+                    after = _plan_fields(file)[1]
+                    if after != INITIATIVE_DONE:
+                        raise TicketsReadBackMismatch(
+                            f"{slug}: {file} reads back status {after!r} after closing it"
+                        )
+                    result = InitiativeMark(slug, file, before, after, "written", preimage)
+        except TicketsError as e:
+            if not isinstance(e, TicketsInitiativeRefused | TicketsPlanMismatch):
+                after = _status_or_unknown(file)
+            _journal_initiative(
+                journal,
+                parent=parent,
+                slug=slug,
+                file=file,
+                before=before,
+                after=after,
+                outcome=_failure_outcome(e),
+            )
+            raise
+        _journal_initiative(
+            journal,
+            parent=parent,
+            slug=slug,
+            file=file,
+            before=result.before,
+            after=result.after,
+            outcome=result.outcome,
+        )
+        return result
+
     def restore_preimage(self, plan: Path, data: bytes | None, journal: Journal) -> None:
-        """Put ``plan`` back to the exact bytes a transaction captured before
-        writing it (``None``: the plan did not exist, so remove it). The sole
-        byte-exact restore of a plan, under the same lock as :meth:`mark`, for
-        undoing a write the same transaction made — never for a status change of
-        its own. No child is spawned. The bytes are read back and must match;
-        journals ``ticket-plan-restored``."""
+        """Put ``plan`` — a ticket plan, or a child initiative's file that
+        :meth:`mark_initiative_done` closed — back to the exact bytes a
+        transaction captured before writing it (``None``: the file did not
+        exist, so remove it). The sole byte-exact restore of either, under the
+        same lock as :meth:`mark` and :meth:`mark_initiative_done` (both lock the
+        file's own path), for undoing a write the same transaction made — never
+        for a status change of its own. No child is spawned. The bytes are read
+        back and must match; journals ``ticket-plan-restored``."""
         plan = Path(plan)
         before = after = "?"
         restored = False
@@ -747,8 +879,29 @@ def _status_or_unknown(plan: Path) -> str:
 
 
 def _failure_outcome(error: TicketsError) -> str:
-    return (
-        "refused" if isinstance(error, TicketsTransitionRefused | TicketsPlanMismatch) else "failed"
+    refusals = TicketsTransitionRefused | TicketsInitiativeRefused | TicketsPlanMismatch
+    return "refused" if isinstance(error, refusals) else "failed"
+
+
+def _journal_initiative(
+    journal: Journal,
+    *,
+    parent: Path,
+    slug: str,
+    file: Path,
+    before: str,
+    after: str,
+    outcome: str,
+) -> None:
+    # `parent` is the parent's folder name (its slug), `file` the child file's path.
+    journal.append(
+        "initiative-mark",
+        parent=parent.name,
+        slug=slug,
+        file=str(file),
+        before=before,
+        after=after,
+        outcome=outcome,
     )
 
 

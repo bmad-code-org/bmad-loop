@@ -8277,6 +8277,7 @@ def set_frontmatter_field(
     *,
     confine_root: Path,
     root_identity: os.stat_result | None = None,
+    keep_bom: bool = False,
 ) -> bool:
     """Rewrite (or insert) a scalar ``<key>:`` line in a spec's `---`…`---`
     frontmatter block.
@@ -8319,18 +8320,24 @@ def set_frontmatter_field(
     Use the BYTES helper and not the text one:
     `atomic_write_text` keeps ``Path.write_text``'s translating newline default,
     which would relay ``\\n``→``\\r\\n`` on Windows and undo the paragraph above.
+
+    ``keep_bom`` reads a file the way the BMAD v7 scripts do (``utf-8-sig``): a
+    leading UTF-8 byte-order mark is set aside before the split and written back
+    ahead of the edit. Off, a BOM hides the block (``False``, nothing to change),
+    which matches what `read_frontmatter` sees in a spec.
     """
     if not path.is_file():
         return False
     text = path.read_bytes().decode("utf-8")
-    split = _split_frontmatter(text)
+    bom = "\ufeff" if keep_bom and text.startswith("\ufeff") else ""
+    split = _split_frontmatter(text[len(bom) :])
     if split is None:
         return False
     before, block, after = split
     edited = _edit_frontmatter_block(block, key, value, insert=True)
     if edited is None:
         return False
-    payload = (before + edited + after).encode("utf-8")
+    payload = (bom + before + edited + after).encode("utf-8")
     if path.is_relative_to(confine_root):
         atomic_write_bytes_confined(
             path,

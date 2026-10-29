@@ -7,7 +7,9 @@ and the pairs listed here are the only exceptions it may perform — each one on
 when its caller opts in explicitly (:func:`check_board_regression`).
 :data:`PLAN_TRANSITIONS` is the BMAD v7 ticket-plan side: every ``status`` write
 ``tickettree.TicketTree.mark`` makes names a :data:`PlanWriteReason`, and
-:func:`check_plan_transition` decides it.
+:func:`check_plan_transition` decides it. :func:`check_initiative_close` decides
+the one write bmad-loop makes to a child initiative's own file
+(``tickettree.TicketTree.mark_initiative_done``).
 """
 
 from __future__ import annotations
@@ -252,3 +254,53 @@ def check_plan_transition(
         return True
     allowed = sorted(rule.sources) + (["blocked (operator park)"] if rule.parked else [])
     raise refuse(f"{reason} writes only from {allowed}")
+
+
+# ---- BMAD v7 child initiatives -----------------------------------------------
+#
+# A child initiative's status is its own file's frontmatter `status` (`""`,
+# `in-progress`, `done` or `dropped`), and `tickets.py` has no verb that writes it.
+# A chained run closes a drained child itself so the children after it stop
+# waiting: the only write is to `done`, and only once every ticket is closed.
+
+INITIATIVE_DONE: Final = "done"
+# The ticket states that count as closed for a drain (upstream's `next` reads the
+# same two as finished).
+TICKET_CLOSED_STATES: Final = frozenset({"done", "dropped"})
+_INITIATIVE_OPEN: Final = frozenset({"", "in-progress"})
+
+
+class InitiativeCloseRefused(IllegalTransition):
+    """A child-initiative close :func:`check_initiative_close` does not allow;
+    nothing was written."""
+
+    def __init__(self, slug: str, current: str, why: str) -> None:
+        super().__init__(
+            f"{slug}: initiative {current or '(no status)'} -> {INITIATIVE_DONE} is not a "
+            f"legal close: {why}"
+        )
+        self.slug = slug
+        self.current = current
+        self.why = why
+
+
+def check_initiative_close(slug: str, current: str, *, total: int, closed: int) -> bool:
+    """Decide closing child initiative ``slug``: True to write ``done``, False for
+    a no-op, else raise :class:`InitiativeCloseRefused`.
+
+    ``current`` is the file's normalized ``status`` (``""`` when unset); ``total``
+    and ``closed`` count the child's tickets and those done or dropped. An
+    already-``done`` child is a no-op; a ``dropped`` one is never reopened or
+    overridden; an open one (unset or ``in-progress``) is written only when drained:
+    at least one ticket and every ticket closed."""
+    if current == INITIATIVE_DONE:
+        return False
+    if current == "dropped":
+        raise InitiativeCloseRefused(slug, current, "a dropped initiative is final")
+    if current not in _INITIATIVE_OPEN:
+        raise InitiativeCloseRefused(slug, current, f"closes only from {sorted(_INITIATIVE_OPEN)}")
+    if total <= 0 or closed != total:
+        raise InitiativeCloseRefused(
+            slug, current, f"not drained: {closed} of {total} tickets done or dropped"
+        )
+    return True
