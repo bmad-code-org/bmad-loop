@@ -16,6 +16,7 @@ rows on the canned path."""
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import dataclasses
 import json
@@ -640,10 +641,11 @@ def test_mark_initiative_done_closes_a_drained_child_for_the_script(
     for epic, stem, ticket in AUTH_PLANS:
         write_plan(auth, epic, stem, ticket, "done")
     file = auth.initiative_folder / f"{AUTH}.md"
-    nl, bom = ("\r\n" if shape == "crlf" else "\n"), ("﻿" if shape == "bom" else "")
+    nl, bom = ("\r\n" if shape == "crlf" else "\n"), ("\ufeff" if shape == "bom" else "")
     lf = file.read_text(encoding="utf-8")
     assert "status" not in lf
     original = (bom + lf.replace("\n", nl)).encode("utf-8")
+    assert original.startswith(codecs.BOM_UTF8) == (shape == "bom")
     file.write_bytes(original)
     tree = TicketTree(project_v7.project, pinned_initiative=PARENT)
 
