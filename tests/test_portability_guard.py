@@ -396,6 +396,7 @@ STORE_TOPOLOGY_CALLERS = {
     ("install.py", "_tickets_store_findings"): 1,  # validate + run preflight findings
     ("cli.py", "_reject_store_topology"): 1,  # the wrapper's own predicate call
     ("cli.py", "cmd_run"): 1,
+    ("cli.py", "_launch_run"): 1,  # a chained child's own store, per child launch
     ("cli.py", "cmd_sweep"): 1,
     # pre-session + post-confirm, as the #414 pair, + ahead of --reverify/--adopt-branch
     ("cli.py", "cmd_resolve"): 3,

@@ -2568,6 +2568,57 @@ def test_compose_sweep_records_no_parent_off_v7(tmp_path):
     assert load_state(composed.run_dir).parent_initiative is None
 
 
+def _compose_chained_run(project_v7, paths, parent):
+    return runsetup.compose_run(
+        project=project_v7.project,
+        paths=paths,
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        epic_filter=None,
+        story_filter=None,
+        max_stories=None,
+        source=worksource.SOURCE_TICKETS,
+        spec_folder="",
+        sweep_factory=lambda _trigger, *, started: None,
+        make_adapters=_accepting_adapters,
+        engine_cls=_CapturingEngine,
+        stories_engine_cls=_CapturingEngine,
+        tickets_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        parent_initiative=parent,
+    )
+
+
+def test_compose_run_records_a_chained_childs_parent_on_the_childs_paths(project_v7):
+    """A chained child run records its parent and pins the CHILD as its initiative
+    and folder, the shape `runs.paths_for_state` re-roots on at resume.
+
+    ABLATION (performed): drop `parent_initiative=` from compose_run's
+    `build_run_state` call and this FAILS."""
+    child_paths, child_folder = _chained_child_paths(project_v7)
+    composed = _compose_chained_run(project_v7, child_paths, project_v7.initiative)
+    state = load_state(composed.run_dir)
+    assert state.parent_initiative == project_v7.initiative
+    assert state.initiative == CHILD
+    assert state.initiative_folder == str(child_folder)
+    assert composed.engine.kwargs["state"].parent_initiative == project_v7.initiative
+    assert composed.engine.kwargs["paths"] is child_paths
+
+
+@pytest.mark.parametrize("rooted", ["parent", "off-v7"])
+def test_compose_run_refuses_a_parent_without_child_rooted_paths(project_v7, rooted):
+    """A parent handed with paths that are not rooted on one of its children — the
+    parent's own, or a project off v7 — raises before a run dir is published."""
+    if rooted == "parent":
+        paths = bmadconfig.load_paths(project_v7.project)
+    else:
+        paths = _fake_paths(project_v7.project)
+    with pytest.raises(ValueError, match="needs paths rooted on one of its child initiatives"):
+        _compose_chained_run(project_v7, paths, project_v7.initiative)
+    runs_dir = project_v7.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
 @pytest.mark.parametrize("live", ["parent", "other", "child", "unset"])
 def test_chained_sweep_resume_is_pinned_to_the_parent(project_v7, monkeypatch, live):
     """A chained child's sweep resumes only while the live config names its

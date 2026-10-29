@@ -858,6 +858,7 @@ def build_run_state(
     initiative_folder: str = "",
     store_topology: dict[str, str | None] | None = None,
     ticket_epic_filter: str = "",
+    parent_initiative: str | None = None,
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -886,7 +887,9 @@ def build_run_state(
     for a tickets run, whose tree reads refuse once the live initiative differs;
     every other source records them empty. ``store_topology`` is the classified
     ticket store (``ticketstore.StoreTopology.to_dict``), and ``ticket_epic_filter``
-    the ``--epic`` selector resolved to an epic slug, likewise tickets only."""
+    the ``--epic`` selector resolved to an epic slug, likewise tickets only.
+    ``parent_initiative`` is a chained child run's parent (``initiative`` then
+    names the child), likewise tickets only."""
     tickets = source == worksource.SOURCE_TICKETS
     return RunState(
         run_id=run_id,
@@ -904,22 +907,24 @@ def build_run_state(
         initiative_folder=initiative_folder if tickets else "",
         store_topology=dict(store_topology or {}) if tickets else {},
         ticket_epic_filter=ticket_epic_filter if tickets else "",
+        parent_initiative=parent_initiative if tickets else None,
         trusted_config_digest=trusted_config_digest,
     )
 
 
 def _run_store_topology(
-    paths: bmadconfig.ProjectPaths, policy: Policy, source: str
+    paths: bmadconfig.ProjectPaths, policy: Policy, source: str, *, chained: bool = False
 ) -> dict[str, str | None]:
     """The ticket-store topology a tickets run records at its start (``{}`` for any
     other source, and when there is no initiative folder to classify — the
     preflight's ``tickets.initiative-*`` checks own that refusal). The run preflight
     refused every unrunnable store already, so a store refused here changed in
     between; that raises :class:`ticketstore.TicketStoreError` rather than starting
-    unrecorded."""
+    unrecorded. ``chained``: ``paths`` are a chained run's, re-rooted on its child
+    (:func:`ticketstore.assess_store`)."""
     if source != worksource.SOURCE_TICKETS:
         return {}
-    result = ticketstore.assess_store(paths, policy.scm.isolation)
+    result = ticketstore.assess_store(paths, policy.scm.isolation, chained=chained)
     if result is None:
         return {}
     if isinstance(result, ticketstore.StoreRefusal):
@@ -1393,6 +1398,7 @@ def compose_run(
     profiles: dict[str, CLIProfile] | None = None,
     plugin_grants: GrantSet = GrantSet.empty(),
     ticket_epic_filter: str = "",
+    parent_initiative: str | None = None,
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -1422,11 +1428,32 @@ def compose_run(
     ``ticket_epic_filter`` is a tickets run's ``--epic`` selector, already resolved
     to an epic slug by the caller (``epic_filter`` stays None for such a run, and
     ``story_filter`` carries the resolved ticket ref).
+
+    ``parent_initiative`` is set only for a chained child run: ``paths`` are then
+    that child's (``ProjectPaths.with_initiative``), so the run pins the child as
+    its ``initiative`` and folder, and records the parent
+    (``RunState.parent_initiative``, which :func:`runs.paths_for_state` re-roots
+    on). Paths not rooted on a child of it — off v7, with no active initiative
+    folder, or naming the parent itself — raise ValueError before anything is
+    published. The caller arms ``sweep_factory`` with the same parent.
     """
+    if parent_initiative is not None and (
+        paths.era != "v7"
+        or paths.initiative_folder is None
+        or not paths.active_initiative
+        or paths.active_initiative == parent_initiative
+    ):
+        rooted = repr(paths.active_initiative) if paths.active_initiative else "no initiative"
+        raise ValueError(
+            f"a chained run of parent initiative {parent_initiative!r} needs paths rooted "
+            f"on one of its child initiatives, not on {rooted} ({paths.era})"
+        )
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
     # Before the claim: a store that changed since the preflight leaves nothing behind.
-    store_topology = _run_store_topology(paths, policy, source)
+    store_topology = _run_store_topology(
+        paths, policy, source, chained=parent_initiative is not None
+    )
     # Outside the try below, and it must stay there: a collision refusal that
     # reached `_unwind_composition` would delete the run it exists to protect.
     composer_claim = _claim_run_dir(run_dir)
@@ -1462,6 +1489,7 @@ def compose_run(
             ),
             store_topology=store_topology,
             ticket_epic_filter=ticket_epic_filter,
+            parent_initiative=parent_initiative,
         )
         journal = Journal(run_dir, pin=state)
         # State becoming resumable and the pid making this process live are one

@@ -366,7 +366,12 @@ def _sweep_store_source(paths: bmadconfig.ProjectPaths, pol: policy_mod.Policy) 
 
 
 def _reject_store_topology(
-    project: Path, pol, source: str, *, recorded: dict[str, str | None] | None = None
+    project: Path,
+    pol,
+    source: str,
+    *,
+    recorded: dict[str, str | None] | None = None,
+    initiative: str | None = None,
 ) -> int | None:
     """Refuse a tickets run whose ticket store tickets runs cannot drive
     (:func:`ticketstore.store_conflict`: a refused layout, or — given the run's
@@ -374,8 +379,14 @@ def _reject_store_topology(
     started). Returns 1 to abort, None to proceed — the
     :func:`_reject_isolation_conflict` sibling, called beside it from every
     run-arming surface that returns an rc to a human; the surfaces without an rc
-    channel call the predicate itself. Outside tickets mode it is a no-op."""
-    conflict = ticketstore.store_conflict(project, source, pol.scm.isolation, recorded=recorded)
+    channel call the predicate itself. Outside tickets mode it is a no-op.
+    ``initiative`` names a chained run's child initiative, whose store is judged
+    on its own (:func:`ticketstore.store_conflict`); unset, the predicate is
+    called exactly as before chains existed."""
+    chained = {} if initiative is None else {"initiative": initiative}
+    conflict = ticketstore.store_conflict(
+        project, source, pol.scm.isolation, recorded=recorded, **chained
+    )
     if conflict is None:
         return None
     print(f"error: {conflict}", file=sys.stderr)
@@ -4223,6 +4234,47 @@ def cmd_run(args: argparse.Namespace) -> int:
             return resolved
         scope = resolved
 
+    launched = _launch_run(
+        project, paths, pol, args, source=source, spec_folder=spec_folder, scope=scope
+    )
+    if isinstance(launched, int):
+        return launched
+    summary = launched.engine.run()
+    print(summary.render())
+    return 0
+
+
+def _launch_run(
+    project: Path,
+    paths: bmadconfig.ProjectPaths,
+    pol,
+    args: argparse.Namespace,
+    *,
+    source: str,
+    spec_folder: str,
+    scope: tickets_source.PickScope,
+    parent_initiative: str | None = None,
+) -> runsetup.ComposedRun | int:
+    """Launch one run whose gates :func:`cmd_run` already passed (git floor,
+    isolation, store topology, the source preflight, the ticket scope): the
+    worktree-clean check, skills, stale reconcile, plugin trust, the config pin,
+    and :func:`runsetup.compose_run`. Returns the composed run, ready for
+    ``engine.run()``, or an rc to abort with.
+
+    ``parent_initiative`` is set only for a chained child run: ``paths`` are then
+    the child's (``ProjectPaths.with_initiative``), whose store is judged on its
+    own here — each child folder can have its own topology — and the parent is
+    recorded on the run and armed on its run-end sweep. Unset, the store was
+    judged by the caller and is not judged again."""
+    traits = worksource.traits_for(source)
+    tickets = source == worksource.SOURCE_TICKETS
+    if (
+        parent_initiative is not None
+        and (rc := _reject_store_topology(project, pol, source, initiative=paths.active_initiative))
+        is not None
+    ):
+        return rc
+
     if not verify.worktree_clean(paths.repo_root, project=paths.project):
         print("git worktree is not clean — commit or stash first", file=sys.stderr)
         return 1
@@ -4238,7 +4290,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         paths.repo_root,
         plugin_grants,
         require_stories=traits.stories_primitive,
-        require_tickets=source == worksource.SOURCE_TICKETS,
+        require_tickets=tickets,
     ):
         return 1
 
@@ -4276,9 +4328,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_stories=args.max_stories,
         source=source,
         spec_folder=spec_folder,
-        # no run starts chained yet: the S3 chain driver supplies a child's parent here
+        # a chained child's run-end sweep works the child's ledger and pins the parent
         sweep_factory=_sweep_factory(
-            project, paths, trusted_digest, plugin_grants=plugin_grants, parent_initiative=None
+            project,
+            paths,
+            trusted_digest,
+            plugin_grants=plugin_grants,
+            parent_initiative=parent_initiative,
         ),
         make_adapters=_make_adapters,
         engine_cls=Engine,
@@ -4287,6 +4343,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         trusted_config_digest=trusted_digest,
         profiles=profiles,
         plugin_grants=plugin_grants,
+        parent_initiative=parent_initiative,
     )
     _warn_bypass_dropped(
         pol,
@@ -4296,9 +4353,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         journal=composed.journal,
     )
     print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
-    summary = composed.engine.run()
-    print(summary.render())
-    return 0
+    return composed
 
 
 def _render_invocation(pol, project: Path, role: str, prompt: str) -> str:

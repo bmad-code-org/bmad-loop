@@ -15863,6 +15863,97 @@ def test_run_tickets_launches_tickets_engine(project, capsys, monkeypatch):
     assert "stub summary" in capsys.readouterr().out
 
 
+class _Composed(Exception):
+    """Raised by a recording `runsetup.compose_run` stand-in: the launch got there."""
+
+
+def _record_launch(project, monkeypatch):
+    """Record the per-launch store checks, `_sweep_factory` calls and the
+    `compose_run` kwargs; compose_run raises `_Composed` so nothing is built."""
+    calls: dict[str, list] = {"store": [], "factory": [], "compose": []}
+    real_store = cli._reject_store_topology
+
+    def store(*a, **kw):
+        calls["store"].append(kw.get("initiative"))
+        return real_store(*a, **kw)
+
+    def factory(project_root, paths, digest, **kw):
+        calls["factory"].append((paths, kw["parent_initiative"]))
+        return lambda _trigger, *, started: None
+
+    def compose_run(**kw):
+        calls["compose"].append(kw)
+        raise _Composed
+
+    monkeypatch.setattr(cli, "_reject_store_topology", store)
+    monkeypatch.setattr(cli, "_sweep_factory", factory)
+    monkeypatch.setattr(runsetup, "compose_run", compose_run)
+    return calls
+
+
+def test_run_unchained_judges_the_store_once(project, capsys, monkeypatch):
+    """An unchained tickets run's store is judged by `cmd_run` alone: `_launch_run`
+    adds no second check, and no parent reaches compose_run or the sweep factory."""
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    calls = _record_launch(project, monkeypatch)
+
+    cli.main(["run", "--project", str(project.project)])  # main reports `_Composed`
+
+    assert calls["store"] == [None]
+    (kw,) = calls["compose"]
+    assert kw["parent_initiative"] is None
+    assert [parent for _paths, parent in calls["factory"]] == [None]
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["launches", "store-refused"])
+def test_launch_run_judges_a_chained_childs_store_and_hands_on_the_parent(
+    project, capsys, monkeypatch, refused
+):
+    """A chained child's launch judges the CHILD's store (`initiative=<child>`) and
+    hands the parent to compose_run and to the run-end sweep factory, which gets the
+    child's paths; a refused child store aborts with rc 1 before anything is
+    composed. Ablation (performed): drop `initiative=` from `_launch_run`'s store
+    check and this FAILS."""
+    from bmad_loop import tickets_source, ticketstore
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    calls = _record_launch(project, monkeypatch)
+    # no child folder on disk: the argument the check is handed is what is under test
+    conflict = "the child's store is refused" if refused else None
+    monkeypatch.setattr(ticketstore, "store_conflict", lambda *_a, **_k: conflict)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    child = "initiative-child"
+    paths = bmadconfig.load_paths(project.project, want_tickets=True).with_initiative(child)
+    args = argparse.Namespace(run_id=None, epic=None, story=None, max_stories=None)
+
+    def launch():
+        return cli._launch_run(
+            project.project,
+            paths,
+            pol,
+            args,
+            source="tickets",
+            spec_folder="",
+            scope=tickets_source.EVERYTHING,
+            parent_initiative=V7_DEFAULT_INITIATIVE,
+        )
+
+    if refused:
+        assert launch() == 1
+        assert calls["store"] == [child]
+        assert (calls["compose"], calls["factory"]) == ([], [])
+        assert "error: the child's store is refused" in capsys.readouterr().err
+        return
+    with pytest.raises(_Composed):
+        launch()
+
+    assert calls["store"] == [child]
+    (kw,) = calls["compose"]
+    assert kw["parent_initiative"] == V7_DEFAULT_INITIATIVE
+    assert kw["paths"] is paths
+    assert calls["factory"] == [(paths, V7_DEFAULT_INITIATIVE)]
+
+
 def test_epic_selector_keeps_ints_and_passes_text():
     """`--epic`'s argparse type returns what `int()` reads (sprint mode unchanged,
     signs and padding included) and the text otherwise."""
