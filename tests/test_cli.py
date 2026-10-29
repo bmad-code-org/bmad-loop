@@ -16683,14 +16683,16 @@ def test_run_after_a_stopped_chain_closes_the_child_it_left_open(project, monkey
     assert _initiative_status(project, CHAIN_AUTH) and _initiative_status(project, CHAIN_BILLING)
     subjects = git(root, "log", "--format=%s").splitlines()
     assert f"chore(tickets): {CHAIN_AUTH} done [bmad-loop chain {CHAIN_PARENT}]" in subjects
-    # the start close journals nothing: BILLING's run carries only its own close
+    # BILLING's run carries the start close of AUTH ahead of its own close
     rows = _chain_rows(built[1][2])
     assert [e["kind"] for e in rows] == [
         "initiative-mark",
         "store-committed",
+        "initiative-mark",
+        "store-committed",
         "initiative-chain-end",
     ]
-    assert rows[0]["slug"] == CHAIN_BILLING
+    assert [rows[0]["slug"], rows[2]["slug"]] == [CHAIN_AUTH, CHAIN_BILLING]
 
 
 def test_run_closes_a_sibling_drained_outside_the_chain(project, monkeypatch, capsys):
@@ -16872,6 +16874,100 @@ def test_pre_pick_close_skips_a_drained_child_whose_file_holds_an_edit(
     assert git(root, "rev-parse", "HEAD") == head
     assert not _initiative_status(project, CHAIN_AUTH)
     assert "half-written note" in file.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("gate", ["dirty-worktree", "plugin-trust"])
+def test_chain_start_refused_by_a_launch_gate_closes_nothing(project, monkeypatch, capsys, gate):
+    """A drained AUTH the start would close, and a launch gate that refuses — a
+    dirty worktree, or an enabled plugin nobody granted: `run` on the parent exits
+    1 having written no `status: done` and made no commit, since the gates run
+    ahead of the start close. Ablation (performed): move the start close back ahead
+    of `_launch_gates` in `cmd_run` and AUTH is closed and committed — this FAILS."""
+    policy = CHAIN_POLICY + (ENABLE_ROGUE if gate == "plugin-trust" else "")
+    built = _chain_project(project, monkeypatch, capsys, [], policy=policy)
+    root = project.project
+    if gate == "plugin-trust":
+        _write_trust_plugin(project)  # committed with the drain below
+    _drain_child(root, CHAIN_AUTH)
+    if gate == "dirty-worktree":
+        (root / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+    head = git(root, "rev-parse", "HEAD")
+
+    assert cli.main(["run", "--project", str(root)]) == 1
+
+    captured = capsys.readouterr()
+    assert built == [] and not _initiative_status(project, CHAIN_AUTH)
+    assert git(root, "rev-parse", "HEAD") == head
+    assert "closed" not in captured.out
+    expected = "worktree is not clean" if gate == "dirty-worktree" else "plugins enable rogue"
+    assert expected in captured.err
+
+
+def test_chain_start_close_is_journaled_in_the_first_childs_run(project, monkeypatch, capsys):
+    """AUTH was drained by hand: the start close's rows, kept in memory while no run
+    dir existed, land verbatim in BILLING's run journal after `run-start` and ahead
+    of BILLING's own close and `initiative-chain-end`. Ablation (performed): drop
+    the replay in `cmd_run` and BILLING's journal starts at its own close — this
+    FAILS."""
+    from bmad_loop.journal import Journal
+
+    built = _chain_project(project, monkeypatch, capsys, ["drain"])
+    root = project.project
+    _drain_child(root, CHAIN_AUTH)
+
+    assert cli.main(["run", "--project", str(root)]) == 0
+
+    ((_, state, run_dir),) = built
+    assert state.initiative == CHAIN_BILLING
+    kinds = [e["kind"] for e in Journal(run_dir).entries()]
+    start = kinds.index("run-start")
+    assert kinds[start + 1 : start + 3] == ["initiative-mark", "store-committed"]
+    rows = _chain_rows(run_dir)
+    assert [(e["kind"], e.get("slug") or e.get("story_key")) for e in rows] == [
+        ("initiative-mark", CHAIN_AUTH),
+        ("store-committed", CHAIN_AUTH),
+        ("initiative-mark", CHAIN_BILLING),
+        ("store-committed", CHAIN_BILLING),
+        ("initiative-chain-end", None),
+    ]
+    assert _row(rows[0], "parent", "before", "after", "outcome") == {
+        "kind": "initiative-mark",
+        "parent": CHAIN_PARENT,
+        "before": "",
+        "after": "done",
+        "outcome": "written",
+    }
+    subject = f"chore(tickets): {CHAIN_AUTH} done [bmad-loop chain {CHAIN_PARENT}]"
+    assert git(root, "log", "-1", "--format=%s", rows[1]["commit"]) == subject
+
+
+@pytest.mark.parametrize("chained", [True, False], ids=["chained", "unchained"])
+def test_run_reads_the_plugin_grants_once(project, monkeypatch, capsys, chained):
+    """#496/#497: one launch reads the grants once. A chained `run` reads them in
+    the gates ahead of the start close and hands that set to its first launch,
+    which does not read again; an unchained run reads them in its launch. Ablation
+    (performed): drop `plugin_grants=` from `cmd_run`'s `_launch_run` call and the
+    chained run reads twice — this FAILS."""
+    reads: list[Path] = []
+    real = cli._launch_plugin_grants
+
+    def counted(project_root):
+        reads.append(project_root)
+        return real(project_root)
+
+    if chained:
+        built = _chain_project(project, monkeypatch, capsys, ["drain"])
+        _drain_child(project.project, CHAIN_AUTH)
+        monkeypatch.setattr(cli, "_launch_plugin_grants", counted)
+        assert cli.main(["run", "--project", str(project.project)]) == 0
+        assert [s.initiative for _, s, _ in built] == [CHAIN_BILLING]
+    else:
+        _make_tickets_validate_pass(project, monkeypatch, capsys)
+        calls = _record_launch(project, monkeypatch)
+        monkeypatch.setattr(cli, "_launch_plugin_grants", counted)
+        cli.main(["run", "--project", str(project.project)])  # main reports `_Composed`
+        assert len(calls["compose"]) == 1
+    assert reads == [project.project]
 
 
 def test_chain_driver_ignores_a_chained_childs_sweep(project, monkeypatch):

@@ -4252,17 +4252,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         return parent
     scope = tickets_source.EVERYTHING
     launch_paths = paths
+    plugin_grants: GrantSet | None = None
+    start_log = _ChainStartLog()
     if parent is not None:
         # A parent initiative has no tickets of its own: the run builds its children,
         # one run each, starting with the first one `next <parent>` can start.
         if args.epic is not None or args.story:
             print(_chain_selector_refusal(parent), file=sys.stderr)
             return 1
+        # The launch gates that do not depend on the child run ahead of the start
+        # close, so a run they refuse has written and committed nothing.
+        gated = _launch_gates(project, paths, pol, source)
+        if isinstance(gated, int):
+            return gated
+        plugin_grants = gated
         try:
             # A child a stopped, interrupted or crashed chain left drained and open,
             # or one drained outside the chain, is closed first so its dependents
             # are ready for the pick.
-            owed = _close_drained_children(project, paths, pol, parent, _ChainStartLog())
+            owed = _close_drained_children(project, paths, pol, parent, start_log)
             pick = None if owed is not None else _chain_pick(project, paths, parent)
         except (tickettree.TicketsError, ValueError) as e:
             print(f"tickets mode: initiative chain {parent}: {e}", file=sys.stderr)
@@ -4294,9 +4302,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         spec_folder=spec_folder,
         scope=scope,
         parent_initiative=parent,
+        plugin_grants=plugin_grants,
     )
     if isinstance(launched, int):
         return launched
+    start_log.replay(launched.journal)
     summary = launched.engine.run()
     print(summary.render())
     return _drive_initiative_chain(project, paths, pol, launched)
@@ -4312,19 +4322,22 @@ def _launch_run(
     spec_folder: str,
     scope: tickets_source.PickScope,
     parent_initiative: str | None = None,
+    plugin_grants: GrantSet | None = None,
 ) -> runsetup.ComposedRun | int:
     """Launch one run whose gates :func:`cmd_run` already passed (git floor,
     isolation, store topology, the source preflight, the ticket scope): the
-    worktree-clean check, skills, stale reconcile, plugin trust, the config pin,
-    and :func:`runsetup.compose_run`. Returns the composed run, ready for
-    ``engine.run()``, or an rc to abort with.
+    :func:`_launch_gates`, the config pin, and :func:`runsetup.compose_run`.
+    Returns the composed run, ready for ``engine.run()``, or an rc to abort with.
 
     ``parent_initiative`` is set only for a chained child run: ``paths`` are then
     the child's (``ProjectPaths.with_initiative``), whose store is judged on its
-    own here — each child folder can have its own topology — and the parent is
-    recorded on the run and armed on its run-end sweep. Unset, the store was
-    judged by the caller and is not judged again."""
-    traits = worksource.traits_for(source)
+    own here, first — each child folder can have its own topology — and the
+    parent is recorded on the run and armed on its run-end sweep. Unset, the store
+    was judged by the caller and is not judged again.
+
+    ``plugin_grants`` is what a caller that already ran :func:`_launch_gates` got
+    from them (``run`` on a parent, ahead of its start close): the gates are not
+    run again and those grants are used. None runs the gates here."""
     tickets = source == worksource.SOURCE_TICKETS
     if (
         parent_initiative is not None
@@ -4333,29 +4346,11 @@ def _launch_run(
     ):
         return rc
 
-    if not verify.worktree_clean(paths.repo_root, project=paths.project):
-        print("git worktree is not clean — commit or stash first", file=sys.stderr)
-        return 1
-
-    # #496/#497: the plugin grants are read ONCE, here, and refused against before
-    # the run dir exists; the same frozen set reaches the skills preflight, the
-    # engine's registry build and the auto-sweep factory's closure, so no later
-    # layer reads the store.
-    plugin_grants = _launch_plugin_grants(project)
-    if not _require_base_skills(
-        project,
-        pol,
-        paths.repo_root,
-        plugin_grants,
-        require_stories=traits.stories_primitive,
-        require_tickets=tickets,
-    ):
-        return 1
-
-    _reconcile_stale(project, paths, pol)
-
-    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
-        return rc
+    if plugin_grants is None:
+        gated = _launch_gates(project, paths, pol, source)
+        if isinstance(gated, int):
+            return gated
+        plugin_grants = gated
 
     # The launch baseline for the auto-sweep child's config re-read (#461 point 4).
     # Taken ONCE, from the same `pol` the engine is about to freeze, and used for
@@ -4412,6 +4407,42 @@ def _launch_run(
     )
     print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
     return composed
+
+
+def _launch_gates(
+    project: Path, paths: bmadconfig.ProjectPaths, pol, source: str
+) -> GrantSet | int:
+    """The launch gates no child initiative changes, in order: the worktree-clean
+    check, the plugin grants read, the skills preflight, the stale reconcile and
+    plugin trust. Each reads ``paths.repo_root``/``paths.project`` alone, which
+    ``ProjectPaths.with_initiative`` keeps, so a parent's paths and its child's
+    answer alike. Returns the grants, or an rc to abort with.
+
+    #496/#497: the plugin grants are read ONCE, here, and refused against before
+    the run dir exists; the same frozen set reaches the skills preflight, the
+    engine's registry build and the auto-sweep factory's closure, so no later
+    layer reads the store."""
+    traits = worksource.traits_for(source)
+    if not verify.worktree_clean(paths.repo_root, project=paths.project):
+        print("git worktree is not clean — commit or stash first", file=sys.stderr)
+        return 1
+
+    plugin_grants = _launch_plugin_grants(project)
+    if not _require_base_skills(
+        project,
+        pol,
+        paths.repo_root,
+        plugin_grants,
+        require_stories=traits.stories_primitive,
+        require_tickets=source == worksource.SOURCE_TICKETS,
+    ):
+        return 1
+
+    _reconcile_stale(project, paths, pol)
+
+    if (rc := _reject_plugin_trust(paths, pol, plugin_grants)) is not None:
+        return rc
+    return plugin_grants
 
 
 def _chain_parent(paths: bmadconfig.ProjectPaths) -> str | int | None:
@@ -4594,15 +4625,24 @@ def _landed_a_ticket(state: RunState) -> bool:
 
 class _ChainStartLog(Journal):
     """Where the closes before a chain's first run journal: no run dir exists yet
-    (the start pick journals nothing either), so the rows are kept in memory and
-    nothing is written, while each close and skip is printed — the
-    :class:`_ConfirmMarkLog` shape."""
+    (the start pick journals nothing either), so the rows are kept in memory, while
+    each close and skip is printed — the :class:`_ConfirmMarkLog` shape. Once the
+    first child's run is composed, :meth:`replay` appends them, in order, to its
+    journal; a start that composes no run (no child to pick, a close that could
+    not be committed, a refused launch) leaves them printed only."""
 
     def __init__(self) -> None:  # no run dir: nothing is written
         self.rows: list[dict[str, object]] = []
 
     def append(self, kind: str, **fields: Any) -> None:
         self.rows.append({"kind": kind, **fields})
+
+    def replay(self, journal: Journal) -> None:
+        """Append every kept row to ``journal``, in order, with its fields as kept."""
+        for row in self.rows:
+            fields = dict(row)
+            kind = fields.pop("kind")
+            journal.append(str(kind), **fields)
 
 
 def _child_runs_holding(project: Path) -> tuple[dict[str, tuple[str, str, str]], str | None]:

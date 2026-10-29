@@ -1200,6 +1200,9 @@ JOURNAL_SPLAT_ALLOW = {
     ("engine.py", "_run_session"): 2,
     # One unresolved `**fields` forward: the forwarder's own hole.
     ("plugins/bus.py", "_log"): 1,
+    # One unresolved `**fields` relay: `_ChainStartLog.replay` re-appends the rows a
+    # chain's start close kept in memory into the first child's run journal.
+    ("cli.py", "replay"): 1,
 }
 
 # The FIELD names that actually flow through each declared hole above, keyed by the
@@ -1300,6 +1303,11 @@ JOURNAL_SPLAT_FIELDS = {
     # routing set with this guard green. That is what the old comment's "the scan
     # reads them directly at their own sites" asserted and did not do.
     ("plugins/bus.py", "_log"): frozenset(),
+    # `_ChainStartLog.replay` relays rows kept by its own `append`, so the fields
+    # belong to the writers that journaled into it (`_close_drained_children`,
+    # `TicketTree.mark_initiative_done`), each a literal write the scan reads at its
+    # own site; the relay adds no name of its own.
+    ("cli.py", "replay"): frozenset(),
 }
 
 # ``(file, function name)`` of every helper that FORWARDS to ``journal.append`` with a
@@ -1358,6 +1366,9 @@ JOURNAL_DYNAMIC_KIND_ALLOW = {
     # The forwarder passes its caller's `kind` straight through; every CALLER spells
     # a literal, and `JOURNAL_FORWARDERS` is what lets the scan read them there.
     ("plugins/bus.py", "_log"): 1,
+    # `_ChainStartLog.replay` relays each kept row's kind, which a literal write into
+    # the start log spelled at its own site.
+    ("cli.py", "replay"): 1,
 }
 
 # The kind SPELLINGS a dynamic-kind position mints itself, keyed by the same
