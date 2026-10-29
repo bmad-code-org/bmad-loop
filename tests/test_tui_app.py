@@ -72,6 +72,7 @@ from bmad_loop.tui.screens.dashboard import (
     _MIN_SIDEBAR,
     DashboardScreen,
     _Snapshot,
+    load_policy_noting_deprecations,
 )
 from bmad_loop.tui.screens.modals import (
     ConfirmModal,
@@ -665,6 +666,43 @@ async def test_policy_without_a_loadable_deprecation_raises_no_toast(project_tre
         await pilot.pause()
         assert dashboard(app).policy_deprecations == ()
         assert not [e for e in emitted(app) if "deprecated" in e.message]
+
+
+def test_policy_deprecation_captures_run_one_at_a_time(tmp_path, monkeypatch):
+    """`catch_warnings` swaps process-wide warning state, so a second capture
+    (the replan worker beside a UI-thread load) waits for the first to finish
+    rather than restoring its state out of order.
+
+    ABLATION: drop `_POLICY_LOAD_LOCK` from the capture and the second load
+    enters while the first is still inside."""
+    policy_file = _write_policy(tmp_path, '[adapter]\nname = "claude"\n')
+    real_load = policy_mod.load
+    inside, release = threading.Event(), threading.Event()
+    entered: list[str] = []
+
+    def load(path):
+        entered.append(threading.current_thread().name)
+        if len(entered) == 1:
+            inside.set()
+            release.wait(5)
+        return real_load(path)
+
+    monkeypatch.setattr(policy_mod, "load", load)
+    first = threading.Thread(
+        target=load_policy_noting_deprecations, args=(policy_file,), name="first"
+    )
+    second = threading.Thread(
+        target=load_policy_noting_deprecations, args=(policy_file,), name="second"
+    )
+    first.start()
+    assert inside.wait(5)
+    second.start()
+    second.join(0.2)
+    assert entered == ["first"]
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert entered == ["first", "second"]
 
 
 async def test_dashboard_survives_project_root_resolve_refusal(project_tree, monkeypatch):

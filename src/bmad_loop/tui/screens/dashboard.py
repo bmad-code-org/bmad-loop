@@ -61,6 +61,11 @@ from ..widgets import (
 )
 from .modals import DeferredEntryModal
 
+# `warnings.catch_warnings` swaps the process-wide filters and `showwarning`, so
+# two overlapping captures (the replan worker thread beside a UI-thread load) can
+# restore each other's state out of order; one capture at a time.
+_POLICY_LOAD_LOCK = threading.Lock()
+
 
 def load_policy_noting_deprecations(path: Path) -> tuple[policy_mod.Policy, tuple[str, ...]]:
     """``policy.load(path)`` plus the text of each ``PolicyDeprecationWarning`` it
@@ -71,7 +76,7 @@ def load_policy_noting_deprecations(path: Path) -> tuple[policy_mod.Policy, tupl
     deprecations: list[str] = []
     caught: list[warnings.WarningMessage] = []
     try:
-        with warnings.catch_warnings(record=True) as caught:
+        with _POLICY_LOAD_LOCK, warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", policy_mod.PolicyDeprecationWarning)
             pol = policy_mod.load(path)
     finally:
