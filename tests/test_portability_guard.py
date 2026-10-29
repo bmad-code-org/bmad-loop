@@ -287,6 +287,9 @@ RUN_STATE_TRANSACTIONS = {
     # DW-591: `resolve --at-reset`'s two wait rows, under the hold cleanup removes
     # the run in, so neither append recreates a removed run dir
     ("cli.py", "_resolve_at_reset"),
+    # the epic-close resolve: its verify journal row, then the locked re-check of
+    # the epic-boundary pause before the resume
+    ("cli.py", "_resolve_epic_close"),
     # #925: a refused TUI-launched child's journal row, under the hold cleanup
     # removes the run in, so the append never recreates a removed run dir
     ("cli.py", "_journal_unaccepted_launch"),
@@ -1467,6 +1470,12 @@ JOURNAL_KINDS = frozenset(
         # `waited_s`); every field declared benign.
         "at-reset-wait-end",
         "at-reset-wait-start",
+        # cli.py: `resolve --no-interactive` on a tickets epic-boundary pause — the
+        # closed-epic verify's outcome. `epic_ref` is aliased by name; `status` (the
+        # epic file's status token) and `missing` (prose lines naming what is undone,
+        # which `scrub_json` redacts as non-identifiers) are benign by name.
+        "epic-close-unverified",
+        "epic-close-verified",
         # #920: the accepting process could not publish its control window;
         # `error` is a drop field.
         "ctl-window-claim-failed",

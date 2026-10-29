@@ -17151,6 +17151,314 @@ def test_resume_records_an_answered_epic_closure_pause(project, capsys, monkeypa
     assert load_state(run_dir).ticket_epic_closure_resumed == ["epic-cart"]
 
 
+# `resolve --no-interactive` on a tickets epic-boundary pause: the closed-epic verify.
+# Real-spawn budget: 2 vendored `tickets.py` spawns (the verified-resume and the
+# open-epic rows read the real tree); every other row injects a FakeTicketTree.
+
+_EPIC_CLOSE_RUN = "20990101-000000-ec10"
+_EPIC_CART_DIR = Path("_bmad-output") / V7_DEFAULT_INITIATIVE / "tickets" / "epic-cart"
+
+
+def _epic_close_run(project, monkeypatch, capsys, *, closed=True, **state_kwargs):
+    """A tickets run paused at `epic-boundary` on `epic-cart` with an accepted
+    closure, its recorded store topology the fixture's live T1 one; `closed`
+    commits the epic file as `status: done`. `_resume_paused_run` is stubbed and
+    returns ``(run_dir, resumed)``, the list of run dirs it was reached with."""
+    from bmad_loop import bmadconfig, ticketstore
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    if closed:
+        epic_file = project.project / _EPIC_CART_DIR / "epic-cart.md"
+        text = epic_file.read_text(encoding="utf-8")
+        epic_file.write_text(text.replace("status: in-progress", "status: done"), encoding="utf-8")
+        git(project.project, "commit", "-q", "-am", "close epic-cart")
+    paths = bmadconfig.load_paths(project.project, want_tickets=True)
+    topology = ticketstore.assess_store(paths, "none")
+    assert isinstance(topology, ticketstore.StoreTopology)
+    state_kwargs.setdefault("paused_story_key", "epic-cart")
+    state_kwargs.setdefault("ticket_epic_closures", {"epic-cart": "accepted"})
+    state_kwargs.setdefault("store_topology", topology.to_dict())
+    run_dir = _make_run_with_state(
+        project.project,
+        _EPIC_CLOSE_RUN,
+        source="tickets",
+        initiative=V7_DEFAULT_INITIATIVE,
+        initiative_folder=str(paths.initiative_folder),
+        paused_reason="close epic-cart with bmad-agent-po",
+        paused_stage="epic-boundary",
+        policy_snapshot=LAUNCH_SNAPSHOT,
+        **state_kwargs,
+    )
+    capsys.readouterr()
+    resumed: list[Path] = []
+
+    def resume(_project, rd, **_kw):
+        resumed.append(rd)
+        return 0
+
+    monkeypatch.setattr(cli, "_resume_paused_run", resume)
+    return run_dir, resumed
+
+
+def _fake_epic_tree(monkeypatch, project, status):
+    """Point the verify's tree read at a FakeTicketTree whose `epic-cart` reads ``status``."""
+    from bmad_loop.ticketmodel import EpicRow
+
+    row = EpicRow(
+        slug="epic-cart",
+        id="1",
+        status=status,
+        after=(),
+        gated_by=(),
+        blocks=(),
+        next_id=3,
+        folder="epic-cart",
+        refined=True,
+    )
+    tree = FakeTicketTree(project.project, status_view=fake_status_view((), epics=(row,)))
+    return _board_tree(monkeypatch, tree)
+
+
+def _epic_close_kinds(run_dir):
+    from bmad_loop.journal import Journal
+
+    return [
+        e for e in Journal(run_dir).entries() if str(e.get("kind", "")).startswith("epic-close-")
+    ]
+
+
+def _resolve_epic(project, *extra):
+    return cli.main(
+        ["resolve", "--project", str(project.project), _EPIC_CLOSE_RUN, "--no-interactive", *extra]
+    )
+
+
+def test_resolve_epic_close_verifies_a_closed_epic_and_resumes(project, capsys, monkeypatch):
+    """`resolve --no-interactive --resume` on a tickets run paused at `epic-boundary`
+    reads the epic's status from the real tree and the dirt of its folder, journals
+    `epic-close-verified` and resumes the run. 1 real spawn. Ablation (performed):
+    skip the `_epic_close_check` call (no missing lines) and
+    `test_resolve_epic_close_refuses_an_open_epic` resumes the open epic and FAILS."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+
+    assert _resolve_epic(project, "--resume") == 0, capsys.readouterr().err
+
+    assert resumed == [run_dir]
+    (row,) = _epic_close_kinds(run_dir)
+    assert (row["kind"], row["epic_ref"], row["status"]) == (
+        "epic-close-verified",
+        "epic-cart",
+        "done",
+    )
+    assert "epic epic-cart reads done" in capsys.readouterr().out
+
+
+def test_resolve_epic_close_refuses_an_open_epic(project, capsys, monkeypatch):
+    """An epic file still `in-progress` is unverified: exit 1, no resume, an
+    `epic-close-unverified` row naming the status, and the run stays paused. 1 real
+    spawn."""
+    from bmad_loop.journal import load_state
+
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys, closed=False)
+
+    assert _resolve_epic(project, "--resume") == 1
+
+    captured = capsys.readouterr()
+    assert resumed == []
+    (row,) = _epic_close_kinds(run_dir)
+    assert row["kind"] == "epic-close-unverified"
+    assert row["missing"] == ["epic epic-cart: the epic reads in-progress"]
+    assert "epic epic-cart: the epic reads in-progress" in captured.err
+    assert (
+        f"close it and commit, then: bmad-loop resolve {_EPIC_CLOSE_RUN} --no-interactive"
+        in captured.out
+    )
+    assert load_state(run_dir).paused_stage == "epic-boundary"
+
+
+@pytest.mark.parametrize("where", ["inside", "outside"])
+def test_resolve_epic_close_checks_only_the_epic_folder(project, capsys, monkeypatch, where):
+    """Uncommitted dirt inside the epic folder leaves the closure unverified; dirt
+    elsewhere — here the sibling epic's folder — is not the closure's to answer and
+    passes. No real spawn. Ablation (performed): pass `"."` (the whole checkout) as
+    the prefix and the `outside` row FAILS."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys, closed=False)
+    _fake_epic_tree(monkeypatch, project, "done")
+    folder = _EPIC_CART_DIR if where == "inside" else _EPIC_CART_DIR.parent / "epic-checkout"
+    (project.project / folder / "notes.md").write_text("draft\n", encoding="utf-8")
+
+    rc = _resolve_epic(project, "--resume")
+
+    (row,) = _epic_close_kinds(run_dir)
+    if where == "inside":
+        assert rc == 1 and resumed == []
+        assert row["kind"] == "epic-close-unverified"
+        assert row["missing"] == [
+            f"epic epic-cart: {_EPIC_CART_DIR.as_posix()}: uncommitted "
+            f"{(_EPIC_CART_DIR / 'notes.md').as_posix()}"
+        ]
+    else:
+        assert rc == 0, capsys.readouterr().err
+        assert resumed == [run_dir]
+        assert row["kind"] == "epic-close-verified"
+
+
+def test_resolve_epic_close_no_resume_prints_the_hint(project, capsys, monkeypatch):
+    """`--no-resume` verifies and journals, then prints the resume hint and stops.
+    No real spawn."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    _fake_epic_tree(monkeypatch, project, "dropped")
+
+    assert _resolve_epic(project, "--no-resume") == 0
+
+    assert resumed == []
+    assert [r["kind"] for r in _epic_close_kinds(run_dir)] == ["epic-close-verified"]
+    assert f"resume when ready: bmad-loop resume {_EPIC_CLOSE_RUN}" in capsys.readouterr().out
+
+
+def test_resolve_epic_close_declined_confirm_keeps_the_pause(project, capsys, monkeypatch):
+    """Without `--resume` the operator is asked; a decline exits 0 with the run
+    still paused. No real spawn."""
+    from bmad_loop.journal import load_state
+
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    _fake_epic_tree(monkeypatch, project, "done")
+    asked: list[str] = []
+    monkeypatch.setattr(cli, "_confirm", lambda q: asked.append(q) and False)
+
+    assert _resolve_epic(project) == 0
+
+    assert asked == [f"resume run {_EPIC_CLOSE_RUN}?"]
+    assert resumed == []
+    assert "cancelled — run is still paused at epic epic-cart" in capsys.readouterr().out
+    assert load_state(run_dir).paused_stage == "epic-boundary"
+
+
+@pytest.mark.parametrize("story", ["epic-other", "epic-cart"])
+def test_resolve_epic_close_story_must_name_the_paused_epic(project, capsys, monkeypatch, story):
+    """`--story` names the epic the run paused on, or resolve refuses before any
+    gate or verify. No real spawn."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    pins = _fake_epic_tree(monkeypatch, project, "done")
+
+    rc = _resolve_epic(project, "--resume", "--story", story)
+
+    if story == "epic-cart":
+        assert rc == 0, capsys.readouterr().err
+        assert resumed == [run_dir]
+    else:
+        assert rc == 1
+        assert (
+            f"run {_EPIC_CLOSE_RUN} is paused at epic epic-cart's closure, not epic-other"
+            in capsys.readouterr().err
+        )
+        assert resumed == [] and pins == [] and _epic_close_kinds(run_dir) == []
+
+
+def test_resolve_epic_close_refuses_when_the_pause_moves(project, capsys, monkeypatch):
+    """The confirm runs lock-free, so the pause is re-read under the run lock
+    before the resume: a pause that moved meanwhile is not resumed. No real
+    spawn."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    _fake_epic_tree(monkeypatch, project, "done")
+
+    def confirm(_q):
+        state = load_state(run_dir)
+        state.paused_story_key = "epic-checkout"
+        save_state(run_dir, state)
+        return True
+
+    monkeypatch.setattr(cli, "_confirm", confirm)
+
+    assert _resolve_epic(project) == 1
+
+    assert resumed == []
+    assert (
+        "the pause for epic-cart changed while resolve was in progress — not resuming"
+        in capsys.readouterr().err
+    )
+
+
+def test_resolve_epic_close_refuses_an_unrecorded_store_topology(project, capsys, monkeypatch):
+    """A tickets run that recorded no store topology (no initiative folder at its
+    start, or a state written before the record existed) has no repo to check the
+    epic folder in: refused, nothing journaled. No real spawn."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys, store_topology={})
+    _fake_epic_tree(monkeypatch, project, "done")
+
+    assert _resolve_epic(project, "--resume") == 1
+
+    assert "recorded no ticket-store versioning" in capsys.readouterr().err
+    assert resumed == [] and _epic_close_kinds(run_dir) == []
+
+
+@pytest.mark.parametrize("cause", ["no-epic", "retro-pending"])
+def test_resolve_epic_close_refusal_causes(project, capsys, monkeypatch, cause):
+    """A pause on no epic, or on an epic this run committed a ticket of with no
+    closure recorded, is no closure to verify: exit 1 with the classifier's step
+    and the quoted pause, nothing journaled, no tree read. Ablation (performed):
+    route the retro-pending refusal to the verify and that row FAILS (it verifies
+    and resumes)."""
+    from bmad_loop.model import Phase, StoryTask, TicketBinding
+
+    if cause == "no-epic":
+        kwargs = {"paused_story_key": None}
+        step = "commit or clean the retrospective's leftovers"
+    else:
+        binding = TicketBinding(
+            ref="1.1",
+            id="1",
+            epic_slug="epic-cart",
+            epic_id="1",
+            title="Cart model",
+            plan="/p/plan.md",
+            risk="",
+            refined=True,
+            plan_checkpoint=False,
+            done_checkpoint=False,
+            hitl=False,
+        )
+        task = StoryTask(
+            story_key="1.1", epic=0, phase=Phase.DONE, commit_sha="abc", ticket=binding
+        )
+        kwargs = {"ticket_epic_closures": {}, "tasks": {"1.1": task}}
+        step = "the retrospective of epic-cart has not run or is not committed"
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys, **kwargs)
+    pins = _fake_epic_tree(monkeypatch, project, "done")
+
+    assert _resolve_epic(project, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert f"cannot resolve {_EPIC_CLOSE_RUN}: {step}" in err
+    assert "  paused: close epic-cart with bmad-agent-po" in err
+    assert resumed == [] and pins == [] and _epic_close_kinds(run_dir) == []
+
+
+@pytest.mark.parametrize("gesture", ["interactive", "stories-run"])
+def test_resolve_epic_boundary_other_gestures_keep_the_refusal(tmp_path, capsys, gesture):
+    """Only `--no-interactive` on a tickets run takes the epic-close branch: a plain
+    (interactive) resolve on the same pause, and a stories run's `epic-boundary`
+    pause, keep the not-an-escalation refusal."""
+    source = "tickets" if gesture == "interactive" else "stories"
+    _make_run_with_state(
+        tmp_path,
+        "r1",
+        source=source,
+        paused_reason="close epic-cart",
+        paused_stage="epic-boundary",
+        paused_story_key="epic-cart",
+        ticket_epic_closures={"epic-cart": "accepted"},
+    )
+    flags = [] if gesture == "interactive" else ["--no-interactive", "--resume"]
+
+    assert cli.main(["resolve", "--project", str(tmp_path), "r1", *flags]) == 1
+
+    err = capsys.readouterr().err
+    assert runs.not_escalation_pause_message("r1", "epic-boundary") in err
+
+
 @pytest.mark.parametrize("recorded", ["moved", "unreadable"])
 def test_resume_tickets_refuses_a_changed_store_topology(project, capsys, monkeypatch, recorded):
     """Resume re-classifies the ticket store and refuses when it differs from the

@@ -44,6 +44,7 @@ from . import (
 )
 from . import stories as stories_mod
 from . import (
+    ticketlayout,
     ticketmodel,
     tickets_source,
     ticketstore,
@@ -92,7 +93,7 @@ from .escalation import (
     resume_skipped_escalation_keys,
 )
 from .journal import Journal, load_state, save_state, state_lock
-from .model import PauseSnapshot, Phase, RunState, StoryTask
+from .model import PAUSE_EPIC_BOUNDARY, PauseSnapshot, Phase, RunState, StoryTask
 from .platform_util import (
     MAX_SEGMENT,
     LockUnavailableError,
@@ -7306,6 +7307,23 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             "proceeding anyway (--force)",
             file=sys.stderr,
         )
+    # A tickets run's epic-boundary pause, answered by closing the epic: routed ahead
+    # of the escalation gate, which refuses it. Only a flagless `--no-interactive`
+    # resolve takes it; every other gesture on that pause keeps the refusal below.
+    if (
+        args.restore_patch is None
+        and not getattr(args, "adopt_branch", False)
+        and not getattr(args, "reverify", False)
+        and not getattr(args, "abandon", False)
+        and not getattr(args, "at_reset", False)
+        and not args.interactive
+    ):
+        target = tickets_source.epic_close_target(state)
+        if not (
+            isinstance(target, tickets_source.EpicCloseRefusal)
+            and target.code == tickets_source.EPIC_CLOSE_NOT_APPLICABLE
+        ):
+            return _resolve_epic_close(args, project, run_dir, state, target)
     # DW-522: `--reverify --story <key>` may name a worktree unit under ANY pause
     # stage (an isolated defer never pauses the run); `reverify_refusal` decides
     # whether the named story qualifies. Everything else needs the escalation pause,
@@ -7772,6 +7790,185 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(
             f"✓ resuming run {args.run_id} in the background — "
             f"watch it in the TUI, or: bmad-loop attach {args.run_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, run_dir)
+
+
+class _EpicCloseUnverifiable(Exception):
+    """The epic-close verify cannot run at all: the run recorded no store to read
+    dirt from, the epic folder cannot be located in that store's repo, or the tree
+    cannot be read. ``resolve`` exits 1 and the run stays paused."""
+
+
+def _epic_close_check(
+    project: Path, state: RunState, paths: bmadconfig.ProjectPaths, slug: str
+) -> tuple[str, list[str]]:
+    """``(status, missing)`` for epic ``slug`` of the paused tickets run ``state``:
+    the epic file's status from the run's pinned tree (``"absent"`` when the tree
+    lists no such epic) and :func:`resolve.epic_close_missing` over the dirt of the
+    repo the run's recorded store topology versions — the epic folder only, never
+    the rest of that repo. Each missing line names the epic; empty means verified.
+
+    A git status that cannot be read is one missing line, not clean. Raises
+    :class:`_EpicCloseUnverifiable` for what no closure answers: an unrecorded or
+    unknown versioning (a tickets run with no initiative folder at its start
+    records none), an epic folder outside the repo whose dirt is read, a tree read
+    fault, or a chained run whose config no longer names its parent."""
+    try:
+        pin, folder = runs.recorded_tree_pin(state, project, project)
+    except bmadconfig.BmadConfigError as e:
+        raise _EpicCloseUnverifiable(str(e)) from e
+    topology = runs.live_store_topology(state, project)
+    versioning = topology.get("versioning")
+    repo: Path | None
+    if versioning == "code-repo":
+        repo = paths.repo_root
+    elif versioning == "store-repo":
+        store_repo = topology.get("store_repo")
+        if not store_repo:
+            raise _EpicCloseUnverifiable(
+                f"run {state.run_id} recorded a store-repo ticket store with no repository"
+            )
+        repo = Path(store_repo)
+    elif versioning == "none":
+        repo = None
+    else:
+        raise _EpicCloseUnverifiable(
+            f"run {state.run_id} recorded no ticket-store versioning ({versioning!r}), so "
+            "there is no repo to check the epic folder in"
+        )
+    if not state.initiative_folder:
+        raise _EpicCloseUnverifiable(f"run {state.run_id} recorded no initiative folder")
+    initiative = runs.rebase_recorded_project_path(Path(state.initiative_folder), state, project)
+    try:
+        epic_folder = ticketlayout.epic_folder(initiative, slug)
+    except OSError as e:
+        raise _EpicCloseUnverifiable(f"cannot locate epic {slug} in {initiative}: {e}") from e
+    prefix = ""
+    if repo is not None:
+        # `dirty_paths` keys are relative to the repo it reads, as the tickets
+        # engine's dirty-initiative gate reads them: a folder outside that repo has
+        # no prefix there, and comparing anyway would read unrelated paths as clean.
+        try:
+            prefix = epic_folder.resolve().relative_to(repo.resolve()).as_posix()
+        except (OSError, RuntimeError, ValueError) as e:
+            raise _EpicCloseUnverifiable(
+                f"epic folder {epic_folder.as_posix()} is not inside the repo at "
+                f"{repo.as_posix()} whose changes it is checked against ({e})"
+            ) from e
+    try:
+        view = _status_ticket_tree(project, pin, folder=folder).status()
+    except tickettree.TicketsError as e:
+        raise _EpicCloseUnverifiable(
+            f"cannot read the ticket tree: tickets.py {e.kind}: {e}"
+        ) from e
+    row = next((epic for epic in view.epics if epic.slug == slug), None)
+    status = row.status if row is not None else "absent"
+    dirty: list[str] = []
+    git_fault: str | None = None
+    if repo is not None:
+        try:
+            dirty = list(verify.dirty_paths(repo))
+        except verify.GitError as e:
+            git_fault = f"cannot read the git status of {repo.as_posix()}: {e}"
+    missing = resolve.epic_close_missing(status, dirty, prefix, versioning)
+    if git_fault is not None:
+        missing.append(git_fault)
+    return status, [f"epic {slug}: {line}" for line in missing]
+
+
+def _resolve_epic_close(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    target: tickets_source.EpicCloseTarget | tickets_source.EpicCloseRefusal,
+) -> int:
+    """``resolve --no-interactive`` on a tickets run's ``epic-boundary`` pause:
+    verify that the person closed the epic (:func:`_epic_close_check`), journal the
+    outcome and resume the run. ``cmd_resolve`` has run the alias, source and
+    liveness gates; this takes the classification's refusal causes, the shared
+    pre-session and configuration gates, then the verify, the confirm, a locked
+    re-check of the pause and the post-confirm plugin-trust refusal. An unverified
+    epic stays paused with only its journal row written."""
+    run_id = args.run_id
+    if isinstance(target, tickets_source.EpicCloseRefusal):
+        print(f"cannot resolve {run_id}: {target.step}", file=sys.stderr)
+        if target.paused_reason:
+            print(f"  paused: {target.paused_reason}", file=sys.stderr)
+        return 1
+    slug = target.slug
+    if args.story and args.story != slug:
+        print(f"run {run_id} is paused at epic {slug}'s closure, not {args.story}", file=sys.stderr)
+        return 1
+    if (rc := _resolve_pre_session_gates(args, project, run_dir, state)) is not None:
+        return rc
+    pol = policy_mod.load(_policy_path(project))
+    try:
+        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+    except (bmadconfig.BmadConfigError, OSError) as e:
+        print(f"cannot resolve {run_id}: cannot read the BMAD config: {e}", file=sys.stderr)
+        return 1
+    if (rc := _resolve_config_refusal(project, pol, state, paths)) is not None:
+        return rc
+    # The interactive epic-close session slots in here, ahead of the verify.
+    try:
+        status, missing = _epic_close_check(project, state, paths, slug)
+    except _EpicCloseUnverifiable as e:
+        print(f"cannot resolve {run_id}: {e} — run is still paused at epic {slug}", file=sys.stderr)
+        return 1
+    with state_lock(run_dir):
+        if missing:
+            Journal(run_dir, pin=state).append(
+                "epic-close-unverified", epic_ref=slug, missing=missing
+            )
+        else:
+            Journal(run_dir, pin=state).append("epic-close-verified", epic_ref=slug, status=status)
+    if missing:
+        for line in missing:
+            print(line, file=sys.stderr)
+        print(f"close it and commit, then: bmad-loop resolve {run_id} --no-interactive")
+        return 1
+    print(f"epic {slug} reads {status} with a clean epic folder")
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {run_id}")
+        return 0
+    if args.resume is None and not _confirm(f"resume run {run_id}?"):
+        print(f"cancelled — run is still paused at epic {slug}")
+        return 0
+    with state_lock(run_dir):
+        # The checks above ran lock-free: repeat them against the last writer's state.
+        fresh_state = load_state(run_dir, pin=state)
+        if fresh_state.paused_stage != PAUSE_EPIC_BOUNDARY or fresh_state.paused_story_key != slug:
+            print(
+                f"the pause for {slug} changed while resolve was in progress — not resuming",
+                file=sys.stderr,
+            )
+            return 1
+        fresh_live = runs.engine_liveness(run_dir)
+        if fresh_live == "alive":
+            print(f"run {run_id} is still live — stop it first", file=sys.stderr)
+            return 1
+        if fresh_live == "unknown" and not args.force:
+            print(
+                f"run {run_id}: engine may still be live (unverifiable pid) — "
+                "refusing to resume. Confirm the engine process is gone, then re-run "
+                "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                file=sys.stderr,
+            )
+            return 1
+    # #496/#497: the plugin dir can change while the confirm waits, so judge the
+    # resume's plugin-trust refusal again on the re-read policy.
+    pol = policy_mod.load(_policy_path(project))
+    if (rc := _reject_plugin_trust(paths, pol, _launch_plugin_grants(project))) is not None:
+        return rc
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {run_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {run_id}"
         )
         launch.detach_client()
     return _resume_paused_run(project, run_dir)
