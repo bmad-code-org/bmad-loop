@@ -5947,6 +5947,206 @@ def test_epic_closure_summary_surfaces_a_layout_probe_fault(project_tree, monkey
     assert f"retrospective: {flat}" not in summary
 
 
+# `R` and the closure viewer on a tickets epic boundary open the epic-close resolve:
+# `bmad-loop resolve <run>` in a ctl window, the CLI's plain call shape. Canned
+# state only; `start_resolve_detached` is stubbed with the two-positional shape, so a
+# keyword argument would fail the call.
+
+_EPIC_REASON = "close epic-cart with bmad-agent-po (closure check) — then resume"
+
+
+def _epic_close_launches(monkeypatch, *, live: str = "dead") -> list[tuple[Path, str]]:
+    launched: list[tuple[Path, str]] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: live)
+
+    def fake_start_resolve(proj, rid):
+        launched.append((proj, rid))
+        return ""  # no window id: the launch is the assertion, not the attach
+
+    monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
+    return launched
+
+
+def _retro_pending_run(root: Path) -> Path:
+    """An epic-boundary pause on epic-cart, which this run committed ticket 1.1 of
+    with no closure recorded: the classifier's retro-pending refusal."""
+    run_dir, plan = _tickets_paused_run(
+        root, stage="epic-boundary", key="epic-cart", reason=_EPIC_REASON
+    )
+    state = load_state(run_dir)
+    task = StoryTask(story_key="1.1", epic=0, phase=Phase.DONE, commit_sha="abc")
+    task.ticket = _ticket_binding(plan, "1.1")
+    state.tasks = {"1.1": task}
+    save_state(run_dir, state)
+    return run_dir
+
+
+async def _press_resolve(app, pilot):
+    await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+    await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+    await pilot.press("R")
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_resolve_epic_boundary_opens_the_epic_close(project_tree, monkeypatch):
+    """`R` on a tickets epic boundary with a recorded closure confirms for the epic
+    and launches the plain resolve, which opens bmad-agent-po in the ctl window.
+    Ablation (performed): drop the epic-close admission in `action_resolve_run` and
+    `R` notifies "only available for a run paused at an escalation" (FAILS)."""
+    launched: list[tuple[Path, str]] = []
+    selected: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_start_resolve(proj, rid):
+        launched.append((proj, rid))
+        return "@7"
+
+    monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
+    monkeypatch.setattr(launch, "ctl_window_reachable", lambda proj, rid, wid: True)
+    calls, _stamps = _patch_attach_exec(monkeypatch)
+    _tickets_paused_run(
+        project_tree.project,
+        stage="epic-boundary",
+        key="epic-cart",
+        reason=_EPIC_REASON,
+        closures={"epic-cart": "approved"},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        assert render(app.screen.query_one(".title").content).strip() == "close epic"
+        body = render(app.screen.query_one("#body Static", Static).content)
+        assert "open bmad-agent-po for epic epic-cart?" in body
+        assert "the run resumes in that window" in body
+        assert "stays held" not in body
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(pilot, lambda: bool(calls))
+    assert launched == [(project_tree.project, "20260611-100000-aaaa")]
+    assert selected == ["@7"]
+
+
+async def test_resolve_epic_boundary_rejected_closure_names_the_hold(project_tree, monkeypatch):
+    """A rejected closure holds the run until the epic is closed: the confirm says so."""
+    _epic_close_launches(monkeypatch)
+    _tickets_paused_run(
+        project_tree.project,
+        stage="epic-boundary",
+        key="epic-cart",
+        reason=_EPIC_REASON,
+        closures={"epic-cart": "rejected"},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        body = render(app.screen.query_one("#body Static", Static).content)
+        assert "open bmad-agent-po for epic epic-cart?" in body
+        assert "The run stays held until this epic is closed." in body
+
+
+@pytest.mark.parametrize("cause", ["retro-pending", "no-epic"])
+async def test_resolve_epic_boundary_refusal_notifies_the_step(project_tree, monkeypatch, cause):
+    """A boundary no closure answers (the retrospective is owed, or the pause names
+    no epic) is refused with the classifier's step; nothing is launched."""
+    launched = _epic_close_launches(monkeypatch)
+    if cause == "retro-pending":
+        _retro_pending_run(project_tree.project)
+        step = "the retrospective of epic-cart has not run or is not committed"
+    else:
+        _tickets_paused_run(
+            project_tree.project, stage="epic-boundary", key=None, reason="retro leftovers"
+        )
+        step = "commit or clean the retrospective's leftovers"
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(pilot, lambda: any(step in m for m in notifications(app)))
+        assert not isinstance(app.screen, ConfirmModal)
+        assert not any("only available for a run paused" in m for m in notifications(app))
+    assert launched == []
+
+
+async def test_resolve_stories_epic_boundary_keeps_the_escalation_refusal(
+    project_tree, monkeypatch
+):
+    """Only a tickets run's epic boundary is an epic-close: a sprint run's pause at
+    the same stage keeps the escalation refusal."""
+    launched = _epic_close_launches(monkeypatch)
+    make_run(
+        project_tree.project,
+        "20260611-100000-aaaa",
+        paused_stage="epic-boundary",
+        paused_reason="epic 1 complete",
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(
+            pilot,
+            lambda: any(
+                "only available for a run paused at an escalation" in m for m in notifications(app)
+            ),
+        )
+    assert launched == []
+
+
+async def test_resolve_epic_boundary_refused_while_possibly_live(project_tree, monkeypatch):
+    """A possibly-live engine refuses the epic-close before the confirm, as it
+    refuses an escalation resolve."""
+    launched = _epic_close_launches(monkeypatch, live="alive")
+    _tickets_paused_run(
+        project_tree.project,
+        stage="epic-boundary",
+        key="epic-cart",
+        reason=_EPIC_REASON,
+        closures={"epic-cart": "approved"},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(pilot, lambda: any("may still be live" in m for m in notifications(app)))
+        assert not isinstance(app.screen, ConfirmModal)
+    assert launched == []
+
+
+async def test_epic_closure_viewer_offers_the_epic_close(project_tree, monkeypatch):
+    """The closure viewer of a closure target offers `Close with bmad-agent-po`,
+    which launches the plain resolve. Ablation (performed): drop the viewer's
+    `close-epic` action and the button is absent (FAILS)."""
+    launched = _epic_close_launches(monkeypatch)
+    _tickets_paused_run(
+        project_tree.project,
+        stage="epic-boundary",
+        key="epic-cart",
+        reason=_EPIC_REASON,
+        closures={"epic-cart": "rejected"},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        button = await ready(pilot, "#act-close-epic")
+        assert "Close with bmad-agent-po" in str(button.label)
+        await click(pilot, button)
+        await until(pilot, lambda: bool(launched))
+    assert launched == [(project_tree.project, "20260611-100000-aaaa")]
+
+
+async def test_epic_closure_viewer_refusal_offers_no_epic_close(project_tree, monkeypatch):
+    """A retro-pending boundary is no closure target: the viewer keeps only its
+    existing verbs (the reason already names the step)."""
+    _epic_close_launches(monkeypatch)
+    _retro_pending_run(project_tree.project)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        await ready(pilot, "#act-resume")
+        assert not app.screen.query("#act-close-epic")
+
+
 async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatch):
     """R13: "Request replan" on a tickets run re-opens the plan to `draft` only
     through `TicketTree.mark(reason="replan")` — pinned to the run's initiative, on

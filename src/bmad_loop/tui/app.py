@@ -39,6 +39,7 @@ from .. import (
     runsetup,
     stories,
     ticketlayout,
+    tickets_source,
     ticketstore,
     tickettree,
     verify,
@@ -835,6 +836,20 @@ class BmadLoopApp(App[None]):
                 markup=False,
             )
             return
+        # A tickets epic boundary is answered by closing the epic with
+        # bmad-agent-po, as a plain `bmad-loop resolve` does: classified ahead of the
+        # escalation rule, which refuses it. Every other pause takes the paths below.
+        target = tickets_source.epic_close_target(state)
+        if isinstance(target, tickets_source.EpicCloseTarget):
+            self._confirm_epic_close(run_id, run_dir, target, pointer)
+            return
+        if target.code != tickets_source.EPIC_CLOSE_NOT_APPLICABLE:
+            self.notify(
+                target.step + (f"\n{pointer}" if pointer else ""),
+                severity="warning",
+                markup=False,
+            )
+            return
         # Admission is `runs.escalation_resolvable`, the CLI's own rule: paused at
         # the escalation stage, or not paused while a story is still escalated —
         # a resume clears the pause before its engine starts (#958).
@@ -860,6 +875,34 @@ class BmadLoopApp(App[None]):
                 "converse to fix the frozen spec, then confirm re-arm + resume in that window."
                 + (f"\n{pointer}" if pointer else ""),
                 confirm_label="resolve",
+            ),
+            lambda ok: self._launch_resolve(run_id) if ok else None,
+        )
+
+    def _confirm_epic_close(
+        self,
+        run_id: str,
+        run_dir: Path,
+        target: tickets_source.EpicCloseTarget,
+        pointer: str = "",
+    ) -> None:
+        """Confirm and launch the epic-close resolve for `R`: the CLI opens
+        bmad-agent-po in a ctl window, then verifies the epic, confirms and resumes
+        there. Liveness is gated before the confirm, as the escalation arm is."""
+        if _engine_possibly_live(run_dir):
+            self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
+            return
+        body = (
+            f"open bmad-agent-po for epic {target.slug}?\n"
+            "close and commit it there; the run resumes in that window."
+        )
+        if target.rejected:
+            body += "\nThe run stays held until this epic is closed."
+        self.push_screen(
+            ConfirmModal(
+                "close epic",
+                body + (f"\n{pointer}" if pointer else ""),
+                confirm_label="close epic",
             ),
             lambda ok: self._launch_resolve(run_id) if ok else None,
         )
@@ -1062,6 +1105,10 @@ class BmadLoopApp(App[None]):
         def done(verb: str | None) -> None:
             if verb == "resume":
                 self._do_resume(run_id)
+            elif verb == "close-epic":
+                if self._mux_missing() or self._resolve_blocked_by_liveness(run_id, run_dir):
+                    return
+                self._launch_resolve(run_id)
 
         if spec_path is None:
             # Spec-less gates: story-gate fires before the story is registered in
@@ -1084,13 +1131,20 @@ class BmadLoopApp(App[None]):
                 else Text(f"run {run_id}", style="bold")
             )
             reason = state.paused_reason or ""
+            actions: list[tuple[str, str, str]] = []
             if closure:
                 reason = f"{self._epic_closure_summary(state)}\n\n{reason}"
+                # A refusal cause offers no verb: its reason names the step.
+                if isinstance(
+                    tickets_source.epic_close_target(state), tickets_source.EpicCloseTarget
+                ):
+                    actions.append(("close-epic", "Close with bmad-agent-po", "warning"))
             self.push_screen(
                 PauseReasonModal(
                     title=f"{label} — pause reason",
                     subtitle=subtitle,
                     reason=reason,
+                    actions=actions,
                 ),
                 done,
             )

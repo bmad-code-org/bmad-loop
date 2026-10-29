@@ -8,6 +8,7 @@ rich Text, never markup.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -826,9 +827,11 @@ class SpecReviewModal(BaseDialog):
 class PauseReasonModal(BaseDialog):
     """Spec-less gate viewer: a story gate fires before its story is registered
     and an epic boundary has no story at all, so the pause reason IS the payload
-    — it names the blocking entries and the remedy. Dismisses with 'resume', or
-    None on close/escape. Reasons are arbitrary engine text → plain Text, never
-    markup. The modal owns no logic — the caller maps the verb to _do_resume."""
+    — it names the blocking entries and the remedy. Dismisses with 'resume', a
+    verb of the caller's extra `actions` ((verb, label, variant) buttons after
+    Resume, none by default), or None on close/escape. Reasons are arbitrary
+    engine text → plain Text, never markup. The modal owns no logic — the caller
+    maps the verb to _do_resume (or its own handler for an extra verb)."""
 
     DEFAULT_CSS = """
     PauseReasonModal #reason {
@@ -844,11 +847,19 @@ class PauseReasonModal(BaseDialog):
     }
     """
 
-    def __init__(self, *, title: str, subtitle: str | Text, reason: str):
+    def __init__(
+        self,
+        *,
+        title: str,
+        subtitle: str | Text,
+        reason: str,
+        actions: Sequence[tuple[str, str, str]] = (),
+    ):
         super().__init__()
         self._title = title
         self._subtitle = subtitle if isinstance(subtitle, Text) else Text(subtitle)
         self._reason = reason
+        self._actions = tuple(actions)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -861,6 +872,8 @@ class PauseReasonModal(BaseDialog):
                 )
             with Horizontal(classes="buttons"):
                 yield Button("Resume", variant="primary", id="act-resume")
+                for verb, label, variant in self._actions:
+                    yield Button(label, variant=variant, id=f"act-{verb}")  # type: ignore[arg-type]
                 yield Button("close", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
