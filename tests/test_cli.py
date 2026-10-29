@@ -3123,6 +3123,7 @@ def test_status_json_tickets_run_is_additive(project, capsys):
     assert doc["tickets"] == {
         "initiative": V7_DEFAULT_INITIATIVE,
         "initiative_folder": f"/p/_bmad-output/{V7_DEFAULT_INITIATIVE}",
+        "parent_initiative": None,
         "epic_filter": "epic-cart",
         "store_topology": _TICKETS_TOPOLOGY,
         "epic_closures": {"epic-cart": "accepted"},
@@ -3143,6 +3144,19 @@ def test_status_json_tickets_run_is_additive(project, capsys):
     }
     assert second["ticket"]["done_pending"] is False
     assert second["ticket"]["park_pending"] == "awaiting operator: needs a decision"
+
+
+def test_status_json_tickets_names_a_parent_initiative(project, capsys):
+    """A run building a parent's child names the parent in the run-level
+    `tickets` object, still at schema 1 (an added key, nothing removed or
+    retyped)."""
+    _make_tickets_status_run(project.project, parent_initiative="initiative-platform")
+
+    doc = _status_json(project, capsys)
+
+    assert doc["schema_version"] == cli.STATUS_SCHEMA_VERSION == 1
+    assert doc["tickets"]["parent_initiative"] == "initiative-platform"
+    assert doc["tickets"]["initiative"] == V7_DEFAULT_INITIATIVE
 
 
 @pytest.mark.parametrize("source", ["sprint-status", "stories"])
@@ -3202,7 +3216,7 @@ def _board_tree(monkeypatch, tree):
     """Point `status`'s tickets board at ``tree``; returns the pins it was built with."""
     pins: list[str | None] = []
 
-    def build(state, _project):
+    def build(state, _project, folder=None):
         pins.append(state.initiative or None)
         return tree
 

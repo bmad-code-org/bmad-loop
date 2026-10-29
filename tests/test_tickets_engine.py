@@ -101,7 +101,7 @@ def make_engine(
     )
     built: list[tuple[Path, str | None]] = []
 
-    def factory(root: Path, pin: str | None) -> FakeTicketTree:
+    def factory(root: Path, pin: str | None, *, folder: Path | None = None) -> FakeTicketTree:
         built.append((root, pin))
         return tree
 
@@ -1938,7 +1938,7 @@ def test_mark_done_failure_pauses_and_resume_marks_again(project_v7, monkeypatch
         run_dir=engine.run_dir,
         journal=Journal(engine.run_dir),
         state=state,
-        ticket_tree_factory=lambda root, pin: tree,
+        ticket_tree_factory=lambda root, pin, folder=None: tree,
     )
     resumed.run()
 
@@ -1989,7 +1989,7 @@ def test_worktree_unit_marks_the_mounts_plan_on_an_epic_branch(project_v7):
     engine, _ = make_engine(
         project_v7, tree, policy=pol, script=[_builds(project_v7, tree, plan)], max_stories=1
     )
-    engine._ticket_tree_factory = lambda root, pin: (  # type: ignore[method-assign]
+    engine._ticket_tree_factory = lambda root, pin, folder=None: (  # type: ignore[method-assign]
         tree if root == main else _MountTree(tree, main, root)
     )
 
@@ -2298,7 +2298,7 @@ def _resumed(engine: TicketsEngine, tree: FakeTicketTree, script: list):
         run_dir=engine.run_dir,
         journal=Journal(engine.run_dir),
         state=state,
-        ticket_tree_factory=lambda root, pin: tree,
+        ticket_tree_factory=lambda root, pin, folder=None: tree,
     )
     return resumed, adapter
 
@@ -3597,7 +3597,7 @@ def _resume(engine: TicketsEngine, tree: FakeTicketTree) -> TicketsEngine:
         run_dir=engine.run_dir,
         journal=Journal(engine.run_dir),
         state=state,
-        ticket_tree_factory=lambda root, pin: tree,
+        ticket_tree_factory=lambda root, pin, folder=None: tree,
     )
 
 
@@ -3887,7 +3887,7 @@ def test_shared_store_record_moves_with_a_renamed_project(project_v7_store_repo,
         run_dir=engine.run_dir,
         journal=Journal(engine.run_dir),
         state=engine.state,
-        ticket_tree_factory=lambda root, pin: tree,
+        ticket_tree_factory=lambda root, pin, folder=None: tree,
     )
 
     assert resumed.paths.shared_store == live.store_root

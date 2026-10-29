@@ -153,6 +153,7 @@ strict = [
   "src/bmad_loop/plugins/grants.py",
   "src/bmad_loop/worksource.py",
   "src/bmad_loop/ticketmodel.py",
+  "src/bmad_loop/initiativechain.py",
   "src/bmad_loop/ticketstore.py",
   "src/bmad_loop/usagereset.py",
   "src/bmad_loop/parked.py",

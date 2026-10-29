@@ -286,14 +286,17 @@ def _ticket_projection(task: StoryTask) -> dict[str, object] | None:
 
 
 def _tickets_projection(state: RunState) -> dict[str, object] | None:
-    """The run-level ``tickets`` object: the initiative the run is pinned to, its
-    ``--epic`` selector, the classified ticket store and the epic closures it
-    recorded. None unless the run's source is ``tickets``."""
+    """The run-level ``tickets`` object: the initiative the run is pinned to (and,
+    for a parent's child, the parent), its ``--epic`` selector, the classified
+    ticket store and the epic closures it recorded. None unless the run's source
+    is ``tickets``."""
     if state.source != SOURCE_TICKETS:
         return None
     return {
         "initiative": state.initiative,
         "initiative_folder": state.initiative_folder,
+        # the parent initiative whose child this run builds, or null
+        "parent_initiative": state.parent_initiative,
         # the `--epic` selector as an epic slug, or null for every epic
         "epic_filter": state.ticket_epic_filter or None,
         # `ticketstore.StoreTopology.to_dict`, or null when none was recorded

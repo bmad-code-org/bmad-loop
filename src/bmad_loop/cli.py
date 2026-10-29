@@ -4727,11 +4727,14 @@ def _owed_post_landing_label(task: StoryTask) -> str:
     return "done" if task.ticket_done_pending else "built"
 
 
-def _status_ticket_tree(state: RunState, project: Path) -> tickettree.TicketTreeLike:
+def _status_ticket_tree(
+    state: RunState, project: Path, *, folder: Path | None = None
+) -> tickettree.TicketTreeLike:
     """The tree ``status`` reads a tickets run's board from: the project's
     installed ``tickets.py``, pinned to the run's initiative, so a board for
-    another initiative is never shown under this run."""
-    return tickettree.TicketTree(project, pinned_initiative=state.initiative or None)
+    another initiative is never shown under this run; ``folder`` is a parent's
+    child folder to read through."""
+    return tickettree.TicketTree(project, pinned_initiative=state.initiative or None, folder=folder)
 
 
 def _print_tickets_status(state: RunState, project: Path) -> None:
@@ -4756,7 +4759,7 @@ def _print_tickets_status(state: RunState, project: Path) -> None:
         )
         print(f"tickets: this run is limited to {selected}")
     try:
-        status_view = _status_ticket_tree(state, project).status()
+        status_view = _status_ticket_tree(state, project, folder=None).status()
     except tickettree.TicketsError as e:
         print(f"tickets board unavailable: tickets.py {e.kind}: {e}")
     else:

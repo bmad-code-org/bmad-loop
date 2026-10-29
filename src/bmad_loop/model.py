@@ -1431,6 +1431,12 @@ class RunState:
     # the pin existed.
     initiative: str = ""
     initiative_folder: str = ""
+    # BMAD v7 tickets runs only: the parent initiative whose child this run
+    # builds (`initiative`/`initiative_folder` then name the child, a sibling
+    # folder of the parent's), or None for a run that builds the active
+    # initiative itself — every run today, and every state.json written before
+    # the field existed.
+    parent_initiative: str | None = None
     # tickets mode only. `ticket_epic_filter`: the `--epic` selector as an epic
     # slug ("" = every epic). `ticket_story_approvals`: refs whose refined
     # `plan_checkpoint` story file an operator approved this run, so the pick
@@ -1677,6 +1683,7 @@ class RunState:
             "spec_folder": self.spec_folder,
             "initiative": self.initiative,
             "initiative_folder": self.initiative_folder,
+            "parent_initiative": self.parent_initiative,
             "ticket_epic_filter": self.ticket_epic_filter,
             "ticket_story_approvals": list(self.ticket_story_approvals),
             "ticket_epic_closures": dict(self.ticket_epic_closures),
@@ -1729,6 +1736,7 @@ class RunState:
             spec_folder=str(d.get("spec_folder", "")),
             initiative=str(d.get("initiative", "")),
             initiative_folder=str(d.get("initiative_folder", "")),
+            parent_initiative=str(d.get("parent_initiative") or "") or None,
             ticket_epic_filter=str(d.get("ticket_epic_filter", "")),
             ticket_story_approvals=[str(r) for r in d.get("ticket_story_approvals", [])],
             ticket_epic_closures={

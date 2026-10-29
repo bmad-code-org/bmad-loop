@@ -1193,11 +1193,14 @@ def _tickets_tree_sig(project: Path, folder: Path) -> object:
     )
 
 
-def _board_ticket_tree(project: Path, initiative: str) -> tickettree.TicketTreeLike:
+def _board_ticket_tree(
+    project: Path, initiative: str, *, folder: Path | None = None
+) -> tickettree.TicketTreeLike:
     """The tree the board reads: the project's installed ``tickets.py``, pinned
     to ``initiative`` so a switched ``active_initiative`` reads as a fault, not
-    as another initiative's board. A seam: tests swap in a ``FakeTicketTree``."""
-    return tickettree.TicketTree(project, pinned_initiative=initiative)
+    as another initiative's board, through a parent's child ``folder`` when
+    given. A seam: tests swap in a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project, pinned_initiative=initiative, folder=folder)
 
 
 def initiative_board(project: Path, initiative: str, folder: Path) -> TicketsBoard:
@@ -1214,7 +1217,7 @@ def initiative_board(project: Path, initiative: str, folder: Path) -> TicketsBoa
         if board.fault is None or time.monotonic() - cached[2] < TICKETS_FAULT_RETRY_S:
             return board
     try:
-        view = _board_ticket_tree(project, initiative).status()
+        view = _board_ticket_tree(project, initiative, folder=None).status()
     except tickettree.TicketsError as e:
         board = TicketsBoard((), f"tickets.py {e.kind}: {e}", initiative)
     else:

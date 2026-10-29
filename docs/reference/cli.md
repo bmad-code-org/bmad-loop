@@ -557,7 +557,7 @@ Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`i
 
 `epic` is always an integer. A unit of a source with no integer epics (stories, sweep, tickets) reports `0`; a ticket's epic is in its `ticket` object.
 
-`tickets` (run level): `initiative` and `initiative_folder` (the pinned initiative), `epic_filter` (the `--epic` slug, or null), `store_topology` (`{layout, placement, versioning, store_root, store_repo}`, or null when none was recorded), `epic_closures` (epic slug → recorded closure verdict) and `epic_closures_acked` (epic slugs whose closure pause was resumed past).
+`tickets` (run level): `initiative` and `initiative_folder` (the pinned initiative), `parent_initiative` (the parent initiative whose child the run builds, or null), `epic_filter` (the `--epic` slug, or null), `store_topology` (`{layout, placement, versioning, store_root, store_repo}`, or null when none was recorded), `epic_closures` (epic slug → recorded closure verdict) and `epic_closures_acked` (epic slugs whose closure pause was resumed past).
 
 `ticket` (per task): `ref`, `id`, `epic_slug`, `epic_id`, `title`, `plan` (the absolute plan path recorded at the pick), `done_pending` (bool: a shared-store `done` mark is still owed), `park_pending` (the owed park's reason, or null) and `commit_pending` (bool: under `mark_done = "never"`, the store-repository commit of the `built` plan is still owed). It is null for a task with no ticket. A plan's live status is not part of the document, because it is not in `state.json`; the text board reads it.
 

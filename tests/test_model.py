@@ -181,6 +181,28 @@ def test_old_state_json_defaults_initiative_empty():
     assert back.initiative == "" and back.initiative_folder == ""
 
 
+def test_run_state_round_trips_parent_initiative():
+    assert _state().parent_initiative is None
+    assert _state().to_dict()["parent_initiative"] is None
+    chained = _state(initiative="initiative-auth", parent_initiative="initiative-platform")
+    d = json.loads(json.dumps(chained.to_dict()))
+    assert d["parent_initiative"] == "initiative-platform"
+    back = RunState.from_dict(d)
+    assert back.parent_initiative == "initiative-platform"
+    assert back.initiative == "initiative-auth"
+
+
+def test_old_state_json_without_parent_initiative_loads_unchained():
+    """A state.json written before the field existed reads as a run that builds
+    the active initiative itself. Ablation (performed): drop the `from_dict`
+    default (`d["parent_initiative"]`) and this FAILS with a KeyError."""
+    d = json.loads(json.dumps(_state(initiative="initiative-checkout").to_dict()))
+    del d["parent_initiative"]
+    back = RunState.from_dict(d)
+    assert back.parent_initiative is None
+    assert back.initiative == "initiative-checkout"
+
+
 def _binding(**kw) -> TicketBinding:
     base = dict(
         ref="2.1",

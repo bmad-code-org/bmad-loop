@@ -5714,12 +5714,13 @@ def _redrive_reads_the_upstream_artifacts(state: RunState) -> bool:
 
 
 def _rearm_ticket_tree(
-    project_root: Path, pinned_initiative: str | None
+    project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
 ) -> tickettree.TicketTreeLike:
     """The tree a tickets-mode re-arm marks its plan through: the installed
     ``tickets.py`` under ``project_root`` (the plan's live root), pinned to the run's
-    initiative. Tests replace it with a ``FakeTicketTree``."""
-    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative)
+    initiative, through a parent's child ``folder`` when given. Tests replace it
+    with a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative, folder=folder)
 
 
 def _rearm_ticket_plan(
@@ -6996,7 +6997,9 @@ def _rearm_escalation_locked(
                     spec_before = None
                 if state.source == worksource.SOURCE_TICKETS and task.ticket is not None:
                     ticket_tree = _rearm_ticket_tree(
-                        live_spec_root(task, state, live_project), state.initiative or None
+                        live_spec_root(task, state, live_project),
+                        state.initiative or None,
+                        folder=None,
                     )
                 try:
                     if ticket_tree is not None and task.ticket is not None:

@@ -66,7 +66,7 @@ from __future__ import annotations
 import errno
 import stat
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -165,6 +165,29 @@ class ProjectPaths:
             ),
             ignored_v6_keys=self.ignored_v6_keys,
             shared_store=self.shared_store,
+        )
+
+    def with_initiative(self, child: str) -> ProjectPaths:
+        """These paths re-rooted on ``child``, a child initiative of the active
+        (parent) one: its folder is the parent folder's sibling named ``child``
+        (upstream ``tickets.py``'s ``folder.parent / slug``), and both artifact
+        dirs — so the ``deferred-work.md`` ledger and the sprint-status path with
+        them — move onto it, as :func:`_assemble_v7` places them for an active
+        initiative. ``active_initiative`` names the child; every other member is
+        kept. Pure: nothing is read, written or canonicalized. Raises ValueError
+        off v7, with no active initiative folder, or for a ``child`` that is not a
+        single folder name."""
+        if self.era != "v7" or self.initiative_folder is None:
+            raise ValueError("with_initiative needs a v7 project with an active initiative folder")
+        if child in ("", ".", "..") or Path(child).name != child or "\\" in child:
+            raise ValueError(f"child initiative {child!r} is not a single folder name")
+        folder = self.initiative_folder.parent / child
+        return replace(
+            self,
+            implementation_artifacts=folder,
+            planning_artifacts=folder,
+            active_initiative=child,
+            initiative_folder=folder,
         )
 
     def in_shared_store(self, path: Path) -> bool:

@@ -5,7 +5,8 @@ tree (``[stories] source = "tickets"``).
 ``tickets.py`` (:class:`~bmad_loop.tickets_source.TicketsWorkSource`, whose pure
 :func:`~bmad_loop.tickets_source.decide_pick` holds the selection rules). The tree
 is reached only through a :class:`~bmad_loop.tickettree.TicketTreeLike`, which
-``ticket_tree_factory`` builds from ``(project_root, pinned_initiative)`` — the
+``ticket_tree_factory`` builds from ``(project_root, pinned_initiative)`` (and a
+child ``folder``, None today) — the
 real :class:`~bmad_loop.tickettree.TicketTree` by default, an in-memory fake in
 tests. The tree is pinned to ``RunState.initiative``, so a resume never builds
 another initiative's ticket.
@@ -94,10 +95,10 @@ import hashlib
 import re
 import stat
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 
 from . import deferredwork, gates, ticketlayout, ticketstore, verify
 from .adapters.base import SessionResult, SpecSnapshot
@@ -175,8 +176,15 @@ from .worksource import SOURCE_TICKETS
 from .worksource import Halt as WorkHalt
 from .worksource import WorkRef, WorkSource
 
-TicketTreeFactory = Callable[[Path, str | None], TicketTreeLike]
-"""Builds the run's tree from ``(project_root, pinned_initiative)``."""
+
+class TicketTreeFactory(Protocol):
+    """Builds the run's tree from ``(project_root, pinned_initiative)``, and
+    ``folder``: a parent initiative's child folder the tree reads and writes
+    through, or None for the active initiative (every run today)."""
+
+    def __call__(
+        self, project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
+    ) -> TicketTreeLike: ...
 
 
 def _pick_scope(state: RunState) -> PickScope:
@@ -385,7 +393,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         """The run's tree, built once from the main checkout and the pin."""
         if self._ticket_tree is None:
             self._ticket_tree = self._ticket_tree_factory(
-                self.paths.project, self.state.initiative or None
+                self.paths.project, self.state.initiative or None, folder=None
             )
         return self._ticket_tree
 
@@ -1721,7 +1729,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         project = self.workspace.paths.project
         if project == self.paths.project:
             return self.ticket_tree
-        return self._ticket_tree_factory(project, self.state.initiative or None)
+        return self._ticket_tree_factory(project, self.state.initiative or None, folder=None)
 
     def _spec_status_write(
         self,

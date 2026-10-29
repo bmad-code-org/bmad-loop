@@ -5927,7 +5927,7 @@ async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatc
     tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
     opened: list[tuple[Path, str | None]] = []
 
-    def factory(root: Path, pin: str | None):
+    def factory(root: Path, pin: str | None, *, folder: Path | None = None):
         opened.append((root, pin))
         return tree
 
@@ -5966,7 +5966,7 @@ async def test_replan_in_tickets_mode_refused_mark_does_not_resume(project_tree,
     row = ticket_row("1.1", status="draft")
     tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
     tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     _no_store_conflict(monkeypatch)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
@@ -6024,7 +6024,7 @@ async def test_replan_in_tickets_mode_refuses_a_changed_store(project_tree, monk
 
     monkeypatch.setattr(ticketstore, "store_conflict", conflict)
     tree = _replan_tree(plan)
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
@@ -6062,7 +6062,7 @@ async def test_replan_in_tickets_mode_refuses_a_worktree_isolation_conflict(
         project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
     )
     tree = _replan_tree(plan)
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
@@ -6100,7 +6100,7 @@ async def test_replan_in_tickets_mode_refuses_a_worktree_mount_swapped_for_a_lin
     roots: list[Path] = []
     tree = _replan_tree(plan)
 
-    def make_tree(root, _pin):
+    def make_tree(root, _pin, folder=None):
         roots.append(root)
         return tree
 
@@ -6138,7 +6138,7 @@ async def test_replan_in_tickets_mode_refuses_a_newer_checkpoint(project_tree, m
         project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
     )
     tree = _replan_tree(plan)
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
@@ -12493,7 +12493,7 @@ async def test_replan_locked_reread_refuses_a_runs_dir_swapped_for_a_foreign_tre
         project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
     )
     tree = _replan_tree(plan)
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)

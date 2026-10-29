@@ -5809,7 +5809,7 @@ def _fake_rearm_tree(monkeypatch, plan: Path, *, status: str = "blocked"):
     row = ticket_row("1.1", status=status, blocked_reason="intent gap")
     tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
     tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
-    monkeypatch.setattr(runs, "_rearm_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", lambda _root, _pin, folder=None: tree)
     return tree
 
 

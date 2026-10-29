@@ -1525,7 +1525,7 @@ def _fake_board_tree(monkeypatch, root: Path) -> FakeTicketTree:
     )
     seen: list[tuple[Path, str]] = []
 
-    def board_tree(project: Path, initiative: str) -> FakeTicketTree:
+    def board_tree(project: Path, initiative: str, *, folder: Path | None = None) -> FakeTicketTree:
         seen.append((project, initiative))
         return tree
 
@@ -1679,7 +1679,7 @@ def test_tickets_overview_unavailable_without_initiative(tmp_path, monkeypatch):
     Ablation (performed): drop the initiative check in `tickets_overview` and
     the tree is read for initiative "" — this FAILS."""
 
-    def no_tree(project: Path, initiative: str):
+    def no_tree(project: Path, initiative: str, *, folder: Path | None = None):
         raise AssertionError(f"read the tree for {initiative!r}")
 
     monkeypatch.setattr(data, "_board_ticket_tree", no_tree)

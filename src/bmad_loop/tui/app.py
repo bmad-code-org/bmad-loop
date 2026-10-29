@@ -98,12 +98,13 @@ def _engine_possibly_live(run_dir: Path) -> bool:
 
 
 def _replan_ticket_tree(
-    project_root: Path, pinned_initiative: str | None
+    project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
 ) -> tickettree.TicketTreeLike:
     """The tree a tickets-mode "Request replan" marks the plan through: the installed
     ``tickets.py`` under ``project_root`` (the plan's live root), pinned to the run's
-    initiative. Tests replace it with a ``FakeTicketTree``."""
-    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative)
+    initiative, through a parent's child ``folder`` when given. Tests replace it
+    with a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative, folder=folder)
 
 
 # Textual has no unlimited toast lifetime (`timeout=None` is the 5s default), and
@@ -1481,7 +1482,7 @@ class BmadLoopApp(App[None]):
                     )
                     return
                 require_root_pinned(tree_root, root_identity)
-                mark = _replan_ticket_tree(tree_root, initiative).mark(
+                mark = _replan_ticket_tree(tree_root, initiative, folder=None).mark(
                     ref,
                     "draft",
                     reason="replan",

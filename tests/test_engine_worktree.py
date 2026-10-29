@@ -13550,7 +13550,7 @@ def _mount_aware(engine, tree, main):
     `tickets.py --project-root <mount>` would; the main checkout reads it as is."""
     from test_tickets_engine import _MountTree
 
-    engine._ticket_tree_factory = lambda root, pin: (
+    engine._ticket_tree_factory = lambda root, pin, folder=None: (
         tree if root == main else _MountTree(tree, main, root)
     )
     return engine
