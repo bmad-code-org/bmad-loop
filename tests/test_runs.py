@@ -1,6 +1,7 @@
 """Run-directory helper tests."""
 
 import contextlib
+import dataclasses
 import errno
 import json
 import os
@@ -12077,3 +12078,80 @@ def test_prior_sweep_closes_records_a_liveness_probe_fault_as_a_fault_row(tmp_pa
     [row] = runs.prior_sweep_closes(tmp_path, exclude="x")
     assert row.run_id == "20260101-000000-aaaa" and row.dw_ids == ()
     assert row.fault and "bogus" in row.fault
+
+
+# ---------------------------------------- a chained run's recorded paths and pin
+
+CHILD = "initiative-child"
+
+
+def _chained(parent: str | None, initiative: str = CHILD) -> RunState:
+    return RunState(
+        run_id="r-chained",
+        project="/p",
+        started_at="now",
+        source="tickets",
+        initiative=initiative,
+        parent_initiative=parent,
+    )
+
+
+def test_paths_for_state_keeps_an_unchained_runs_paths(project_v7):
+    """An ordinary run reopens on the loaded paths themselves."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    assert runs.paths_for_state(paths, _chained(None, project_v7.initiative)) is paths
+
+
+def test_paths_for_state_reroots_a_chained_run_on_its_child(project_v7):
+    """A chained run reopens on its child initiative: the folder is the parent's
+    sibling named for the child, and the ledger, sprint path and both artifact
+    dirs move onto it. Ablation (performed): return `paths` unconditionally and
+    this FAILS."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    child = runs.paths_for_state(paths, _chained(project_v7.initiative))
+    folder = project_v7.initiative_folder.parent / CHILD
+    assert child.active_initiative == CHILD and child.initiative_folder == folder
+    assert child.implementation_artifacts == child.planning_artifacts == folder
+    assert child.deferred_work == folder / "deferred-work.md"
+    assert child.sprint_status == folder / "sprint-status.yaml"
+
+
+def test_paths_for_state_refuses_a_chained_run_whose_parent_moved(project_v7):
+    """A live `active_initiative` that no longer names the run's parent refuses
+    with a config error naming the value to restore — never the loaded (other)
+    initiative's paths, nor a child located from them."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match="set it back to 'initiative-platform'"):
+        runs.paths_for_state(paths, _chained("initiative-platform"))
+
+
+def test_paths_for_state_refuses_a_child_it_cannot_locate(project_v7):
+    """A child slug that is no folder name is a config error, not a ValueError
+    escaping past every `load_paths` caller's handler."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot locate child initiative"):
+        runs.paths_for_state(paths, _chained(project_v7.initiative, initiative="a/b"))
+
+
+def test_tree_pin_refuses_parent_rooted_paths(project_v7):
+    """`tree_pin` on a chained run handed the parent's own paths (`load_paths`
+    output, not re-rooted) refuses instead of routing the tree through the
+    parent's folder as if it were the child's; so does a folder not named for the
+    child. Ablation (performed): delete the guard and this FAILS."""
+    parent = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    state = _chained(project_v7.initiative)
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        runs.tree_pin(state, parent)
+    elsewhere = parent.with_initiative(CHILD)
+    misfiled = dataclasses.replace(elsewhere, initiative_folder=parent.initiative_folder)
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        runs.tree_pin(state, misfiled)
+    assert runs.tree_pin(state, elsewhere) == (project_v7.initiative, elsewhere.initiative_folder)
+
+
+def test_recorded_tree_pin_pins_a_mount_to_the_child(tmp_path, monkeypatch):
+    """A tree built in a worktree mount pins the chained run's child with no
+    folder — the mount's config names it — and reads no config at all."""
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda *a, **k: pytest.fail("read config"))
+    state = _chained("initiative-platform")
+    assert runs.recorded_tree_pin(state, tmp_path, tmp_path / "wt" / "u1") == (CHILD, None)

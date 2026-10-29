@@ -193,6 +193,32 @@ def test_chained_trees_pin_the_parent_in_place_and_the_child_in_a_mount(
         assert built == [(project_v7.project, parent, None), (mount, parent, None)]
 
 
+def test_chained_engine_refuses_parent_rooted_paths(project_v7):
+    """A chained run's engine built on the parent's own paths (`load_paths`
+    output a caller forgot to re-root with `runs.paths_for_state`) refuses at
+    construction — loudly, before any ledger or tree I/O — instead of reading
+    and marking the parent's folder as the child's. Ablation (performed): drop
+    the `tree_pin` call in `TicketsEngine.__init__` and this FAILS."""
+    run_dir = project_v7.project / ".bmad-loop" / "runs" / "test-run"
+    state = RunState(
+        run_id="test-run",
+        project=str(project_v7.project),
+        started_at="now",
+        initiative="initiative-child",
+        parent_initiative=project_v7.initiative,
+    )
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        TicketsEngine(
+            paths=load_paths(project_v7.project, want_tickets=True),
+            policy=_policy(),
+            adapter=MockAdapter([]),
+            run_dir=run_dir,
+            journal=Journal(run_dir),
+            state=state,
+            ticket_tree_factory=lambda *_a, **_k: pytest.fail("built a tree"),
+        )
+
+
 @pytest.mark.parametrize(("layout", "shared"), [("T1", False), ("T3", True)])
 def test_engine_shares_the_store_the_run_recorded(project_v7, layout, shared):
     """A run that recorded a shared store (here T3, its own nested repository)

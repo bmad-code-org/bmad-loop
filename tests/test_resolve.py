@@ -5986,6 +5986,68 @@ def test_rearm_tickets_uses_mark_and_clears_blocked_fields(project_v7):
     assert load_state(run_dir).tasks[outcome.story_key].phase == Phase.PENDING
 
 
+@pytest.mark.parametrize("in_mount", [False, True])
+def test_rearm_chained_ticket_tree_pins_like_the_engine(
+    project_v7, tmp_path, monkeypatch, in_mount
+):
+    """A chained run's re-arm marks the plan through a tree pinned as the engine
+    pins it: in the main checkout, the parent the live config names, through the
+    child's folder; in a worktree mount, the child with no folder (the mount's
+    config names it). Ablation (performed): pass `state.initiative` and
+    `folder=None` again and the main-checkout row FAILS."""
+    child = "initiative-child"
+    if in_mount:
+        root = tmp_path / "wt" / "u1"
+        plan = root / "epic-cart" / "story-cart-model-plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("---\nticket: 1\nstatus: blocked\n---\n" + TICKET_PLAN_BODY, "utf-8")
+        run_dir, state, task = _escalated_run(
+            tmp_path, spec_file=str(plan), source="tickets", worktree_path=str(root)
+        )
+        task.ticket = _ticket_binding(plan)
+    else:
+        root = project_v7.project
+        plan = _blocked_ticket_plan(project_v7)
+        run_dir, state, _ = _escalated_ticket_run(root, plan)
+    state.initiative, state.parent_initiative = child, project_v7.initiative
+    save_state(run_dir, state)
+    tree = _fake_rearm_tree(monkeypatch, plan)
+    built: list = []
+
+    def factory(project_root, pin, *, folder=None):
+        built.append((project_root, pin, folder))
+        return tree
+
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", factory)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    if in_mount:
+        assert built == [(root, child, None)]
+    else:
+        folder = project_v7.initiative_folder.parent / child
+        assert built == [(root, project_v7.initiative, folder)]
+    assert [(m.target, m.reason) for m in tree.marks] == [("ready-for-dev", "rearm")]
+
+
+def test_rearm_chained_ticket_refuses_a_moved_parent_before_any_write(project_v7, monkeypatch):
+    """A chained run whose live config no longer names its parent refuses the
+    re-arm before its first write: the escalation stays armed, the plan as it
+    was."""
+    plan = _blocked_ticket_plan(project_v7)
+    before = plan.read_bytes()
+    run_dir, state, _ = _escalated_ticket_run(project_v7.project, plan)
+    state.initiative, state.parent_initiative = "initiative-child", "initiative-platform"
+    save_state(run_dir, state)
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", lambda *_a, **_k: pytest.fail("built"))
+
+    with pytest.raises(runs.RearmError, match="set it back to 'initiative-platform'"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+    assert plan.read_bytes() == before
+
+
 def test_rearm_rollback_restores_plan_bytes_on_fault(project_v7, monkeypatch):
     """A fault after the mark — here `save_state` itself — rolls the plan back to the
     exact bytes the re-arm found, through the chokepoint's `restore_preimage` (journaled

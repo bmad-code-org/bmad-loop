@@ -4695,7 +4695,7 @@ def _print_sprint_status(state: RunState, project: Path) -> None:
     """``status``'s queue footer for a sprint-status run: the board's remaining
     actionable stories, or nothing when the config or board cannot be read."""
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
         ss = sprintstatus.load(paths.sprint_status)
         remaining = [s.key for s in ss.stories if s.status in sprintstatus.ACTIONABLE_STATUSES]
         print(f"sprint backlog remaining: {len(remaining)}")
@@ -4730,13 +4730,14 @@ def _owed_post_landing_label(task: StoryTask) -> str:
 
 
 def _status_ticket_tree(
-    state: RunState, project: Path, *, folder: Path | None = None
+    project: Path, pinned_initiative: str | None, *, folder: Path | None = None
 ) -> tickettree.TicketTreeLike:
     """The tree ``status`` reads a tickets run's board from: the project's
-    installed ``tickets.py``, pinned to the run's initiative, so a board for
-    another initiative is never shown under this run; ``folder`` is a parent's
-    child folder to read through."""
-    return tickettree.TicketTree(project, pinned_initiative=state.initiative or None, folder=folder)
+    installed ``tickets.py``, pinned to the run's initiative (a chained run's
+    parent), so a board for another initiative is never shown under this run;
+    ``folder`` is a parent's child folder to read through
+    (:func:`runs.recorded_tree_pin`)."""
+    return tickettree.TicketTree(project, pinned_initiative=pinned_initiative, folder=folder)
 
 
 def _print_tickets_status(state: RunState, project: Path) -> None:
@@ -4761,7 +4762,10 @@ def _print_tickets_status(state: RunState, project: Path) -> None:
         )
         print(f"tickets: this run is limited to {selected}")
     try:
-        status_view = _status_ticket_tree(state, project, folder=None).status()
+        pin, tree_folder = runs.recorded_tree_pin(state, project, project)
+        status_view = _status_ticket_tree(project, pin, folder=tree_folder).status()
+    except bmadconfig.BmadConfigError as e:
+        print(f"tickets board unavailable: {e}")
     except tickettree.TicketsError as e:
         print(f"tickets board unavailable: tickets.py {e.kind}: {e}")
     else:
@@ -5416,6 +5420,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         print(f"cannot resume {run_dir.name}: {refusal}", file=sys.stderr)
         return 1
     paths = bmadconfig.load_paths(project, want_tickets=runs.resolves_as_tickets(state))
+    # A chained run's engine works on its child initiative's paths; the gates below
+    # judge the loaded (parent's) paths as `run` does, since the tickets preflight
+    # classifies a parent and its children itself. Ahead of every side effect: a
+    # config that no longer names the parent refuses here (BmadConfigError).
+    run_paths = runs.paths_for_state(paths, state)
     sweep_options = None
     if state.run_type == "sweep":
         try:
@@ -5781,7 +5790,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants, pause
+    return run_paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants, pause
 
 
 class _CtlLaunch:
@@ -6247,7 +6256,7 @@ def _resolve_restore_patch(
     # is_relative_to(project) check would reject every legitimate restore there.
     tickets = state.source == worksource.SOURCE_TICKETS
     try:
-        paths = bmadconfig.load_paths(project, want_tickets=tickets)
+        paths = runs.paths_for_state(bmadconfig.load_paths(project, want_tickets=tickets), state)
     except bmadconfig.BmadConfigError as e:
         return None, f"cannot validate the restore patch path against the project config: {e}"
     # tickets mode: an earlier re-arm moved the plan's intent-gap patch to the run dir
@@ -6495,7 +6504,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # does; the resume's own config read refuses it.
     if state.run_type == "sweep":
         try:
-            pin_paths = bmadconfig.load_paths(project)
+            pin_paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
         except (bmadconfig.BmadConfigError, OSError):
             pin_paths = None
         if (
@@ -6515,7 +6524,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # config read refuses it, as before.
     if args.resume is not False and not getattr(args, "abandon", False):
         try:
-            trust_paths = bmadconfig.load_paths(project)
+            trust_paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
         except (bmadconfig.BmadConfigError, OSError):
             trust_paths = None
         if (
@@ -6607,7 +6616,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # only, no new failure mode: `load_paths` is a read, and the arm that cannot
         # read degrades exactly as it did when it sat lower.
         try:
-            pre_session_paths = bmadconfig.load_paths(project)
+            pre_session_paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
         except (bmadconfig.BmadConfigError, OSError):
             pre_session_code_root = state.code_root
         else:
@@ -6817,7 +6826,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # AFTER the confirm, deliberately: a cancelled resolve writes nothing, so the
     # divergence is still there for `resume` to report on its own terms.
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
     except (bmadconfig.BmadConfigError, OSError) as e:
         paths = None
         # An observation, so it degrades: without the config this process cannot NAME
@@ -7258,7 +7267,7 @@ def _resolve_abandon(
         print(f"error: {refusal}", file=sys.stderr)
         return 1
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
     except (bmadconfig.BmadConfigError, OSError) as e:
         print(
             f"error: cannot read the BMAD config to abandon run {args.run_id}: {e}", file=sys.stderr
@@ -7537,7 +7546,7 @@ def _resolve_reverify_finished(
         print(f"error: {refusal}", file=sys.stderr)
         return 1
     try:
-        paths = bmadconfig.load_paths(project)
+        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
     except bmadconfig.BmadConfigError as e:
         print(f"error: cannot read the BMAD config ({e})", file=sys.stderr)
         return 1

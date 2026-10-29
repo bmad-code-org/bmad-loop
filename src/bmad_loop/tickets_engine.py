@@ -11,7 +11,9 @@ real :class:`~bmad_loop.tickettree.TicketTree` by default, an in-memory fake in
 tests. The tree is pinned to ``RunState.initiative``, so a resume never builds
 another initiative's ticket; a chained run, which builds one child initiative of
 the parent ``RunState.parent_initiative``, pins the parent and reads the child
-through its folder (:func:`tree_pin`).
+through its folder (:func:`~bmad_loop.runs.tree_pin`, re-exported here); its paths
+must be re-rooted on the child (:func:`~bmad_loop.runs.paths_for_state`), and
+parent-rooted ones are refused at construction.
 
 The unit key is the ticket ref (``E.M``); every unit's epic is 0 and the epic
 lifecycle is keyed by slug here, not by the base engine's numbered epics.
@@ -104,7 +106,6 @@ from typing import Any, NoReturn, Protocol
 
 from . import deferredwork, gates, ticketlayout, ticketstore, verify
 from .adapters.base import SessionResult, SpecSnapshot
-from .bmadconfig import ProjectPaths
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import (
     RETRO_SKILL,
@@ -131,7 +132,12 @@ from .model import (
     result_mapping,
 )
 from .recovery_flow import OwnedPlanRefused, OwnedPlanWriter
-from .runs import graceful_stop_requested, live_store_topology, rebase_recorded_project_path
+from .runs import (
+    graceful_stop_requested,
+    live_store_topology,
+    rebase_recorded_project_path,
+    tree_pin,
+)
 from .statemachine import OPERATOR_PARK_PREFIX, PlanWriteReason, advance
 from .ticketmodel import FindResult, StatusView, TicketRow
 from .tickets_source import (
@@ -183,24 +189,11 @@ from .worksource import WorkRef, WorkSource
 class TicketTreeFactory(Protocol):
     """Builds the run's tree from ``(project_root, pinned_initiative)``, and
     ``folder``: a parent initiative's child folder the tree reads and writes
-    through, or None for the active initiative (see :func:`tree_pin`)."""
+    through, or None for the active initiative (see :func:`~bmad_loop.runs.tree_pin`)."""
 
     def __call__(
         self, project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
     ) -> TicketTreeLike: ...
-
-
-def tree_pin(state: RunState, paths: ProjectPaths) -> tuple[str | None, Path | None]:
-    """``(pinned_initiative, folder)`` for a main-checkout tree of the run
-    ``state`` over ``paths``. A chained run (``state.parent_initiative`` set) pins
-    the parent — the live ``[core] active_initiative`` still names it — and
-    reads and writes through the child's folder (``paths`` are the child's:
-    ``ProjectPaths.with_initiative``); any other run pins its own initiative and
-    reads it directly. A worktree mount's tree is never chained: its config names
-    the child (``ticketstore.redirect_mount_config``)."""
-    if state.parent_initiative is not None:
-        return state.parent_initiative, paths.initiative_folder
-    return state.initiative or None, None
 
 
 def _pick_scope(state: RunState) -> PickScope:
@@ -386,6 +379,10 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         # redirected to it. Read from the topology the run recorded at its start,
         # moved with a renamed project.
         state, paths = kwargs.get("state"), kwargs.get("paths")
+        if state is not None and paths is not None:
+            # a chained run's paths must be its child's (`runs.paths_for_state`):
+            # parent-rooted ones raise here, before the base engine touches them
+            tree_pin(state, paths)
         if state is not None and paths is not None and state.store_topology:
             kwargs["paths"] = ticketstore.with_shared_store(
                 paths, live_store_topology(state, paths.project)
@@ -407,7 +404,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     @property
     def ticket_tree(self) -> TicketTreeLike:
         """The run's tree, built once from the main checkout, the pin and, for a
-        chained run, the child folder (:func:`tree_pin`)."""
+        chained run, the child folder (:func:`~bmad_loop.runs.tree_pin`)."""
         if self._ticket_tree is None:
             pin, folder = tree_pin(self.state, self.paths)
             self._ticket_tree = self._ticket_tree_factory(self.paths.project, pin, folder=folder)

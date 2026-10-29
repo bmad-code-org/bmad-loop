@@ -5948,6 +5948,55 @@ async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatc
     assert [(e["reason"], e["after"]) for e in marks] == [("replan", "draft")]
 
 
+async def test_replan_of_a_chained_run_marks_the_child_through_the_parent(
+    project_tree, monkeypatch
+):
+    """A chained run's replan marks the plan through the main-checkout tree pinned
+    as its engine pins it — the parent the live config names, routed through the
+    child's folder — read from the run state re-read under the lock. Ablation
+    (performed): pass the run's initiative and `folder=None` again and this FAILS."""
+    from bmad_loop import bmadconfig
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    root = project_tree.project
+    run_dir, plan = _tickets_paused_run(
+        root, stage="plan-checkpoint", plan_status="ready-for-dev", initiative="init-child"
+    )
+    state = load_state(run_dir)
+    state.parent_initiative = "init-a"
+    save_state(run_dir, state)
+    parent = root / "_bmad-output" / "init-a"
+    loaded = bmadconfig.ProjectPaths(
+        project=root,
+        implementation_artifacts=parent,
+        planning_artifacts=parent,
+        era="v7",
+        active_initiative="init-a",
+        initiative_folder=parent,
+    )
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda _p, *, want_tickets=False: loaded)
+    tree = _replan_tree(plan)
+    opened: list[tuple[Path, str | None, Path | None]] = []
+
+    def factory(tree_root: Path, pin: str | None, *, folder: Path | None = None):
+        opened.append((tree_root, pin, folder))
+        return tree
+
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", factory)
+    _no_store_conflict(monkeypatch)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert opened == [(root, "init-a", root / "_bmad-output" / "init-child")]
+    assert [(m.target, m.reason) for m in tree.marks] == [("draft", "replan")]
+
+
 async def test_replan_in_tickets_mode_refused_mark_does_not_resume(project_tree, monkeypatch):
     """A transition the chokepoint refuses (here: the plan is already `draft`, a
     no-op) or a `tickets.py` fault leaves the run paused with a visible error.

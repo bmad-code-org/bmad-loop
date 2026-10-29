@@ -3721,7 +3721,9 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
         return []
     try:
         paths = ticketstore.with_shared_store(
-            bmadconfig.load_paths(project, want_tickets=resolves_as_tickets(state)),
+            paths_for_state(
+                bmadconfig.load_paths(project, want_tickets=resolves_as_tickets(state)), state
+            ),
             live_store_topology(state, project),
         )
     except Exception as e:  # a config or topology fault is "unknown", never "none"
@@ -4578,7 +4580,7 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
     """
     try:
         state = load_state(run_dir)
-        paths = bmadconfig.load_paths(project)
+        paths = paths_for_state(bmadconfig.load_paths(project), state)
     except Exception:
         # Broad on purpose: a missing/corrupt state.json, a missing BMAD config and
         # a run cleanup removed mid-command all already have owners downstream
@@ -4815,6 +4817,84 @@ def resolves_as_tickets(state: RunState) -> bool:
     if state.run_type == "sweep":
         return bool(state.initiative or state.store_topology)
     return state.source == worksource.SOURCE_TICKETS
+
+
+def paths_for_state(paths: bmadconfig.ProjectPaths, state: RunState) -> bmadconfig.ProjectPaths:
+    """``paths`` (``bmadconfig.load_paths`` output) as the recorded run ``state``
+    sees them: re-rooted on its child initiative for a chained run
+    (``state.parent_initiative`` set — ``ProjectPaths.with_initiative``, so its
+    ledger, sprint path and artifact dirs are the child's), else ``paths`` itself.
+
+    A chained run reopens only while the live ``[core] active_initiative`` still
+    names its parent: re-rooted on any other initiative, the child folder would be
+    located from a config the run never launched under, and an engine handed the
+    loaded paths unchanged would read and write the other initiative's ledger and
+    sprint path before its tree pin could pause it. So a moved live value — or
+    paths that cannot be re-rooted (off v7, no initiative folder, a child slug that
+    is no folder name) — raises :class:`~bmad_loop.bmadconfig.BmadConfigError`,
+    the type every caller of ``load_paths`` already refuses or degrades on, naming
+    the value to restore. Pure: nothing is read."""
+    parent = state.parent_initiative
+    if parent is None:
+        return paths
+    if paths.active_initiative != parent:
+        live = repr(paths.active_initiative) if paths.active_initiative else "unset"
+        raise bmadconfig.BmadConfigError(
+            f"run {state.run_id} builds child initiative {state.initiative!r} of parent "
+            f"initiative {parent!r}, but `[core] active_initiative` is {live} — set it "
+            f"back to {parent!r} to reopen this run"
+        )
+    try:
+        return paths.with_initiative(state.initiative)
+    except ValueError as e:
+        raise bmadconfig.BmadConfigError(
+            f"run {state.run_id}: cannot locate child initiative {state.initiative!r} "
+            f"of parent initiative {parent!r}: {e}"
+        ) from e
+
+
+def tree_pin(state: RunState, paths: bmadconfig.ProjectPaths) -> tuple[str | None, Path | None]:
+    """``(pinned_initiative, folder)`` for a main-checkout tree of the run
+    ``state`` over ``paths``. A chained run (``state.parent_initiative`` set) pins
+    the parent — the live ``[core] active_initiative`` still names it — and
+    reads and writes through the child's folder (``paths`` are the child's:
+    :func:`paths_for_state`); any other run pins its own initiative and reads it
+    directly. A worktree mount's tree is never chained: its config names the
+    child (``ticketstore.redirect_mount_config``).
+
+    Raises ValueError on a chained ``state`` whose ``paths`` are not re-rooted on
+    its child — ``active_initiative`` not the child, or an initiative folder not
+    named for it: the parent's own paths would route the tree through the
+    parent's folder and read and mark the wrong tree."""
+    if state.parent_initiative is None:
+        return state.initiative or None, None
+    folder = paths.initiative_folder
+    if (
+        paths.active_initiative != state.initiative
+        or folder is None
+        or (folder.name != state.initiative)
+    ):
+        raise ValueError(
+            f"run {state.run_id} builds child initiative {state.initiative!r} of "
+            f"{state.parent_initiative!r}, but its paths are rooted on initiative "
+            f"{paths.active_initiative!r} ({folder}) — re-root them with paths_for_state"
+        )
+    return state.parent_initiative, folder
+
+
+def recorded_tree_pin(state: RunState, project: Path, root: Path) -> tuple[str | None, Path | None]:
+    """``(pinned_initiative, folder)`` for a tree of the recorded run ``state``
+    built at ``root``, as :meth:`TicketsEngine._workspace_ticket_tree` pins its
+    trees: in the main checkout ``project`` (``root == project``), :func:`tree_pin`
+    over the run's own paths (:func:`paths_for_state` over ``project``'s config,
+    loaded for a chained run only); in a worktree mount, the run's initiative with
+    no folder, since the mount's config names the child. Raises
+    :class:`~bmad_loop.bmadconfig.BmadConfigError` when a chained run's config
+    cannot be read or no longer names its parent."""
+    if state.parent_initiative is None or root != project:
+        return state.initiative or None, None
+    paths = bmadconfig.load_paths(project, want_tickets=True)
+    return tree_pin(state, paths_for_state(paths, state))
 
 
 def live_store_topology(state: RunState, project_root: Path) -> dict[str, str | None]:
@@ -6687,6 +6767,19 @@ def _rearm_escalation_locked(
     # is where the run was launched and nothing re-stamps it, so after a project move it
     # names a directory that is no longer there. See the `project_root` note above.
     live_project = project_root if project_root is not None else Path(state.project)
+    # tickets mode: the pin of the tree the plan's status moves through, resolved
+    # before the first write — a chained run whose config no longer names its parent
+    # refuses here with the escalation still armed, not inside the transaction below.
+    ticket_pin: tuple[str | None, Path | None] = (state.initiative or None, None)
+    if state.source == worksource.SOURCE_TICKETS and task.ticket is not None and task.spec_file:
+        try:
+            ticket_pin = recorded_tree_pin(
+                state, live_project, live_spec_root(task, state, live_project)
+            )
+        except bmadconfig.BmadConfigError as e:
+            raise RearmError(
+                f"cannot pin ticket {task.ticket.ref}'s tree to re-open its plan: {e}"
+            ) from e
 
     journal = _RearmJournal(run_dir, pin=state)
     # DW-446: reconcile the mint-time root identities before the first pinned write
@@ -6996,10 +7089,9 @@ def _rearm_escalation_locked(
                         ) from e
                     spec_before = None
                 if state.source == worksource.SOURCE_TICKETS and task.ticket is not None:
+                    pin, folder = ticket_pin
                     ticket_tree = _rearm_ticket_tree(
-                        live_spec_root(task, state, live_project),
-                        state.initiative or None,
-                        folder=None,
+                        live_spec_root(task, state, live_project), pin, folder=folder
                     )
                 try:
                     if ticket_tree is not None and task.ticket is not None:
@@ -7693,7 +7785,7 @@ def _reverify_root_refusal(
     the caller locates it — the finished-run replay rebases it onto a moved project;
     ``None`` reads it as recorded."""
     try:
-        paths = bmadconfig.load_paths(project_root)
+        paths = paths_for_state(bmadconfig.load_paths(project_root), state)
     except bmadconfig.BmadConfigError as e:
         return None, f"cannot read the BMAD config to locate the code root ({e})"
     if str(paths.repo_root) != str(state.code_root if code_root is None else code_root):

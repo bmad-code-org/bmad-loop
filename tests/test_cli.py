@@ -28,6 +28,7 @@ from conftest import (
     UNDECODABLE_LEDGER,
     UNRESOLVABLE,
     V7_DEFAULT_INITIATIVE,
+    V7_USER_CONFIG_REL,
     FakeTicketTree,
     _reverify_run,
     assert_run_state_lock_held,
@@ -3216,8 +3217,8 @@ def _board_tree(monkeypatch, tree):
     """Point `status`'s tickets board at ``tree``; returns the pins it was built with."""
     pins: list[str | None] = []
 
-    def build(state, _project, folder=None):
-        pins.append(state.initiative or None)
+    def build(_project, pin, *, folder=None):
+        pins.append(pin)
         return tree
 
     monkeypatch.setattr(cli, "_status_ticket_tree", build)
@@ -3332,6 +3333,41 @@ def test_status_text_tickets_board_reports_wrapper_fault(project, capsys, monkey
     out = capsys.readouterr().out
     assert "tickets board unavailable: tickets.py crashed: exit 3: boom\n" in out
     assert "mark or store commit owed after landing" in out
+
+
+def test_status_text_chained_tickets_board_reads_the_child_through_the_parent(
+    project_v7, capsys, monkeypatch
+):
+    """A chained run's board is read from the main checkout pinned to the parent
+    the live config names, through the child's folder — never the parent's own
+    board under the child's name; a config that no longer names the parent is
+    printed as an unavailable board. Ablation (performed): pass `folder=None` at
+    the status site and this FAILS."""
+    child = "initiative-child"
+    tree = FakeTicketTree(project_v7.project, status_view=fake_status_view(()))
+    built: list[tuple[Path, str | None, Path | None]] = []
+
+    def build(root, pin, *, folder=None):
+        built.append((root, pin, folder))
+        return tree
+
+    monkeypatch.setattr(cli, "_status_ticket_tree", build)
+    _make_tickets_status_run(
+        project_v7.project, initiative=child, parent_initiative=project_v7.initiative
+    )
+
+    assert cli.main(["status", "--project", str(project_v7.project)]) == 0
+    capsys.readouterr()
+    folder = project_v7.initiative_folder.parent / child
+    assert built == [(project_v7.project, project_v7.initiative, folder)]
+
+    (project_v7.project / V7_USER_CONFIG_REL).write_text(
+        '[core]\nactive_initiative = "initiative-other"\n', encoding="utf-8"
+    )
+    assert cli.main(["status", "--project", str(project_v7.project)]) == 0
+    out = capsys.readouterr().out
+    assert "tickets board unavailable: run 20990101-000000-0001 builds child initiative" in out
+    assert len(built) == 1
 
 
 def test_list_document_library_call_matches_the_cli(project, capsys):
@@ -10282,6 +10318,52 @@ def test_tickets_resume_runs_the_tickets_preflight_and_skill_probe(project, monk
     assert preflights == ([str(project.project)] if tickets else [])
     assert [kw["require_tickets"] for kw in skill_kwargs] == [tickets]
     assert _resume_entries(run_dir) == []
+
+
+@pytest.mark.parametrize("live", ["initiative-platform", "initiative-other"])
+def test_chained_tickets_resume_builds_its_engine_on_the_childs_paths(
+    project, monkeypatch, capsys, live
+):
+    """A chained tickets run resumes with the launch-parity gates judging the
+    loaded (parent's) paths — the tickets preflight classifies a parent and its
+    children itself — and its engine built on the child's (`runs.paths_for_state`).
+    A config whose `active_initiative` moved off the parent refuses ahead of every
+    side effect. Ablation (performed): return the loaded `paths` from
+    `_prepare_resume_locked` and the engine row FAILS."""
+    from bmad_loop import bmadconfig
+
+    parent, child = "initiative-platform", "initiative-child"
+    run_dir = _paused_run_for_resume(
+        project, monkeypatch, source="tickets", initiative=child, parent_initiative=parent
+    )
+    real = bmadconfig.load_paths(project.project)
+    loaded = dataclasses.replace(
+        real, era="v7", active_initiative=live, initiative_folder=real.output_folder / live
+    )
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda _p, *, want_tickets=False: loaded)
+    preflights: list = []
+    monkeypatch.setattr(cli, "_check_tickets_preflight", lambda p, _pol: preflights.append(p))
+    monkeypatch.setattr(cli, "_require_base_skills", lambda *_a, **_k: True)
+    monkeypatch.setattr(cli, "_reject_store_topology", lambda *_a, **_k: None)
+    built: list = []
+
+    class Engine(_StubEngine):
+        def __init__(self, **kwargs):
+            built.append(kwargs["paths"])
+
+    monkeypatch.setattr(cli, "TicketsEngine", Engine)
+
+    if live != parent:
+        with pytest.raises(bmadconfig.BmadConfigError, match=f"set it back to {parent!r}"):
+            cli._resume_paused_run(project.project, run_dir)
+        assert (preflights, built, _resume_entries(run_dir)) == ([], [], [])
+        return
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert preflights == [loaded]
+    (paths,) = built
+    assert paths.active_initiative == child
+    assert paths.initiative_folder == real.output_folder / child
+    assert paths.deferred_work == real.output_folder / child / "deferred-work.md"
 
 
 # ------------------------------------------- resume re-stamps the code root
