@@ -6087,6 +6087,49 @@ async def test_replan_in_tickets_mode_refuses_a_changed_store(project_tree, monk
     assert calls == []
 
 
+@pytest.mark.parametrize("chained", [True, False], ids=["chained", "unchained"])
+async def test_replan_judges_a_chained_childs_own_store(project_tree, monkeypatch, chained):
+    """The replan's ticket-store refusal judges a chained run's CHILD store
+    (`initiative=<child>`), as the detached resume does; an unchained run's call
+    carries no `initiative`. Ablation (performed): drop the `initiative` in
+    `_ticket_replan_worker`'s store check and the chained row FAILS."""
+    from bmad_loop import ticketstore
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir, plan = _tickets_paused_run(
+        project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
+    )
+    if chained:
+        state = load_state(run_dir)
+        state.initiative, state.parent_initiative = "initiative-child", "initiative-platform"
+        save_state(run_dir, state)
+    seen: list[dict] = []
+
+    def conflict(_project, _source, _isolation, **kw):
+        seen.append(kw)
+        return "the ticket store changed since this run started"
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    tree = _replan_tree(plan)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any("ticket store changed" in m for m in notifications(app)),
+        )
+    (kw,) = seen
+    assert ("initiative" in kw) == chained
+    assert kw.get("initiative") == ("initiative-child" if chained else None)
+    assert (tree.marks, calls) == ([], [])
+
+
 async def test_replan_in_tickets_mode_refuses_a_worktree_isolation_conflict(
     project_tree, monkeypatch
 ):
@@ -9661,6 +9704,46 @@ def test_escalation_rearm_judges_a_v7_sweeps_store_as_a_tickets_run(project_v7, 
     app._do_rearm(run_dir.name, run_dir, "1")
 
     assert "the ticket store is not supported" in notes
+
+
+@pytest.mark.parametrize("chained", [True, False], ids=["chained", "unchained"])
+def test_escalation_rearm_judges_a_chained_childs_own_store(project_v7, monkeypatch, chained):
+    """The re-arm's ticket-store refusal judges a chained child's sweep on the
+    CHILD's store (`initiative=<child>`), as the resume it folds in does; an
+    unchained sweep's call carries no `initiative`. Ablation (performed): drop the
+    `initiative` in `_do_rearm`'s store check and the chained row FAILS."""
+    from conftest import escalated_run
+
+    from bmad_loop import runs, ticketstore
+    from bmad_loop.journal import load_state
+
+    run_dir = escalated_run(project_v7.project, "r1", story_key="1", run_type="sweep").run_dir
+    state = load_state(run_dir)
+    if chained:  # a chained child's sweep, as `compose_sweep` pins it
+        state.initiative, state.parent_initiative = "initiative-child", project_v7.initiative
+    else:
+        state.initiative = project_v7.initiative
+    save_state(run_dir, state)
+    seen: list[dict] = []
+
+    def conflict(_project, _source, _isolation, **kw):
+        seen.append(kw)
+        return "the ticket store is not supported"
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed"))
+    notes: list[str] = []
+    app = BmadLoopApp(project_v7.project)
+    monkeypatch.setattr(app, "notify", lambda msg, **_k: notes.append(str(msg)))
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: None)
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert "the ticket store is not supported" in notes
+    (kw,) = seen
+    assert ("initiative" in kw) == chained
+    assert kw.get("initiative") == ("initiative-child" if chained else None)
 
 
 def test_escalation_rearm_refuses_a_sweep_on_a_switched_initiative(project_v7, monkeypatch):

@@ -6255,6 +6255,46 @@ def test_resolve_early_dispatch_refuses_a_changed_ticket_store_first(
     assert _state_bytes(run_dir) == before
 
 
+@pytest.mark.parametrize("chained", [True, False], ids=["chained", "unchained"])
+@pytest.mark.parametrize("flag", ["--adopt-branch", "--reverify"])
+def test_resolve_early_dispatch_judges_a_chained_childs_own_store(
+    tmp_path, monkeypatch, capsys, flag, chained
+):
+    """The early store gate ahead of `--adopt-branch` / `--reverify` judges a
+    chained child's OWN store (`initiative=<child>`), as the resume it ends in does;
+    an unchained run's call carries no `initiative`. Ablation (performed): drop
+    `initiative=` at that gate and the chained rows FAIL."""
+    from bmad_loop import ticketstore
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir = _adoptable_run(tmp_path)
+    state = load_state(run_dir)
+    state.source = "tickets"
+    if chained:
+        state.initiative, state.parent_initiative = "initiative-child", "initiative-platform"
+    save_state(run_dir, state)
+    before = _state_bytes(run_dir)
+    seen: list[dict] = []
+
+    def conflict(_project, source, _isolation, **kw):
+        seen.append(kw)
+        return "the ticket store changed since this run started"
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("a refusal must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", flag, "--resume"])
+
+    assert rc == 1
+    assert "the ticket store changed since this run started" in capsys.readouterr().err
+    (kw,) = seen
+    assert kw.get("initiative") == ("initiative-child" if chained else None)
+    assert ("initiative" in kw) == chained
+    assert _state_bytes(run_dir) == before
+
+
 def test_resolve_adopt_branch_refuses_a_task_with_no_recorded_worktree(tmp_path, capsys):
     from bmad_loop.journal import load_state, save_state
 
@@ -10375,6 +10415,38 @@ def test_chained_tickets_resume_builds_its_engine_on_the_childs_paths(
     assert paths.active_initiative == child
     assert paths.initiative_folder == real.output_folder / child
     assert paths.deferred_work == real.output_folder / child / "deferred-work.md"
+
+
+@pytest.mark.parametrize("chained", [True, False], ids=["chained", "unchained"])
+def test_tickets_resume_judges_a_chained_childs_own_store(project, monkeypatch, chained):
+    """A chained child's resume judges the CHILD's store (`initiative=<child>`, as
+    its launch did) against the topology it recorded; an unchained resume calls the
+    predicate exactly as before chains existed (no `initiative`). Ablation
+    (performed): drop `initiative=` at `_prepare_resume_locked`'s store check and
+    the chained row FAILS."""
+    from bmad_loop import bmadconfig, ticketstore
+
+    parent, child = "initiative-platform", "initiative-child"
+    chain = {"initiative": child, "parent_initiative": parent} if chained else {}
+    run_dir = _paused_run_for_resume(project, monkeypatch, source="tickets", **chain)
+    real = bmadconfig.load_paths(project.project)
+    loaded = dataclasses.replace(
+        real, era="v7", active_initiative=parent, initiative_folder=real.output_folder / parent
+    )
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda _p, *, want_tickets=False: loaded)
+    seen: list[dict] = []
+
+    def conflict(_project, source, _isolation, **kw):
+        seen.append(kw)
+        return "the ticket store changed since this run started"
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    (kw,) = seen
+    assert kw.keys() == ({"recorded", "initiative"} if chained else {"recorded"})
+    assert kw.get("initiative") == (child if chained else None)
+    assert _resume_entries(run_dir) == []
 
 
 def test_chained_sweep_resume_refuses_a_moved_parent_with_the_sweep_pin(
@@ -22425,6 +22497,43 @@ def test_auto_sweep_hands_the_runs_parent_initiative_to_compose_sweep(project, m
     (kw,) = composed
     assert kw["parent_initiative"] == parent
     assert kw["paths"] is paths
+
+
+@pytest.mark.parametrize("parent", [None, "initiative-platform"])
+def test_auto_sweep_judges_a_chained_childs_own_store(project, monkeypatch, parent):
+    """A chained child's run-end sweep factory judges the CHILD's store
+    (`initiative=` the re-rooted paths' child) before the child sweep launches; an
+    unchained run's call carries no `initiative`. Ablation (performed): drop the
+    `initiative` from the factory's store check and the chained row FAILS."""
+    from bmad_loop import bmadconfig, ticketstore
+    from bmad_loop.adapters.profile import get_profile
+
+    install_bmad_config(project)
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    install_sweep_skill(project.project, get_profile("mycli", project.project).skill_tree)
+    seen: list[dict] = []
+
+    def conflict(_project, _source, _isolation, **kw):
+        seen.append(kw)
+        return "the child's store is refused"
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    paths = bmadconfig.load_paths(project.project)
+    if parent is not None:  # re-rooted on the child, as `runs.paths_for_state` does
+        paths = dataclasses.replace(paths, active_initiative="initiative-child")
+    factory = cli._sweep_factory(
+        project.project,
+        paths,
+        _config_pin(project),
+        plugin_grants=GrantSet.empty(),
+        parent_initiative=parent,
+    )
+    with pytest.raises(RuntimeError, match="the child's store is refused"):
+        factory("epic-boundary", started=_never_started)
+    (kw,) = seen
+    assert ("initiative" in kw) == (parent is not None)
+    assert kw.get("initiative") == (None if parent is None else "initiative-child")
 
 
 # --- #461 point 4: the auto-sweep child's config re-read is integrity-pinned ---

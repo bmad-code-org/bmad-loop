@@ -394,6 +394,14 @@ def _reject_store_topology(
     return 1
 
 
+def _store_initiative(state: RunState) -> str | None:
+    """The ``initiative`` a recorded run's store is judged on
+    (:func:`_reject_store_topology`): a chained run's child (``state.initiative``
+    when ``state.parent_initiative`` is set — a child folder can have its own
+    topology), else None, so an unchained run is judged as before chains existed."""
+    return state.initiative if state.parent_initiative is not None else None
+
+
 def _store_extra_args_roles(pol, source: str) -> tuple[str, ...]:
     """The roles a ``source`` run launches whose resolved adapter sets
     ``extra_args`` — for the ``tickets.store-sandbox`` warning."""
@@ -5513,8 +5521,12 @@ def _sweep_factory(
         conflict = bmadconfig.worktree_isolation_conflict(paths, pol.scm.isolation)
         if conflict is not None:
             raise RuntimeError(conflict)
+        # a chained child's sweep works the child's store: `paths` are re-rooted on it
+        chained: dict[str, Any] = (
+            {} if parent_initiative is None else {"initiative": paths.active_initiative}
+        )
         store = ticketstore.store_conflict(
-            project, _sweep_store_source(paths, pol), pol.scm.isolation
+            project, _sweep_store_source(paths, pol), pol.scm.isolation, **chained
         )
         if store is not None:
             raise RuntimeError(store)
@@ -5990,8 +6002,10 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
             return 1
     # A chained run's engine works on its child initiative's paths; the gates below
     # judge the loaded (parent's) paths as `run` does, since the tickets preflight
-    # classifies a parent and its children itself. Ahead of every side effect: a
-    # config that no longer names the parent refuses here (BmadConfigError).
+    # classifies a parent and its children itself — except the store refusal, which
+    # judges the child's own store (`_store_initiative`), as its launch did. Ahead of
+    # every side effect: a config that no longer names the parent refuses here
+    # (BmadConfigError).
     run_paths = runs.paths_for_state(paths, state)
     pol = policy_mod.load(_policy_path(project))
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
@@ -6008,7 +6022,11 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     store_source = runs.judged_store_source(state, _sweep_store_source(paths, pol))
     if (
         rc := _reject_store_topology(
-            project, pol, store_source, recorded=runs.live_store_topology(state, project) or None
+            project,
+            pol,
+            store_source,
+            recorded=runs.live_store_topology(state, project) or None,
+            initiative=_store_initiative(state),
         )
     ) is not None:
         return rc
@@ -7133,6 +7151,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 policy_mod.load(_policy_path(project)),
                 state.source,
                 recorded=runs.live_store_topology(state, project) or None,
+                initiative=_store_initiative(state),
             )
         )
         is not None
@@ -7228,6 +7247,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                     pol,
                     runs.judged_store_source(state, _sweep_store_source(pre_session_paths, pol)),
                     recorded=runs.live_store_topology(state, project) or None,
+                    initiative=_store_initiative(state),
                 )
             ) is not None:
                 return rc
@@ -7463,6 +7483,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 pol,
                 runs.judged_store_source(state, _sweep_store_source(paths, pol)),
                 recorded=runs.live_store_topology(state, project) or None,
+                initiative=_store_initiative(state),
             )
         ) is not None:
             return rc
@@ -8142,7 +8163,11 @@ def _resolve_reverify_finished(
         return rc
     if (
         rc := _reject_store_topology(
-            project, pol, state.source, recorded=runs.live_store_topology(state, project) or None
+            project,
+            pol,
+            state.source,
+            recorded=runs.live_store_topology(state, project) or None,
+            initiative=_store_initiative(state),
         )
     ) is not None:
         return rc

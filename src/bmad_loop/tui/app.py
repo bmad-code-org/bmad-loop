@@ -1448,11 +1448,16 @@ class BmadLoopApp(App[None]):
             else:
                 conflict = bmadconfig.worktree_isolation_conflict(paths, isolation)
         if conflict is None:
+            # a chained run's store is its child's, as `cli._store_initiative` judges it
+            chained = (
+                {} if recorded.parent_initiative is None else {"initiative": recorded.initiative}
+            )
             conflict = ticketstore.store_conflict(
                 self.project,
                 worksource.SOURCE_TICKETS,
                 isolation,
                 recorded=runs.live_store_topology(recorded, self.project) or None,
+                **chained,
             )
         if conflict is not None:
             self.call_from_thread(self.notify, conflict, severity="error")
@@ -1665,6 +1670,12 @@ class BmadLoopApp(App[None]):
                             recorded, paths, rerooted=True
                         )
                 if recorded is not None and conflict is None:
+                    # a chained run's store is its child's (`cli._store_initiative`)
+                    chained = (
+                        {}
+                        if recorded.parent_initiative is None
+                        else {"initiative": recorded.initiative}
+                    )
                     conflict = ticketstore.store_conflict(
                         self.project,
                         runs.judged_store_source(
@@ -1673,6 +1684,7 @@ class BmadLoopApp(App[None]):
                         ),
                         isolation,
                         recorded=runs.live_store_topology(recorded, self.project) or None,
+                        **chained,
                     )
             if conflict is not None:
                 self.notify(conflict, severity="error")
