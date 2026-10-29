@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -3849,6 +3850,59 @@ def test_run_session_threads_model_and_effort_onto_the_spec(tmp_path, monkeypatc
     plain = _SpecCapture()
     resolve.run_session(plain, tmp_path, tmp_path / "run", "6-4-cli-list-command", generation=0)
     assert plain.specs[0].model == "" and plain.specs[0].effort == ""
+
+
+def test_run_epic_close_session_builds_the_spec_and_returns_the_returncode(tmp_path, monkeypatch):
+    """The epic-close session carries its prompt verbatim on a dev spec rooted at
+    the project, with the run dir and epic ref in its env and no BMAD_LOOP_MODE (a
+    human is present), and hands the process returncode back for the journal."""
+    calls: list = []
+
+    def fake_subprocess_run(argv, cwd, env):
+        calls.append((argv, cwd, env))
+        return SimpleNamespace(returncode=3)
+
+    monkeypatch.setattr(resolve.subprocess, "run", fake_subprocess_run)
+    adapter = _SpecCapture()
+    prompt = "/bmad-agent-po Run your epic closure check for epic e1 of initiative i1."
+    rc = resolve.run_epic_close_session(
+        adapter,
+        tmp_path,
+        tmp_path / "run",
+        "e1",
+        prompt,
+        model="anthropic/claude-x",
+        effort="max",
+    )
+    assert rc == 3
+    spec = adapter.specs[0]
+    assert spec.prompt == prompt
+    assert spec.role == "dev"
+    assert spec.cwd == tmp_path
+    assert spec.env == {"BMAD_LOOP_RUN_DIR": str(tmp_path / "run"), "BMAD_LOOP_EPIC_REF": "e1"}
+    assert spec.task_id == _session_task_id("e1", "epic-close", 1, 0)
+    assert (spec.model, spec.effort) == ("anthropic/claude-x", "max")
+    [(argv, cwd, env)] = calls
+    assert argv == ["fake-agent", prompt]
+    assert cwd == str(tmp_path)
+    assert env["BMAD_LOOP_EPIC_REF"] == "e1"
+    assert env["BMAD_LOOP_RUN_DIR"] == str(tmp_path / "run")
+    assert "BMAD_LOOP_MODE" not in spec.env
+
+
+def test_run_epic_close_session_propagates_no_interactive_mode(tmp_path, monkeypatch):
+    """An adapter with no interactive mode raises out of `interactive_argv`; the
+    caller owns that answer, so it propagates and nothing is spawned."""
+
+    class _NoInteractive(_FakeAdapter):
+        def interactive_argv(self, spec):
+            raise NotImplementedError
+
+    monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: pytest.fail("spawned a session"))
+    with pytest.raises(NotImplementedError):
+        resolve.run_epic_close_session(
+            _NoInteractive(None), tmp_path, tmp_path / "run", "e1", "/bmad-agent-po x"
+        )
 
 
 def test_run_session_id_is_byte_identical_to_the_hand_mint_at_generation_zero(

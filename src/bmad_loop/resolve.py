@@ -746,3 +746,44 @@ def run_session(
     env = {**os.environ, **adapter.interactive_env(spec)}
     subprocess.run(argv, cwd=str(project), env=env)  # attached, inherited stdio
     return marker.is_file()
+
+
+def run_epic_close_session(
+    adapter,
+    project: Path,
+    run_dir: Path,
+    slug: str,
+    prompt: str,
+    *,
+    model: str = "",
+    effort: str = "",
+) -> int:
+    """Launch the interactive epic-close agent for epic ``slug`` attached to the
+    caller's terminal, with ``prompt`` (:func:`epic_close_prompt`) as its first
+    prompt.
+
+    Blocks until the session exits. The session ends on process exit, as the
+    resolve agent's does, never on prose. The returncode is returned for the
+    journal only and is never trusted: the caller verifies the epic folder from
+    the tree afterwards (:func:`epic_close_missing`), so no marker file is
+    written or read. A ``NotImplementedError`` from ``interactive_argv`` (an
+    adapter with no interactive mode) propagates to the caller, as with
+    :func:`run_session`.
+    """
+    spec = SessionSpec(
+        task_id=_session_task_id(slug, "epic-close", 1, 0),
+        role="dev",
+        prompt=prompt,
+        cwd=project,
+        env={
+            # deliberately NOT BMAD_LOOP_MODE: this session is interactive, a
+            # human is present, the skill must be allowed to ask.
+            "BMAD_LOOP_RUN_DIR": str(run_dir),
+            "BMAD_LOOP_EPIC_REF": slug,
+        },
+        model=model,
+        effort=effort,
+    )
+    argv = adapter.interactive_argv(spec)
+    env = {**os.environ, **adapter.interactive_env(spec)}
+    return subprocess.run(argv, cwd=str(project), env=env).returncode  # attached, inherited stdio

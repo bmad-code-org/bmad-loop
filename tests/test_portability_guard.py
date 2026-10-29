@@ -359,17 +359,20 @@ REFUSAL_HELPER_DEFS = {
 # Every #414-family call site — `bmadconfig.worktree_isolation_conflict`, sole
 # producer of the isolation-under-repo-root refusal text, plus its rc-returning CLI
 # wrapper `_reject_isolation_conflict` — as `(file, enclosing function) -> count`.
-# The `REARM_ESCALATION_CALLERS` idiom WITH multiplicity, because `cmd_resolve`
-# legitimately calls the wrapper twice: post-confirm is the authority, and the
-# pre-session arm spares the operator a full interactive session on a pair knowable
-# from config — the `96aa09a9` fix, which landed with no structural gate naming it.
+# The `REARM_ESCALATION_CALLERS` idiom WITH multiplicity, because one function
+# could call the wrapper twice and a set of keys would absorb it. `cmd_resolve`
+# takes the refusal twice through `_resolve_config_refusal`: post-confirm is the
+# authority, and the pre-session arm spares the operator a full interactive session
+# on a pair knowable from config — the `96aa09a9` fix, which landed with no
+# structural gate naming it.
 # Accepted cost (human decision 2026-09-02): every future caller of the predicate
 # touches a row here in the same PR.
 ISOLATION_CONFLICT_CALLERS = {
     ("cli.py", "_reject_isolation_conflict"): 1,  # the wrapper's own predicate call
     ("cli.py", "cmd_run"): 1,
     ("cli.py", "cmd_sweep"): 1,
-    ("cli.py", "cmd_resolve"): 2,  # pre-session + post-confirm re-read
+    # cmd_resolve's pre-session + post-confirm re-read, both through this helper
+    ("cli.py", "_resolve_config_refusal"): 1,
     # DW-525: the finished-run replay, before a replay run is minted
     ("cli.py", "_resolve_reverify_finished"): 1,
     ("cli.py", "cmd_validate"): 1,  # reports a Finding rather than aborting
@@ -399,8 +402,9 @@ STORE_TOPOLOGY_CALLERS = {
     ("cli.py", "_launch_run"): 1,  # a chained child's own store, per child launch
     ("cli.py", "_child_store"): 1,  # a drained child's store, ahead of its close
     ("cli.py", "cmd_sweep"): 1,
-    # pre-session + post-confirm, as the #414 pair, + ahead of --reverify/--adopt-branch
-    ("cli.py", "cmd_resolve"): 3,
+    # cmd_resolve's pre-session + post-confirm, as the #414 pair
+    ("cli.py", "_resolve_config_refusal"): 1,
+    ("cli.py", "_resolve_pre_session_gates"): 1,  # ahead of --reverify/--adopt-branch
     ("cli.py", "_resolve_reverify_finished"): 1,
     ("cli.py", "_prepare_resume_locked"): 1,  # re-validates the recorded topology
     ("cli.py", "_warn_preflight_would_abort"): 1,
@@ -5560,14 +5564,14 @@ def test_isolation_conflict_refusal_sites_are_enumerated():
     `cmd_resolve`'s pre-session refusal landed as a wrapper call with no test row,
     and nothing structural named the omission until a review pass did.
 
-    Multiplicity is load-bearing on today's tree — `cmd_resolve` legitimately calls
-    the wrapper twice, so a set of keys would absorb a third call there silently
+    Multiplicity is load-bearing — a function calling the wrapper twice must
+    declare both, so a set of keys would absorb a second call there silently
     (`test_isolation_callsite_count_does_not_hide_a_second_call_in_one_function`
     pins the counting itself).
 
     Ablation: delete the `isolationcall` emit and this reddens (eleven declared,
-    zero scanned); add a third `_reject_isolation_conflict` call inside
-    `cmd_resolve` and the count comparison reddens naming the site."""
+    zero scanned); add a second `_reject_isolation_conflict` call inside
+    `_resolve_config_refusal` and the count comparison reddens naming the site."""
     findings = _of("isolationcall")
     sites = _isolation_callsite_counts(findings)
     declared = Counter(ISOLATION_CONFLICT_CALLERS)

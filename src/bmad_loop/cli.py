@@ -7113,6 +7113,116 @@ def _bypass_permission_policy(pol):
     )
 
 
+def _resolve_config_refusal(
+    project: Path, pol: policy_mod.Policy, state: RunState, paths: bmadconfig.ProjectPaths
+) -> int | None:
+    """The configuration refusals a resolve takes on ``paths`` before it arms
+    anything: the isolation conflict, then the ticket-store topology. Returns the rc
+    to abort with, or None to proceed. ``cmd_resolve`` takes it twice, before the
+    interactive session and again after the confirm on the re-read config."""
+    if (rc := _reject_isolation_conflict(paths, pol)) is not None:
+        return rc
+    if (
+        rc := _reject_store_topology(
+            project,
+            pol,
+            runs.judged_store_source(state, _sweep_store_source(paths, pol)),
+            recorded=runs.live_store_topology(state, project) or None,
+            initiative=_store_initiative(state),
+        )
+    ) is not None:
+        return rc
+    return None
+
+
+def _resolve_pre_session_gates(
+    args: argparse.Namespace, project: Path, run_dir: Path, state: RunState
+) -> int | None:
+    """The entry refusals every resuming resolve takes before any side effect.
+    Returns the rc ``cmd_resolve`` must return, or None to continue. Shared with
+    the epic-close branch, so no session is spent on a resume that would refuse."""
+    # DW-204/DW-229: the same probe `cmd_resume` takes, taken here at resolve's own
+    # entry. `_resume_paused_run` cannot carry this gate for resolve — by the time
+    # this flow reaches it the interactive session has run and `runs.rearm_escalation`
+    # has spent the escalation, so a refusal there is a refusal after the side
+    # effects. LAST in this gate block, not first: the refusals above answer "this
+    # gesture does not apply to this run at all" (alias, live engine, not paused at an
+    # escalation, no escalated story) and must not be displaced by a ledger-repair
+    # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
+    # also wins outright and the ledger gate follows it.
+    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
+        print(refusal, file=sys.stderr)
+        return ExitCode.FAILURE
+
+    # v7: a sweep resolves only on the initiative it started on — the resume's
+    # refusal (`_prepare_resume_locked`), judged ahead of every dispatch below:
+    # reverify, adopt and the re-arm each persist a transition before the resume
+    # that would refuse it, and the interactive session would be spent first.
+    # Re-judged after the confirm against the config the re-arm reads. An
+    # unreadable config skips this early exit only, as the trust gate below
+    # does; the resume's own config read refuses it.
+    # Judged on the loaded paths, as the resume judges them, so a chained child's
+    # sweep whose parent is no longer active is refused here too.
+    if state.run_type == "sweep":
+        try:
+            pin_paths = bmadconfig.load_paths(project)
+        except (bmadconfig.BmadConfigError, OSError):
+            pin_paths = None
+        if (
+            pin_paths is not None
+            and (conflict := runsetup.sweep_initiative_conflict(state, pin_paths)) is not None
+        ):
+            print(f"cannot resolve {run_dir.name}: {conflict}", file=sys.stderr)
+            return 1
+
+    # #496/#497: every resolve that resumes ends in the resume's plugin-trust refusal,
+    # so judge it here — ahead of the reverify/adopt dispatches (each persists its
+    # transition before resuming) and of the interactive session (a refusal after it
+    # throws the conversation away). The post-confirm re-check below stays: a plugin
+    # dir can change during the conversation. A re-arm-only resolve (`--no-resume`)
+    # and an abandon (DW-535: it closes the run) launch nothing, so they are not
+    # judged. An unreadable config skips this early exit only; the resume's own
+    # config read refuses it, as before.
+    if args.resume is not False and not getattr(args, "abandon", False):
+        try:
+            trust_paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+        except (bmadconfig.BmadConfigError, OSError):
+            trust_paths = None
+        if (
+            trust_paths is not None
+            and (
+                rc := _reject_plugin_trust(
+                    trust_paths,
+                    policy_mod.load(_policy_path(project)),
+                    _launch_plugin_grants(project),
+                )
+            )
+            is not None
+        ):
+            return rc
+
+    # The resume's ticket-store refusal, judged ahead of the reverify/adopt
+    # dispatches for the same reason: each persists its transition before the
+    # resume that would refuse a changed store. The re-arm path judges it below.
+    early = getattr(args, "reverify", False) or getattr(args, "adopt_branch", False)
+    if (
+        early
+        and state.source == worksource.SOURCE_TICKETS
+        and (
+            rc := _reject_store_topology(
+                project,
+                policy_mod.load(_policy_path(project)),
+                state.source,
+                recorded=runs.live_store_topology(state, project) or None,
+                initiative=_store_initiative(state),
+            )
+        )
+        is not None
+    ):
+        return rc
+    return None
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     from .model import Phase
 
@@ -7230,84 +7340,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
         return 1
 
-    # DW-204/DW-229: the same probe `cmd_resume` takes, taken here at resolve's own
-    # entry. `_resume_paused_run` cannot carry this gate for resolve — by the time
-    # this flow reaches it the interactive session has run and `runs.rearm_escalation`
-    # has spent the escalation, so a refusal there is a refusal after the side
-    # effects. LAST in this gate block, not first: the refusals above answer "this
-    # gesture does not apply to this run at all" (alias, live engine, not paused at an
-    # escalation, no escalated story) and must not be displaced by a ledger-repair
-    # steer that would not help. Mirrors `cmd_resume`, where the live-engine refusal
-    # also wins outright and the ledger gate follows it.
-    if (refusal := runs.unreadable_sweep_ledger(project, run_dir)) is not None:
-        print(refusal, file=sys.stderr)
-        return ExitCode.FAILURE
-
-    # v7: a sweep resolves only on the initiative it started on — the resume's
-    # refusal (`_prepare_resume_locked`), judged ahead of every dispatch below:
-    # reverify, adopt and the re-arm each persist a transition before the resume
-    # that would refuse it, and the interactive session would be spent first.
-    # Re-judged after the confirm against the config the re-arm reads. An
-    # unreadable config skips this early exit only, as the trust gate below
-    # does; the resume's own config read refuses it.
-    # Judged on the loaded paths, as the resume judges them, so a chained child's
-    # sweep whose parent is no longer active is refused here too.
-    if state.run_type == "sweep":
-        try:
-            pin_paths = bmadconfig.load_paths(project)
-        except (bmadconfig.BmadConfigError, OSError):
-            pin_paths = None
-        if (
-            pin_paths is not None
-            and (conflict := runsetup.sweep_initiative_conflict(state, pin_paths)) is not None
-        ):
-            print(f"cannot resolve {run_dir.name}: {conflict}", file=sys.stderr)
-            return 1
-
-    # #496/#497: every resolve that resumes ends in the resume's plugin-trust refusal,
-    # so judge it here — ahead of the reverify/adopt dispatches (each persists its
-    # transition before resuming) and of the interactive session (a refusal after it
-    # throws the conversation away). The post-confirm re-check below stays: a plugin
-    # dir can change during the conversation. A re-arm-only resolve (`--no-resume`)
-    # and an abandon (DW-535: it closes the run) launch nothing, so they are not
-    # judged. An unreadable config skips this early exit only; the resume's own
-    # config read refuses it, as before.
-    if args.resume is not False and not getattr(args, "abandon", False):
-        try:
-            trust_paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
-        except (bmadconfig.BmadConfigError, OSError):
-            trust_paths = None
-        if (
-            trust_paths is not None
-            and (
-                rc := _reject_plugin_trust(
-                    trust_paths,
-                    policy_mod.load(_policy_path(project)),
-                    _launch_plugin_grants(project),
-                )
-            )
-            is not None
-        ):
-            return rc
-
-    # The resume's ticket-store refusal, judged ahead of the reverify/adopt
-    # dispatches for the same reason: each persists its transition before the
-    # resume that would refuse a changed store. The re-arm path judges it below.
-    early = reverify or getattr(args, "adopt_branch", False)
-    if (
-        early
-        and state.source == worksource.SOURCE_TICKETS
-        and (
-            rc := _reject_store_topology(
-                project,
-                policy_mod.load(_policy_path(project)),
-                state.source,
-                recorded=runs.live_store_topology(state, project) or None,
-                initiative=_store_initiative(state),
-            )
-        )
-        is not None
-    ):
+    if (rc := _resolve_pre_session_gates(args, project, run_dir, state)) is not None:
         return rc
 
     # DW-522: re-verify the kept attempt instead of re-arming. Behind the same gates
@@ -7391,17 +7424,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             # config, which is the authority for the re-arm and is the only check the
             # `--no-interactive` path reaches. This is a strictly earlier exit on the
             # same predicate, so an operator who declines still gets no config lecture.
-            if (rc := _reject_isolation_conflict(pre_session_paths, pol)) is not None:
-                return rc
-            if (
-                rc := _reject_store_topology(
-                    project,
-                    pol,
-                    runs.judged_store_source(state, _sweep_store_source(pre_session_paths, pol)),
-                    recorded=runs.live_store_topology(state, project) or None,
-                    initiative=_store_initiative(state),
-                )
-            ) is not None:
+            if (rc := _resolve_config_refusal(project, pol, state, pre_session_paths)) is not None:
                 return rc
         # Past every entry refusal, this window now hosts the resolve session, so
         # it becomes the run's control window (#920). Under the lock a driving
@@ -7627,17 +7650,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         # Ordered after the confirm with the re-stamp, not before it: a cancelled
         # resolve still writes nothing, and an operator who declines is not owed a
         # config lecture about a gesture they did not make.
-        if (rc := _reject_isolation_conflict(paths, pol)) is not None:
-            return rc
-        if (
-            rc := _reject_store_topology(
-                project,
-                pol,
-                runs.judged_store_source(state, _sweep_store_source(paths, pol)),
-                recorded=runs.live_store_topology(state, project) or None,
-                initiative=_store_initiative(state),
-            )
-        ) is not None:
+        if (rc := _resolve_config_refusal(project, pol, state, paths)) is not None:
             return rc
         # The sweep's initiative pin, re-judged: the active initiative can change
         # during the resolve session, and the re-arm below precedes the resume.
