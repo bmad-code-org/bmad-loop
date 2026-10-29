@@ -795,7 +795,7 @@ def test_e2e_tickets_worktree_isolation_finds_tree(project_v7, topology):
     and the merge carries the `done` plan back to main. T2 (an ignored, unversioned
     store): the mount is redirected to the main store, the plan is written there and
     marked `done` after the merge, and `store-unversioned` is journaled once.
-    Ablation: drop the redirect (`redirect_mount_store`) and T2's fake writes a plan
+    Ablation: drop the redirect (`redirect_mount_config`) and T2's fake writes a plan
     the main store never sees."""
     layout = _scaffold(
         project_v7,

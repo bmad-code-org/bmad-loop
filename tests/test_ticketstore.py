@@ -193,6 +193,30 @@ def test_tracked_user_config_refuses_redirect(over, code):
     assert isinstance(classify_store(_ignored(**over), "none"), StoreTopology)
 
 
+@pytest.mark.parametrize(
+    ("over", "code"),
+    [
+        ({"user_config_tracked": True, "user_config_ignored": False}, "user-config-tracked"),
+        ({"user_config_ignored": False}, "user-config-not-ignored"),
+    ],
+)
+def test_chained_run_refuses_an_unsafe_user_config_on_a_tracked_store(over, code):
+    """A chained run under worktree isolation rewrites the mount's
+    `config.user.toml` (its child as `active_initiative`) on every layout, so a
+    tracked store (T1), which needs no redirect, is refused like a shared one when
+    the file is tracked or not gitignored. An unchained T1 run writes nothing there
+    and still runs; without isolation there is no mount, so a chained run writes
+    nothing either and runs. Ablation (performed): drop `chained` from the
+    precondition in `classify_store` and both rows FAIL."""
+    refused = classify_store(_facts(**over), "worktree", chained=True)
+    assert isinstance(refused, StoreRefusal) and refused.code == code
+    assert "chained run's child initiative" in (store_topology_conflict(refused) or "")
+    t1 = StoreTopology("T1", "checkout", "code-repo", STORE)
+    assert classify_store(_facts(**over), "worktree") == t1
+    assert classify_store(_facts(**over), "none", chained=True) == t1
+    assert classify_store(_facts(), "worktree", chained=True) == t1
+
+
 @pytest.mark.parametrize("layout", ["T2", "T3", "T4", "T6"])
 def test_shared_layouts_run(layout):
     """Every classified shared layout runs: its plans are marked after the code
@@ -256,12 +280,12 @@ MAIN = Path("/main/_bmad-output")
 
 
 def _redirected(text: str) -> dict:
-    return tomllib.loads(redirected_user_config_text(text, MAIN))
+    return tomllib.loads(redirected_user_config_text(text, main_store=MAIN, initiative=None))
 
 
 def test_redirected_user_config_text_inserts_into_core_table():
     text = '[core]\nactive_initiative = "initiative-demo"\n'
-    out = redirected_user_config_text(text, MAIN)
+    out = redirected_user_config_text(text, main_store=MAIN, initiative=None)
     assert out.startswith("[core]\noutput_folder = ")
     assert tomllib.loads(out)["core"] == {
         "output_folder": str(MAIN),
@@ -280,9 +304,9 @@ def test_redirected_user_config_text_replaces_existing_output_folder():
 
 def test_redirected_user_config_text_appends_core_table_when_absent():
     assert _redirected('[modules.x]\nk = "v"')["core"] == {"output_folder": str(MAIN)}
-    assert redirected_user_config_text("", MAIN) == f'[core]\noutput_folder = "{MAIN}"\n'.replace(
-        "\\", "\\\\"
-    )
+    assert redirected_user_config_text(
+        "", main_store=MAIN, initiative=None
+    ) == f'[core]\noutput_folder = "{MAIN}"\n'.replace("\\", "\\\\")
 
 
 @pytest.mark.parametrize(
@@ -290,12 +314,12 @@ def test_redirected_user_config_text_appends_core_table_when_absent():
 )
 def test_redirected_user_config_text_refuses_inline_core_table(text):
     with pytest.raises(TicketStoreError):
-        redirected_user_config_text(text, MAIN)
+        redirected_user_config_text(text, main_store=MAIN, initiative=None)
 
 
 def test_redirected_user_config_text_preserves_crlf():
     text = '# mine\r\n[core]\r\nactive_initiative = "x"\r\n'
-    out = redirected_user_config_text(text, MAIN)
+    out = redirected_user_config_text(text, main_store=MAIN, initiative=None)
     assert out.count("\r\n") == out.count("\n") == 4
     assert out.startswith("# mine\r\n[core]\r\noutput_folder = ")
 
@@ -304,6 +328,58 @@ def test_redirected_user_config_text_preserves_crlf():
 def test_redirected_user_config_text_escapes_the_path(raw):
     """Quotes and backslashes (a Windows path) survive as a TOML basic string."""
     store = Path(raw)
-    assert tomllib.loads(redirected_user_config_text("", store))["core"]["output_folder"] == str(
-        store
+    assert tomllib.loads(redirected_user_config_text("", main_store=store, initiative=None))[
+        "core"
+    ]["output_folder"] == str(store)
+
+
+def test_redirected_user_config_text_writes_only_the_initiative():
+    """A chained run over a tracked store sets `active_initiative` alone: the
+    existing value is replaced in place under `[core]`, no `output_folder` appears,
+    and every other line is kept."""
+    text = '# mine\n[core]\nactive_initiative = "initiative-parent"\nlang = "en"\n'
+    out = redirected_user_config_text(text, main_store=None, initiative="initiative-child")
+    assert out == '# mine\n[core]\nactive_initiative = "initiative-child"\nlang = "en"\n'
+
+
+def test_redirected_user_config_text_writes_both_values():
+    text = '[core]\nactive_initiative = "initiative-parent"\noutput_folder = "x"\n[other]\nk = 1\n'
+    data = tomllib.loads(
+        redirected_user_config_text(text, main_store=MAIN, initiative="initiative-child")
     )
+    assert data == {
+        "core": {"output_folder": str(MAIN), "active_initiative": "initiative-child"},
+        "other": {"k": 1},
+    }
+    appended = redirected_user_config_text("", main_store=MAIN, initiative="initiative-child")
+    assert tomllib.loads(appended)["core"] == data["core"]
+
+
+def test_redirected_user_config_text_keeps_crlf_with_both_values():
+    text = '[core]\r\nactive_initiative = "p"\r\n'
+    out = redirected_user_config_text(text, main_store=MAIN, initiative="c")
+    assert out.count("\r\n") == out.count("\n") == 3
+    assert tomllib.loads(out)["core"] == {"output_folder": str(MAIN), "active_initiative": "c"}
+
+
+def test_redirected_user_config_text_escapes_the_initiative():
+    raw = 'odd "quoted" \\ name'
+    out = redirected_user_config_text("", main_store=None, initiative=raw)
+    assert tomllib.loads(out)["core"] == {"active_initiative": raw}
+
+
+def test_redirected_user_config_text_needs_a_value():
+    """Nothing to write is a caller fault; a blank initiative would read as no
+    active initiative, so it is refused rather than written."""
+    with pytest.raises(ValueError):
+        redirected_user_config_text("", main_store=None, initiative=None)
+    with pytest.raises(TicketStoreError, match="blank initiative"):
+        redirected_user_config_text("", main_store=MAIN, initiative="  ")
+
+
+@pytest.mark.parametrize(
+    "text", ['core = { active_initiative = "x" }\n', 'core.active_initiative = "x"\n']
+)
+def test_redirected_user_config_text_refuses_inline_core_table_for_the_initiative(text):
+    with pytest.raises(TicketStoreError):
+        redirected_user_config_text(text, main_store=None, initiative="initiative-child")

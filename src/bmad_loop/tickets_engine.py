@@ -6,10 +6,12 @@ tree (``[stories] source = "tickets"``).
 :func:`~bmad_loop.tickets_source.decide_pick` holds the selection rules). The tree
 is reached only through a :class:`~bmad_loop.tickettree.TicketTreeLike`, which
 ``ticket_tree_factory`` builds from ``(project_root, pinned_initiative)`` (and a
-child ``folder``, None today) — the
+child ``folder``) — the
 real :class:`~bmad_loop.tickettree.TicketTree` by default, an in-memory fake in
 tests. The tree is pinned to ``RunState.initiative``, so a resume never builds
-another initiative's ticket.
+another initiative's ticket; a chained run, which builds one child initiative of
+the parent ``RunState.parent_initiative``, pins the parent and reads the child
+through its folder (:func:`tree_pin`).
 
 The unit key is the ticket ref (``E.M``); every unit's epic is 0 and the epic
 lifecycle is keyed by slug here, not by the base engine's numbered epics.
@@ -102,6 +104,7 @@ from typing import Any, NoReturn, Protocol
 
 from . import deferredwork, gates, ticketlayout, ticketstore, verify
 from .adapters.base import SessionResult, SpecSnapshot
+from .bmadconfig import ProjectPaths
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import (
     RETRO_SKILL,
@@ -180,11 +183,24 @@ from .worksource import WorkRef, WorkSource
 class TicketTreeFactory(Protocol):
     """Builds the run's tree from ``(project_root, pinned_initiative)``, and
     ``folder``: a parent initiative's child folder the tree reads and writes
-    through, or None for the active initiative (every run today)."""
+    through, or None for the active initiative (see :func:`tree_pin`)."""
 
     def __call__(
         self, project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
     ) -> TicketTreeLike: ...
+
+
+def tree_pin(state: RunState, paths: ProjectPaths) -> tuple[str | None, Path | None]:
+    """``(pinned_initiative, folder)`` for a main-checkout tree of the run
+    ``state`` over ``paths``. A chained run (``state.parent_initiative`` set) pins
+    the parent — the live ``[core] active_initiative`` still names it — and
+    reads and writes through the child's folder (``paths`` are the child's:
+    ``ProjectPaths.with_initiative``); any other run pins its own initiative and
+    reads it directly. A worktree mount's tree is never chained: its config names
+    the child (``ticketstore.redirect_mount_config``)."""
+    if state.parent_initiative is not None:
+        return state.parent_initiative, paths.initiative_folder
+    return state.initiative or None, None
 
 
 def _pick_scope(state: RunState) -> PickScope:
@@ -390,11 +406,11 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     @property
     def ticket_tree(self) -> TicketTreeLike:
-        """The run's tree, built once from the main checkout and the pin."""
+        """The run's tree, built once from the main checkout, the pin and, for a
+        chained run, the child folder (:func:`tree_pin`)."""
         if self._ticket_tree is None:
-            self._ticket_tree = self._ticket_tree_factory(
-                self.paths.project, self.state.initiative or None, folder=None
-            )
+            pin, folder = tree_pin(self.state, self.paths)
+            self._ticket_tree = self._ticket_tree_factory(self.paths.project, pin, folder=folder)
         return self._ticket_tree
 
     def _make_work_source(self) -> WorkSource:
@@ -1725,7 +1741,9 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _workspace_ticket_tree(self) -> TicketTreeLike:
         """The tree that owns the active workspace's plans: the run's own in
         place, one built for the unit worktree's project under isolation (its
-        ``find`` names the worktree's copy of the plan)."""
+        ``find`` names the worktree's copy of the plan). A mount's tree is pinned
+        to ``state.initiative`` with no folder even on a chained run: the mount's
+        config names the child as its active initiative."""
         project = self.workspace.paths.project
         if project == self.paths.project:
             return self.ticket_tree

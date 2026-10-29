@@ -139,6 +139,60 @@ def test_engine_pins_source_and_builds_the_tree_from_the_pin(project_v7):
     assert engine.tree_builds == [(project_v7.project, project_v7.initiative)]
 
 
+@pytest.mark.parametrize("chained", [False, True])
+def test_chained_trees_pin_the_parent_in_place_and_the_child_in_a_mount(
+    project_v7, tmp_path, chained
+):
+    """A chained run (one child initiative of the parent the live config names)
+    builds its main tree pinned to the parent and routed through the child's
+    folder, and a unit mount's tree pinned to the child with no folder — the
+    mount's config names the child. An unchained run pins its own initiative in
+    both, with no folder. Ablation (performed): pin the main tree to
+    `state.initiative` in `tree_pin` and the chained row FAILS."""
+    parent, child = project_v7.initiative, "initiative-child"
+    paths = load_paths(project_v7.project, want_tickets=True)
+    if chained:
+        paths = paths.with_initiative(child)
+    run_dir = project_v7.project / ".bmad-loop" / "runs" / "test-run"
+    state = RunState(
+        run_id="test-run",
+        project=str(project_v7.project),
+        started_at="now",
+        initiative=child if chained else parent,
+        initiative_folder=str(paths.initiative_folder),
+        parent_initiative=parent if chained else None,
+    )
+    tree = _tree(project_v7)
+    built: list[tuple[Path, str | None, Path | None]] = []
+
+    def factory(root, pin, folder=None):
+        built.append((root, pin, folder))
+        return tree
+
+    engine = TicketsEngine(
+        paths=paths,
+        policy=_policy(),
+        adapter=MockAdapter([]),
+        run_dir=run_dir,
+        journal=Journal(run_dir),
+        state=state,
+        ticket_tree_factory=factory,
+    )
+    assert engine.ticket_tree is tree
+    mount = (tmp_path / "mount").resolve()
+    engine.workspace = Workspace(root=mount, paths=engine.paths.rebased(mount))
+    engine._workspace_ticket_tree()
+
+    if chained:
+        assert built == [
+            (project_v7.project, parent, paths.initiative_folder),
+            (mount, child, None),
+        ]
+        assert paths.initiative_folder == project_v7.initiative_folder.parent / child
+    else:
+        assert built == [(project_v7.project, parent, None), (mount, parent, None)]
+
+
 @pytest.mark.parametrize(("layout", "shared"), [("T1", False), ("T3", True)])
 def test_engine_shares_the_store_the_run_recorded(project_v7, layout, shared):
     """A run that recorded a shared store (here T3, its own nested repository)
