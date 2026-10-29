@@ -12,6 +12,17 @@ the project's installed copy as a bounded subprocess and parses its JSON into
 merge the BMad config layers. Running it is the same trust step as install's
 render probe running the project's ``render_skill.py``.
 
+Child folders. A parent initiative's children are initiative folders beside
+it, and the live ``[core] active_initiative`` names the parent while a run
+builds one child. A :class:`TicketTree` given ``folder`` (the child's absolute
+path) passes it to the script as the ``<dir>`` positional on every tree read and
+write — ``next <dir>``, ``status <dir>``, ``find <dir> -- <ref>``,
+``mark … <dir> -- <ref> <status>`` — while the pin still names the parent; with
+no ``folder`` the argv is the active initiative's, unchanged. ``<dir>`` makes
+upstream skip the backlog view and the backlog fallback of ``find``.
+:meth:`TicketTree.parent_next` reads the parent's own ``next`` (its children,
+:class:`ticketmodel.ParentView`).
+
 Spawning. :meth:`TicketTree._call` is the single spawn point (a portability
 guard holds every other module off the script). It goes through
 :func:`childrun.run_argv` — no shell, stdin closed, stop-aware, whole-tree kill
@@ -115,7 +126,7 @@ from . import (
 )
 from .process_host import ProcessHostError
 from .statemachine import PlanTransitionRefused, PlanWriteReason, check_plan_transition
-from .ticketmodel import Capability, FindResult, NextView, StatusView
+from .ticketmodel import Capability, FindResult, NextView, ParentView, StatusView
 
 if TYPE_CHECKING:
     from .journal import Journal
@@ -335,7 +346,10 @@ class TicketTree:
     pinned ``RunState.initiative``: when set, every tree read first checks the
     live ``[core] active_initiative`` and refuses on a difference, so a run never
     reads (or later writes) another initiative's tree. None means no pin
-    (validate, preflight)."""
+    (validate, preflight). ``folder`` is a child initiative's folder under a
+    parent: every read and write names it as the script's ``<dir>`` (see the
+    module docstring), and the pin — the parent's slug — is checked as before.
+    None reads the active initiative."""
 
     def __init__(
         self,
@@ -343,6 +357,7 @@ class TicketTree:
         script: Path | None = None,
         pinned_initiative: str | None = None,
         *,
+        folder: Path | None = None,
         timeout: float = TICKETS_TIMEOUT_S,
     ) -> None:
         self._project_root = Path(project_root)
@@ -350,6 +365,7 @@ class TicketTree:
             Path(script) if script is not None else self._project_root / bmadconfig.V7_MARKER_REL
         )
         self._pinned_initiative = pinned_initiative
+        self._folder = None if folder is None else Path(folder)
         self.timeout = timeout
 
     @property
@@ -359,6 +375,14 @@ class TicketTree:
     @property
     def pinned_initiative(self) -> str | None:
         return self._pinned_initiative
+
+    @property
+    def folder(self) -> Path | None:
+        return self._folder
+
+    def _dir(self) -> list[str]:
+        """The ``<dir>`` positional: the child folder, or nothing."""
+        return [] if self._folder is None else [str(self._folder)]
 
     # ----------------------------------------------------------- launch
 
@@ -445,18 +469,29 @@ class TicketTree:
         return cap
 
     def next(self) -> NextView:
-        """``next`` on the active initiative (plus the backlog), as build-auto runs it."""
-        return _parsed(ticketmodel.parse_next, self._call(["next"], verb="next"))
+        """``next`` on the tree's folder, else on the active initiative (plus the
+        backlog), as build-auto runs it."""
+        return _parsed(ticketmodel.parse_next, self._call(["next", *self._dir()], verb="next"))
 
     def status(self, folder: Path | None = None) -> StatusView:
-        """``status`` on ``folder``, or on the active initiative (plus the backlog)."""
-        tail = ["status"] if folder is None else ["status", str(folder)]
+        """``status`` on ``folder``, else on the tree's folder, else on the active
+        initiative (plus the backlog)."""
+        target = folder if folder is not None else self._folder
+        tail = ["status"] if target is None else ["status", str(target)]
         return _parsed(ticketmodel.parse_status, self._call(tail, verb="status"))
 
     def find(self, ref: str) -> FindResult:
-        """``find <ref>`` on the active initiative, then the backlog."""
+        """``find <ref>`` in the tree's folder, else on the active initiative, then
+        the backlog."""
         # `--` keeps a ref that starts with `-` from reading as an option.
-        return _parsed(ticketmodel.parse_find, self._call(["find", "--", ref], verb="find"))
+        tail = ["find", *self._dir(), "--", ref]
+        return _parsed(ticketmodel.parse_find, self._call(tail, verb="find"))
+
+    def parent_next(self, parent: Path) -> ParentView:
+        """``next <parent>`` on a parent initiative's folder: its children, which
+        are ready and what each waits on. Pin-checked like every tree read."""
+        doc = self._call(["next", str(parent)], verb="next")
+        return _parsed(ticketmodel.parse_parent_next, doc)
 
     # ----------------------------------------------------------- writes
 
@@ -530,7 +565,8 @@ class TicketTree:
                     result = PlanMark(ref, plan, before, before, "noop")
                 else:
                     flags = ["--blocked", blocked] if blocked is not None else []
-                    doc = self._call(["mark", *flags, "--", ref, target], verb="mark")
+                    tail = ["mark", *flags, *self._dir(), "--", ref, target]
+                    doc = self._call(tail, verb="mark")
                     report = _parsed(ticketmodel.parse_mark, doc)
                     _, after, blocked_after, blocked_at_after = _plan_fields(plan)
                     if (

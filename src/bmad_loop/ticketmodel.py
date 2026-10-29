@@ -30,9 +30,14 @@ for the values upstream emits:
   reads as refined.
 
 A parent initiative (one whose ``tickets.toml`` lists ``[[initiative]]``
-children) answers ``status``/``next`` with its children instead of tickets;
-:class:`TicketsParentInitiative` refuses that document, since a run builds one
-child initiative at a time.
+children) answers ``status``/``next`` with its children instead of tickets
+(upstream ``parent_view``); :class:`TicketsParentInitiative` refuses that
+document from :func:`parse_next`/:func:`parse_status`, since a run builds one
+child initiative at a time. :func:`parse_parent_next` reads ``next`` on a
+parent as a :class:`ParentView`: each child in build order, with its folder
+(None for a child declared but not created yet, which then carries no
+``status``/``counts``), its ``after`` edges, the prerequisites it is still
+``waiting_on``, and whether upstream lists it as ``ready``.
 
 ``parse_help`` and :func:`capability_problems` gate the installed script on the
 verbs and ``mark`` statuses bmad-loop drives, from its ``--help`` output (the
@@ -88,6 +93,10 @@ REQUIRED_STATUSES: Final[frozenset[str]] = frozenset(
 )
 
 _ROW_STATUSES: Final[frozenset[str]] = frozenset(("", *PLAN_STATUSES))
+# An initiative or epic file's own `status` (`tickets.py` CONTAINER_STATUSES);
+# `""` when the file sets none.
+CONTAINER_STATUSES: Final[tuple[str, ...]] = ("in-progress", "done", "dropped")
+_CONTAINER_STATUSES: Final[frozenset[str]] = frozenset(("", *CONTAINER_STATUSES))
 
 
 class TicketsSchemaError(ValueError):
@@ -230,6 +239,56 @@ class StatusView:
     problems: tuple[str, ...]
     backlog: StatusView | None = None
     backlog_error: str | None = None
+
+
+@dataclass(frozen=True)
+class InitiativeEdge:
+    """One declared ``after`` of a parent's ``[[initiative]]`` table: the child
+    slug it needs (upstream resolves an id to the slug) and why."""
+
+    initiative: str
+    needs: str
+
+
+@dataclass(frozen=True)
+class ChildInitiative:
+    """One child of a parent initiative, as ``parent_view`` prints it.
+
+    ``folder`` is the child's folder name (a sibling of the parent's), or None
+    when the parent declares the child and its folder does not exist yet: such a
+    child has no ``status`` (``""``) and no ``counts`` (empty). ``status`` is the
+    child's own file's (``""`` when unset); ``waiting_on`` names the ``after``
+    children whose status is not ``done``. ``ready`` is whether ``next`` listed
+    the child: nothing to wait on and not done or dropped — a folder-less child
+    included."""
+
+    id: str
+    slug: str
+    title: str
+    after: tuple[InitiativeEdge, ...]
+    folder: str | None
+    status: str
+    counts: Mapping[str, int]
+    waiting_on: tuple[str, ...]
+    ready: bool
+
+
+@dataclass(frozen=True)
+class ParentView:
+    """``next`` on a parent initiative: its children in build order (the
+    ``[[initiative]]`` table's order), the slugs ``next`` lists as ``ready`` in
+    that order, and upstream's ``order_conflict`` (an ``after`` naming a child
+    later in the order), kept opaque."""
+
+    store: str
+    folder: str
+    initiatives: tuple[ChildInitiative, ...]
+    ready: tuple[str, ...]
+    order_conflict: tuple[Mapping[str, object], ...]
+
+    def child(self, slug: str) -> ChildInitiative | None:
+        """The child named ``slug``, or None when the parent lists no such child."""
+        return next((c for c in self.initiatives if c.slug == slug), None)
 
 
 @dataclass(frozen=True)
@@ -558,6 +617,66 @@ def parse_status(doc: object, *, store: str | None = None) -> StatusView:
         problems=_texts(d, command, "problems", required=False),
         backlog=backlog,
         backlog_error=backlog_error,
+    )
+
+
+def _child(doc: object, command: str, ready: frozenset[str]) -> ChildInitiative:
+    d = _obj(doc, command, "initiatives")
+    edges: list[InitiativeEdge] = []
+    for raw in _list(_need(d, command, "after"), command, "after"):
+        e = _obj(raw, command, "after")
+        edges.append(
+            InitiativeEdge(
+                initiative=_str(e, command, "initiative"), needs=_str(e, command, "needs")
+            )
+        )
+    slug = _str(d, command, "slug")
+    folder = _opt_str(d, command, "folder")
+    status = ""
+    counts: Mapping[str, int] = {}
+    # Upstream adds `status` and `counts` only once the child's folder exists.
+    if folder is not None:
+        status = _str(d, command, "status")
+        if status not in _CONTAINER_STATUSES:
+            raise TicketsSchemaError(command, "status", f"unknown initiative status {status!r}")
+        counts = _counts(d, command)
+    return ChildInitiative(
+        id=_scalar_text(_need(d, command, "id"), command, "id"),
+        slug=slug,
+        title=_str(d, command, "title"),
+        after=tuple(edges),
+        folder=folder,
+        status=status,
+        counts=counts,
+        waiting_on=_texts(d, command, "waiting_on", required=True),
+        ready=slug in ready,
+    )
+
+
+def parse_parent_next(doc: object) -> ParentView:
+    """``next``'s document on a parent initiative (upstream ``parent_view`` plus
+    ``ready``). Any other document — a plain initiative's ``next``, or a
+    parent's ``status``, which carries no ``ready`` — is a schema error, as is a
+    ``ready`` slug the parent does not list or two children with one slug."""
+    command = "next"
+    d = _obj(doc, command, "document")
+    ready = _texts(d, command, "ready", required=True)
+    children = tuple(
+        _child(raw, command, frozenset(ready))
+        for raw in _list(_need(d, command, "initiatives"), command, "initiatives")
+    )
+    slugs = [c.slug for c in children]
+    if len(set(slugs)) != len(slugs):
+        raise TicketsSchemaError(command, "initiatives", f"a slug is listed twice: {slugs}")
+    unknown = [s for s in ready if s not in slugs]
+    if unknown:
+        raise TicketsSchemaError(command, "ready", f"names no listed initiative: {unknown}")
+    return ParentView(
+        store=_str(d, command, "store"),
+        folder=_str(d, command, "folder"),
+        initiatives=children,
+        ready=ready,
+        order_conflict=_objects(d, command, "order_conflict"),
     )
 
 

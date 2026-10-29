@@ -296,9 +296,12 @@ def _with_trailers(message: str, trailers: list[str]) -> str:
     return body + "\n\n" + "\n".join(trailers)
 
 
-def default_ticket_tree(project_root: Path, pinned_initiative: str | None) -> TicketTreeLike:
-    """The project's installed ``tickets.py``, pinned to ``pinned_initiative``."""
-    return TicketTree(project_root, pinned_initiative=pinned_initiative)
+def default_ticket_tree(
+    project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
+) -> TicketTreeLike:
+    """The project's installed ``tickets.py``, pinned to ``pinned_initiative``;
+    ``folder`` routes every read and write through a parent's child folder."""
+    return TicketTree(project_root, pinned_initiative=pinned_initiative, folder=folder)
 
 
 class _TicketPlanWriter:
