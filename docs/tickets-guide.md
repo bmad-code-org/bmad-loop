@@ -47,6 +47,7 @@ A parent initiative, whose `tickets.toml` lists child initiatives in `[[initiati
 - a stop was asked of the run.
 - the `--max-stories` budget is spent (`max-stories`).
 - it would build the same child again after a run that landed no ticket (`stalled`).
+- a launch check refuses the next child's run, such as a dirty worktree or the child's store (`launch-refused`). `run` exits with that check's exit code.
 - no child can start: some still wait on a prerequisite (`waiting`), every child left was passed over (`passed-over`), or every child is done or dropped (`all-done`). A child waiting on a dropped prerequisite still counts as waiting. The end line names each waiting child's unmet prerequisites with their status, for example `initiative-billing on initiative-search (dropped), initiative-ledger (no-folder)`; `open` is a prerequisite whose file sets no status.
 
 Closing a child writes `status: done` into its `<child>.md`. It happens before every pick, both when `run` starts and after each child's run finishes, for every child whose tickets are all done or dropped. That includes a child a stopped or interrupted chain left open, and one drained outside the chain. A line names each child closed. A drained child is left open, with a line naming why, while a run of it is live, or while a run that builds it is paused or otherwise unfinished (resume that run). A sweep of it holds it only while live. It is also left open while its first pick still finds work, such as an epic awaiting closure, which a run of the child then does, and while its store is refused.

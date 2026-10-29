@@ -4564,7 +4564,8 @@ def _journal_chain_end(
 ) -> None:
     """``initiative-chain-end`` in the finished run's journal. ``end`` is a
     :data:`initiativechain.ChainEnd`, ``stalled``, ``stop-requested``,
-    ``max-stories``, ``store-commit-failed`` or ``fault``. Each prerequisite a
+    ``max-stories``, ``store-commit-failed``, ``launch-refused`` or ``fault``.
+    Each prerequisite a
     waiting child waits on is one row of three parallel lists: the child
     (``waiting_child``), the prerequisite (``waiting_on``) and its status
     (``waiting_on_status``, :func:`initiativechain.prerequisite_status`)."""
@@ -4867,7 +4868,11 @@ def _drive_initiative_chain(
     passed-over slugs and why) or ``initiative-chain-end`` (``parent``, ``end``,
     the waiting slugs and what each waits on); the next run, once composed,
     ``initiative-chain`` (``parent``, ``previous_run``, ``previous_child``). One
-    line per switch is printed.
+    line per switch is printed. A next launch a gate refuses (a dirty tree, the
+    skills, plugin trust, the child's store) leaves ``initiative-chain-next``
+    followed by ``initiative-chain-end`` ``launch-refused`` (the pick, and an
+    ``error`` naming the child and the rc), so the journal shows no switch to a
+    child that never got a run.
 
     Each next run launches with no ``--run-id`` (it mints its own; ``run``'s names
     the first child's run alone), the budget left as its ``--max-stories``, and
@@ -4930,6 +4935,18 @@ def _drive_initiative_chain(
             parent_initiative=parent,
         )
         if isinstance(launched, int):
+            _journal_chain_end(
+                finished.journal,
+                parent,
+                "launch-refused",
+                pick,
+                f"the launch of {child} was refused (exit {launched})",
+            )
+            print(
+                f"initiative chain {parent}: ends (launch-refused): the launch of {child} "
+                "was refused",
+                file=sys.stderr,
+            )
             return launched
         launched.journal.append(
             "initiative-chain",

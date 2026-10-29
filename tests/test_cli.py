@@ -16314,7 +16314,8 @@ def _chain_project(project, monkeypatch, capsys, outcomes, *, policy=None):
     * ``pause`` — paused, so not finished; ``pause-stop-discarded`` — paused, with
       a stop request the engine discarded (its journal row);
     * ``stop-lodged`` / ``stop-discarded`` — ``drain``, with a stop request left in
-      the run dir, or discarded by the engine (its journal row).
+      the run dir, or discarded by the engine (its journal row);
+    * ``drain-dirty`` — ``drain``, leaving an untracked file in the checkout.
 
     Returns the list each built engine appends ``(paths, state, run_dir)`` to."""
     from bmad_loop.journal import save_state
@@ -16349,9 +16350,11 @@ def _chain_project(project, monkeypatch, capsys, outcomes, *, policy=None):
                 self.state.record_pause("scripted pause", "ticket-tree", None)
             else:
                 self.state.finished = True
-            if outcome in ("drain", "stop-lodged", "stop-discarded"):
+            if outcome in ("drain", "drain-dirty", "stop-lodged", "stop-discarded"):
                 _drain_child(root, self.state.initiative)
                 self.state.tasks["1.1"] = StoryTask("1.1", 0, Phase.DONE)
+            if outcome == "drain-dirty":
+                (root / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
             if outcome == "stop-lodged":
                 (self.run_dir / runs.STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
             if outcome in ("stop-discarded", "pause-stop-discarded"):
@@ -16659,6 +16662,53 @@ def test_run_on_a_parent_ends_naming_what_each_waiting_child_waits_on(project, m
         f"{CHAIN_SEARCH} (dropped), {CHAIN_LEDGER} (no-folder) (passed over: "
         f"{CHAIN_LEDGER} (no-folder))"
     ) in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("gate", ["dirty-worktree", "store-refused"])
+def test_chain_next_launch_refused_ends_the_chain_in_the_finished_run(
+    project, monkeypatch, capsys, gate
+):
+    """AUTH drains, BILLING is picked, and a launch check refuses BILLING's run — a
+    file AUTH's run left uncommitted, or BILLING's store: AUTH's journal ends
+    `initiative-chain-next` then `initiative-chain-end` `launch-refused` naming
+    BILLING and the rc, `run` exits with the refusal rc, and no second run dir is
+    made. Ablation (performed): drop the `launch-refused` journal call and AUTH's
+    journal ends at `initiative-chain-next` — this FAILS."""
+    from bmad_loop import ticketstore
+
+    outcome = "drain-dirty" if gate == "dirty-worktree" else "drain"
+    built = _chain_project(project, monkeypatch, capsys, [outcome])
+    root = project.project
+    if gate == "store-refused":
+        real = ticketstore.store_conflict
+
+        def store_conflict(*a, **kw):
+            if kw.get("initiative") == CHAIN_BILLING:
+                return "BILLING's store is refused"
+            return real(*a, **kw)
+
+        monkeypatch.setattr(ticketstore, "store_conflict", store_conflict)
+
+    rc = cli.main(["run", "--project", str(root)])
+
+    assert rc == 1  # what both gates return
+    ((_, state, run_dir),) = built
+    assert state.initiative == CHAIN_AUTH
+    nxt, end = _chain_rows(run_dir)[-2:]
+    assert (nxt["kind"], nxt["to_child"]) == ("initiative-chain-next", CHAIN_BILLING)
+    assert _row(end, "parent", "end", "waiting", "passed_over") == {
+        "kind": "initiative-chain-end",
+        "parent": CHAIN_PARENT,
+        "end": "launch-refused",
+        "waiting": [],
+        "passed_over": [],
+    }
+    assert end["error"] == f"the launch of {CHAIN_BILLING} was refused (exit {rc})"
+    assert [p.name for p in (root / runs.RUNS_DIR).iterdir() if p.is_dir()] == [run_dir.name]
+    err = capsys.readouterr().err
+    assert f"initiative chain {CHAIN_PARENT}: ends (launch-refused)" in err
+    expected = "worktree is not clean" if gate == "dirty-worktree" else "BILLING's store is refused"
+    assert expected in err
 
 
 def test_run_after_a_stopped_chain_closes_the_child_it_left_open(project, monkeypatch, capsys):

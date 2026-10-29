@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from . import bmadconfig
+from . import bmadconfig, install
 from . import policy as policy_mod
 from . import runs, ticketstore, worksource
 from .checks import Finding
@@ -1378,6 +1378,40 @@ def _unwind_composition(
                 journal.append("composition-unwind-failed", run_id=run_dir.name, error=detail)
 
 
+def _chained_child_refusal(paths: bmadconfig.ProjectPaths, parent: str) -> str | None:
+    """Why ``paths`` are not rooted on a child initiative of ``parent``, or None.
+    The child must be listed in the parent's ``[[initiative]]`` table, read as the
+    tickets preflight reads it (``install._initiative_children``) from the
+    parent's folder: the child folder's sibling named ``parent``, the sibling
+    :meth:`~bmadconfig.ProjectPaths.with_initiative` derives the child from."""
+    child, folder = paths.active_initiative, paths.initiative_folder
+    if paths.era != "v7" or folder is None or not child or child == parent:
+        rooted = repr(child) if child else "no initiative"
+        return (
+            f"a chained run of parent initiative {parent!r} needs paths rooted on one "
+            f"of its child initiatives, not on {rooted} ({paths.era})"
+        )
+    children, breakdown, fault = install._initiative_children(folder.parent / parent)
+    if fault:
+        return (
+            f"a chained run of parent initiative {parent!r} cannot confirm {child!r} is "
+            f"one of its child initiatives: reading {breakdown} failed: {fault}"
+        )
+    if children is None:
+        return (
+            f"a chained run of parent initiative {parent!r} needs paths rooted on one "
+            f"of its child initiatives, not on {child!r}: {breakdown} lists no "
+            "`[[initiative]]` children"
+        )
+    if child not in children:
+        listed = ", ".join(children) or "none"
+        return (
+            f"a chained run of parent initiative {parent!r} needs paths rooted on one "
+            f"of its child initiatives, not on {child!r}: {breakdown} lists {listed}"
+        )
+    return None
+
+
 def compose_run(
     *,
     project: Path,
@@ -1433,21 +1467,17 @@ def compose_run(
     that child's (``ProjectPaths.with_initiative``), so the run pins the child as
     its ``initiative`` and folder, and records the parent
     (``RunState.parent_initiative``, which :func:`runs.paths_for_state` re-roots
-    on). Paths not rooted on a child of it — off v7, with no active initiative
-    folder, or naming the parent itself — raise ValueError before anything is
-    published. The caller arms ``sweep_factory`` with the same parent.
+    on). Paths not rooted on a child of it raise ValueError before anything is
+    published (:func:`_chained_child_refusal`): off v7, with no active initiative
+    folder, naming the parent itself, or naming an initiative the parent's
+    ``[[initiative]]`` table does not list — or a parent with no such table, or
+    whose table cannot be read. The caller arms ``sweep_factory`` with the same
+    parent.
     """
     if parent_initiative is not None and (
-        paths.era != "v7"
-        or paths.initiative_folder is None
-        or not paths.active_initiative
-        or paths.active_initiative == parent_initiative
+        refusal := _chained_child_refusal(paths, parent_initiative)
     ):
-        rooted = repr(paths.active_initiative) if paths.active_initiative else "no initiative"
-        raise ValueError(
-            f"a chained run of parent initiative {parent_initiative!r} needs paths rooted "
-            f"on one of its child initiatives, not on {rooted} ({paths.era})"
-        )
+        raise ValueError(refusal)
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
     # Before the claim: a store that changed since the preflight leaves nothing behind.

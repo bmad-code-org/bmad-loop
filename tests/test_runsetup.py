@@ -2568,6 +2568,21 @@ def test_compose_sweep_records_no_parent_off_v7(tmp_path):
     assert load_state(composed.run_dir).parent_initiative is None
 
 
+def _parent_breakdown(project_v7):
+    return project_v7.initiative_folder / "tickets" / "tickets.toml"
+
+
+def _list_children(project_v7, *slugs):
+    """Make the template's initiative a parent listing ``slugs`` as its
+    `[[initiative]]` children, as compose_run's membership check reads it."""
+    rows = "".join(
+        f'\n[[initiative]]\nid = {i}\nslug = "{slug}"\ntitle = "{slug}"\n'
+        for i, slug in enumerate(slugs, 1)
+    )
+    breakdown = _parent_breakdown(project_v7)
+    breakdown.write_text(breakdown.read_text(encoding="utf-8") + rows, encoding="utf-8")
+
+
 def _compose_chained_run(project_v7, paths, parent):
     return runsetup.compose_run(
         project=project_v7.project,
@@ -2596,6 +2611,7 @@ def test_compose_run_records_a_chained_childs_parent_on_the_childs_paths(project
     ABLATION (performed): drop `parent_initiative=` from compose_run's
     `build_run_state` call and this FAILS."""
     child_paths, child_folder = _chained_child_paths(project_v7)
+    _list_children(project_v7, CHILD)
     composed = _compose_chained_run(project_v7, child_paths, project_v7.initiative)
     state = load_state(composed.run_dir)
     assert state.parent_initiative == project_v7.initiative
@@ -2615,6 +2631,34 @@ def test_compose_run_refuses_a_parent_without_child_rooted_paths(project_v7, roo
         paths = _fake_paths(project_v7.project)
     with pytest.raises(ValueError, match="needs paths rooted on one of its child initiatives"):
         _compose_chained_run(project_v7, paths, project_v7.initiative)
+    runs_dir = project_v7.project / runs.RUNS_DIR
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+@pytest.mark.parametrize("parent", ["unlisted", "no-children-table", "unreadable"])
+def test_compose_run_refuses_a_child_its_parent_does_not_list(project_v7, parent):
+    """Child-rooted paths are not enough: the child must be one the parent's
+    `[[initiative]]` table lists. A parent listing other children, one with no
+    such table, or one whose table cannot be read raises before a run dir is
+    published, naming the parent and the child.
+
+    ABLATION (performed): drop the membership check from `_chained_child_refusal`
+    and this FAILS."""
+    child_paths, _ = _chained_child_paths(project_v7)
+    if parent == "unlisted":
+        _list_children(project_v7, "initiative-other")
+    elif parent == "unreadable":
+        _parent_breakdown(project_v7).write_text("[[initiative]\n", encoding="utf-8")
+    with pytest.raises(ValueError) as refused:
+        _compose_chained_run(project_v7, child_paths, project_v7.initiative)
+    message = str(refused.value)
+    assert repr(project_v7.initiative) in message and repr(CHILD) in message
+    expected = {
+        "unlisted": "lists initiative-other",
+        "no-children-table": "lists no `[[initiative]]` children",
+        "unreadable": "TOMLDecodeError",
+    }[parent]
+    assert expected in message
     runs_dir = project_v7.project / runs.RUNS_DIR
     assert not runs_dir.exists() or not any(runs_dir.iterdir())
 
