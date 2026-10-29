@@ -1250,6 +1250,19 @@ def test_select_window_sends_every_target_form_unrewritten(rec, target):
     assert len(rec.calls) == 1
 
 
+@pytest.mark.parametrize("target", ["ctl:@3", "=ctl:@3", "=ctl:run-a"])
+def test_rename_window_inherits_the_base_verb_unrewritten(rec, target):
+    # No override: psmux validates a rename-window target server-side (a miss
+    # is an error, not the active window, psmux/psmux#545) and routes the
+    # qualified id this backend mints to its session's server (psmux/psmux#483),
+    # so the target goes out verbatim. Its rename sets the window's
+    # manual_rename flag (source-read at v3.4.0), so automatic rename leaves
+    # the new name alone: one spawn, no `automatic-rename off` write.
+    PsmuxMultiplexer().rename_window(target, "run-b")
+    assert rec.argv[1:] == ["rename-window", "-t", target, "run-b"]
+    assert len(rec.calls) == 1
+
+
 def test_tmux_backend_keeps_bare_tui_ids(monkeypatch, tmp_path):
     # The divergence is psmux-only: tmux ids are server-global, so qualifying
     # them would produce targets its own verbs do not accept. tmux's `-u` (#881)

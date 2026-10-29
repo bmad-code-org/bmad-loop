@@ -326,3 +326,7 @@ Operational notes for any external backend:
 - **The TUI's parked-prompt answer keys need `send_keys`.** The method is optional: a
   backend that does not override it refuses every answer, and the operator answers by
   attaching instead. See the [backend contract](adapter-authoring-guide.md#the-transport-contract-for-a-backend-author).
+- **`rename_window(target, name)` is checked.** Unlike `select_window`, it raises
+  `MultiplexerError` when the rename did not land, and the new name must stick: a
+  multiplexer that auto-renames windows must not rename it back. The method is optional:
+  a backend that does not override it raises `MultiplexerError` for every rename.

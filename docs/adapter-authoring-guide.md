@@ -79,6 +79,7 @@ Rules that span methods:
 - `window_alive(session, window_id)`: `True` while the window is listed AND its pane is alive; a window the multiplexer keeps listed after its pane exited (`remain-on-exit on`) is not alive. Membership alone is `list_window_ids`. Raise when liveness cannot be known; never answer `False` for that.
 - `kill_window(target)`: tolerate the window already being gone; no-op on a transport failure.
 - `select_window(target)`: make the window current; best-effort.
+- `rename_window(target, name)` (default: raises `MultiplexerError`): rename the window so a by-name lookup finds it under `name`, which must stick against any automatic rename. Checked: raise `MultiplexerError` when the rename did not land.
 - `set_window_option(target, option, value)` / `unset_window_option(target, option)`: best-effort. An unset option must read back as unset, not empty.
 - `show_window_option(target, option)`: the value, or `''` when unset or on failure.
 - `pipe_pane(window_id, log_file)`: tee the pane to `log_file`; tolerate a dead window.

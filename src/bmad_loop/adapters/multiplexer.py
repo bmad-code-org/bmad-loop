@@ -375,6 +375,23 @@ class TerminalMultiplexer(ABC):
         on a transport failure). ``target`` is a :meth:`target` token or a
         backend-native window id."""
 
+    def rename_window(self, target: str, name: str) -> None:
+        """Rename the targeted window to ``name``, so a later by-name lookup
+        (the TUI's ``<kind>-<run_id>`` control-window scan) finds it under the
+        new one. ``target`` is a :meth:`target` token or a backend-native
+        window id. The name must stick: a multiplexer that auto-renames
+        windows must not rename this one back.
+
+        CHECKED, unlike :meth:`select_window`: a rename that did not land
+        raises :class:`MultiplexerError`, so the caller can say the window is
+        still under its old name.
+
+        NON-abstract so released out-of-tree backends keep working unchanged:
+        the default raises :class:`MultiplexerError` ("cannot rename"), which
+        the caller reads as a rename that did not land. A backend that can
+        rename a window overrides this."""
+        raise MultiplexerError(f"{type(self).__name__} cannot rename a window")
+
     @abstractmethod
     def set_window_option(self, target: str, option: str, value: str) -> None:
         """Set a user option on the targeted window (best-effort: a no-op on a
