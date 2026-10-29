@@ -53,7 +53,7 @@ dev = [
   # checks that fail the build on untouched code. This is the single pin — the
   # typecheck job runs `uv run pyright`, so CI and `uv run pyright` locally are
   # the same resolved version and cannot drift apart (#245).
-  "pyright==1.1.411",
+  "pyright==1.1.414",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -130,7 +130,7 @@ line_length = 100
 
 [tool.pyright]
 # Stage 1 of #245 (assessment F-4): a basic-mode type-check gate so annotation
-# drift stops being invisible. Verified against pyright 1.1.411 docs.
+# drift stops being invisible. Verified against pyright 1.1.414 docs.
 include = ["src/bmad_loop"]
 # data/ ships skill assets + hook scripts that are templates / stand-alone (not
 # part of the package's import graph); type-checking them is noise.
