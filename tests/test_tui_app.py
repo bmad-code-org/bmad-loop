@@ -9702,7 +9702,7 @@ def test_escalation_rearm_rejudges_a_sweeps_initiative_under_the_lock(project_v7
     run_dir = escalated_run(project_v7.project, "r1", story_key="1", run_type="sweep").run_dir
     judged: list = []
 
-    def judge(state, paths):
+    def judge(state, paths, **_kw):
         judged.append(state)
         return "initiative switched" if len(judged) > 1 else None
 

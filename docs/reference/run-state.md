@@ -93,7 +93,7 @@ A tickets run's `state.json` also records `initiative` and `initiative_folder`, 
 
 `parent_initiative` names the parent initiative when a tickets run builds one of its children, and is null otherwise.
 
-A v7 sweep records `initiative` and `initiative_folder` too, and its resume, `resolve` and the dashboard's re-arm refuse while the live `[core] active_initiative` names another, because its ledger and pre-answers belong to the initiative it started on.
+A v7 sweep records `initiative` and `initiative_folder` too, and its resume, `resolve` and the dashboard's re-arm refuse while the live `[core] active_initiative` names another, because its ledger and pre-answers belong to the initiative it started on. The run-end sweep of a run that builds a child initiative works that child's ledger: its `initiative` and `initiative_folder` name the child and its `parent_initiative` the parent, and it is refused while the live `[core] active_initiative` names anything but the parent.
 
 A pick pause, and a resume's stale-binding pause (`binding-moved`: an in-flight unit's ref no longer names its plan, or its verified plan is gone), journal `ticket-pick-halt` with its `cause` and `stage`:
 

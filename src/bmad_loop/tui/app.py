@@ -1661,7 +1661,9 @@ class BmadLoopApp(App[None]):
                     except bmadconfig.BmadConfigError as e:
                         conflict = str(e)  # a chained run's config no longer names its parent
                     else:
-                        conflict = runsetup.sweep_initiative_conflict(recorded, paths)
+                        conflict = runsetup.sweep_initiative_conflict(
+                            recorded, paths, rerooted=True
+                        )
                 if recorded is not None and conflict is None:
                     conflict = ticketstore.store_conflict(
                         self.project,
@@ -1723,9 +1725,12 @@ class BmadLoopApp(App[None]):
                     return
                 if paths is not None:
                     # the initiative pin, re-judged on the state the re-arm writes:
-                    # the lock-free judgment above skips a state it could not read
+                    # the lock-free judgment above skips a state it could not read,
+                    # and then `paths` are the loaded ones, never re-rooted
                     if (
-                        pinned := runsetup.sweep_initiative_conflict(fresh_state, paths)
+                        pinned := runsetup.sweep_initiative_conflict(
+                            fresh_state, paths, rerooted=recorded is not None
+                        )
                     ) is not None:
                         self.notify(pinned, severity="error")
                         return

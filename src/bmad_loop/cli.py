@@ -4276,7 +4276,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         max_stories=args.max_stories,
         source=source,
         spec_folder=spec_folder,
-        sweep_factory=_sweep_factory(project, paths, trusted_digest, plugin_grants=plugin_grants),
+        # no run starts chained yet: the S3 chain driver supplies a child's parent here
+        sweep_factory=_sweep_factory(
+            project, paths, trusted_digest, plugin_grants=plugin_grants, parent_initiative=None
+        ),
         make_adapters=_make_adapters,
         engine_cls=Engine,
         stories_engine_cls=StoriesEngine,
@@ -4843,6 +4846,7 @@ def _start_sweep(
     profiles=None,
     on_started: Callable[[], None] | None = None,
     plugin_grants: GrantSet,
+    parent_initiative: str | None = None,
 ) -> int:
     # The composition (run dir + state + pid + sweep.json + adapters + engine)
     # lives in runsetup; this stays compose -> render. SweepEngine and
@@ -4862,6 +4866,9 @@ def _start_sweep(
     # requires it: the launch's frozen read (#496/#497). A default would let a new
     # caller silently refuse every granted plugin — or tempt one to read the store
     # here, below the launch.
+    #
+    # `parent_initiative` is a chained child's parent, for its run-end sweep
+    # (`_sweep_factory`); `paths` are then the child's. None for every other sweep.
     composed = runsetup.compose_sweep(
         project=project,
         paths=paths,
@@ -4881,6 +4888,7 @@ def _start_sweep(
         profiles=profiles,
         on_started=on_started,
         plugin_grants=plugin_grants,
+        parent_initiative=parent_initiative,
     )
     _warn_bypass_dropped(
         pol,
@@ -4902,6 +4910,7 @@ def _sweep_factory(
     trusted_digest: str,
     *,
     plugin_grants: GrantSet,
+    parent_initiative: str | None = None,
 ):
     """Child-sweep launcher injected into story-run engines. Auto-triggered
     sweeps are unattended: never prompt, never run decision bundles.
@@ -4926,7 +4935,12 @@ def _sweep_factory(
     launch (by anyone) bless code no human launched. The child's registry build
     judges the plugins on disk against these launch grants, so a plugin swapped
     after launch raises out of the engine build — before ``started`` — and the
-    parent records ``sweep-auto-not-started``."""
+    parent records ``sweep-auto-not-started``.
+
+    ``parent_initiative`` is the launching run's ``RunState.parent_initiative``:
+    for a chained child it is the parent, ``paths`` are re-rooted on the child
+    (``runs.paths_for_state``), and the child sweep works the child's ledger and
+    records the parent as its pin (``runsetup.compose_sweep``). None otherwise."""
 
     def factory(trigger: str, *, started: Callable[[], None]) -> None:
         pol = policy_mod.load(_policy_path(project))
@@ -5009,6 +5023,7 @@ def _sweep_factory(
             profiles=profiles,
             on_started=started,
             plugin_grants=plugin_grants,
+            parent_initiative=parent_initiative,
         )
 
     return factory
@@ -5101,6 +5116,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         trigger="cli",
         run_id=args.run_id,
         plugin_grants=plugin_grants,
+        # a human-started sweep works the active initiative's ledger, never a child's
+        parent_initiative=None,
     )
 
 
@@ -5420,11 +5437,6 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         print(f"cannot resume {run_dir.name}: {refusal}", file=sys.stderr)
         return 1
     paths = bmadconfig.load_paths(project, want_tickets=runs.resolves_as_tickets(state))
-    # A chained run's engine works on its child initiative's paths; the gates below
-    # judge the loaded (parent's) paths as `run` does, since the tickets preflight
-    # classifies a parent and its children itself. Ahead of every side effect: a
-    # config that no longer names the parent refuses here (BmadConfigError).
-    run_paths = runs.paths_for_state(paths, state)
     sweep_options = None
     if state.run_type == "sweep":
         try:
@@ -5441,11 +5453,19 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         except runsetup.SweepOptionsError as exc:
             print(f"cannot resume {run_dir.name}: {exc}", file=sys.stderr)
             return 1
-        # v7: a sweep resumes only on the initiative it started on. Ahead of every
-        # side effect below; `compose_resume` raises the same text as a backstop.
+        # v7: a sweep resumes only on the initiative it started on (a chained
+        # child's sweep: while its parent is active), judged on the loaded paths
+        # ahead of the re-root below, so that refusal names the sweep's pin. Ahead
+        # of every side effect below; `compose_resume` judges the re-rooted paths
+        # as a backstop.
         if (conflict := runsetup.sweep_initiative_conflict(state, paths)) is not None:
             print(f"cannot resume {run_dir.name}: {conflict}", file=sys.stderr)
             return 1
+    # A chained run's engine works on its child initiative's paths; the gates below
+    # judge the loaded (parent's) paths as `run` does, since the tickets preflight
+    # classifies a parent and its children itself. Ahead of every side effect: a
+    # config that no longer names the parent refuses here (BmadConfigError).
+    run_paths = runs.paths_for_state(paths, state)
     pol = policy_mod.load(_policy_path(project))
     # Resume re-reads config.yaml and policy.toml from disk, so it is a second
     # entrypoint into the same engine and gets the same refusal — a run started
@@ -6011,7 +6031,15 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
             state=state,
             policy=pol,
             journal=journal,
-            sweep_factory=_sweep_factory(project, paths, new_digest, plugin_grants=plugin_grants),
+            # a chained child's run-end sweep works the child's ledger (`paths` are
+            # re-rooted on it) and pins the parent
+            sweep_factory=_sweep_factory(
+                project,
+                paths,
+                new_digest,
+                plugin_grants=plugin_grants,
+                parent_initiative=state.parent_initiative,
+            ),
             make_adapters=_make_adapters,
             engine_cls=Engine,
             stories_engine_cls=StoriesEngine,
@@ -6502,9 +6530,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # Re-judged after the confirm against the config the re-arm reads. An
     # unreadable config skips this early exit only, as the trust gate below
     # does; the resume's own config read refuses it.
+    # Judged on the loaded paths, as the resume judges them, so a chained child's
+    # sweep whose parent is no longer active is refused here too.
     if state.run_type == "sweep":
         try:
-            pin_paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+            pin_paths = bmadconfig.load_paths(project)
         except (bmadconfig.BmadConfigError, OSError):
             pin_paths = None
         if (
@@ -6888,7 +6918,10 @@ def cmd_resolve(args: argparse.Namespace) -> int:
             return rc
         # The sweep's initiative pin, re-judged: the active initiative can change
         # during the resolve session, and the re-arm below precedes the resume.
-        if (conflict := runsetup.sweep_initiative_conflict(state, paths)) is not None:
+        # `paths` are re-rooted (`runs.paths_for_state`).
+        if (
+            conflict := runsetup.sweep_initiative_conflict(state, paths, rerooted=True)
+        ) is not None:
             print(f"cannot resolve {args.run_id}: {conflict}", file=sys.stderr)
             return 1
         # #496/#497: the resume's plugin-trust refusal, hoisted ahead of the re-arm

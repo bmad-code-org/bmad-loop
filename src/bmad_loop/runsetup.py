@@ -985,7 +985,9 @@ class SweepPinError(ValueError):
     """A sweep would resume under another BMAD v7 initiative than it started on."""
 
 
-def sweep_initiative_conflict(state: RunState, paths: bmadconfig.ProjectPaths) -> str | None:
+def sweep_initiative_conflict(
+    state: RunState, paths: bmadconfig.ProjectPaths, *, rerooted: bool = False
+) -> str | None:
     """The refusal text when a sweep would resume on another initiative than the
     one it pinned at launch (``RunState.initiative``), else None. Every story run
     is None here: a tickets run checks its pin on each tree read instead.
@@ -997,9 +999,27 @@ def sweep_initiative_conflict(state: RunState, paths: bmadconfig.ProjectPaths) -
     whose ids mean other entries. The live side is ``paths.active_initiative``
     (``""`` off v7). A sweep that started with no initiative active pins
     ``""``; one written before the pin existed reads the same, which on a v7
-    project with an initiative active is refused rather than guessed."""
+    project with an initiative active is refused rather than guessed.
+
+    A chained child's run-end sweep (``state.parent_initiative`` set) works the
+    child's ledger but is pinned to the PARENT, as the chained run is
+    (:func:`runs.paths_for_state`). ``rerooted`` names which paths the caller
+    passes, and is never inferred from their values — a live config naming the
+    child loads paths that look re-rooted:
+
+    - ``rerooted=False`` (default): ``bmadconfig.load_paths`` output. Passes only
+      while the live ``active_initiative`` names ``state.parent_initiative``.
+    - ``rerooted=True``: :func:`runs.paths_for_state` output, which raised
+      unless the live config named the parent. Passes only when the paths are
+      rooted on the child (``active_initiative`` and the initiative folder's name
+      are ``state.initiative``).
+
+    An unchained sweep is judged the same either way (``paths_for_state``
+    returns its loaded paths unchanged)."""
     if state.run_type != "sweep":
         return None
+    if state.parent_initiative is not None:
+        return _chained_sweep_conflict(state, paths, rerooted=rerooted)
     pinned = state.initiative
     live = paths.active_initiative if paths.era == "v7" else ""
     if pinned == live:
@@ -1015,6 +1035,34 @@ def sweep_initiative_conflict(state: RunState, paths: bmadconfig.ProjectPaths) -
         f"sweep {state.run_id} started on {started}, but the active initiative is now "
         f"{now}; its ledger and pre-answers belong to the initiative it started on. "
         f"To resume it, {fix} (_bmad/custom/config.user.toml); otherwise start a new sweep"
+    )
+
+
+def _chained_sweep_conflict(
+    state: RunState, paths: bmadconfig.ProjectPaths, *, rerooted: bool
+) -> str | None:
+    """:func:`sweep_initiative_conflict` for a chained child's sweep."""
+    parent = state.parent_initiative
+    child = state.initiative
+    live = paths.active_initiative if paths.era == "v7" else ""
+    folder = paths.initiative_folder if paths.era == "v7" else None
+    if rerooted:
+        if live == child and folder is not None and folder.name == child:
+            return None
+        found = (
+            f"its paths are rooted on initiative {live!r} ({folder})"
+            if live
+            else "its paths are rooted on no initiative"
+        )
+    else:
+        if live == parent:
+            return None
+        found = f"the active initiative is now {repr(live) if live else 'unset'}"
+    return (
+        f"sweep {state.run_id} works child initiative {child!r} of parent initiative "
+        f"{parent!r}, but {found}; its ledger and pre-answers belong to that child. "
+        f"To resume it, set `[core] active_initiative` back to {parent!r} "
+        "(_bmad/custom/config.user.toml); otherwise start a new sweep"
     )
 
 
@@ -1485,6 +1533,7 @@ def compose_sweep(
     profiles: dict[str, CLIProfile] | None = None,
     on_started: Callable[[], None] | None = None,
     plugin_grants: GrantSet = GrantSet.empty(),
+    parent_initiative: str | None = None,
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
@@ -1502,6 +1551,13 @@ def compose_sweep(
     injected so ``cli`` supplies its own module-level names — keeping the test
     suite's ``monkeypatch.setattr(cli, "SweepEngine"/"_make_adapters", ...)``
     effective.
+
+    ``parent_initiative`` is set only for the run-end sweep of a chained child
+    (``RunState.parent_initiative`` of the run that triggered it): ``paths`` are
+    then that child's (:func:`runs.paths_for_state`), so the sweep works the
+    child's ledger and pins the child as its ``initiative``, and it records the
+    parent, which a resume finds still active (:func:`sweep_initiative_conflict`).
+    Recorded on v7 only.
 
     ``plugin_grants`` is the launch's frozen grant set, as in :func:`compose_run`.
     For the auto-sweep child it is the set the PARENT's launch read, held by the
@@ -1603,6 +1659,8 @@ def compose_sweep(
             initiative_folder=(
                 str(paths.initiative_folder) if v7 and paths.initiative_folder is not None else ""
             ),
+            # a chained child's sweep: the parent its pin names (above: the child)
+            parent_initiative=parent_initiative if v7 else None,
             store_topology=store_topology,
         )
         journal = Journal(run_dir, pin=state)
@@ -1698,7 +1756,8 @@ def compose_resume(
     effect (:func:`_engine_cls_for`)."""
     if state.run_type == "sweep":
         validate_sweep_options_version(state.sweep_options_version)
-        if (conflict := sweep_initiative_conflict(state, paths)) is not None:
+        # `paths` are the run's own: re-rooted on a chained sweep's child
+        if (conflict := sweep_initiative_conflict(state, paths, rerooted=True)) is not None:
             raise SweepPinError(conflict)
         story_engine = None
     else:

@@ -2487,3 +2487,177 @@ def test_sweep_initiative_conflict_ignores_story_runs_and_v6():
         runsetup.sweep_initiative_conflict(pinned, v6) or ""
     )
     assert "now unset" in (runsetup.sweep_initiative_conflict(pinned, v6) or "")
+
+
+# ------------------------- v7: a chained child's run-end sweep (pinned to the parent)
+
+CHILD = "initiative-child"
+
+
+def _chained_child_paths(project_v7):
+    """A v7 parent initiative with a committed child folder beside it, and the
+    paths a chained child run holds: the loaded (parent's) paths re-rooted on the
+    child, as `runs.paths_for_state` re-roots them."""
+    from conftest import git
+
+    root = project_v7.project
+    child_folder = project_v7.initiative_folder.parent / CHILD
+    shutil.copytree(project_v7.initiative_folder, child_folder)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "a child initiative")
+    return bmadconfig.load_paths(root).with_initiative(CHILD), child_folder
+
+
+def _compose_chained_sweep(project_v7):
+    child_paths, child_folder = _chained_child_paths(project_v7)
+    composed = runsetup.compose_sweep(
+        project=project_v7.project,
+        paths=child_paths,
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="epic-boundary",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        parent_initiative=project_v7.initiative,
+    )
+    return composed, child_folder
+
+
+def test_compose_sweep_pins_a_chained_childs_parent_and_works_the_childs_ledger(project_v7):
+    """A chained child's run-end sweep records the parent it is pinned to, keeps
+    the child as its initiative and folder, and its engine works the CHILD's
+    ledger, never the parent's.
+
+    ABLATION (performed): drop `parent_initiative=` from compose_sweep's RunState
+    and this FAILS."""
+    composed, child_folder = _compose_chained_sweep(project_v7)
+    state = load_state(composed.run_dir)
+    assert state.parent_initiative == project_v7.initiative
+    assert state.initiative == CHILD
+    assert state.initiative_folder == str(child_folder)
+    assert composed.state.parent_initiative == project_v7.initiative
+    ledger = composed.engine.kwargs["paths"].deferred_work
+    assert ledger == child_folder / "deferred-work.md"
+    assert ledger != project_v7.initiative_folder / "deferred-work.md"
+
+
+def test_compose_sweep_records_no_parent_off_v7(tmp_path):
+    """Off v7 there is no initiative to chain through: the parent is never recorded."""
+    composed = runsetup.compose_sweep(
+        project=tmp_path,
+        paths=_fake_paths(tmp_path),
+        policy=policy_mod.loads(""),
+        run_id=RUN_ID,
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        trigger="cli",
+        make_adapters=_accepting_adapters,
+        sweep_engine_cls=_CapturingEngine,
+        trusted_config_digest="deadbeef",
+        parent_initiative="initiative-parent",
+    )
+    assert load_state(composed.run_dir).parent_initiative is None
+
+
+@pytest.mark.parametrize("live", ["parent", "other", "child", "unset"])
+def test_chained_sweep_resume_is_pinned_to_the_parent(project_v7, monkeypatch, live):
+    """A chained child's sweep resumes only while the live config names its
+    parent: the resume judges the loaded paths (`_prepare_resume_locked`), then
+    `compose_resume` the re-rooted ones. A config naming another initiative, the
+    child itself, or none is refused with the parent to restore, before any
+    session is killed.
+
+    ABLATION (performed): make the conflict compare only `state.initiative`
+    against the live value and the parent row is refused while the child row
+    composes."""
+    from conftest import V7_USER_CONFIG_REL
+
+    project = project_v7.project
+    parent = project_v7.initiative
+    composed, _child_folder = _compose_chained_sweep(project_v7)
+    state = load_state(composed.run_dir)
+    (project_v7.output_folder / "other").mkdir()
+    value = {"parent": parent, "other": "other", "child": CHILD, "unset": None}[live]
+    (project / V7_USER_CONFIG_REL).write_text(
+        "[core]\n" + (f'active_initiative = "{value}"\n' if value else ""), encoding="utf-8"
+    )
+    killed: list[str] = []
+    monkeypatch.setattr(runs, "kill_session", killed.append)
+
+    loaded = bmadconfig.load_paths(project, want_tickets=runs.resolves_as_tickets(state))
+    conflict = runsetup.sweep_initiative_conflict(state, loaded)
+    if live != "parent":
+        assert conflict is not None
+        assert f"child initiative {CHILD!r} of parent initiative {parent!r}" in conflict
+        assert f"set `[core] active_initiative` back to {parent!r}" in conflict
+        assert "start a new sweep" in conflict
+        assert killed == []
+        return
+    assert conflict is None
+    run_paths = runs.paths_for_state(loaded, state)
+
+    def resume(paths):
+        return runsetup.compose_resume(
+            project=project,
+            paths=paths,
+            run_dir=composed.run_dir,
+            state=state,
+            policy=policy_mod.loads(""),
+            journal=Journal(composed.run_dir),
+            sweep_factory=lambda _trigger, *, started: None,
+            make_adapters=_accepting_adapters,
+            engine_cls=_CapturingEngine,
+            stories_engine_cls=_CapturingEngine,
+            sweep_engine_cls=_CapturingEngine,
+        )
+
+    # the backstop refuses the loaded (parent-rooted) paths handed in un-re-rooted
+    with pytest.raises(runsetup.SweepPinError, match=f"rooted on initiative {parent!r}"):
+        resume(loaded)
+    assert killed == []
+    engine = resume(run_paths).engine
+    assert engine.kwargs["paths"].deferred_work == run_paths.initiative_folder / "deferred-work.md"
+    assert run_paths.initiative_folder.name == CHILD
+
+
+def test_sweep_initiative_conflict_judges_a_chained_sweep_by_which_paths_it_gets(project_v7):
+    """Loaded paths pass only while they name the parent; re-rooted paths only
+    while they are rooted on the child. Loaded paths of a config naming the child
+    look re-rooted, so the kind is the caller's to name, never inferred. An
+    unchained sweep is judged the same either way."""
+    loaded = bmadconfig.load_paths(project_v7.project)
+    parent = project_v7.initiative
+    rerooted = loaded.with_initiative(CHILD)
+    sweep = RunState(
+        run_id=RUN_ID,
+        project=str(project_v7.project),
+        started_at="now",
+        run_type="sweep",
+        initiative=CHILD,
+        parent_initiative=parent,
+    )
+    judge = runsetup.sweep_initiative_conflict
+    assert judge(sweep, loaded) is None
+    assert judge(sweep, rerooted, rerooted=True) is None
+    # the re-rooted (child's) paths judged as loaded: the live value is not the parent
+    assert "the active initiative is now 'initiative-child'" in (judge(sweep, rerooted) or "")
+    # the loaded (parent's) paths judged as re-rooted: not rooted on the child
+    assert f"rooted on initiative {parent!r}" in (judge(sweep, loaded, rerooted=True) or "")
+    misfiled = dataclasses.replace(rerooted, initiative_folder=loaded.initiative_folder)
+    assert judge(sweep, misfiled, rerooted=True) is not None
+    v6 = _fake_paths(project_v7.project)
+    for kind in (False, True):
+        assert f"back to {parent!r}" in (judge(sweep, v6, rerooted=kind) or "")
+    unchained = dataclasses.replace(sweep, initiative=parent, parent_initiative=None)
+    for kind in (False, True):
+        assert judge(unchained, loaded, rerooted=kind) is None
+        assert judge(unchained, rerooted, rerooted=kind) == judge(unchained, rerooted)

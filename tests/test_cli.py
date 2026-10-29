@@ -10236,7 +10236,7 @@ def test_sweep_resume_refuses_an_initiative_change_before_any_write(project, mon
     run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep")
     runs.write_trusted_config_digest(project.project, run_dir.name, "OLDPIN")
     monkeypatch.setattr(
-        runsetup, "sweep_initiative_conflict", lambda state, paths: "initiative switched"
+        runsetup, "sweep_initiative_conflict", lambda state, paths, **_kw: "initiative switched"
     )
     monkeypatch.setattr(cli, "SweepEngine", _StubEngine)
 
@@ -10352,6 +10352,14 @@ def test_chained_tickets_resume_builds_its_engine_on_the_childs_paths(
             built.append(kwargs["paths"])
 
     monkeypatch.setattr(cli, "TicketsEngine", Engine)
+    factories: list = []
+    real_factory = cli._sweep_factory
+
+    def factory(project_root, paths, digest, **kw):
+        factories.append((paths, kw["parent_initiative"]))
+        return real_factory(project_root, paths, digest, **kw)
+
+    monkeypatch.setattr(cli, "_sweep_factory", factory)
 
     if live != parent:
         with pytest.raises(bmadconfig.BmadConfigError, match=f"set it back to {parent!r}"):
@@ -10361,9 +10369,39 @@ def test_chained_tickets_resume_builds_its_engine_on_the_childs_paths(
     assert cli._resume_paused_run(project.project, run_dir) == 0
     assert preflights == [loaded]
     (paths,) = built
+    # the run-end sweep works the child's ledger and pins the parent
+    assert factories == [(paths, parent)]
     assert paths.active_initiative == child
     assert paths.initiative_folder == real.output_folder / child
     assert paths.deferred_work == real.output_folder / child / "deferred-work.md"
+
+
+def test_chained_sweep_resume_refuses_a_moved_parent_with_the_sweep_pin(
+    project, monkeypatch, capsys
+):
+    """A chained child's sweep resumed after `active_initiative` moved off its
+    parent is refused by the sweep pin, judged on the loaded paths ahead of the
+    re-root, so the refusal names the sweep and the parent to restore — before any
+    side effect. Ablation (performed): judge the pin after `runs.paths_for_state`
+    and the re-root's BmadConfigError escapes instead."""
+    from bmad_loop import bmadconfig
+
+    parent, child = "initiative-platform", "initiative-child"
+    run_dir = _paused_run_for_resume(
+        project, monkeypatch, run_type="sweep", initiative=child, parent_initiative=parent
+    )
+    real = bmadconfig.load_paths(project.project)
+    other = "initiative-other"
+    loaded = dataclasses.replace(
+        real, era="v7", active_initiative=other, initiative_folder=real.output_folder / other
+    )
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda _p, *, want_tickets=False: loaded)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 1
+    err = capsys.readouterr().err
+    assert f"cannot resume {run_dir.name}: sweep {run_dir.name} works child initiative" in err
+    assert f"set `[core] active_initiative` back to {parent!r}" in err
+    assert _resume_entries(run_dir) == []
 
 
 # ------------------------------------------- resume re-stamps the code root
@@ -11668,7 +11706,7 @@ def test_resolve_refuses_a_sweep_on_a_switched_initiative_before_any_write(
     )
     before = load_state(run_dir)
     monkeypatch.setattr(
-        runsetup, "sweep_initiative_conflict", lambda state, paths: "initiative switched"
+        runsetup, "sweep_initiative_conflict", lambda state, paths, **_kw: "initiative switched"
     )
     effects: list = []
     monkeypatch.setattr(
@@ -11683,6 +11721,48 @@ def test_resolve_refuses_a_sweep_on_a_switched_initiative_before_any_write(
 
     assert rc == 1
     assert "cannot resolve r1: initiative switched" in capsys.readouterr().err
+    assert effects == []
+    assert rearms == []
+    _assert_escalation_intact(run_dir, before)
+
+
+@pytest.mark.parametrize("flags", [[], ["--reverify"]], ids=["interactive", "reverify"])
+def test_resolve_refuses_a_chained_sweep_whose_parent_moved_before_any_write(
+    project, monkeypatch, capsys, flags
+):
+    """A chained child's sweep resolved after `active_initiative` moved off its
+    parent is refused by the entry gate, judged on the loaded paths, with the
+    parent to restore — ahead of the session and the reverify transition. Ablation
+    (performed): judge the re-rooted paths there again (`runs.paths_for_state`,
+    whose config fault skips the gate) and the session/reverify recorders run."""
+    from bmad_loop import resolve as resolve_mod
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, rearms = _resolve_gate_run(
+        project, monkeypatch, run_type="sweep", ledger_bytes=READABLE_LEDGER
+    )
+    parent = "initiative-platform"
+    state = load_state(run_dir)
+    state.initiative, state.parent_initiative = "initiative-child", parent
+    save_state(run_dir, state)
+    before = load_state(run_dir)
+    real = bmadconfig.load_paths(project.project)
+    other = "initiative-other"
+    loaded = dataclasses.replace(
+        real, era="v7", active_initiative=other, initiative_folder=real.output_folder / other
+    )
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda _p, *, want_tickets=False: loaded)
+    effects: list = []
+    monkeypatch.setattr(resolve_mod, "build_context", lambda *a, **k: (None, [], []))
+    monkeypatch.setattr(resolve_mod, "run_session", lambda *a, **k: effects.append("session"))
+    monkeypatch.setattr(cli, "_resolve_reverify", lambda *a, **k: effects.append("reverify") or 0)
+
+    rc = cli.main(["resolve", "--project", str(project.project), "r1", *flags])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "cannot resolve r1: sweep r1 works child initiative 'initiative-child'" in err
+    assert f"set `[core] active_initiative` back to {parent!r}" in err
     assert effects == []
     assert rearms == []
     _assert_escalation_intact(run_dir, before)
@@ -11705,7 +11785,7 @@ def test_resolve_rejudges_a_sweeps_initiative_after_the_session(project, monkeyp
     before = load_state(run_dir)
     sessions: list = []
 
-    def judge(state, paths):
+    def judge(state, paths, **_kw):
         return "initiative switched" if sessions else None
 
     monkeypatch.setattr(runsetup, "sweep_initiative_conflict", judge)
@@ -21575,6 +21655,46 @@ def test_auto_sweep_launches_under_worktree_isolation_beside_a_nested_repo_root(
     )
     factory("epic-boundary", started=lambda: None)
     assert len(launched) == 1
+
+
+@pytest.mark.parametrize("parent", [None, "initiative-platform"])
+def test_auto_sweep_hands_the_runs_parent_initiative_to_compose_sweep(project, monkeypatch, parent):
+    """The child-sweep factory hands the launching run's parent initiative (a
+    chained child's run-end sweep) through `_start_sweep` to `compose_sweep`, which
+    records it as the sweep's pin; None for every other run. Ablation (performed):
+    drop `parent_initiative=` from the factory's `_start_sweep` call and the
+    chained row FAILS."""
+    from bmad_loop import bmadconfig
+    from bmad_loop.adapters.profile import get_profile
+
+    class Composed(Exception):
+        pass
+
+    composed: list = []
+
+    def compose_sweep(**kw):
+        composed.append(kw)
+        raise Composed
+
+    install_bmad_config(project)
+    _write_policy(project.project, PIN_POLICY)
+    _pin_profile(project)
+    install_sweep_skill(project.project, get_profile("mycli", project.project).skill_tree)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    monkeypatch.setattr(runsetup, "compose_sweep", compose_sweep)
+    paths = bmadconfig.load_paths(project.project)
+    factory = cli._sweep_factory(
+        project.project,
+        paths,
+        _config_pin(project),
+        plugin_grants=GrantSet.empty(),
+        parent_initiative=parent,
+    )
+    with pytest.raises(Composed):
+        factory("epic-boundary", started=_never_started)
+    (kw,) = composed
+    assert kw["parent_initiative"] == parent
+    assert kw["paths"] is paths
 
 
 # --- #461 point 4: the auto-sweep child's config re-read is integrity-pinned ---

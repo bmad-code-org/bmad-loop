@@ -3737,7 +3737,8 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
         return []
     from .runsetup import sweep_initiative_conflict  # lazy: runsetup imports runs
 
-    if (conflict := sweep_initiative_conflict(state, paths)) is not None:
+    # `paths` are re-rooted (`paths_for_state`)
+    if (conflict := sweep_initiative_conflict(state, paths, rerooted=True)) is not None:
         # The live paths resolve another initiative's ledger, which holds nothing
         # under this run's op id: answering `[]` there would wave the holder through.
         raise HeldClosesUnknownError(conflict)
