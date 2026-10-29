@@ -4274,7 +4274,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return launched
     summary = launched.engine.run()
     print(summary.render())
-    return _drive_initiative_chain(project, paths, pol, args, launched, spec_folder=spec_folder)
+    return _drive_initiative_chain(project, paths, pol, launched)
 
 
 def _launch_run(
@@ -4451,13 +4451,24 @@ def _passed_over_note(pick: initiativechain.ChildPick) -> str:
     return " (passed over: " + ", ".join(f"{p.slug} ({p.why})" for p in pick.passed_over) + ")"
 
 
+def _waiting_note(pick: initiativechain.ChildPick) -> str:
+    """`` — waiting: b on a (in-progress); c on a (in-progress), d (no-folder)``:
+    each waiting child and the prerequisites it waits on, with their status; or
+    ``""``."""
+    if not pick.waiting:
+        return ""
+    parts: list[str] = []
+    for slug in pick.waiting:
+        on = [f"{w.prerequisite} ({w.status})" for w in pick.waiting_on if w.slug == slug]
+        parts.append(f"{slug} on {', '.join(on)}" if on else slug)
+    return " — waiting: " + "; ".join(parts)
+
+
 def _chain_end_line(parent: str, end: str, pick: initiativechain.ChildPick | None) -> str:
-    """The human line for a chain that ends: why, what still waits, what was
-    passed over."""
+    """The human line for a chain that ends: why, what still waits and on what,
+    what was passed over."""
     line = f"initiative chain {parent}: ends ({end})"
-    if pick is not None and pick.waiting:
-        line += f" — waiting: {', '.join(pick.waiting)}"
-    return line + ("" if pick is None else _passed_over_note(pick))
+    return line + ("" if pick is None else _waiting_note(pick) + _passed_over_note(pick))
 
 
 def _journal_chain_end(
@@ -4469,14 +4480,20 @@ def _journal_chain_end(
 ) -> None:
     """``initiative-chain-end`` in the finished run's journal. ``end`` is a
     :data:`initiativechain.ChainEnd`, ``stalled``, ``stop-requested``,
-    ``store-commit-failed`` or ``fault``."""
-    # S3c: name each waiting child's unmet prerequisite here.
+    ``max-stories``, ``store-commit-failed`` or ``fault``. Each prerequisite a
+    waiting child waits on is one row of three parallel lists: the child
+    (``waiting_child``), the prerequisite (``waiting_on``) and its status
+    (``waiting_on_status``, :func:`initiativechain.prerequisite_status`)."""
     extras = {} if error is None else {"error": error}
+    waits = () if pick is None else pick.waiting_on
     journal.append(
         "initiative-chain-end",
         parent=parent,
         end=end,
         waiting=[] if pick is None else list(pick.waiting),
+        waiting_child=[w.slug for w in waits],
+        waiting_on=[w.prerequisite for w in waits],
+        waiting_on_status=[w.status for w in waits],
         passed_over=[] if pick is None else [p.slug for p in pick.passed_over],
         passed_over_why=[] if pick is None else [p.why for p in pick.passed_over],
         **extras,
@@ -4505,11 +4522,15 @@ def _chain_stop_requested(finished: runsetup.ComposedRun) -> bool:
     """Whether a stop was asked of the finished run: a request still lodged
     (``runs.graceful_stop_requested``, what ``bmad-loop stop`` writes), or one the
     engine discarded because the run had nothing left to stop
-    (``stop-request-discarded``) — it was a fresh run, so the request was made
-    while it built and was meant for the chain."""
+    (``stop-request-discarded``) since it last started — fresh, or resumed
+    (``run-resume``), so the request was made while it built and was meant for
+    the chain. A discard before the last resume was a request the operator's
+    resume overrode (the engine discards one pending when it pauses, too)."""
     if runs.graceful_stop_requested(finished.run_dir):
         return True
-    return any(e.get("kind") == "stop-request-discarded" for e in finished.journal.entries())
+    entries = finished.journal.entries()
+    since = max((i for i, e in enumerate(entries) if e.get("kind") == "run-resume"), default=-1)
+    return any(e.get("kind") == "stop-request-discarded" for e in entries[since + 1 :])
 
 
 def _landed_a_ticket(state: RunState) -> bool:
@@ -4563,40 +4584,57 @@ def _close_drained_child(
     return None
 
 
+def _chain_budget(state: RunState) -> int | None:
+    """What is left of the chain's ``--max-stories`` after the child run ``state``:
+    its own cap (the budget left when it launched) less the units it dispatched,
+    counted as the engine counts against the cap (``Engine._dispatched_count``:
+    every task the run recorded). None when the chain has no cap."""
+    if state.max_stories is None:
+        return None
+    return state.max_stories - len(state.tasks)
+
+
 def _drive_initiative_chain(
     project: Path,
     paths: bmadconfig.ProjectPaths,
     pol,
-    args: argparse.Namespace,
     finished: runsetup.ComposedRun,
-    *,
-    spec_folder: str,
 ) -> int:
     """Build a parent initiative's children one run after another, after the run
-    ``finished`` (``paths`` are the parent's, as ``run`` loaded them). Goes on only
-    while the run just built finished (``RunState.finished``: not paused,
-    escalated, stopped or crashed), is a chained child run (``parent_initiative``
-    set) and replays nothing (``replay_of`` empty); otherwise returns 0 at once.
+    ``finished`` — launched by ``run`` or driven by a resume of a recorded run
+    (``resume``, ``resolve``, and the TUI gestures that spawn them). ``paths`` are
+    the parent's, as the caller loaded them; ``pol`` is the policy it loaded.
+    Goes on only while the run just built finished (``RunState.finished``: not
+    paused, escalated, stopped or crashed), is a chained child run
+    (``parent_initiative`` set, and not a sweep: a chained child's run-end sweep
+    carries the parent too) and replays nothing (``replay_of`` empty); otherwise
+    returns 0 at once.
 
     Per switch, in order: a stop asked of the finished run ends the chain
     (:func:`_chain_stop_requested`); a drained child is marked done
     (:func:`_close_drained_child`) so its dependents become ready; the next child
-    is picked (:func:`_chain_pick`); picking the child just built again when its
-    run landed no ticket ends the chain as ``stalled``, since another run would
-    do the same. The finished run's journal gets ``initiative-chain-next``
-    (``parent``, ``from_child``, ``to_child``, the passed-over slugs and why) or
-    ``initiative-chain-end`` (``parent``, ``end``, the waiting slugs); the next
-    run, once composed, ``initiative-chain`` (``parent``, ``previous_run``,
-    ``previous_child``). One line per switch is printed.
+    is picked (:func:`_chain_pick`); a spent ``--max-stories`` budget
+    (:func:`_chain_budget`) ends the chain as ``max-stories``; picking the child
+    just built again when its run landed no ticket ends it as ``stalled``, since
+    another run would do the same. The finished run's journal gets
+    ``initiative-chain-next`` (``parent``, ``from_child``, ``to_child``, the
+    passed-over slugs and why) or ``initiative-chain-end`` (``parent``, ``end``,
+    the waiting slugs and what each waits on); the next run, once composed,
+    ``initiative-chain`` (``parent``, ``previous_run``, ``previous_child``). One
+    line per switch is printed.
+
+    Each next run launches with no ``--run-id`` (it mints its own; ``run``'s names
+    the first child's run alone), the budget left as its ``--max-stories``, and
+    the finished run's spec folder. Like a fresh ``run`` it does not claim the
+    control window (``_claim_ctl_window``): that claim settles which of several
+    windows named for one run id drives it, and a new run id has none.
 
     Returns 0, 1 for a tree fault or a close that could not be committed, or the
     refusal rc of the next launch."""
-    # `--run-id` names the first child's run alone; each later run mints its own.
-    args = argparse.Namespace(**{**vars(args), "run_id": None})
     while True:
         state = finished.state
         parent = state.parent_initiative
-        if parent is None or state.replay_of or not state.finished:
+        if parent is None or state.run_type == "sweep" or state.replay_of or not state.finished:
             if parent is not None and not state.finished:
                 print(
                     f"initiative chain {parent}: stops at {state.initiative} — run "
@@ -4619,6 +4657,9 @@ def _drive_initiative_chain(
             return _chain_end(finished, parent, "fault", error=str(e))
         if pick.child is None:
             return _chain_end(finished, parent, pick.end or "", pick)
+        budget = _chain_budget(state)
+        if budget is not None and budget <= 0:
+            return _chain_end(finished, parent, "max-stories", pick)
         child = pick.child.slug
         if child == state.initiative and not _landed_a_ticket(state):
             return _chain_end(finished, parent, "stalled", pick)
@@ -4631,15 +4672,13 @@ def _drive_initiative_chain(
             passed_over_why=[p.why for p in pick.passed_over],
         )
         print(f"initiative chain {parent}: {state.initiative} -> {child}{_passed_over_note(pick)}")
-        # S3c: hold `--max-stories` across the chain (each run takes the full cap
-        # today) and claim the control window per run (`_claim_ctl_window`).
         launched = _launch_run(
             project,
             paths.with_initiative(child),
             pol,
-            args,
+            argparse.Namespace(run_id=None, epic=None, story=None, max_stories=budget),
             source=worksource.SOURCE_TICKETS,
-            spec_folder=spec_folder,
+            spec_folder=state.spec_folder,
             scope=tickets_source.EVERYTHING,
             parent_initiative=parent,
         )
@@ -6164,7 +6203,18 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return run_paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants, pause
+    return (
+        run_paths,
+        state,
+        pol,
+        journal,
+        new_digest,
+        profiles,
+        sweep_options,
+        plugin_grants,
+        pause,
+        paths,
+    )
 
 
 class _CtlLaunch:
@@ -6349,7 +6399,10 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
     """Resume a paused/interrupted run without holding its lock across execution.
 
     Also resolve's re-arm path, which never passes ``accept_baseline`` — its re-arm
-    (`runs.rearm_escalation`) already advances the baseline to HEAD."""
+    (`runs.rearm_escalation`) already advances the baseline to HEAD. Every path
+    that drives a recorded run's engine comes through here, so a chained child
+    resumed to finished continues its parent's chain here
+    (:func:`_drive_initiative_chain`)."""
     with state_lock(run_dir):
         # Cleanup removes the run under this same hold. A resume that resolved the
         # path before cleanup won must not let Journal/save_state recreate it after
@@ -6369,9 +6422,18 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
         if isinstance(prepared, int):
             return prepared
-        paths, state, pol, journal, new_digest, profiles, sweep_options, plugin_grants, pause = (
-            prepared
-        )
+        (
+            paths,
+            state,
+            pol,
+            journal,
+            new_digest,
+            profiles,
+            sweep_options,
+            plugin_grants,
+            pause,
+            loaded_paths,
+        ) = prepared
         _claim_ctl_window(project, run_dir, state)
 
     # Adapter construction and the engine lifetime are deliberately outside the
@@ -6432,11 +6494,11 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         raise
     summary = composed.engine.run()
     print(summary.render())
-    return (
-        ExitCode.FAILURE
-        if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None
-        else ExitCode.OK
-    )
+    if summary.crashed and sweep_options is not None and sweep_options.only_ids is not None:
+        return ExitCode.FAILURE
+    # A chained child resumed to finished goes on to its parent's next child, as
+    # after `run`; `loaded_paths` are the parent's, which `paths` were re-rooted from.
+    return _drive_initiative_chain(project, loaded_paths, pol, composed)
 
 
 def _restore_aborted_resume(

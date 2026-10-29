@@ -1210,7 +1210,8 @@ def test_initiative_chain_rows_alias_every_slug_and_keep_their_tokens():
     """The chain's three kinds name the parent and child initiatives as scalars and
     as lists: every slug aliases in the one `initiative` namespace (so the parent
     and `initiative-mark`'s `parent` read alike), the pass-over and end tokens and
-    the previous run id stay readable, and `error` is dropped.
+    the prerequisite statuses and the previous run id stay readable, and `error`
+    is dropped.
 
     Ablation: drop the kinds' alias rows and the scalars ship verbatim; drop their
     keylist rows and the slug lists do."""
@@ -1234,6 +1235,9 @@ def test_initiative_chain_rows_alias_every_slug_and_keep_their_tokens():
             "parent": parent,
             "end": "fault",
             "waiting": [billing],
+            "waiting_child": [billing],
+            "waiting_on": [auth],
+            "waiting_on_status": ["dropped"],
             "passed_over": [auth],
             "passed_over_why": ["no-folder"],
             "error": f"tickets.py fault: /home/acme/{auth}",
@@ -1254,6 +1258,8 @@ def test_initiative_chain_rows_alias_every_slug_and_keep_their_tokens():
     assert nxt["from_child"] == nxt["passed_over"][0] == link["previous_child"] == mark["slug"]
     assert nxt["to_child"] == end["waiting"][0] != nxt["from_child"]
     assert (nxt["passed_over_why"], end["passed_over_why"]) == (["drained"], ["no-folder"])
+    assert end["waiting_child"] == end["waiting"] and end["waiting_on"] == [nxt["from_child"]]
+    assert end["waiting_on_status"] == ["dropped"]
     assert (end["end"], link["previous_run"]) == ("fault", "20261028-000000-beef")
     assert "error" not in end and end["error_present"] is True
 

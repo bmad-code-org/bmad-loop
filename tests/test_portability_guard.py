@@ -603,11 +603,11 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # `diagnostics._JOURNAL_KIND_SCHEMAS`.
     "initiative-mark": frozenset({"before", "after", "outcome"}),
     # cli.py, the initiative chain: closed pass-over tokens (`no-folder`,
-    # `drained`), a closed chain-end token, and the previous run's id. The slugs
-    # are aliased or keylisted by `diagnostics`' kind-scoped tables; `error` is
-    # dropped by name.
+    # `drained`), a closed chain-end token, closed prerequisite-status tokens, and
+    # the previous run's id. The slugs are aliased or keylisted by `diagnostics`'
+    # kind-scoped tables; `error` is dropped by name.
     "initiative-chain-next": frozenset({"passed_over_why"}),
-    "initiative-chain-end": frozenset({"end", "passed_over_why"}),
+    "initiative-chain-end": frozenset({"end", "passed_over_why", "waiting_on_status"}),
     "initiative-chain": frozenset({"previous_run"}),
     # runs.py: whether the re-arm moved its restore latch onto the evacuated copy.
     # `patch` and `stashed_to` are dropped by name.

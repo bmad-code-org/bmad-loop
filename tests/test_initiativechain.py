@@ -3,7 +3,7 @@ builds next, and why the chain ends when none is taken."""
 
 from __future__ import annotations
 
-from bmad_loop.initiativechain import NO_FOLDER, PassedOver, next_child
+from bmad_loop.initiativechain import NO_FOLDER, PassedOver, WaitingOn, next_child
 from bmad_loop.ticketmodel import ChildInitiative, InitiativeEdge, ParentView
 
 
@@ -132,3 +132,30 @@ def test_probe_is_not_asked_about_a_folder_less_child():
     pick = next_child(_view(reports, billing), take)
 
     assert asked == ["billing"] and pick.child is billing
+
+
+def test_waiting_children_name_each_prerequisite_with_its_status():
+    """One row per prerequisite a waiting child waits on, in build order, whether
+    or not a child is taken: an initiative status, `open` for a folder with no status, `no-folder` for one
+    not created yet, and `?` for a slug the parent does not list."""
+    auth = _child("auth", ready=True, status="")
+    search = _child("search", status="dropped")
+    ledger = _child("ledger", ready=True, folder=None)
+    billing = _child(
+        "billing",
+        after=("auth", "search", "ledger"),
+        waiting_on=("auth", "search", "ledger"),
+    )
+    reports = _child("reports", status="in-progress", waiting_on=("billing", "gone"))
+
+    pick = next_child(_view(auth, search, ledger, billing, reports))
+
+    assert pick.child is auth
+    assert pick.waiting == ("billing", "reports")
+    assert pick.waiting_on == (
+        WaitingOn("billing", "auth", "open"),
+        WaitingOn("billing", "search", "dropped"),
+        WaitingOn("billing", "ledger", NO_FOLDER),
+        WaitingOn("reports", "billing", "in-progress"),
+        WaitingOn("reports", "gone", "?"),
+    )

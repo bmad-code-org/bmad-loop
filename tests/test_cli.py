@@ -10794,7 +10794,8 @@ def test_resume_crash_exit_is_failure_only_for_persisted_named_scope(
         runsetup,
         "compose_resume",
         # ComposedRun always carries a journal; DW-410's launch warning reads it.
-        lambda **_kwargs: types.SimpleNamespace(engine=engine, journal=None),
+        # And its state, which the initiative chain reads after the engine.
+        lambda **kwargs: types.SimpleNamespace(engine=engine, journal=None, state=kwargs["state"]),
     )
 
     assert cli._resume_paused_run(project.project, run_dir) == expected
@@ -16000,7 +16001,8 @@ def _chain_project(project, monkeypatch, capsys, outcomes):
     * ``drain`` — every ticket and epic of the run's child closed and committed,
       one task landed, the run finished;
     * ``idle`` — finished with nothing dispatched;
-    * ``pause`` — paused, so not finished;
+    * ``pause`` — paused, so not finished; ``pause-stop-discarded`` — paused, with
+      a stop request the engine discarded (its journal row);
     * ``stop-lodged`` / ``stop-discarded`` — ``drain``, with a stop request left in
       the run dir, or discarded by the engine (its journal row).
 
@@ -16033,7 +16035,7 @@ def _chain_project(project, monkeypatch, capsys, outcomes):
         def run(self):
             assert script, f"run {len(built)} of the chain was never scripted"
             outcome = script.pop(0)
-            if outcome == "pause":
+            if outcome.startswith("pause"):
                 self.state.record_pause("scripted pause", "ticket-tree", None)
             else:
                 self.state.finished = True
@@ -16048,7 +16050,7 @@ def _chain_project(project, monkeypatch, capsys, outcomes):
                 self.state.tasks["1.1"] = StoryTask("1.1", 0, Phase.DONE)
             if outcome == "stop-lodged":
                 (self.run_dir / runs.STOP_REQUEST_FILE).write_text("{}", encoding="utf-8")
-            if outcome == "stop-discarded":
+            if outcome in ("stop-discarded", "pause-stop-discarded"):
                 self.journal.append("stop-request-discarded")
             save_state(self.run_dir, self.state)
             return super().run()
@@ -16221,6 +16223,164 @@ def test_run_on_a_parent_stops_on_a_stop_request(project, monkeypatch, capsys, h
         {"kind": "initiative-chain-end", "end": "stop-requested"}
     ]
     assert not _initiative_status(project, CHAIN_AUTH)
+
+
+@pytest.mark.parametrize("paused", ["pause", "pause-stop-discarded"])
+def test_resume_of_a_paused_child_continues_the_chain(project, monkeypatch, capsys, paused):
+    """A child run that paused stops the chain; resumed to finished, it goes on as
+    after `run`: AUTH is closed, BILLING launches as a chained run of the parent,
+    and BILLING's run names the resumed run as the one before it. A stop request
+    the engine discarded as the run paused is not a stop of the resumed run.
+    Ablations (performed): drop the driver call from `_resume_paused_run` and
+    BILLING never launches; scan the whole journal for a discarded stop and the
+    chain ends `stop-requested` — each FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, [paused, "drain", "drain"])
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+    ((_, _, first),) = built
+    # the run's pid is this test process's own: read it as gone so resume proceeds
+    monkeypatch.setattr(runs, "engine_liveness", lambda _run_dir: "dead")
+    capsys.readouterr()
+
+    assert cli.main(["resume", "--project", str(project.project), first.name]) == 0
+
+    out = capsys.readouterr().out
+    assert [(s.initiative, s.parent_initiative) for _, s, _ in built] == [
+        (CHAIN_AUTH, CHAIN_PARENT),
+        (CHAIN_AUTH, CHAIN_PARENT),
+        (CHAIN_BILLING, CHAIN_PARENT),
+    ]
+    assert built[1][2] == first
+    second = built[2][2]
+    assert second != first
+    assert f"initiative chain {CHAIN_PARENT}: {CHAIN_AUTH} -> {CHAIN_BILLING}" in out
+    assert f"initiative chain {CHAIN_PARENT}: ends (all-done)" in out
+    assert [e["kind"] for e in _chain_rows(first)] == [
+        "initiative-mark",
+        "store-committed",
+        "initiative-chain-next",
+    ]
+    link = _chain_rows(second)[0]
+    assert _row(link, "parent", "previous_run", "previous_child") == {
+        "kind": "initiative-chain",
+        "parent": CHAIN_PARENT,
+        "previous_run": first.name,
+        "previous_child": CHAIN_AUTH,
+    }
+    assert _initiative_status(project, CHAIN_AUTH) and _initiative_status(project, CHAIN_BILLING)
+
+
+@pytest.mark.parametrize(
+    ("cap", "outcomes", "budgets", "end"),
+    [
+        (None, ["drain", "drain"], [None, None], "all-done"),
+        ("3", ["drain", "drain"], [3, 2], "all-done"),
+        ("1", ["drain"], [1], "max-stories"),
+    ],
+    ids=["no-cap", "budget-left", "budget-spent"],
+)
+def test_run_on_a_parent_holds_one_max_stories_across_the_chain(
+    project, monkeypatch, capsys, cap, outcomes, budgets, end
+):
+    """`--max-stories` caps the whole chain: each child launches with what the runs
+    before it left (its cap less the units it dispatched — one per scripted
+    drain), and a spent budget ends the chain `max-stories` once the drained
+    child is closed; no cap stays no cap. Ablation (performed): launch every child
+    with the finished run's own cap and BILLING's budget reads 3 — this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, outcomes)
+    flags = [] if cap is None else ["--max-stories", cap]
+
+    assert cli.main(["run", "--project", str(project.project), *flags]) == 0
+
+    assert [s.max_stories for _, s, _ in built] == budgets
+    rows = _chain_rows(built[-1][2])
+    assert [_row(e, "end") for e in rows if e["kind"] == "initiative-chain-end"] == [
+        {"kind": "initiative-chain-end", "end": end}
+    ]
+    assert f"initiative chain {CHAIN_PARENT}: ends ({end})" in capsys.readouterr().out
+    assert _initiative_status(project, CHAIN_AUTH)
+
+
+CHAIN_SEARCH, CHAIN_LEDGER = "initiative-search", "initiative-ledger"
+
+
+def test_run_on_a_parent_ends_naming_what_each_waiting_child_waits_on(project, monkeypatch, capsys):
+    """BILLING waits on AUTH, on SEARCH (dropped) and on LEDGER (declared, no
+    folder). Once AUTH drains and is closed, LEDGER is passed over and BILLING
+    still waits: the chain ends `waiting` — a dropped prerequisite included — and
+    both the journal row and the printed line name each unmet prerequisite with its
+    status. Ablation (performed): drop the waiting detail from the journal row and
+    the printed line and this FAILS."""
+    built = _chain_project(project, monkeypatch, capsys, ["drain"])
+    root = project.project
+    parent = v7_layout(root, initiative=CHAIN_PARENT).initiative_folder
+    (parent / "tickets" / "tickets.toml").write_text(
+        f'[[initiative]]\nid = 1\nslug = "{CHAIN_AUTH}"\ntitle = "Auth"\n\n'
+        f'[[initiative]]\nid = 2\nslug = "{CHAIN_BILLING}"\ntitle = "Billing"\n'
+        'after = [{ initiative = 1, needs = "auth live" }, '
+        '{ initiative = 3, needs = "search live" }, { initiative = 4, needs = "ledger" }]\n\n'
+        f'[[initiative]]\nid = 3\nslug = "{CHAIN_SEARCH}"\ntitle = "Search"\n\n'
+        f'[[initiative]]\nid = 4\nslug = "{CHAIN_LEDGER}"\ntitle = "Ledger"\n',
+        encoding="utf-8",
+    )
+    search = v7_layout(root, initiative=CHAIN_SEARCH)
+    write_ticket_tree(search, DEFAULT_TREE)
+    file = search.initiative_folder / f"{CHAIN_SEARCH}.md"
+    file.write_text(
+        file.read_text(encoding="utf-8").replace(
+            "parent: none\n", "parent: none\nstatus: dropped\n"
+        ),
+        encoding="utf-8",
+    )
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "billing waits on search and ledger")
+
+    assert cli.main(["run", "--project", str(root)]) == 0
+
+    ((_, state, run_dir),) = built
+    assert state.initiative == CHAIN_AUTH
+    end = _chain_rows(run_dir)[-1]
+    fields = ("end", "waiting", "waiting_child", "waiting_on", "waiting_on_status")
+    assert _row(end, *fields, "passed_over", "passed_over_why") == {
+        "kind": "initiative-chain-end",
+        "end": "waiting",
+        "waiting": [CHAIN_BILLING],
+        "waiting_child": [CHAIN_BILLING, CHAIN_BILLING],
+        "waiting_on": [CHAIN_SEARCH, CHAIN_LEDGER],
+        "waiting_on_status": ["dropped", "no-folder"],
+        "passed_over": [CHAIN_LEDGER],
+        "passed_over_why": ["no-folder"],
+    }
+    assert (
+        f"initiative chain {CHAIN_PARENT}: ends (waiting) — waiting: {CHAIN_BILLING} on "
+        f"{CHAIN_SEARCH} (dropped), {CHAIN_LEDGER} (no-folder) (passed over: "
+        f"{CHAIN_LEDGER} (no-folder))"
+    ) in capsys.readouterr().out
+
+
+def test_chain_driver_ignores_a_chained_childs_sweep(project, monkeypatch):
+    """A chained child's run-end sweep carries the parent too: resumed to finished,
+    it is not a child run, so the driver neither closes, picks nor launches.
+    Ablation (performed): drop the sweep condition and the driver goes on to its
+    stop check — this FAILS."""
+    from bmad_loop.model import RunState
+
+    state = RunState(
+        run_id="20990101-000000-0001",
+        project=str(project.project),
+        started_at="2099-01-01T00:00:00",
+        finished=True,
+        run_type="sweep",
+        initiative=CHAIN_AUTH,
+        parent_initiative=CHAIN_PARENT,
+    )
+
+    def refuse(*_a, **_k):
+        raise AssertionError("the chain went on after a sweep")
+
+    monkeypatch.setattr(cli, "_chain_stop_requested", refuse)
+    finished = types.SimpleNamespace(state=state)
+
+    assert cli._drive_initiative_chain(project.project, None, None, finished) == 0
 
 
 def test_initiative_chain_drained_reads_an_open_child_with_every_ticket_closed():

@@ -506,11 +506,17 @@ _JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
     # ship verbatim, `scrub_json` being the identity on a list of
     # identifier-shaped strings.
     "sweep-bundle-dwids-adopted": {"previous_dw_ids": "dw"},
-    # `cli._drive_initiative_chain`: child initiative slugs passed over, or still
-    # waiting on a prerequisite, aliased in the `initiative` namespace the
+    # `cli._drive_initiative_chain`: child initiative slugs passed over, still
+    # waiting on a prerequisite (`waiting`, and per prerequisite `waiting_child`),
+    # or waited on (`waiting_on`), aliased in the `initiative` namespace the
     # kind-scoped `parent`/`*_child` rows use.
     "initiative-chain-next": {"passed_over": "initiative"},
-    "initiative-chain-end": {"passed_over": "initiative", "waiting": "initiative"},
+    "initiative-chain-end": {
+        "passed_over": "initiative",
+        "waiting": "initiative",
+        "waiting_child": "initiative",
+        "waiting_on": "initiative",
+    },
 }
 _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-preflight-refused": frozenset({"tolerated"}),
@@ -621,11 +627,13 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # status/outcome tokens; `parent`/`slug` are kind-aliased, which runs first.
     "initiative-mark": frozenset({"before", "after", "outcome"}),
     # `cli._drive_initiative_chain`: `passed_over_why` holds closed pass-over
-    # tokens (`no-folder`, `drained`), `end` a closed chain-end token, and
-    # `previous_run` a run id; the slugs are kind-aliased or kind-keylisted, which
-    # runs first, and `error` is dropped by name.
+    # tokens (`no-folder`, `drained`), `end` a closed chain-end token,
+    # `waiting_on_status` closed prerequisite-status tokens (an initiative status,
+    # `open`, `no-folder`, `?`), and `previous_run` a run id; the slugs are
+    # kind-aliased or kind-keylisted, which runs first, and `error` is dropped by
+    # name.
     "initiative-chain-next": frozenset({"passed_over_why"}),
-    "initiative-chain-end": frozenset({"end", "passed_over_why"}),
+    "initiative-chain-end": frozenset({"end", "passed_over_why", "waiting_on_status"}),
     "initiative-chain": frozenset({"previous_run"}),
 }
 

@@ -43,12 +43,13 @@ A parent initiative, whose `tickets.toml` lists child initiatives in `[[initiati
 
 `bmad-loop run` on a parent builds its children one run at a time, taking the first child `next <parent>` lists as ready. It passes over a ready child that has no folder yet (`no-folder`) and one whose first pick finds nothing to dispatch (`drained`). Each child's run records the parent as `parent_initiative`. When a child's run finishes with every ticket done or dropped, bmad-loop writes `status: done` into the child's `<child>.md` before it picks the next child, so the children waiting on it become ready. Where the store is versioned, that write is committed as `chore(tickets): <child> done [bmad-loop <run>]`, in the code repo (T1) or in the store's own repository (T3/T4). One line per switch names the next child or why the chain ended. The chain ends when:
 
-- a child's run does not finish (paused, escalated, stopped or crashed). Resuming that run builds that child only.
+- a child's run does not finish (paused, escalated, stopped or crashed). Once `resume` or `resolve` (from the CLI or the TUI) drives that run to finished, the chain goes on to the next child as it does after `run`.
 - a stop was asked of the run.
+- the `--max-stories` budget is spent (`max-stories`).
 - it would build the same child again after a run that landed no ticket (`stalled`).
-- no child can start: some still wait on a prerequisite (`waiting`), every child left was passed over (`passed-over`), or every child is done or dropped (`all-done`).
+- no child can start: some still wait on a prerequisite (`waiting`), every child left was passed over (`passed-over`), or every child is done or dropped (`all-done`). A child waiting on a dropped prerequisite still counts as waiting. The end line names each waiting child's unmet prerequisites with their status, for example `initiative-billing on initiative-search (dropped), initiative-ledger (no-folder)`; `open` is a prerequisite whose file sets no status.
 
-`--epic` and `--story` select within one initiative, so `run` on a parent refuses them with exit 1. `--run-id` names the first child's run, and `--max-stories` applies to each child's run.
+`--epic` and `--story` select within one initiative, so `run` on a parent refuses them with exit 1. `--run-id` names the first child's run; each later child's run gets its own id. `--max-stories` caps the whole chain: each child's run starts with what the runs before it left, counting every ticket they dispatched.
 
 ## Store layouts
 

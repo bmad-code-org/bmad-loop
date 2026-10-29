@@ -1342,7 +1342,8 @@ def test_a_refused_resume_leaves_the_record_with_the_driving_window(
         engine["live"] = True  # the pid this child publishes under the lock
         # the resumed state: the sweep factory reads its parent initiative
         state = RunState(run_id="RID", project=str(tmp_path), started_at="now")
-        return (None, state, *(None,) * 6, PauseSnapshot(*(None,) * 5, False, False, None))
+        pause = PauseSnapshot(*(None,) * 5, False, False, None)
+        return (None, state, *(None,) * 6, pause, None)
 
     def compose(**_kwargs):
         raise Drove

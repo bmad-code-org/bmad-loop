@@ -16,7 +16,9 @@ why.
   and returns a reason to pass it over (``"drained"`` for a child with nothing
   left to dispatch), or None to take it.
 * Children that are not ready and not done or dropped are ``waiting`` on a
-  prerequisite (a folder-less one included).
+  prerequisite (a folder-less one included). ``waiting_on`` names, per waiting
+  child, each prerequisite it still waits on and that prerequisite's status
+  (:func:`prerequisite_status`).
 
 :func:`drained` says whether a child is open with every ticket closed — the child
 whose initiative a chain marks ``done`` before it picks again.
@@ -43,6 +45,12 @@ NO_FOLDER: Final = "no-folder"
 DRAINED: Final = "drained"
 """The pass-over reason for a ready child with nothing left to dispatch."""
 
+OPEN: Final = "open"
+"""A prerequisite's status when its folder exists and its file sets none."""
+
+UNLISTED: Final = "?"
+"""A prerequisite's status when the parent lists no such child."""
+
 _CLOSED: Final[frozenset[str]] = frozenset(("done", "dropped"))
 
 ChainEnd = Literal["waiting", "passed-over", "all-done"]
@@ -57,16 +65,29 @@ class PassedOver:
 
 
 @dataclass(frozen=True)
+class WaitingOn:
+    """One prerequisite a waiting child still waits on: the child, the
+    prerequisite, and the prerequisite's status (:func:`prerequisite_status`)."""
+
+    slug: str
+    prerequisite: str
+    status: str
+
+
+@dataclass(frozen=True)
 class ChildPick:
     """:func:`next_child`'s answer. ``child`` is the child to build, or None and
     ``end`` says why the chain ends. ``passed_over`` holds the ready children
     walked past before the pick (in build order); ``waiting`` the slugs of the
-    children still waiting on a prerequisite, whether or not one was taken."""
+    children still waiting on a prerequisite, whether or not one was taken, and
+    ``waiting_on`` one row per prerequisite each of them waits on, in the same
+    order."""
 
     child: ChildInitiative | None
     passed_over: tuple[PassedOver, ...]
     waiting: tuple[str, ...]
     end: ChainEnd | None
+    waiting_on: tuple[WaitingOn, ...] = ()
 
 
 def drained(child: ChildInitiative) -> bool:
@@ -80,6 +101,19 @@ def drained(child: ChildInitiative) -> bool:
     return total > 0 and closed == total
 
 
+def prerequisite_status(view: ParentView, slug: str) -> str:
+    """The status of the child ``slug`` of ``view`` as a prerequisite: its file's
+    status (``in-progress``, ``dropped``, ``done``), :data:`OPEN` when its folder
+    exists and the file sets none, :data:`NO_FOLDER` when it is declared but not
+    created yet, or :data:`UNLISTED` when the parent lists no such child."""
+    child = view.child(slug)
+    if child is None:
+        return UNLISTED
+    if child.folder is None:
+        return NO_FOLDER
+    return child.status or OPEN
+
+
 def next_child(
     view: ParentView,
     passes_over: Callable[[ChildInitiative], str | None] | None = None,
@@ -87,7 +121,11 @@ def next_child(
     """The first ready child of ``view`` that has a folder and that
     ``passes_over`` does not pass over, in build order (see the module
     docstring)."""
-    waiting = tuple(c.slug for c in view.initiatives if not c.ready and c.status not in _CLOSED)
+    blocked = [c for c in view.initiatives if not c.ready and c.status not in _CLOSED]
+    waiting = tuple(c.slug for c in blocked)
+    waiting_on = tuple(
+        WaitingOn(c.slug, p, prerequisite_status(view, p)) for c in blocked for p in c.waiting_on
+    )
     passed: list[PassedOver] = []
     for child in view.initiatives:
         if not child.ready:
@@ -96,7 +134,7 @@ def next_child(
         if why is None and passes_over is not None:
             why = passes_over(child)
         if why is None:
-            return ChildPick(child, tuple(passed), waiting, None)
+            return ChildPick(child, tuple(passed), waiting, None, waiting_on)
         passed.append(PassedOver(child.slug, why))
     end: ChainEnd = "waiting" if waiting else "passed-over" if passed else "all-done"
-    return ChildPick(None, tuple(passed), waiting, end)
+    return ChildPick(None, tuple(passed), waiting, end, waiting_on)
