@@ -1475,12 +1475,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # the next clean scan.
         scan_failures = 0
 
-        def sample_transcript(path: str, now: float) -> None:
+        def sample_transcript(path: str, now: float) -> bool:
             nonlocal transcript_work_seen, scan_failures
             same_path = idle.path == path
             prior_key = idle.last_key if same_path else None
             was_absent = idle.seen_absent if same_path else False
-            self._sample_transcript_idle(handle.task_id, path, idle, now)
+            sampled = self._sample_transcript_idle(handle.task_id, path, idle, now)
             current_key = idle.last_key
             # A same-size rewrite or truncation does not append a new record.
             # Scanning from byte zero in that case would credit an old assistant
@@ -1501,12 +1501,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             "transcript-scan-failed",
                             error=f"{type(e).__name__}: {e}",
                         )
-                    return
+                    return sampled
                 if scan_failures:
                     self._note_lifecycle(
                         handle.task_id, "transcript-scan-recovered", failures=scan_failures
                     )
                 scan_failures = 0
+            return sampled
 
         def try_resolve() -> None:
             """Resolve the transcript by session id when no readable one is known.
@@ -1783,12 +1784,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # Transcript idle sample (#680), ahead of the heartbeat write so
                 # the payload carries this tick's age. Inert until a hook event
                 # has named the transcript.
+                sampled = False
                 if transcript_path:
-                    sample_transcript(transcript_path, now)
-                if notice.open and idle.last_key is not None:
+                    sampled = sample_transcript(transcript_path, now)
+                if notice.open and sampled:
                     # The live parked notice (#855) closes on this sample, not
                     # on pane growth: the auto-deny countdown repaints the pane
-                    # every second while the prompt waits.
+                    # every second while the prompt waits. Only a stat taken
+                    # this tick counts: after a failed one `idle.last_key` is
+                    # an older sample, which can predate the latch and so
+                    # differ from its key while the prompt still waits.
                     if notice.baseline is None:
                         notice.baseline = idle.last_key
                     elif idle.last_key != notice.baseline:
@@ -2627,12 +2632,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def _sample_transcript_idle(
         self, task_id: str, transcript_path: str, idle: _IdleTracker, now: float
-    ) -> None:
+    ) -> bool:
         """One heartbeat-cadence sample of the #680 idle detector: advance `idle`
         from the transcript's current stat key and journal the stretch boundaries.
 
+        True when this tick's stat yielded a key, so `idle.last_key` is current.
         A None key (not yet created, torn by a rename, unreadable) skips the tick
-        and leaves the stretch as it was — `_sample_weighted_usage`'s tolerance,
+        (False) and leaves the stretch as it was — `_sample_weighted_usage`'s tolerance,
         for a stat — but remembers that the named path was absent, so the file's
         later appearance is a change, not the baseline. A key that moved closes any open stretch with one
         `session-active` carrying the stretch's full length; a key that has not
@@ -2693,7 +2699,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if key is None:
             if idle.last_key is None:
                 idle.seen_absent = True
-            return
+            return False
         sub = self._sample_subagent_tree(task_id, transcript_path, idle)
         sub_moved = sub is not None and idle.sub_key is not None and sub != idle.sub_key
         if sub is not None:
@@ -2729,6 +2735,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 pass
             else:
                 idle.open_since = idle.last_change_wall
+        return True
 
     def _note_session_start_missing(self, handle: SessionHandle, waited_s: float) -> bool:
         """Journal one `session-start-missing` (`task_id`, `waited_s`, `grace_s`,

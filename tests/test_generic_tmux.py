@@ -12751,6 +12751,51 @@ def test_an_unmoved_permission_latch_still_parks_the_stall(tmp_path, monkeypatch
     assert _stall_nudges(mux) == []
 
 
+def test_a_failed_transcript_stat_leaves_the_permission_latch(tmp_path, monkeypatch):
+    """The transcript grows between its first sample and the latch, then cannot
+    be stat'ed: `idle.last_key` is still the pre-latch sample, which differs
+    from the latch's key though the prompt still waits. A failed stat is no
+    sample, so the notice stays open, the latch stays set, and the stall gate
+    withholds the nudge and ends the session `stalled` + `parked`.
+
+    ABLATION: compare `idle.last_key` without the `sampled` gate and the notice
+    closes on `activity`, the latch goes with it and both nudges are sent."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 40.0
+    adapter._stall_nudges = 2
+    adapter._window_alive = lambda handle: True
+    adapter.journal = _FakeJournal()
+    clock = _frozen_stall_clock(monkeypatch)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+
+    class _Watcher:
+        calls = 0
+
+        def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
+            self.calls += 1
+            if self.calls == 1:  # names the transcript: its first sample
+                return _hook_event("SessionStart", transcript_path=str(transcript))
+            if self.calls == 2:
+                _grow(transcript, b'{"type":"assistant"}\n')
+                return _hook_event(
+                    "Notification", "permission_prompt", transcript_path=str(transcript)
+                )
+            if self.calls == 3:
+                transcript.unlink()
+            clock["t"] += 11.0
+            return None
+
+    adapter.watcher = _Watcher()
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["ended"]
+    assert (result.status, result.parked) == ("stalled", True)
+    assert _stall_nudges(mux) == []
+
+
 def test_capture_pane_argv_reads_the_visible_screen(monkeypatch, force_tmux_backend):
     """`capture-pane -p -t <window>`: the visible screen to stdout, no `-S`/`-E`
     scrollback range — the question is what is on screen NOW (DW-350)."""
