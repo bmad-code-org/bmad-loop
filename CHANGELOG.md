@@ -212,6 +212,11 @@ breaking changes may land in a minor release.
   closes for unlanded code; a new sweep warns while such a run exists (DW-571).
 - Pass `--allow-all-urls` in copilot's `bypass_args` so unattended sessions fetch URLs
   without a permission prompt; this changes the copilot default config digest (DW-598).
+- Build a parent initiative's children one run each when `run` targets a parent (was
+  exit 1). Require worktree isolation without the auto retrospective; pause each child
+  at its epic boundaries; close drained children (`status: done`) before every pick;
+  spend one `--max-stories` budget across the chain. Show the chain in `run --dry-run`
+  and the TUI start-run preview, and a chained run's child on its tickets board (DW-574).
 
 ### Removed
 

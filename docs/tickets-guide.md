@@ -53,7 +53,13 @@ Closing a child writes `status: done` into its `<child>.md`. It happens before e
 
 Where the store is versioned, a close is committed as `chore(tickets): <child> done [bmad-loop <run>]` (`[bmad-loop chain <parent>]` for a close before the first child's run), in the code repo (T1) or in the store's own repository (T3/T4). A close that cannot be committed ends the chain (`store-commit-failed`, exit 1).
 
-`--epic` and `--story` select within one initiative, so `run` on a parent refuses them with exit 1. `--run-id` names the first child's run; each later child's run gets its own id. `--max-stories` caps the whole chain: each child's run starts with what the runs before it left, counting every ticket they dispatched.
+Each child's run pauses at `epic-boundary` after every epic it finishes, as a one-initiative run does, and no policy key skips that pause. Close the epic with bmad-agent-po and commit it (see [closure](#epic-retrospective-and-closure)), then `bmad-loop resume <run-id>`. The resume goes on with that child, and once its run finishes the chain goes on to the next child.
+
+`--epic` and `--story` select within one initiative, so `run` on a parent, and its dry run, refuse them with exit 1. `--run-id` names the first child's run; each later child's run gets its own id. `--max-stories` caps the whole chain: each child's run starts with what the runs before it left, counting every ticket they dispatched.
+
+`bmad-loop run --dry-run` on a parent writes nothing. It lists the children in build order, each with its status, closed and total tickets, the prerequisites it waits on and a tag (`next`, `ready`, `ready, passed over (<why>)`, `waiting`, `no folder`, `drained (the run closes it first)`, `done` or `dropped`). It then prints the `next` child's dry run, read through that child's folder, and ends `predicted: chain starts with <child>; later children are chosen as each finishes`, or with the end line `run` prints when no child can start. It closes no drained child; the predicted line names those the run closes before its first pick. Its `--max-stories` caps the first child's listing only, and its banner warns when the preflight would refuse the parent.
+
+The TUI's start-run preview lists the same children and shows the board of the first ready child that has a folder and is not drained; `run --dry-run` names the exact first pick. A chained child run's [tickets board](tui-guide.md#tickets-board-middle-tickets-mode) shows that child's tickets.
 
 ## Store layouts
 

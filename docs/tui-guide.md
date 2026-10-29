@@ -164,6 +164,11 @@ ticket: state glyph and label, the ref, the epic folder, a three-slot flags cell
 and the title. The state is the plan's status when the ticket has a plan, else
 `planned` (or `refine` when it must be refined first).
 
+A run that builds one child of a parent initiative shows that child's tickets,
+read as `bmad-loop status` reads them: through the child's folder, with the tree
+pinned to the parent that `[core] active_initiative` names. A config that no
+longer names the parent shows as the board's fault.
+
 `tickets.py` is the project's own code, so the board reads it on the poll worker,
 never the UI thread. It runs again only when a `tickets.toml` or `.md` file in the
 initiative tree (its `tickets/` folders and epic folders, in either layout), the
@@ -393,8 +398,15 @@ To return to the default proportions, delete the `[tui]` size keys from
 - **source**: `sprint mode` (walks `sprint-status.yaml`), `stories mode`
   (folder-and-id dispatch) or `tickets mode` (the BMAD v7 ticket tree),
   prefilled from `[stories]`. Tickets mode previews the active initiative: its
-  ticket counts and the refs that pause on hitl or a checkpoint. A tickets pick
-  launches only while `[stories] source = "tickets"`. Under that policy a
+  ticket counts and the refs that pause on hitl or a checkpoint. On a parent
+  initiative it lists the children in build order, each with its status, closed
+  and total tickets, what it waits on and a tag (`first ready`, `ready`,
+  `waiting`, `no folder`, `drained`, `done` or `dropped`), then the counts and
+  checkpoint refs of the `first ready` child (the first ready child that has a
+  folder and is not drained), or why no child can start. The run's pick also
+  passes over a ready child with nothing to dispatch, so `run --dry-run` names
+  the child a run builds first. A
+  tickets pick launches only while `[stories] source = "tickets"`. Under that policy a
   stories pick still launches (its `--spec` overrides the policy source); a
   sprint pick does not.
 - **spec folder**: stories mode only. The epic spec folder holding
