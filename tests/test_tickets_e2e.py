@@ -33,8 +33,11 @@ tracker store and (13) a workspace layout (T5), and (14) a worktree-isolated `sw
 over a shared store (T2–T4): its bundle plan and ledger close committed in the store
 repository, or `store-unversioned` for T2, (15) a parent initiative built as a chain
 of child runs under worktree isolation, each unit mount's own config naming its
-child, the drained child closed and committed before the next child's run, and
-(16) the same parent refused at preflight under `isolation = "none"`. Rows 7–9 run
+child, the drained child closed and committed before the next child's run, (16)
+the same parent refused at preflight under `isolation = "none"`, and (17) that
+chain's first epic boundary closed through `resolve`, the fake standing in for
+bmad-agent-po (its `/bmad-agent-po` prompt flips and commits the epic file the
+prompt names, or leaves it open on a run-dir `.no-close` marker). Rows 7–9 run
 over T1 and T3. A run that finishes an epic it committed a ticket of always ends
 paused at `epic-boundary` for a person to close the epic.
 
@@ -99,6 +102,25 @@ PY=@PY@
 INIT=@INIT@
 rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"; ref="$BMAD_LOOP_STORY_KEY"
 prompt="${1:-}"
+
+# The epic-close resolve (`/bmad-agent-po`): an attached interactive session, not
+# an engine window, so no hook events and no task dir. Record the argv and cwd in
+# the run dir, then close the epic file the prompt names (`status: done`) and
+# commit it in the repo the prompt names — unless a `.no-close` marker in the run
+# dir says to leave it open.
+case "$prompt" in
+    /bmad-agent-po*)
+        printf '%s\n' "$0" "$@" > "$rd/fake-epic-close-argv.txt"
+        printf '%s' "$PWD" > "$rd/fake-epic-close-cwd.txt"
+        [ -f "$rd/.no-close" ] && exit 0
+        epic=$(printf '%s' "$prompt" | sed -n 's/.*Epic file: \([^ ]*\)\. .*/\1/p')
+        repo=$(printf '%s' "$prompt" | sed -n 's/.*commit the epic file in the \(store \)\{0,1\}repo at \([^ ]*\)\. .*/\2/p')
+        sed -i 's/^status: in-progress/status: done/' "$epic"
+        git -C "$repo" add -- "$epic"
+        git -C "$repo" commit -q -m "close epic"
+        exit 0 ;;
+esac
+
 ts=$(date +%s%N)
 ed="$BMAD_LOOP_EVENTS_DIR"
 td="$rd/tasks/$tid"
@@ -1196,4 +1218,80 @@ def test_e2e_tickets_parent_initiative_refused_without_isolation(project_v7):
     assert '`[scm] isolation = "none"`' in proc.stderr, proc.stderr
     assert not (root / ".bmad-loop" / "runs").exists()
     assert "tickets.initiative-parent" in _validate_problems(root)
+    assert _clean(root)
+
+
+def test_e2e_tickets_epic_close_resolve(project_v7):
+    """The chain row's epic boundary answered by `resolve` instead of by hand: the
+    fake stands in for bmad-agent-po, launched attached through the dev profile's
+    interactive argv with the epic-close prompt. With a run-dir `.no-close` marker it leaves
+    A's epic open, so `resolve --resume` exits 1 with the run still paused at A's
+    boundary and `epic-close-unverified` journaled; without it the fake closes and
+    commits A's epic file, the verify passes, and the resumed run closes A and
+    chains on until B pauses at its own boundary. Ablation: make
+    `_epic_close_check` report nothing missing and the `.no-close` resolve resumes
+    the run (exit 0)."""
+    layout = _scaffold(
+        project_v7,
+        _epic(EntrySpec(1, "Cart model")),
+        isolation="worktree",
+        children=(CHILD_A, CHILD_B),
+    )
+    root = layout.project
+    auth = _child(layout, CHILD_A)
+    skill = root / ".claude" / "skills" / "bmad-agent-po" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bmad-agent-po\n---\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "po skill")
+
+    _ok(_run(root, "run"))
+
+    (auth_run,) = _runs_by_initiative(root).values()
+    _assert_ended_at_epic_boundary(_status_doc(root, auth_run))
+
+    # In the (ignored) run dir, so the checkout stays clean and only the verify
+    # stands between this resolve and a resume.
+    (auth_run / ".no-close").write_text("", encoding="utf-8")
+    proc = _run(root, "resolve", auth_run.name, "--resume")
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert f"epic {EPIC}: the epic reads in-progress" in proc.stderr, proc.stderr
+    doc = _status_doc(root, auth_run)
+    _assert_ended_at_epic_boundary(doc)
+    assert (doc["paused_story_key"], doc["tickets"]["initiative"]) == (EPIC, CHILD_A), doc
+    assert list(_runs_by_initiative(root)) == [CHILD_A]
+    (unverified,) = _run_journal(auth_run, "epic-close-unverified")
+    assert unverified["epic_ref"] == EPIC, unverified
+    assert _run_journal(auth_run, "epic-close-verified") == []
+
+    (auth_run / ".no-close").unlink()
+    _ok(_run(root, "resolve", auth_run.name, "--resume"))
+
+    argv = (auth_run / "fake-epic-close-argv.txt").read_text(encoding="utf-8").splitlines()
+    fake = root / ".bmad-loop" / "fake-build-auto.sh"
+    assert len(argv) == 2 and argv[0] == str(fake), argv  # the profile binary; one arg, the prompt
+    epic_file = (_epic_dir(auth) / f"{EPIC}.md").resolve()
+    assert argv[1].startswith(f"/bmad-agent-po Run your epic closure check for epic {EPIC}")
+    assert f"Epic file: {epic_file.as_posix()}." in argv[1], argv[1]
+    assert f"{CHILD_A} is a child of parent {PARENT}" in argv[1], argv[1]
+    cwd = Path((auth_run / "fake-epic-close-cwd.txt").read_text(encoding="utf-8"))
+    assert cwd.resolve() == root.resolve(), cwd
+    epic_rel = epic_file.relative_to(root.resolve()).as_posix()
+    assert _git(root, "log", "--format=%s", "--", epic_rel).splitlines()[0] == "close epic"
+    for kind, count in (("epic-close-session-start", 2), ("epic-close-session-end", 2)):
+        rows = _run_journal(auth_run, kind)
+        assert [row["epic_ref"] for row in rows] == [EPIC] * count, rows
+    assert [row["rc"] for row in _run_journal(auth_run, "epic-close-session-end")] == [0, 0]
+    (verified,) = _run_journal(auth_run, "epic-close-verified")
+    assert (verified["epic_ref"], verified["status"]) == (EPIC, "done"), verified
+    (nxt,) = _run_journal(auth_run, "initiative-chain-next")
+    assert (nxt["from_child"], nxt["to_child"]) == (CHILD_A, CHILD_B), nxt
+
+    runs = _runs_by_initiative(root)
+    assert sorted(runs) == [CHILD_A, CHILD_B]
+    doc = _status_doc(root, runs[CHILD_B])
+    _assert_ended_at_epic_boundary(doc)
+    assert doc["tickets"]["initiative"] == CHILD_B
+    assert _git(root, "worktree", "list", "--porcelain").count("worktree ") == 1
     assert _clean(root)

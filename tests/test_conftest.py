@@ -1693,7 +1693,7 @@ _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
         # `test_reap_identity_*`, `test_recorded_*`.
         _OTHER_DEFS: 28,
     },
-    "test_tickets_e2e.py": {"test_e2e_tickets_": 16},
+    "test_tickets_e2e.py": {"test_e2e_tickets_": 17},
     "test_conftest.py": {"test_private_tmux_": 1},
 }
 
