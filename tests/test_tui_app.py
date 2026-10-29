@@ -3333,6 +3333,55 @@ async def test_start_run_modal_drops_a_superseded_tickets_preview(project, monke
         assert "init-stale" not in str(body.render())
 
 
+async def test_start_run_modal_previews_a_parent_initiative(project, monkeypatch):
+    """On a parent active initiative the tickets preview lists the children in
+    build order with their tags and what each waits on, then the first ready
+    child's board, and points at `run --dry-run` for the exact chain. Canned
+    board: nothing here runs tickets.py.
+
+    Ablation (performed): drop the `board.parent` branch in
+    `_show_tickets_preview` and no child line renders — this FAILS."""
+    from bmad_loop.initiativechain import WaitingOn
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(BmadLoopApp, "_stories_defaults", lambda self: ("tickets", ""))
+    children = (
+        data.ChainChild("initiative-auth", "open", 1, 4, "first ready", ()),
+        data.ChainChild(
+            "initiative-billing",
+            "open",
+            0,
+            4,
+            "waiting",
+            (WaitingOn("initiative-billing", "initiative-auth", "open"),),
+        ),
+    )
+    board = data.TicketsBoard(
+        (ticket_row("1.1", status="done"), ticket_row("1.2", plan_checkpoint=True)),
+        None,
+        "initiative-auth",
+        parent="initiative-platform",
+        children=children,
+    )
+    monkeypatch.setattr(data, "project_tickets_overview", lambda proj: board)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        body = app.screen.query_one("#preview-body", Static)
+        await until(pilot, lambda: "parent initiative initiative-platform" in str(body.render()))
+        rendered = str(body.render())
+        assert "2 children in build order" in rendered
+        assert "1. initiative-auth  (open; 1 of 4 tickets closed)  [first ready]" in rendered
+        assert "2. initiative-billing  (open; 0 of 4 tickets closed)  [waiting]" in rendered
+        assert "waits on: initiative-auth (open)" in rendered
+        assert "first ready: initiative-auth · 2 tickets" in rendered
+        assert "plan checkpoint: 1.2" in rendered
+        assert "run --dry-run prints the exact chain prediction" in rendered
+
+
 async def test_start_run_modal_epic_text_validation_per_mode(project, monkeypatch):
     """The epic input is text: outside tickets mode it must still be a number
     (`run --epic` exits 2 on anything else there), so a slug keeps the modal open

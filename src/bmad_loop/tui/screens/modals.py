@@ -180,6 +180,60 @@ class BaseDialog(ModalScreen):
         self.dismiss(None)
 
 
+def _append_board(text: Text, board: data.TicketsBoard) -> None:
+    """A tickets preview's body under its header: the counts by derived state,
+    then the open tickets that pause a run (hitl, plan and done checkpoints)."""
+    counts: dict[str, int] = {}
+    for row in board.rows:
+        counts[row.state] = counts.get(row.state, 0) + 1
+    if counts:
+        text.append("\n  " + " · ".join(f"{n} {state}" for state, n in counts.items()))
+    flagged = [r for r in board.rows if r.state not in ("done", "dropped")]
+    for label, pick in (
+        ("hitl", lambda r: r.hitl),
+        ("plan checkpoint", lambda r: r.plan_checkpoint),
+        ("done checkpoint", lambda r: r.done_checkpoint),
+    ):
+        refs = [tickets_source.row_label(r) for r in flagged if pick(r)]
+        if refs:
+            text.append(f"\n  {label}: {', '.join(refs)}", style="magenta")
+
+
+def _chain_preview(board: data.TicketsBoard) -> Text:
+    """The tickets preview of a parent initiative (:func:`data.project_tickets_overview`):
+    one line per child in build order with its status, ticket counts, tag and what
+    it waits on, then the board of the first ready child, or why no child can
+    start, or the fault that kept the children or that board from being read."""
+    text = Text()
+    text.append(
+        f"parent initiative {board.parent} · {len(board.children)} children in build order",
+        style="bold",
+    )
+    for position, child in enumerate(board.children, 1):
+        status = child.status
+        if child.total:
+            status += f"; {child.closed} of {child.total} tickets closed"
+        text.append(f"\n  {position}. {child.slug}  ({status})  ")
+        text.append(f"[{child.tag}]", style="cyan" if child.tag == "first ready" else "magenta")
+        if child.waiting_on:
+            waits = ", ".join(f"{w.prerequisite} ({w.status})" for w in child.waiting_on)
+            text.append(f"  waits on: {waits}", style="dim")
+    if board.fault is not None:
+        text.append(f"\n⚠ tickets board unavailable: {board.fault}", style="red")
+        return text
+    if board.chain_end is not None:
+        text.append(f"\nno child can start ({board.chain_end})", style="yellow")
+    else:
+        text.append(f"\nfirst ready: {board.initiative} · {len(board.rows)} tickets", style="bold")
+        _append_board(text, board)
+    text.append(
+        "\n  first ready skips drained children only — "
+        "run --dry-run prints the exact chain prediction",
+        style="dim",
+    )
+    return text
+
+
 class StartRunModal(BaseDialog):
     """Options for `bmad-loop run`.
 
@@ -189,8 +243,9 @@ class StartRunModal(BaseDialog):
     present) and lists the linear schedule with independent spec/done checkpoint
     markers — the same projection `run --dry-run` prints. In tickets mode the
     preview is the active initiative's board (:func:`data.project_tickets_overview`),
-    read on a worker thread because it runs the project's ``tickets.py``. The
-    epic input is a number, or in tickets mode an epic id or slug
+    read on a worker thread because it runs the project's ``tickets.py``; on a
+    parent initiative it lists the children and the first ready one's board
+    (:func:`_chain_preview`). The epic input is a number, or in tickets mode an epic id or slug
     (:func:`epic_selector`). Returns
     ``{source, spec_folder, epic, story, max_stories, dry_run}``."""
 
@@ -330,25 +385,15 @@ class StartRunModal(BaseDialog):
             return  # dismissed while the read was in flight
         if source != worksource.SOURCE_TICKETS:
             return  # the picker moved on; that source's preview stands
+        if board.parent:
+            body.update(_chain_preview(board))
+            return
         if board.fault is not None:
             body.update(Text(f"⚠ tickets board unavailable: {board.fault}", style="red"))
             return
-        counts: dict[str, int] = {}
-        for row in board.rows:
-            counts[row.state] = counts.get(row.state, 0) + 1
         text = Text()
         text.append(f"initiative {board.initiative} · {len(board.rows)} tickets", style="bold")
-        if counts:
-            text.append("\n  " + " · ".join(f"{n} {state}" for state, n in counts.items()))
-        flagged = [r for r in board.rows if r.state not in ("done", "dropped")]
-        for label, pick in (
-            ("hitl", lambda r: r.hitl),
-            ("plan checkpoint", lambda r: r.plan_checkpoint),
-            ("done checkpoint", lambda r: r.done_checkpoint),
-        ):
-            refs = [tickets_source.row_label(r) for r in flagged if pick(r)]
-            if refs:
-                text.append(f"\n  {label}: {', '.join(refs)}", style="magenta")
+        _append_board(text, board)
         text.append("\n  dry run prints the build order and the first pause", style="dim")
         body.update(text)
 
