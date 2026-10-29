@@ -50,7 +50,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Description:** An opt-in third story source for BMAD v7 projects. It drives the same pipeline from the active initiative's ticket tree through the project's own `tickets.py`, dispatching each ticket as `/<dev skill> ticket <ref>` in initiative build order, and, under the default `mark_done`, marks a verified ticket `done` itself.
 - **Properties:**
   - A run is pinned to `[core] active_initiative` at start; a changed initiative pauses the run at `ticket-tree` instead of building another initiative's ticket.
-  - The tree is read in the layout the installed `tickets.py` uses: a `tickets/` folder inside each initiative and epic, or the preview-era flat layout. A parent initiative is refused (`tickets.initiative-parent`), and an epic declared but not sliced yet holds no tickets.
+  - The tree is read in the layout the installed `tickets.py` uses: a `tickets/` folder inside each initiative and epic, or the preview-era flat layout. A parent initiative passes the preflight only under worktree isolation without `gates.retrospective = "auto"`, with the store checks run for each sliced child (`tickets.initiative-parent`), and an epic declared but not sliced yet holds no tickets.
   - A hitl ticket pauses at `ticket-hitl` and a ticket that needs refining at `ticket-refine`, both before any session runs for it.
   - bmad-loop writes a plan's `status` and `blocked_*` only through `tickets.py mark`, under a lock, read back afterwards and checked against one plan transition table; it never writes `dropped` or an epic file.
   - Tickets this run did not start are never dispatched or marked.

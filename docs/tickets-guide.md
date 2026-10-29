@@ -9,7 +9,7 @@ Tickets mode is **experimental**. It is built and tested against BMAD-METHOD mai
 1. **Install BMAD v7 and bmad-loop.** Follow [Installing on BMAD v7](setup-guide.md#installing-on-bmad-v7-bmad-setup): `npx skills add bmad-code-org/bmad-loop`, then `/bmad setup bmad-loop`, then `/bmad-loop-setup`. The module record requires `bmad` and `bmad-build-auto` at 6.13.0 or newer and recommends `bmad-agent-po` and `bmad-retrospective`, which tickets mode uses.
 2. **Plan the tree with Sofia.** Talk to Sofia, the Product Owner agent (`bmad-agent-po`): she creates the initiative, slices it into epics and stories, writes and refines the tickets, and readies them. She also replans mid-flight and runs the epic closure check. On v7 she replaces `bmad-spec`, `bmad-ticket` and `bmad-correct-course`.
 3. **Select the source.** Set `[stories] source = "tickets"` in `.bmad-loop/policy.toml`.
-4. **Pick an initiative.** `[core] active_initiative` in `_bmad/custom/config.user.toml` must name an initiative whose folder exists, and not a parent initiative. Sofia records the initiative she creates there, and the `bmad` skill shows, switches, creates or clears it, so you rarely edit the file by hand.
+4. **Pick an initiative.** `[core] active_initiative` in `_bmad/custom/config.user.toml` must name an initiative whose folder exists. A parent initiative passes the preflight only under `[scm] isolation = "worktree"` without `gates.retrospective = "auto"`. Sofia records the initiative she creates there, and the `bmad` skill shows, switches, creates or clears it, so you rarely edit the file by hand.
 5. **Use a repo store.** With no `_bmad/custom/ticketing-store-config.toml` the store is the repo store. Sofia writes that file only when you connect a tracker or switch stores, and it must then say `store = "repo"`: tracker stores are refused.
 6. **Check it.** Run `bmad-loop validate --probes`. Every `run` repeats the same `tickets.*` preflight and refuses on any problem.
 
@@ -19,7 +19,7 @@ Tickets mode is **experimental**. It is built and tested against BMAD-METHOD mai
 | `tickets.config-utils-missing`                           | `_bmad/scripts/config_utils.py` exists; `tickets.py` loads it.                                         |
 | `tickets.uv-missing`                                     | `uv` is on `PATH`. build-auto runs `tickets.py` with `uv run`.                                         |
 | `tickets.initiative-unset`, `tickets.initiative-missing` | `active_initiative` is set and its folder exists.                                                      |
-| `tickets.initiative-parent`                              | the active initiative is no parent initiative: a run builds one child at a time.                       |
+| `tickets.initiative-parent`                              | the active initiative is no parent, unless worktree isolation runs without the auto retrospective.     |
 | `tickets.store-not-repo`                                 | the store is a repo store, not a tracker.                                                              |
 | `tickets.store-topology` and its siblings                | the store layout is one tickets runs can drive (see [Store layouts](#store-layouts)).                  |
 | `tickets.branch-per-run`                                 | a warning: `[scm] branch_per = "run"` puts every ticket on one branch.                                 |
@@ -39,7 +39,7 @@ An initiative folder holds its own `<initiative>.md` and, in a `tickets/` folder
 
 bmad-loop reads each folder the way the installed `tickets.py` does: a folder with a `tickets/` folder inside it is read there, and any other folder is read as the preview-era flat layout. A preview-era tree therefore still runs with the preview-era `tickets.py` it was installed with. The current `tickets.py` refuses that layout; `bmad migrate method` moves the tree into `tickets/` folders.
 
-A parent initiative, whose `tickets.toml` lists child initiatives in `[[initiative]]` tables, is refused (`tickets.initiative-parent`): set `active_initiative` to one child. An epic the initiative declares but has not sliced yet has no folder; it holds no tickets, and the tickets gated after it wait for it.
+A parent initiative, whose `tickets.toml` lists child initiatives in `[[initiative]]` tables, holds no tickets of its own, and each child's folder sits beside the parent's. The preflight refuses a parent (`tickets.initiative-parent`) under `[scm] isolation = "none"`, because sessions in the main checkout read the parent from `config.user.toml`, and under `gates.retrospective = "auto"`, whose session also runs in the main checkout. Set `active_initiative` to one child, or switch to worktree isolation without the auto retrospective. There the parent is an ok line naming its children, and the store checks run once for each child that has a folder: a child declared but not sliced yet is skipped. Each child is held to the `config.user.toml` rule of a shared store whatever its layout (`tickets.own-repo-isolation`). An epic the initiative declares but has not sliced yet has no folder; it holds no tickets, and the tickets gated after it wait for it.
 
 ## Store layouts
 

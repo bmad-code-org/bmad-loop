@@ -12018,14 +12018,15 @@ def _tickets_paths(layout):
     return bmadconfig.load_paths(layout.project, want_tickets=True)
 
 
-def _tickets_findings(layout, monkeypatch, *, probe=False, uv="/usr/bin/uv"):
+def _tickets_findings(layout, monkeypatch, *, probe=False, uv="/usr/bin/uv", **kwargs):
     """`tickets_preflight` on ``layout`` with uv pinned present (or absent with
-    ``uv=None``) — the host's PATH must not decide a project check."""
+    ``uv=None``) — the host's PATH must not decide a project check. ``kwargs`` go
+    to the preflight."""
     monkeypatch.setattr(
         install_mod.shutil, "which", lambda tool: uv if tool == "uv" else f"/usr/bin/{tool}"
     )
     return install_mod.tickets_preflight(
-        _tickets_paths(layout), [".claude/skills"], probe_capability=probe
+        _tickets_paths(layout), [".claude/skills"], probe_capability=probe, **kwargs
     )
 
 
@@ -12145,26 +12146,119 @@ def _make_parent(layout, *, flat: bool = False) -> Path:
     return path
 
 
+def _slice_children(layout, *slugs: str) -> None:
+    """Give each child initiative in ``slugs`` a committed folder beside the active
+    initiative's, a copy of its ticket tree (call before `_make_parent`)."""
+    for slug in slugs:
+        shutil.copytree(layout.initiative_folder, layout.initiative_folder.parent / slug)
+    git(layout.project, "add", "-A")
+    git(layout.project, "commit", "-q", "-m", "child initiatives")
+
+
 def test_tickets_preflight_refuses_a_parent_initiative(project_v7, monkeypatch):
     """A parent initiative has no tickets of its own (tickets.py `status`/`next`
-    print its children, every other verb refuses), so a run needs one child
-    active: a problem naming the children, read from its `tickets.toml` without a
-    spawn, and the store checks are skipped. Ablation (performed): drop the
-    parent check and this FAILS (the store checks pass instead)."""
+    print its children, every other verb refuses), and without worktree isolation
+    every session reads the parent from the user config: a problem naming the
+    children, read from its `tickets.toml` without a spawn, and the store checks
+    are skipped. Ablation (performed): drop the isolation check and this FAILS
+    (the parent is accepted instead)."""
     from bmad_loop.checks import VALIDATE_CHECKS
 
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
     _make_parent(project_v7)
-    findings = _tickets_findings(project_v7, monkeypatch)
+    findings = _tickets_findings(project_v7, monkeypatch, isolation="none")
     (problem,) = [f for f in findings if f.severity == "problem"]
     assert problem.check == "tickets.initiative-parent"
     assert problem.detail == {
         "initiative": project_v7.initiative,
         "children": ["initiative-auth", "initiative-billing"],
+        "isolation": "none",
+        "retrospective": None,
     }
     assert "(children: initiative-auth, initiative-billing)" in problem.message
+    assert '`isolation = "worktree"`' in problem.message
     assert "`[core] active_initiative`" in problem.message
     assert "tickets.store-topology" not in _ids(findings)
     assert set(_ids(findings)) <= VALIDATE_CHECKS
+
+
+def test_tickets_preflight_accepts_a_parent_under_worktree_isolation(project_v7, monkeypatch):
+    """Under worktree isolation, with no auto retrospective, a parent is an ok line
+    naming its children, and each child's store is classified on its own folder.
+    Ablation (performed): drop the per-child store loop and this FAILS."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    _make_parent(project_v7)
+    findings = _tickets_findings(
+        project_v7, monkeypatch, isolation="worktree", retrospective="notify"
+    )
+    assert [f for f in findings if f.severity == "problem"] == []
+    (parent,) = [f for f in findings if f.check == "tickets.initiative-parent"]
+    assert parent.severity == "ok"
+    assert parent.detail["children"] == ["initiative-auth", "initiative-billing"]
+    assert parent.detail["skipped"] == []
+    stores = [f for f in findings if f.check == "tickets.store-topology"]
+    assert [f.detail["initiative"] for f in stores] == ["initiative-auth", "initiative-billing"]
+    root = project_v7.initiative_folder.parent
+    assert [f.detail["path"] for f in stores] == [
+        str(root / "initiative-auth"),
+        str(root / "initiative-billing"),
+    ]
+    assert all(f.severity == "ok" and f.detail["topology"]["layout"] == "T1" for f in stores)
+    assert stores[0].message.startswith("child initiative 'initiative-auth': ")
+    assert set(_ids(findings)) <= VALIDATE_CHECKS
+
+
+def test_tickets_preflight_refuses_a_parent_under_auto_retrospective(project_v7, monkeypatch):
+    """The auto retrospective session runs in the main checkout and reads the
+    parent, so even worktree isolation refuses a parent while it is on.
+    Ablation (performed): drop the retrospective check and this FAILS."""
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    _make_parent(project_v7)
+    findings = _tickets_findings(
+        project_v7, monkeypatch, isolation="worktree", retrospective="auto"
+    )
+    (problem,) = [f for f in findings if f.severity == "problem"]
+    assert problem.check == "tickets.initiative-parent"
+    assert '`gates.retrospective = "auto"`' in problem.message
+    assert "`[scm] isolation" not in problem.message
+    assert "tickets.store-topology" not in _ids(findings)
+
+
+def test_tickets_preflight_skips_a_parents_unsliced_child(project_v7, monkeypatch):
+    """A child declared but not sliced yet has no folder: the ok line says it is
+    skipped, and only the sliced child's store is classified."""
+    _slice_children(project_v7, "initiative-auth")
+    _make_parent(project_v7)
+    findings = _tickets_findings(project_v7, monkeypatch, isolation="worktree")
+    assert [f for f in findings if f.severity == "problem"] == []
+    (parent,) = [f for f in findings if f.check == "tickets.initiative-parent"]
+    assert parent.severity == "ok"
+    assert parent.detail["skipped"] == ["initiative-billing"]
+    assert "initiative-billing has no folder yet (declared, not sliced)" in parent.message
+    stores = [f for f in findings if f.check == "tickets.store-topology"]
+    assert [f.detail["initiative"] for f in stores] == ["initiative-auth"]
+
+
+def test_tickets_preflight_refuses_a_parents_child_on_a_tracked_user_config(
+    project_v7, monkeypatch
+):
+    """A chained run rewrites the mount's `config.user.toml` on every layout, so a
+    tracked personal layer refuses each child even on T1, which needs no store
+    redirect (the same project as a plain initiative runs)."""
+    _slice_children(project_v7, "initiative-auth", "initiative-billing")
+    git(project_v7.project, "add", "-f", "_bmad/custom/config.user.toml")
+    git(project_v7.project, "commit", "-q", "-m", "track the personal layer")
+    plain = _tickets_findings(project_v7, monkeypatch, isolation="worktree")
+    assert [f for f in plain if f.severity == "problem"] == []
+    _make_parent(project_v7)
+    findings = _tickets_findings(project_v7, monkeypatch, isolation="worktree")
+    problems = [f for f in findings if f.severity == "problem"]
+    assert [f.check for f in problems] == ["tickets.own-repo-isolation"] * 2
+    assert [f.detail["initiative"] for f in problems] == ["initiative-auth", "initiative-billing"]
+    assert [f.detail["refusal"] for f in problems] == ["user-config-tracked"] * 2
+    assert "config.user.toml" in problems[0].message
 
 
 def test_tickets_preflight_reads_a_parent_in_the_flat_layout_too(project_v7, monkeypatch):

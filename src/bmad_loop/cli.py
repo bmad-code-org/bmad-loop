@@ -3248,6 +3248,7 @@ def _validate_tickets_mode_queue(
             sandboxed_roles=(
                 _store_sandboxed_roles(pol, worksource.SOURCE_TICKETS) if pol is not None else ()
             ),
+            retrospective=pol.gates.retrospective if pol is not None else None,
         )
     )
     tickets_probs = install.missing_tickets_support(project, dev_trees)
@@ -4139,6 +4140,7 @@ def _check_tickets_preflight(paths: bmadconfig.ProjectPaths, pol) -> int | None:
         isolation=pol.scm.isolation,
         extra_args_roles=_store_extra_args_roles(pol, worksource.SOURCE_TICKETS),
         sandboxed_roles=_store_sandboxed_roles(pol, worksource.SOURCE_TICKETS),
+        retrospective=pol.gates.retrospective,
     )
     for warning in (f for f in findings if f.severity == "warning"):
         print(f"warning: {warning.message}", file=sys.stderr)
