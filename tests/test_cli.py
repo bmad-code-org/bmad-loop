@@ -6225,8 +6225,9 @@ def test_resolve_early_dispatch_refuses_a_changed_ticket_store_first(
     """A tickets run's `--adopt-branch` / `--reverify` each persist a transition
     before the resume that refuses a changed ticket store, so the store is judged
     ahead of both: rc 1 with the store's refusal, the state untouched. Ablation
-    (performed): drop the early `_reject_store_topology` gate in `cmd_resolve` and
-    both rows FAIL (adopt persists COMMITTING; reverify refuses for another reason)."""
+    (performed): drop the early `_reject_store_topology` gate in
+    `_resolve_pre_session_gates` and both rows FAIL (adopt persists COMMITTING; reverify refuses for another reason).
+    """
     from bmad_loop import ticketstore
     from bmad_loop.journal import load_state, save_state
 
@@ -6559,9 +6560,9 @@ def test_resolve_refuses_worktree_isolation_before_it_mutates_anything(
     the fix — writing nothing is. `_resolve_run_with_a_moved_code_root` stubs
     `_resume_paused_run` to 0, so the rc can only come from the hoisted check.
 
-    Ablation: move the `_reject_isolation_conflict(...)` call below the
-    `runs.restamp_code_root(...)` line and the persisted-root assertion reddens; delete
-    it outright and the rc assertion reddens too.
+    Ablation: move the post-confirm `_resolve_config_refusal(...)` call in `cmd_resolve`
+    below the `runs.restamp_code_root(...)` line and the persisted-root assertion
+    reddens; delete it outright and the rc assertion reddens too.
     """
     from bmad_loop import runs
     from bmad_loop.journal import load_state
@@ -6593,8 +6594,9 @@ def test_resolve_refuses_an_untrusted_plugin_before_it_rearms(project, monkeypat
     was already spent. A re-arm-only resolve launches nothing and is not judged.
 
     `_resume_paused_run` is stubbed to 0, so the rc can only come from the hoist.
-    Ablation: delete the `_reject_plugin_trust` call in `cmd_resolve` and the
-    `--resume` leg re-arms."""
+    Ablation: delete both `_reject_plugin_trust` calls — the pre-session one in
+    `_resolve_pre_session_gates` and the post-confirm one in `cmd_resolve` — and the
+    `--resume` leg re-arms; delete either alone and the other refuses first."""
     from bmad_loop.journal import load_state
     from bmad_loop.model import Phase
 
@@ -6669,8 +6671,8 @@ def test_resolve_refuses_an_untrusted_plugin_before_any_resolve_action(
     only then meeting the resume's refusal. One preflight now precedes all three.
 
     Each action is failed rather than stubbed, so the rc can only come from the
-    early refusal. Ablation: delete the `_reject_plugin_trust` call ahead of the
-    reverify dispatch in `cmd_resolve` and every row reddens on its action."""
+    early refusal. Ablation: delete the `_reject_plugin_trust` call in
+    `_resolve_pre_session_gates` and every row reddens on its action."""
     from bmad_loop import resolve
     from bmad_loop.journal import load_state
     from bmad_loop.model import Phase
@@ -6732,9 +6734,9 @@ def test_resolve_refuses_worktree_isolation_before_the_interactive_session(
     re-reads the config after a conversation of unbounded length, and it is the only one
     the `--no-interactive` path reaches.
 
-    Ablation: delete the `_reject_isolation_conflict` call from the `else:` branch of
-    `pre_session_paths` and this reddens on `_make_adapters` while the sibling row above
-    stays green.
+    Ablation: delete the pre-session `_resolve_config_refusal(...)` call (the `else:`
+    branch of the `pre_session_paths` read in `cmd_resolve`) and this reddens on
+    `_make_adapters` while the sibling row above stays green.
     """
     from bmad_loop import resolve, runs
     from bmad_loop.journal import load_state
@@ -11686,8 +11688,8 @@ def _assert_escalation_intact(run_dir, before):
 
 @pytest.mark.parametrize("interactive", [True, False], ids=["interactive", "noninteractive"])
 def test_resolve_refuses_sweep_run_on_undecodable_ledger(project, monkeypatch, capsys, interactive):
-    """The DW-229 row. Ablation: delete the probe block from `cmd_resolve` and the
-    re-arm recorder fills instead of returning the ledger refusal. The interactive
+    """The DW-229 row. Ablation: delete the `unreadable_sweep_ledger` probe block from
+    `_resolve_pre_session_gates` and the re-arm recorder fills instead of returning the ledger refusal. The interactive
     case also records a session. Persisted-state assertions complement the call
     recorders; the re-arm stub itself does not mutate state."""
     from bmad_loop.journal import load_state
@@ -11768,8 +11770,8 @@ def test_resolve_refuses_a_sweep_on_a_switched_initiative_before_any_write(
     resume's own refusal. The judgment itself is pinned in
     tests/test_runsetup.py; here it is stubbed to a refusal.
 
-    ABLATION (performed): delete the entry gate in `cmd_resolve` and the
-    interactive, adopt and reverify rows reach their side-effect recorders (the
+    ABLATION (performed): delete the `sweep_initiative_conflict` entry gate in
+    `_resolve_pre_session_gates` and the interactive, adopt and reverify rows reach their side-effect recorders (the
     non-interactive re-arm rows fall to the post-confirm check instead)."""
     from bmad_loop import resolve as resolve_mod
     from bmad_loop import runsetup
@@ -15962,15 +15964,16 @@ def test_dry_run_tickets_parent_previews_the_chain(project, monkeypatch, capsys)
     )
 
 
-def test_dry_run_tickets_parent_tags_a_drained_child_and_closes_nothing(
+def test_dry_run_tickets_parent_predicts_the_pick_after_closing_a_drained_child(
     project, monkeypatch, capsys
 ):
-    """AUTH drained but its initiative not yet `done`: the real run would close it
-    and then build BILLING. The dry run never writes, so it tags AUTH `drained (the
-    run closes it first)`, picks as the unclosed tree reads — BILLING still waits,
-    so the chain ends `waiting` with no tickets block — and says the run closes AUTH
-    before its first pick. Ablation (performed): drop the `drained` tag and AUTH
-    reads `ready, passed over (drained)` — this FAILS."""
+    """AUTH drained but its initiative not yet `done`: the real run closes it and
+    then builds BILLING. The dry run writes nothing, but re-judges the pick as the
+    tree reads once AUTH is closed: AUTH is tagged `drained (the run closes it
+    first)`, BILLING is `next` with no wait left, its tickets block is printed, and
+    the predicted line says the run closes AUTH first. Ablation (performed): pick
+    with `after_close=False` in `_dry_run_chain` and BILLING still waits, the chain
+    ends `waiting` — this FAILS."""
     _chain_project(project, monkeypatch, capsys, [])
     _drain_child(project.project, CHAIN_AUTH)
 
@@ -15978,21 +15981,41 @@ def test_dry_run_tickets_parent_tags_a_drained_child_and_closes_nothing(
 
     assert rc == 0, err
     assert written == ""
-    assert (
-        f"  1. {CHAIN_AUTH}  (open; 4 of 4 tickets closed)  [drained (the run closes it first)]\n"
-        in out
-    )
-    assert f"  2. {CHAIN_BILLING}  (open; 0 of 4 tickets closed)  [waiting]" in out
-    assert "build order (" not in out
-    end = (
-        f"initiative chain {CHAIN_PARENT}: ends (waiting) — waiting: {CHAIN_BILLING} on "
-        f"{CHAIN_AUTH} (open) (passed over: {CHAIN_AUTH} (drained))"
-    )
-    assert out.splitlines()[-1] == (
-        f"predicted: {end}; the run closes drained {CHAIN_AUTH} before its first pick, "
-        "which this preview does not simulate"
+    lines = out.splitlines()
+    assert lines[1:3] == [
+        f"  1. {CHAIN_AUTH}  (open; 4 of 4 tickets closed)  [drained (the run closes it first)]",
+        f"  2. {CHAIN_BILLING}  (open; 0 of 4 tickets closed)  [next]",
+    ]
+    assert f"tickets mode: initiative {CHAIN_BILLING} — 1 ready of 4 tickets" in out
+    assert lines[-1] == (
+        f"predicted: chain starts with {CHAIN_BILLING}; later children are chosen as each "
+        f"finishes; the run closes drained {CHAIN_AUTH} before its first pick"
     )
     assert not _initiative_status(project, CHAIN_AUTH)
+
+
+def test_dry_run_tickets_parent_keeps_a_drained_child_with_work_left_open(
+    project, monkeypatch, capsys
+):
+    """AUTH's tickets are all closed but its epics are not: the run leaves it open
+    (`work-left`) and builds it to close them, so the dry run counts no close —
+    AUTH is `next` and BILLING still waits on it."""
+    _chain_project(project, monkeypatch, capsys, [])
+    _drain_child(project.project, CHAIN_AUTH, epics=False)
+
+    rc, out, err, written = _chain_dry_run(project, monkeypatch, capsys)
+
+    assert rc == 0, err
+    assert written == ""
+    lines = out.splitlines()
+    assert lines[1:3] == [
+        f"  1. {CHAIN_AUTH}  (open; 4 of 4 tickets closed)  [next]",
+        f"  2. {CHAIN_BILLING}  (open; 0 of 4 tickets closed)  [waiting]  "
+        f"waits on: {CHAIN_AUTH} (open)",
+    ]
+    assert lines[-1] == (
+        f"predicted: chain starts with {CHAIN_AUTH}; later children are chosen as each finishes"
+    )
 
 
 @pytest.mark.parametrize("selector", [["--epic", "epic-cart"], ["--story", "1.1"]])

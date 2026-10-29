@@ -1,9 +1,18 @@
 """initiativechain.next_child: which ready child of a parent initiative a chain
-builds next, and why the chain ends when none is taken."""
+builds next, and why the chain ends when none is taken; next_child_after_close:
+the same pick once the chain has closed its drained children."""
 
 from __future__ import annotations
 
-from bmad_loop.initiativechain import NO_FOLDER, PassedOver, WaitingOn, next_child
+from bmad_loop.initiativechain import (
+    DRAINED,
+    NO_FOLDER,
+    PassedOver,
+    WaitingOn,
+    drained,
+    next_child,
+    next_child_after_close,
+)
 from bmad_loop.ticketmodel import ChildInitiative, InitiativeEdge, ParentView
 
 
@@ -15,9 +24,11 @@ def _child(
     status: str = "in-progress",
     after: tuple[str, ...] = (),
     waiting_on: tuple[str, ...] = (),
+    closed: int | None = None,
 ) -> ChildInitiative:
     """A child as `parse_parent_next` builds it; ``folder=""`` means "its slug",
-    and a folder-less child carries no status, as upstream prints it."""
+    and a folder-less child carries no status, as upstream prints it. ``closed``
+    gives it four tickets, that many of them done."""
     return ChildInitiative(
         id=slug,
         slug=slug,
@@ -25,7 +36,7 @@ def _child(
         after=tuple(InitiativeEdge(a, "") for a in after),
         folder=(slug if folder == "" else folder),
         status=(status if folder is not None else ""),
-        counts={},
+        counts={} if closed is None else {"total": 4, "done": closed},
         waiting_on=waiting_on,
         ready=ready,
     )
@@ -159,3 +170,75 @@ def test_waiting_children_name_each_prerequisite_with_its_status():
         WaitingOn("reports", "billing", "in-progress"),
         WaitingOn("reports", "gone", "?"),
     )
+
+
+def _passes_drained(child: ChildInitiative) -> str | None:
+    return DRAINED if drained(child) else None
+
+
+def test_after_close_takes_the_dependent_of_a_drained_child():
+    """AUTH drained and open, BILLING waiting on it: the chain closes AUTH before
+    it picks, so the re-judged pick takes BILLING and names AUTH closed.
+
+    Ablation (performed): return `next_child(view, passes_over)` without the
+    re-judge and BILLING still waits — this FAILS."""
+    auth = _child("auth", ready=True, status="", closed=4)
+    billing = _child("billing", after=("auth",), waiting_on=("auth",), closed=0)
+
+    pick = next_child_after_close(_view(auth, billing), _passes_drained)
+
+    assert pick.child is not None and pick.child.slug == "billing"
+    assert pick.child.ready and pick.child.waiting_on == ()
+    assert pick.closed == ("auth",)
+    assert (pick.passed_over, pick.waiting, pick.waiting_on, pick.end) == ((), (), (), None)
+
+
+def test_after_close_keeps_a_child_waiting_on_an_undrained_prerequisite():
+    """A genuinely blocked chain: BILLING waits on AUTH, open with tickets left
+    and itself waiting on a folder-less IDENTITY. Nothing is drained, nothing
+    closes, and no child can start."""
+    identity = _child("identity", ready=True, folder=None)
+    auth = _child("auth", status="", after=("identity",), waiting_on=("identity",), closed=1)
+    billing = _child("billing", after=("auth",), waiting_on=("auth",), closed=0)
+
+    pick = next_child_after_close(_view(identity, auth, billing), _passes_drained)
+
+    assert pick.child is None and pick.end == "waiting"
+    assert pick.closed == ()
+    assert pick.passed_over == (PassedOver("identity", NO_FOLDER),)
+    assert pick.waiting_on == (
+        WaitingOn("auth", "identity", NO_FOLDER),
+        WaitingOn("billing", "auth", "open"),
+    )
+
+
+def test_after_close_drops_only_the_closed_prerequisites():
+    """REPORTS waits on drained AUTH and on in-progress BILLING: closing AUTH
+    leaves it waiting on BILLING alone."""
+    auth = _child("auth", ready=True, status="", closed=4)
+    billing = _child("billing", ready=True, closed=0)
+    reports = _child("reports", after=("auth", "billing"), waiting_on=("auth", "billing"))
+
+    pick = next_child_after_close(_view(auth, billing, reports), _passes_drained)
+
+    assert pick.child is billing
+    assert pick.waiting == ("reports",)
+    assert pick.waiting_on == (WaitingOn("reports", "billing", "in-progress"),)
+
+
+def test_after_close_asks_closes_about_drained_children_only():
+    """``closes`` is asked about each drained child; one it keeps open is judged
+    as ``next`` read it — here passed over as drained, its dependent waiting."""
+    auth = _child("auth", ready=True, status="", closed=4)
+    billing = _child("billing", after=("auth",), waiting_on=("auth",), closed=0)
+    asked: list[str] = []
+
+    def closes(child: ChildInitiative) -> bool:
+        asked.append(child.slug)
+        return False
+
+    pick = next_child_after_close(_view(auth, billing), _passes_drained, closes)
+
+    assert asked == ["auth"]
+    assert pick.child is None and pick.end == "waiting" and pick.closed == ()
+    assert pick.passed_over == (PassedOver("auth", DRAINED),)

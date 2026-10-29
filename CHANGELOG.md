@@ -224,7 +224,8 @@ breaking changes may land in a minor release.
   exit 1). Require worktree isolation without the auto retrospective; pause each child
   at its epic boundaries; close drained children (`status: done`) before every pick;
   spend one `--max-stories` budget across the chain. Show the chain in `run --dry-run`
-  and the TUI start-run preview, and a chained run's child on its tickets board (DW-574).
+  and the TUI start-run preview, both picking as if the drained children were closed,
+  and a chained run's child on its tickets board (DW-574).
 
 ### Removed
 

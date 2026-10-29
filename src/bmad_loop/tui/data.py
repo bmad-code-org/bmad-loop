@@ -1342,14 +1342,14 @@ def project_tickets_overview(project: Path) -> TicketsBoard:
 def _chain_tag(child: ticketmodel.ChildInitiative, pick: initiativechain.ChildPick) -> str:
     """The start-run preview's tag for one child of a parent initiative:
     ``first ready`` (the child :func:`_parent_board` shows the board of),
-    ``done``/``dropped``, ``drained`` (:func:`~bmad_loop.initiativechain.drained`),
-    ``waiting``, ``no folder``, or ``ready``."""
+    ``done``/``dropped``, ``closes first`` (drained, so a run marks it done
+    before its first pick), ``waiting``, ``no folder``, or ``ready``."""
     if pick.child is not None and child.slug == pick.child.slug:
         return "first ready"
     if child.status in ("done", "dropped"):
         return child.status
-    if initiativechain.drained(child):
-        return "drained"
+    if child.slug in pick.closed:
+        return "closes first"
     if not child.ready:
         return "waiting"
     if child.folder is None:
@@ -1360,13 +1360,13 @@ def _chain_tag(child: ticketmodel.ChildInitiative, pick: initiativechain.ChildPi
 def _parent_board(project: Path, paths: bmadconfig.ProjectPaths) -> TicketsBoard:
     """The start-run preview of the parent active initiative ``paths`` name: its
     children (``tickets.py next <parent>``, pinned to the parent) and the board of
-    the first ready child that has a folder and is not drained
-    (:func:`~bmad_loop.initiativechain.next_child` with
-    :func:`~bmad_loop.initiativechain.drained` as the probe), read through that
-    child's folder with the tree pinned to the parent.
+    the first ready child once a run has closed every drained child, as it does
+    before its first pick (:func:`~bmad_loop.initiativechain.next_child_after_close`),
+    read through that child's folder with the tree pinned to the parent.
 
     An approximation of the chain ``bmad-loop run`` builds: its pick also passes
-    over a ready child whose fresh pick dispatches nothing, which takes a
+    over a ready child whose fresh pick dispatches nothing, and it leaves open a
+    drained child whose fresh pick still finds work, which takes a
     ``next``/``status`` read per child; ``run --dry-run`` prints that prediction."""
     parent = paths.active_initiative
     folder = paths.initiative_folder
@@ -1375,9 +1375,7 @@ def _parent_board(project: Path, paths: bmadconfig.ProjectPaths) -> TicketsBoard
         view = _parent_view(project, parent, folder)
     except tickettree.TicketsError as e:
         return TicketsBoard((), f"tickets.py {e.kind}: {e}", "", parent=parent)
-    pick = initiativechain.next_child(
-        view, lambda c: initiativechain.DRAINED if initiativechain.drained(c) else None
-    )
+    pick = initiativechain.next_child_after_close(view)
     children = tuple(
         ChainChild(
             slug=c.slug,

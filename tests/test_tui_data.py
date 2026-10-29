@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import dataclasses
 import importlib
 import json
 import os
@@ -1736,8 +1737,9 @@ def test_project_tickets_overview_resolves_a_mixed_install_as_tickets_mode(tmp_p
 # ------------------------------------------------------------- initiative chains
 # A v7 parent initiative over the sliced children AUTH and BILLING (after AUTH),
 # each holding `DEFAULT_TREE`, read by the real vendored `tickets.py`. Real-spawn
-# budget: 4 (`next <parent>` + the first child's `status` for the preview, one
-# `next <parent>` for the drained preview, one `status` for the chained run's board).
+# budget: 6 (`next <parent>` + the first child's `status` for the preview and for
+# the drained preview, one `next <parent>` for the blocked preview, one `status` for
+# the chained run's board).
 
 CHAIN_PARENT = "initiative-platform"
 CHAIN_AUTH, CHAIN_BILLING = "initiative-auth", "initiative-billing"
@@ -1839,26 +1841,60 @@ def test_project_tickets_overview_previews_a_parent_initiative(tmp_path, monkeyp
     assert sorted(r.ref for r in board.rows) == ["1.1", "1.2", "2.1", "2.2"]
 
 
-def test_project_tickets_overview_tags_a_drained_child(tmp_path, monkeypatch):
-    """A child with every ticket closed and its initiative file still open is
-    `drained` — passed over, never previewed as the first ready child — and the
-    child after it still waits on it, so no child can start.
+def test_project_tickets_overview_closes_a_drained_child_first(tmp_path, monkeypatch):
+    """A child with every ticket and epic closed and its initiative file still
+    open is drained: a run marks it done before its first pick, so the preview
+    tags it `closes first` and previews the child after it — BILLING, no longer
+    waiting — never `no child can start`.
 
-    Ablation (performed): pass `next_child` no probe and AUTH is the first ready
-    child — this FAILS."""
+    Ablation (performed): pick with `next_child` and `drained` as the probe in
+    `_parent_board` (no re-judge) and BILLING still waits, the chain ends
+    `waiting` — this FAILS."""
     root = tmp_path / "proj"
     _chain_project(root, monkeypatch)
     auth = v7_layout(root, initiative=CHAIN_AUTH)
+    write_ticket_tree(auth, tuple(dataclasses.replace(e, status="done") for e in DEFAULT_TREE))
     for epic, stem, ticket in CHAIN_PLANS:
         write_plan(auth, epic, stem, ticket, "done")
 
     board = data.project_tickets_overview(root)
     assert board.fault is None, board.fault
     assert [(c.slug, c.tag) for c in board.children] == [
-        (CHAIN_AUTH, "drained"),
-        (CHAIN_BILLING, "waiting"),
+        (CHAIN_AUTH, "closes first"),
+        (CHAIN_BILLING, "first ready"),
     ]
     assert (board.children[0].closed, board.children[0].total) == (4, 4)
+    assert board.children[1].waiting_on == ()
+    assert board.chain_end is None
+    assert board.initiative == CHAIN_BILLING
+    assert sorted(r.ref for r in board.rows) == ["1.1", "1.2", "2.1", "2.2"]
+
+
+def test_project_tickets_overview_keeps_a_blocked_chain_blocked(tmp_path, monkeypatch):
+    """BILLING waits on AUTH, open with every ticket left and itself waiting on
+    IDENTITY, declared but not sliced: nothing is drained, nothing closes, and no
+    child can start."""
+    root = tmp_path / "proj"
+    parent = _chain_project(root, monkeypatch)
+    (parent / "tickets" / "tickets.toml").write_text(
+        '[[initiative]]\nid = 3\nslug = "initiative-identity"\ntitle = "Identity"\n\n'
+        f'[[initiative]]\nid = 1\nslug = "{CHAIN_AUTH}"\ntitle = "Auth"\n'
+        'after = [{ initiative = 3, needs = "accounts" }]\n\n'
+        f'[[initiative]]\nid = 2\nslug = "{CHAIN_BILLING}"\ntitle = "Billing"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n',
+        encoding="utf-8",
+    )
+
+    board = data.project_tickets_overview(root)
+    assert board.fault is None, board.fault
+    assert [(c.slug, c.tag) for c in board.children] == [
+        ("initiative-identity", "no folder"),
+        (CHAIN_AUTH, "waiting"),
+        (CHAIN_BILLING, "waiting"),
+    ]
+    assert [(w.prerequisite, w.status) for w in board.children[2].waiting_on] == [
+        (CHAIN_AUTH, "open")
+    ]
     assert board.rows == ()
     assert board.initiative == ""
     assert board.chain_end == "waiting"

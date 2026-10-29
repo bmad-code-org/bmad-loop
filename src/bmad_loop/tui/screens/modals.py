@@ -228,7 +228,7 @@ def _chain_preview(board: data.TicketsBoard) -> Text:
         text.append(f"\nfirst ready: {board.initiative} · {len(board.rows)} tickets", style="bold")
         _append_board(text, board)
     text.append(
-        "\n  first ready skips drained children only — "
+        "\n  first ready assumes a run closes every drained child — "
         "run --dry-run prints the exact chain prediction",
         style="dim",
     )

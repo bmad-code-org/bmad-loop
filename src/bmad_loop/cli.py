@@ -4462,25 +4462,38 @@ def _chain_pick(
     paths: bmadconfig.ProjectPaths,
     parent: str,
     view: ticketmodel.ParentView | None = None,
+    *,
+    after_close: bool = False,
 ) -> initiativechain.ChildPick:
     """The next child of the parent initiative ``parent`` (``paths`` are the
     parent's): :func:`initiativechain.next_child` over ``next <parent>`` (``view``
     when the caller already read it), passing over as ``drained`` a ready child
     whose fresh pick (:func:`_fresh_pick`) finds nothing to dispatch. Reads only.
-    Raises :class:`tickettree.TicketsError` on a tree fault and ValueError on a
-    child slug that is no folder name."""
+    ``after_close`` (the dry run) re-judges the pick as if
+    :func:`_close_drained_children` had closed each drained child whose fresh pick
+    finds nothing (:func:`initiativechain.next_child_after_close`). Raises
+    :class:`tickettree.TicketsError` on a tree fault and ValueError on a child
+    slug that is no folder name."""
     folder = paths.initiative_folder
     assert folder is not None  # _chain_parent
     if view is None:
         view = _chain_ticket_tree(project, parent).parent_next(folder)
+    empty: dict[str, bool] = {}
+
+    def nothing_left(child: ticketmodel.ChildInitiative) -> bool:
+        if child.slug not in empty:
+            tree = _chain_ticket_tree(
+                project, parent, paths.with_initiative(child.slug).initiative_folder
+            )
+            decision = _fresh_pick(tree.next(), tree.status())
+            empty[child.slug] = isinstance(decision, tickets_source.Skip)
+        return empty[child.slug]
 
     def drained(child: ticketmodel.ChildInitiative) -> str | None:
-        tree = _chain_ticket_tree(
-            project, parent, paths.with_initiative(child.slug).initiative_folder
-        )
-        decision = _fresh_pick(tree.next(), tree.status())
-        return initiativechain.DRAINED if isinstance(decision, tickets_source.Skip) else None
+        return initiativechain.DRAINED if nothing_left(child) else None
 
+    if after_close:
+        return initiativechain.next_child_after_close(view, drained, nothing_left)
     return initiativechain.next_child(view, drained)
 
 
@@ -5224,13 +5237,13 @@ def _dry_run_tickets(
 def _chain_child_tag(child: ticketmodel.ChildInitiative, pick: initiativechain.ChildPick) -> str:
     """The dry run's tag for one child of a parent initiative: ``next`` (the child
     the run builds first), ``done``/``dropped``, ``drained (the run closes it
-    first)`` (``initiativechain.drained``), ``waiting``, ``no folder``, or
-    ``ready`` (with why the pick passed it over, when it did)."""
+    first)`` (in ``pick.closed``), ``waiting``, ``no folder``, or ``ready``
+    (with why the pick passed it over, when it did)."""
     if pick.child is not None and child.slug == pick.child.slug:
         return "next"
     if child.status in ("done", "dropped"):
         return child.status
-    if initiativechain.drained(child):
+    if child.slug in pick.closed:
         return "drained (the run closes it first)"
     if not child.ready:
         return "waiting"
@@ -5251,9 +5264,11 @@ def _dry_run_chain(
     chain with stands in for the block.
 
     Never writes: the run's first step, closing drained children
-    (:func:`_close_drained_children`), is not taken or simulated, so the pick is
-    the one the tree reads now, and the predicted line names the children the run
-    closes before its first pick. ``--max-stories`` caps the first child's
+    (:func:`_close_drained_children`), is not taken but re-judged — the pick is
+    the one the tree would read once each drained child whose fresh pick finds
+    nothing is closed (``_chain_pick(after_close=True)``), and the predicted line
+    names those children. A close the run skips for a live or unfinished run or
+    a refused store is not predicted. ``--max-stories`` caps the first child's
     listing; the cap's spend across later children is not predicted."""
     if args.epic is not None or args.story:
         print(_chain_selector_refusal(parent), file=sys.stderr)
@@ -5263,7 +5278,7 @@ def _dry_run_chain(
     assert folder is not None  # _chain_parent
     try:
         view = _chain_ticket_tree(project, parent).parent_next(folder)
-        pick = _chain_pick(project, paths, parent, view)
+        pick = _chain_pick(project, paths, parent, view, after_close=True)
         child_paths = None if pick.child is None else paths.with_initiative(pick.child.slug)
     except tickettree.TicketsError as e:
         print(f"tickets mode: tickets.py {e.kind}: {e}", file=sys.stderr)
@@ -5281,15 +5296,15 @@ def _dry_run_chain(
             closed, total = initiativechain.closed_tickets(child), child.counts.get("total", 0)
             status += f"; {closed} of {total} tickets closed"
         waits = ", ".join(
-            f"{p} ({initiativechain.prerequisite_status(view, p)})" for p in child.waiting_on
+            f"{p} ({initiativechain.prerequisite_status(view, p)})"
+            for p in child.waiting_on
+            if p not in pick.closed
         )
         line = f"  {position}. {child.slug}  ({status})  [{_chain_child_tag(child, pick)}]"
         print(line + (f"  waits on: {waits}" if waits else ""))
-    closing = [c.slug for c in view.initiatives if initiativechain.drained(c)]
     closes = (
-        f"; the run closes drained {', '.join(closing)} before its first pick, "
-        "which this preview does not simulate"
-        if closing
+        f"; the run closes drained {', '.join(pick.closed)} before its first pick"
+        if pick.closed
         else ""
     )
     if pick.child is None or child_paths is None:

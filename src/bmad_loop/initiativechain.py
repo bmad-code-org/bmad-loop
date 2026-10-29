@@ -22,6 +22,8 @@ why.
 
 :func:`drained` says whether a child is open with every ticket closed — the child
 whose initiative a chain marks ``done`` before it picks again.
+:func:`next_child_after_close` re-judges :func:`next_child` as the view reads once
+those closes are written, for a prediction that does not write them.
 
 When no child is taken the pick says why the chain ends: ``waiting`` when some
 child still waits on a prerequisite (a drained child whose initiative is not
@@ -33,7 +35,7 @@ unbuilt was passed over, and ``all-done`` when every child is done or dropped
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final, Literal
 
 from .statemachine import TICKET_CLOSED_STATES
@@ -81,13 +83,15 @@ class ChildPick:
     walked past before the pick (in build order); ``waiting`` the slugs of the
     children still waiting on a prerequisite, whether or not one was taken, and
     ``waiting_on`` one row per prerequisite each of them waits on, in the same
-    order."""
+    order. ``closed`` names the drained children :func:`next_child_after_close`
+    judged as closed, in build order (empty from :func:`next_child`)."""
 
     child: ChildInitiative | None
     passed_over: tuple[PassedOver, ...]
     waiting: tuple[str, ...]
     end: ChainEnd | None
     waiting_on: tuple[WaitingOn, ...] = ()
+    closed: tuple[str, ...] = ()
 
 
 def closed_tickets(child: ChildInitiative) -> int:
@@ -142,3 +146,42 @@ def next_child(
         passed.append(PassedOver(child.slug, why))
     end: ChainEnd = "waiting" if waiting else "passed-over" if passed else "all-done"
     return ChildPick(None, tuple(passed), waiting, end, waiting_on)
+
+
+def next_child_after_close(
+    view: ParentView,
+    passes_over: Callable[[ChildInitiative], str | None] | None = None,
+    closes: Callable[[ChildInitiative], bool] | None = None,
+) -> ChildPick:
+    """:func:`next_child` on ``view`` as it reads once a chain has marked its
+    drained children ``done``, as it does before every pick — for a prediction
+    that does not write them. ``closes``, when given, is asked about each
+    drained child and says whether the chain closes it (every drained child,
+    when not given).
+
+    ``tickets.py next`` judges a child ready from its prerequisites alone: no
+    ``after`` child short of ``done``, and not done or dropped itself. So each
+    closed child reads ``done`` and not ready, every ``waiting_on`` loses the
+    closed children, and a child whose ``waiting_on`` changed is ready when it
+    empties and the child is not done or dropped; every other child keeps the
+    answer ``next`` gave. The pick's ``closed`` names the closed children."""
+    closing = tuple(
+        c.slug for c in view.initiatives if drained(c) and (closes is None or closes(c))
+    )
+    if not closing:
+        return next_child(view, passes_over)
+    shut = frozenset(closing)
+    children: list[ChildInitiative] = []
+    for child in view.initiatives:
+        if child.slug in shut:
+            child = replace(child, status="done", ready=False)
+        elif shut.intersection(child.waiting_on):
+            waits = tuple(p for p in child.waiting_on if p not in shut)
+            child = replace(
+                child, waiting_on=waits, ready=not waits and child.status not in _CLOSED
+            )
+        children.append(child)
+    rejudged = replace(
+        view, initiatives=tuple(children), ready=tuple(c.slug for c in children if c.ready)
+    )
+    return replace(next_child(rejudged, passes_over), closed=closing)

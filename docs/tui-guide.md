@@ -401,11 +401,11 @@ To return to the default proportions, delete the `[tui]` size keys from
   ticket counts and the refs that pause on hitl or a checkpoint. On a parent
   initiative it lists the children in build order, each with its status, closed
   and total tickets, what it waits on and a tag (`first ready`, `ready`,
-  `waiting`, `no folder`, `drained`, `done` or `dropped`), then the counts and
-  checkpoint refs of the `first ready` child (the first ready child that has a
-  folder and is not drained), or why no child can start. The run's pick also
-  passes over a ready child with nothing to dispatch, so `run --dry-run` names
-  the child a run builds first. A
+  `waiting`, `no folder`, `closes first`, `done` or `dropped`), then the counts
+  and checkpoint refs of the `first ready` child (the first ready child with a
+  folder once a run closes the drained ones), or why no child can start. A run
+  passes over a ready child with nothing to dispatch and keeps open a drained
+  one with an epic to close, so `run --dry-run` names the child it builds first. A
   tickets pick launches only while `[stories] source = "tickets"`. Under that policy a
   stories pick still launches (its `--spec` overrides the policy source); a
   sprint pick does not.
