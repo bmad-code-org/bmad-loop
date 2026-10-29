@@ -4882,7 +4882,11 @@ def _drive_initiative_chain(
     (``_claim_ctl_window`` with ``renamed``), so the TUI's attach and stop on the
     next run reach the window and those on the finished run no longer do. A
     claim that does not land is printed and journaled ``ctl-window-claim-failed``
-    in the next run, which goes on regardless.
+    in the next run, which goes on regardless. The claim's ``launched`` is
+    ``_ctl_minted``, this process's own ``--ctl-launch``, whichever command
+    started the chain: a launched ``run`` sets no ``_ctl_launch``, so a session
+    probe gone unanswered at its switch is reported as a launched resume's is
+    (#925), while an operator's shell still claims nothing in silence.
 
     Returns 0, 1 for a tree fault or a close that could not be committed, or the
     refusal rc of the next launch."""
@@ -4965,7 +4969,13 @@ def _drive_initiative_chain(
         # rival resume can accept the new run.
         try:
             with state_lock(launched.run_dir):
-                _claim_ctl_window(project, launched.run_dir, launched.state, renamed=True)
+                _claim_ctl_window(
+                    project,
+                    launched.run_dir,
+                    launched.state,
+                    renamed=True,
+                    launched=_ctl_minted,
+                )
         except OSError as exc:
             _report_ctl_window_fault(
                 launched.run_dir,
@@ -6644,6 +6654,14 @@ class _CtlLaunch:
 # ponytail: process-wide, which is what the flag is — one command per process.
 _ctl_launch: _CtlLaunch | None = None
 
+# Whether this process was started with the hidden `--ctl-launch`: the launcher's
+# word that it minted the window this process runs in (`tui.launch.start_detached`,
+# for every kind it starts, a `run` included). Set by `main` from the parsed flag
+# for the command's lifetime. Unlike `_ctl_launch`, which only a resume/resolve
+# sets and which tracks its acceptance, it reaches every command, so a chain's
+# window claims read it whichever command drives the chain.
+_ctl_minted = False
+
 # The most of a refused launch's reason one journal entry keeps: the line trim
 # bounds the count, not a line (a validator echoing one huge policy scalar), and
 # an exception's message skips it.
@@ -6651,7 +6669,12 @@ _CTL_REFUSAL_MAX_CHARS = 4000
 
 
 def _claim_ctl_window(
-    project: Path, run_dir: Path, state: RunState, *, renamed: bool = False
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    *,
+    renamed: bool = False,
+    launched: bool | None = None,
 ) -> None:
     """Publish the control window this process runs in as the run's, once this
     process has accepted the run (`tui.launch.claim_ctl_window`). The caller holds
@@ -6663,6 +6686,12 @@ def _claim_ctl_window(
     (`tui.launch.claim_renamed_ctl_window`). That leaves the launch's accepted
     flag alone: it is the launched command's acceptance of its own run, settled
     before any chain switch.
+
+    ``launched`` is the claim's word that the TUI minted this window
+    (`tui.launch.claim_ctl_window`). The chain passes ``_ctl_minted``, the parsed
+    ``--ctl-launch``, since a launched ``run`` sets no ``_ctl_launch``; None reads
+    it off ``_ctl_launch``, which a resume/resolve sets exactly when it was given
+    the flag (:func:`_drive_ctl_launch`).
 
     A claim that did not land is journaled as well as printed: a TUI-launched
     resume prints into a detached window nobody is looking at, while the
@@ -6679,9 +6708,11 @@ def _claim_ctl_window(
     ctl = _ctl_launch
     if ctl is not None and not renamed:
         ctl.accepted = True
+    if launched is None:
+        launched = ctl is not None
     claim = launch.claim_renamed_ctl_window if renamed else launch.claim_ctl_window
     try:
-        warning = claim(project, run_dir.name, launched=ctl is not None)
+        warning = claim(project, run_dir.name, launched=launched)
     except (MultiplexerError, OSError) as exc:
         warning = f"could not record this window as run {run_dir.name}'s control window: {exc}"
     if warning is not None:
@@ -11143,7 +11174,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-root", help=argparse.SUPPRESS)
     parser.add_argument("--registry-root", help=argparse.SUPPRESS)
     # Hidden, composed the same way: this process runs in a window the launcher
-    # minted (`_drive_ctl_launch`, `tui.launch.claim_ctl_window`, #925).
+    # minted (`_ctl_minted`, `_drive_ctl_launch`, `tui.launch.claim_ctl_window`,
+    # #925).
     parser.add_argument("--ctl-launch", action="store_true", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -11694,6 +11726,8 @@ def main(argv: list[str] | None = None) -> int:
         from .adapters.psmux_backend import note_displaced_registry
 
         note_displaced_registry(args.displaced_registry_root)
+    global _ctl_minted
+    _ctl_minted = bool(args.ctl_launch)
     try:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux
@@ -11729,6 +11763,8 @@ def main(argv: list[str] | None = None) -> int:
         # die to the parked control pane with a bare traceback.
         print(f"error: {e}", file=sys.stderr)
         return ExitCode.FAILURE
+    finally:
+        _ctl_minted = False
 
 
 if __name__ == "__main__":

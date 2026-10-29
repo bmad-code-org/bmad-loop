@@ -16538,6 +16538,76 @@ def test_a_chain_switch_claims_the_window_for_the_next_run(project, monkeypatch,
     assert not [e for e in Journal(first).entries() if e["kind"] == "ctl-window-claim-failed"]
 
 
+def _unanswered_session_probe(monkeypatch) -> list:
+    """The chain's control-window probes as a launched window whose session probe
+    answers None (a non-zero `display-message` is a silent None): no session, so
+    no window to rename. Returns the list each rename_window appends its args to."""
+    from bmad_loop.tui import launch
+
+    renames: list = []
+
+    class Mux:
+        def current_session(self):
+            return None
+
+        def current_window_id(self):
+            raise AssertionError("outside a control session, no window is named")
+
+        def rename_window(self, *a):
+            renames.append(a)
+
+    monkeypatch.setattr(launch, "get_multiplexer", Mux)
+    return renames
+
+
+def test_a_launched_chain_whose_session_probe_is_unanswered_says_so(project, monkeypatch, capsys):
+    """A `run` the TUI launched carries `--ctl-launch` but sets no `_ctl_launch`
+    (only a resume/resolve does), so the switch reads the parsed flag: at the
+    switch its session probe answers None, the window cannot be renamed for
+    BILLING's run, and that is printed and journaled `ctl-window-claim-failed` in
+    BILLING's run (#925), never taken for an operator's shell. Ablation
+    (performed): pass `launched=False` from the chain driver and no row is
+    journaled — this FAILS."""
+    from bmad_loop.journal import Journal
+
+    built = _chain_project(project, monkeypatch, capsys, ["drain", "drain"])
+    renames = _unanswered_session_probe(monkeypatch)
+
+    assert cli.main(["--ctl-launch", "run", "--project", str(project.project)]) == 0
+
+    (_, _, first), (_, second_state, second) = built
+    assert second_state.finished
+    err = capsys.readouterr().err
+    assert f"warning: this window could not be recorded as run {second.name}'s" in err
+    faults = [e for e in Journal(second).entries() if e["kind"] == "ctl-window-claim-failed"]
+    assert [e["error"] for e in faults] == [
+        f"this window could not be recorded as run {second.name}'s control window — "
+        "attach and stop from the TUI may target an older window for this run"
+    ]
+    assert not [e for e in Journal(first).entries() if e["kind"] == "ctl-window-claim-failed"]
+    assert renames == []
+
+
+def test_an_operator_shell_chain_claims_no_window_in_silence(project, monkeypatch, capsys):
+    """The same chain typed in an operator's own shell (no `--ctl-launch`): the
+    probe's None is the answer "no control session", so the switch renames
+    nothing, records nothing and says nothing."""
+    from bmad_loop.journal import Journal
+
+    built = _chain_project(project, monkeypatch, capsys, ["drain", "drain"])
+    renames = _unanswered_session_probe(monkeypatch)
+
+    assert cli.main(["run", "--project", str(project.project)]) == 0
+
+    (_, _, first), (_, second_state, second) = built
+    assert second_state.finished
+    assert "control window" not in capsys.readouterr().err
+    for run_dir in (first, second):
+        kinds = [e["kind"] for e in Journal(run_dir).entries()]
+        assert "ctl-window-claim-failed" not in kinds
+    assert renames == []
+
+
 def test_run_on_a_parent_with_nothing_to_build_says_why(project, monkeypatch, capsys):
     """Both children already done: `run` launches nothing, prints why the chain
     ends (`all-done`) and exits 0, with no run dir. Ablation (performed): drop the

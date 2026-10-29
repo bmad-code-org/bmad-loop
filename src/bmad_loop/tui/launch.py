@@ -450,7 +450,11 @@ def claim_renamed_ctl_window(project: Path, run_id: str, *, launched: bool = Fal
     land, None when it did or when this process is in no control session (an
     operator's shell owns no window to rename). A rename that raises is worded
     and claims nothing: the window keeps the previous run's name and record,
-    so `a` and `x` on that run still reach the window driving this one."""
+    so `a` and `x` on that run still reach the window driving this one.
+
+    `launched` is the chain process's own `--ctl-launch`, whichever command
+    started the chain (a TUI `run` included): with it, a session probe that
+    goes unanswered is worded, not taken for an operator's shell."""
     try:
         win_id = get_multiplexer().current_window_id() if in_ctl_session() else None
     except MultiplexerError:
