@@ -17621,6 +17621,74 @@ def test_resolve_epic_close_session_refuses_a_moved_chain_config(project, capsys
     assert resumed == [] and claims == [] and _epic_close_kinds(run_dir) == []
 
 
+def test_resolve_epic_close_reads_a_mixed_install_as_tickets(project, capsys, monkeypatch):
+    """On a v7 install with a leftover v6 key the epic-close resolve reads the config
+    as tickets, as the resume does, and verifies and resumes. 1 real spawn. Ablation
+    (performed): drop `want_tickets` from the pre-session read and this FAILS (the
+    partial v6 config raises)."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    (project.project / "_bmad" / "custom" / "config.toml").write_text(
+        "[modules.bmm]\n"
+        'implementation_artifacts = "{project-root}/_bmad-output/implementation-artifacts"\n',
+        encoding="utf-8",
+    )
+
+    assert _resolve_epic(project, "--resume") == 0, capsys.readouterr().err
+
+    assert resumed == [run_dir]
+    assert [row["kind"] for row in _epic_close_kinds(run_dir)] == ["epic-close-verified"]
+
+
+def test_resolve_epic_close_session_refuses_a_moved_code_root(project, capsys, monkeypatch):
+    """A code root moved during the session is refused before the verify: the epic
+    folder was located in the old tree. No real spawn. Ablation (performed): drop
+    the root comparison and this resumes the run and FAILS."""
+    from bmad_loop import bmadconfig
+
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    elsewhere = project.project.parent / "elsewhere"
+    real_load = bmadconfig.load_paths
+
+    def move_root(_prompt):
+        monkeypatch.setattr(
+            bmadconfig,
+            "load_paths",
+            lambda *a, **k: dataclasses.replace(real_load(*a, **k), repo_root=elsewhere),
+        )
+        return 0
+
+    _epic_close_session(project, monkeypatch, move_root)
+
+    assert _resolve_epic_interactive(project, "--resume") == 1
+
+    err = capsys.readouterr().err
+    assert "the code root changed during the epic-close session" in err
+    assert elsewhere.as_posix() in err
+    assert resumed == []
+    assert [row["kind"] for row in _epic_close_kinds(run_dir)] == [
+        "epic-close-session-start",
+        "epic-close-session-end",
+    ]
+
+
+def test_resolve_epic_close_session_does_not_recreate_a_deleted_run(project, capsys, monkeypatch):
+    """A run removed during the session (`delete --force`) is reported, never
+    recreated by the session-end journal row. No real spawn. Ablation (performed):
+    drop the post-session `is_run` guard and this FAILS."""
+    run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+
+    def delete(_prompt):
+        shutil.rmtree(run_dir)
+        return 0
+
+    _epic_close_session(project, monkeypatch, delete)
+
+    assert _resolve_epic_interactive(project, "--resume") == 1
+
+    assert f"no such run: {_EPIC_CLOSE_RUN}" in capsys.readouterr().err
+    assert resumed == [] and not run_dir.exists()
+
+
 @pytest.mark.parametrize("gesture", ["interactive", "no-interactive"])
 def test_resolve_epic_boundary_other_gestures_keep_the_refusal(tmp_path, capsys, gesture):
     """Only a tickets run takes the epic-close branch: a stories run's

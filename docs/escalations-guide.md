@@ -32,7 +32,8 @@ Before each pick and at run end, a tickets run checks the epic table. An open ep
 - the closure does not check out: it prints what is missing and journals `epic-close-unverified`;
 - the pause names no epic, or the epic's retrospective has not run or is not committed: the refusal names the step to take, then `bmad-loop resume`;
 - the dev CLI's skill tree has no bmad-agent-po, or the dev CLI has no interactive mode: close the epic by hand, then use `--no-interactive`;
-- the run's store cannot be checked (no recorded store layout, or a tree that cannot be read).
+- the run's store cannot be checked (no recorded store layout, or a tree that cannot be read);
+- the code root (`repo_root`) changed during the session.
 
 The session is journaled as `epic-close-session-start` and `epic-close-session-end` (with its exit code). Instead of resolving, you can also close the epic with bmad-agent-po yourself, commit it, and run `bmad-loop resume <run-id>`.
 

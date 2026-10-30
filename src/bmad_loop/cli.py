@@ -7934,8 +7934,13 @@ def _resolve_epic_close(
     if (rc := _resolve_pre_session_gates(args, project, run_dir, state)) is not None:
         return rc
     pol = policy_mod.load(_policy_path(project))
+    # Read as tickets, as the resume reads it (`_prepare_resume_locked`): a mixed
+    # install's leftover v6 keys must not resolve this run's config as v6.
+    want_tickets = runs.resolves_as_tickets(state)
     try:
-        paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+        paths = runs.paths_for_state(
+            bmadconfig.load_paths(project, want_tickets=want_tickets), state
+        )
     except (bmadconfig.BmadConfigError, OSError) as e:
         print(f"cannot resolve {run_id}: cannot read the BMAD config: {e}", file=sys.stderr)
         return 1
@@ -8048,16 +8053,34 @@ def _resolve_epic_close(
             _hand_back_ctl_window(project, run_dir, state, predecessor, claimed)
             raise
         with state_lock(run_dir):
+            # `delete --force` can remove the run during the conversation: said,
+            # never recreated by the journal write.
+            if not runs.is_run(run_dir):
+                print(f"no such run: {run_dir.name}", file=sys.stderr)
+                return 1
             Journal(run_dir, pin=state).append(
                 "epic-close-session-end", epic_ref=slug, rc=session_rc
             )
         # The conversation may have edited the config: judge it again, as
         # `cmd_resolve` does after its session.
+        pre_session_root = paths.repo_root
         pol = policy_mod.load(_policy_path(project))
         try:
-            paths = runs.paths_for_state(bmadconfig.load_paths(project), state)
+            paths = runs.paths_for_state(
+                bmadconfig.load_paths(project, want_tickets=want_tickets), state
+            )
         except (bmadconfig.BmadConfigError, OSError) as e:
             print(f"cannot resolve {run_id}: cannot read the BMAD config: {e}", file=sys.stderr)
+            return 1
+        # The epic folder was located in the pre-session tree, so a moved code root
+        # would verify one tree and resume in another (the escalation arm's refusal).
+        if paths.repo_root != pre_session_root:
+            print(
+                f"cannot resolve {run_id}: the code root changed during the epic-close "
+                f"session from {pre_session_root.as_posix()!r} to "
+                f"{paths.repo_root.as_posix()!r} — run is still paused at epic {slug}",
+                file=sys.stderr,
+            )
             return 1
         if (rc := _resolve_config_refusal(project, pol, state, paths)) is not None:
             return rc
@@ -8067,6 +8090,9 @@ def _resolve_epic_close(
         print(f"cannot resolve {run_id}: {e} — run is still paused at epic {slug}", file=sys.stderr)
         return 1
     with state_lock(run_dir):
+        if not runs.is_run(run_dir):
+            print(f"no such run: {run_dir.name}", file=sys.stderr)
+            return 1
         if missing:
             Journal(run_dir, pin=state).append(
                 "epic-close-unverified", epic_ref=slug, missing=missing
