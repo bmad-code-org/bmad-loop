@@ -1222,9 +1222,12 @@ def test_a_chain_claim_whose_rename_fails_records_nothing(fake_run, tmp_path: Pa
 def test_a_chain_claim_outside_a_control_session_touches_nothing(
     fake_run, tmp_path: Path, monkeypatch
 ):
-    # A chain driven from the operator's own shell has no window to rename.
+    # A chain driven from the operator's own shell has no window to rename,
+    # even when the multiplexer would name the window it runs in. Ablation
+    # (performed): drop the in_ctl_session gate and @7 is renamed.
     _make_run(tmp_path, "B")
     monkeypatch.setattr(launch, "in_ctl_session", lambda: False)
+    monkeypatch.setattr(type(get_multiplexer()), "current_window_id", lambda self: "@7")
     assert launch.claim_renamed_ctl_window(tmp_path, "B") is None
     assert fake_run.calls == []
     assert launch.recorded_ctl_window(tmp_path, "B") is None
