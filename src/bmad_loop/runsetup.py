@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from . import bmadconfig
+from . import bmadconfig, install
 from . import policy as policy_mod
 from . import runs, ticketstore, worksource
 from .checks import Finding
@@ -168,7 +168,9 @@ def config_digest(
       what flags and environment**. That rule, not a hand-picked list, is what
       keeps this complete: walk ``GenericAdapter.interactive_argv`` and
       ``interactive_env`` and every token there traces back to one of
-      ``binary`` / ``launch_args`` / ``bypass_args`` / ``model_flag`` /
+      ``binary`` / ``launch_args`` / ``bypass_args`` / ``linked_worktree_args``
+      (hashed as the UNFILLED template, placeholders and all, so a resumed run's
+      digest does not depend on its worktree's path) / ``model_flag`` /
       ``prompt_template`` / ``env`` on the *resolved* profile, or to
       ``extra_args`` on the resolved adapter — plus ``session_id_flag``, which
       ``build_command`` appends (with a minted id) to the launched argv only.
@@ -440,6 +442,10 @@ def config_digest(
         # pin also records which mapping those args came from.
         if cfg.permission_mode != "bypass":
             launch[role]["permission_mode"] = cfg.permission_mode
+        # Argv tokens `interactive_argv` appends after the mode's args in a linked
+        # worktree (DW-599), placeholders unfilled; same byte-identity rule.
+        if prof.linked_worktree_args:
+            launch[role]["linked_worktree_args"] = list(prof.linked_worktree_args)
     payload = {
         "verify_commands": list(policy.verify.commands),
         "plugins_enabled": sorted(policy.plugins.enabled),
@@ -852,6 +858,7 @@ def build_run_state(
     initiative_folder: str = "",
     store_topology: dict[str, str | None] | None = None,
     ticket_epic_filter: str = "",
+    parent_initiative: str | None = None,
 ) -> RunState:
     """Assemble the launch-time :class:`RunState` for a fresh run.
 
@@ -880,7 +887,9 @@ def build_run_state(
     for a tickets run, whose tree reads refuse once the live initiative differs;
     every other source records them empty. ``store_topology`` is the classified
     ticket store (``ticketstore.StoreTopology.to_dict``), and ``ticket_epic_filter``
-    the ``--epic`` selector resolved to an epic slug, likewise tickets only."""
+    the ``--epic`` selector resolved to an epic slug, likewise tickets only.
+    ``parent_initiative`` is a chained child run's parent (``initiative`` then
+    names the child), likewise tickets only."""
     tickets = source == worksource.SOURCE_TICKETS
     return RunState(
         run_id=run_id,
@@ -898,22 +907,24 @@ def build_run_state(
         initiative_folder=initiative_folder if tickets else "",
         store_topology=dict(store_topology or {}) if tickets else {},
         ticket_epic_filter=ticket_epic_filter if tickets else "",
+        parent_initiative=parent_initiative if tickets else None,
         trusted_config_digest=trusted_config_digest,
     )
 
 
 def _run_store_topology(
-    paths: bmadconfig.ProjectPaths, policy: Policy, source: str
+    paths: bmadconfig.ProjectPaths, policy: Policy, source: str, *, chained: bool = False
 ) -> dict[str, str | None]:
     """The ticket-store topology a tickets run records at its start (``{}`` for any
     other source, and when there is no initiative folder to classify — the
     preflight's ``tickets.initiative-*`` checks own that refusal). The run preflight
     refused every unrunnable store already, so a store refused here changed in
     between; that raises :class:`ticketstore.TicketStoreError` rather than starting
-    unrecorded."""
+    unrecorded. ``chained``: ``paths`` are a chained run's, re-rooted on its child
+    (:func:`ticketstore.assess_store`)."""
     if source != worksource.SOURCE_TICKETS:
         return {}
-    result = ticketstore.assess_store(paths, policy.scm.isolation)
+    result = ticketstore.assess_store(paths, policy.scm.isolation, chained=chained)
     if result is None:
         return {}
     if isinstance(result, ticketstore.StoreRefusal):
@@ -979,7 +990,9 @@ class SweepPinError(ValueError):
     """A sweep would resume under another BMAD v7 initiative than it started on."""
 
 
-def sweep_initiative_conflict(state: RunState, paths: bmadconfig.ProjectPaths) -> str | None:
+def sweep_initiative_conflict(
+    state: RunState, paths: bmadconfig.ProjectPaths, *, rerooted: bool = False
+) -> str | None:
     """The refusal text when a sweep would resume on another initiative than the
     one it pinned at launch (``RunState.initiative``), else None. Every story run
     is None here: a tickets run checks its pin on each tree read instead.
@@ -991,9 +1004,27 @@ def sweep_initiative_conflict(state: RunState, paths: bmadconfig.ProjectPaths) -
     whose ids mean other entries. The live side is ``paths.active_initiative``
     (``""`` off v7). A sweep that started with no initiative active pins
     ``""``; one written before the pin existed reads the same, which on a v7
-    project with an initiative active is refused rather than guessed."""
+    project with an initiative active is refused rather than guessed.
+
+    A chained child's run-end sweep (``state.parent_initiative`` set) works the
+    child's ledger but is pinned to the PARENT, as the chained run is
+    (:func:`runs.paths_for_state`). ``rerooted`` names which paths the caller
+    passes, and is never inferred from their values — a live config naming the
+    child loads paths that look re-rooted:
+
+    - ``rerooted=False`` (default): ``bmadconfig.load_paths`` output. Passes only
+      while the live ``active_initiative`` names ``state.parent_initiative``.
+    - ``rerooted=True``: :func:`runs.paths_for_state` output, which raised
+      unless the live config named the parent. Passes only when the paths are
+      rooted on the child (``active_initiative`` and the initiative folder's name
+      are ``state.initiative``).
+
+    An unchained sweep is judged the same either way (``paths_for_state``
+    returns its loaded paths unchanged)."""
     if state.run_type != "sweep":
         return None
+    if state.parent_initiative is not None:
+        return _chained_sweep_conflict(state, paths, rerooted=rerooted)
     pinned = state.initiative
     live = paths.active_initiative if paths.era == "v7" else ""
     if pinned == live:
@@ -1009,6 +1040,34 @@ def sweep_initiative_conflict(state: RunState, paths: bmadconfig.ProjectPaths) -
         f"sweep {state.run_id} started on {started}, but the active initiative is now "
         f"{now}; its ledger and pre-answers belong to the initiative it started on. "
         f"To resume it, {fix} (_bmad/custom/config.user.toml); otherwise start a new sweep"
+    )
+
+
+def _chained_sweep_conflict(
+    state: RunState, paths: bmadconfig.ProjectPaths, *, rerooted: bool
+) -> str | None:
+    """:func:`sweep_initiative_conflict` for a chained child's sweep."""
+    parent = state.parent_initiative
+    child = state.initiative
+    live = paths.active_initiative if paths.era == "v7" else ""
+    folder = paths.initiative_folder if paths.era == "v7" else None
+    if rerooted:
+        if live == child and folder is not None and folder.name == child:
+            return None
+        found = (
+            f"its paths are rooted on initiative {live!r} ({folder})"
+            if live
+            else "its paths are rooted on no initiative"
+        )
+    else:
+        if live == parent:
+            return None
+        found = f"the active initiative is now {repr(live) if live else 'unset'}"
+    return (
+        f"sweep {state.run_id} works child initiative {child!r} of parent initiative "
+        f"{parent!r}, but {found}; its ledger and pre-answers belong to that child. "
+        f"To resume it, set `[core] active_initiative` back to {parent!r} "
+        "(_bmad/custom/config.user.toml); otherwise start a new sweep"
     )
 
 
@@ -1319,6 +1378,40 @@ def _unwind_composition(
                 journal.append("composition-unwind-failed", run_id=run_dir.name, error=detail)
 
 
+def _chained_child_refusal(paths: bmadconfig.ProjectPaths, parent: str) -> str | None:
+    """Why ``paths`` are not rooted on a child initiative of ``parent``, or None.
+    The child must be listed in the parent's ``[[initiative]]`` table, read as the
+    tickets preflight reads it (``install._initiative_children``) from the
+    parent's folder: the child folder's sibling named ``parent``, the sibling
+    :meth:`~bmadconfig.ProjectPaths.with_initiative` derives the child from."""
+    child, folder = paths.active_initiative, paths.initiative_folder
+    if paths.era != "v7" or folder is None or not child or child == parent:
+        rooted = repr(child) if child else "no initiative"
+        return (
+            f"a chained run of parent initiative {parent!r} needs paths rooted on one "
+            f"of its child initiatives, not on {rooted} ({paths.era})"
+        )
+    children, breakdown, fault = install._initiative_children(folder.parent / parent)
+    if fault:
+        return (
+            f"a chained run of parent initiative {parent!r} cannot confirm {child!r} is "
+            f"one of its child initiatives: reading {breakdown} failed: {fault}"
+        )
+    if children is None:
+        return (
+            f"a chained run of parent initiative {parent!r} needs paths rooted on one "
+            f"of its child initiatives, not on {child!r}: {breakdown} lists no "
+            "`[[initiative]]` children"
+        )
+    if child not in children:
+        listed = ", ".join(children) or "none"
+        return (
+            f"a chained run of parent initiative {parent!r} needs paths rooted on one "
+            f"of its child initiatives, not on {child!r}: {breakdown} lists {listed}"
+        )
+    return None
+
+
 def compose_run(
     *,
     project: Path,
@@ -1339,6 +1432,7 @@ def compose_run(
     profiles: dict[str, CLIProfile] | None = None,
     plugin_grants: GrantSet = GrantSet.empty(),
     ticket_epic_filter: str = "",
+    parent_initiative: str | None = None,
 ) -> ComposedRun:
     """Stand up a run: allocate the run dir, persist state + pid, build the
     adapters, and wire the engine — everything ``cmd_run`` did inline between its
@@ -1368,11 +1462,28 @@ def compose_run(
     ``ticket_epic_filter`` is a tickets run's ``--epic`` selector, already resolved
     to an epic slug by the caller (``epic_filter`` stays None for such a run, and
     ``story_filter`` carries the resolved ticket ref).
+
+    ``parent_initiative`` is set only for a chained child run: ``paths`` are then
+    that child's (``ProjectPaths.with_initiative``), so the run pins the child as
+    its ``initiative`` and folder, and records the parent
+    (``RunState.parent_initiative``, which :func:`runs.paths_for_state` re-roots
+    on). Paths not rooted on a child of it raise ValueError before anything is
+    published (:func:`_chained_child_refusal`): off v7, with no active initiative
+    folder, naming the parent itself, or naming an initiative the parent's
+    ``[[initiative]]`` table does not list — or a parent with no such table, or
+    whose table cannot be read. The caller arms ``sweep_factory`` with the same
+    parent.
     """
+    if parent_initiative is not None and (
+        refusal := _chained_child_refusal(paths, parent_initiative)
+    ):
+        raise ValueError(refusal)
     run_id = run_id or runs.new_run_id()
     run_dir = project / RUNS_DIR / run_id
     # Before the claim: a store that changed since the preflight leaves nothing behind.
-    store_topology = _run_store_topology(paths, policy, source)
+    store_topology = _run_store_topology(
+        paths, policy, source, chained=parent_initiative is not None
+    )
     # Outside the try below, and it must stay there: a collision refusal that
     # reached `_unwind_composition` would delete the run it exists to protect.
     composer_claim = _claim_run_dir(run_dir)
@@ -1408,6 +1519,7 @@ def compose_run(
             ),
             store_topology=store_topology,
             ticket_epic_filter=ticket_epic_filter,
+            parent_initiative=parent_initiative,
         )
         journal = Journal(run_dir, pin=state)
         # State becoming resumable and the pid making this process live are one
@@ -1479,6 +1591,7 @@ def compose_sweep(
     profiles: dict[str, CLIProfile] | None = None,
     on_started: Callable[[], None] | None = None,
     plugin_grants: GrantSet = GrantSet.empty(),
+    parent_initiative: str | None = None,
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
@@ -1496,6 +1609,13 @@ def compose_sweep(
     injected so ``cli`` supplies its own module-level names — keeping the test
     suite's ``monkeypatch.setattr(cli, "SweepEngine"/"_make_adapters", ...)``
     effective.
+
+    ``parent_initiative`` is set only for the run-end sweep of a chained child
+    (``RunState.parent_initiative`` of the run that triggered it): ``paths`` are
+    then that child's (:func:`runs.paths_for_state`), so the sweep works the
+    child's ledger and pins the child as its ``initiative``, and it records the
+    parent, which a resume finds still active (:func:`sweep_initiative_conflict`).
+    Recorded on v7 only.
 
     ``plugin_grants`` is the launch's frozen grant set, as in :func:`compose_run`.
     For the auto-sweep child it is the set the PARENT's launch read, held by the
@@ -1597,6 +1717,8 @@ def compose_sweep(
             initiative_folder=(
                 str(paths.initiative_folder) if v7 and paths.initiative_folder is not None else ""
             ),
+            # a chained child's sweep: the parent its pin names (above: the child)
+            parent_initiative=parent_initiative if v7 else None,
             store_topology=store_topology,
         )
         journal = Journal(run_dir, pin=state)
@@ -1692,7 +1814,8 @@ def compose_resume(
     effect (:func:`_engine_cls_for`)."""
     if state.run_type == "sweep":
         validate_sweep_options_version(state.sweep_options_version)
-        if (conflict := sweep_initiative_conflict(state, paths)) is not None:
+        # `paths` are the run's own: re-rooted on a chained sweep's child
+        if (conflict := sweep_initiative_conflict(state, paths, rerooted=True)) is not None:
             raise SweepPinError(conflict)
         story_engine = None
     else:

@@ -51,6 +51,13 @@ CTL_SESSION = runs.CTL_SESSION
 _CTL_WINDOW_RE = re.compile(r"^(?:run|sweep|resume|resolve)-(.+)$")
 
 
+def _ctl_window_name(kind: str, run_id: str) -> str:
+    """The name a control-session window hosting `run_id` carries: the one
+    start_detached mints and claim_renamed_ctl_window renames to, and the one
+    _CTL_WINDOW_RE parses back."""
+    return f"{kind}-{run_id}"
+
+
 class LaunchError(Exception):
     pass
 
@@ -423,6 +430,50 @@ def claim_ctl_window(project: Path, run_id: str, *, launched: bool = False) -> s
         f"this window could not be recorded as run {run_id}'s control window — "
         "attach and stop from the TUI may target an older window for this run"
     )
+
+
+def claim_renamed_ctl_window(project: Path, run_id: str, *, launched: bool = False) -> str | None:
+    """claim_ctl_window for a run this process starts in a window it already
+    drives under another run's name: a parent-initiative chain builds each next
+    child as a new run, in the process and so the window of the run before it
+    (cli `_drive_initiative_chain`). The lookup reaches a run's window by name,
+    so the window is renamed first, to the `run` name start_detached would have
+    given `run_id`, and then claimed. Afterwards ctl_window_id answers the
+    window for `run_id` and no longer for the run before: that run's record
+    still names it, but the lookup re-proves a record by name and drops it.
+
+    Nothing is re-stamped. The project tag is a window option, which a rename
+    keeps, and a chain stays in its project, so start_detached's tag still
+    proves the window ours.
+
+    Same contract as claim_ctl_window: operator wording when the claim did not
+    land, None when it did or when this process is in no control session (an
+    operator's shell owns no window to rename). A rename that raises is worded
+    and claims nothing: the window keeps the previous run's name and record,
+    so `a` and `x` on that run still reach the window driving this one.
+
+    `launched` is the chain process's own `--ctl-launch`, whichever command
+    started the chain (a TUI `run` included): with it, a session probe that
+    goes unanswered is worded, not taken for an operator's shell."""
+    try:
+        win_id = get_multiplexer().current_window_id() if in_ctl_session() else None
+    except MultiplexerError:
+        if not launched:
+            raise
+        win_id = None
+    if not win_id:
+        # No window to rename: an operator's shell answers None from the claim,
+        # a launched window that cannot name itself the claim's wording.
+        return claim_ctl_window(project, run_id, launched=launched)
+    try:
+        get_multiplexer().rename_window(win_id, _ctl_window_name("run", run_id))
+    except MultiplexerError as e:
+        return (
+            f"this window could not be renamed for run {run_id} ({e}), so attach and stop "
+            f"from the TUI cannot find it as the run's control window — stop it with: "
+            f"bmad-loop stop {run_id}"
+        )
+    return claim_ctl_window(project, run_id, launched=launched)
 
 
 def recorded_ctl_window(project: Path, run_id: str) -> str | None:
@@ -1483,7 +1534,7 @@ def start_detached(project: Path, argv_tail: list[str], run_id: str, kind: str) 
         win_id = (
             mux.new_parked_window(
                 ctl,
-                f"{kind}-{run_id}",
+                _ctl_window_name(kind, run_id),
                 project,
                 argv,
                 RETURN_OPTION,

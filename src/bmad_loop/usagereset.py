@@ -1,6 +1,7 @@
 """Parse the ``resets …`` clause of a coding CLI's usage-limit line (#610).
 
-Pure: no clock reads, no I/O beyond the stdlib zone database and the host's
+Pure: no clock reads, no I/O beyond the zone database (the system's, or the
+``tzdata`` package zoneinfo falls back to, a Windows dependency) and the host's
 local-time rules. The caller passes ``now`` and the full pane line that a
 ``usage_limit_patterns`` / ``usage_wait_patterns`` entry matched; the result
 feeds the pause reason, ``heartbeat.json`` (``quota_resets_at``), the
@@ -22,8 +23,8 @@ across a DST change would get an hour wrong.
 
 Degrade contract: :func:`parse_reset` never raises. A line with no clause is
 ``None``. A clause it cannot resolve keeps its raw text with ``at=None`` and
-names why in ``unresolved``: ``"zone-unavailable"`` when the named zone is not
-in this host's zone database (Windows without the ``tzdata`` package, say), and
+names why in ``unresolved``: ``"zone-unavailable"`` only when neither the
+system zone database nor the ``tzdata`` package provides the named zone, and
 ``"unparsed"`` for any other shape. The caller makes that degrade visible (the
 generic adapter writes a ``usage-reset-unparsed`` crumb and carries the raw
 text); it is never read as "no reset".
@@ -38,7 +39,7 @@ from datetime import time as dtime
 from datetime import timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-__all__ = ["UsageReset", "parse_reset"]
+__all__ = ["UsageReset", "parse_reset", "resolved_reset"]
 
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -108,6 +109,25 @@ def parse_reset(line: str, now: datetime) -> UsageReset | None:
     if at is None:
         return _unresolved(raw, "unparsed")
     return UsageReset(raw=raw, at=at, unresolved=None)
+
+
+def resolved_reset(value: str | None) -> str | None:
+    """``value`` when it is a :attr:`UsageReset.value` that resolved, else None.
+
+    A resolved value is ``datetime.isoformat()`` of an aware datetime, so it
+    round-trips exactly through ``datetime.fromisoformat`` with an offset; raw
+    clause text (an unresolved reset) does not. Lets a consumer of the carried
+    string (``SessionResult.usage_limit_resets``) tell the two apart without a
+    second field."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.utcoffset() is None or parsed.isoformat() != value:
+        return None
+    return value
 
 
 def _unresolved(raw: str, why: str) -> UsageReset:

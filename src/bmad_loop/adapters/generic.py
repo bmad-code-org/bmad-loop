@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import regex
 
@@ -53,8 +53,10 @@ from ..process_host import ProcessHostError, get_process_host
 from ..signals import REBIND_SOURCES, SessionAttribution, SignalWatcher
 from ..tokens import read_usage as tally_usage
 from ..usagereset import UsageReset, parse_reset
-from ..verify import read_frontmatter, status_of
+from ..verify import GitError, git_bytes, read_frontmatter, status_of
 from .base import (
+    USAGE_LIMIT_BLOCKED,
+    USAGE_LIMIT_WAIT,
     CodingCLIAdapter,
     SessionHandle,
     SessionResult,
@@ -160,8 +162,9 @@ class _IdleTracker:
     declares a subagent tree: the wait loop's `sample_transcript` reads
     `last_key[1]` as the parent's byte size — the #727 growth test and the scan
     offset for `_transcript_has_assistant_activity` — so a folded key would credit
-    subagent bytes as parent growth and scan from a wrong offset. The tree gets
-    its own `sub_key`, OR-ed only into the idle clock's change test.
+    subagent bytes as parent growth and scan from a wrong offset. The tree (and
+    any spawned child conversations) gets its own `sub_key`, OR-ed only into the
+    idle clock's change test.
 
     `tool_scan_failures` is the streak of `session-idle` `in_tool` reads that
     raised; it never moves the clock, only the `tool-scan-*` crumbs."""
@@ -187,6 +190,11 @@ class _IdleTracker:
     # Reset on a re-point; kept through a failed walk, so writes made during a
     # fault count as movement once the walk recovers.
     sub_key: tuple[int, int, int] | None = None
+    # Whether the last walk watched the spawned children (DW-548): their
+    # parent's conversation folder could be judged. A flip changes what the key
+    # covers, so it rebaselines `sub_key` rather than reading as movement. None
+    # = not walked on this path yet; reset on a re-point.
+    sub_children_judged: bool | None = None
     # The running streak of subagent-tree walks that raised: crumbed at its
     # transitions (`subagent-scan-failed` / `subagent-scan-recovered`). NOT reset
     # on a re-point, so a streak open across one still gets its recovery crumb.
@@ -239,7 +247,8 @@ class _ParkedNotice:
     `wait_for_completion` call: the `session-parked` / `session-unparked`
     journal pair a PermissionPrompt latch opens. Observation only; the parked
     latch the stall and timeout gates read is the wait loop's own and is never
-    touched from here.
+    touched from here (the loop clears it itself when this notice closes on
+    activity).
 
     `open` is set while a `session-parked` awaits its `session-unparked`.
     `baseline` is the transcript's (mtime_ns, size), stat'ed fresh at the
@@ -418,6 +427,94 @@ def _is_regular_file(path: str | None) -> bool:
         return False
 
 
+def _conversation_folder(session_id: str | None, transcript_path: str | None) -> Path | None:
+    """The conversation folder a transcript sits in under a spawn-marker layout
+    (DW-548): its nearest ancestor named by the session id, or None when there
+    is no id, no transcript path, or no such ancestor — nothing to judge."""
+    if (
+        not session_id
+        or not transcript_path
+        or session_id in (".", "..")
+        or "\0" in transcript_path
+    ):
+        return None
+    return next((p for p in Path(transcript_path).parents if p.name == session_id), None)
+
+
+def _spawned_children(template: str, conversation: Path) -> list[Path]:
+    """The child conversation folders ``conversation`` lists through the spawn
+    marker its CLI writes there at each spawn (DW-548; the profile's
+    ``subagent_spawn_marker``, ``{session_id}`` read as the wildcard): each
+    child's folder is ``<store root>/<childId>/``, a sibling of
+    ``conversation``, whether or not it exists yet.
+
+    The component holding ``{session_id}`` is matched against a listing of its
+    directory; a candidate id counts only when the whole marker it fills in
+    stats, so a template with the id in a middle component holds too. The
+    conversation's own id and "."/".." never count. Stat-only, nothing is
+    opened. ``FileNotFoundError``/``NotADirectoryError`` on the listed
+    directory (no spawn yet) or on a candidate marker read as absent; every
+    other ``OSError`` propagates for the caller to crumb, so a fault never
+    reads as "no children"."""
+    parts = Path(template.format(session_id="\0")).parts
+    index = next(i for i, part in enumerate(parts) if "\0" in part)
+    head, *tail = parts[index].split("\0")
+    pattern = regex.escape(head)
+    for n, piece in enumerate(tail):
+        pattern += ("(?P<id>.+)" if n == 0 else "(?P=id)") + regex.escape(piece)
+    matcher = regex.compile(pattern)
+    try:
+        with os.scandir(conversation.joinpath(*parts[:index])) as entries:
+            names = [entry.name for entry in entries]
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    children: list[Path] = []
+    for name in sorted(names):
+        match = matcher.fullmatch(name)
+        if match is None or match["id"] in (".", "..", conversation.name):
+            continue
+        try:
+            os.stat(conversation / template.format(session_id=match["id"]))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        children.append(conversation.parent / match["id"])
+    return children
+
+
+def _spawn_marker_verdict(
+    template: str, session_id: str | None, transcript_path: str | None
+) -> Literal["child", "own", "unjudged"]:
+    """Whether a Stop is a child conversation's, by the spawn marker its parent
+    wrote (DW-548; the profile's ``subagent_spawn_marker``).
+
+    agy runs a subagent as its own conversation: a folder named by its id,
+    beside the parent's under one store root (``brain/<id>/``), holding the
+    transcript its Stop reports. The conversation folder is the transcript's
+    nearest ancestor named by the session id; the Stop is a child's ("child")
+    when any OTHER folder under the store root holds ``template`` with the id
+    filled in, else "own". "unjudged" when there is no id, no transcript path,
+    or no ancestor named by the id: there is nowhere to look.
+
+    Stat-only, nothing is opened. ``FileNotFoundError``/``NotADirectoryError``
+    on a candidate marker read as absent; every other ``OSError`` — the store
+    root's listing included — propagates for the caller to crumb, so a fault
+    never reads as "own"."""
+    conversation = _conversation_folder(session_id, transcript_path)
+    if conversation is None or session_id is None:
+        return "unjudged"
+    marker = template.format(session_id=session_id)
+    with os.scandir(conversation.parent) as entries:
+        for entry in entries:
+            if entry.name == session_id:
+                continue
+            try:
+                os.stat(Path(entry.path, marker))
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            return "child"
+    return "own"
+
+
 def _subagent_tree_files(root: Path) -> list[tuple[Path, os.stat_result]]:
     """Every subagent transcript (``*.jsonl``) under ``root``, recursively, with
     its stat — the stat-only walk behind the idle notice's subagent fold.
@@ -505,6 +602,43 @@ def _idle_tool_slug(name: str) -> str:
     if name.startswith("mcp__"):
         return "mcp"
     return "other"
+
+
+class LinkedWorktreeGrantError(RuntimeError):
+    """A sandboxed launch that owes a linked worktree's gitdir grant (DW-599)
+    could not resolve the paths to grant. Raised out of ``start_session``
+    rather than launching without the grant: such a session could not
+    `git add`/`commit`, and would fail its unit only after spending its turn."""
+
+
+def _linked_worktree_git_dirs(cwd: Path) -> tuple[Path, Path] | None:
+    """``(gitdir, common dir)`` of the linked worktree ``cwd`` is in, both
+    resolved; None in a main checkout, whose gitdir IS its common dir. Every
+    fault raises :class:`LinkedWorktreeGrantError`: the caller has already
+    decided a grant is owed, and a session run without it cannot commit."""
+    try:
+        answer = git_bytes(
+            cwd, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"
+        )
+    except GitError as e:
+        raise LinkedWorktreeGrantError(f"could not ask git for the git dirs of {cwd}: {e}") from e
+    try:
+        # fsdecode can raise on Windows (utf-8/surrogatepass refuses a lone byte).
+        stdout, stderr = os.fsdecode(answer.stdout), os.fsdecode(answer.stderr)
+    except UnicodeError as e:
+        raise LinkedWorktreeGrantError(f"could not decode the git dirs of {cwd}: {e}") from e
+    if answer.returncode != 0:
+        detail = stderr.strip() or f"git exited {answer.returncode}"
+        raise LinkedWorktreeGrantError(f"could not read the git dirs of {cwd}: {detail}")
+    # One path per line; removesuffix, not strip: every other byte is the path's.
+    lines = stdout.removesuffix("\n").split("\n")
+    if len(lines) != 2 or not all(lines):
+        raise LinkedWorktreeGrantError(f"unexpected git dirs for {cwd}: {lines!r}")
+    try:
+        git_dir, common_dir = Path(lines[0]).resolve(), Path(lines[1]).resolve()
+    except (OSError, RuntimeError) as e:
+        raise LinkedWorktreeGrantError(f"could not resolve the git dirs of {cwd}: {e}") from e
+    return None if git_dir == common_dir else (git_dir, common_dir)
 
 
 class _ResultFileMixin:
@@ -1142,7 +1276,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     def interactive_argv(self, spec: SessionSpec) -> list[str]:
         extra = self.extra_args
         if extra is None:
-            extra = self.profile.bypass_args
+            # The linked-worktree grant rides with the mode args it extends, so an
+            # `extra_args` override (which replaces them) drops it too.
+            extra = (*self.profile.bypass_args, *self._linked_worktree_grant(spec.cwd))
         binary = self.binary
         if self.profile.hooks.dialect == "codex-hooks-json":
             from ..codex_trust import resolved_codex_binary
@@ -1157,6 +1293,24 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if spec.model:
             argv += [self.profile.model_flag, spec.model]
         return argv
+
+    def _linked_worktree_grant(self, cwd: Path) -> tuple[str, ...]:
+        """The permission mode's ``linked_worktree_args`` filled in with the
+        gitdir and common dir of the linked worktree ``cwd`` is in (DW-599); ()
+        when the mode declares none (bypass, or a CLI whose sandbox needs no
+        grant) or ``cwd`` is a main checkout. Git is asked only when a grant
+        could be owed; a fault raises :class:`LinkedWorktreeGrantError`."""
+        if not self.profile.linked_worktree_args:
+            return ()
+        dirs = _linked_worktree_git_dirs(cwd)
+        if dirs is None:
+            return ()
+        try:
+            return self.profile.render_linked_worktree_args(*dirs)
+        except ValueError as e:
+            raise LinkedWorktreeGrantError(
+                f"cannot write the git dirs of {cwd} into {self.profile.name}'s grant: {e}"
+            ) from e
 
     def interactive_env(self, spec: SessionSpec) -> dict[str, str]:
         # The pin chokepoint (runs.pin_state_root): the profile's [env] table
@@ -1303,6 +1457,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # once for all id-less drops, under the None key (DW-507).
         foreign_hook_events = 0
         crumbed_foreign: set[str | None] = set()
+        # DW-548: admitted Stops that carried `fully_idle: false` — agy's yield
+        # to a foreground subagent, not a turn end. Crumbed once per attempt;
+        # heartbeat + timeout-fired carry the running count.
+        stop_yields_ignored = 0
+        # DW-548: child-conversation ids whose Stops are dropped (crumbed once
+        # each), and the one-shot crumbs for a Stop the spawn-marker rule could
+        # not read or could not judge — both admitted as before.
+        spawned_children: set[str] = set()
+        marker_unreadable_crumbed = False
+        marker_unjudged_crumbed = False
         # DW-507: the one-shot crumb for a lineage the first SessionStart could
         # not calibrate ("miscalibrated"/"unavailable"), so the degrade to the
         # #767 rules alone is visible in session-lifecycle.jsonl.
@@ -1365,7 +1529,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # event saying the CLI is waiting on a human (a permission/idle/quota
         # prompt), or None. Set by a parked kind — directly, or a `Notification`
         # whose subtype the profile maps — and cleared by a `Stop`, since a turn
-        # that ended proves the prompt was answered. It completes nothing and
+        # that ended proves the prompt was answered; a PermissionPrompt latch is
+        # also cleared when the live notice closes on a transcript write after it
+        # (DW-594). It completes nothing and
         # re-arms nothing: it is consulted only where the grace expiry would type
         # the stall wake nudge, which it withholds (the nudge's Enter can answer
         # the prompt, #727), ending the session `stalled` + `parked`.
@@ -1448,8 +1614,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 frame_key = tick_key
 
         # Idle detection (#680): the live transcript's (mtime_ns, size) — plus the
-        # profile's subagent transcript tree, whose writes also count as activity
-        # — sampled on the heartbeat cadence from the first tick that knows
+        # profile's subagent transcript tree and spawned child conversations, whose
+        # writes also count as activity — sampled on the heartbeat cadence from the first tick that knows
         # `transcript_path`; see `_sample_transcript_idle`. Observes only: nothing here nudges,
         # stalls or kills (#680 item 2 stays open), and `stall_deadline` is
         # neither consulted nor touched.
@@ -1472,12 +1638,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # the next clean scan.
         scan_failures = 0
 
-        def sample_transcript(path: str, now: float) -> None:
+        def sample_transcript(path: str, now: float) -> bool:
             nonlocal transcript_work_seen, scan_failures
             same_path = idle.path == path
             prior_key = idle.last_key if same_path else None
             was_absent = idle.seen_absent if same_path else False
-            self._sample_transcript_idle(handle.task_id, path, idle, now)
+            sampled = self._sample_transcript_idle(handle.task_id, path, idle, now, session_id)
             current_key = idle.last_key
             # A same-size rewrite or truncation does not append a new record.
             # Scanning from byte zero in that case would credit an old assistant
@@ -1498,12 +1664,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             "transcript-scan-failed",
                             error=f"{type(e).__name__}: {e}",
                         )
-                    return
+                    return sampled
                 if scan_failures:
                     self._note_lifecycle(
                         handle.task_id, "transcript-scan-recovered", failures=scan_failures
                     )
                 scan_failures = 0
+            return sampled
 
         def try_resolve() -> None:
             """Resolve the transcript by session id when no readable one is known.
@@ -1568,7 +1735,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return self._quota_wait_tool_open(handle, path)
 
         def stall_exit(
-            parked_now: str | None, usage_now: str | None, resets_now: str | None = None
+            parked_now: str | None,
+            usage_now: str | None,
+            resets_now: str | None = None,
+            class_now: str | None = None,
         ) -> SessionResult:
             """The non-completion exit of a stalled session (DW-348, #610):
             resolve, then re-probe liveness. A now-dead window is ``crashed``
@@ -1576,7 +1746,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             is gone). Otherwise ``stalled`` with ``accept_result=False``: an
             artifact on disk cannot upgrade the stall to completed (it may be
             stale or mid-write; only a Stop or window death vouches for it), and
-            ``parked_now`` / ``usage_now`` / ``resets_now`` label it. Both exits
+            ``parked_now`` / ``usage_now`` / ``resets_now`` / ``class_now``
+            label it. Both exits
             carry the rollout."""
             try_resolve()
             if self._probe_liveness(handle, "stall") is False:
@@ -1608,6 +1779,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     parked_evidence=parked_now,
                     usage_limited=usage_now,
                     usage_limit_resets=resets_now if usage_now is not None else None,
+                    usage_limit_class=class_now if usage_now is not None else None,
                 )
             return stalled
 
@@ -1632,7 +1804,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                     evidence = quota.evidence
                     self._end_quota_wait(handle, quota, "cap")
-                    return stall_exit(evidence, evidence, quota.resets)
+                    return stall_exit(evidence, evidence, quota.resets, USAGE_LIMIT_WAIT)
                 # The freeze runs on EVERY tick, not only on heartbeats: a wait
                 # admitted with less than a heartbeat interval left would
                 # otherwise time out between samples. This is the one sanctioned
@@ -1664,6 +1836,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # nonzero = a nested CLI's events were dropped (the parent's
                     # own Stop may have been read as foreign)
                     foreign_hook_events=foreign_hook_events,
+                    # nonzero = agy Stops read as subagent yields (DW-548)
+                    stop_yields_ignored=stop_yields_ignored,
                 )
                 # Every exit resolves first (a SessionStart that came before its
                 # rollout existed, then no further hook event): the exit's
@@ -1702,12 +1876,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # None = no baseline or no sample: the idle gate alone decides.
                 latch_moved = latch_key_now is not None and latch_key_now != parked_key
                 parked_now = None if latch_moved else parked_evidence
-                parked_hit, usage_hit = self._pane_evidence(
+                parked_hit, blocked_hit, waiting_hit = self._pane_evidence(
                     handle,
                     self._parked_prompt_patterns if parked_now is None else (),
-                    self._usage_pane_patterns,
+                    self._usage_limit_patterns,
+                    self._usage_wait_patterns,
                     skip=quota.spent,
                 )
+                usage_hit = self._usage_hit(blocked_hit, waiting_hit)
                 if parked_now is None and parked_hit is not None:
                     parked_now = parked_hit[0]
                 if (parked_now is not None or usage_hit is not None) and self._probe_liveness(
@@ -1726,9 +1902,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     and not latch_unmoved
                 ):
                     parked_now = None
-                usage_now = resets_now = None
+                usage_now = resets_now = class_now = None
                 if usage_hit is not None and not still_working():
-                    usage_now = usage_hit[0]
+                    usage_now, class_now = usage_hit[0], usage_hit[2]
                     reset = self._usage_reset(handle, usage_hit[1], _local_now())
                     resets_now = reset.value if reset is not None else None
                 timed_out = SessionResult(
@@ -1742,6 +1918,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     produced_work=produced_work(),
                     usage_limited=usage_now,
                     usage_limit_resets=resets_now,
+                    usage_limit_class=class_now,
                 )
                 if parked_now is not None:
                     return dataclasses.replace(timed_out, parked=True, parked_evidence=parked_now)
@@ -1780,16 +1957,30 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # Transcript idle sample (#680), ahead of the heartbeat write so
                 # the payload carries this tick's age. Inert until a hook event
                 # has named the transcript.
+                sampled = False
                 if transcript_path:
-                    sample_transcript(transcript_path, now)
-                if notice.open and idle.last_key is not None:
+                    sampled = sample_transcript(transcript_path, now)
+                if notice.open and sampled:
                     # The live parked notice (#855) closes on this sample, not
                     # on pane growth: the auto-deny countdown repaints the pane
-                    # every second while the prompt waits.
+                    # every second while the prompt waits. Only a stat taken
+                    # this tick counts: after a failed one `idle.last_key` is
+                    # an older sample, which can predate the latch and so
+                    # differ from its key while the prompt still waits.
                     if notice.baseline is None:
                         notice.baseline = idle.last_key
                     elif idle.last_key != notice.baseline:
                         self._note_session_unparked(handle, notice, "activity")
+                        # A write after the latch is the prompt answered (in
+                        # the window, or by the TUI's `Y`): the CLI is working
+                        # again, so the PermissionPrompt latch goes with the
+                        # notice and the stall gate nudges instead of parking
+                        # (DW-594). A latch whose key is unchanged is the
+                        # prompt itself and stays.
+                        if parked_kind == "PermissionPrompt" and (
+                            parked_key is None or idle.last_key != parked_key
+                        ):
+                            parked_evidence = parked_kind = parked_key = None
                 if quota.waiting:
                     # The transcript moved: the CLI continued after the reset.
                     # The timeout resumes from the remaining time frozen at
@@ -1845,7 +2036,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 resets_at=resets,
                                 cap_left_s=round(cap_left, 3),
                             )
-                            return stall_exit(wait_hit[0], wait_hit[0], resets)
+                            return stall_exit(wait_hit[0], wait_hit[0], resets, USAGE_LIMIT_WAIT)
                         frozen = max(
                             min(remaining, wall_deadline - time.time()),
                             QUOTA_WAIT_MIN_REMAINING_S,
@@ -1888,6 +2079,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         "usage_sample_failures": usage_failures,
                         # hook events dropped as a nested CLI's (#767)
                         "foreign_hook_events": foreign_hook_events,
+                        # Stops ignored as subagent yields (DW-548)
+                        "stop_yields_ignored": stop_yields_ignored,
                         # the usage-limit quota wait (DW-396): present only when
                         # this session can enter one.
                         **(
@@ -2187,17 +2380,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # a silent foreground tool past the grace, say), which
                     # stalls as before #610 rather than pausing uncharged.
                     parked_now = parked_evidence
-                    parked_hit, usage_hit = self._pane_evidence(
+                    parked_hit, blocked_hit, waiting_hit = self._pane_evidence(
                         handle,
                         self._parked_prompt_patterns if parked_now is None else (),
-                        self._usage_pane_patterns,
+                        self._usage_limit_patterns,
+                        self._usage_wait_patterns,
                         skip=quota.spent,
                     )
+                    usage_hit = self._usage_hit(blocked_hit, waiting_hit)
                     if parked_now is None and parked_hit is not None:
                         parked_now = parked_hit[0]
-                    usage_now = resets_now = None
+                    usage_now = resets_now = class_now = None
                     if usage_hit is not None and not still_working():
-                        usage_now = usage_hit[0]
+                        usage_now, class_now = usage_hit[0], usage_hit[2]
                         reset = self._usage_reset(handle, usage_hit[1], _local_now())
                         resets_now = reset.value if reset is not None else None
                     if parked_now is None:
@@ -2243,7 +2438,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # persistent failure. A dead window is never labelled parked:
                     # nothing is waiting on a human once the CLI is gone. The
                     # probe fault is crumbed (`site="stall"`, DW-454).
-                    return stall_exit(parked_now, usage_now, resets_now)
+                    return stall_exit(parked_now, usage_now, resets_now, class_now)
                 continue
             # Drop a nested CLI's events before they can re-point the identity
             # or transcript, set stop_seen, spend nudges or re-arm the stall
@@ -2327,6 +2522,48 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # result-less completion -> false stall, and the main session's
                 # real transcript is preserved for usage tallying.
                 continue
+            spawn_marker = self.profile.subagent_spawn_marker
+            if event.event == "Stop" and spawn_marker:
+                # agy runs a subagent as a sibling conversation whose Stops reach
+                # this stream unannounced, so attribution admits them; its final
+                # `fully_idle: true` Stop would complete the parent while the
+                # parent still works (DW-548). A Stop whose id has a spawn marker
+                # in a sibling folder is the child's: dropped before it can
+                # re-point the identity or transcript. A fault or an unjudgeable
+                # Stop is admitted as before, crumbed once — never read as own.
+                if event.session_id in spawned_children:
+                    continue
+                try:
+                    verdict = _spawn_marker_verdict(
+                        spawn_marker, event.session_id, event.transcript_path
+                    )
+                except OSError as e:
+                    if not marker_unreadable_crumbed:
+                        marker_unreadable_crumbed = True
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "subagent-marker-unreadable",
+                            session_id=event.session_id,
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                else:
+                    if verdict == "child" and event.session_id:
+                        spawned_children.add(event.session_id)
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "subagent-stop-ignored",
+                            child_session_id=event.session_id,
+                            fully_idle=event.fully_idle,
+                        )
+                        continue
+                    if verdict == "unjudged" and not marker_unjudged_crumbed:
+                        marker_unjudged_crumbed = True
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "subagent-marker-unjudged",
+                            session_id=event.session_id,
+                            transcript_path=event.transcript_path,
+                        )
             session_id = event.session_id or session_id
             hook_transcript_path = event.transcript_path or hook_transcript_path
             hook_path = event.transcript_path
@@ -2377,6 +2614,22 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # An IdlePrompt never ends one.
                     if quota.waiting and parked_kind in QUOTA_WAIT_BLOCKING_KINDS:
                         self._end_quota_wait(handle, quota, "latch")
+                continue
+            if event.event == "Stop" and event.fully_idle is False:
+                # agy fires Stop with `fullyIdle: false` when the parent yields
+                # to a foreground subagent (DW-548): the session's own event, so
+                # the identity/transcript tracking above took it, but no turn
+                # ended. It must not set stop_seen, drop the parked latch or
+                # complete. Not profile-gated: only a CLI that sends the key
+                # carries it.
+                stop_yields_ignored += 1
+                if stop_yields_ignored == 1:
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "hook-stop-yield-ignored",
+                        session_id=event.session_id,
+                        ignored_so_far=stop_yields_ignored,
+                    )
                 continue
             if event.event == "Stop":
                 # A completed turn proves any prompt the CLI was parked on got
@@ -2548,29 +2801,66 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return path.parent / template.format(stem=path.stem)
 
     def _sample_subagent_tree(
-        self, task_id: str, transcript_path: str, idle: _IdleTracker
+        self,
+        task_id: str,
+        transcript_path: str,
+        idle: _IdleTracker,
+        session_id: str | None = None,
     ) -> tuple[int, int, int] | None:
-        """The subagent tree's `_subagent_tree_key` this tick, or None when there
-        is no tree to watch or the walk raised. A raising walk degrades the tick
-        to parent-only (the pre-subagent behaviour) and is crumbed at the streak's
-        transitions, as the wait loop's transcript scan is:
-        `subagent-scan-failed` (`path`, `error`) at failure 1,
-        `subagent-scan-recovered` (`failures`) at the next clean walk."""
+        """The subagent activity key this tick: `_subagent_tree_key` summed over
+        every root watched — (count, total_bytes, newest_mtime_ns) — or None when
+        there is nothing to watch or a walk raised.
+
+        The roots are the declared tree (`_subagent_root`) plus, when the
+        profile sets `subagent_spawn_marker`, every child conversation folder the
+        parent's own folder lists through it (`_spawned_children`, DW-548): agy
+        writes nothing to the parent while a foreground subagent runs, only to
+        the child's sibling folder. The parent's folder is the transcript's
+        ancestor named by `session_id` (`_conversation_folder`); when it cannot
+        be judged, no children are watched this tick — never guessed. A child
+        folder is walked with the same `*.jsonl` rule as the tree, so its
+        transcript (`.system_generated/logs/transcript_full.jsonl` on agy) is
+        activity and its other files are not. A change in whether children are
+        watched rebaselines the key.
+
+        A raising walk or marker listing degrades the tick to parent-only (the
+        pre-subagent behaviour) and is crumbed at the streak's transitions, as
+        the wait loop's transcript scan is: `subagent-scan-failed` (`path` =
+        the root walked, or the parent's conversation folder for a listing
+        fault; `error`) at failure 1, `subagent-scan-recovered` (`failures`) at
+        the next clean walk."""
         root = self._subagent_root(transcript_path)
-        if root is None:
+        marker = self.profile.subagent_spawn_marker
+        conversation = _conversation_folder(session_id, transcript_path) if marker else None
+        if root is None and conversation is None:
             return None
+        if idle.sub_children_judged != (conversation is not None):
+            idle.sub_children_judged = conversation is not None
+            idle.sub_key = None
+        roots = [] if root is None else [root]
+        where = root
         try:
-            key = _subagent_tree_key(root)
+            if marker and conversation is not None:
+                where = conversation
+                roots.extend(_spawned_children(marker, conversation))
+            keys: list[tuple[int, int, int]] = []
+            for where in roots:
+                keys.append(_subagent_tree_key(where))
         except OSError as e:
             idle.sub_scan_failures += 1
             if idle.sub_scan_failures == 1:
                 self._note_lifecycle(
                     task_id,
                     "subagent-scan-failed",
-                    path=str(root),
+                    path=str(where),
                     error=f"{type(e).__name__}: {e}",
                 )
             return None
+        key = (
+            sum(k[0] for k in keys),
+            sum(k[1] for k in keys),
+            max((k[2] for k in keys), default=0),
+        )
         if idle.sub_scan_failures:
             self._note_lifecycle(
                 task_id, "subagent-scan-recovered", failures=idle.sub_scan_failures
@@ -2613,13 +2903,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return "none" if name is None else _idle_tool_slug(name)
 
     def _sample_transcript_idle(
-        self, task_id: str, transcript_path: str, idle: _IdleTracker, now: float
-    ) -> None:
+        self,
+        task_id: str,
+        transcript_path: str,
+        idle: _IdleTracker,
+        now: float,
+        session_id: str | None = None,
+    ) -> bool:
         """One heartbeat-cadence sample of the #680 idle detector: advance `idle`
         from the transcript's current stat key and journal the stretch boundaries.
 
+        True when this tick's stat yielded a key, so `idle.last_key` is current.
         A None key (not yet created, torn by a rename, unreadable) skips the tick
-        and leaves the stretch as it was — `_sample_weighted_usage`'s tolerance,
+        (False) and leaves the stretch as it was — `_sample_weighted_usage`'s tolerance,
         for a stat — but remembers that the named path was absent, so the file's
         later appearance is a change, not the baseline. A key that moved closes any open stretch with one
         `session-active` carrying the stretch's full length; a key that has not
@@ -2635,10 +2931,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         an unwritable journal must not end a session that is, by this very
         evidence, alive.
 
-        The profile's subagent transcript tree (`_sample_subagent_tree`) counts
-        too: a parent blocked on a foreground subagent writes nothing to its own
-        transcript, so a tree that moved since the last clean walk is a change
-        like a parent key that moved. Its first walk on a path is a baseline. A
+        The profile's subagent transcript tree, and the child conversations a
+        `subagent_spawn_marker` lists in the folder `session_id` names
+        (`_sample_subagent_tree`), count too: a parent blocked on a foreground
+        subagent writes nothing to its own transcript, so subagent activity that
+        moved since the last clean walk is a change like a parent key that moved.
+        Its first walk on a path is a baseline. A
         walk that raises degrades the tick to parent-only, crumbed as
         `subagent-scan-failed` / `subagent-scan-recovered`; `idle.last_key` stays
         the parent's key either way.
@@ -2675,13 +2973,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             idle.open_since = None
             idle.seen_absent = False
             idle.sub_key = None
+            idle.sub_children_judged = None
         key = self._transcript_activity_key(transcript_path)
         flush_active()
         if key is None:
             if idle.last_key is None:
                 idle.seen_absent = True
-            return
-        sub = self._sample_subagent_tree(task_id, transcript_path, idle)
+            return False
+        sub = self._sample_subagent_tree(task_id, transcript_path, idle, session_id)
         sub_moved = sub is not None and idle.sub_key is not None and sub != idle.sub_key
         if sub is not None:
             idle.sub_key = sub
@@ -2716,6 +3015,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 pass
             else:
                 idle.open_since = idle.last_change_wall
+        return True
 
     def _note_session_start_missing(self, handle: SessionHandle, waited_s: float) -> bool:
         """Journal one `session-start-missing` (`task_id`, `waited_s`, `grace_s`,
@@ -3118,11 +3418,22 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return None
         return (found.evidence, found.line)
 
-    @property
-    def _usage_pane_patterns(self) -> tuple[regex.Pattern[str], ...]:
-        """Both usage-limit lists (#610) as the live gates consult them: disjoint
-        by contract, so either one matching means usage-limited."""
-        return self._usage_limit_patterns + self._usage_wait_patterns
+    @staticmethod
+    def _usage_hit(
+        blocked: tuple[str, str] | None, waiting: tuple[str, str] | None
+    ) -> tuple[str, str, str] | None:
+        """The live usage-limit sighting (#610) from one ``_pane_evidence`` look
+        that matched both lists as separate sets: ``(evidence, matched_line,
+        usage_limit_class)``, else None. Either list matching means
+        usage-limited; the set it came from is the class (DW-591). The lists are
+        disjoint by contract, but should one screen match both, ``blocked`` wins:
+        a CLI that will not continue by itself needs an operator, and reading it
+        as a wait would let a resume-at-reset relaunch into the same wall."""
+        if blocked is not None:
+            return (blocked[0], blocked[1], USAGE_LIMIT_BLOCKED)
+        if waiting is not None:
+            return (waiting[0], waiting[1], USAGE_LIMIT_WAIT)
+        return None
 
     def _session_vanished(self, task_id: str) -> bool:
         # The disambiguating probe (#489): `list_window_ids` returns [] for a

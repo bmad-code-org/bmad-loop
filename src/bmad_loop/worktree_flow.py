@@ -2664,16 +2664,25 @@ class WorktreeFlow:
         # A shared ticket store (no checkout carries its own copy) is read and
         # written in place: point the mount's `tickets.py` and renderer at it before
         # anything inside the mount resolves `output_folder`, and before the
-        # escalating gates below, so a failed redirect never reaches a session.
-        if self.paths.shared_store is not None:
+        # escalating gates below, so a failed redirect never reaches a session. A
+        # chained run's child initiative is written the same way on every layout:
+        # the live `active_initiative` names the parent, and inside the mount the
+        # child is the active initiative (the user's own file is never written).
+        store = self.paths.shared_store
+        child = self.state.initiative if self.state.parent_initiative is not None else None
+        if store is not None or child is not None:
             try:
-                ticketstore.redirect_mount_store(
-                    unit.workspace.paths.project, self.paths.shared_store
+                ticketstore.redirect_mount_config(
+                    unit.workspace.paths.project, main_store=store, initiative=child
                 )
             except ticketstore.TicketStoreError as e:
+                targets = [
+                    *(["the shared ticket store"] if store is not None else []),
+                    *([f"the child initiative {child!r}"] if child is not None else []),
+                ]
                 reason = (
-                    f"cannot point the worktree for {task.story_key} at the shared ticket "
-                    f"store: {e}"
+                    f"cannot point the worktree for {task.story_key} at "
+                    f"{' and '.join(targets)}: {e}"
                 )
                 self.escalate_unit(task, reason)  # always raises RunPaused
         # Before any session launches in the worktree: a CLI that gates sessions

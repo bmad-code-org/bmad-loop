@@ -20,6 +20,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import pytest
 from conftest import (
     committing_crash_state,
     dev_effect,
@@ -29,7 +30,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.base import USAGE_LIMIT_WAIT, SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
 from bmad_loop.journal import Journal, load_state
@@ -307,6 +308,34 @@ def test_blocking_workflow_env_fault_escalates_instead_of_deferring(project):
     assert end["env_fault_evidence"] == evidence
     kinds = [e["kind"] for e in engine.journal.entries()]
     assert "story-deferred" not in kinds  # escalated, not deferred
+
+
+@pytest.mark.parametrize("env_fault", [True, False], ids=["env-fault-arm", "parked-arm"])
+def test_blocking_workflow_usage_limit_pause_records_reset_and_class(project, env_fault):
+    """DW-591: a blocking workflow's usage-limit pause records the resolved reset
+    and limit class on the run state.
+    ABLATION: escalate the workflow site's arm with `self._escalate` and this
+    fails."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
+    reset = "2026-10-25T19:20:00+00:00"
+    limited = SessionResult(
+        status="stalled",
+        parked=True,
+        parked_evidence=evidence,
+        usage_limited=evidence,
+        env_fault=env_fault,
+        env_fault_evidence=evidence if env_fault else None,
+        usage_limit_resets=reset,
+        usage_limit_class=USAGE_LIMIT_WAIT,
+    )
+    engine, _ = make_engine(project, [dev_effect(project, "1-1-a"), limited], reg)
+    assert engine.run().paused
+
+    assert engine.state.paused_reason.startswith("usage limit: blocking workflow")
+    assert engine.state.paused_reset_at == reset
+    assert engine.state.paused_limit_class == USAGE_LIMIT_WAIT
 
 
 def test_blocking_workflow_parked_escalates_instead_of_deferring(project):

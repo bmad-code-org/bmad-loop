@@ -21,6 +21,7 @@ from bmad_loop.ticketmodel import (
     parse_help,
     parse_mark,
     parse_next,
+    parse_parent_next,
     parse_requires_python,
     parse_status,
     requires_python_satisfied,
@@ -374,6 +375,151 @@ def test_next_parent_view_raises_parent_initiative():
     with pytest.raises(TicketsSchemaError) as plain:
         parse_next(doc)
     assert not isinstance(plain.value, ticketmodel.TicketsParentInitiative)
+
+
+def _parent_next() -> dict[str, object]:
+    """`next` on a parent: `_parent_view` plus a third child, declared and not
+    created yet with nothing to wait on, and `ready`."""
+    doc = _parent_view()
+    doc["initiatives"].append(
+        {
+            "id": "r1",
+            "slug": "initiative-reports",
+            "title": "Reports",
+            "after": [],
+            "folder": None,
+            "waiting_on": [],
+        }
+    )
+    doc["ready"] = ["initiative-auth", "initiative-reports"]
+    return doc
+
+
+def test_parent_next_reads_children_in_build_order():
+    view = parse_parent_next(_parent_next())
+    assert (view.store, view.folder, view.order_conflict) == ("repo", "initiative-platform", ())
+    assert view.ready == ("initiative-auth", "initiative-reports")
+    auth, billing, reports = view.initiatives
+    assert (auth.id, auth.slug, auth.title, auth.folder) == (
+        "1",
+        "initiative-auth",
+        "Auth",
+        "initiative-auth",
+    )
+    assert (auth.status, dict(auth.counts), auth.ready) == (
+        "in-progress",
+        {"total": 2, "planned": 2},
+        True,
+    )
+    assert view.child("initiative-auth") is auth and view.child("initiative-x") is None
+
+
+def test_parent_next_waiting_child_is_not_ready():
+    """Ablation: read `ready` as true for every child and this reddens."""
+    billing = parse_parent_next(_parent_next()).initiatives[1]
+    assert billing.waiting_on == ("initiative-auth",) and not billing.ready
+    assert billing.after == (ticketmodel.InitiativeEdge("initiative-auth", ""),)
+
+
+def test_parent_next_folderless_child_is_data_not_an_error():
+    """A child the parent declares before its folder exists: no status, no
+    counts, and still ready when it waits on nothing (as upstream lists it)."""
+    reports = parse_parent_next(_parent_next()).initiatives[2]
+    assert (reports.id, reports.folder, reports.status, dict(reports.counts)) == (
+        "r1",
+        None,
+        "",
+        {},
+    )
+    assert reports.ready and reports.waiting_on == ()
+
+
+def test_parent_next_keeps_order_conflicts():
+    doc = _parent_next()
+    doc["order_conflict"] = [{"initiative": "initiative-auth", "after": "initiative-billing"}]
+    assert parse_parent_next(doc).order_conflict == (
+        {"initiative": "initiative-auth", "after": "initiative-billing"},
+    )
+
+
+def _child_set(i: int, key: str, value: object):
+    def edit(doc: dict) -> None:
+        doc["initiatives"][i][key] = value
+
+    return edit
+
+
+def _child_drop(i: int, key: str):
+    def edit(doc: dict) -> None:
+        del doc["initiatives"][i][key]
+
+    return edit
+
+
+def _top_set(key: str, value: object):
+    def edit(doc: dict) -> None:
+        doc[key] = value
+
+    return edit
+
+
+def _top_drop(key: str):
+    def edit(doc: dict) -> None:
+        del doc[key]
+
+    return edit
+
+
+@pytest.mark.parametrize(
+    ("edit", "field"),
+    [
+        (_top_drop("ready"), "ready"),
+        (_top_set("ready", "initiative-auth"), "ready"),
+        (_top_set("ready", [1]), "ready"),
+        (_top_set("ready", ["initiative-gone"]), "ready"),
+        (_top_drop("initiatives"), "initiatives"),
+        (_top_set("initiatives", {}), "initiatives"),
+        (_top_set("initiatives", ["initiative-auth"]), "initiatives"),
+        (_top_drop("store"), "store"),
+        (_top_drop("folder"), "folder"),
+        (_top_set("order_conflict", ["x"]), "order_conflict"),
+        (_child_drop(0, "id"), "id"),
+        (_child_set(0, "id", True), "id"),
+        (_child_set(0, "slug", 1), "slug"),
+        (_child_set(1, "slug", "initiative-auth"), "initiatives"),
+        (_child_drop(0, "title"), "title"),
+        (_child_drop(0, "after"), "after"),
+        (_child_set(1, "after", ["initiative-auth"]), "after"),
+        (_child_set(1, "after", [{"initiative": 1, "needs": ""}]), "initiative"),
+        (_child_set(1, "after", [{"initiative": "initiative-auth"}]), "needs"),
+        (_child_drop(0, "folder"), "folder"),
+        (_child_set(0, "folder", 3), "folder"),
+        (_child_drop(0, "status"), "status"),
+        (_child_set(0, "status", "closed"), "status"),
+        (_child_drop(0, "counts"), "counts"),
+        (_child_set(0, "counts", {"total": "2"}), "total"),
+        (_child_drop(0, "waiting_on"), "waiting_on"),
+        (_child_set(1, "waiting_on", [1]), "waiting_on"),
+    ],
+)
+def test_parent_next_schema_errors(edit, field):
+    doc = _parent_next()
+    edit(doc)
+    with pytest.raises(TicketsSchemaError) as caught:
+        parse_parent_next(doc)
+    assert caught.value.command == "next" and caught.value.field == field
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [_parent_view(), _next(), "not an object"],
+    ids=["parent-status", "plain-next", "not-an-object"],
+)
+def test_parent_next_refuses_other_documents(doc):
+    """A parent's `status` has no `ready`, a plain initiative's `next` lists no
+    children: neither reads as a parent's `next`."""
+    with pytest.raises(TicketsSchemaError):
+        parse_parent_next(doc)
 
 
 def _find(**over: object) -> dict[str, object]:

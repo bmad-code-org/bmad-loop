@@ -284,9 +284,18 @@ RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resolve_adopt"),
     ("cli.py", "_resolve_reverify"),
     ("cli.py", "_resolve_abandon"),
+    # DW-591: `resolve --at-reset`'s two wait rows, under the hold cleanup removes
+    # the run in, so neither append recreates a removed run dir
+    ("cli.py", "_resolve_at_reset"),
+    # the epic-close resolve: its verify journal row, then the locked re-check of
+    # the epic-boundary pause before the resume
+    ("cli.py", "_resolve_epic_close"),
     # #925: a refused TUI-launched child's journal row, under the hold cleanup
     # removes the run in, so the append never recreates a removed run dir
     ("cli.py", "_journal_unaccepted_launch"),
+    # a chain switch's claim of its control window for the next run, under the
+    # hold every claim is made under (the record's writers, cleanup's removal)
+    ("cli.py", "_drive_initiative_chain"),
     ("journal.py", "save_state"),
     ("runs.py", "rearm_escalation"),
     ("runs.py", "rearm_for_reverify"),
@@ -356,17 +365,20 @@ REFUSAL_HELPER_DEFS = {
 # Every #414-family call site — `bmadconfig.worktree_isolation_conflict`, sole
 # producer of the isolation-under-repo-root refusal text, plus its rc-returning CLI
 # wrapper `_reject_isolation_conflict` — as `(file, enclosing function) -> count`.
-# The `REARM_ESCALATION_CALLERS` idiom WITH multiplicity, because `cmd_resolve`
-# legitimately calls the wrapper twice: post-confirm is the authority, and the
-# pre-session arm spares the operator a full interactive session on a pair knowable
-# from config — the `96aa09a9` fix, which landed with no structural gate naming it.
+# The `REARM_ESCALATION_CALLERS` idiom WITH multiplicity, because one function
+# could call the wrapper twice and a set of keys would absorb it. `cmd_resolve`
+# takes the refusal twice through `_resolve_config_refusal`: post-confirm is the
+# authority, and the pre-session arm spares the operator a full interactive session
+# on a pair knowable from config — the `96aa09a9` fix, which landed with no
+# structural gate naming it.
 # Accepted cost (human decision 2026-09-02): every future caller of the predicate
 # touches a row here in the same PR.
 ISOLATION_CONFLICT_CALLERS = {
     ("cli.py", "_reject_isolation_conflict"): 1,  # the wrapper's own predicate call
     ("cli.py", "cmd_run"): 1,
     ("cli.py", "cmd_sweep"): 1,
-    ("cli.py", "cmd_resolve"): 2,  # pre-session + post-confirm re-read
+    # cmd_resolve's pre-session + post-confirm re-read, both through this helper
+    ("cli.py", "_resolve_config_refusal"): 1,
     # DW-525: the finished-run replay, before a replay run is minted
     ("cli.py", "_resolve_reverify_finished"): 1,
     ("cli.py", "cmd_validate"): 1,  # reports a Finding rather than aborting
@@ -393,9 +405,12 @@ STORE_TOPOLOGY_CALLERS = {
     ("install.py", "_tickets_store_findings"): 1,  # validate + run preflight findings
     ("cli.py", "_reject_store_topology"): 1,  # the wrapper's own predicate call
     ("cli.py", "cmd_run"): 1,
+    ("cli.py", "_launch_run"): 1,  # a chained child's own store, per child launch
+    ("cli.py", "_child_store"): 1,  # a drained child's store, ahead of its close
     ("cli.py", "cmd_sweep"): 1,
-    # pre-session + post-confirm, as the #414 pair, + ahead of --reverify/--adopt-branch
-    ("cli.py", "cmd_resolve"): 3,
+    # cmd_resolve's pre-session + post-confirm, as the #414 pair
+    ("cli.py", "_resolve_config_refusal"): 1,
+    ("cli.py", "_resolve_pre_session_gates"): 1,  # ahead of --reverify/--adopt-branch
     ("cli.py", "_resolve_reverify_finished"): 1,
     ("cli.py", "_prepare_resume_locked"): 1,  # re-validates the recorded topology
     ("cli.py", "_warn_preflight_would_abort"): 1,
@@ -572,6 +587,11 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # aliased by name.
     "ticket-epic-closure": frozenset({"verdict"}),
     "epic-closure-not-recorded": frozenset({"verdict"}),
+    # cli.py: the interactive epic-close session's launch — the run's recorded
+    # closure verdict for the epic (the same closed token, or null) and `cli`, the
+    # dev CLI profile name as on `session-start-missing`. `epic_ref` is aliased by
+    # name.
+    "epic-close-session-start": frozenset({"verdict", "cli"}),
     # DW-527: the literal `post-proceed`, marking the row `_finish_inflight`'s
     # post-replay arm writes (a re-latched `--reverify` replay) apart from the
     # ordinary reverify arm's. Kind-scoped because `replay` is generic.
@@ -593,6 +613,21 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # by name.
     "ticket-mark": frozenset({"before", "after", "outcome", "created"}),
     "ticket-plan-restored": frozenset({"before", "after", "outcome"}),
+    # tickettree.py: a child initiative's `status` tokens (`?` when unreadable)
+    # and a closed outcome slug. `parent`/`slug` are aliased by
+    # `diagnostics._JOURNAL_KIND_ALIAS_FIELDS`; `file` collapses to presence under
+    # `diagnostics._JOURNAL_KIND_SCHEMAS`.
+    "initiative-mark": frozenset({"before", "after", "outcome"}),
+    # cli.py, the initiative chain: closed pass-over tokens (`no-folder`,
+    # `drained`), a closed chain-end token, closed prerequisite-status tokens, and
+    # the previous run's id. The slugs are aliased or keylisted by `diagnostics`'
+    # kind-scoped tables; `error` is dropped by name.
+    "initiative-chain-next": frozenset({"passed_over_why"}),
+    "initiative-chain-end": frozenset({"end", "passed_over_why", "waiting_on_status"}),
+    "initiative-chain": frozenset({"previous_run"}),
+    # cli.py, the chain's pre-pick close: a closed skip token and the blocking run's
+    # id. `parent`/`slug` are kind-aliased; `detail` is dropped by name.
+    "initiative-close-skipped": frozenset({"why", "blocking_run"}),
     # runs.py: whether the re-arm moved its restore latch onto the evacuated copy.
     # `patch` and `stashed_to` are dropped by name.
     "restore-patch-evacuated": frozenset({"latched"}),
@@ -849,6 +884,8 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # least"); none is authored text or an identifier, and the refused path
         # remains inside dropped `error`.
         "limit_bytes",
+        # `at-reset-wait-start` (DW-591): `resolve --margin-min`, whole minutes.
+        "margin_min",
         "measured_bytes",
         "measurement_is_lower_bound",
         # `bypass-dropped` (DW-410): the profile bypass tokens an explicit
@@ -983,6 +1020,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # kept unit to (`unit-replay-handoff`).
         "replay_of",
         "replay_run",
+        # `at-reset-wait-start` (DW-591): the pause's recorded reset — always an
+        # ISO-8601 instant (`usagereset.resolved_reset` admitted it).
+        "reset_at",
         "reset_from",
         "restore",
         "returncode",
@@ -1062,12 +1102,21 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `session-end` / `workflow-end` (#610): the usage limit's reset parsed
         # from the same pane line — ISO-8601, or the raw clause text.
         "usage_limit_resets",
+        # `session-end` / `workflow-end` (DW-591): which usage-limit list the live
+        # sighting matched — one of two literal enum strings (`blocked`, `wait`).
+        "usage_limit_class",
+        # `run-paused` (DW-591): a usage-limit pause's resolved reset — always an
+        # ISO-8601 instant (`usagereset.resolved_reset`), never the raw clause.
+        "usage_limit_reset_at",
         "verification_sequence",
         "verification_stage",
         "via",
         # `session-start-missing`: whole seconds the session had run without a
         # SessionStart when the notice fired — a measured integer.
         "waited_s",
+        # `at-reset-wait-start` / `at-reset-wait-end` (DW-591): the reset plus the
+        # margin, an ISO-8601 instant `resolve --at-reset` computed.
+        "wake_at",
         "weighted",
         "workflow",
         "worktree",
@@ -1154,6 +1203,9 @@ JOURNAL_SPLAT_ALLOW = {
     ("engine.py", "_run_session"): 2,
     # One unresolved `**fields` forward: the forwarder's own hole.
     ("plugins/bus.py", "_log"): 1,
+    # One unresolved `**fields` relay: `_ChainStartLog.replay` re-appends the rows a
+    # chain's start close kept in memory into the first child's run journal.
+    ("cli.py", "replay"): 1,
 }
 
 # The FIELD names that actually flow through each declared hole above, keyed by the
@@ -1242,6 +1294,7 @@ JOURNAL_SPLAT_FIELDS = {
             "usage_limited",
             "quota_wait_s",
             "usage_limit_resets",
+            "usage_limit_class",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys
@@ -1253,6 +1306,11 @@ JOURNAL_SPLAT_FIELDS = {
     # routing set with this guard green. That is what the old comment's "the scan
     # reads them directly at their own sites" asserted and did not do.
     ("plugins/bus.py", "_log"): frozenset(),
+    # `_ChainStartLog.replay` relays rows kept by its own `append`, so the fields
+    # belong to the writers that journaled into it (`_close_drained_children`,
+    # `TicketTree.mark_initiative_done`), each a literal write the scan reads at its
+    # own site; the relay adds no name of its own.
+    ("cli.py", "replay"): frozenset(),
 }
 
 # ``(file, function name)`` of every helper that FORWARDS to ``journal.append`` with a
@@ -1311,6 +1369,9 @@ JOURNAL_DYNAMIC_KIND_ALLOW = {
     # The forwarder passes its caller's `kind` straight through; every CALLER spells
     # a literal, and `JOURNAL_FORWARDERS` is what lets the scan read them there.
     ("plugins/bus.py", "_log"): 1,
+    # `_ChainStartLog.replay` relays each kept row's kind, which a literal write into
+    # the start log spelled at its own site.
+    ("cli.py", "replay"): 1,
 }
 
 # The kind SPELLINGS a dynamic-kind position mints itself, keyed by the same
@@ -1423,6 +1484,22 @@ JOURNAL_KINDS = frozenset(
         # profile's bypass tokens — one per affected launched role. `role`,
         # `profile` and `missing` are config names/flags from the resolved profile.
         "bypass-dropped",
+        # DW-591: `resolve --at-reset`'s wait for a usage-limit reset — its start
+        # (`reset_at`, `margin_min`, `wake_at`) and end (`wake_at`, `interrupted`,
+        # `waited_s`); every field declared benign.
+        "at-reset-wait-end",
+        "at-reset-wait-start",
+        # cli.py: `resolve --no-interactive` on a tickets epic-boundary pause — the
+        # closed-epic verify's outcome. `epic_ref` is aliased by name; `status` (the
+        # epic file's status token) and `missing` (prose lines naming what is undone,
+        # which `scrub_json` redacts as non-identifiers) are benign by name.
+        "epic-close-unverified",
+        "epic-close-verified",
+        # cli.py: an interactive `resolve` on that pause — the bmad-agent-po
+        # session's launch and its exit code (`rc`, benign by name, journaled
+        # and never trusted). `verdict` and `cli` are declared on the start kind.
+        "epic-close-session-end",
+        "epic-close-session-start",
         # #920: the accepting process could not publish its control window;
         # `error` is a drop field.
         "ctl-window-claim-failed",
@@ -2220,9 +2297,17 @@ JOURNAL_KINDS = frozenset(
         "ticket-status-write-refused",
         # tickettree.py — the ticket-plan chokepoint: one `ticket-mark` per
         # mark/discard call (any outcome), one `ticket-plan-restored` per
-        # byte-exact restore.
+        # byte-exact restore, one `initiative-mark` per child-initiative close.
         "ticket-mark",
         "ticket-plan-restored",
+        "initiative-mark",
+        # cli.py — the initiative chain: per switch, the next child or the end in
+        # the finished run, the chain link in the next run, and each drained child
+        # the pre-pick close leaves open.
+        "initiative-chain-next",
+        "initiative-chain-end",
+        "initiative-chain",
+        "initiative-close-skipped",
         # worktree_flow.py
         "accepted-spec-delivery-unreachable",
         "accepted-spec-write-unreachable",
@@ -5512,14 +5597,14 @@ def test_isolation_conflict_refusal_sites_are_enumerated():
     `cmd_resolve`'s pre-session refusal landed as a wrapper call with no test row,
     and nothing structural named the omission until a review pass did.
 
-    Multiplicity is load-bearing on today's tree — `cmd_resolve` legitimately calls
-    the wrapper twice, so a set of keys would absorb a third call there silently
+    Multiplicity is load-bearing — a function calling the wrapper twice must
+    declare both, so a set of keys would absorb a second call there silently
     (`test_isolation_callsite_count_does_not_hide_a_second_call_in_one_function`
     pins the counting itself).
 
     Ablation: delete the `isolationcall` emit and this reddens (eleven declared,
-    zero scanned); add a third `_reject_isolation_conflict` call inside
-    `cmd_resolve` and the count comparison reddens naming the site."""
+    zero scanned); add a second `_reject_isolation_conflict` call inside
+    `_resolve_config_refusal` and the count comparison reddens naming the site."""
     findings = _of("isolationcall")
     sites = _isolation_callsite_counts(findings)
     declared = Counter(ISOLATION_CONFLICT_CALLERS)
@@ -5564,6 +5649,43 @@ def test_store_topology_refusal_sites_are_enumerated():
         "alongside that decision:\n"
         f"  scanned:  {sorted(sites.elements())}\n"
         f"  declared: {sorted(declared.elements())}\n" + "\n".join(detail)
+    )
+
+
+def test_cmd_resolve_takes_the_config_refusal_before_the_session_and_after_the_confirm():
+    """`cmd_resolve` reaches the isolation and store refusals through
+    `_resolve_config_refusal` at BOTH points: before the interactive session (the
+    `96aa09a9` arm — no conversation spent on a config knowable up front) and after
+    the confirm, on the re-read config the re-arm acts on. The caller tables count
+    the helper's own predicate calls once, so they cannot see either call drop
+    out; this pins both by position against the session and the confirm.
+
+    Ablation (performed): delete the pre-session `_resolve_config_refusal` call in
+    `cmd_resolve` and this reddens."""
+    tree = ast.parse((SRC / "cli.py").read_text(encoding="utf-8"), filename="cli.py")
+    (fn,) = (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "cmd_resolve"
+    )
+
+    def lines(name: str) -> list[int]:
+        return sorted(
+            node.lineno
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and _called_name(node.func) == name
+        )
+
+    refusals = lines("_resolve_config_refusal")
+    (session,) = lines("run_session")
+    (confirm,) = lines("_confirm")
+    assert [line < session for line in refusals] == [True, False], (
+        "cmd_resolve must call _resolve_config_refusal once before the interactive "
+        f"session (run_session at line {session}) and once after it: {refusals}"
+    )
+    assert refusals[1] > confirm, (
+        f"cmd_resolve's second _resolve_config_refusal (line {refusals[1]}) must "
+        f"follow the confirm (line {confirm})"
     )
 
 
@@ -10330,9 +10452,11 @@ def test_journal_routing_tables_are_read_from_diagnostics():
         # can neither name a field nothing produces nor quietly introduce one that
         # bypassed the routed/benign decision. `type` and `severity` reach the
         # journal only through the allowlisted splat, so the inventory there is
-        # where they are declared.
+        # where they are declared. A benign row on this kind alone accounts for the
+        # name on this kind's schema only.
         unaccounted = names - JOURNAL_ROUTED_FIELDS - JOURNAL_BENIGN_FIELDS
         unaccounted -= frozenset().union(*JOURNAL_SPLAT_FIELDS.values())
+        unaccounted -= JOURNAL_KIND_BENIGN_FIELDS.get(kind, frozenset())
         assert unaccounted == set(), (
             f"{kind}'s declared schema names fields the guard does not account for: "
             f"{sorted(unaccounted)}"

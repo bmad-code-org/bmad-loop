@@ -1173,6 +1173,108 @@ def test_ticket_mark_ref_is_pseudonymized():
     assert pseudo.entries() == [("ticket", "story-acme-vault-rotation", scrubbed["ref"])]
 
 
+def test_initiative_mark_aliases_slugs_and_drops_the_file_path():
+    """`initiative-mark` names two initiative folders and the closed child's file:
+    both slugs alias in one `initiative` namespace, the path collapses to presence,
+    and the status/outcome tokens stay readable.
+
+    Ablation: drop the kind's `_JOURNAL_KIND_SCHEMAS` row and `file` ships through
+    `scrub_json`; drop its alias row and the slugs ship verbatim."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    raw = {
+        "kind": "initiative-mark",
+        "parent": "initiative-acme-platform",
+        "slug": "initiative-acme-auth",
+        "file": "/home/acme/store/initiative-acme-auth/initiative-acme-auth.md",
+        "before": "in-progress",
+        "after": "done",
+        "outcome": "written",
+    }
+
+    scrubbed = diagnostics._scrub_entry(raw, pseudo, {}, None)
+
+    assert scrubbed["parent"].startswith("initiative-") and scrubbed["slug"].startswith(
+        "initiative-"
+    )
+    assert scrubbed["parent"] != scrubbed["slug"]
+    assert "file" not in scrubbed and scrubbed["file_present"] is True
+    assert (scrubbed["before"], scrubbed["after"], scrubbed["outcome"]) == (
+        "in-progress",
+        "done",
+        "written",
+    )
+    assert "acme" not in json.dumps(scrubbed)
+
+
+def test_initiative_chain_rows_alias_every_slug_and_keep_their_tokens():
+    """The chain's kinds name the parent and child initiatives as scalars and
+    as lists: every slug aliases in the one `initiative` namespace (so the parent
+    and `initiative-mark`'s `parent` read alike), the pass-over and end tokens and
+    the prerequisite statuses and the previous run id stay readable, and `error`
+    is dropped.
+
+    Ablation: drop the kinds' alias rows and the scalars ship verbatim; drop their
+    keylist rows and the slug lists do."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    parent, auth, billing = (
+        "initiative-acme-platform",
+        "initiative-acme-auth",
+        "initiative-acme-billing",
+    )
+    rows = [
+        {
+            "kind": "initiative-chain-next",
+            "parent": parent,
+            "from_child": auth,
+            "to_child": billing,
+            "passed_over": [auth],
+            "passed_over_why": ["drained"],
+        },
+        {
+            "kind": "initiative-chain-end",
+            "parent": parent,
+            "end": "fault",
+            "waiting": [billing],
+            "waiting_child": [billing],
+            "waiting_on": [auth],
+            "waiting_on_status": ["dropped"],
+            "passed_over": [auth],
+            "passed_over_why": ["no-folder"],
+            "error": f"tickets.py fault: /home/acme/{auth}",
+        },
+        {
+            "kind": "initiative-chain",
+            "parent": parent,
+            "previous_run": "20261028-000000-beef",
+            "previous_child": auth,
+        },
+        {"kind": "initiative-mark", "parent": parent, "slug": auth, "outcome": "written"},
+        {
+            "kind": "initiative-close-skipped",
+            "parent": parent,
+            "slug": auth,
+            "why": "run-unfinished",
+            "blocking_run": "20261028-000000-cafe",
+            "detail": f"run in /home/acme/{auth} is paused",
+        },
+    ]
+
+    nxt, end, link, mark, skipped = (diagnostics._scrub_entry(r, pseudo, {}, None) for r in rows)
+
+    assert "acme" not in json.dumps([nxt, end, link, mark, skipped])
+    assert (skipped["parent"], skipped["slug"]) == (mark["parent"], mark["slug"])
+    assert (skipped["why"], skipped["blocking_run"]) == ("run-unfinished", "20261028-000000-cafe")
+    assert "detail" not in skipped
+    assert nxt["parent"] == end["parent"] == link["parent"] == mark["parent"]
+    assert nxt["from_child"] == nxt["passed_over"][0] == link["previous_child"] == mark["slug"]
+    assert nxt["to_child"] == end["waiting"][0] != nxt["from_child"]
+    assert (nxt["passed_over_why"], end["passed_over_why"]) == (["drained"], ["no-folder"])
+    assert end["waiting_child"] == end["waiting"] and end["waiting_on"] == [nxt["from_child"]]
+    assert end["waiting_on_status"] == ["dropped"]
+    assert (end["end"], link["previous_run"]) == ("fault", "20261028-000000-beef")
+    assert "error" not in end and end["error_present"] is True
+
+
 @pytest.mark.parametrize(
     "kind",
     [

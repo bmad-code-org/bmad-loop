@@ -1149,6 +1149,40 @@ def test_v7_ledger_falls_back_to_output_folder(tmp_path: Path) -> None:
     assert paths.deferred_work == paths.output_folder / "deferred-work.md"
 
 
+def test_with_initiative_reroots_on_the_child_folder(tmp_path: Path) -> None:
+    """A parent's child is the parent folder's sibling (upstream's
+    ``folder.parent / slug``): both artifact dirs, the ledger and the sprint
+    path move onto it, and nothing else changes."""
+    paths = bmadconfig.load_paths(_v7(tmp_path, initiative="initiative-platform"))
+    child = paths.with_initiative("initiative-auth")
+    folder = paths.output_folder / "initiative-auth"
+    assert child.active_initiative == "initiative-auth"
+    assert child.initiative_folder == folder
+    assert child.implementation_artifacts == child.planning_artifacts == folder
+    assert child.deferred_work == folder / "deferred-work.md"
+    assert child.sprint_status == folder / "sprint-status.yaml"
+    unchanged = ("project", "output_folder", "repo_root", "era", "ignored_v6_keys", "shared_store")
+    assert all(getattr(child, f) == getattr(paths, f) for f in unchanged)
+    # pure: the child folder need not exist, and the parent is untouched
+    assert not folder.exists()
+    assert paths.active_initiative == "initiative-platform"
+
+
+@pytest.mark.parametrize("child", ["", ".", "..", "a/b", "a\\b"])
+def test_with_initiative_refuses_a_non_folder_name(tmp_path: Path, child: str) -> None:
+    paths = bmadconfig.load_paths(_v7(tmp_path, initiative="initiative-platform"))
+    with pytest.raises(ValueError, match="single folder name"):
+        paths.with_initiative(child)
+
+
+def test_with_initiative_refuses_without_an_active_initiative(tmp_path: Path) -> None:
+    root = _v7(tmp_path)
+    _write_user_config(root, "# no initiative\n")
+    paths = bmadconfig.load_paths(root)
+    with pytest.raises(ValueError, match="active initiative folder"):
+        paths.with_initiative("initiative-auth")
+
+
 def test_v6_keys_present_keep_v6_era_even_with_tickets_py(project) -> None:
     """A complete v6 config resolves exactly as before when the v7 marker appears
     beside it: the marker alone never flips the era. Ablation: gate the v7 branch on

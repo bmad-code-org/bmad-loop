@@ -5,10 +5,15 @@ tree (``[stories] source = "tickets"``).
 ``tickets.py`` (:class:`~bmad_loop.tickets_source.TicketsWorkSource`, whose pure
 :func:`~bmad_loop.tickets_source.decide_pick` holds the selection rules). The tree
 is reached only through a :class:`~bmad_loop.tickettree.TicketTreeLike`, which
-``ticket_tree_factory`` builds from ``(project_root, pinned_initiative)`` — the
+``ticket_tree_factory`` builds from ``(project_root, pinned_initiative)`` (and a
+child ``folder``) — the
 real :class:`~bmad_loop.tickettree.TicketTree` by default, an in-memory fake in
 tests. The tree is pinned to ``RunState.initiative``, so a resume never builds
-another initiative's ticket.
+another initiative's ticket; a chained run, which builds one child initiative of
+the parent ``RunState.parent_initiative``, pins the parent and reads the child
+through its folder (:func:`~bmad_loop.runs.tree_pin`, re-exported here); its paths
+must be re-rooted on the child (:func:`~bmad_loop.runs.paths_for_state`), and
+parent-rooted ones are refused at construction.
 
 The unit key is the ticket ref (``E.M``); every unit's epic is 0 and the epic
 lifecycle is keyed by slug here, not by the base engine's numbered epics.
@@ -26,6 +31,11 @@ Pick-time pauses (``_halt_pick``), all raised before a ticket is recorded in
   (:meth:`~bmad_loop.checkpoints.CheckpointFlowMixin._pause_wedged`), the shape
   ``bmad-loop resolve`` acts on. Like a stories wedge it is re-derived from the
   tree every pick; an in-run escalation re-pauses before the pick instead.
+
+A resume pauses at ``ticket-tree`` (``binding-moved``) before it drives an
+in-flight unit whose binding went stale while the run was paused — its ref no
+longer names its plan, or its verified plan is gone, as ``tickets.py move``
+leaves it (:meth:`TicketsEngine._gate_stale_binding`); it never rebinds.
 
 Rows the pick passed over are journaled once per process (``ticket-skipped``,
 ``ticket-foreign-active``).
@@ -89,10 +99,10 @@ import hashlib
 import re
 import stat
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 
 from . import deferredwork, gates, ticketlayout, ticketstore, verify
 from .adapters.base import SessionResult, SpecSnapshot
@@ -122,15 +132,21 @@ from .model import (
     result_mapping,
 )
 from .recovery_flow import OwnedPlanRefused, OwnedPlanWriter
-from .runs import graceful_stop_requested, live_store_topology, rebase_recorded_project_path
+from .runs import (
+    graceful_stop_requested,
+    live_store_topology,
+    rebase_recorded_project_path,
+    tree_pin,
+)
 from .statemachine import OPERATOR_PARK_PREFIX, PlanWriteReason, advance
-from .ticketmodel import StatusView, TicketRow
+from .ticketmodel import FindResult, StatusView, TicketRow
 from .tickets_source import (
     BOUNDARY_ACK,
     BOUNDARY_PAUSE,
     BOUNDARY_REJECTED,
     BOUNDARY_RETRO,
     CLOSURE_REJECTED,
+    HALT_BINDING_MOVED,
     HALT_BLOCKED_PLAN,
     HALT_DIRTY_INITIATIVE,
     HALT_EPIC_CLOSURE,
@@ -150,14 +166,17 @@ from .tickets_source import (
     Skip,
     TicketRef,
     TicketsWorkSource,
+    committed_epics,
     dispatch_invocation,
     epic_boundary,
+    path_overlaps,
     plan_planned,
     ticket_binding,
     wants_thorough,
 )
 from .tickettree import (
     TicketsError,
+    TicketsNoMatch,
     TicketsV6KeyUnreadable,
     TicketTree,
     TicketTreeLike,
@@ -168,8 +187,15 @@ from .worksource import SOURCE_TICKETS
 from .worksource import Halt as WorkHalt
 from .worksource import WorkRef, WorkSource
 
-TicketTreeFactory = Callable[[Path, str | None], TicketTreeLike]
-"""Builds the run's tree from ``(project_root, pinned_initiative)``."""
+
+class TicketTreeFactory(Protocol):
+    """Builds the run's tree from ``(project_root, pinned_initiative)``, and
+    ``folder``: a parent initiative's child folder the tree reads and writes
+    through, or None for the active initiative (see :func:`~bmad_loop.runs.tree_pin`)."""
+
+    def __call__(
+        self, project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
+    ) -> TicketTreeLike: ...
 
 
 def _pick_scope(state: RunState) -> PickScope:
@@ -189,6 +215,13 @@ PLAN_WRITE_REASONS: Mapping[tuple[SpecWriteReason, str], PlanWriteReason] = {
 """The engine status writes tickets mode makes, as ``(engine reason, target) →
 plan-transition reason``; every other pair is refused
 (:meth:`TicketsEngine._spec_status_write`)."""
+
+PLAN_WRITTEN_PHASES: frozenset[Phase] = frozenset(
+    {Phase.DEV_VERIFY, Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY, Phase.COMMITTING}
+)
+"""The phases of a unit whose dev leg has verified its plan on disk (with a
+recorded ``spec_file``), so a resume finding that plan gone reads it as a stale
+binding (:meth:`TicketsEngine._gate_stale_binding`)."""
 
 
 @dataclass(frozen=True)
@@ -227,15 +260,6 @@ def _same_file(a: Path, b: Path) -> bool:
         return a.resolve() == b.resolve()
     except (OSError, RuntimeError):
         return False
-
-
-def _overlaps(path: str, folder: str) -> bool:
-    """Whether repo-relative ``path`` lies in ``folder`` (``"."`` is the whole
-    checkout), or contains it: an untracked nested repository is one dirty
-    entry for its whole directory."""
-    if folder == ".":
-        return True
-    return path == folder or path.startswith(folder + "/") or folder.startswith(path + "/")
 
 
 # A rolled-back attempt's plan re-routed to `ready-for-dev` (the recovery flow's
@@ -282,9 +306,12 @@ def _with_trailers(message: str, trailers: list[str]) -> str:
     return body + "\n\n" + "\n".join(trailers)
 
 
-def default_ticket_tree(project_root: Path, pinned_initiative: str | None) -> TicketTreeLike:
-    """The project's installed ``tickets.py``, pinned to ``pinned_initiative``."""
-    return TicketTree(project_root, pinned_initiative=pinned_initiative)
+def default_ticket_tree(
+    project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
+) -> TicketTreeLike:
+    """The project's installed ``tickets.py``, pinned to ``pinned_initiative``;
+    ``folder`` routes every read and write through a parent's child folder."""
+    return TicketTree(project_root, pinned_initiative=pinned_initiative, folder=folder)
 
 
 class _TicketPlanWriter:
@@ -345,6 +372,10 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         # redirected to it. Read from the topology the run recorded at its start,
         # moved with a renamed project.
         state, paths = kwargs.get("state"), kwargs.get("paths")
+        if state is not None and paths is not None:
+            # a chained run's paths must be its child's (`runs.paths_for_state`):
+            # parent-rooted ones raise here, before the base engine touches them
+            tree_pin(state, paths)
         if state is not None and paths is not None and state.store_topology:
             kwargs["paths"] = ticketstore.with_shared_store(
                 paths, live_store_topology(state, paths.project)
@@ -365,11 +396,11 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     @property
     def ticket_tree(self) -> TicketTreeLike:
-        """The run's tree, built once from the main checkout and the pin."""
+        """The run's tree, built once from the main checkout, the pin and, for a
+        chained run, the child folder (:func:`~bmad_loop.runs.tree_pin`)."""
         if self._ticket_tree is None:
-            self._ticket_tree = self._ticket_tree_factory(
-                self.paths.project, self.state.initiative or None
-            )
+            pin, folder = tree_pin(self.state, self.paths)
+            self._ticket_tree = self._ticket_tree_factory(self.paths.project, pin, folder=folder)
         return self._ticket_tree
 
     def _make_work_source(self) -> WorkSource:
@@ -489,7 +520,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         touched = sorted(
             path
             for path in dirty
-            if _overlaps(path.rstrip("/"), prefix) and path.rstrip("/") not in owned
+            if path_overlaps(path.rstrip("/"), prefix) and path.rstrip("/") not in owned
         )
         if not touched:
             return
@@ -576,14 +607,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _committed_epics(self) -> frozenset[str]:
         """Epic slugs this run committed at least one ticket of."""
-        return frozenset(
-            task.ticket.epic_slug
-            for task in self.state.tasks.values()
-            if task.ticket is not None
-            and task.ticket.epic_slug
-            and task.phase == Phase.DONE
-            and task.commit_sha
-        )
+        return committed_epics(self.state)
 
     def _ticket_epic_boundary_check(self, status_view: StatusView) -> None:
         """The epic boundary, run before every pick (on the pick's own ``status``
@@ -927,7 +951,8 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
 
     def _pause_ticket_pick(self, halt: Halt) -> NoReturn:
         """Every other pick halt: a refined plan checkpoint (named story file), an
-        epic boundary, or the tree itself. ``key`` "" (a tree fault) pauses with
+        epic boundary, or the tree itself — and a resumed unit's stale binding
+        (:meth:`_gate_stale_binding`). ``key`` "" (a tree fault) pauses with
         no story key. A ``find`` fault naming the plan checkpoint's story file
         pauses at ``ticket-tree`` with the fault instead."""
         if halt.cause == HALT_PLAN_CHECKPOINT:
@@ -1148,7 +1173,95 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
                         Path(recorded), self.state, self.paths.project
                     )
                     setattr(task, name, str(live))
+        for task in self.state.tasks.values():
+            if not task.terminal:
+                self._gate_stale_binding(task)
         super()._finish_inflight()
+
+    def _gate_stale_binding(self, task: StoryTask) -> None:
+        """Pause at ``ticket-tree`` (``binding-moved``), on resume and before an
+        in-flight unit is driven, when its binding went stale while the run was
+        paused: ``find`` of the recorded ref no longer names the recorded plan
+        (moved with a renamed project, :meth:`_recorded_plan`), or the plan its
+        dev leg verified is gone. ``tickets.py move`` renumbers the entry and
+        moves its plan, so the driven unit would re-dispatch a ref the tree no
+        longer holds and rewrite its plan at the old path.
+
+        The detail names the ticket's new ref and plan when the live tree holds
+        it (:meth:`_moved_to`), else the missing plan. Nothing is rebound or
+        marked, so a resume after the move is undone drives the unit. A ``find``
+        fault pauses at ``ticket-tree`` too: the gate fails closed. The plan's
+        presence is asked only in :data:`PLAN_WRITTEN_PHASES`, and not of a
+        worktree unit's plan outside the shared store, which lives in its mount."""
+        binding = task.ticket
+        if binding is None:
+            return
+        recorded = self._recorded_plan(binding)
+        try:
+            found = self.ticket_tree.find(binding.ref)
+        except TicketsNoMatch as e:
+            why = f"tickets.py find {binding.ref}: {e}"
+        except TicketsError as e:
+            self._pause_ticket_pick(
+                Halt("tree-fault", task.story_key, None, f"tickets.py {e.kind}: {e}")
+            )
+        else:
+            if not _same_file(Path(found.plan), recorded):
+                why = f"{binding.ref} now names the plan {found.plan}"
+            elif (fault := self._written_plan_fault(task, recorded)) is not None:
+                why = fault
+            else:
+                return
+        moved, search_fault = self._moved_to(binding, recorded)
+        if moved is not None and moved.row.ref is not None:
+            detail = (
+                f"ticket {binding.ref} ({binding.title}) was moved while the run was paused: "
+                f"{binding.ref} → {moved.row.ref}, plan {recorded} → {moved.plan}; "
+                f"undo the move (the entry back at {binding.ref}, its plan at {recorded}) "
+                "to drive this unit"
+            )
+        else:
+            detail = (
+                f"the bound plan of ticket {binding.ref} ({binding.title}) is missing: "
+                f"{recorded} ({why}{search_fault}); restore the ticket and its plan "
+                "to drive this unit"
+            )
+        self._pause_ticket_pick(Halt(HALT_BINDING_MOVED, task.story_key, None, detail))
+
+    def _written_plan_fault(self, task: StoryTask, plan: Path) -> str | None:
+        """Why ``task``'s verified plan cannot be found at ``plan``, or None when
+        it is there or not yet owed (:meth:`_gate_stale_binding`). A plan that
+        cannot be stat'ed reads as missing, with the error."""
+        if task.phase not in PLAN_WRITTEN_PHASES or not task.spec_file:
+            return None
+        if task.worktree_path and not self.paths.in_shared_store(plan):
+            return None
+        try:
+            plan.stat()
+        except FileNotFoundError:
+            return "the file is gone"
+        except OSError as e:
+            return f"cannot read it: {type(e).__name__}: {e}"
+        return None
+
+    def _moved_to(self, binding: TicketBinding, plan: Path) -> tuple[FindResult | None, str]:
+        """The live ticket that holds ``binding``'s plan under another ref, or
+        None: a ``status`` row of the same title whose ``find`` names a plan of
+        the bound plan's file name (``tickets.py move`` renumbers the entry and
+        keeps both). With None, the tree fault that cut the search short, as a
+        clause of the halt detail ("" when there was none)."""
+        try:
+            view = self.ticket_tree.status()
+            rows = [*view.tickets, *(view.backlog.tickets if view.backlog is not None else ())]
+            for row in rows:
+                if row.ref is None or row.ref == binding.ref or row.title != binding.title:
+                    continue
+                found = self.ticket_tree.find(row.ref)
+                if Path(found.plan).name == plan.name:
+                    return found, ""
+        except TicketsError as e:
+            return None, f"; the tree could not be searched for it: tickets.py {e.kind}: {e}"
+        return None, ""
 
     def _plan_halt_now(self, task: StoryTask) -> bool:
         """Leg 1 of an unrefined ``plan_checkpoint``, read from the binding and the
@@ -1611,11 +1724,13 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
     def _workspace_ticket_tree(self) -> TicketTreeLike:
         """The tree that owns the active workspace's plans: the run's own in
         place, one built for the unit worktree's project under isolation (its
-        ``find`` names the worktree's copy of the plan)."""
+        ``find`` names the worktree's copy of the plan). A mount's tree is pinned
+        to ``state.initiative`` with no folder even on a chained run: the mount's
+        config names the child as its active initiative."""
         project = self.workspace.paths.project
         if project == self.paths.project:
             return self.ticket_tree
-        return self._ticket_tree_factory(project, self.state.initiative or None)
+        return self._ticket_tree_factory(project, self.state.initiative or None, folder=None)
 
     def _spec_status_write(
         self,

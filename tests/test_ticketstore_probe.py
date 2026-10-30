@@ -1,12 +1,13 @@
 """The probe half of `ticketstore` on real git repositories: what
 `probe_store_facts` reads, what `assess_store` / `store_conflict` answer for each
-sandbox layout, and `redirect_mount_store` on disk. Real-spawn budget: 0 spawns of
+sandbox layout, and `redirect_mount_config` on disk. Real-spawn budget: 0 spawns of
 tickets.py (git only)."""
 
 from __future__ import annotations
 
 import dataclasses
 import os
+import shutil
 import tomllib
 from pathlib import Path
 
@@ -348,11 +349,11 @@ def test_store_conflict_refuses_a_recorded_store_whose_initiative_is_gone(
     assert str(recorded.store_root) in text
 
 
-def test_redirect_mount_store_rewrites_the_user_layer(project_v7, tmp_path):
+def test_redirect_mount_config_rewrites_the_user_layer(project_v7, tmp_path):
     """The mount's personal layer points `output_folder` at the main store, the
     other keys kept, and the merged config reads it back the way tickets.py does."""
     store = tmp_path / "main-store"
-    ticketstore.redirect_mount_store(project_v7.project, store)
+    ticketstore.redirect_mount_config(project_v7.project, main_store=store, initiative=None)
     text = (project_v7.project / ticketstore.USER_CONFIG_REL).read_text(encoding="utf-8")
     assert tomllib.loads(text)["core"] == {
         "output_folder": str(store),
@@ -362,15 +363,78 @@ def test_redirect_mount_store_rewrites_the_user_layer(project_v7, tmp_path):
     assert git(project_v7.project, "status", "--porcelain") == ""
 
 
-def test_redirect_mount_store_refuses_an_unredirectable_config(project_v7, tmp_path):
+def test_redirect_mount_config_writes_a_childs_initiative(project_v7, tmp_path):
+    """A chained mount's personal layer names the child as `active_initiative`,
+    alone or beside the store redirect, and the merged config reads both back the
+    way tickets.py does."""
+    ticketstore.redirect_mount_config(
+        project_v7.project, main_store=None, initiative="initiative-child"
+    )
+    path = project_v7.project / ticketstore.USER_CONFIG_REL
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["core"] == {
+        "active_initiative": "initiative-child"
+    }
+    assert bmadconfig.active_initiative(project_v7.project) == "initiative-child"
+
+    store = tmp_path / "main-store"
+    ticketstore.redirect_mount_config(
+        project_v7.project, main_store=store, initiative="initiative-other"
+    )
+    assert bmadconfig.read_core_value(project_v7.project, "output_folder")[0] == str(store)
+    assert bmadconfig.active_initiative(project_v7.project) == "initiative-other"
+    assert git(project_v7.project, "status", "--porcelain") == ""
+
+
+def test_redirect_mount_config_refuses_a_value_the_merge_does_not_read_back(
+    project_v7, monkeypatch
+):
+    """Each written key is read back from the merged layers; one that merges to
+    anything else (here: a stubbed read) is refused, naming the key."""
+    real = bmadconfig.read_core_value
+
+    def read(project, key):
+        return ("initiative-parent", "x") if key == "active_initiative" else real(project, key)
+
+    monkeypatch.setattr(bmadconfig, "read_core_value", read)
+    with pytest.raises(ticketstore.TicketStoreError, match="active_initiative"):
+        ticketstore.redirect_mount_config(
+            project_v7.project, main_store=None, initiative="initiative-child"
+        )
+
+
+def test_store_conflict_classifies_a_chained_childs_store(project_v7):
+    """`store_conflict(initiative=)` classifies the child folder beside the active
+    (parent) initiative as a chained run: on a tracked store it runs while the
+    personal layer is untracked, and once that file is tracked only the chained
+    call is refused — the mount rewrite would ride the unit commit."""
+    root = project_v7.project
+    child = project_v7.initiative_folder.parent / "initiative-child"
+    shutil.copytree(project_v7.initiative_folder, child)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "a child initiative")
+    assert ticketstore.store_conflict(root, "tickets", "worktree", initiative=child.name) is None
+
+    git(root, "add", "-f", ticketstore.USER_CONFIG_REL.as_posix())
+    git(root, "commit", "-q", "-m", "track the personal layer")
+    text = ticketstore.store_conflict(root, "tickets", "worktree", initiative=child.name)
+    assert text is not None and "config.user.toml" in text
+    assert ticketstore.store_conflict(root, "tickets", "worktree") is None
+    assert ticketstore.store_conflict(root, "tickets", "none", initiative=child.name) is None
+    bad = ticketstore.store_conflict(root, "tickets", "worktree", initiative="a/b")
+    assert bad is not None and "child initiative 'a/b'" in bad
+
+
+def test_redirect_mount_config_refuses_an_unredirectable_config(project_v7, tmp_path):
     (project_v7.project / ticketstore.USER_CONFIG_REL).write_text(
         'core = { active_initiative = "x" }\n', encoding="utf-8"
     )
     with pytest.raises(ticketstore.TicketStoreError):
-        ticketstore.redirect_mount_store(project_v7.project, tmp_path / "store")
+        ticketstore.redirect_mount_config(
+            project_v7.project, main_store=tmp_path / "store", initiative=None
+        )
 
 
-def test_redirect_mount_store_refuses_an_unreadable_user_layer(project_v7, tmp_path, monkeypatch):
+def test_redirect_mount_config_refuses_an_unreadable_user_layer(project_v7, tmp_path, monkeypatch):
     """A personal layer that exists but cannot be read is refused, never rewritten
     from empty: Python 3.14's `Path.is_file` reads a stat fault as False, which
     would drop the user's other keys."""
@@ -389,6 +453,8 @@ def test_redirect_mount_store_refuses_an_unreadable_user_layer(project_v7, tmp_p
     monkeypatch.setattr(Path, "is_file", is_file)
     monkeypatch.setattr(Path, "read_bytes", read_bytes)
     with pytest.raises(ticketstore.TicketStoreError, match="Permission denied"):
-        ticketstore.redirect_mount_store(project_v7.project, tmp_path / "store")
+        ticketstore.redirect_mount_config(
+            project_v7.project, main_store=tmp_path / "store", initiative=None
+        )
     monkeypatch.undo()
     assert path.read_bytes() == before

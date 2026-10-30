@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1475,7 +1476,9 @@ def test_run_isolated_records_every_pinned_rewrite(tmp_path, monkeypatch):
 
     monkeypatch.setattr(worktree_flow, "provision_worktree", provision)
     monkeypatch.setattr(worktree_flow, "worktree_seed_undelivered", stop)
-    state = SimpleNamespace(target_branch="main", run_id="run-1", source="sprint", tasks={})
+    state = SimpleNamespace(
+        target_branch="main", run_id="run-1", source="sprint", tasks={}, parent_initiative=None
+    )
     flow = _make_flow(
         tmp_path,
         paths=paths,
@@ -2425,18 +2428,23 @@ class _AfterRedirect(Exception):
     there without a session."""
 
 
-def _isolated_v7_flow(tmp_path, monkeypatch, layout):
+def _isolated_v7_flow(tmp_path, monkeypatch, layout, *, shared=True, child=None):
     """`run_isolated` over a REAL git worktree of ``layout``'s code repo with the
-    store shared, provisioning stubbed (it copies only the personal config layer,
-    as `_seed_bmad_tree` does) and the first result probe raising
-    :class:`_AfterRedirect`. Returns ``(flow, unit, task)``."""
+    store shared (unless not ``shared``), provisioning stubbed (it copies only the
+    personal config layer, as `_seed_bmad_tree` does) and the first result probe
+    raising :class:`_AfterRedirect`. A ``child`` makes the run chained: it builds
+    that child initiative of the layout's (parent) initiative, on the child's
+    paths. Returns ``(flow, unit, task)``."""
     import dataclasses
 
     import bmad_loop.worktree_flow as worktree_flow
     from bmad_loop import bmadconfig, ticketstore
 
     paths = bmadconfig.load_paths(layout.project, want_tickets=True)
-    paths = dataclasses.replace(paths, shared_store=paths.output_folder)
+    if shared:
+        paths = dataclasses.replace(paths, shared_store=paths.output_folder)
+    if child is not None:
+        paths = paths.with_initiative(child)
     wt = tmp_path / "mount"
     git(layout.project, "worktree", "add", "-q", "-b", "bmad-loop/run-1/1.1", str(wt))
     unit = UnitWorkspace(
@@ -2457,7 +2465,14 @@ def _isolated_v7_flow(tmp_path, monkeypatch, layout):
 
     monkeypatch.setattr(worktree_flow, "provision_worktree", provision)
     monkeypatch.setattr(worktree_flow, "worktree_seed_undelivered", stop)
-    state = SimpleNamespace(target_branch="main", run_id="run-1", source="tickets", tasks={})
+    state = SimpleNamespace(
+        target_branch="main",
+        run_id="run-1",
+        source="tickets",
+        tasks={},
+        initiative=child or layout.initiative,
+        parent_initiative=None if child is None else layout.initiative,
+    )
     flow = _make_flow(
         tmp_path,
         paths=paths,
@@ -2489,6 +2504,37 @@ def test_run_isolated_redirects_ignored_store(tmp_path, monkeypatch, project_v7_
     assert task.phase != Phase.ESCALATED
 
 
+def test_run_isolated_writes_a_chained_childs_initiative_into_the_mount(
+    tmp_path, monkeypatch, project_v7
+):
+    """A chained run over a tracked store (T1, no redirect of its own) still gets
+    its mount's personal config rewritten — `active_initiative` names the child,
+    and only that key changes — while the user's own file in the main checkout
+    keeps its bytes (its `active_initiative` still names the parent). Ablation
+    (performed): drop the initiative from the `redirect_mount_config` call site in
+    `run_isolated` and this FAILS (the mount still names the parent)."""
+    from bmad_loop import bmadconfig, ticketstore
+
+    main_config = project_v7.project / ticketstore.USER_CONFIG_REL
+    before = main_config.read_bytes()
+    flow, unit, task = _isolated_v7_flow(
+        tmp_path, monkeypatch, project_v7, shared=False, child="initiative-child"
+    )
+
+    with pytest.raises(_AfterRedirect):
+        flow.run_isolated(task, lambda _t: pytest.fail("drove a session"))
+
+    assert bmadconfig.active_initiative(unit.path) == "initiative-child"
+    expected = tomllib.loads(before.decode("utf-8"))
+    expected["core"]["active_initiative"] = "initiative-child"
+    mounted = (unit.path / ticketstore.USER_CONFIG_REL).read_text(encoding="utf-8")
+    assert tomllib.loads(mounted) == expected  # no output_folder on a T1 store
+    assert main_config.read_bytes() == before
+    assert bmadconfig.active_initiative(project_v7.project) == project_v7.initiative
+    assert git(unit.path, "status", "--porcelain") == ""
+    assert task.phase != Phase.ESCALATED
+
+
 def test_redirect_failure_escalates_unit(tmp_path, monkeypatch, project_v7_store_repo):
     """A redirect that cannot be written escalates the unit before any result probe
     or session. Ablation (performed): drop the `TicketStoreError` catch in
@@ -2500,7 +2546,7 @@ def test_redirect_failure_escalates_unit(tmp_path, monkeypatch, project_v7_store
     def refuse(*_a, **_k):
         raise ticketstore.TicketStoreError("config.user.toml cannot take the redirect")
 
-    monkeypatch.setattr(ticketstore, "redirect_mount_store", refuse)
+    monkeypatch.setattr(ticketstore, "redirect_mount_config", refuse)
 
     with pytest.raises(_Pause) as excinfo:
         flow.run_isolated(task, lambda _t: pytest.fail("drove a session"))
@@ -2510,3 +2556,29 @@ def test_redirect_failure_escalates_unit(tmp_path, monkeypatch, project_v7_store
     assert "cannot take the redirect" in excinfo.value.reason
     assert flow.journal.events() == ["worktree-opened", "story-escalated"]
     assert flow.calls.pauses == [(excinfo.value.reason, "1.1")]
+
+
+def test_chained_redirect_failure_names_the_child_initiative(tmp_path, monkeypatch, project_v7):
+    """A chained mount whose config cannot take the child escalates the unit
+    before any session, the reason naming the child initiative (and no shared
+    store on a T1 layout)."""
+    from bmad_loop import ticketstore
+
+    flow, _unit, task = _isolated_v7_flow(
+        tmp_path, monkeypatch, project_v7, shared=False, child="initiative-child"
+    )
+    seen = {}
+
+    def refuse(_project, **kwargs):
+        seen.update(kwargs)
+        raise ticketstore.TicketStoreError("config.user.toml cannot take the redirect")
+
+    monkeypatch.setattr(ticketstore, "redirect_mount_config", refuse)
+
+    with pytest.raises(_Pause) as excinfo:
+        flow.run_isolated(task, lambda _t: pytest.fail("drove a session"))
+
+    assert seen == {"main_store": None, "initiative": "initiative-child"}
+    assert task.phase == Phase.ESCALATED
+    assert "the child initiative 'initiative-child'" in excinfo.value.reason
+    assert "shared ticket store" not in excinfo.value.reason

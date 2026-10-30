@@ -17,8 +17,8 @@ to rediscover, so the corpora below are the gate: add a line here before
 loosening a pattern.
 
 Only two profiles seed patterns, and only because captured output exists for
-them: opencode seeds env_fault_patterns, claude seeds all three fields
-(SEEDED_PANE_FIELDS). The other four stay inert deliberately — see
+them: opencode seeds env_fault_patterns and usage_limit_patterns, claude seeds
+all three fields (SEEDED_PANE_FIELDS). The other four stay inert deliberately — see
 test_unseeded_profiles_stay_inert.
 
 WHAT BAIT IS FOR. The tmux adapters match against a tmux pane capture, which
@@ -88,6 +88,7 @@ PANE_PATTERN_FIELDS = ("env_fault_patterns", "usage_limit_patterns", "usage_wait
 # shrinking every parametrization keyed on this.
 SEEDED_PANE_FIELDS = (
     ("opencode", "env_fault_patterns"),
+    ("opencode", "usage_limit_patterns"),
     ("claude", "env_fault_patterns"),
     ("claude", "usage_limit_patterns"),
     ("claude", "usage_wait_patterns"),
@@ -112,26 +113,61 @@ OPENCODE_REAL = [
         # OpenCode 2.x: the `provider-errors.log` lines the adapter writes
         # (`format_provider_error`) for frames captured live from 2.0.27
         # (2026-10-12, zero tokens, a local mock provider answering a 429 rate
-        # limit, a 429 and a 402 `insufficient_quota`, and a closed port). Every
-        # byte is reproduced — test_v2_corpus_lines_are_what_the_adapter_writes
+        # limit and a closed port; the quota refusals are OPENCODE_USAGE_REAL).
+        # Every byte is reproduced — test_v2_corpus_lines_are_what_the_adapter_writes
         # rebuilds them from those frames' payloads.
         "provider-error event=session.retry.scheduled type=provider.rate-limit status=429 "
         'attempt=2 message="Rate limit reached for requests"',
         "provider-error event=session.step.failed type=provider.rate-limit status=429 "
         'attempt=- message="Rate limit reached for requests"',
-        "provider-error event=session.execution.failed type=provider.quota status=429 "
-        'attempt=- message="You exceeded your current quota, please check your plan and '
-        'billing details."',
-        "provider-error event=session.step.failed type=provider.quota status=402 "
-        'attempt=- message="You exceeded your current quota, please check your plan and '
-        'billing details."',
         "provider-error event=session.retry.scheduled type=provider.transport status=- "
         'attempt=2 message="ConnectionRefused: Unable to connect. Is the computer able to '
         'access the url?"',
         "provider-error event=session.execution.failed type=provider.transport status=- "
         'attempt=- message="ConnectionRefused: Unable to connect. Is the computer able to '
         'access the url?"',
+        # Captured the same way from 2.0.32 (2026-10-28): the mock provider
+        # answering HTTP 500 / 503 / 502 (provider.internal, retried), 401 / 403
+        # (provider.auth, not retried), and a session model with no route —
+        # an unconfigured provider, an unknown variant (provider.no-route,
+        # failed before any provider request).
+        "provider-error event=session.retry.scheduled type=provider.internal status=500 "
+        'attempt=2 message="The server had an error while processing your request. Sorry '
+        'about that!"',
+        "provider-error event=session.step.failed type=provider.internal status=500 "
+        'attempt=- message="The server had an error while processing your request. Sorry '
+        'about that!"',
+        "provider-error event=session.retry.scheduled type=provider.internal status=503 "
+        'attempt=2 message="The engine is currently overloaded, please try again later."',
+        "provider-error event=session.execution.failed type=provider.internal status=502 "
+        'attempt=- message="Provider request failed with HTTP 502"',
+        "provider-error event=session.step.failed type=provider.auth status=401 attempt=- "
+        'message="Incorrect API key provided: x. You can find your API key at '
+        'https://platform.openai.com/account/api-keys."',
+        "provider-error event=session.execution.failed type=provider.auth status=403 "
+        'attempt=- message="Your organization does not have access to this model."',
+        "provider-error event=session.execution.failed type=provider.no-route status=- "
+        'attempt=- message="Model unavailable: nosuch/mock-1"',
+        "provider-error event=session.execution.failed type=provider.no-route status=- "
+        'attempt=- message="Variant unavailable for mock/mock-1: bogus"',
+        # A hung provider under a `headerTimeout` / `chunkTimeout` setting reads
+        # provider.transport, not provider.timeout (unset, nothing fires at all).
+        "provider-error event=session.retry.scheduled type=provider.transport status=- "
+        'attempt=2 message="Timed out waiting for response headers"',
+        "provider-error event=session.step.failed type=provider.transport status=200 "
+        'attempt=- message="Timed out waiting for response data"',
     ),
+]
+# OpenCode 2.x's quota refusals, captured as OPENCODE_REAL's 2.x lines were (a
+# 429 and a 402 `insufficient_quota`): a usage limit, not an env fault — opencode
+# never retries one (DW-592), so they are seeded in usage_limit_patterns.
+OPENCODE_USAGE_REAL = [
+    "provider-error event=session.execution.failed type=provider.quota status=429 "
+    'attempt=- message="You exceeded your current quota, please check your plan and '
+    'billing details."',
+    "provider-error event=session.step.failed type=provider.quota status=402 "
+    'attempt=- message="You exceeded your current quota, please check your plan and '
+    'billing details."',
 ]
 
 # The captured 2.x frames behind the provider-errors lines above: `(event,
@@ -156,6 +192,20 @@ _TRANSPORT_ERROR = {
     "type": "provider.transport",
     "message": "ConnectionRefused: Unable to connect. Is the computer able to access the url?",
 }
+_INTERNAL_500_MESSAGE = "The server had an error while processing your request. Sorry about that!"
+_INTERNAL_500_ERROR = {
+    "type": "provider.internal",
+    "message": _INTERNAL_500_MESSAGE,
+    "status": 500,
+    "response": {
+        "body": f'{{"error": {{"message": "{_INTERNAL_500_MESSAGE}", "type": "server_error", '
+        '"param": null, "code": null}}'
+    },
+}
+_AUTH_401_MESSAGE = (
+    "Incorrect API key provided: x. You can find your API key at "
+    "https://platform.openai.com/account/api-keys."
+)
 OPENCODE_V2_CAPTURED_FRAMES = [
     (
         "session.retry.scheduled",
@@ -175,6 +225,137 @@ OPENCODE_V2_CAPTURED_FRAMES = [
             "error": _RATE_LIMIT_ERROR,
             "snapshot": "34371aaf",
             "files": [],
+        },
+    ),
+    (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_4",
+            "assistantMessageID": "msg_4",
+            "attempt": 2,
+            "at": 1791830566207,
+            "error": _TRANSPORT_ERROR,
+        },
+    ),
+    ("session.execution.failed", {"sessionID": "ses_4", "error": _TRANSPORT_ERROR}),
+    (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_5",
+            "assistantMessageID": "msg_5",
+            "attempt": 2,
+            "at": 1793222564524,
+            "error": _INTERNAL_500_ERROR,
+        },
+    ),
+    (
+        "session.step.failed",
+        {"sessionID": "ses_5", "assistantMessageID": "msg_5", "error": _INTERNAL_500_ERROR},
+    ),
+    (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_6",
+            "assistantMessageID": "msg_6",
+            "attempt": 2,
+            "at": 1793222564313,
+            "error": {
+                "type": "provider.internal",
+                "message": "The engine is currently overloaded, please try again later.",
+                "status": 503,
+                "response": {
+                    "body": '{"error": {"message": "The engine is currently overloaded, please '
+                    'try again later.", "type": "server_error", "param": null, "code": null}}'
+                },
+            },
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_7",
+            "error": {
+                "type": "provider.internal",
+                "message": "Provider request failed with HTTP 502",
+                "status": 502,
+                "response": {
+                    "body": "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n"
+                    "<center><h1>502 Bad Gateway</h1></center>\r\n</body>\r\n</html>\r\n"
+                },
+            },
+        },
+    ),
+    (
+        "session.step.failed",
+        {
+            "sessionID": "ses_8",
+            "assistantMessageID": "msg_8",
+            "error": {
+                "type": "provider.auth",
+                "message": _AUTH_401_MESSAGE,
+                "status": 401,
+                "response": {
+                    "body": f'{{"error": {{"message": "{_AUTH_401_MESSAGE}", "type": '
+                    '"invalid_request_error", "param": null, "code": "invalid_api_key"}}'
+                },
+            },
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_9",
+            "error": {
+                "type": "provider.auth",
+                "message": "Your organization does not have access to this model.",
+                "status": 403,
+                "response": {
+                    "body": '{"error": {"message": "Your organization does not have access to '
+                    'this model.", "type": "permission_error", "param": null, "code": null}}'
+                },
+            },
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_10",
+            "error": {"type": "provider.no-route", "message": "Model unavailable: nosuch/mock-1"},
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_11",
+            "error": {
+                "type": "provider.no-route",
+                "message": "Variant unavailable for mock/mock-1: bogus",
+            },
+        },
+    ),
+    (
+        "session.retry.scheduled",
+        {
+            "sessionID": "ses_15",
+            "assistantMessageID": "msg_15",
+            "attempt": 2,
+            "at": 1793222868765,
+            "error": {
+                "type": "provider.transport",
+                "message": "Timed out waiting for response headers",
+            },
+        },
+    ),
+    (
+        "session.step.failed",
+        {
+            "sessionID": "ses_16",
+            "assistantMessageID": "msg_16",
+            "error": {
+                "type": "provider.transport",
+                "message": "Timed out waiting for response data",
+                "status": 200,
+            },
         },
     ),
     (
@@ -204,19 +385,70 @@ OPENCODE_V2_CAPTURED_FRAMES = [
             "files": [],
         },
     ),
+]
+OPENCODE_V2_REAL = [
+    line for line in OPENCODE_REAL + OPENCODE_USAGE_REAL if line.startswith("provider-error ")
+]
+# Captured from 2.0.32 with the seeded lines above, and deliberately NOT seeded:
+# what the session sent can cause both types — an HTTP 400
+# (provider.invalid-request) and a malformed or truncated stream
+# (provider.invalid-output; opencode retries the truncated one). Charging the
+# story an attempt is the right call for them, so no opencode field may match.
+OPENCODE_V2_UNSEEDED_CAPTURED_FRAMES = [
+    (
+        "session.step.failed",
+        {
+            "sessionID": "ses_12",
+            "assistantMessageID": "msg_12",
+            "error": {
+                "type": "provider.invalid-request",
+                "message": "Invalid value for 'temperature': expected a number.",
+                "status": 400,
+                "response": {
+                    "body": '{"error": {"message": "Invalid value for \'temperature\': expected '
+                    'a number.", "type": "invalid_request_error", "param": "temperature", '
+                    '"code": null}}'
+                },
+            },
+        },
+    ),
+    (
+        "session.execution.failed",
+        {
+            "sessionID": "ses_13",
+            "error": {
+                "type": "provider.invalid-output",
+                "message": "Invalid mock/openai-compatible-chat stream event",
+                "status": 200,
+                "response": {
+                    "body": '{"id": "c1", "object": "chat.completion.chunk", "choices": ['
+                },
+            },
+        },
+    ),
     (
         "session.retry.scheduled",
         {
-            "sessionID": "ses_4",
-            "assistantMessageID": "msg_4",
+            "sessionID": "ses_14",
+            "assistantMessageID": "msg_14",
             "attempt": 2,
-            "at": 1791830566207,
-            "error": _TRANSPORT_ERROR,
+            "at": 1793222564535,
+            "error": {
+                "type": "provider.invalid-output",
+                "message": "OpenAI Chat stream ended without finish_reason",
+                "status": 200,
+            },
         },
     ),
-    ("session.execution.failed", {"sessionID": "ses_4", "error": _TRANSPORT_ERROR}),
 ]
-OPENCODE_V2_REAL = [line for line in OPENCODE_REAL if line.startswith("provider-error ")]
+OPENCODE_V2_UNSEEDED_REAL = [
+    "provider-error event=session.step.failed type=provider.invalid-request status=400 "
+    "attempt=- message=\"Invalid value for 'temperature': expected a number.\"",
+    "provider-error event=session.execution.failed type=provider.invalid-output status=200 "
+    'attempt=- message="Invalid mock/openai-compatible-chat stream event"',
+    "provider-error event=session.retry.scheduled type=provider.invalid-output status=200 "
+    'attempt=2 message="OpenAI Chat stream ended without finish_reason"',
+]
 
 # Claude Code surfaces provider failures behind its own "API Error" prefix, and
 # claude.toml reproduces each message's first sentence WHOLE (as a prefix match —
@@ -290,6 +522,7 @@ REAL_BY_PROFILE = [
     (name, field, line)
     for name, field, corpus in (
         ("opencode", "env_fault_patterns", OPENCODE_REAL),
+        ("opencode", "usage_limit_patterns", OPENCODE_USAGE_REAL),
         ("claude", "env_fault_patterns", CLAUDE_REAL),
         *(("claude", field, lines) for field, lines in CLAUDE_USAGE_REAL.items()),
     )
@@ -328,13 +561,15 @@ ANCHOR_REACHING_BAIT = [
     'provider-error event=session.step.failed type=aborted status=- attempt=- message="Step interrupted"',
     "provider-error event=session.execution.failed type=permission.rejected status=- "
     'attempt=- message="provider.quota rate-limit"',
-    "provider-error event=session.retry.scheduled type=provider.auth status=401 attempt=2 "
-    'message="quota exceeded; rate-limit; transport down"',
-    "provider-error event=session.execution.failed type=provider.no-route status=- "
+    "provider-error event=session.retry.scheduled type=provider.invalid-request status=400 "
+    'attempt=2 message="quota exceeded; rate-limit; transport down; auth; no-route"',
+    "provider-error event=session.execution.failed type=provider.content-filter status=- "
     'attempt=- message="Variant unavailable for mock/mock-1: rate-limit"',
     # A type that only STARTS like a seeded one (the pattern needs the whole
     # token), and the sanitized remains of a hostile `type` value.
     "provider-error event=session.execution.failed type=provider.quota-exceeded status=- "
+    'attempt=- message=""',
+    "provider-error event=session.execution.failed type=provider.authorization status=403 "
     'attempt=- message=""',
     "provider-error event=session.execution.failed type=provider.unknown_type_provider.quota "
     'status=- attempt=- message=""',
@@ -1010,28 +1245,48 @@ def test_unseeded_profiles_stay_inert(name: str) -> None:
 
 
 def test_v2_corpus_lines_are_what_the_adapter_writes() -> None:
-    """Provenance for the 2.x half of OPENCODE_REAL: each line is exactly what
+    """Provenance for the 2.x lines of OPENCODE_REAL and OPENCODE_USAGE_REAL: each line is exactly what
     the adapter writes (`format_provider_error`) for a frame captured live —
     so the corpus is the real thing, not a plausible-looking string."""
     written = [format_provider_error(event, data) for event, data in OPENCODE_V2_CAPTURED_FRAMES]
     assert written == OPENCODE_V2_REAL
-    for line in written:
-        assert "response" not in line and "insufficient_quota" not in line  # body dropped
+    for (_, data), line in zip(OPENCODE_V2_CAPTURED_FRAMES, written):
+        body = data["error"].get("response", {}).get("body")
+        assert body is None or body not in line  # body dropped
+        assert "response=" not in line and "insufficient_quota" not in line
+    unseeded = [
+        format_provider_error(event, data) for event, data in OPENCODE_V2_UNSEEDED_CAPTURED_FRAMES
+    ]
+    assert unseeded == OPENCODE_V2_UNSEEDED_REAL
 
 
-@pytest.mark.parametrize("line", OPENCODE_V2_REAL)
-def test_v2_provider_error_line_is_model_free_shape(line: str) -> None:
+@pytest.mark.parametrize("line", OPENCODE_V2_UNSEEDED_REAL)
+def test_v2_unseeded_provider_error_types_stay_unclassified(line: str) -> None:
+    """The captured 2.x types the session itself can cause — an invalid request,
+    an invalid provider output — are charged as a code failure, not read as an
+    environment fault or a usage limit. Unlike the bait above, these are REAL
+    adapter lines for real provider refusals: a widened type alternation (or a
+    type-agnostic `type=provider[.]\\S+`) reddens here first."""
+    assert not _matches("opencode", line), f"opencode classifies an unseeded type: {line[:120]}"
+
+
+@pytest.mark.parametrize(
+    ("field", "line"),
+    [
+        (field, line)
+        for name, field, line in REAL_BY_PROFILE
+        if name == "opencode" and line.startswith("provider-error ")
+    ],
+)
+def test_v2_provider_error_line_is_model_free_shape(field: str, line: str) -> None:
     """The 2.x pattern matches only the structured head of an adapter-written
     line: cut the line at `message=` and it still classifies, so nothing
     provider- or model-sourced is what made it match; and the same line behind
-    any leading text — quoted in the transcript, a doc, a fixture — does not."""
+    any leading text — quoted in the transcript, a doc, a fixture — does not.
+    Held per field: the env-fault and usage-limit lists each ship one."""
     head = line.split(' message="', 1)[0] + " "
-    v2 = [
-        p
-        for p in _patterns("opencode", ("env_fault_patterns",))
-        if p.pattern.startswith("^provider-error")
-    ]
-    assert len(v2) == 1, "the opencode profile should ship one 2.x provider-error pattern"
+    v2 = [p for p in _patterns("opencode", (field,)) if p.pattern.startswith("^provider-error")]
+    assert len(v2) == 1, f"the opencode profile should ship one 2.x provider-error {field} entry"
     assert v2[0].search(head)
     assert v2[0].search(line)
     assert not v2[0].search("  " + line)

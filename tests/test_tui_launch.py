@@ -24,7 +24,7 @@ import pytest
 from bmad_loop import envvars, runs
 from bmad_loop.adapters import tmux_base
 from bmad_loop.adapters.multiplexer import PARKED_BANNER, MultiplexerError, get_multiplexer
-from bmad_loop.model import PauseSnapshot
+from bmad_loop.model import PauseSnapshot, RunState
 from bmad_loop.tui import launch
 
 # Every test here asserts tmux-specific argv/behaviour through the multiplexer
@@ -1170,6 +1170,69 @@ def test_claim_outside_a_control_session_leaves_the_record(tmp_path: Path, monke
     assert record.read_text(encoding="utf-8") == "@2"
 
 
+def test_a_chain_claim_renames_the_window_then_records_it(fake_run, tmp_path: Path, monkeypatch):
+    # A chain's next run B starts in the window run A was launched in. The
+    # window is renamed to the `run-B` start_detached would have minted, and
+    # only then recorded and re-proved by name. Ablation (performed): skip the
+    # rename and no rename-window is sent, so the first assertion FAILS.
+    _make_run(tmp_path, "A")
+    _write_record(tmp_path, "A", "@7")
+    _make_run(tmp_path, "B")
+    fake_run.windows = "@7\trun-B\n"  # the listing after the rename
+    _in_ctl_window(monkeypatch, "@7")
+    real_record = launch._record_ctl_window
+
+    def record(project: Path, run_id: str, win_id: str) -> None:
+        assert fake_run.by_verb("rename-window"), "recorded before the rename"
+        real_record(project, run_id, win_id)
+
+    monkeypatch.setattr(launch, "_record_ctl_window", record)
+    assert launch.claim_renamed_ctl_window(tmp_path, "B") is None
+    assert fake_run.by_verb("rename-window") == [
+        ["tmux", "-u", "rename-window", "-t", "@7", "run-B"]
+    ]
+    assert launch.recorded_ctl_window(tmp_path, "B") == "@7"
+
+
+def test_a_chain_claim_whose_rename_fails_records_nothing(fake_run, tmp_path: Path, monkeypatch):
+    # The window keeps run A's name, so a record for B would name a window the
+    # lookup cannot reach as B's: B gets none, A keeps its own, and the
+    # operator hears. Ablation (performed): claim after a failed rename and B's
+    # record is written.
+    _make_run(tmp_path, "A")
+    a_record = _write_record(tmp_path, "A", "@7")
+    _make_run(tmp_path, "B")
+    _in_ctl_window(monkeypatch, "@7")
+
+    def run(argv, **kwargs):
+        if argv[2] == "rename-window":
+            fake_run.calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no server\n")
+        return fake_run(argv, **kwargs)
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", run)
+    warning = launch.claim_renamed_ctl_window(tmp_path, "B") or ""
+    assert "could not be renamed for run B" in warning
+    assert "no server" in warning
+    assert launch.recorded_ctl_window(tmp_path, "B") is None
+    assert not (runs.run_dir_for(tmp_path, "B") / launch._CTL_WINDOW_FILE).exists()
+    assert a_record.read_text(encoding="utf-8") == "@7"
+
+
+def test_a_chain_claim_outside_a_control_session_touches_nothing(
+    fake_run, tmp_path: Path, monkeypatch
+):
+    # A chain driven from the operator's own shell has no window to rename,
+    # even when the multiplexer would name the window it runs in. Ablation
+    # (performed): drop the in_ctl_session gate and @7 is renamed.
+    _make_run(tmp_path, "B")
+    monkeypatch.setattr(launch, "in_ctl_session", lambda: False)
+    monkeypatch.setattr(type(get_multiplexer()), "current_window_id", lambda self: "@7")
+    assert launch.claim_renamed_ctl_window(tmp_path, "B") is None
+    assert fake_run.calls == []
+    assert launch.recorded_ctl_window(tmp_path, "B") is None
+
+
 def test_a_launched_claim_whose_session_probe_went_unanswered_drops_the_record(
     tmp_path: Path, monkeypatch
 ):
@@ -1340,7 +1403,10 @@ def test_a_refused_resume_leaves_the_record_with_the_driving_window(
 
     def prepare(_project, _run_dir, *, accept_baseline=False):
         engine["live"] = True  # the pid this child publishes under the lock
-        return (*(None,) * 8, PauseSnapshot(None, None, None, False, False, None))
+        # the resumed state: the sweep factory reads its parent initiative
+        state = RunState(run_id="RID", project=str(tmp_path), started_at="now")
+        pause = PauseSnapshot(*(None,) * 5, False, False, None)
+        return (None, state, *(None,) * 6, pause, None)
 
     def compose(**_kwargs):
         raise Drove

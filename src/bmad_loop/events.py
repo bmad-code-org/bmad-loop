@@ -6,7 +6,7 @@ contract (its docstring says so) and cannot import ``bmad_loop`` to reach this
 module — and this module cannot import it back, since it ships as package DATA
 rather than as an importable module. Hence a twin rather than shared code:
 ``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_notification_type``,
-``_source``, the DW-507 lineage block (``_LAUNCH_SHIM_WINDOW_S``,
+``_source``, ``_fully_idle``, the DW-507 lineage block (``_LAUNCH_SHIM_WINDOW_S``,
 ``_proc_stat``, ``_cmdline``, ``_HOOK_SHELLS``, ``_runs_relay``,
 ``_is_hook_wrapper``, ``_lineage``), ``_is_link_like``,
 ``_write_all`` and ``_write_event`` below are byte-identical copies of the
@@ -74,6 +74,15 @@ def _source(payload):
     # string is forwarded, like the notification subtype above.
     value = payload.get("source")
     return value if isinstance(value, str) else None
+
+
+def _fully_idle(payload):
+    # An agy Stop payload's `fullyIdle` (DW-548): false when the parent only
+    # yielded to a foreground subagent, true at the real turn end. Only a JSON
+    # boolean is forwarded, and the key is written only then, so every other
+    # CLI's event stays unchanged.
+    value = payload.get("fullyIdle")
+    return value if isinstance(value, bool) else None
 
 
 # How long after the launched CLI the rest of its launch chain may start
@@ -376,7 +385,8 @@ def shape_event(
     :func:`_lineage`); :func:`relay` computes it, since it reads this process's
     own parent chain rather than anything in the payload. ``payload_error`` is
     :func:`_read_payload`'s tag, written only when set so a readable payload's
-    event is unchanged."""
+    event is unchanged; ``fully_idle`` (DW-548) likewise appears only when the
+    payload carries a boolean ``fullyIdle``."""
     event = {
         "ts": ts,
         "event": event_name,
@@ -405,6 +415,11 @@ def shape_event(
         # a filter — the orchestrator decides what a "mismatch" means.
         "lineage": lineage,
     }
+    # Only when the payload carries a boolean `fullyIdle` (agy, DW-548): a Stop
+    # with false is a subagent yield, not a turn end. Absent for every other CLI.
+    fully_idle = _fully_idle(payload)
+    if fully_idle is not None:
+        event["fully_idle"] = fully_idle
     if payload_error:
         event["payload_error"] = payload_error
     return event

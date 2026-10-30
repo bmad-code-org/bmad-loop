@@ -60,6 +60,7 @@ def test_writes_event_file(tmp_path):
     assert event["task_id"] == "1-1-a-dev-1"
     assert event["session_id"] == "abc-123"
     assert event["transcript_path"].endswith("abc-123.jsonl")
+    assert "fully_idle" not in event  # DW-548: absent unless the CLI sends one
     assert not list((tmp_path / "events").glob("*.tmp"))
 
 
@@ -107,6 +108,7 @@ def test_antigravity_payload(tmp_path):
     assert event["session_id"] == "agy-3"
     assert event["transcript_path"].endswith("transcript.jsonl")
     assert event["cwd"] == "/ws"
+    assert event["fully_idle"] is True  # DW-548: forwarded as a boolean
 
 
 def test_workspace_paths_ignored_when_unusable(tmp_path):

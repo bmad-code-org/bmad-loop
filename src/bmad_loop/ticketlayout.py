@@ -53,6 +53,12 @@ def epic_folder(initiative: Path, slug: str) -> Path:
     return breakdown_dir(initiative) / slug
 
 
+def epic_file(initiative: Path, slug: str) -> Path:
+    """Epic ``slug``'s own file, ``<slug>.md`` at the top of its epic folder.
+    Raises ``OSError`` as :func:`breakdown_dir` does."""
+    return epic_folder(initiative, slug) / f"{slug}.md"
+
+
 def retrospective_doc(initiative: Path, slug: str) -> Path:
     """Epic ``slug``'s retrospective document, ``<slug>-retrospective.md`` at the
     top of its epic folder — beside the epic file, above the epic's own

@@ -1681,8 +1681,9 @@ def _declares_loadgroup(addopts: object) -> bool:
 _OTHER_DEFS = "<other>"  # explicit catch-all; a module omitting it refuses unexplained defs
 _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
     "test_generic_tmux.py": {"test_tmux_": 6},
-    "test_tui_launch_tmux_e2e.py": {"test_e2e_": 1},
+    "test_tui_launch_tmux_e2e.py": {"test_e2e_": 2},
     "test_tmux_locale_e2e.py": {"test_e2e_": 1},
+    "test_launch_probe.py": {"test_e2e_": 1},
     "test_stories_e2e.py": {
         "test_e2e_": 18,
         "test_reap_e2e_": 3,
@@ -1692,7 +1693,7 @@ _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
         # `test_reap_identity_*`, `test_recorded_*`.
         _OTHER_DEFS: 28,
     },
-    "test_tickets_e2e.py": {"test_e2e_tickets_": 14},
+    "test_tickets_e2e.py": {"test_e2e_tickets_": 17},
     "test_conftest.py": {"test_private_tmux_": 1},
 }
 

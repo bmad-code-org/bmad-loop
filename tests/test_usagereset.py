@@ -1,8 +1,9 @@
 """Tests for usagereset.py: the usage-limit `resets …` clause parse (#610).
 
-None of these depend on the host's zone database: the named-zone route is
-pinned by monkeypatching the module's `ZoneInfo` lookup to a fixed offset, and
-the one real-zone test skips when the zone is absent."""
+The named-zone route is mostly pinned by monkeypatching the module's
+`ZoneInfo` lookup to a fixed offset. One test requires a real zone on every
+platform (Windows through the `tzdata` dependency), and the DST-crossing
+real-zone test skips when the zone is absent."""
 
 from __future__ import annotations
 
@@ -196,6 +197,17 @@ def test_any_zone_lookup_fault_is_zone_unavailable(
     assert (reset.at, reset.unresolved) == (None, "zone-unavailable")
 
 
+def test_named_zone_resolves_on_every_platform() -> None:
+    """Never skipped: Windows has no system zone database, so this resolves
+    there only through the win32 `tzdata` dependency (pyproject.toml), and the
+    Windows CI legs are what prove that dependency is installed."""
+    reset = parse_reset("limit · resets 9am (America/Los_Angeles)", NOW)
+    assert reset is not None and reset.unresolved is None, reset
+    assert reset.at is not None and reset.at.tzinfo == ZoneInfo("America/Los_Angeles")
+    # 15:00 UTC is 08:00 PDT (summer time there runs to 2026-11-01).
+    assert reset.value == "2026-10-25T09:00:00-07:00"
+
+
 def test_real_zone_database_when_present() -> None:
     """The unpatched lookup, end to end, over a DST change (skipped without
     tzdata): Warsaw leaves summer time on 2026-10-25, so 6pm there today is
@@ -264,3 +276,31 @@ def test_adapter_local_now_resolves_through_dst(
     monkeypatch.setattr(time, "time", lambda: datetime(2026, 3, 28, 23, 30, tzinfo=UTC).timestamp())
     at = _at("resets 6am", generic._local_now())
     assert at.astimezone(UTC) == datetime(2026, 3, 29, 4, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["resets 7:20pm", "resets 12:50pm (Asia/Ho_Chi_Minh)", "resets Sep 15 at 7pm"],
+)
+def test_resolved_reset_accepts_every_resolved_value(line: str) -> None:
+    """DW-591: what `UsageReset.value` emits for a resolved reset is recognised."""
+    reset = parse_reset(line, NOW)
+    assert reset is not None and reset.at is not None
+    assert usagereset.resolved_reset(reset.value) == reset.value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "7:20pm (Mars/Olympus_Mons)",  # zone-unavailable raw text
+        "soon",  # unparsed raw text
+        "2026-10-25T19:20:00",  # ISO but naive: no instant
+        "2026-10-25 19:20+00:00",  # ISO but not the form `value` emits
+    ],
+)
+def test_resolved_reset_refuses_raw_or_naive_text(value: str | None) -> None:
+    """Raw clause text, and anything that is not an aware `isoformat()`, is not
+    a resolved reset."""
+    assert usagereset.resolved_reset(value) is None

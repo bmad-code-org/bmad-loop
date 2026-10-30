@@ -417,6 +417,9 @@ def test_v2_provider_error_line_formats_structured_fields():
     # Other frames write nothing; neither does V1.
     assert v2.provider_error_line("session.text.ended", {"text": "x"}) is None
     assert V1Protocol().provider_error_line("session.error", {"error": {}}) is None
+    # No V1 frame type formats a line at all, so V1 never makes the adapter's
+    # live usage-limit sighting (DW-592): its quota stays a tail-scan match.
+    assert V1Protocol().provider_error_types == frozenset()
 
 
 def test_v2_provider_error_line_is_model_free_shape():
@@ -618,6 +621,104 @@ def test_v2_tool_name_joined_from_input_started():
         f'{_G}[bmad] tool: read {{"path": "b.txt"}}{_R}\n',
         f'{_G}[bmad] tool: write {{"path": "out.txt", "content": "hello\\n"}}{_R}\n',
     ]
+
+
+# The live 2.0.32 `form.created` payload of a two-question `question` call
+# (module docstring, "Forms").
+_FORM_CREATED = {
+    "form": {
+        "id": "frm_1",
+        "sessionID": "ses_1",
+        "title": "Questions",
+        "metadata": {"kind": "question", "tool": {"messageID": "msg_a", "id": "call_q1"}},
+        "fields": [
+            {
+                "key": "q0",
+                "title": "Database",
+                "description": "Which database should the service use?",
+                "type": "string",
+                "options": [
+                    {"value": "Postgres", "label": "Postgres", "description": "Relational"},
+                    {"value": "SQLite", "label": "SQLite", "description": "Embedded file"},
+                ],
+                "custom": True,
+            },
+            {
+                "key": "q1",
+                "title": "Extras",
+                "description": "Which extras?",
+                "type": "multiselect",
+                "options": [{"value": "Cache", "label": "Cache", "description": "Redis"}],
+                "custom": True,
+            },
+        ],
+    }
+}
+
+
+def test_v2_render_form_ask_reply_and_cancel():
+    """A form parks the turn until answered, so its ask names the form and
+    each question (never the options), and its reply or cancel gets one line —
+    the live 2.0.32 shapes: `form.created` nests the whole form, `form.replied`
+    carries `answer`, `form.cancelled` only `id` / `sessionID`."""
+    lines = _render(
+        [
+            ("form.created", _FORM_CREATED),
+            (
+                "form.replied",
+                {"id": "frm_1", "sessionID": "ses_1", "answer": {"q0": "SQLite", "q1": ["Cache"]}},
+            ),
+            ("form.created", _FORM_CREATED),
+            ("form.cancelled", {"id": "frm_1", "sessionID": "ses_1"}),
+        ]
+    )
+    ask = (
+        f'{_G}[bmad] form ask: Questions ["Database: Which database should the service '
+        f'use?", "Extras: Which extras?"]{_R}\n'
+    )
+    assert lines == [
+        ask,
+        f'{_G}[bmad] form reply: {{"q0": "SQLite", "q1": ["Cache"]}}{_R}\n',
+        ask,
+        f"{_G}[bmad] form cancelled{_R}\n",
+    ]
+    assert not any("Embedded file" in line for line in lines)
+
+
+def test_v2_render_unknown_or_malformed_form_frames_do_not_crash():
+    """Only the three pinned `form.*` types render: an unseen subtype is
+    silent, and a `form.created` whose form or fields are not the pinned shape
+    still names what it can instead of raising into the reader."""
+    lines = _render(
+        [
+            ("form.updated", {"id": "frm_1", "sessionID": "ses_1", "form": "x"}),
+            ("form.list", {}),
+            ("form.created", {"form": "not-a-dict"}),
+            ("form.created", {"form": {"title": "T", "fields": ["x", {"key": "k"}]}}),
+            ("form.replied", {"id": "frm_1"}),
+        ]
+    )
+    assert lines == [
+        f"{_G}[bmad] form ask: ?{_R}\n",
+        f'{_G}[bmad] form ask: T ["k"]{_R}\n',
+        f"{_G}[bmad] form reply:{_R}\n",
+    ]
+
+
+def test_v2_form_created_names_its_nested_session():
+    """`form.created` is the one V2 frame with no top-level `sessionID` (it
+    nests the form, session id included): the envelope reads it from there, or
+    the session filter drops the very line that explains a parked turn. Other
+    frames are not read from a nested `form`."""
+    v2 = V2Protocol()
+    frame = {"id": "evt_1", "type": "form.created", "data": _FORM_CREATED}
+    assert v2.frame_payload(frame) == (_FORM_CREATED, "ses_1")
+    assert v2.frame_payload({"type": "form.created", "data": {"form": "x"}}) == (
+        {"form": "x"},
+        None,
+    )
+    other = {"type": "form.updated", "data": {"form": {"sessionID": "ses_1"}}}
+    assert v2.frame_payload(other)[1] is None
 
 
 def test_v2_trace_skips_deltas(tmp_path):

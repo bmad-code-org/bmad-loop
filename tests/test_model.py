@@ -181,6 +181,28 @@ def test_old_state_json_defaults_initiative_empty():
     assert back.initiative == "" and back.initiative_folder == ""
 
 
+def test_run_state_round_trips_parent_initiative():
+    assert _state().parent_initiative is None
+    assert _state().to_dict()["parent_initiative"] is None
+    chained = _state(initiative="initiative-auth", parent_initiative="initiative-platform")
+    d = json.loads(json.dumps(chained.to_dict()))
+    assert d["parent_initiative"] == "initiative-platform"
+    back = RunState.from_dict(d)
+    assert back.parent_initiative == "initiative-platform"
+    assert back.initiative == "initiative-auth"
+
+
+def test_old_state_json_without_parent_initiative_loads_unchained():
+    """A state.json written before the field existed reads as a run that builds
+    the active initiative itself. Ablation (performed): drop the `from_dict`
+    default (`d["parent_initiative"]`) and this FAILS with a KeyError."""
+    d = json.loads(json.dumps(_state(initiative="initiative-checkout").to_dict()))
+    del d["parent_initiative"]
+    back = RunState.from_dict(d)
+    assert back.parent_initiative is None
+    assert back.initiative == "initiative-checkout"
+
+
 def _binding(**kw) -> TicketBinding:
     base = dict(
         ref="2.1",
@@ -1443,6 +1465,49 @@ def test_clear_pause_also_clears_crashed():
     assert state.paused is False
 
 
+def test_usage_limit_pause_fields_round_trip_and_default_legacy():
+    """DW-591: a usage-limit pause's reset and limit class persist; a state.json
+    written before the fields existed loads both as None."""
+    state = _state(
+        paused_reason="usage limit: dev session stalled (x)",
+        paused_reset_at="2026-10-25T19:20:00+07:00",
+        paused_limit_class="wait",
+    )
+    loaded = RunState.from_dict(state.to_dict())
+    assert loaded.paused_reset_at == "2026-10-25T19:20:00+07:00"
+    assert loaded.paused_limit_class == "wait"
+    legacy = state.to_dict()
+    del legacy["paused_reset_at"]
+    del legacy["paused_limit_class"]
+    loaded = RunState.from_dict(legacy)
+    assert loaded.paused_reset_at is None
+    assert loaded.paused_limit_class is None
+
+
+def test_clear_pause_also_clears_usage_limit_fields():
+    state = _state(
+        paused_reason="usage limit",
+        paused_reset_at="2026-10-25T19:20:00+07:00",
+        paused_limit_class="blocked",
+    )
+    state.clear_pause()
+    assert state.paused_reset_at is None
+    assert state.paused_limit_class is None
+
+
+def test_record_pause_never_inherits_usage_limit_fields():
+    """A pause that is not a usage limit stores None for both facts, even over
+    values a previous pause left on the state (DW-591)."""
+    state = _state()
+    state.record_pause("usage limit", "escalation", "s1", reset_at="r", limit_class="wait")
+    assert (state.paused_reset_at, state.paused_limit_class) == ("r", "wait")
+    state.record_pause("CRITICAL escalation", "escalation", "s2")
+    assert state.paused_reason == "CRITICAL escalation"
+    assert state.paused_story_key == "s2"
+    assert state.paused_reset_at is None
+    assert state.paused_limit_class is None
+
+
 def test_restore_pause_undoes_clear_pause():
     """`pause_snapshot` captures exactly the fields `clear_pause` clears, so a resume
     that fails before its engine starts can put the pause back. Every field is set
@@ -1451,6 +1516,8 @@ def test_restore_pause_undoes_clear_pause():
         paused_reason="CRITICAL escalation",
         paused_stage="escalation",
         paused_story_key="s1",
+        paused_reset_at="2026-10-25T19:20:00+07:00",
+        paused_limit_class="wait",
         stopped=True,
         crashed=True,
         crash_error="RuntimeError: boom",

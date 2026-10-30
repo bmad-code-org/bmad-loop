@@ -22,6 +22,10 @@ dependencies = [
   # win32 liveness needs psutil (no /proc; os.kill(pid,0) is destructive there);
   # without it the TUI shows every run as `?`. Hard dep so no install path misses it.
   "psutil>=7.2.2; sys_platform == 'win32'",
+  # Windows has no system tz database, so zoneinfo can resolve a usage-limit reset's
+  # `(<Area/City>)` zone (usagereset.py) only through this first-party fallback.
+  # Linux/macOS ship the system database.
+  "tzdata>=2026.5; sys_platform == 'win32'",
 ]
 
 [project.scripts]
@@ -49,7 +53,7 @@ dev = [
   # checks that fail the build on untouched code. This is the single pin — the
   # typecheck job runs `uv run pyright`, so CI and `uv run pyright` locally are
   # the same resolved version and cannot drift apart (#245).
-  "pyright==1.1.411",
+  "pyright==1.1.414",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -126,7 +130,7 @@ line_length = 100
 
 [tool.pyright]
 # Stage 1 of #245 (assessment F-4): a basic-mode type-check gate so annotation
-# drift stops being invisible. Verified against pyright 1.1.411 docs.
+# drift stops being invisible. Verified against pyright 1.1.414 docs.
 include = ["src/bmad_loop"]
 # data/ ships skill assets + hook scripts that are templates / stand-alone (not
 # part of the package's import graph); type-checking them is noise.
@@ -149,6 +153,7 @@ strict = [
   "src/bmad_loop/plugins/grants.py",
   "src/bmad_loop/worksource.py",
   "src/bmad_loop/ticketmodel.py",
+  "src/bmad_loop/initiativechain.py",
   "src/bmad_loop/ticketstore.py",
   "src/bmad_loop/usagereset.py",
   "src/bmad_loop/parked.py",

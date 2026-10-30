@@ -9,6 +9,26 @@ breaking changes may land in a minor release.
 
 ### Added
 
+- Add an epic-close `resolve` for tickets runs paused at `epic-boundary`: open
+  bmad-agent-po on the paused epic's closure check (`--no-interactive`: no session),
+  then resume only when the epic reads `done` or `dropped` and its epic folder has no
+  uncommitted change; never trust the session's exit code. Exit 1, still paused, on a
+  failed check (`epic-close-unverified`), a retrospective still owed, a missing
+  bmad-agent-po skill or a dev CLI with no interactive mode. Journal
+  `epic-close-session-start` / `-end` and `epic-close-verified`. TUI: `R`, and **Close
+  with bmad-agent-po** in the epic-closure viewer.
+- Add `resolve --at-reset [--margin-min N]`: for a usage-limit pause the coding CLI waits
+  out, wait in the foreground until the recorded reset plus the margin (default 2 min),
+  then re-arm and resume as `--no-interactive --resume`. Refuse (exit 1) credit
+  exhaustion, an unresolved reset and a reset past `[limits] quota_wait_max_min`, and,
+  after the wait, a pause other than the one waited on; Ctrl-C leaves the run paused
+  (exit 130). Journal the wait as `at-reset-wait-start` / `-end`.
+- Add the `adapter.launch-probe` check to `validate --probes`: for each distinct role
+  launch (roles with the same argv share one) whose `generic`-adapter profile declares
+  `parked_prompt_patterns`, launch the coding CLI once with no prompt, and fail when its
+  first screen shows a startup dialog an unattended session would park on. A profile
+  without patterns is reported and not launched; a screen the probe could not see is a
+  warning.
 - Add `limits.quota_wait_max_min` (default 300; 0 = off): while the visible pane shows
   Claude Code waiting out a usage-window reset and the transcript is idle, freeze the
   session timeout and hold the stall nudge, so the session finishes after the CLI's own
@@ -107,8 +127,11 @@ breaking changes may land in a minor release.
   with a clear error, and `validate` reports it as `adapter.opencode-version` (#847).
 - On OpenCode 2.x, send `effort` as the session model's variant, and refuse a session
   start whose effort is not one of the model's variants (#847).
-- Write each OpenCode 2.x provider-error event to `logs/<task-id>.provider-errors.log`
-  and classify rate-limit, quota and transport outages there as environment faults (#847).
+- Write each OpenCode 2.x provider-error event to `logs/<task-id>.provider-errors.log`;
+  classify rate-limit and transport outages there as environment faults and quota
+  failures as a blocking usage limit (#847).
+- Render OpenCode 2.x forms in the `[bmad]` transcript: a `form ask` line naming the form
+  and its questions when one parks the turn, then `form reply` or `form cancelled`.
 - Add the `subagent_transcript_dir` CLI profile field: a subagent transcript tree whose
   writes count as session activity for the idle notice (#858).
 - Name the tool call an idle Claude session is waiting on: `session-idle` carries
@@ -195,6 +218,14 @@ breaking changes may land in a minor release.
 - Refuse `delete` (even `--force`), the TUI delete and `clean` on a run whose state
   cannot be read, or on an isolated v7 sweep run still holding shared-store ledger
   closes for unlanded code; a new sweep warns while such a run exists (DW-571).
+- Pass `--allow-all-urls` in copilot's `bypass_args` so unattended sessions fetch URLs
+  without a permission prompt; this changes the copilot default config digest (DW-598).
+- Build a parent initiative's children one run each when `run` targets a parent (was
+  exit 1). Require worktree isolation without the auto retrospective; pause each child
+  at its epic boundaries; close drained children (`status: done`) before every pick;
+  spend one `--max-stories` budget across the chain. Show the chain in `run --dry-run`
+  and the TUI start-run preview, both picking as if the drained children were closed,
+  and a chained run's child on its tickets board (DW-574).
 
 ### Removed
 
@@ -203,6 +234,36 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Count OpenCode 2.x subagent (child) session tokens, at every nesting depth, in recorded
+  usage and the budget guard's samples; a failed child walk is a `usage-capture-failed`
+  (`stage=children`) fault, never a parent-only figure. A child still running at capture
+  is journaled as `usage-child-active` (DW-540).
+- Ignore an Antigravity `Stop` sent with `fullyIdle: false` (a yield to a foreground
+  subagent) instead of completing the session while the subagent still works; the
+  relay forwards `fully_idle`, and `hook-stop-yield-ignored` journals the skip.
+- Ignore an Antigravity subagent conversation's `Stop` instead of letting its final turn end
+  complete the parent early: the new profile key `subagent_spawn_marker` identifies a child
+  by the spawn file its parent wrote, and `subagent-stop-ignored` journals each child.
+- Count an Antigravity subagent's writes as its parent's activity, so a parent blocked on a
+  long foreground subagent no longer journals a false `session-idle`: the idle notice walks
+  each child conversation the parent's `subagent_spawn_marker` files list.
+- Classify OpenCode 2.x provider 5xx errors (`provider.internal`), rejected credentials
+  (`provider.auth`) and unroutable models (`provider.no-route`) as environment faults
+  instead of charging the session as a code failure.
+- Let sandboxed Codex sessions commit under worktree isolation: grant them write access to
+  the linked worktree's gitdir and the main repo's `.git`. `validate` warns only when
+  `extra_args` drops the grant or the profile's grant misses either path.
+- Pause a tickets resume at `ticket-tree` (`binding-moved`) when an in-flight unit's ticket
+  was moved with `tickets.py move` or its plan is gone, naming the old and new ref and plan,
+  instead of re-dispatching a ref the tree no longer holds (DW-575).
+- Refuse to archive a sweep run holding unlanded ledger closes, and leave such a run's unit
+  worktree and artifacts alone on every `clean` arm, reporting it protected (DW-572, DW-573).
+- Show policy.toml deprecation notices in the TUI dashboard as a warning toast (DW-603).
+- Nudge a stalled session whose permission prompt was approved: a transcript write after
+  the PermissionPrompt latch now clears it, instead of the stall pausing as parked (DW-594).
+- Windows installs now depend on tzdata, so usage-limit resets that name a time zone
+  resolve (DW-593).
+- validate's hooks.trust now checks the permission-mode launch args each role runs with (DW-602).
 - Show the legacy `[engine]` deprecation notice to CLI users: it was a `DeprecationWarning`,
   which Python hides outside `__main__`. It is now `policy.PolicyDeprecationWarning` (a
   `FutureWarning`), printed once on stderr as `bmad-loop: warning: …`, and `validate` reports
@@ -223,6 +284,9 @@ breaking changes may land in a minor release.
   a live pane sighting is exempt from the token veto. Add the profile fields
   `usage_limit_patterns` and `usage_wait_patterns`, seeded from lines captured in
   community reports (#610).
+- Pause an OpenCode 2.x session that fails on a provider quota as a usage limit, never
+  charged, even after it did work: the adapter matches each provider-error line against
+  the profile's usage lists as it writes it, a live sighting exempt from the token veto.
 - Read an epic the initiative declares but has not sliced yet: `status` no longer
   faults the board on its folderless row, and it triggers no retrospective or closure.
 - Name the T1 ticket plan an interrupted commit window left `done` or `blocked` when

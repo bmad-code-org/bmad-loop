@@ -3625,11 +3625,19 @@ class HeldClosesUnknownError(Exception):
 
 
 class HeldSweepClosesError(Exception):
-    """:func:`delete_run` refused a run that holds unlanded sweep ledger closes,
-    or one where that could not be told. ``dw_ids`` lists the held ids (empty
-    when ``reason`` names the fault that stopped the check)."""
+    """:func:`delete_run` or :func:`archive_run` (``action``) refused a run that
+    holds unlanded sweep ledger closes, or one where that could not be told.
+    ``dw_ids`` lists the held ids (empty when ``reason`` names the fault that
+    stopped the check)."""
 
-    def __init__(self, run_id: str, dw_ids: list[str], reason: str | None = None) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        dw_ids: list[str],
+        reason: str | None = None,
+        *,
+        action: str = "delete",
+    ) -> None:
         self.run_id = run_id
         self.dw_ids = list(dw_ids)
         self.reason = reason
@@ -3650,7 +3658,7 @@ class HeldSweepClosesError(Exception):
                 f"{run_id}` once it reads to land or reopen any closes it holds; a run "
                 "you have confirmed holds none can be removed by hand"
             )
-        super().__init__(f"run {run_id}: refusing to delete it — {what}. {remedy}")
+        super().__init__(f"run {run_id}: refusing to {action} it — {what}. {remedy}")
 
 
 def _bundle_code_landed(task: StoryTask) -> bool:
@@ -3689,8 +3697,9 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
 
     Read-only. An absent ``state.json`` or ledger answers ``[]``: there is no
     record of a close. Any other fault raises :class:`HeldClosesUnknownError`
-    and is never folded into ``[]``. Used by the :func:`delete_run` refusal and
-    the sweep-start warning (:func:`prior_sweep_closes`)."""
+    and is never folded into ``[]``. Used by the :func:`delete_run` and
+    :func:`archive_run` refusals, ``clean``, and the sweep-start warning (:func:`prior_sweep_closes`).
+    """
     try:
         state = load_state(run_dir)
     except (FileNotFoundError, NotADirectoryError):
@@ -3712,7 +3721,9 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
         return []
     try:
         paths = ticketstore.with_shared_store(
-            bmadconfig.load_paths(project, want_tickets=resolves_as_tickets(state)),
+            paths_for_state(
+                bmadconfig.load_paths(project, want_tickets=resolves_as_tickets(state)), state
+            ),
             live_store_topology(state, project),
         )
     except Exception as e:  # a config or topology fault is "unknown", never "none"
@@ -3726,7 +3737,8 @@ def held_sweep_closes(project: Path, run_dir: Path) -> list[str]:
         return []
     from .runsetup import sweep_initiative_conflict  # lazy: runsetup imports runs
 
-    if (conflict := sweep_initiative_conflict(state, paths)) is not None:
+    # `paths` are re-rooted (`paths_for_state`)
+    if (conflict := sweep_initiative_conflict(state, paths, rerooted=True)) is not None:
         # The live paths resolve another initiative's ledger, which holds nothing
         # under this run's op id: answering `[]` there would wave the holder through.
         raise HeldClosesUnknownError(conflict)
@@ -3798,16 +3810,17 @@ def prior_sweep_closes(project: Path, *, exclude: str) -> list[PriorSweepCloses]
     return rows
 
 
-def refuse_held_sweep_closes(project: Path, run_dir: Path) -> None:
+def refuse_held_sweep_closes(project: Path, run_dir: Path, action: str = "delete") -> None:
     """Raise :class:`HeldSweepClosesError` when ``run_dir`` holds unlanded sweep
     closes or could not be checked (:func:`held_sweep_closes`). This is the
-    :func:`delete_run` gate. ``clean`` also calls it before it trims anything."""
+    :func:`delete_run` and :func:`archive_run` gate. ``clean`` also calls it once
+    per run, before it reconciles, trims or removes anything of that run."""
     try:
         held = held_sweep_closes(project, run_dir)
     except HeldClosesUnknownError as e:
-        raise HeldSweepClosesError(run_dir.name, [], str(e)) from e
+        raise HeldSweepClosesError(run_dir.name, [], str(e), action=action) from e
     if held:
-        raise HeldSweepClosesError(run_dir.name, held)
+        raise HeldSweepClosesError(run_dir.name, held, action=action)
 
 
 def delete_run(
@@ -4003,7 +4016,13 @@ def archive_run(
     declines a contended run with :class:`platform_util.LockUnavailableError`
     rather than queueing behind its holder, and refuses before the tarball is
     written, so a decline — like the guards above it — leaves nothing behind.
-    ``warn`` carries the session guard's degrade as on :func:`delete_run`."""
+    ``warn`` carries the session guard's degrade as on :func:`delete_run`.
+
+    A run that holds unlanded sweep ledger closes, or could not be checked,
+    raises :class:`HeldSweepClosesError` as on :func:`delete_run`, under the lock
+    and before any archive path is created. ``force`` does not waive it: nothing
+    restores an archive, and ``resume`` resolves runs only under the runs dir, so
+    an archived holder could never land or reopen its closes (DW-572)."""
     _refuse_uncontained_run_dir(project, run_dir, "archive")
     with state_lock(run_dir, blocking=wait_for_lock):
         if engine_liveness(run_dir) == "alive":
@@ -4012,6 +4031,7 @@ def archive_run(
             )
         if not force:
             _refuse_live_session(project, run_dir.name, "archive", warn=warn)
+        refuse_held_sweep_closes(project, run_dir, "archive")
         return _archive_run_locked(project, run_dir)
 
 
@@ -4561,7 +4581,7 @@ def unreadable_sweep_ledger(project: Path, run_dir: Path) -> str | None:
     """
     try:
         state = load_state(run_dir)
-        paths = bmadconfig.load_paths(project)
+        paths = paths_for_state(bmadconfig.load_paths(project), state)
     except Exception:
         # Broad on purpose: a missing/corrupt state.json, a missing BMAD config and
         # a run cleanup removed mid-command all already have owners downstream
@@ -4798,6 +4818,84 @@ def resolves_as_tickets(state: RunState) -> bool:
     if state.run_type == "sweep":
         return bool(state.initiative or state.store_topology)
     return state.source == worksource.SOURCE_TICKETS
+
+
+def paths_for_state(paths: bmadconfig.ProjectPaths, state: RunState) -> bmadconfig.ProjectPaths:
+    """``paths`` (``bmadconfig.load_paths`` output) as the recorded run ``state``
+    sees them: re-rooted on its child initiative for a chained run
+    (``state.parent_initiative`` set — ``ProjectPaths.with_initiative``, so its
+    ledger, sprint path and artifact dirs are the child's), else ``paths`` itself.
+
+    A chained run reopens only while the live ``[core] active_initiative`` still
+    names its parent: re-rooted on any other initiative, the child folder would be
+    located from a config the run never launched under, and an engine handed the
+    loaded paths unchanged would read and write the other initiative's ledger and
+    sprint path before its tree pin could pause it. So a moved live value — or
+    paths that cannot be re-rooted (off v7, no initiative folder, a child slug that
+    is no folder name) — raises :class:`~bmad_loop.bmadconfig.BmadConfigError`,
+    the type every caller of ``load_paths`` already refuses or degrades on, naming
+    the value to restore. Pure: nothing is read."""
+    parent = state.parent_initiative
+    if parent is None:
+        return paths
+    if paths.active_initiative != parent:
+        live = repr(paths.active_initiative) if paths.active_initiative else "unset"
+        raise bmadconfig.BmadConfigError(
+            f"run {state.run_id} builds child initiative {state.initiative!r} of parent "
+            f"initiative {parent!r}, but `[core] active_initiative` is {live} — set it "
+            f"back to {parent!r} to reopen this run"
+        )
+    try:
+        return paths.with_initiative(state.initiative)
+    except ValueError as e:
+        raise bmadconfig.BmadConfigError(
+            f"run {state.run_id}: cannot locate child initiative {state.initiative!r} "
+            f"of parent initiative {parent!r}: {e}"
+        ) from e
+
+
+def tree_pin(state: RunState, paths: bmadconfig.ProjectPaths) -> tuple[str | None, Path | None]:
+    """``(pinned_initiative, folder)`` for a main-checkout tree of the run
+    ``state`` over ``paths``. A chained run (``state.parent_initiative`` set) pins
+    the parent — the live ``[core] active_initiative`` still names it — and
+    reads and writes through the child's folder (``paths`` are the child's:
+    :func:`paths_for_state`); any other run pins its own initiative and reads it
+    directly. A worktree mount's tree is never chained: its config names the
+    child (``ticketstore.redirect_mount_config``).
+
+    Raises ValueError on a chained ``state`` whose ``paths`` are not re-rooted on
+    its child — ``active_initiative`` not the child, or an initiative folder not
+    named for it: the parent's own paths would route the tree through the
+    parent's folder and read and mark the wrong tree."""
+    if state.parent_initiative is None:
+        return state.initiative or None, None
+    folder = paths.initiative_folder
+    if (
+        paths.active_initiative != state.initiative
+        or folder is None
+        or (folder.name != state.initiative)
+    ):
+        raise ValueError(
+            f"run {state.run_id} builds child initiative {state.initiative!r} of "
+            f"{state.parent_initiative!r}, but its paths are rooted on initiative "
+            f"{paths.active_initiative!r} ({folder}) — re-root them with paths_for_state"
+        )
+    return state.parent_initiative, folder
+
+
+def recorded_tree_pin(state: RunState, project: Path, root: Path) -> tuple[str | None, Path | None]:
+    """``(pinned_initiative, folder)`` for a tree of the recorded run ``state``
+    built at ``root``, as :meth:`TicketsEngine._workspace_ticket_tree` pins its
+    trees: in the main checkout ``project`` (``root == project``), :func:`tree_pin`
+    over the run's own paths (:func:`paths_for_state` over ``project``'s config,
+    loaded for a chained run only); in a worktree mount, the run's initiative with
+    no folder, since the mount's config names the child. Raises
+    :class:`~bmad_loop.bmadconfig.BmadConfigError` when a chained run's config
+    cannot be read or no longer names its parent."""
+    if state.parent_initiative is None or root != project:
+        return state.initiative or None, None
+    paths = bmadconfig.load_paths(project, want_tickets=True)
+    return tree_pin(state, paths_for_state(paths, state))
 
 
 def live_store_topology(state: RunState, project_root: Path) -> dict[str, str | None]:
@@ -5697,12 +5795,13 @@ def _redrive_reads_the_upstream_artifacts(state: RunState) -> bool:
 
 
 def _rearm_ticket_tree(
-    project_root: Path, pinned_initiative: str | None
+    project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
 ) -> tickettree.TicketTreeLike:
     """The tree a tickets-mode re-arm marks its plan through: the installed
     ``tickets.py`` under ``project_root`` (the plan's live root), pinned to the run's
-    initiative. Tests replace it with a ``FakeTicketTree``."""
-    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative)
+    initiative, through a parent's child ``folder`` when given. Tests replace it
+    with a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative, folder=folder)
 
 
 def _rearm_ticket_plan(
@@ -6669,6 +6768,19 @@ def _rearm_escalation_locked(
     # is where the run was launched and nothing re-stamps it, so after a project move it
     # names a directory that is no longer there. See the `project_root` note above.
     live_project = project_root if project_root is not None else Path(state.project)
+    # tickets mode: the pin of the tree the plan's status moves through, resolved
+    # before the first write — a chained run whose config no longer names its parent
+    # refuses here with the escalation still armed, not inside the transaction below.
+    ticket_pin: tuple[str | None, Path | None] = (state.initiative or None, None)
+    if state.source == worksource.SOURCE_TICKETS and task.ticket is not None and task.spec_file:
+        try:
+            ticket_pin = recorded_tree_pin(
+                state, live_project, live_spec_root(task, state, live_project)
+            )
+        except bmadconfig.BmadConfigError as e:
+            raise RearmError(
+                f"cannot pin ticket {task.ticket.ref}'s tree to re-open its plan: {e}"
+            ) from e
 
     journal = _RearmJournal(run_dir, pin=state)
     # DW-446: reconcile the mint-time root identities before the first pinned write
@@ -6978,8 +7090,9 @@ def _rearm_escalation_locked(
                         ) from e
                     spec_before = None
                 if state.source == worksource.SOURCE_TICKETS and task.ticket is not None:
+                    pin, folder = ticket_pin
                     ticket_tree = _rearm_ticket_tree(
-                        live_spec_root(task, state, live_project), state.initiative or None
+                        live_spec_root(task, state, live_project), pin, folder=folder
                     )
                 try:
                     if ticket_tree is not None and task.ticket is not None:
@@ -7673,7 +7786,7 @@ def _reverify_root_refusal(
     the caller locates it — the finished-run replay rebases it onto a moved project;
     ``None`` reads it as recorded."""
     try:
-        paths = bmadconfig.load_paths(project_root)
+        paths = paths_for_state(bmadconfig.load_paths(project_root), state)
     except bmadconfig.BmadConfigError as e:
         return None, f"cannot read the BMAD config to locate the code root ({e})"
     if str(paths.repo_root) != str(state.code_root if code_root is None else code_root):

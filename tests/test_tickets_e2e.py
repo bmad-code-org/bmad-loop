@@ -31,13 +31,21 @@ ignored, redirected (T2) store, (11) plan and retrospective commits in a separat
 store repository (T3 nested, T4 outside), the preflight refusals of (12) a
 tracker store and (13) a workspace layout (T5), and (14) a worktree-isolated `sweep`
 over a shared store (T2–T4): its bundle plan and ledger close committed in the store
-repository, or `store-unversioned` for T2. Rows 7–9 run over T1 and T3. A run
-that finishes an epic it committed a ticket of always ends paused at
-`epic-boundary` for a person to close the epic.
+repository, or `store-unversioned` for T2, (15) a parent initiative built as a chain
+of child runs under worktree isolation, each unit mount's own config naming its
+child, the drained child closed and committed before the next child's run, (16)
+the same parent refused at preflight under `isolation = "none"`, and (17) that
+chain's first epic boundary closed through `resolve`, the fake standing in for
+bmad-agent-po (its `/bmad-agent-po` prompt flips and commits the epic file the
+prompt names, or leaves it open on a run-dir `.no-close` marker). Rows 7–9 run
+over T1 and T3. A run that finishes an epic it committed a ticket of always ends
+paused at `epic-boundary` for a person to close the epic.
 
 Real `tickets.py` spawns: every run and resolve spawns it through bmad-loop and
-every fake ticket session once more; outside them this file spawns it twice (rows
-3 and 4). Linux and real tmux only, so none of this reaches the Windows legs'
+every fake ticket session once more; a parent's run and its chain-continuing
+resume (row 15) spawn it more per chain step (`next <parent>`, each ready child's
+`next`/`status` probe, the close); outside them this file spawns it twice (rows 3
+and 4). Linux and real tmux only, so none of this reaches the Windows legs'
 budget.
 """
 
@@ -53,6 +61,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    V7_USER_CONFIG_REL,
     EntrySpec,
     EpicSpec,
     V7Layout,
@@ -63,6 +72,7 @@ from conftest import (
     real_mux_e2e,
     remove_tree,
     ticket_slug,
+    v7_layout,
     write_ticket_tree,
 )
 
@@ -92,6 +102,25 @@ PY=@PY@
 INIT=@INIT@
 rd="$BMAD_LOOP_RUN_DIR"; tid="$BMAD_LOOP_TASK_ID"; ref="$BMAD_LOOP_STORY_KEY"
 prompt="${1:-}"
+
+# The epic-close resolve (`/bmad-agent-po`): an attached interactive session, not
+# an engine window, so no hook events and no task dir. Record the argv and cwd in
+# the run dir, then close the epic file the prompt names (`status: done`) and
+# commit it in the repo the prompt names — unless a `.no-close` marker in the run
+# dir says to leave it open.
+case "$prompt" in
+    /bmad-agent-po*)
+        printf '%s\n' "$0" "$@" > "$rd/fake-epic-close-argv.txt"
+        printf '%s' "$PWD" > "$rd/fake-epic-close-cwd.txt"
+        [ -f "$rd/.no-close" ] && exit 0
+        epic=$(printf '%s' "$prompt" | sed -n 's/.*Epic file: \([^ ]*\)\. .*/\1/p')
+        repo=$(printf '%s' "$prompt" | sed -n 's/.*commit the epic file in the \(store \)\{0,1\}repo at \([^ ]*\)\. .*/\2/p')
+        sed -i 's/^status: in-progress/status: done/' "$epic"
+        git -C "$repo" add -- "$epic"
+        git -C "$repo" commit -q -m "close epic"
+        exit 0 ;;
+esac
+
 ts=$(date +%s%N)
 ed="$BMAD_LOOP_EVENTS_DIR"
 td="$rd/tasks/$tid"
@@ -203,6 +232,9 @@ events = {{ SessionStart = "SessionStart", Stop = "Stop" }}
 CLI = [sys.executable, "-m", "bmad_loop.cli"]
 EPIC = "epic-cart"
 EPIC2 = "epic-checkout"
+# A parent initiative and its two children, CHILD_B after CHILD_A.
+PARENT = "initiative-platform"
+CHILD_A, CHILD_B = "initiative-auth", "initiative-billing"
 
 
 def _git(root: Path, *args: str) -> str:
@@ -231,6 +263,7 @@ def _scaffold(
     retro: str = "never",
     isolation: str = "none",
     store: str = "repo",
+    children: tuple[str, ...] = (),
 ) -> V7Layout:
     """``sandbox`` (the `project_v7` fixture's copy of the per-worker v7 template)
     turned into a committed, clean tickets-mode sandbox: ``epics`` replace the
@@ -242,7 +275,11 @@ def _scaffold(
     ``topology`` places the store: T1 tracked in the checkout (upstream's default),
     T2 in the checkout but gitignored and unversioned, T3 a gitignored repository
     nested in the checkout, T4 its own repository outside the project (beside
-    ``root``, with an absolute `output_folder`)."""
+    ``root``, with an absolute `output_folder`).
+
+    ``children`` makes the active initiative the parent `PARENT` of those child
+    initiatives (:func:`_write_parent`), each holding ``epics``; the returned
+    layout is the parent's."""
     root = sandbox.project
     # The template's tracked store goes wholesale, index included (a tracked path
     # stays tracked under a new ignore rule); the commit below records its deletion
@@ -253,8 +290,12 @@ def _scaffold(
         with (root / ".gitignore").open("a", encoding="utf-8") as f:
             f.write("/_bmad-output/\n")
     out = str(root.parent / "store") if topology == "T4" else "_bmad-output"
-    layout = install_bmad_v7(root, output_folder=out, store=store)
-    write_ticket_tree(layout, epics)
+    if children:
+        layout = install_bmad_v7(root, initiative=PARENT, output_folder=out, store=store)
+        _write_parent(layout, children, epics)
+    else:
+        layout = install_bmad_v7(root, output_folder=out, store=store)
+        write_ticket_tree(layout, epics)
     install_build_auto_v7_skill(root)
     if retro == "auto":
         skill = root / ".claude" / "skills" / "bmad-retrospective" / "SKILL.md"
@@ -297,6 +338,40 @@ def _scaffold(
     if topology in ("T3", "T4"):
         _store_repo(layout.output_folder)
     return layout
+
+
+def _write_parent(layout: V7Layout, children: tuple[str, ...], epics: tuple[EpicSpec, ...]) -> None:
+    """The parent initiative at ``layout``: its own file and a `tickets/tickets.toml`
+    listing ``children`` as `[[initiative]]` tables in build order, each after the
+    one before it, and per child its folder holding ``epics``."""
+    folder = layout.initiative_folder
+    (folder / ticketlayout.TICKETS).mkdir(parents=True, exist_ok=True)
+    (folder / f"{layout.initiative}.md").write_text(
+        f"---\ntype: initiative\ntitle: {layout.initiative}\nparent: none\n---\n\n"
+        f"# {layout.initiative}\n",
+        encoding="utf-8",
+    )
+    tables = []
+    for i, slug in enumerate(children, 1):
+        table = f'[[initiative]]\nid = {i}\nslug = "{slug}"\ntitle = "{slug}"\n'
+        if i > 1:
+            table += f'after = [{{ initiative = {i - 1}, needs = "{children[i - 2]} live" }}]\n'
+        tables.append(table)
+    (folder / ticketlayout.TICKETS / ticketlayout.BREAKDOWN).write_text(
+        "\n".join(tables), encoding="utf-8"
+    )
+    for slug in children:
+        write_ticket_tree(_child(layout, slug), epics)
+
+
+def _child(layout: V7Layout, slug: str) -> V7Layout:
+    """The layout of the child initiative ``slug`` of the parent at ``layout``."""
+    return v7_layout(
+        layout.project,
+        initiative=slug,
+        output_folder=layout.output_folder.as_posix(),
+        store=layout.store,
+    )
 
 
 def _tree_repo(layout: V7Layout, topology: str) -> Path:
@@ -384,8 +459,9 @@ def _run_dir(root: Path) -> Path:
     return runs[-1]
 
 
-def _status_doc(root: Path) -> dict:
-    proc = _run(root, "status", _run_dir(root).name, "--json")
+def _status_doc(root: Path, run_dir: Path | None = None) -> dict:
+    """``status --json`` of ``run_dir`` (default: the only, or latest, run)."""
+    proc = _run(root, "status", (run_dir or _run_dir(root)).name, "--json")
     _ok(proc)
     return json.loads(proc.stdout)
 
@@ -401,8 +477,22 @@ def _prompts(root: Path) -> list[str]:
 
 
 def _journal(root: Path, kind: str) -> list[dict]:
-    lines = (_run_dir(root) / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+    return _run_journal(_run_dir(root), kind)
+
+
+def _run_journal(run_dir: Path, kind: str) -> list[dict]:
+    lines = (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
     return [row for row in map(json.loads, lines) if row["kind"] == kind]
+
+
+def _runs_by_initiative(root: Path) -> dict[str, Path]:
+    """Every run dir, keyed by the initiative its state pins (one run each)."""
+    runs: dict[str, Path] = {}
+    for run_dir in (root / ".bmad-loop" / "runs").iterdir():
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state["initiative"] not in runs, state["initiative"]
+        runs[state["initiative"]] = run_dir
+    return runs
 
 
 def _assert_ended_at_epic_boundary(doc: dict) -> None:
@@ -795,7 +885,7 @@ def test_e2e_tickets_worktree_isolation_finds_tree(project_v7, topology):
     and the merge carries the `done` plan back to main. T2 (an ignored, unversioned
     store): the mount is redirected to the main store, the plan is written there and
     marked `done` after the merge, and `store-unversioned` is journaled once.
-    Ablation: drop the redirect (`redirect_mount_store`) and T2's fake writes a plan
+    Ablation: drop the redirect (`redirect_mount_config`) and T2's fake writes a plan
     the main store never sees."""
     layout = _scaffold(
         project_v7,
@@ -1047,3 +1137,161 @@ def test_e2e_tickets_workspace_layout_refused(project_v7):
     assert "is not a git repository" in proc.stderr and "workspace" in proc.stderr, proc.stderr
     assert not (root / ".bmad-loop" / "runs").exists()
     assert "tickets.workspace-unsupported" in _validate_problems(root)
+
+
+def test_e2e_tickets_parent_initiative_chain(project_v7):
+    """A parent initiative whose children A and B (B after A) hold one ticket each,
+    under `isolation = "worktree"`: `run` builds A's ticket in a unit mount whose own
+    gitignored config names A, and A's run pauses at its epic boundary. The person
+    closes A's epic; `resume` finishes A's run, bmad-loop closes A (`status: done`,
+    committed) and the chain launches B's run, which builds B's ticket and pauses
+    at B's epic boundary. Each run journals its side of the switch, and the user's
+    own `config.user.toml`, which names the parent, is never written. Ablation:
+    drop the child initiative from the mount config rewrite
+    (`ticketstore.redirect_mount_config`'s ``initiative`` in `WorktreeFlow`) and
+    the fake's `tickets.py find` reads the parent inside the mount, so A's run
+    escalates instead of building its ticket."""
+    layout = _scaffold(
+        project_v7,
+        _epic(EntrySpec(1, "Cart model")),
+        isolation="worktree",
+        children=(CHILD_A, CHILD_B),
+    )
+    root = layout.project
+    auth, billing = _child(layout, CHILD_A), _child(layout, CHILD_B)
+    user_config = (root / V7_USER_CONFIG_REL).read_bytes()
+
+    _ok(_run(root, "run"))
+
+    (auth_run,) = _runs_by_initiative(root).values()
+    doc = _status_doc(root, auth_run)
+    _assert_ended_at_epic_boundary(doc)
+    assert (doc["tickets"]["initiative"], doc["tickets"]["parent_initiative"]) == (CHILD_A, PARENT)
+    assert _plan_status(auth, "Cart model") == "done"
+    assert _plan_status(billing, "Cart model") == "absent"
+
+    _close_epic(auth, "T1", EPIC)
+    _ok(_run(root, "resume", auth_run.name))
+
+    runs = _runs_by_initiative(root)
+    assert sorted(runs) == [CHILD_A, CHILD_B] and runs[CHILD_A] == auth_run
+    billing_run = runs[CHILD_B]
+    (nxt,) = _run_journal(auth_run, "initiative-chain-next")
+    assert (nxt["parent"], nxt["from_child"], nxt["to_child"]) == (PARENT, CHILD_A, CHILD_B)
+    (link,) = _run_journal(billing_run, "initiative-chain")
+    assert (link["parent"], link["previous_run"], link["previous_child"]) == (
+        PARENT,
+        auth_run.name,
+        CHILD_A,
+    )
+    assert _plan_status(auth, "Cart model") == "done"
+    assert _plan_status(billing, "Cart model") == "done"
+    for run_dir in (auth_run, billing_run):  # each child's session ran in its unit mount
+        (cwd,) = [Path(p.read_text(encoding="utf-8")) for p in run_dir.glob("tasks/*/fake-cwd.txt")]
+        assert cwd.is_relative_to(run_dir / "worktrees"), cwd
+    initiative_rel = (auth.initiative_folder / f"{CHILD_A}.md").relative_to(root).as_posix()
+    assert status_of(parse_frontmatter(_git(root, "show", f"HEAD:{initiative_rel}"))) == "done"
+    assert _git(root, "log", "-1", "--format=%s", "--", initiative_rel).strip() == (
+        f"chore(tickets): {CHILD_A} done [bmad-loop {auth_run.name}]"
+    )
+    doc = _status_doc(root, billing_run)
+    _assert_ended_at_epic_boundary(doc)
+    assert (doc["tickets"]["initiative"], doc["tickets"]["parent_initiative"]) == (CHILD_B, PARENT)
+    assert (root / V7_USER_CONFIG_REL).read_bytes() == user_config
+    assert _git(root, "worktree", "list", "--porcelain").count("worktree ") == 1
+    assert _clean(root)
+
+
+def test_e2e_tickets_parent_initiative_refused_without_isolation(project_v7):
+    """The same parent under `isolation = "none"`: sessions in the main checkout
+    would read the parent from the user config, so `run` refuses it at preflight
+    before any run dir exists, and `validate` reports `tickets.initiative-parent`.
+    Ablation: drop the isolation cause in `install._tickets_parent_findings` and
+    the run composes (a run dir appears)."""
+    layout = _scaffold(project_v7, _epic(EntrySpec(1, "Cart model")), children=(CHILD_A, CHILD_B))
+    root = layout.project
+
+    proc = _run(root, "run")
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert f"{PARENT!r} is a parent initiative" in proc.stderr, proc.stderr
+    assert '`[scm] isolation = "none"`' in proc.stderr, proc.stderr
+    assert not (root / ".bmad-loop" / "runs").exists()
+    assert "tickets.initiative-parent" in _validate_problems(root)
+    assert _clean(root)
+
+
+def test_e2e_tickets_epic_close_resolve(project_v7):
+    """The chain row's epic boundary answered by `resolve` instead of by hand: the
+    fake stands in for bmad-agent-po, launched attached through the dev profile's
+    interactive argv with the epic-close prompt. With a run-dir `.no-close` marker it leaves
+    A's epic open, so `resolve --resume` exits 1 with the run still paused at A's
+    boundary and `epic-close-unverified` journaled; without it the fake closes and
+    commits A's epic file, the verify passes, and the resumed run closes A and
+    chains on until B pauses at its own boundary. Ablation: make
+    `_epic_close_check` report nothing missing and the `.no-close` resolve resumes
+    the run (exit 0)."""
+    layout = _scaffold(
+        project_v7,
+        _epic(EntrySpec(1, "Cart model")),
+        isolation="worktree",
+        children=(CHILD_A, CHILD_B),
+    )
+    root = layout.project
+    auth = _child(layout, CHILD_A)
+    skill = root / ".claude" / "skills" / "bmad-agent-po" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bmad-agent-po\n---\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "po skill")
+
+    _ok(_run(root, "run"))
+
+    (auth_run,) = _runs_by_initiative(root).values()
+    _assert_ended_at_epic_boundary(_status_doc(root, auth_run))
+
+    # In the (ignored) run dir, so the checkout stays clean and only the verify
+    # stands between this resolve and a resume.
+    (auth_run / ".no-close").write_text("", encoding="utf-8")
+    proc = _run(root, "resolve", auth_run.name, "--resume")
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert f"epic {EPIC}: the epic reads in-progress" in proc.stderr, proc.stderr
+    doc = _status_doc(root, auth_run)
+    _assert_ended_at_epic_boundary(doc)
+    assert (doc["paused_story_key"], doc["tickets"]["initiative"]) == (EPIC, CHILD_A), doc
+    assert list(_runs_by_initiative(root)) == [CHILD_A]
+    (unverified,) = _run_journal(auth_run, "epic-close-unverified")
+    assert unverified["epic_ref"] == EPIC, unverified
+    assert _run_journal(auth_run, "epic-close-verified") == []
+
+    (auth_run / ".no-close").unlink()
+    _ok(_run(root, "resolve", auth_run.name, "--resume"))
+
+    argv = (auth_run / "fake-epic-close-argv.txt").read_text(encoding="utf-8").splitlines()
+    fake = root / ".bmad-loop" / "fake-build-auto.sh"
+    assert len(argv) == 2 and argv[0] == str(fake), argv  # the profile binary; one arg, the prompt
+    epic_file = (_epic_dir(auth) / f"{EPIC}.md").resolve()
+    assert argv[1].startswith(f"/bmad-agent-po Run your epic closure check for epic {EPIC}")
+    assert f"Epic file: {epic_file.as_posix()}." in argv[1], argv[1]
+    assert f"{CHILD_A} is a child of parent {PARENT}" in argv[1], argv[1]
+    cwd = Path((auth_run / "fake-epic-close-cwd.txt").read_text(encoding="utf-8"))
+    assert cwd.resolve() == root.resolve(), cwd
+    epic_rel = epic_file.relative_to(root.resolve()).as_posix()
+    assert _git(root, "log", "--format=%s", "--", epic_rel).splitlines()[0] == "close epic"
+    for kind, count in (("epic-close-session-start", 2), ("epic-close-session-end", 2)):
+        rows = _run_journal(auth_run, kind)
+        assert [row["epic_ref"] for row in rows] == [EPIC] * count, rows
+    assert [row["rc"] for row in _run_journal(auth_run, "epic-close-session-end")] == [0, 0]
+    (verified,) = _run_journal(auth_run, "epic-close-verified")
+    assert (verified["epic_ref"], verified["status"]) == (EPIC, "done"), verified
+    (nxt,) = _run_journal(auth_run, "initiative-chain-next")
+    assert (nxt["from_child"], nxt["to_child"]) == (CHILD_A, CHILD_B), nxt
+
+    runs = _runs_by_initiative(root)
+    assert sorted(runs) == [CHILD_A, CHILD_B]
+    doc = _status_doc(root, runs[CHILD_B])
+    _assert_ended_at_epic_boundary(doc)
+    assert doc["tickets"]["initiative"] == CHILD_B
+    assert _git(root, "worktree", "list", "--porcelain").count("worktree ") == 1
+    assert _clean(root)

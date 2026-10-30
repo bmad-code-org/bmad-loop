@@ -834,6 +834,8 @@ def _tickets_store_findings(
     isolation: str,
     extra_args_roles: Sequence[str],
     sandboxed_roles: Sequence[str] = (),
+    *,
+    chained: bool = False,
 ) -> list[Finding]:
     """The store-topology findings for the active initiative's folder (it exists):
     the classified layout (``tickets.store-topology``), or the refusal under the
@@ -841,8 +843,10 @@ def _tickets_store_findings(
     ``tickets.store-sandbox`` warning when sessions write a shared store outside
     their cwd while a role's ``extra_args`` replace the profile's bypass flags or
     a role runs ``adapter.permission_mode = "sandboxed"``, whose sandbox confines
-    writes to the working directory."""
-    result = ticketstore.assess_store(paths, isolation)
+    writes to the working directory. ``chained``: ``paths`` are re-rooted on a
+    child initiative of the active (parent) one, classified as a chained run
+    (:func:`ticketstore.classify_store`), and every finding names the child."""
+    result = ticketstore.assess_store(paths, isolation, chained=chained)
     if result is None:
         return []
     conflict = ticketstore.store_topology_conflict(result)
@@ -851,14 +855,20 @@ def _tickets_store_findings(
         "repo_root": str(paths.repo_root),
         "isolation": isolation,
     }
+    prefix = ""
+    if chained:
+        detail["initiative"] = paths.active_initiative
+        prefix = f"child initiative {paths.active_initiative!r}: "
     if isinstance(result, ticketstore.StoreRefusal):
         assert conflict is not None
-        return [Finding(result.check, "problem", conflict, {**detail, "refusal": result.code})]
+        return [
+            Finding(result.check, "problem", prefix + conflict, {**detail, "refusal": result.code})
+        ]
     findings = [
         Finding(
             "tickets.store-topology",
             "ok" if conflict is None else "problem",
-            conflict or f"ticket store {ticketstore.describe_topology(result)}",
+            prefix + (conflict or f"ticket store {ticketstore.describe_topology(result)}"),
             {**detail, "topology": result.to_dict()},
         )
     ]
@@ -879,17 +889,128 @@ def _tickets_store_findings(
             Finding(
                 "tickets.store-sandbox",
                 "warning",
-                f"sessions write the shared ticket store {result.store_root} outside their "
-                f"working directory, and {'; '.join(causes)} — a sandboxed CLI may refuse "
-                "those writes",
+                f"{prefix}sessions write the shared ticket store {result.store_root} outside "
+                f"their working directory, and {'; '.join(causes)} — a sandboxed CLI may "
+                "refuse those writes",
                 {
                     "store_root": str(result.store_root),
                     "roles": list(extra_args_roles),
                     "sandboxed_roles": list(sandboxed_roles),
+                    **({"initiative": paths.active_initiative} if chained else {}),
                 },
             )
         )
     return findings
+
+
+def _tickets_parent_findings(
+    paths: bmadconfig.ProjectPaths,
+    children: Sequence[str],
+    isolation: str,
+    retrospective: str | None,
+    extra_args_roles: Sequence[str],
+    sandboxed_roles: Sequence[str],
+) -> list[Finding]:
+    """The findings for an active initiative that is a parent of ``children``.
+
+    Refused (a ``tickets.initiative-parent`` problem) unless ``[scm] isolation``
+    is ``"worktree"`` — sessions in the main checkout read the user config, which
+    names the parent; only a worktree mount can name a child — and
+    ``gates.retrospective`` is not ``"auto"``, whose session runs in the main
+    checkout and reads the parent. Accepted, it is an ok line naming the children,
+    followed by :func:`_tickets_store_findings` for each child that has a folder
+    (``paths`` re-rooted on it, classified as chained); a child declared but not
+    sliced yet has none and is skipped. A child slug that is no single folder
+    name is refused, and a child folder that cannot be statted is a
+    ``tickets.initiative-missing`` problem naming the error."""
+    listed = ", ".join(children) or "none listed"
+    detail: dict[str, object] = {
+        "initiative": paths.active_initiative,
+        "children": list(children),
+        "isolation": isolation,
+        "retrospective": retrospective,
+    }
+    causes: list[str] = []
+    if isolation != "worktree":
+        causes.append(
+            f'`[scm] isolation = "{isolation}"` runs sessions in the main checkout, which '
+            'reads the parent from the user config — set `isolation = "worktree"`'
+        )
+    if retrospective == "auto":
+        causes.append(
+            '`gates.retrospective = "auto"` runs its session in the main checkout, which '
+            'reads the parent — set it to "notify" or "never"'
+        )
+    child_paths: list[bmadconfig.ProjectPaths] = []
+    if not causes:
+        for child in children:
+            try:
+                child_paths.append(paths.with_initiative(child))
+            except ValueError:
+                causes.append(f"child initiative {child!r} is not a single folder name")
+    if causes:
+        return [
+            Finding(
+                "tickets.initiative-parent",
+                "problem",
+                f"active initiative {paths.active_initiative!r} is a parent initiative "
+                f"(children: {listed}) and {'; '.join(causes)} — or set `[core] "
+                "active_initiative` to one child (ask the `bmad` skill to switch it)",
+                detail,
+            )
+        ]
+    store_findings: list[Finding] = []
+    skipped: list[str] = []
+    for child in child_paths:
+        folder = child.initiative_folder
+        assert folder is not None and child.active_initiative is not None  # with_initiative
+        present, fault = _probe_fault(folder, "dir")
+        if fault:
+            store_findings.append(
+                _probe_unreadable("tickets.initiative-missing", str(folder), fault)
+            )
+        elif not present:
+            skipped.append(child.active_initiative)
+        else:
+            store_findings.extend(
+                _tickets_store_findings(
+                    child, isolation, extra_args_roles, sandboxed_roles, chained=True
+                )
+            )
+    message = (
+        f"active initiative {paths.active_initiative!r} is a parent initiative "
+        f"(children: {listed}), accepted under worktree isolation"
+    )
+    if skipped:
+        message += (
+            f"; {', '.join(skipped)} {'has' if len(skipped) == 1 else 'have'} no folder "
+            "yet (declared, not sliced) and the store checks skip "
+            f"{'it' if len(skipped) == 1 else 'them'}"
+        )
+    return [
+        Finding("tickets.initiative-parent", "ok", message, {**detail, "skipped": skipped}),
+        *store_findings,
+    ]
+
+
+def tickets_parent_problems(
+    paths: bmadconfig.ProjectPaths, isolation: str, retrospective: str | None
+) -> list[Finding]:
+    """The problems :func:`tickets_preflight` refuses a parent active initiative
+    with (:func:`_tickets_parent_findings`: ``tickets.initiative-parent`` and the
+    store of a child it refuses), or the fault that kept the parent read from
+    answering — for a caller that does not run the whole preflight (the dry-run
+    banner). Empty when the active initiative is no parent."""
+    folder = paths.initiative_folder
+    if paths.era != "v7" or folder is None or not paths.active_initiative:
+        return []
+    children, breakdown, fault = _initiative_children(folder)
+    if fault:
+        return [_probe_unreadable("tickets.initiative-parent", str(breakdown), fault)]
+    if children is None:
+        return []
+    findings = _tickets_parent_findings(paths, children, isolation, retrospective, (), ())
+    return [f for f in findings if f.severity == "problem"]
 
 
 def tickets_preflight(
@@ -901,19 +1022,25 @@ def tickets_preflight(
     isolation: str = "none",
     extra_args_roles: Sequence[str] = (),
     sandboxed_roles: Sequence[str] = (),
+    retrospective: str | None = None,
 ) -> list[Finding]:
     """Tickets mode's project checks, as :class:`Finding` s (``paths`` is the
     paths loaded for tickets mode, ``trees`` the dev skill trees, ``branch_per``
     the policy's ``[scm] branch_per``; None skips its check; ``isolation`` the
     policy's ``[scm] isolation``; ``extra_args_roles`` the launch roles whose
     resolved adapter sets ``extra_args``; ``sandboxed_roles`` those whose
-    ``permission_mode`` is not bypass).
+    ``permission_mode`` is not bypass; ``retrospective`` the policy's
+    ``gates.retrospective``, None read as not ``"auto"``).
 
     Static checks, in order: the script (``tickets.script-missing``), the BMad
     config reader it imports (``tickets.config-utils-missing``), ``uv`` on PATH
     (``tickets.uv-missing``: bmad-build-auto runs the script through uv even when
     bmad-loop runs it directly), the active initiative (``tickets.initiative-unset``
-    / ``tickets.initiative-missing``), the store topology
+    / ``tickets.initiative-missing``), a parent initiative
+    (``tickets.initiative-parent``, :func:`_tickets_parent_findings`: refused
+    unless ``isolation`` is ``"worktree"`` and ``retrospective`` is not
+    ``"auto"``, else an ok line and the store topology of each child that has a
+    folder), the store topology
     (:func:`_tickets_store_findings`: ``tickets.store-topology``,
     ``tickets.tree-untracked``, ``tickets.own-repo-isolation``,
     ``tickets.workspace-unsupported``, and the ``tickets.store-sandbox`` warning),
@@ -1020,15 +1147,14 @@ def tickets_preflight(
                         _probe_unreadable("tickets.initiative-parent", str(breakdown), parent_fault)
                     )
                 elif children is not None:
-                    findings.append(
-                        Finding(
-                            "tickets.initiative-parent",
-                            "problem",
-                            f"active initiative {paths.active_initiative!r} is a parent "
-                            f"initiative (children: {', '.join(children) or 'none listed'}) "
-                            "— set `[core] active_initiative` to one child (ask the `bmad` "
-                            "skill to switch it)",
-                            {"initiative": paths.active_initiative, "children": list(children)},
+                    findings.extend(
+                        _tickets_parent_findings(
+                            paths,
+                            children,
+                            isolation,
+                            retrospective,
+                            extra_args_roles,
+                            sandboxed_roles,
                         )
                     )
                 else:

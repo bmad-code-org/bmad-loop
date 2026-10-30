@@ -23,8 +23,12 @@ Layouts (:data:`Layout`):
 A store no checkout carries (T2–T4, T6) is SHARED: under worktree isolation the
 mount's highest config layer, ``_bmad/custom/config.user.toml``, is rewritten to
 point ``[core] output_folder`` at the main checkout's store
-(:func:`redirect_mount_store`), so ``tickets.py`` and the renderer inside the mount
-resolve the one store every session reads and writes.
+(:func:`redirect_mount_config`), so ``tickets.py`` and the renderer inside the mount
+resolve the one store every session reads and writes. A CHAINED run (one child
+initiative of a parent, the live ``active_initiative`` naming the parent) gets the
+same rewrite of ``[core] active_initiative`` to the child, on every layout, so
+inside the mount the child is a plain active initiative; the user's own file in the
+main checkout is never written.
 
 Two parts. The PURE part (pyright-strict) holds the data — :class:`StoreFacts`,
 :class:`StoreTopology`, :class:`StoreRefusal` — the classifier
@@ -32,7 +36,7 @@ Two parts. The PURE part (pyright-strict) holds the data — :class:`StoreFacts`
 refusal text, the :func:`bmadconfig.worktree_isolation_conflict` pattern) and the
 config rewrite :func:`redirected_user_config_text`. The PROBE part reads git and
 the disk: :func:`probe_store_facts` (every git call through ``verify``'s
-``_run_git`` chokepoint), :func:`assess_store` and :func:`redirect_mount_store`.
+``_run_git`` chokepoint), :func:`assess_store` and :func:`redirect_mount_config`.
 
 A store with its own repository (T3/T4) is committed by :class:`StoreCommitter`:
 the marked plan (and the ledger or retro document the run wrote there) alone, by
@@ -218,7 +222,9 @@ def _within(path: Path, root: Path) -> bool:
     return path == root or path.is_relative_to(root)
 
 
-def classify_store(facts: StoreFacts, isolation: str) -> StoreTopology | StoreRefusal:
+def classify_store(
+    facts: StoreFacts, isolation: str, *, chained: bool = False
+) -> StoreTopology | StoreRefusal:
     """The layout ``facts`` describe under ``[scm] isolation``, or why it is refused.
 
     - The project is not a repository: a workspace (T5), deferred.
@@ -234,7 +240,10 @@ def classify_store(facts: StoreFacts, isolation: str) -> StoreTopology | StoreRe
 
     A shared layout under worktree isolation needs the redirect, so it also needs
     :data:`USER_CONFIG_REL` untracked and gitignored: the rewrite must neither ride
-    a commit nor dirty the mount."""
+    a commit nor dirty the mount. A ``chained`` run (one child initiative of a
+    parent) under worktree isolation rewrites the mount's ``active_initiative``
+    whatever the layout, so it needs the same of every layout, T1 included; without
+    isolation there is no mount and nothing is rewritten."""
     initiative = facts.initiative
     if not facts.project_is_repo or facts.repo_toplevel is None:
         return StoreRefusal("workspace-unsupported", facts.project)
@@ -261,14 +270,15 @@ def classify_store(facts: StoreFacts, isolation: str) -> StoreTopology | StoreRe
                 return StoreRefusal("tracked-outside-checkout", initiative, str(facts.repo_root))
             if isolation == "worktree" and not _within(initiative, facts.project):
                 return StoreRefusal("tracked-outside-project", initiative)
-            return StoreTopology("T1", "checkout", "code-repo", facts.store_root)
-        if any(states):
+            result = StoreTopology("T1", "checkout", "code-repo", facts.store_root)
+        elif any(states):
             untracked = ", ".join(rel for rel, tracked in facts.tracked if not tracked)
             return StoreRefusal("partial-tracking", initiative, untracked)
-        if not facts.ignored:
+        elif not facts.ignored:
             return StoreRefusal("store-not-ignored", initiative, "an untracked folder")
-        result = StoreTopology("T2", shared, "none", facts.store_root)
-    if result.needs_redirect(isolation):
+        else:
+            result = StoreTopology("T2", shared, "none", facts.store_root)
+    if result.needs_redirect(isolation) or (chained and isolation == "worktree"):
         if facts.user_config_tracked:
             return StoreRefusal("user-config-tracked", facts.project / USER_CONFIG_REL)
         if not facts.user_config_ignored:
@@ -380,8 +390,9 @@ def _refusal_text(refusal: StoreRefusal) -> str:
         state = "tracked by" if code == "user-config-tracked" else "not gitignored in"
         return (
             f'isolation = "worktree" points each unit worktree at the shared ticket '
-            f"store by rewriting {path}, which is {state} the code repository — the "
-            "rewrite would show up as a change in the unit's commit. Untrack it and "
+            f"store or a chained run's child initiative by rewriting {path}, which is "
+            f"{state} the code repository — the rewrite would show up as a change in "
+            "the unit's commit. Untrack it and "
             "keep `*.user.toml` in _bmad/custom/.gitignore (as `bmad setup` writes "
             'it), or set `isolation = "none"`'
         )
@@ -389,7 +400,6 @@ def _refusal_text(refusal: StoreRefusal) -> str:
 
 
 _SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*(?:#.*)?$")
-_OUTPUT_FOLDER_RE = re.compile(r"^\s*output_folder\s*=")
 
 
 def _toml_basic_string(value: str) -> str:
@@ -397,18 +407,52 @@ def _toml_basic_string(value: str) -> str:
     return f'"{escaped}"'
 
 
-def redirected_user_config_text(text: str, main_store: Path) -> str:
+def _core_values(main_store: Path | None, initiative: str | None) -> dict[str, str]:
+    """The ``[core]`` keys a mount rewrite sets, in the order they are written.
+    Raises ValueError when neither is given (a caller fault) and
+    :class:`TicketStoreError` on a blank ``initiative``, which would read as no
+    active initiative."""
+    values: dict[str, str] = {}
+    if main_store is not None:
+        values["output_folder"] = str(main_store)
+    if initiative is not None:
+        if not initiative.strip():
+            raise TicketStoreError(
+                "a blank initiative cannot be written as [core] active_initiative"
+            )
+        values["active_initiative"] = initiative
+    if not values:
+        raise ValueError("a mount config rewrite needs main_store, initiative, or both")
+    return values
+
+
+def _describe_values(values: Mapping[str, str]) -> str:
+    named = {
+        "output_folder": "the shared ticket store",
+        "active_initiative": "the child initiative",
+    }
+    return " and ".join(f"{named[key]} {value}" for key, value in values.items())
+
+
+def redirected_user_config_text(
+    text: str, *, main_store: Path | None, initiative: str | None
+) -> str:
     """``text`` (a ``config.user.toml``) with ``[core] output_folder`` set to
-    ``main_store``, every other byte kept: any ``output_folder`` line in the
-    ``[core]`` table is dropped and the new one written right under its header, or
-    a ``[core]`` table is appended. A CRLF file stays CRLF.
+    ``main_store`` and ``[core] active_initiative`` set to ``initiative`` — each
+    only when given, at least one required — every other byte kept: any line of a
+    key being set in the ``[core]`` table is dropped and the new ones written right
+    under its header, or a ``[core]`` table is appended. A CRLF file stays CRLF.
 
     Re-parsed before it is returned: a shape this line edit cannot reach — an
-    inline ``core = {…}`` table, dotted ``core.x`` keys — fails the parse or the
+    inline ``core = {…}`` table, dotted ``core.x`` keys — fails the parse or a
     value check and raises :class:`TicketStoreError`, never a silently wrong
     redirect."""
+    values = _core_values(main_store, initiative)
     newline = "\r\n" if "\r\n" in text else "\n"
-    line = f"output_folder = {_toml_basic_string(str(main_store))}"
+    lines = "".join(
+        f"{key} = {_toml_basic_string(value)}{newline}" for key, value in values.items()
+    )
+    replaced = re.compile(r"^\s*(?:" + "|".join(map(re.escape, values)) + r")\s*=")
     out: list[str] = []
     section: str | None = None
     inserted = False
@@ -420,28 +464,29 @@ def redirected_user_config_text(text: str, main_store: Path) -> str:
             if section == "core" and not inserted:
                 if not raw.endswith(("\n", "\r")):
                     out[-1] = raw + newline
-                out.append(line + newline)
+                out.append(lines)
                 inserted = True
             continue
-        if section == "core" and _OUTPUT_FOLDER_RE.match(raw):
+        if section == "core" and replaced.match(raw):
             continue
         out.append(raw)
     if not inserted:
         if out and not out[-1].endswith(("\n", "\r")):
             out.append(newline)
-        out.append(f"{newline if out else ''}[core]{newline}{line}{newline}")
+        out.append(f"{newline if out else ''}[core]{newline}{lines}")
     result = "".join(out)
     try:
         parsed = tomllib.loads(result)
     except tomllib.TOMLDecodeError as e:
         raise TicketStoreError(f"{USER_CONFIG_REL.as_posix()} cannot take the redirect: {e}") from e
     core: object = parsed.get("core")
-    value = cast("dict[str, object]", core).get("output_folder") if isinstance(core, dict) else None
-    if value != str(main_store):
-        raise TicketStoreError(
-            f"{USER_CONFIG_REL.as_posix()} cannot take the redirect: [core] output_folder "
-            f"reads {value!r} after the rewrite"
-        )
+    table = cast("dict[str, object]", core) if isinstance(core, dict) else {}
+    for key, value in values.items():
+        if table.get(key) != value:
+            raise TicketStoreError(
+                f"{USER_CONFIG_REL.as_posix()} cannot take the redirect: [core] {key} "
+                f"reads {table.get(key)!r} after the rewrite"
+            )
     return result
 
 
@@ -540,13 +585,14 @@ def probe_store_facts(paths: bmadconfig.ProjectPaths, initiative: Path) -> Store
 
 
 def assess_store(
-    paths: bmadconfig.ProjectPaths, isolation: str
+    paths: bmadconfig.ProjectPaths, isolation: str, *, chained: bool = False
 ) -> StoreTopology | StoreRefusal | None:
-    """Probe and classify the store of ``paths`` (loaded for tickets mode). None
-    when there is no active initiative folder to classify — the tickets preflight
-    reports that on its own (``tickets.initiative-unset`` / ``-missing``). A git
-    fault — or an initiative folder that cannot be statted — is a ``probe-failed``
-    refusal, never a guess."""
+    """Probe and classify the store of ``paths`` (loaded for tickets mode; a
+    ``chained`` run's paths re-rooted on its child, see :func:`classify_store`).
+    None when there is no active initiative folder to classify — the tickets
+    preflight reports that on its own (``tickets.initiative-unset`` /
+    ``-missing``). A git fault — or an initiative folder that cannot be statted —
+    is a ``probe-failed`` refusal, never a guess."""
     initiative = paths.initiative_folder
     if paths.era != "v7" or initiative is None:
         return None
@@ -556,32 +602,42 @@ def assess_store(
         facts = probe_store_facts(paths, initiative)
     except verify.GitError as e:
         return StoreRefusal("probe-failed", initiative, str(e))
-    return classify_store(facts, isolation)
+    return classify_store(facts, isolation, chained=chained)
 
 
-def redirect_mount_store(mount_project: Path, main_store: Path) -> None:
-    """Point the worktree mount at ``mount_project`` to the main checkout's store:
+def redirect_mount_config(
+    mount_project: Path, *, main_store: Path | None, initiative: str | None
+) -> None:
+    """Point the worktree mount at ``mount_project`` to the main checkout's store
+    (``main_store``) and/or a chained run's child initiative (``initiative``):
     rewrite its :data:`USER_CONFIG_REL` (created when absent) so ``[core]
-    output_folder`` is ``main_store``, then read the merged config back the way
-    ``tickets.py`` does. Raises :class:`TicketStoreError` when the file cannot be
-    rewritten or the merged value is not ``main_store``."""
+    output_folder`` / ``[core] active_initiative`` hold them
+    (:func:`redirected_user_config_text`; at least one required), then read each
+    merged value back the way ``tickets.py`` does. Raises :class:`TicketStoreError`
+    when the file cannot be rewritten or a merged value is not the one written."""
     path = mount_project / USER_CONFIG_REL
+    values = _core_values(main_store, initiative)
+    what = _describe_values(values)
     try:
         try:  # only absence reads as empty: Path.is_file folds any stat fault to False
             text = path.read_bytes().decode("utf-8")
         except (FileNotFoundError, NotADirectoryError):
             text = ""
-        data = redirected_user_config_text(text, main_store).encode("utf-8")
+        data = redirected_user_config_text(
+            text, main_store=main_store, initiative=initiative
+        ).encode("utf-8")
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_bytes(path, data)
-        merged = bmadconfig.read_core_value(mount_project, "output_folder")
+        merged = {key: bmadconfig.read_core_value(mount_project, key) for key in values}
     except (OSError, UnicodeDecodeError, bmadconfig.BmadConfigError) as e:
-        raise TicketStoreError(f"cannot redirect {path} to {main_store}: {e}") from e
-    if merged is None or merged[0] != str(main_store):
-        raise TicketStoreError(
-            f"redirected {path}, but the merged [core] output_folder reads "
-            f"{None if merged is None else merged[0]!r}, not {main_store}"
-        )
+        raise TicketStoreError(f"cannot point {path} at {what}: {e}") from e
+    for key, value in values.items():
+        hit = merged[key]
+        if hit is None or hit[0] != value:
+            raise TicketStoreError(
+                f"redirected {path}, but the merged [core] {key} reads "
+                f"{None if hit is None else hit[0]!r}, not {value}"
+            )
 
 
 def sweep_store_source(paths: bmadconfig.ProjectPaths, stories_source: str) -> str:
@@ -593,21 +649,35 @@ def sweep_store_source(paths: bmadconfig.ProjectPaths, stories_source: str) -> s
 
 
 def store_conflict(
-    project: Path, source: str, isolation: str, *, recorded: Mapping[str, object] | None = None
+    project: Path,
+    source: str,
+    isolation: str,
+    *,
+    recorded: Mapping[str, object] | None = None,
+    initiative: str | None = None,
 ) -> str | None:
     """The store-topology refusal for a ``source`` run of ``project`` under
     ``isolation``, or None — the predicate every run-arming surface calls (and
     ``cli._reject_store_topology`` wraps). None outside tickets mode. Loads the
     paths itself with ``want_tickets``, so a caller holding v6-era paths of a mixed
     install still classifies the v7 store. ``recorded`` is the run's
-    ``RunState.store_topology`` on resume (empty or None: nothing recorded)."""
+    ``RunState.store_topology`` on resume (empty or None: nothing recorded).
+    ``initiative`` names a chained run's child initiative of the active (parent)
+    one: the paths are re-rooted on it (``ProjectPaths.with_initiative``) and
+    classified as ``chained``."""
     if source != "tickets":
         return None
     try:
         paths = bmadconfig.load_paths(project, want_tickets=True)
     except bmadconfig.BmadConfigError as e:
         return f"cannot read the BMAD config to classify the ticket store: {e}"
-    return store_topology_conflict(assess_store(paths, isolation), recorded=recorded or None)
+    if initiative is not None:
+        try:
+            paths = paths.with_initiative(initiative)
+        except ValueError as e:
+            return f"cannot classify the ticket store of child initiative {initiative!r}: {e}"
+    result = assess_store(paths, isolation, chained=initiative is not None)
+    return store_topology_conflict(result, recorded=recorded or None)
 
 
 def with_shared_store(

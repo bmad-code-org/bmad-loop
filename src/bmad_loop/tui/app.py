@@ -39,6 +39,7 @@ from .. import (
     runsetup,
     stories,
     ticketlayout,
+    tickets_source,
     ticketstore,
     tickettree,
     verify,
@@ -68,7 +69,7 @@ from ..policy import POLICY_FILE
 from ..process_host import ProcessHostError
 from ..runs import RUNS_DIR, RearmError, StopRunError
 from . import commands, data, launch, widgets
-from .screens.dashboard import DashboardScreen
+from .screens.dashboard import DashboardScreen, load_policy_noting_deprecations
 from .screens.modals import (
     ConfirmModal,
     ConfirmResumeModal,
@@ -98,13 +99,18 @@ def _engine_possibly_live(run_dir: Path) -> bool:
 
 
 def _replan_ticket_tree(
-    project_root: Path, pinned_initiative: str | None
+    project_root: Path, pinned_initiative: str | None, *, folder: Path | None = None
 ) -> tickettree.TicketTreeLike:
     """The tree a tickets-mode "Request replan" marks the plan through: the installed
     ``tickets.py`` under ``project_root`` (the plan's live root), pinned to the run's
-    initiative. Tests replace it with a ``FakeTicketTree``."""
-    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative)
+    initiative, through a parent's child ``folder`` when given. Tests replace it
+    with a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project_root, pinned_initiative=pinned_initiative, folder=folder)
 
+
+# Textual has no unlimited toast lifetime (`timeout=None` is the 5s default), and
+# Windows' timer sleep cannot take `inf`, so "until clicked" is a day.
+_PERSISTENT_TOAST_S = 24 * 60 * 60.0
 
 # Pause stages whose payload is the pause reason, never a spec: the viewer is
 # `PauseReasonModal`. The three ticket stages are raised at pick time, before the
@@ -245,9 +251,35 @@ class BmadLoopApp(App[None]):
         self.project = resolve_or_lexical(project)
         self.sub_title = str(self.project)
         self._dashboard = DashboardScreen(self.project)
+        self._policy_deprecations_shown: set[str] = set()
 
     def on_mount(self) -> None:
         self.push_screen(self._dashboard)
+        self.note_policy_deprecations(self._dashboard.policy_deprecations)
+
+    def _load_policy(self) -> policy.Policy:
+        """``policy.load`` of the project's policy.toml for an in-session read on
+        the message loop, toasting any deprecation notice it raises that this
+        session has not shown (DW-603). Raises exactly what ``policy.load`` does."""
+        pol, deprecations = load_policy_noting_deprecations(self.project / POLICY_FILE)
+        self.note_policy_deprecations(deprecations)
+        return pol
+
+    def note_policy_deprecations(self, messages: Iterable[str]) -> None:
+        """Toast each policy.toml deprecation notice this app session has not shown
+        yet, with the advice text the CLI prints (DW-603). The toast stays up until
+        clicked: the fix is an edit the operator has to go and make."""
+        for message in messages:
+            if message in self._policy_deprecations_shown:
+                continue
+            self._policy_deprecations_shown.add(message)
+            self.notify(
+                message,
+                title="policy.toml",
+                severity="warning",
+                timeout=_PERSISTENT_TOAST_S,
+                markup=False,
+            )
 
     def action_toggle_dark(self) -> None:
         self.theme = "textual-light" if self.theme == "textual-dark" else "textual-dark"
@@ -326,7 +358,7 @@ class BmadLoopApp(App[None]):
         try:
             conflict = None
             if loaded is not None:
-                pol = policy.load(self.project / POLICY_FILE)
+                pol = self._load_policy()
                 conflict = bmadconfig.worktree_isolation_conflict(loaded, pol.scm.isolation)
                 if conflict is None:
                     # the ticket-store topology `cmd_run` refuses next (tickets mode)
@@ -395,7 +427,7 @@ class BmadLoopApp(App[None]):
         the tomlkit error can only arrive from the `PolicyDoc` path in
         :meth:`action_settings`, which catches it there."""
         try:
-            pol = policy.load(self.project / POLICY_FILE)
+            pol = self._load_policy()
         except (policy.PolicyError, OSError):
             return worksource.SOURCE_SPRINT, ""
         return pol.stories.source, pol.stories.spec_folder
@@ -804,6 +836,20 @@ class BmadLoopApp(App[None]):
                 markup=False,
             )
             return
+        # A tickets epic boundary is answered by closing the epic with
+        # bmad-agent-po, as a plain `bmad-loop resolve` does: classified ahead of the
+        # escalation rule, which refuses it. Every other pause takes the paths below.
+        target = tickets_source.epic_close_target(state)
+        if isinstance(target, tickets_source.EpicCloseTarget):
+            self._confirm_epic_close(run_id, run_dir, target, pointer)
+            return
+        if target.code != tickets_source.EPIC_CLOSE_NOT_APPLICABLE:
+            self.notify(
+                target.step + (f"\n{pointer}" if pointer else ""),
+                severity="warning",
+                markup=False,
+            )
+            return
         # Admission is `runs.escalation_resolvable`, the CLI's own rule: paused at
         # the escalation stage, or not paused while a story is still escalated —
         # a resume clears the pause before its engine starts (#958).
@@ -829,6 +875,34 @@ class BmadLoopApp(App[None]):
                 "converse to fix the frozen spec, then confirm re-arm + resume in that window."
                 + (f"\n{pointer}" if pointer else ""),
                 confirm_label="resolve",
+            ),
+            lambda ok: self._launch_resolve(run_id) if ok else None,
+        )
+
+    def _confirm_epic_close(
+        self,
+        run_id: str,
+        run_dir: Path,
+        target: tickets_source.EpicCloseTarget,
+        pointer: str = "",
+    ) -> None:
+        """Confirm and launch the epic-close resolve for `R`: the CLI opens
+        bmad-agent-po in a ctl window, then verifies the epic, confirms and resumes
+        there. Liveness is gated before the confirm, as the escalation arm is."""
+        if _engine_possibly_live(run_dir):
+            self.notify(f"run {run_id} may still be live — stop it first", severity="warning")
+            return
+        body = (
+            f"open bmad-agent-po for epic {target.slug}?\n"
+            "close and commit it there; the run resumes in that window."
+        )
+        if target.rejected:
+            body += "\nThe run stays held until this epic is closed."
+        self.push_screen(
+            ConfirmModal(
+                "close epic",
+                body + (f"\n{pointer}" if pointer else ""),
+                confirm_label="close epic",
             ),
             lambda ok: self._launch_resolve(run_id) if ok else None,
         )
@@ -995,7 +1069,7 @@ class BmadLoopApp(App[None]):
                 if spec_path is None:
                     self.notify("no spec file to reset for replan", severity="error")
                     return
-                ticket: tuple[str, TicketBinding, str | None] | None = None
+                ticket: tuple[str, TicketBinding] | None = None
                 if state.source == worksource.SOURCE_TICKETS:
                     # R13: a ticket's plan is re-opened only through the chokepoint,
                     # so a paused task with no recorded binding has no ref to mark.
@@ -1006,7 +1080,7 @@ class BmadLoopApp(App[None]):
                             severity="error",
                         )
                         return
-                    ticket = (task.story_key, task.ticket, state.initiative or None)
+                    ticket = (task.story_key, task.ticket)
                 self._do_replan(
                     run_id,
                     spec_path,
@@ -1031,6 +1105,10 @@ class BmadLoopApp(App[None]):
         def done(verb: str | None) -> None:
             if verb == "resume":
                 self._do_resume(run_id)
+            elif verb == "close-epic":
+                if self._mux_missing() or self._resolve_blocked_by_liveness(run_id, run_dir):
+                    return
+                self._launch_resolve(run_id)
 
         if spec_path is None:
             # Spec-less gates: story-gate fires before the story is registered in
@@ -1053,13 +1131,20 @@ class BmadLoopApp(App[None]):
                 else Text(f"run {run_id}", style="bold")
             )
             reason = state.paused_reason or ""
+            actions: list[tuple[str, str, str]] = []
             if closure:
                 reason = f"{self._epic_closure_summary(state)}\n\n{reason}"
+                # A refusal cause offers no verb: its reason names the step.
+                if isinstance(
+                    tickets_source.epic_close_target(state), tickets_source.EpicCloseTarget
+                ):
+                    actions.append(("close-epic", "Close with bmad-agent-po", "warning"))
             self.push_screen(
                 PauseReasonModal(
                     title=f"{label} — pause reason",
                     subtitle=subtitle,
                     reason=reason,
+                    actions=actions,
                 ),
                 done,
             )
@@ -1274,14 +1359,14 @@ class BmadLoopApp(App[None]):
         confine_root: Path,
         *,
         root_identity: os.stat_result | None = None,
-        ticket: tuple[str, TicketBinding, str | None] | None = None,
+        ticket: tuple[str, TicketBinding] | None = None,
     ) -> None:
         """Request-replan: reset the planned spec to draft + strip its Auto Run
         Result, then resume — the next dispatch re-enters step-02 planning. Uses
         the same devcontract primitives the engine's repair path uses.
 
-        `ticket` is `(paused key, its recorded binding, pinned initiative)` for a
-        tickets-mode run. The plan is
+        `ticket` is `(paused key, its recorded binding)` for a tickets-mode run.
+        The plan is
         then re-opened to `draft` only through `TicketTree.mark(reason="replan")`,
         on a worker thread (`_ticket_replan_worker`), never by a raw frontmatter
         write; the Auto Run Result is left alone.
@@ -1319,9 +1404,9 @@ class BmadLoopApp(App[None]):
             self.notify(f"replan: no spec at {spec_path} — not resuming", severity="error")
             return
         if ticket is not None:
-            key, binding, initiative = ticket
+            key, binding = ticket
             self._ticket_replan_worker(
-                run_id, run_dir, spec_path, confine_root, key, binding, initiative, root_identity
+                run_id, run_dir, spec_path, confine_root, key, binding, root_identity
             )
             return
         try:
@@ -1365,7 +1450,6 @@ class BmadLoopApp(App[None]):
         tree_root: Path,
         key: str,
         binding: TicketBinding,
-        initiative: str | None,
         root_identity: os.stat_result | None,
     ) -> None:
         """Re-open a ticket's plan to `draft` through the chokepoint, then resume.
@@ -1381,12 +1465,16 @@ class BmadLoopApp(App[None]):
         re-read pause must still be `key`'s with the `binding` the modal showed, or
         another controller has moved the run to a newer checkpoint the operator never
         reviewed. `tree_root` is the plan's live root (`_paused_spec_root`), the tree a
-        re-arm marks through too. `root_identity` pins it as it pins the stories-mode
+        re-arm marks through too, pinned from the re-read state as a re-arm pins it
+        (`runs.recorded_tree_pin`: a chained run's parent and child folder in the main
+        checkout, its child in a mount). `root_identity` pins it as it pins the stories-mode
         reset (DW-423): a worktree mount swapped for a link refuses before the tree's
         `tickets.py` is run. Every UI update marshals through `call_from_thread`."""
         ref = binding.ref
         try:
-            isolation = policy.load(self.project / POLICY_FILE).scm.isolation
+            pol, deprecations = load_policy_noting_deprecations(self.project / POLICY_FILE)
+            self.call_from_thread(self.note_policy_deprecations, deprecations)
+            isolation = pol.scm.isolation
             recorded = load_state(run_dir)
         except (policy.PolicyError, OSError, KeyError, ValueError) as e:
             self.call_from_thread(
@@ -1407,13 +1495,23 @@ class BmadLoopApp(App[None]):
             )
             return
         else:
-            conflict = bmadconfig.worktree_isolation_conflict(paths, isolation)
+            try:
+                paths = runs.paths_for_state(paths, recorded)
+            except bmadconfig.BmadConfigError as e:
+                conflict = str(e)  # a chained run whose config no longer names its parent
+            else:
+                conflict = bmadconfig.worktree_isolation_conflict(paths, isolation)
         if conflict is None:
+            # a chained run's store is its child's, as `cli._store_initiative` judges it
+            chained = (
+                {} if recorded.parent_initiative is None else {"initiative": recorded.initiative}
+            )
             conflict = ticketstore.store_conflict(
                 self.project,
                 worksource.SOURCE_TICKETS,
                 isolation,
                 recorded=runs.live_store_topology(recorded, self.project) or None,
+                **chained,
             )
         if conflict is not None:
             self.call_from_thread(self.notify, conflict, severity="error")
@@ -1449,7 +1547,8 @@ class BmadLoopApp(App[None]):
                     )
                     return
                 require_root_pinned(tree_root, root_identity)
-                mark = _replan_ticket_tree(tree_root, initiative).mark(
+                pin, folder = runs.recorded_tree_pin(fresh, self.project, tree_root)
+                mark = _replan_ticket_tree(tree_root, pin, folder=folder).mark(
                     ref,
                     "draft",
                     reason="replan",
@@ -1470,7 +1569,7 @@ class BmadLoopApp(App[None]):
                 severity="error",
             )
             return
-        except (OSError, KeyError, ValueError) as e:
+        except (OSError, KeyError, ValueError, bmadconfig.BmadConfigError) as e:
             self.call_from_thread(
                 self.notify, f"replan failed: {e} — not resuming", severity="error"
             )
@@ -1568,7 +1667,7 @@ class BmadLoopApp(App[None]):
         # silently, and unrecoverably, since a re-arm consumes the escalation.
         # `cli.cmd_resolve` raises on the same unreadable file before it re-arms.
         try:
-            live_policy = policy.load(self.project / POLICY_FILE)
+            live_policy = self._load_policy()
         except (policy.PolicyError, OSError) as e:
             self.notify(
                 f"cannot read policy.toml to determine the re-drive's isolation mode "
@@ -1616,8 +1715,21 @@ class BmadLoopApp(App[None]):
                 except (OSError, KeyError, ValueError):
                     recorded = None  # the locked re-read below names an unreadable state
                 if recorded is not None:
-                    conflict = runsetup.sweep_initiative_conflict(recorded, paths)
+                    try:
+                        paths = runs.paths_for_state(paths, recorded)
+                    except bmadconfig.BmadConfigError as e:
+                        conflict = str(e)  # a chained run's config no longer names its parent
+                    else:
+                        conflict = runsetup.sweep_initiative_conflict(
+                            recorded, paths, rerooted=True
+                        )
                 if recorded is not None and conflict is None:
+                    # a chained run's store is its child's (`cli._store_initiative`)
+                    chained = (
+                        {}
+                        if recorded.parent_initiative is None
+                        else {"initiative": recorded.initiative}
+                    )
                     conflict = ticketstore.store_conflict(
                         self.project,
                         runs.judged_store_source(
@@ -1626,6 +1738,7 @@ class BmadLoopApp(App[None]):
                         ),
                         isolation,
                         recorded=runs.live_store_topology(recorded, self.project) or None,
+                        **chained,
                     )
             if conflict is not None:
                 self.notify(conflict, severity="error")
@@ -1678,9 +1791,12 @@ class BmadLoopApp(App[None]):
                     return
                 if paths is not None:
                     # the initiative pin, re-judged on the state the re-arm writes:
-                    # the lock-free judgment above skips a state it could not read
+                    # the lock-free judgment above skips a state it could not read,
+                    # and then `paths` are the loaded ones, never re-rooted
                     if (
-                        pinned := runsetup.sweep_initiative_conflict(fresh_state, paths)
+                        pinned := runsetup.sweep_initiative_conflict(
+                            fresh_state, paths, rerooted=recorded is not None
+                        )
                     ) is not None:
                         self.notify(pinned, severity="error")
                         return
@@ -2262,7 +2378,13 @@ class BmadLoopApp(App[None]):
         guard_notes: list[str] = []
         try:
             dest = runs.archive_run(self.project, run_dir, warn=guard_notes.append)
-        except (OSError, runs.StateRootError, runs.LiveEngineError, runs.LiveSessionError) as e:
+        except (
+            OSError,
+            runs.StateRootError,
+            runs.LiveEngineError,
+            runs.LiveSessionError,
+            runs.HeldSweepClosesError,
+        ) as e:
             # Same worker boundary as delete: report the authoritative transaction,
             # not the earlier modal sample.
             self._notify_guard_notes(guard_notes)

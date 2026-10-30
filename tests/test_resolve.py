@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -263,6 +264,25 @@ def test_set_frontmatter_field_inserts_without_introducing_a_foreign_line_ending
     assert text == "---\rtitle: t\rstatus: done\rbaseline_revision: abc123\r---\r\rbody\r"
     assert "\n" not in text
     assert verify.read_frontmatter(spec)["baseline_revision"] == "abc123"
+
+
+def test_set_frontmatter_field_keep_bom_edits_behind_a_byte_order_mark(tmp_path):
+    """A leading BOM hides the block unless `keep_bom` (a v7 file read as
+    `utf-8-sig`): then the key is inserted behind it and the BOM is kept.
+
+    Ablation: drop the BOM peel and the `keep_bom` call returns False."""
+    spec = tmp_path / "initiative.md"
+    original = "\ufeff---\ntype: initiative\n---\n\nbody\n".encode("utf-8")
+    spec.write_bytes(original)
+    assert verify.set_frontmatter_field(spec, "status", "done", confine_root=tmp_path) is False
+    assert spec.read_bytes() == original
+    assert (
+        verify.set_frontmatter_field(spec, "status", "done", confine_root=tmp_path, keep_bom=True)
+        is True
+    )
+    assert spec.read_bytes().decode("utf-8") == (
+        "\ufeff---\ntype: initiative\nstatus: done\n---\n\nbody\n"
+    )
 
 
 # --- set_frontmatter_field: atomic write (#379) ---
@@ -3832,6 +3852,59 @@ def test_run_session_threads_model_and_effort_onto_the_spec(tmp_path, monkeypatc
     assert plain.specs[0].model == "" and plain.specs[0].effort == ""
 
 
+def test_run_epic_close_session_builds_the_spec_and_returns_the_returncode(tmp_path, monkeypatch):
+    """The epic-close session carries its prompt verbatim on a dev spec rooted at
+    the project, with the run dir and epic ref in its env and no BMAD_LOOP_MODE (a
+    human is present), and hands the process returncode back for the journal."""
+    calls: list = []
+
+    def fake_subprocess_run(argv, cwd, env):
+        calls.append((argv, cwd, env))
+        return SimpleNamespace(returncode=3)
+
+    monkeypatch.setattr(resolve.subprocess, "run", fake_subprocess_run)
+    adapter = _SpecCapture()
+    prompt = "/bmad-agent-po Run your epic closure check for epic e1 of initiative i1."
+    rc = resolve.run_epic_close_session(
+        adapter,
+        tmp_path,
+        tmp_path / "run",
+        "e1",
+        prompt,
+        model="anthropic/claude-x",
+        effort="max",
+    )
+    assert rc == 3
+    spec = adapter.specs[0]
+    assert spec.prompt == prompt
+    assert spec.role == "dev"
+    assert spec.cwd == tmp_path
+    assert spec.env == {"BMAD_LOOP_RUN_DIR": str(tmp_path / "run"), "BMAD_LOOP_EPIC_REF": "e1"}
+    assert spec.task_id == _session_task_id("e1", "epic-close", 1, 0)
+    assert (spec.model, spec.effort) == ("anthropic/claude-x", "max")
+    [(argv, cwd, env)] = calls
+    assert argv == ["fake-agent", prompt]
+    assert cwd == str(tmp_path)
+    assert env["BMAD_LOOP_EPIC_REF"] == "e1"
+    assert env["BMAD_LOOP_RUN_DIR"] == str(tmp_path / "run")
+    assert "BMAD_LOOP_MODE" not in spec.env
+
+
+def test_run_epic_close_session_propagates_no_interactive_mode(tmp_path, monkeypatch):
+    """An adapter with no interactive mode raises out of `interactive_argv`; the
+    caller owns that answer, so it propagates and nothing is spawned."""
+
+    class _NoInteractive(_FakeAdapter):
+        def interactive_argv(self, spec):
+            raise NotImplementedError
+
+    monkeypatch.setattr(resolve.subprocess, "run", lambda *a, **k: pytest.fail("spawned a session"))
+    with pytest.raises(NotImplementedError):
+        resolve.run_epic_close_session(
+            _NoInteractive(None), tmp_path, tmp_path / "run", "e1", "/bmad-agent-po x"
+        )
+
+
 def test_run_session_id_is_byte_identical_to_the_hand_mint_at_generation_zero(
     tmp_path, monkeypatch
 ):
@@ -5809,7 +5882,7 @@ def _fake_rearm_tree(monkeypatch, plan: Path, *, status: str = "blocked"):
     row = ticket_row("1.1", status=status, blocked_reason="intent gap")
     tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
     tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
-    monkeypatch.setattr(runs, "_rearm_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", lambda _root, _pin, folder=None: tree)
     return tree
 
 
@@ -5965,6 +6038,68 @@ def test_rearm_tickets_uses_mark_and_clears_blocked_fields(project_v7):
         "written",
     )
     assert load_state(run_dir).tasks[outcome.story_key].phase == Phase.PENDING
+
+
+@pytest.mark.parametrize("in_mount", [False, True])
+def test_rearm_chained_ticket_tree_pins_like_the_engine(
+    project_v7, tmp_path, monkeypatch, in_mount
+):
+    """A chained run's re-arm marks the plan through a tree pinned as the engine
+    pins it: in the main checkout, the parent the live config names, through the
+    child's folder; in a worktree mount, the child with no folder (the mount's
+    config names it). Ablation (performed): pass `state.initiative` and
+    `folder=None` again and the main-checkout row FAILS."""
+    child = "initiative-child"
+    if in_mount:
+        root = tmp_path / "wt" / "u1"
+        plan = root / "epic-cart" / "story-cart-model-plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("---\nticket: 1\nstatus: blocked\n---\n" + TICKET_PLAN_BODY, "utf-8")
+        run_dir, state, task = _escalated_run(
+            tmp_path, spec_file=str(plan), source="tickets", worktree_path=str(root)
+        )
+        task.ticket = _ticket_binding(plan)
+    else:
+        root = project_v7.project
+        plan = _blocked_ticket_plan(project_v7)
+        run_dir, state, _ = _escalated_ticket_run(root, plan)
+    state.initiative, state.parent_initiative = child, project_v7.initiative
+    save_state(run_dir, state)
+    tree = _fake_rearm_tree(monkeypatch, plan)
+    built: list = []
+
+    def factory(project_root, pin, *, folder=None):
+        built.append((project_root, pin, folder))
+        return tree
+
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", factory)
+
+    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    if in_mount:
+        assert built == [(root, child, None)]
+    else:
+        folder = project_v7.initiative_folder.parent / child
+        assert built == [(root, project_v7.initiative, folder)]
+    assert [(m.target, m.reason) for m in tree.marks] == [("ready-for-dev", "rearm")]
+
+
+def test_rearm_chained_ticket_refuses_a_moved_parent_before_any_write(project_v7, monkeypatch):
+    """A chained run whose live config no longer names its parent refuses the
+    re-arm before its first write: the escalation stays armed, the plan as it
+    was."""
+    plan = _blocked_ticket_plan(project_v7)
+    before = plan.read_bytes()
+    run_dir, state, _ = _escalated_ticket_run(project_v7.project, plan)
+    state.initiative, state.parent_initiative = "initiative-child", "initiative-platform"
+    save_state(run_dir, state)
+    monkeypatch.setattr(runs, "_rearm_ticket_tree", lambda *_a, **_k: pytest.fail("built"))
+
+    with pytest.raises(runs.RearmError, match="set it back to 'initiative-platform'"):
+        runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    assert load_state(run_dir).tasks["6-4-cli-list-command"].phase == Phase.ESCALATED
+    assert plan.read_bytes() == before
 
 
 def test_rearm_rollback_restores_plan_bytes_on_fault(project_v7, monkeypatch):
@@ -6125,3 +6260,130 @@ def test_ticket_context_journal_is_pinned_to_the_run_state(tmp_path, recorded):
         assert kinds == ["resolve-ticket-context-unreadable"]
     else:
         assert kinds == ["journal-unpinned", "resolve-ticket-context-unreadable"]
+
+
+_INIT = Path("/w/_bmad-output/initiatives/shop")
+_EPIC = _INIT / "epics" / "epic-cart"
+
+
+def _close_prompt(**kw) -> str:
+    args = {
+        "slug": "epic-cart",
+        "initiative": "shop",
+        "initiative_folder": _INIT,
+        "epic_file": _EPIC / "epic-cart.md",
+        "retrospective": _EPIC / "epic-cart-retrospective.md",
+        "verdict": "accepted",
+        "parent": None,
+        "rejected": False,
+        "versioning": "code-repo",
+        "repo": Path("/w"),
+    } | kw
+    return resolve.epic_close_prompt(**args)
+
+
+def test_epic_close_prompt_names_the_epic_and_its_paths():
+    """One canonical `/bmad-agent-po` line naming the epic, the initiative, the
+    absolute epic file and retrospective with its verdict; a run with no recorded
+    verdict says so, and a plain run carries neither the chained nor the rejected
+    clause."""
+    prompt = _close_prompt()
+
+    assert prompt.startswith("/bmad-agent-po Run your epic closure check for epic epic-cart ")
+    assert "\n" not in prompt
+    assert "of initiative shop." in prompt
+    assert f"Initiative folder: {_INIT.as_posix()}." in prompt
+    assert f"Epic file: {(_EPIC / 'epic-cart.md').as_posix()}." in prompt
+    assert (
+        f"Retrospective: {(_EPIC / 'epic-cart-retrospective.md').as_posix()} "
+        "(verdict: accepted)."
+    ) in prompt
+    assert "parent" not in prompt and "stays held" not in prompt
+    assert "(verdict: none recorded by this run)" in _close_prompt(verdict=None)
+
+
+def test_epic_close_prompt_chained_and_rejected_clauses():
+    """A chained child names its parent and points the agent at the child folder;
+    a rejected verdict says the run stays held. Ablation (performed): drop the
+    chained clause and its assertion FAILS."""
+    prompt = _close_prompt(parent="platform", rejected=True, verdict="rejected")
+
+    assert (
+        "shop is a child of parent platform, which [core] active_initiative names; "
+        "work in the child folder above."
+    ) in prompt
+    assert "The run stays held until this epic is closed." in prompt
+
+
+@pytest.mark.parametrize(
+    ("versioning", "repo", "commit", "clean"),
+    [
+        ("code-repo", Path("/w"), "then commit the epic file in the repo at /w.", True),
+        (
+            "store-repo",
+            Path("/store"),
+            "then commit the epic file in the store repo at /store.",
+            True,
+        ),
+        ("none", None, "the store is unversioned, so there is nothing to commit.", False),
+    ],
+    ids=["T1", "T3", "T2"],
+)
+def test_epic_close_prompt_versioning_hint(versioning, repo, commit, clean):
+    """Where the closed epic file is committed follows the store's versioning, and
+    only a versioned store is told its epic folder must be clean."""
+    prompt = _close_prompt(versioning=versioning, repo=repo)
+
+    assert commit in prompt
+    assert ("epic folder has no uncommitted change" in prompt) is clean
+    assert prompt.endswith(".")
+
+
+@pytest.mark.parametrize(
+    ("versioning", "repo"), [("code-repo", None), ("store-repo", None), ("git", Path("/w"))]
+)
+def test_epic_close_prompt_refuses_an_unknown_commit_target(versioning, repo):
+    with pytest.raises(ValueError, match="no epic-close commit hint"):
+        _close_prompt(versioning=versioning, repo=repo)
+
+
+_PREFIX = "_bmad-output/initiatives/shop/epics/epic-cart"
+_DIRT = {
+    "inside": [f"{_PREFIX}/epic-cart.md", "src/app.py"],
+    "outside": ["src/app.py", "_bmad-output/initiatives/shop/epics/epic-cartography/x.md"],
+    "clean": [],
+}
+
+
+@pytest.mark.parametrize("versioning", ["code-repo", "store-repo", "none"])
+@pytest.mark.parametrize("dirt", ["inside", "outside", "clean"])
+@pytest.mark.parametrize("status", ["in-progress", "done", "dropped"])
+def test_epic_close_missing(status, dirt, versioning):
+    """Verified is an empty list: a closed epic (`done`/`dropped`) and, on a
+    versioned store, no dirt in or around the epic folder. Dirt elsewhere —
+    including a sibling folder sharing the prefix's spelling — is not the
+    session's. Ablation (performed): treat `none` like `code-repo` and the
+    T2 dirty-inside rows FAIL."""
+    missing = resolve.epic_close_missing(status, _DIRT[dirt], _PREFIX, versioning)
+
+    expected = [] if status in ("done", "dropped") else [f"the epic reads {status}"]
+    if dirt == "inside" and versioning != "none":
+        expected.append(f"{_PREFIX}: uncommitted {_PREFIX}/epic-cart.md")
+    assert missing == expected
+
+
+def test_epic_close_missing_reads_a_nested_repo_and_a_blank_status():
+    """An untracked nested repository above the folder (`dirty_paths` spells it with
+    a trailing slash) is dirt on it, and an epic with no status is not closed; more
+    than five dirty paths are summarized."""
+    nested = resolve.epic_close_missing("", ["_bmad-output/"], _PREFIX, "code-repo")
+    many = resolve.epic_close_missing(
+        "done", [f"{_PREFIX}/t{i}.md" for i in range(7)], _PREFIX, "store-repo"
+    )
+
+    assert nested == ["the epic reads no status", f"{_PREFIX}: uncommitted _bmad-output"]
+    assert many == [
+        f"{_PREFIX}: uncommitted "
+        + ", ".join(f"{_PREFIX}/t{i}.md" for i in range(5))
+        + " and 2 more"
+    ]

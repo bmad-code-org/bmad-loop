@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -336,6 +337,76 @@ def test_validate_trust_query_uses_selected_project(project, tmp_path, monkeypat
     )
     assert finding["severity"] == "ok"
     assert queried == [project.project]
+
+
+_SANDBOXED_ONLY_POSIX = pytest.mark.skipif(
+    sys.platform == "win32", reason="the packaged codex sandboxed mode maps linux/darwin only"
+)
+
+
+def _codex_validate_project(project, policy_text):
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    install_into(project.project, clis=("codex",))
+    (project.project / ".bmad-loop/policy.toml").write_text(policy_text, encoding="utf-8")
+
+
+@_SANDBOXED_ONLY_POSIX
+def test_validate_trust_query_uses_each_roles_permission_mode_launch(project, monkeypatch, capsys):
+    """Validate queries the profile the run launches: under a sandboxed
+    permission_mode that is the mode's args, not the profile's bypass_args.
+
+    Ablation: query `project_hook_trust(project, profile)` with the base profile
+    and the queried bypass_args are the bypass switch, so this fails."""
+    _codex_validate_project(project, '[adapter]\nname = "codex"\npermission_mode = "sandboxed"\n')
+    capsys.readouterr()
+    base = get_profile("codex")
+    sandboxed = base.for_permission_mode("sandboxed")
+    assert sandboxed.bypass_args != base.bypass_args
+    queried = []
+
+    def trust(_path, profile):
+        queried.append(profile.bypass_args)
+        return codex_trust.TrustResult("trusted", "hook trust current")
+
+    monkeypatch.setattr(codex_trust, "project_hook_trust", trust)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    finding = next(
+        f for f in json.loads(capsys.readouterr().out)["findings"] if f["check"] == "hooks.trust"
+    )
+    assert finding["severity"] == "ok"
+    # every role shares one sandboxed launch: one query, at the mode's args
+    assert queried == [sandboxed.bypass_args]
+
+
+@_SANDBOXED_ONLY_POSIX
+def test_validate_fails_trust_untrusted_for_one_roles_permission_mode_launch(
+    project, monkeypatch, capsys
+):
+    _codex_validate_project(
+        project, '[adapter]\nname = "codex"\n[adapter.review]\npermission_mode = "sandboxed"\n'
+    )
+    capsys.readouterr()
+    base = get_profile("codex")
+    queried = []
+
+    def trust(_path, profile):
+        queried.append(profile.bypass_args)
+        if profile.bypass_args == base.bypass_args:
+            return codex_trust.TrustResult("trusted", "hook trust current")
+        return codex_trust.TrustResult("untrusted", "hook trust stale under sandbox")
+
+    monkeypatch.setattr(codex_trust, "project_hook_trust", trust)
+    cli.main(["validate", "--project", str(project.project), "--json"])
+    doc = json.loads(capsys.readouterr().out)
+    findings = [f for f in doc["findings"] if f["check"] == "hooks.trust"]
+    assert len(findings) == 1 and findings[0]["severity"] == "problem"
+    message = findings[0]["message"]
+    assert "hook trust stale under sandbox" in message and "review (sandboxed)" in message
+    assert "dev (bypass)" not in message
+    assert set(findings[0]["detail"]) >= {"profile", "project", "binary"}
+    assert queried == [base.bypass_args, base.for_permission_mode("sandboxed").bypass_args]
 
 
 def test_validate_does_not_run_project_owned_codex_profile(project, tmp_path, capsys):

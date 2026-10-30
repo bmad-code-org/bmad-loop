@@ -52,10 +52,11 @@ Transport shape (the settled design drivers):
   #48/#53 artifact-distrust invariant, unchanged.
 - **Usage is read over HTTP before teardown** (server state is sqlite, not a
   readable file tree): V1 sums assistant-message tokens, V2 reads the
-  session's own token aggregate; stashed by session id, the raw messages
-  (V2: every page, oldest first) dumped to ``tasks/<task_id>/messages.json``
-  as the transcript. Child-session (subagent) tokens are not counted — the
-  API scopes messages and usage per session.
+  session's token aggregate plus every descendant (subagent) session's;
+  stashed by session id, the raw messages (V2: every page, oldest first)
+  dumped to ``tasks/<task_id>/messages.json`` as the transcript. V1 counts no
+  child-session tokens — its API scopes messages per session. A V2 child
+  still running at capture is journaled as ``usage-child-active``.
 - ``opencode serve`` survives parent death, so teardown is
   authoritative: kill in ``run()``'s finally plus an atexit sweep. On Windows
   the binary is an npm ``.cmd`` shim, so the kill goes straight to the
@@ -77,7 +78,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -88,6 +89,8 @@ from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from .base import (
+    USAGE_LIMIT_BLOCKED,
+    USAGE_LIMIT_WAIT,
     CodingCLIAdapter,
     SessionHandle,
     SessionResult,
@@ -96,7 +99,13 @@ from .base import (
     validate_adapter_artifact_paths,
     validated_task_directory,
 )
-from .env_fault import ENV_FAULT_TAIL_BYTES, EnvFaultMixin
+from .env_fault import (
+    ENV_FAULT_MATCH_TIMEOUT_S,
+    ENV_FAULT_STATUSES,
+    ENV_FAULT_TAIL_BYTES,
+    EnvFaultMixin,
+    _excerpt,
+)
 from .generic import (
     BUDGET_NUDGE_TEXT,
     HEARTBEAT_INTERVAL_S,
@@ -454,6 +463,12 @@ class _ServerSession:
     # Whether a provider-errors append has failed this session: the first
     # failure is crumbed (`provider-errors-write-failed`), the rest only lost.
     provider_errors_write_failed: bool = False
+    # The session's first live usage-limit sighting (DW-592): a provider-error
+    # line `_note_provider_error` formatted that matched the profile's usage
+    # lists, as ``(evidence, usage_limit_class)``; None = none seen. Written once
+    # by the reader thread, read by `wait_for_completion` — one tuple assignment,
+    # like the `activity` bump, so the wait thread reads nothing or the whole pair.
+    usage_sighting: tuple[str, str] | None = None
 
 
 class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
@@ -1102,7 +1117,9 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         line (:func:`format_provider_error` — structured fields only, never the
         provider's response body), to ``logs/<task_id>.provider-errors.log``:
         the env-fault classifier's evidence on 2.x, whose server log carries no
-        line per retry. A frame of another type writes nothing.
+        line per retry. A frame of another type writes nothing. The line is
+        also this session's live usage-limit evidence (`_note_usage_sighting`),
+        sighted before the append so a lost line does not lose the sighting.
 
         Never raises — the reader must not die — but a lost line is a lost
         classification, so a failure is visible: a payload that will not format
@@ -1114,6 +1131,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             line = sess.protocol.provider_error_line(etype, props)
             if line is None:
                 return
+            self._note_usage_sighting(sess, line)
             with sess.provider_errors_path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
         except Exception as e:  # the reader must never die; the loss is crumbed
@@ -1125,6 +1143,35 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     frame=etype,
                     error=f"{type(e).__name__}: {e}",
                 )
+
+    def _note_usage_sighting(self, sess: _ServerSession, line: str) -> None:
+        """Record ``line`` as this session's live usage-limit sighting (#610,
+        DW-592) when it matches the profile's ``usage_limit_patterns`` (class
+        blocked) or ``usage_wait_patterns`` (class wait) — blocked wins, as on
+        the pane (`GenericAdapter._usage_hit`). opencode has no pane: the typed
+        provider-error frame, seen while the session runs and filtered to its
+        id, is the live sighting. The first one sticks.
+
+        A search that blows ``ENV_FAULT_MATCH_TIMEOUT_S`` is no match for its
+        list, crumbed ``usage-limit-match-failed`` (``pattern``) — the reader
+        must not die, and the post-mortem tail scan still sees the line."""
+        if sess.usage_sighting is not None:
+            return
+        for patterns, limit_class in (
+            (self._usage_limit_patterns, USAGE_LIMIT_BLOCKED),
+            (self._usage_wait_patterns, USAGE_LIMIT_WAIT),
+        ):
+            for pat in patterns:
+                try:
+                    hit = pat.search(line, timeout=ENV_FAULT_MATCH_TIMEOUT_S)
+                except TimeoutError:
+                    self._note_lifecycle(
+                        sess.lifecycle_task, "usage-limit-match-failed", pattern=pat.pattern
+                    )
+                    continue
+                if hit is not None:
+                    sess.usage_sighting = (_excerpt(line, hit.start()), limit_class)
+                    return
 
     def _render_inline(self, sess: _ServerSession, etype: str, props: dict) -> None:
         """Append one human-readable progress line to the run log for the event
@@ -1206,6 +1253,25 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return self._await_result(handle.task_id)
 
     def wait_for_completion(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
+        """`_wait_loop`, with the session's live usage-limit sighting (DW-592,
+        `_note_usage_sighting`) carried onto a result whose status is in
+        ``ENV_FAULT_STATUSES`` — one choke point, as generic's
+        `wait_for_completion` carries `quota_wait_s`, rather than a stamp at
+        each return site. Read before `run()`'s `kill` pops the session. Only
+        those statuses reach `_classify_env_fault` and its usage-limit pause, so
+        a completed, aborted or over_budget result is never stamped: the stamp
+        would be journaled as the evidence of a pause that never happens.
+        ``usage_limit_resets`` stays None — the provider-error frame carries no
+        reset time."""
+        result = self._wait_loop(handle, spec)
+        sess = self._sessions.get(handle.task_id)
+        sighting = sess.usage_sighting if sess is not None else None
+        if sighting is None or result.status not in ENV_FAULT_STATUSES:
+            return result
+        evidence, limit_class = sighting
+        return replace(result, usage_limited=evidence, usage_limit_class=limit_class)
+
+    def _wait_loop(self, handle: SessionHandle, spec: SessionSpec) -> SessionResult:
         sess = self._sessions.get(handle.task_id)
         if sess is None:
             raise OpencodeServerError(f"no live opencode server for task {handle.task_id!r}")
@@ -1718,7 +1784,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         unwritable transcript no longer costs the usage; nor does a failed
         transcript read on a protocol whose usage is read apart from it (V2) —
         that usage is still read, without the transcript (a zero total then
-        stays untracked), and only the dump is skipped."""
+        stays untracked), and only the dump is skipped.
+
+        A read usage counts each child session as far as it has landed; the
+        children still running (a V2 background subagent) are crumbed as
+        `usage-child-active` with their ``sessions`` ids, and a failure to
+        tell is crumbed as `usage-child-active-failed` with ``error``."""
         if sess.client is None or not sess.session_id:
             return None
         messages, fault = sess.protocol.transcript(sess.client, sess.session_id)
@@ -1731,6 +1802,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             self._stash_usage(sess.session_id, usage)
         elif usage_fault is not None:
             self._note_usage_capture_failed(handle, usage_fault.stage, usage_fault.error)
+        if usage_fault is None:
+            self._note_active_children(handle, sess.protocol, sess.client, sess.session_id)
         if fault is not None:
             return None
         try:
@@ -1743,6 +1816,15 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def _note_usage_capture_failed(self, handle: SessionHandle, stage: str, error: str) -> None:
         self._note_lifecycle(handle.task_id, "usage-capture-failed", stage=stage, error=error)
+
+    def _note_active_children(
+        self, handle: SessionHandle, protocol: OpencodeProtocol, client: Any, session_id: str
+    ) -> None:
+        active, fault = protocol.active_descendants(client, session_id)
+        if active is None:
+            self._note_lifecycle(handle.task_id, "usage-child-active-failed", error=fault)
+        elif active:
+            self._note_lifecycle(handle.task_id, "usage-child-active", sessions=active)
 
     def _stash_usage(self, session_id: str, usage: TokenUsage) -> None:
         """Write into the capacity-bounded `_usage` stash (see USAGE_STASH_CAP).

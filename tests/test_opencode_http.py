@@ -40,6 +40,7 @@ from bmad_loop import runs
 from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import generic, opencode_http
 from bmad_loop.adapters.base import (
+    USAGE_LIMIT_BLOCKED,
     ZERO_TOKEN_TIMEOUT_EVIDENCE,
     AdapterTaskDirectoryError,
     SessionHandle,
@@ -114,6 +115,8 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #   provider-quota-settling  provider-quota in 2.0.27's real order: the session
 #                      stays on `/api/session/active` ~0.5s AFTER its
 #                      `session.execution.failed` is published
+#   provider-quota-after-work  provider-quota, but Session.Info reports the
+#                      tokens of work already done (the #764 veto's measurement)
 # FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind;
 # FAKE_OPENCODE_START_FAILURE_LINE is printed to stdout just before each such exit.
 # FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
@@ -238,7 +241,7 @@ def turn_tokens():
                 "cache": {"read": 0, "write": 0}}
     with LOCK:
         done = STATE["completed_ms"]
-    if done or SCENARIO == "provider-outage-after-work":
+    if done or SCENARIO in ("provider-outage-after-work", "provider-quota-after-work"):
         return {"input": 100, "output": 50, "reasoning": 5, "cache": {"read": 7, "write": 3}}
     return {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
 
@@ -308,7 +311,7 @@ def run_turn():
         finish_turn(); push_idle()
     elif SCENARIO in ("busy-forever", "busy-big-usage", "busy-zero-errored", "busy-zero-aborted"):
         write_spec()  # visible only post-kill: the turn never ends or idles
-    elif SCENARIO in ("provider-quota", "provider-quota-settling"):
+    elif SCENARIO in ("provider-quota", "provider-quota-settling", "provider-quota-after-work"):
         error = {"type": "provider.quota", "status": 402,
                  "message": "You exceeded your current quota, please check your plan "
                             "and billing details.",
@@ -320,7 +323,7 @@ def run_turn():
             time.sleep(0.5)
         with LOCK:
             STATE["busy"] = False  # the turn is over; nothing was spent
-        if SCENARIO == "provider-quota":
+        if SCENARIO in ("provider-quota", "provider-quota-after-work"):
             push(v2_frame("session.execution.failed", sessionID=SESSION_ID, error=error))
     elif SCENARIO in ("provider-outage", "provider-outage-after-work"):
         for attempt in (2, 3, 4):  # live, the first retry is attempt 2
@@ -441,6 +444,8 @@ class Handler(BaseHTTPRequestHandler):
             self._message_page(parse_qs(urlsplit(self.path).query))
         elif path == f"/api/session/{SESSION_ID}":
             self._json(200, {"data": session_info()})
+        elif path == "/api/session":
+            self._json(200, {"data": [], "cursor": {"previous": None, "next": None}})
         elif path in ("/api/model", "/api/model/default"):
             query = parse_qs(urlsplit(self.path).query)
             directory = (query.get("location[directory]") or [""])[0]
@@ -4560,6 +4565,24 @@ def test_v2_dispatch_filters_child_sessions_and_maps_execution_events(tmp_path):
         assert sess.events.get_nowait() == queued, etype
 
 
+def test_v2_dispatch_renders_form_created_of_this_session_only(tmp_path):
+    """`form.created` names its session only inside the nested form: it must
+    pass the session filter into both sinks for our session, and a child
+    session's form must still be filtered out."""
+    adapter, sess, log_path, event_path = _sess_with_sinks(tmp_path)
+    sess.protocol = V2Protocol()
+    fields = [{"key": "q0", "title": "Database", "description": "Which one?"}]
+    for sid in ("ses_child", "ses_test"):
+        form = {"id": "frm_1", "sessionID": sid, "title": "Questions", "fields": fields}
+        adapter._dispatch_sse(sess, _v2_frame("form.created", form=form))
+    adapter._dispatch_sse(sess, _v2_frame("form.cancelled", id="frm_1", sessionID="ses_test"))
+    log = _log_text(log_path)
+    assert log.count("[bmad] form ask:") == 1
+    assert '[bmad] form ask: Questions ["Database: Which one?"]\n' in log
+    assert "[bmad] form cancelled\n" in log
+    assert [r["type"] for r in read_jsonl(event_path)] == ["form.created", "form.cancelled"]
+
+
 def test_v2_html_health_reports_protocol_mismatch(tmp_path, v2_fake):
     """`--version` said 2.x but `/api/info` answers the web-UI HTML shell: the
     give-up error names the mismatch on the 2.x health endpoint."""
@@ -4598,12 +4621,18 @@ def test_v2_session_env_and_config_are_the_v2_dialect(tmp_path, monkeypatch):
 class _V2RouteClient:
     """A V2 control client answering GETs off a per-route script (the path
     before any query): an int is a bare status code, an Exception is raised,
+    a callable is called with the params and its result read the same way,
     anything else is a 200 whose JSON body is that value. A route's last entry
-    repeats; an unscripted route is a 404. Every GET is recorded with its
-    params."""
+    repeats; an unscripted route is a 404, except the child list and the
+    active map, which default to a server with no subagents and nothing
+    running. Every GET is recorded with its params."""
 
     def __init__(self, **routes):
-        self.routes = {path: list(answers) for path, answers in routes.items()}
+        self.routes = {
+            _V2_LIST: [_v2_children()],
+            _V2_ACTIVE: [{"data": {}}],
+            **{path: list(answers) for path, answers in routes.items()},
+        }
         self.gets: list[tuple[str, dict | None]] = []
         self.posts: list[str] = []
 
@@ -4611,6 +4640,8 @@ class _V2RouteClient:
         self.gets.append((path, params))
         answers = self.routes.get(path) or [404]
         answer = answers.pop(0) if len(answers) > 1 else answers[0]
+        if callable(answer):
+            answer = answer(params)
         if isinstance(answer, Exception):
             raise answer
 
@@ -4640,12 +4671,40 @@ _V2_SID = "ses_1"
 _V2_ACTIVE = "/api/session/active"
 _V2_MESSAGES = f"/api/session/{_V2_SID}/message"
 _V2_INFO = f"/api/session/{_V2_SID}"
+_V2_LIST = "/api/session"
 
 
 def _v2_info(**tokens) -> dict:
     full = {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}
     full.update(tokens)
     return {"data": {"id": _V2_SID, "tokens": full}}
+
+
+def _v2_child(session_id: str, parent_id: str, **tokens) -> dict:
+    """A listed child `Session.Info`: `parentID` names its parent."""
+    return {**_v2_info(**tokens)["data"], "id": session_id, "parentID": parent_id}
+
+
+def _v2_children(*infos, next_cursor=None) -> dict:
+    """One `GET /api/session` page."""
+    return {"data": list(infos), "cursor": {"previous": None, "next": next_cursor}}
+
+
+def _v2_tree(tree: dict):
+    """A child-list answer off ``{parent id: [page, ...]}``: the first page by
+    ``parentID``, a later one by ``cursor`` (``"<parent id>#<n>"``, the page
+    index); a page is a child list body, a status code or an Exception, and a
+    parent not in the tree has no children."""
+
+    def answer(params):
+        params = params or {}
+        if "cursor" in params:
+            parent, _, index = params["cursor"].partition("#")
+            return tree[parent][int(index)]
+        pages = tree.get(params.get("parentID"))
+        return pages[0] if pages else _v2_children()
+
+    return answer
 
 
 def _v2_assistant(completed: int | None, **extra) -> dict:
@@ -4888,7 +4947,225 @@ def test_v2_sample_usage_separates_faults_from_inert(tmp_path):
     assert weighted is None and fault and fault.startswith("KeyError")
     sess.client = _V2RouteClient(**{_V2_INFO: [_v2_info(input=3, output=1)]})
     assert adapter._sample_weighted_usage(sess, spec) == (4, None)
-    assert [path for path, _ in sess.client.gets] == [_V2_INFO]  # never the walk
+    # never the transcript walk: the aggregate plus the (empty) child list
+    assert [path for path, _ in sess.client.gets] == [_V2_INFO, _V2_LIST]
+
+
+# A parent with two children over two list pages, a grandchild under the first,
+# and two entries the walk must not count: a session naming another parent (a
+# server ignoring the filter) and the parent itself listed under the grandchild
+# (a cycle).
+_V2_TREE = {
+    _V2_SID: [
+        _v2_children(_v2_child("ses_a", _V2_SID, input=20, output=2), next_cursor=f"{_V2_SID}#1"),
+        _v2_children(
+            _v2_child("ses_b", _V2_SID, input=300, reasoning=30),
+            _v2_child("ses_stray", "ses_elsewhere", input=9999),
+            next_cursor=f"{_V2_SID}#2",
+        ),
+        _v2_children(),
+    ],
+    "ses_a": [
+        _v2_children(_v2_child("ses_a1", "ses_a", input=4000, cache={"read": 7, "write": 0}))
+    ],
+    "ses_a1": [_v2_children(_v2_child(_V2_SID, "ses_a1", input=50000))],
+}
+
+
+def test_v2_usage_sums_every_descendant_session(tmp_path):
+    """DW-540: a 2.x session counts only its own steps, so recorded usage is
+    the parent's aggregate plus every descendant's — the children list paged on
+    its cursor, the walk recursing to the grandchild, a stray or cyclic entry
+    never counted. Through `_capture_usage` the sum is what is stashed.
+
+    ABLATION: make `V2Protocol.descendants` answer `([], None)` and this
+    reddens (the parent alone, 100/10)."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9))],
+            _V2_INFO: [_v2_info(input=100, output=10)],
+            _V2_LIST: [_v2_tree(_V2_TREE)],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    assert adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID)) == (
+        TokenUsage(input_tokens=4420, output_tokens=42, cache_read_tokens=7)
+    )
+    lists = [params for path, params in sess.client.gets if path == _V2_LIST]
+    assert lists[:3] == [
+        {"parentID": _V2_SID, "limit": 200},
+        {"cursor": f"{_V2_SID}#1", "limit": 200},  # the cursor carries the parentID
+        {"cursor": f"{_V2_SID}#2", "limit": 200},
+    ]
+    assert {"parentID": "ses_a1", "limit": 200} in lists
+    assert {"parentID": "ses_stray", "limit": 200} not in lists
+    assert _lifecycle_lines(adapter, "t-cap") == []
+
+
+def test_v2_sample_usage_counts_children_while_the_parent_reads_zero():
+    """Mid-turn, a parent blocked on a foreground subagent reads all zeros
+    while its child spends: the budget sample is the child's, not inert.
+
+    ABLATION: make `V2Protocol.descendants` answer `([], None)` and the sample
+    reads `(None, None)`."""
+    client = _V2RouteClient(
+        **{
+            _V2_INFO: [_v2_info()],
+            _V2_LIST: [_v2_tree({_V2_SID: [_v2_children(_v2_child("ses_a", _V2_SID, input=7))]})],
+        }
+    )
+    assert V2Protocol().sample_usage(client, _V2_SID) == (TokenUsage(input_tokens=7), None)
+
+
+@pytest.mark.parametrize(
+    "tree, error",
+    [
+        pytest.param({_V2_SID: [503]}, f"child list of {_V2_SID}: HTTP 503", id="child-list"),
+        pytest.param(
+            {**_V2_TREE, "ses_a": [RuntimeError("boom")]},
+            "RuntimeError: boom",
+            id="grandchild-list",
+        ),
+        pytest.param(
+            {_V2_SID: [{"data": "x"}]},
+            f"child list of {_V2_SID} is str, not a list",
+            id="malformed",
+        ),
+        pytest.param(
+            {_V2_SID: [_v2_children({"parentID": _V2_SID})]},
+            f"a child of {_V2_SID} has no session id",
+            id="no-id",
+        ),
+        pytest.param(
+            {_V2_SID: [_v2_children({**_v2_child("ses_a", _V2_SID), "tokens": "n/a"})]},
+            "malformed child session ses_a: TypeError",
+            id="child-tokens",
+        ),
+        pytest.param(
+            {_V2_SID: [_v2_children(next_cursor=f"{_V2_SID}#1"), _v2_children(next_cursor="x")]},
+            None,
+            id="empty-page-ends",
+        ),
+        pytest.param(
+            {_V2_SID: [_v2_children(_v2_child("ses_a", _V2_SID), next_cursor=f"{_V2_SID}#0")]},
+            "child sessions did not end within 1000 pages",
+            id="runaway-cursor",
+        ),
+    ],
+)
+def test_v2_child_walk_fault_is_never_a_parent_only_figure(tmp_path, tree, error):
+    """DW-461 for the descendant walk: a child list failing at any depth, a
+    malformed page, an id-less child, a child's malformed aggregate or a
+    cursor that never runs dry stashes nothing and is crumbed
+    `stage=children` — the parent's own 100 tokens never stand in for the
+    tree. (An empty page ends a listing even with a `next`.)"""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [_v2_tree(tree)],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    usage = adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID))
+    if error is None:
+        assert usage == TokenUsage(input_tokens=100) and _capture_crumbs(adapter) == []
+        return
+    assert usage is None
+    (crumb,) = _capture_crumbs(adapter)
+    assert crumb["stage"] == "children" and crumb["error"].startswith(error)
+    sess.client.routes[_V2_INFO] = [_v2_info(input=100)]
+    sample, fault = V2Protocol().sample_usage(sess.client, _V2_SID)
+    assert sample is None and fault and fault.startswith(error)
+
+
+def _child_active_crumbs(adapter):
+    return [
+        ln
+        for ln in _lifecycle_lines(adapter, "t-cap")
+        if ln["event"].startswith("usage-child-active")
+    ]
+
+
+def test_v2_capture_journals_a_still_active_background_child(tmp_path):
+    """A `background: true` subagent can outlive its parent's turn: capture
+    counts what it has landed and journals `usage-child-active` naming it —
+    never a session outside the tree, never the parent itself.
+
+    ABLATION: drop the `_note_active_children` call in `_capture_usage` and
+    the crumb is gone."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    running = {"type": "running"}
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [_v2_tree(_V2_TREE)],
+            _V2_ACTIVE: [{"data": {_V2_SID: running, "ses_a1": running, "ses_other": running}}],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    usage = adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID))
+    assert usage is not None and usage.input_tokens == 4420
+    (crumb,) = _child_active_crumbs(adapter)
+    assert crumb["event"] == "usage-child-active" and crumb["sessions"] == ["ses_a1"]
+
+
+@pytest.mark.parametrize(
+    "active, error",
+    [
+        (500, "HTTP 500"),
+        (RuntimeError("gone"), "RuntimeError: gone"),
+        ({"data": []}, "active map is list, not an object"),
+        ({"data": {"ses_a": {"type": "running"}}}, f"child list of {_V2_SID}: HTTP 502"),
+    ],
+    ids=["non-200", "transport", "malformed", "walk"],
+)
+def test_v2_capture_crumbs_an_unread_active_map(tmp_path, active, error):
+    """Not knowing whether a child is still running is crumbed
+    (`usage-child-active-failed`), never read as "none active"; the usage
+    itself, read fine, is still stashed. The walk case fails only the second
+    walk, the one the active check makes.
+
+    ABLATION: answer `([], None)` on a non-200 in `active_descendants` and the
+    non-200 case reddens."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [_v2_children(), 502],
+            _V2_ACTIVE: [active],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    assert adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID)) == (
+        TokenUsage(input_tokens=100)
+    )
+    (crumb,) = _child_active_crumbs(adapter)
+    assert crumb["event"] == "usage-child-active-failed" and crumb["error"] == error
 
 
 def test_v2_transcript_walks_all_pages(tmp_path, v2_fake, monkeypatch):
@@ -5219,6 +5496,109 @@ def test_v2_provider_outage_after_work_is_overruled(tmp_path, v2_fake):
     events = _lifecycle(tmp_path)
     assert [e["event"] for e in events][-1:] == ["env-fault-overruled"]
     assert_server_gone(rec)
+
+
+def test_v2_provider_quota_after_work_is_a_live_sighting(tmp_path, v2_fake):
+    """DW-592: a quota frame for this session, seen while it ran, is a LIVE
+    usage-limit sighting — class blocked (opencode never retries a quota
+    refusal), no reset — so tokens spent before it cannot overrule the env
+    fault the way they overrule a tail-only match.
+
+    ABLATION: drop the stamp in `wait_for_completion` and the #764 veto
+    overrules the tail match (env_fault False, env_fault_overruled set)."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+
+    result = adapter.run(make_spec(tmp_path, rec, "provider-quota-after-work", timeout_s=5.0))
+
+    assert result.status in ("timeout", "stalled", "crashed"), result.status
+    assert adapter.read_usage(result).total > 0
+    assert result.usage_limited is not None
+    assert result.usage_limited.startswith(
+        "provider-error event=session.step.failed type=provider.quota status=402"
+    )
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert result.usage_limit_resets is None
+    assert result.env_fault is True
+    assert result.env_fault_evidence == result.usage_limited
+    assert result.env_fault_overruled is None
+    (crumb,) = [e for e in _lifecycle(tmp_path) if e["event"] == "env-fault-classified"]
+    assert crumb["usage_limited"] is True
+    assert_server_gone(rec)
+
+
+def test_usage_sighting_counts_only_this_sessions_frames(tmp_path):
+    """A child session's quota frame shares the stream but is not this
+    session's: no sighting, no provider-errors line. The parent's own frame
+    is the sighting, and the first one sticks."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess()
+    sess.lifecycle_task = "t-1"
+    sess.provider_errors_path = tmp_path / "t-1.provider-errors.log"
+    sess.provider_errors_path.touch()
+
+    def quota(session_id: str, message: str) -> dict:
+        return _v2_frame(
+            "session.execution.failed",
+            sessionID=session_id,
+            error={"type": "provider.quota", "status": 402, "message": message},
+        )
+
+    adapter._dispatch_sse(sess, quota("ses_child", "child"))
+    assert sess.usage_sighting is None
+    assert sess.provider_errors_path.read_bytes() == b""
+
+    adapter._dispatch_sse(sess, quota("ses_parent", "first"))
+    adapter._dispatch_sse(sess, quota("ses_parent", "second"))
+    assert sess.usage_sighting == (
+        "provider-error event=session.execution.failed type=provider.quota status=402 "
+        'attempt=- message="first"',
+        USAGE_LIMIT_BLOCKED,
+    )
+
+
+@pytest.mark.parametrize("status", ["aborted", "over_budget"])
+def test_usage_sighting_is_not_stamped_outside_env_fault_statuses(tmp_path, status):
+    """Only an ENV_FAULT_STATUSES result reaches `_classify_env_fault` and its
+    usage-limit pause, so a sighting followed by an aborted or over_budget
+    result stamps nothing: the field would journal a pause that never happens.
+
+    ABLATION: drop the status gate in `wait_for_completion` and the sighting
+    lands on these results."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess()
+    sess.usage_sighting = ("provider-error event=x type=provider.quota", USAGE_LIMIT_BLOCKED)
+    adapter._sessions["t-1"] = sess
+    adapter._teardown = lambda _sess: None  # no real server behind the session
+    adapter._wait_loop = lambda handle, spec: SessionResult(status=status)
+
+    result = adapter.wait_for_completion(
+        SessionHandle(task_id="t-1", native_id="ses_parent"), _timeout_spec(tmp_path)
+    )
+
+    assert result.status == status
+    assert result.usage_limited is None
+    assert result.usage_limit_class is None
+
+
+def test_rate_limit_and_transport_frames_are_no_sighting(tmp_path):
+    """Only the profile's usage lists make a sighting: a retried rate limit or
+    a transport fault stays an ordinary env fault (subject to the veto)."""
+    adapter = make_adapter(tmp_path)
+    sess = _v2_sess()
+    sess.provider_errors_path = tmp_path / "t-1.provider-errors.log"
+    for error_type in ("provider.rate-limit", "provider.transport"):
+        adapter._dispatch_sse(
+            sess,
+            _v2_frame(
+                "session.retry.scheduled",
+                sessionID="ses_parent",
+                attempt=2,
+                error={"type": error_type, "status": 429, "message": "quota"},
+            ),
+        )
+    assert sess.usage_sighting is None
+    assert len(sess.provider_errors_path.read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_provider_errors_log_is_created_at_spawn_on_v1(tmp_path, fake_opencode):

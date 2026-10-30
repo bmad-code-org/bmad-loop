@@ -1,8 +1,9 @@
 import dataclasses
 import json
 import re
+import tomllib
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from conftest import fault_read_text
@@ -66,6 +67,13 @@ def test_builtin_profiles_load():
         "sessionEnd": "SessionEnd",
     }
     assert profiles["copilot"].usage_parser == "copilot-events"
+    # copilot confirms tool calls, file paths and URL fetches separately; an
+    # unattended session needs all three bypassed, or a URL fetch parks it
+    assert profiles["copilot"].bypass_args == (
+        "--allow-all-tools",
+        "--allow-all-paths",
+        "--allow-all-urls",
+    )
     # copilot writes token totals only on shutdown (poll grace) and fires
     # agentStop per turn (multi-turn reviews need more nudges)
     assert profiles["copilot"].usage_grace_s == 8.0
@@ -590,6 +598,14 @@ def test_permission_modes_table_parses_into_its_spec(tmp_path):
         ),
         ('\n[permission_modes.sandboxed]\nargs = "--x"\n', "args must be a list"),
         ("\n[permission_modes]\nsandboxed = 1\n", "sandboxed must be a table"),
+        (
+            _PERMISSION_MODES_TABLE + 'linked_worktree_args = "{gitdir}"\n',
+            "linked_worktree_args must be a list",
+        ),
+        (
+            _PERMISSION_MODES_TABLE + 'linked_worktree_args = ["--grant", "/fixed"]\n',
+            "must use at least one of",
+        ),
     ],
 )
 def test_malformed_permission_modes_is_a_profile_error(tmp_path, table, match):
@@ -607,6 +623,38 @@ def test_for_permission_mode_resolves_the_mode_into_bypass_args(tmp_path):
     assert sandboxed.name == prof.name and sandboxed.launch_args == prof.launch_args
     # extra_args still replaces the resolved args, so a drop is reported against them
     assert sandboxed.missing_bypass_tokens(("--yes",)) == ("--sandbox", '{"a": 1}')
+
+
+def test_for_permission_mode_carries_the_linked_worktree_args(tmp_path):
+    """DW-599: the mode's grant template rides onto the resolved profile beside
+    its args; bypass (and a mode that declares none) carries none."""
+    body = MINIMAL_PROFILE + _PERMISSION_MODES_TABLE + 'linked_worktree_args = ["-g={gitdir}"]\n'
+    prof = _mode_profiles(tmp_path, body)["mycli"]
+    assert prof.permission_modes["sandboxed"].linked_worktree_args == ("-g={gitdir}",)
+    assert prof.linked_worktree_args == ()
+    assert prof.for_permission_mode("sandboxed", platform="linux").linked_worktree_args == (
+        "-g={gitdir}",
+    )
+    assert (
+        get_profile("claude").for_permission_mode("sandboxed", "linux").linked_worktree_args == ()
+    )
+
+
+def test_render_linked_worktree_args_writes_each_path_as_one_toml_string():
+    """Each placeholder becomes a TOML basic string, so a path holding a quote,
+    a backslash or a control character cannot break out of the value Codex
+    parses; one substitution pass, so a path spelling a placeholder stays put; a
+    path TOML cannot carry (a lone surrogate) raises."""
+    prof = dataclasses.replace(
+        get_profile("claude"), linked_worktree_args=("{gitdir}={common_dir}", "plain")
+    )
+    gitdir = PurePosixPath('/a"b\\c\td/{common_dir}')  # Posix: the bytes are the point
+    rendered = prof.render_linked_worktree_args(gitdir, PurePosixPath("/r"))
+    assert rendered == ('"/a\\"b\\\\c\\u0009d/{common_dir}"="/r"', "plain")
+    key = rendered[0].partition("=")[0]
+    assert tomllib.loads(f"k = {key}")["k"] == str(gitdir)
+    with pytest.raises(ValueError):
+        prof.render_linked_worktree_args(PurePosixPath("/a\udcff"), PurePosixPath("/r"))
 
 
 def test_for_permission_mode_refuses_an_excluded_platform(tmp_path):
@@ -634,6 +682,10 @@ def test_shipped_sandboxed_mappings_parse_and_resolve():
     }
     codex = get_profile("codex").for_permission_mode("sandboxed", platform="darwin")
     assert codex.bypass_args[-2:] == ("--ask-for-approval", "never")
+    # DW-599: a child of the mode's permission profile with the two exact paths,
+    # selected by a `default_permissions` placed after the mode's own
+    assert codex.linked_worktree_args[-1] == 'default_permissions="bmad_loop_worktree"'
+    assert any("{gitdir}" in a and "{common_dir}" in a for a in codex.linked_worktree_args)
     assert "--dangerously-bypass-approvals-and-sandbox" not in codex.bypass_args
     for name in ("claude", "codex"):
         with pytest.raises(ProfileError, match="not win32"):
@@ -684,10 +736,15 @@ def test_shipped_claude_answer_guards_match_the_captured_855_screen():
     assert _wrapped_hits(text, patterns) == []
 
 
-def test_only_claude_seeds_usage_patterns():
-    # the other built-ins opt in on their own captured evidence; none has yet
+def test_only_claude_and_opencode_seed_usage_patterns():
+    # the other built-ins opt in on their own captured evidence; none has yet.
+    # opencode-http seeds the blocked list only: its 2.x quota refusal is never
+    # retried, and no 2.x provider error is a window that resets (DW-592).
     for name, prof in load_profiles().items():
-        if name != "claude":
+        if name == "opencode-http":
+            assert prof.usage_limit_patterns != (), name
+            assert prof.usage_wait_patterns == (), name
+        elif name != "claude":
             assert prof.usage_limit_patterns == (), name
             assert prof.usage_wait_patterns == (), name
 
@@ -994,6 +1051,58 @@ def test_hookless_profile_cannot_set_a_subagent_transcript_dir(tmp_path):
         HOOKLESS_PROFILE.replace("[hooks]", 'subagent_transcript_dir = "{stem}/x"\n[hooks]')
     )
     with pytest.raises(ProfileError, match="must not set subagent_transcript_dir"):
+        load_profiles(tmp_path)
+
+
+def test_subagent_spawn_marker_defaults_off_and_agy_ships_one(tmp_path):
+    """Unset is off; the packaged agy profile names its spawn file (DW-548)."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    profiles = load_profiles(tmp_path)
+    assert profiles["mycli"].subagent_spawn_marker is None
+    assert profiles["claude"].subagent_spawn_marker is None
+    assert (
+        profiles["antigravity"].subagent_spawn_marker
+        == ".system_generated/subagents/{session_id}.json"
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        # shape: never `str()`-coerced into a path template
+        ("5", "subagent_spawn_marker must be a string"),
+        # value: relative, under a conversation folder
+        ('"/abs/{session_id}.json"', "relative path"),
+        ('"../{session_id}.json"', "relative path"),
+        ('"x/../{session_id}.json"', "relative path"),
+        # value: exactly the {session_id} placeholder, so the marker names one child
+        ('"subagents/child.json"', "{session_id}"),
+        ('"{stem}.json"', "{session_id}"),
+        ('"{session_id!r}.json"', "{session_id}"),
+        ('"{session_id"', "not a valid template"),
+        ('"{session_id}\\u0000.json"', "NUL"),
+    ],
+)
+def test_malformed_subagent_spawn_marker_is_a_profile_error(tmp_path, value, match):
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        MINIMAL_PROFILE.replace("[hooks]", f"subagent_spawn_marker = {value}\n[hooks]")
+    )
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(tmp_path)
+
+
+def test_hookless_profile_cannot_set_a_subagent_spawn_marker(tmp_path):
+    """The marker drops a child's Stop hook, and a hookless profile has none."""
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True)
+    (profiles_dir / "bad.toml").write_text(
+        HOOKLESS_PROFILE.replace("[hooks]", 'subagent_spawn_marker = "{session_id}.json"\n[hooks]')
+    )
+    with pytest.raises(ProfileError, match="must not set subagent_spawn_marker"):
         load_profiles(tmp_path)
 
 
@@ -1742,6 +1851,12 @@ def test_profile_scan_failure_degrades(profile_scan):
             {"permission_modes": {"sandboxed": PermissionModeSpec(("--x",), ("haiku",))}},
             "platforms must name",
         ),
+        # the DW-599 linked-worktree grant: per mode and on the resolved field
+        (
+            {"permission_modes": {"sandboxed": PermissionModeSpec(("--x",), (), ("--y",))}},
+            "must use at least one of",
+        ),
+        ({"linked_worktree_args": ("{gitdir}", "")}, "non-empty strings"),
         # the remaining value-level knobs
         ({"usage_parser": "magic"}, "usage_parser"),
         ({"usage_grace_s": -1.0}, "usage_grace_s"),

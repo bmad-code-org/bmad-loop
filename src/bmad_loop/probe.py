@@ -19,6 +19,10 @@ Two strategies, one report shape:
   raw capture exists only transiently inside the temp dir, which is ``rmtree``'d in a
   ``finally`` (even on exception / Ctrl-C).
 
+A third, separate probe, :func:`launch_screen_probe`, launches the CLI with no
+prompt and only watches its first screen for a parked startup dialog — zero
+tokens; it shares the tmux launcher and the availability checks, not the report.
+
 One finding, two render targets: :func:`render_markdown` for the human report
 (the CLI default) and :func:`render_json` for the machine-readable document that
 ``--json`` emits instead (the :mod:`bmad_loop.machine` contract — one object on
@@ -55,9 +59,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
+from typing import Literal
+
+import regex
 
 from . import childrun, runs, sanitize
-from .adapters.multiplexer import MultiplexerError, get_multiplexer
+from .adapters.generic import PARKED_PROMPT_MATCH_TIMEOUT_S
+from .adapters.multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
+from .adapters.panematch import Hit, MatchTimeout, match_rows, screen_rows
 from .adapters.profile import CLIProfile
 from .install import merge_hooks, relay_registered
 from .process_host import ProcessHostError, get_process_host
@@ -661,6 +670,8 @@ class _ProbeLauncher:
     def __init__(self, session_name: str):
         self.session_name = session_name
         self.mux = get_multiplexer()
+        # The fault behind the last `start` that returned None, as `Type: message`.
+        self.error: str | None = None
 
     def start(self, argv: list[str], env: dict[str, str], cwd: Path, log_file: Path) -> str | None:
         try:
@@ -677,7 +688,8 @@ class _ProbeLauncher:
             window_id = self.mux.new_window(
                 self.session_name, PROBE_TASK_ID, cwd, window_env, command
             )
-        except MultiplexerError:
+        except MultiplexerError as e:
+            self.error = f"{type(e).__name__}: {e}"
             return None
         # pipe-pane may race a window that dies instantly; tolerate failure.
         self.mux.pipe_pane(window_id, log_file)
@@ -690,11 +702,35 @@ class _ProbeLauncher:
         self.mux.kill_session(self.session_name)
 
 
-def _probe_argv(profile: CLIProfile, binary: str, hints: Hints) -> list[str]:
+def _resolved_binary(profile: CLIProfile, binary: str) -> str:
     if profile.hooks.dialect == "codex-hooks-json":
         from .codex_trust import resolved_codex_binary
 
-        binary = resolved_codex_binary(binary, profile.env) or binary
+        return resolved_codex_binary(binary, profile.env) or binary
+    return binary
+
+
+def _mux_ready(mux: TerminalMultiplexer) -> bool:
+    # Gate on the SELECTED backend's availability rather than a hardcoded
+    # `which("tmux")` — a Windows host running herdr (or a future psmux) must
+    # still probe. Guarded so a backend whose host probe raises reads as
+    # unavailable, exactly like selection's _usable().
+    try:
+        return bool(mux.available())
+    except Exception:  # a raising host probe means "cannot probe", not a crash
+        return False
+
+
+def _binary_found(profile: CLIProfile, binary: str) -> bool:
+    if profile.hooks.dialect == "codex-hooks-json":
+        from .codex_trust import resolved_codex_binary
+
+        return resolved_codex_binary(binary, profile.env) is not None
+    return shutil.which(binary) is not None
+
+
+def _probe_argv(profile: CLIProfile, binary: str, hints: Hints) -> list[str]:
+    binary = _resolved_binary(profile, binary)
     argv = [
         binary,
         *profile.launch_args,
@@ -790,21 +826,10 @@ def probe(
     finding.flags = run_version_help(binary)
 
     # The live probe launches through the selected multiplexer backend (see
-    # _ProbeLauncher), so gate on THAT backend's availability rather than a
-    # hardcoded `which("tmux")` — a Windows host running herdr (or a future psmux)
-    # must still probe. `available()` is guarded so a backend whose host probe
-    # raises reads as unavailable, exactly like selection's _usable().
+    # _ProbeLauncher), so gate on THAT backend's availability (_mux_ready).
     mux = get_multiplexer()
-    try:
-        mux_ready = bool(mux.available())
-    except Exception:  # a raising host probe means "cannot probe", not a crash
-        mux_ready = False
-    if profile.hooks.dialect == "codex-hooks-json":
-        from .codex_trust import resolved_codex_binary
-
-        binary_found = resolved_codex_binary(binary, profile.env) is not None
-    else:
-        binary_found = shutil.which(binary) is not None
+    mux_ready = _mux_ready(mux)
+    binary_found = _binary_found(profile, binary)
     if not mux_ready or not binary_found:
         # finding.binary, not the raw local — see the identical note in scan()
         missing = f"multiplexer backend {type(mux).__name__}" if not mux_ready else finding.binary
@@ -950,6 +975,185 @@ def _log_tail(log_file: Path, max_lines: int = 20) -> str | None:
     return sanitize.scrub_text(
         "\n".join(lines), max_lines=max_lines, max_chars=sanitize.SCRUB_TEXT_MAX_CHARS
     )
+
+
+# ------------------------------------------------------- LAUNCH-SCREEN probe
+
+LAUNCH_PROBE_TIMEOUT_S = 15.0
+LAUNCH_PROBE_POLL_S = 0.5
+LAUNCH_PROBE_TASK_ID = "launchprobe"
+
+LaunchVerdict = Literal[
+    "parked", "clean", "died", "unavailable", "launch-failed", "capture-failed", "skipped"
+]
+LAUNCH_PARKED: LaunchVerdict = "parked"
+LAUNCH_CLEAN: LaunchVerdict = "clean"
+LAUNCH_DIED: LaunchVerdict = "died"
+LAUNCH_UNAVAILABLE: LaunchVerdict = "unavailable"
+LAUNCH_FAILED: LaunchVerdict = "launch-failed"
+LAUNCH_CAPTURE_FAILED: LaunchVerdict = "capture-failed"
+LAUNCH_SKIPPED: LaunchVerdict = "skipped"
+
+
+@dataclass(frozen=True)
+class LaunchScreenResult:
+    """The one verdict of :func:`launch_screen_probe`. ``detail`` says why in
+    one line; ``evidence``/``line`` are the parked ``Hit``'s; ``log_tail`` is
+    the scrubbed pipe-pane tail of a window that died."""
+
+    verdict: LaunchVerdict
+    detail: str = ""
+    evidence: str | None = None
+    line: str | None = None
+    log_tail: str | None = None
+
+
+def _launch_argv(profile: CLIProfile, binary: str, model: str | None) -> list[str]:
+    """A real session's argv (``GenericAdapter.interactive_argv``) with no
+    prompt, and ``launch_args`` moved to the END.
+
+    The prompt positional is what a launch arg may carry: gemini, copilot and
+    agy launch with ``-i <prompt>``. Dropping the prompt in place would hand
+    ``-i`` the first bypass arg AS a prompt — a model turn, the one thing this
+    probe must never cause. A working profile can only put such a flag last in
+    ``launch_args`` (the prompt follows it in a real launch), so ending the
+    argv with ``launch_args`` leaves it nothing to consume: the CLI starts with
+    no prompt, or refuses the flag and exits."""
+    argv = [_resolved_binary(profile, binary), *profile.bypass_args]
+    if model:
+        argv += [profile.model_flag, model]
+    return [*argv, *profile.launch_args]
+
+
+def launch_screen_probe(
+    profile: CLIProfile,
+    *,
+    binary: str,
+    project: Path,
+    model: str | None = None,
+    timeout_s: float = LAUNCH_PROBE_TIMEOUT_S,
+    poll_s: float = LAUNCH_PROBE_POLL_S,
+) -> LaunchScreenResult:
+    """Launch the CLI the way a session would and watch its first screen for a
+    dialog only a human should answer (#727, DW-596).
+
+    ``profile`` must already be resolved for the role's permission mode
+    (``profile.for_permission_mode(mode)``), so its ``bypass_args`` are the
+    args a real session launches with. The CLI runs in ``project`` in a fresh
+    private multiplexer session; its env is ``profile.env`` plus the relay's
+    ``BMAD_LOOP_RUN_DIR``/``BMAD_LOOP_TASK_ID``/``BMAD_LOOP_EVENTS_DIR``, all
+    aimed into a throwaway temp dir, so a hook the CLI fires at startup writes
+    its event file there and never into a run of the project.
+
+    ZERO TOKENS, by construction: no prompt is launched (see
+    :func:`_launch_argv`), nothing is ever typed into the pane, and no dialog is
+    answered. The pane is only captured, every ``poll_s`` until ``timeout_s``,
+    and matched against ``profile.parked_prompt_patterns`` with the adapter's
+    own matcher and per-search timeout (``panematch.match_rows``).
+
+    Exactly one verdict:
+
+    - ``parked``: a pattern matched the screen (``evidence``, ``line``).
+    - ``clean``: the deadline passed with the window alive and no match.
+    - ``died``: the window exited first (``log_tail``). The screen is matched
+      before liveness is read, so a CLI that paints a dialog and then exits
+      still reads ``parked`` when its last look caught the dialog.
+    - ``unavailable``: no usable multiplexer backend, or the binary is not
+      found (the codex binary resolved as a session would).
+    - ``launch-failed``: the window could not be opened.
+    - ``capture-failed``: the pane could not be read, a search timed out, or
+      liveness was unknowable — a failed look, never folded into ``clean``.
+    - ``skipped``: the profile has no ``parked_prompt_patterns``; nothing is
+      launched.
+
+    The session is killed and the temp dir removed on every path."""
+    if not profile.parked_prompt_patterns:
+        return LaunchScreenResult(LAUNCH_SKIPPED, "profile declares no parked_prompt_patterns")
+    patterns = tuple(regex.compile(p) for p in profile.parked_prompt_patterns)
+    mux = get_multiplexer()
+    if not _mux_ready(mux):
+        return LaunchScreenResult(
+            LAUNCH_UNAVAILABLE, f"multiplexer backend {type(mux).__name__} is not available"
+        )
+    if not _binary_found(profile, binary):
+        return LaunchScreenResult(
+            LAUNCH_UNAVAILABLE, f"binary {sanitize.redact_home(binary)!r} not found"
+        )
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="bmad-loop-launchprobe-"))
+    launcher = _ProbeLauncher(session_name=f"bmad-loop-launchprobe-{tmpdir.name}")
+    try:
+        env = {
+            **profile.env,
+            "BMAD_LOOP_RUN_DIR": str(tmpdir),
+            "BMAD_LOOP_TASK_ID": LAUNCH_PROBE_TASK_ID,
+            "BMAD_LOOP_EVENTS_DIR": str(tmpdir / "events"),
+        }
+        log_file = tmpdir / "launch.log"
+        window_id = launcher.start(_launch_argv(profile, binary, model), env, project, log_file)
+        if window_id is None:
+            return LaunchScreenResult(
+                LAUNCH_FAILED, launcher.error or "could not open the probe window"
+            )
+
+        def died() -> LaunchScreenResult:
+            return LaunchScreenResult(
+                LAUNCH_DIED,
+                "the CLI window exited before the deadline",
+                log_tail=_log_tail(log_file),
+            )
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                screen = launcher.mux.capture_pane(window_id)
+            except MultiplexerError as capture_fault:
+                # A window that exited cannot be captured: that is death, not
+                # a failed look — but only when liveness says so.
+                try:
+                    alive = launcher.window_alive(window_id)
+                except MultiplexerError as alive_fault:
+                    return LaunchScreenResult(
+                        LAUNCH_CAPTURE_FAILED,
+                        f"{type(capture_fault).__name__}: {capture_fault}; liveness "
+                        f"unknowable: {type(alive_fault).__name__}: {alive_fault}",
+                    )
+                if not alive:
+                    return died()
+                return LaunchScreenResult(
+                    LAUNCH_CAPTURE_FAILED, f"{type(capture_fault).__name__}: {capture_fault}"
+                )
+            found = match_rows(screen_rows(screen), patterns, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
+            if isinstance(found, MatchTimeout):
+                return LaunchScreenResult(
+                    LAUNCH_CAPTURE_FAILED, f"pattern {found.pattern!r}: {found.error}"
+                )
+            if isinstance(found, Hit):
+                return LaunchScreenResult(
+                    LAUNCH_PARKED,
+                    "a parked prompt is on the launch screen",
+                    found.evidence,
+                    found.line,
+                )
+            try:
+                alive = launcher.window_alive(window_id)
+            except MultiplexerError as e:
+                return LaunchScreenResult(
+                    LAUNCH_CAPTURE_FAILED, f"liveness unknowable: {type(e).__name__}: {e}"
+                )
+            if not alive:
+                return died()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return LaunchScreenResult(
+                    LAUNCH_CLEAN, f"no parked prompt within {timeout_s:g}s of launch"
+                )
+            time.sleep(min(poll_s, remaining))
+    finally:
+        try:
+            launcher.kill()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ rendering

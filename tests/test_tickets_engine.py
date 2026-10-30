@@ -4,7 +4,8 @@ dispatch, verify and review path of a picked ticket.
 Every test builds the engine directly (`make_engine`) on the `project_v7`
 sandbox with the mock adapter and an injected `FakeTicketTree`
 (`compose_run`'s own wiring is pinned in tests/test_runsetup.py). Real-spawn
-budget: none.
+budget: none, except the stale-binding move test, which runs the vendored
+`tickets.py` under a real tree (its section comment counts the spawns).
 """
 
 from __future__ import annotations
@@ -12,10 +13,21 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import os
+import shutil
 from pathlib import Path
 
 import pytest
-from conftest import DEFAULT_TREE, FakeTicketTree, V7Layout, git, ticket_row, write_ticket_tree
+from conftest import (
+    DEFAULT_TREE,
+    EntrySpec,
+    EpicSpec,
+    FakeTicketTree,
+    V7Layout,
+    git,
+    run_tickets,
+    ticket_row,
+    write_ticket_tree,
+)
 
 from bmad_loop import runs, tickets_engine, tickets_source, verify
 from bmad_loop.adapters.base import SessionResult, SessionSpec
@@ -54,6 +66,7 @@ from bmad_loop.tickettree import (
     TicketsLockBusy,
     TicketsParentInitiative,
     TicketsPlanIOError,
+    TicketTree,
     V6KeyClaim,
 )
 from bmad_loop.workspace import Workspace
@@ -88,7 +101,7 @@ def make_engine(
     )
     built: list[tuple[Path, str | None]] = []
 
-    def factory(root: Path, pin: str | None) -> FakeTicketTree:
+    def factory(root: Path, pin: str | None, *, folder: Path | None = None) -> FakeTicketTree:
         built.append((root, pin))
         return tree
 
@@ -124,6 +137,86 @@ def test_engine_pins_source_and_builds_the_tree_from_the_pin(project_v7):
 
     assert engine.state.source == "tickets"
     assert engine.tree_builds == [(project_v7.project, project_v7.initiative)]
+
+
+@pytest.mark.parametrize("chained", [False, True])
+def test_chained_trees_pin_the_parent_in_place_and_the_child_in_a_mount(
+    project_v7, tmp_path, chained
+):
+    """A chained run (one child initiative of the parent the live config names)
+    builds its main tree pinned to the parent and routed through the child's
+    folder, and a unit mount's tree pinned to the child with no folder — the
+    mount's config names the child. An unchained run pins its own initiative in
+    both, with no folder. Ablation (performed): pin the main tree to
+    `state.initiative` in `tree_pin` and the chained row FAILS."""
+    parent, child = project_v7.initiative, "initiative-child"
+    paths = load_paths(project_v7.project, want_tickets=True)
+    if chained:
+        paths = paths.with_initiative(child)
+    run_dir = project_v7.project / ".bmad-loop" / "runs" / "test-run"
+    state = RunState(
+        run_id="test-run",
+        project=str(project_v7.project),
+        started_at="now",
+        initiative=child if chained else parent,
+        initiative_folder=str(paths.initiative_folder),
+        parent_initiative=parent if chained else None,
+    )
+    tree = _tree(project_v7)
+    built: list[tuple[Path, str | None, Path | None]] = []
+
+    def factory(root, pin, folder=None):
+        built.append((root, pin, folder))
+        return tree
+
+    engine = TicketsEngine(
+        paths=paths,
+        policy=_policy(),
+        adapter=MockAdapter([]),
+        run_dir=run_dir,
+        journal=Journal(run_dir),
+        state=state,
+        ticket_tree_factory=factory,
+    )
+    assert engine.ticket_tree is tree
+    mount = (tmp_path / "mount").resolve()
+    engine.workspace = Workspace(root=mount, paths=engine.paths.rebased(mount))
+    engine._workspace_ticket_tree()
+
+    if chained:
+        assert built == [
+            (project_v7.project, parent, paths.initiative_folder),
+            (mount, child, None),
+        ]
+        assert paths.initiative_folder == project_v7.initiative_folder.parent / child
+    else:
+        assert built == [(project_v7.project, parent, None), (mount, parent, None)]
+
+
+def test_chained_engine_refuses_parent_rooted_paths(project_v7):
+    """A chained run's engine built on the parent's own paths (`load_paths`
+    output a caller forgot to re-root with `runs.paths_for_state`) refuses at
+    construction — loudly, before any ledger or tree I/O — instead of reading
+    and marking the parent's folder as the child's. Ablation (performed): drop
+    the `tree_pin` call in `TicketsEngine.__init__` and this FAILS."""
+    run_dir = project_v7.project / ".bmad-loop" / "runs" / "test-run"
+    state = RunState(
+        run_id="test-run",
+        project=str(project_v7.project),
+        started_at="now",
+        initiative="initiative-child",
+        parent_initiative=project_v7.initiative,
+    )
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        TicketsEngine(
+            paths=load_paths(project_v7.project, want_tickets=True),
+            policy=_policy(),
+            adapter=MockAdapter([]),
+            run_dir=run_dir,
+            journal=Journal(run_dir),
+            state=state,
+            ticket_tree_factory=lambda *_a, **_k: pytest.fail("built a tree"),
+        )
 
 
 @pytest.mark.parametrize(("layout", "shared"), [("T1", False), ("T3", True)])
@@ -1925,7 +2018,7 @@ def test_mark_done_failure_pauses_and_resume_marks_again(project_v7, monkeypatch
         run_dir=engine.run_dir,
         journal=Journal(engine.run_dir),
         state=state,
-        ticket_tree_factory=lambda root, pin: tree,
+        ticket_tree_factory=lambda root, pin, folder=None: tree,
     )
     resumed.run()
 
@@ -1976,7 +2069,7 @@ def test_worktree_unit_marks_the_mounts_plan_on_an_epic_branch(project_v7):
     engine, _ = make_engine(
         project_v7, tree, policy=pol, script=[_builds(project_v7, tree, plan)], max_stories=1
     )
-    engine._ticket_tree_factory = lambda root, pin: (  # type: ignore[method-assign]
+    engine._ticket_tree_factory = lambda root, pin, folder=None: (  # type: ignore[method-assign]
         tree if root == main else _MountTree(tree, main, root)
     )
 
@@ -2285,7 +2378,7 @@ def _resumed(engine: TicketsEngine, tree: FakeTicketTree, script: list):
         run_dir=engine.run_dir,
         journal=Journal(engine.run_dir),
         state=state,
-        ticket_tree_factory=lambda root, pin: tree,
+        ticket_tree_factory=lambda root, pin, folder=None: tree,
     )
     return resumed, adapter
 
@@ -3584,7 +3677,7 @@ def _resume(engine: TicketsEngine, tree: FakeTicketTree) -> TicketsEngine:
         run_dir=engine.run_dir,
         journal=Journal(engine.run_dir),
         state=state,
-        ticket_tree_factory=lambda root, pin: tree,
+        ticket_tree_factory=lambda root, pin, folder=None: tree,
     )
 
 
@@ -3874,7 +3967,7 @@ def test_shared_store_record_moves_with_a_renamed_project(project_v7_store_repo,
         run_dir=engine.run_dir,
         journal=Journal(engine.run_dir),
         state=engine.state,
-        ticket_tree_factory=lambda root, pin: tree,
+        ticket_tree_factory=lambda root, pin, folder=None: tree,
     )
 
     assert resumed.paths.shared_store == live.store_root
@@ -3961,3 +4054,168 @@ def test_tickets_harvest_accepts_built_and_done_plans(project_v7):
 
     assert engine._harvest_success_statuses() == frozenset({"built", "done"})
     assert engine._harvest_source_name(plan) == "epic-auth/story-login-plan.md"
+
+
+# ------------------------------------------- resume: a stale binding (DW-575)
+# Real-spawn budget: the move test runs the vendored `tickets.py` under a real
+# tree — 13 spawns (the first run's pick, the `move`, the gate's `find`, `status`
+# and `find` on the paused resume, and the last resume's gate and commit-window
+# mark); every other test here injects a FakeTicketTree.
+
+_MOVE_TREE = (
+    EpicSpec(1, "epic-cart", "Cart", (EntrySpec(1, "Cart model", plan_checkpoint=True),)),
+    EpicSpec(2, "epic-extras", "Extras", (EntrySpec(1, "Extras note"),)),
+)
+
+
+def _real_legs(plan_of):
+    """A build-auto over a real tree: the plan-halt leg writes the plan the
+    session expects at `ready-for-dev`; any other leg builds it to `built`."""
+
+    def leg(spec: SessionSpec) -> SessionResult:
+        here = Path(spec.expected_spec or plan_of())
+        cwd = Path(spec.cwd)
+        baseline = verify.rev_parse_head(cwd)
+        if spec.env.get("BMAD_LOOP_PLAN_HALT"):
+            _write_plan(here, "ready-for-dev", baseline=baseline)
+            result = {
+                "workflow": "auto-dev",
+                "spec_file": str(here),
+                "status": "ready-for-dev",
+                "plan_halt": True,
+            }
+            return SessionResult(status="completed", result_json=result)
+        (cwd / "src.txt").write_bytes(b"cart model\n")
+        _write_plan(here, "built", baseline=baseline)
+        result = {"workflow": "auto-dev", "spec_file": str(here), "status": "built"}
+        return SessionResult(status="completed", result_json=result)
+
+    return leg
+
+
+def test_resume_pauses_when_the_bound_ticket_was_moved(project_v7):
+    """`tickets.py move` while a unit is paused at its plan checkpoint renumbers
+    the entry (1.1 → 2.2) and moves its plan into the other epic. The resume
+    pauses at `ticket-tree` (`binding-moved`) before it drives the unit, naming
+    both refs and both plans, with no session, no rebind and no mark; once the
+    move is undone the next resume drives leg 2 and commits. Ablation
+    (performed): drop the `_gate_stale_binding` call in `_finish_inflight` and
+    the resume re-dispatches `ticket 1.1 Halt after planning.` for a ref the tree
+    no longer holds, writes a stray plan back at the old path and pauses at
+    `plan-checkpoint` again — this FAILS."""
+    shutil.rmtree(project_v7.initiative_folder / "tickets")
+    write_ticket_tree(project_v7, _MOVE_TREE)
+    git(project_v7.project, "add", "-A")
+    git(project_v7.project, "commit", "-q", "-m", "two epics")
+    tree = TicketTree(project_v7.project, pinned_initiative=project_v7.initiative)
+    plan = Path(tree.find("1.1").plan)
+    leg = _real_legs(lambda: plan)
+    engine, _ = make_engine(project_v7, tree, script=[leg])  # type: ignore[arg-type]
+    assert engine.run().paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
+
+    moved = run_tickets(project_v7, "move", "epic-cart", "1.1", "epic-extras")
+    assert moved["ref"] == "2.2"
+    new_plan = plan.parents[2] / "epic-extras" / "tickets" / plan.name
+    resumed, adapter = _resumed(engine, tree, [leg])  # type: ignore[arg-type]
+
+    assert resumed.run().paused
+
+    state = load_state(engine.run_dir)
+    task = state.tasks["1.1"]
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_TICKET_TREE, "1.1")
+    [halt] = _kinds(resumed, "ticket-pick-halt")
+    assert (halt["cause"], halt["stage"]) == (tickets_source.HALT_BINDING_MOVED, PAUSE_TICKET_TREE)
+    assert "1.1 → 2.2" in state.paused_reason
+    assert f"plan {plan} → {new_plan};" in state.paused_reason
+    assert adapter.sessions == [] and not plan.exists()
+    assert task.phase == Phase.DEV_VERIFY and task.ticket is not None
+    assert (task.ticket.ref, task.ticket.plan) == ("1.1", str(plan))
+    assert status_of(parse_frontmatter(new_plan.read_text(encoding="utf-8"))) == "ready-for-dev"
+
+    git(project_v7.project, "checkout", "--", str(project_v7.initiative_folder))
+    shutil.move(str(new_plan), str(plan))
+    _write_plan(plan, "ready-for-dev")
+    resumed, adapter = _resumed(engine, tree, [leg])  # type: ignore[arg-type]
+    resumed.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    [leg_two] = adapter.sessions
+    assert leg_two.prompt.startswith(f"/{engine._dev_skill()} ticket 1.1 — ")
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert _committed_status(project_v7, task.commit_sha, plan) == "done"
+
+
+def _paused_at_plan_checkpoint(layout: V7Layout):
+    """A FakeTicketTree run paused at 1.1's plan checkpoint, its `ready-for-dev`
+    plan on disk and the unit at DEV_VERIFY."""
+    tree = _tree(layout, ready_to_start=(ticket_row("1.1", plan_checkpoint=True),))
+    plan = Path(tree.finds["1.1"].plan)
+    effect = _plans_then_builds(layout, tree, plan)
+    engine, _ = make_engine(layout, tree, script=[effect])
+    assert engine.run().paused
+    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
+    return engine, tree, plan, effect
+
+
+@pytest.mark.parametrize("gone", ["plan", "ticket"])
+def test_resume_pauses_when_the_bound_plan_is_missing(project_v7, gone):
+    """A bound unit whose verified plan is gone pauses the resume at
+    `ticket-tree` (`binding-moved`) naming the recorded plan as missing: the
+    plan file deleted under a ticket the tree still holds, or the ticket gone
+    from the tree with no row of its title left to have moved to. No session
+    runs and nothing is marked. Ablation (performed): drop the
+    `_written_plan_fault` arm and the `plan` row re-dispatches leg 1 — this
+    FAILS."""
+    engine, tree, plan, effect = _paused_at_plan_checkpoint(project_v7)
+    plan.unlink()
+    if gone == "ticket":
+        del tree.finds["1.1"]
+    resumed, adapter = _resumed(engine, tree, [effect])
+
+    assert resumed.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_TICKET_TREE, "1.1")
+    [halt] = _kinds(resumed, "ticket-pick-halt")
+    assert halt["cause"] == tickets_source.HALT_BINDING_MOVED
+    assert f"the bound plan of ticket 1.1 (Ticket 1.1) is missing: {plan} (" in state.paused_reason
+    why = "the file is gone" if gone == "plan" else "tickets.py find 1.1: no ticket matches"
+    assert why in state.paused_reason
+    assert adapter.sessions == [] and tree.marks == [] and not plan.exists()
+    assert state.tasks["1.1"].phase == Phase.DEV_VERIFY
+
+
+def test_resume_without_a_move_drives_the_bound_unit(project_v7):
+    """An unchanged binding passes the gate: the resume asks `find` of the bound
+    ref once and drives leg 2 as before. Ablation (performed): answer every
+    resume with the missing-plan halt and this FAILS."""
+    engine, tree, plan, effect = _paused_at_plan_checkpoint(project_v7)
+    resumed, adapter = _resumed(engine, tree, [effect])
+
+    resumed.run()
+
+    state = load_state(engine.run_dir)
+    assert state.paused_stage is None and state.tasks["1.1"].phase == Phase.DONE
+    assert len(adapter.sessions) == 1 and _kinds(resumed, "ticket-pick-halt") == []
+    assert ("find", "1.1") in tree.calls
+
+
+def test_stale_binding_gate_follows_a_renamed_project(project_v7, tmp_path):
+    """A renamed project is not a ticket move: the binding's plan, recorded under
+    the launch-time project, is rebased onto the live one before it is compared
+    with `find`, so the gate passes. Ablation (performed): compare the raw
+    `ticket.plan` instead of `_recorded_plan` and this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    live = Path(tree.finds["1.1"].plan)
+    _write_plan(live, "built")
+    launched = tmp_path / "launched-here"
+    engine.state.project = str(launched)
+    task.ticket = dataclasses.replace(
+        task.ticket, plan=str(launched / live.relative_to(project_v7.project))
+    )
+    task.phase, task.spec_file = Phase.REVIEW_VERIFY, task.ticket.plan
+
+    engine._gate_stale_binding(task)  # must not raise

@@ -187,7 +187,14 @@ Poll fallback, usage, transcript and effort — pinned live against 2.0.27
   interrupt cancels is stamped ``time.completed`` with ``finish: "error"``,
   ``error: {"type": "aborted"}`` and no ``tokens``; a provider failure that
   exhausts its retries is stamped the same way with the provider's error type
-  (e.g. ``provider.transport``). Interrupt itself adds no tokens.
+  (e.g. ``provider.transport``). Interrupt itself adds no tokens. It counts
+  the session's OWN steps only: a ``subagent`` tool call runs a child session
+  (``Session.Info.parentID`` = the parent; absent on a root) with its own
+  aggregate. No children route exists — ``GET /api/session?parentID=<id>``
+  lists the direct children, paged like the messages (the cursor carries the
+  ``parentID``), and nesting is configurable (``experimental.subagent_depth``).
+  A ``background: true`` child can still be on ``/api/session/active`` after
+  its parent's turn ends (pinned 2.0.32).
 - Effort: the prompt body has no variant; the session's model ref
   ``{"id", "providerID", "variant"}`` carries it, set at create. Create
   accepts ANY variant (and any model) with a 200 and echoes it in
@@ -235,7 +242,21 @@ and a closed port:
   /api/session/{id}/permission/{requestID}/reply {"decision":
   "once"|"always"|"reject", "message"?}`` → 204, then ``permission.replied
   {sessionID, requestID, reply}``. No ``form.*`` frame fired (the adapter's
-  ``question`` deny keeps forms away); none is rendered.
+  ``question`` deny keeps forms away).
+- Forms — pinned live against 2.0.32 (2026-10-28) by lifting that deny in a
+  probe and having the mock call the ``question`` tool. The call parks on
+  ``form.created {form: {id, sessionID, title, metadata {kind: "question",
+  tool {messageID, id}}, fields}}``, the one frame whose session id is
+  nested (``data.form.sessionID``, no top-level ``sessionID``). The tool maps
+  each question to a field ``{key: "q<n>", title: <header>, description:
+  <question>, type: "string"|"multiselect", options [{value, label,
+  description}], custom}``. The reply is ``POST /api/session/{id}/form/
+  {formID}/reply {"answer": {<key>: value}}`` → 204, then ``form.replied {id,
+  sessionID, answer}`` and the tool's ``session.tool.success``. ``DELETE
+  /api/session/{id}/form/{formID}`` → 204 and an interrupt both end it
+  ``form.cancelled {id, sessionID}``, then ``session.tool.failed`` with
+  ``error.type aborted`` ("The user dismissed this question" / "Tool
+  execution interrupted"). The adapter renders all three and never replies.
 - A provider failure surfaces ONLY as frames, each with a structured
   ``error {type, message, status?, response? {body}}``: ``session.retry.
   scheduled {attempt, at, error}`` per backoff (attempts 2..11, ~2/4/8 s then
@@ -244,13 +265,22 @@ and a closed port:
   ``provider.rate-limit`` (``status 429``, retried 10 times, ~80–88 s); a
   quota refusal is ``provider.quota`` (``status`` 429 or 402, NOT retried —
   fails in ~0.3 s); a refused connection is ``provider.transport`` (no
-  ``status``, no ``response``; retried 10 times, ~87 s). ``error.message`` is
+  ``status``, no ``response``; retried 10 times, ~87 s). On 2.0.32 a 5xx is
+  ``provider.internal`` (retried 10 times), a 401/403 ``provider.auth``, a
+  400 ``provider.invalid-request``, a session model with no route
+  ``provider.no-route`` (no provider request; only ``session.execution.
+  failed``) and a malformed stream ``provider.invalid-output`` — none
+  retried but a stream cut before its ``finish_reason``. A hung provider
+  fires nothing unless a provider ``timeout``/``headerTimeout``/
+  ``chunkTimeout`` setting is set, then reads ``provider.transport``
+  ("Timed out waiting for response headers"/"… data"). ``error.message`` is
   the provider's own message verbatim and ``response.body`` its raw body —
   provider-written text, so the adapter copies only the bounded message, last
   on its line (:func:`format_provider_error`), never the body. The server log
   carries no line per retry; only the final give-up logs one ``level=ERROR
   message="Failed to drain Session"`` line, too late for a run killed
-  mid-retry, so it is not what the classifier reads.
+  mid-retry, so it is not what the classifier reads — and written for every
+  failed execution, whatever its cause, with no error type.
 """
 
 from __future__ import annotations
@@ -555,12 +585,22 @@ class OpencodeProtocol:
         tallied yet, ``fault`` when the sample failed. Never raises."""
         raise NotImplementedError
 
+    def active_descendants(
+        self, client: Any, session_id: str
+    ) -> tuple[list[str] | None, str | None]:
+        """``(ids, fault)``: the child sessions :meth:`usage` counted that are
+        still running at capture, so their landed tokens are a lower bound —
+        or None with ``fault`` naming why that could not be read. A protocol
+        that counts no child sessions has none. Never raises."""
+        return [], None
+
 
 @dataclass(frozen=True)
 class UsageFault:
     """Why a usage read failed, as the ``usage-capture-failed`` crumb reports it
     (DW-461): ``stage`` is ``fetch`` (the request, its status or an undecodable
-    body) or ``payload`` (a body of the wrong shape)."""
+    body), ``payload`` (a body of the wrong shape) or ``children`` (V2's
+    descendant-session walk, or a child's malformed ``Session.Info``)."""
 
     stage: str
     error: str
@@ -881,10 +921,27 @@ def _error_summary(error: Any) -> str:
     return _sum_args(text)
 
 
+def _form_asks(fields: Any) -> list[str]:
+    """``<title>: <description>`` per field of a V2 ``form.created`` form (the
+    ``question`` tool maps each question's ``header`` to ``title`` and its text
+    to ``description``) — what the form asks, without its options."""
+    if not isinstance(fields, list):
+        return []
+    asks: list[str] = []
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        label = field.get("title") or field.get("key") or "?"
+        description = field.get("description")
+        asks.append(f"{label}: {description}" if description else str(label))
+    return asks
+
+
 # `GET /api/session/{id}/message` page size for the transcript walk: the
 # server's maximum — `limit=201` is a 400, never clamped (pinned 2.0.27).
 _V2_PAGE_LIMIT = 200
-# Bound on that walk, so a cursor that never runs dry is a fault, not a hang.
+# Bound on that walk, so a cursor that never runs dry is a fault, not a hang —
+# and on the descendant walk's `GET /api/session?parentID=` pages in total.
 _V2_MAX_PAGES = 1000
 
 
@@ -895,7 +952,8 @@ class V2Protocol(OpencodeProtocol):
     Drives the session lifecycle (config, health, create, prompt, the
     ``/api/event`` envelope and the ``session.execution.*`` turn end,
     interrupt), the poll fallback (``/api/session/active`` + assistant-message
-    proof-of-work), usage (the ``Session.Info`` aggregate) and the paginated
+    proof-of-work), usage (the ``Session.Info`` aggregates of the session and
+    its descendants) and the paginated
     transcript, the inline renderer and the provider-errors log."""
 
     major = 2
@@ -1095,7 +1153,13 @@ class V2Protocol(OpencodeProtocol):
 
     def frame_payload(self, event: dict[str, Any]) -> tuple[Any, Any]:
         data = event.get("data") or {}
-        return data, data.get("sessionID")
+        session_id = data.get("sessionID")
+        if session_id is None and event.get("type") == "form.created":
+            # The one frame that nests its session id: `form.created` carries
+            # the whole `Form.Info` under `data.form` (pinned 2.0.32).
+            form = data.get("form")
+            session_id = form.get("sessionID") if isinstance(form, dict) else None
+        return data, session_id
 
     def render_line(self, msg_roles: dict[Any, Any], etype: str, props: Any) -> str | None:
         """The inline-log line for one V2 frame, or None for a frame that
@@ -1126,6 +1190,24 @@ class V2Protocol(OpencodeProtocol):
             )
         if etype == "permission.replied":
             return f"{_TOOL_COLOR}[bmad] perm reply: {props.get('reply') or '?'}{_RESET}\n"
+        if etype == "form.created":
+            # A form parks the turn until it is replied or cancelled, so this
+            # line is what explains the stall. Any other `form.*` type renders
+            # nothing (the fall-through below).
+            form = props.get("form")
+            form = form if isinstance(form, dict) else {}
+            asks = _sum_args(_form_asks(form.get("fields")))
+            return (
+                f"{_TOOL_COLOR}[bmad] form ask: {form.get('title') or '?'}"
+                f"{(' ' + asks) if asks else ''}{_RESET}\n"
+            )
+        if etype == "form.replied":
+            answer = _sum_args(props.get("answer"))
+            return f"{_TOOL_COLOR}[bmad] form reply:{(' ' + answer) if answer else ''}{_RESET}\n"
+        if etype == "form.cancelled":
+            # The payload is only `id` / `sessionID`; the reason is on the
+            # parked tool's `session.tool.failed` line that follows.
+            return f"{_TOOL_COLOR}[bmad] form cancelled{_RESET}\n"
         if etype == "session.retry.scheduled":
             detail = _error_summary(props.get("error"))
             return (
@@ -1238,13 +1320,18 @@ class V2Protocol(OpencodeProtocol):
         self, client: Any, session_id: str, transcript: Any
     ) -> tuple[TokenUsage | None, UsageFault | None]:
         """``GET /api/session/{id}`` → ``data.tokens``, the cumulative session
-        aggregate (never also summed per step). Reasoning bills as output; the
-        cache read/write map as in V1. Untracked (None) when that total is zero
-        and the transcript holds no completed, un-interrupted assistant message
-        — the V1 rule (:func:`_sum_usage`): an in-flight first step reports
-        zeros, and the step an interrupt cancelled is stamped completed with
-        ``error.type == "aborted"`` and no tokens. Child (subagent) sessions
-        are not counted. Never raises."""
+        aggregate (never also summed per step), plus every descendant
+        (subagent) session's aggregate (:meth:`descendants`): a 2.x session
+        counts only its own steps. Reasoning bills as output; the cache
+        read/write map as in V1. A child still running is counted as far as it
+        has landed (:meth:`active_descendants` names it). A failed walk or a
+        malformed child is a ``children`` fault, never a parent-only figure.
+        Untracked (None) when the summed total is zero and the transcript
+        holds no completed, un-interrupted assistant message — the V1 rule
+        (:func:`_sum_usage`): an in-flight first step reports zeros, and the
+        step an interrupt cancelled is stamped completed with
+        ``error.type == "aborted"`` and no tokens. (V1 still counts the parent
+        alone.) Never raises."""
         try:
             resp = client.get(f"/api/session/{session_id}")
             if resp.status_code != 200:
@@ -1254,16 +1341,20 @@ class V2Protocol(OpencodeProtocol):
             return None, UsageFault("fetch", f"{type(e).__name__}: {e}")
         try:
             usage = _session_tokens(body)
-            if usage.total == 0 and not _any_completed_assistant(transcript):
-                return None, None
         except (AttributeError, KeyError, TypeError, ValueError) as e:
             return None, UsageFault("payload", f"malformed session: {type(e).__name__}: {e}")
+        children, fault = self._children_tokens(client, session_id)
+        if children is None:
+            return None, UsageFault("children", fault or "")
+        usage.add(children)
+        if usage.total == 0 and not _any_completed_assistant(transcript):
+            return None, None
         return usage, None
 
     def sample_usage(self, client: Any, session_id: str) -> tuple[TokenUsage | None, str | None]:
-        """The budget guard's sample: the same ``Session.Info`` aggregate, one
-        GET a tick (never the transcript walk). A zero total is inert, not a
-        sample — nothing has been spent yet."""
+        """The budget guard's sample: the same parent-plus-descendants sum as
+        :meth:`usage`, read each tick (never the transcript walk). A zero total
+        is inert, not a sample — nothing has been spent yet."""
         try:
             resp = client.get(f"/api/session/{session_id}")
             if resp.status_code != 200:
@@ -1271,14 +1362,114 @@ class V2Protocol(OpencodeProtocol):
             usage = _session_tokens(resp.json())
         except Exception as e:  # sampling is advisory
             return None, f"{type(e).__name__}: {e}"
+        children, fault = self._children_tokens(client, session_id)
+        if children is None:
+            return None, fault
+        usage.add(children)
         return (usage if usage.total else None), None
+
+    def descendants(self, client: Any, session_id: str) -> tuple[list[Any] | None, str | None]:
+        """``(infos, fault)``: the ``Session.Info`` of every session below
+        ``session_id``. There is no children route: ``GET /api/session?parentID=``
+        lists one level, so the walk recurses breadth-first (subagent nesting
+        is configurable), each listing paged like :meth:`transcript` — the
+        cursor carries the ``parentID``. A listed session whose ``parentID`` is
+        not the one asked for is not a child; an id already seen is skipped,
+        so a cycle ends. A failed or malformed page, a child without an id, or
+        more than ``_V2_MAX_PAGES`` pages in all is a fault — never a partial
+        tree. Never raises."""
+        found: list[Any] = []
+        seen = {session_id}
+        queue = [session_id]
+        pages = 0
+        try:
+            while queue:
+                parent = queue.pop(0)
+                params: dict[str, Any] = {"parentID": parent, "limit": _V2_PAGE_LIMIT}
+                while True:
+                    if pages == _V2_MAX_PAGES:
+                        return None, f"child sessions did not end within {_V2_MAX_PAGES} pages"
+                    pages += 1
+                    resp = client.get("/api/session", params=params)
+                    if resp.status_code != 200:
+                        return None, f"child list of {parent}: HTTP {resp.status_code}"
+                    body = resp.json()
+                    page = body.get("data")
+                    if not isinstance(page, list):
+                        return None, (
+                            f"child list of {parent} is {type(page).__name__}, not a list"
+                        )
+                    for info in page:
+                        child = info.get("id")
+                        if not isinstance(child, str) or not child:
+                            return None, f"a child of {parent} has no session id"
+                        if info.get("parentID") != parent or child in seen:
+                            continue
+                        seen.add(child)
+                        found.append(info)
+                        queue.append(child)
+                    next_cursor = (body.get("cursor") or {}).get("next")
+                    if not page or not next_cursor:
+                        break
+                    params = {"cursor": next_cursor, "limit": _V2_PAGE_LIMIT}
+        except Exception as e:  # usage is metadata, never a gate
+            return None, f"{type(e).__name__}: {e}"
+        return found, None
+
+    def _children_tokens(
+        self, client: Any, session_id: str
+    ) -> tuple[TokenUsage | None, str | None]:
+        """``(usage, fault)``: the summed aggregate of every :meth:`descendants`
+        session (a zero usage when there are none), or None with ``fault``
+        naming the failed walk or the malformed child. Never raises."""
+        infos, fault = self.descendants(client, session_id)
+        if infos is None:
+            return None, fault
+        total = TokenUsage()
+        for info in infos:
+            try:
+                total.add(_info_tokens(info))
+            except (AttributeError, KeyError, TypeError, ValueError) as e:
+                return None, f"malformed child session {info.get('id')}: {type(e).__name__}: {e}"
+        return total, None
+
+    def active_descendants(
+        self, client: Any, session_id: str
+    ) -> tuple[list[str] | None, str | None]:
+        """The descendants still listed by ``GET /api/session/active`` — a
+        ``background: true`` subagent can outlive its parent's turn. The walk
+        runs only when a session other than the parent is listed. A non-200,
+        a body without the ``data`` map or a failed walk is a fault, never
+        "none active"."""
+        try:
+            resp = client.get("/api/session/active")
+            if resp.status_code != 200:
+                return None, f"HTTP {resp.status_code}"
+            active = resp.json().get("data")
+            if not isinstance(active, dict):
+                return None, f"active map is {type(active).__name__}, not an object"
+            others = [sid for sid in active if sid != session_id]
+        except Exception as e:  # observation only
+            return None, f"{type(e).__name__}: {e}"
+        if not others:
+            return [], None
+        infos, fault = self.descendants(client, session_id)
+        if infos is None:
+            return None, fault
+        mine = {info.get("id") for info in infos}
+        return sorted(sid for sid in others if sid in mine), None
 
 
 def _session_tokens(body: Any) -> TokenUsage:
     """The ``{"data": Session.Info}`` body's ``tokens`` aggregate; raises on a
     body of the wrong shape (no ``data`` / ``tokens`` object, a non-numeric
     count) — a fault, never a zero."""
-    tokens = body["data"]["tokens"]
+    return _info_tokens(body["data"])
+
+
+def _info_tokens(info: Any) -> TokenUsage:
+    """One ``Session.Info``'s ``tokens`` aggregate; raises on a wrong shape."""
+    tokens = info["tokens"]
     if not isinstance(tokens, dict):
         raise TypeError(f"tokens is {type(tokens).__name__}, not an object")
     cache = tokens.get("cache") or {}

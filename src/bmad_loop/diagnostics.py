@@ -304,6 +304,22 @@ _JOURNAL_KIND_ALIAS_FIELDS: dict[str, dict[str, str]] = {
     "ticket-refine-pause": {"ref": "ticket"},
     "ticket-pick-halt": {"ref": "ticket"},
     "ticket-story-approved": {"ref": "ticket"},
+    # A BMAD v7 initiative slug (the parent's and the closed child's folder names):
+    # the customer's initiative name, identifier-shaped, aliased in its own
+    # namespace so one initiative gets one alias. Kind-scoped: `parent` and `slug`
+    # are generic names.
+    "initiative-mark": {"parent": "initiative", "slug": "initiative"},
+    # `cli._drive_initiative_chain`: the parent and the children it switches
+    # between, in the same `initiative` namespace.
+    "initiative-chain-next": {
+        "parent": "initiative",
+        "from_child": "initiative",
+        "to_child": "initiative",
+    },
+    "initiative-chain-end": {"parent": "initiative"},
+    "initiative-chain": {"parent": "initiative", "previous_child": "initiative"},
+    # `cli._close_drained_children`: a drained child left open, and its parent.
+    "initiative-close-skipped": {"parent": "initiative", "slug": "initiative"},
 }
 # Namespaces whose journalled value arrives in more than one shape and must be
 # reduced to its basename before it is aliased. `spec` is one: engine.py's
@@ -492,6 +508,17 @@ _JOURNAL_KIND_KEYLIST_FIELDS: dict[str, dict[str, str]] = {
     # ship verbatim, `scrub_json` being the identity on a list of
     # identifier-shaped strings.
     "sweep-bundle-dwids-adopted": {"previous_dw_ids": "dw"},
+    # `cli._drive_initiative_chain`: child initiative slugs passed over, still
+    # waiting on a prerequisite (`waiting`, and per prerequisite `waiting_child`),
+    # or waited on (`waiting_on`), aliased in the `initiative` namespace the
+    # kind-scoped `parent`/`*_child` rows use.
+    "initiative-chain-next": {"passed_over": "initiative"},
+    "initiative-chain-end": {
+        "passed_over": "initiative",
+        "waiting": "initiative",
+        "waiting_child": "initiative",
+        "waiting_on": "initiative",
+    },
 }
 _JOURNAL_KIND_COUNTLIST_FIELDS: dict[str, frozenset[str]] = {
     "merge-preflight-refused": frozenset({"tolerated"}),
@@ -595,6 +622,25 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # recovery withhold) write `cycle` and `bundles_not_run`; `reason` is a DROP
     # field and `story_keys` a `_JOURNAL_KEYLIST_FIELDS` name, both reached first.
     "sweep-bundles-withheld": frozenset({"cycle", "bundles_not_run", "reason", "story_keys"}),
+    # `tickettree.TicketTree.mark_initiative_done`: `file` is the child initiative
+    # file's absolute host path, which the by-name benign `file` (a code-constant
+    # basename elsewhere) would ship through `scrub_json`; left off the schema, it
+    # collapses to `file_present`. `before`, `after` and `outcome` are closed
+    # status/outcome tokens; `parent`/`slug` are kind-aliased, which runs first.
+    "initiative-mark": frozenset({"before", "after", "outcome"}),
+    # `cli._drive_initiative_chain`: `passed_over_why` holds closed pass-over
+    # tokens (`no-folder`, `drained`), `end` a closed chain-end token,
+    # `waiting_on_status` closed prerequisite-status tokens (an initiative status,
+    # `open`, `no-folder`, `?`), and `previous_run` a run id; the slugs are
+    # kind-aliased or kind-keylisted, which runs first, and `error` is dropped by
+    # name. `initiative-close-skipped`'s `why` is a closed skip token (`run-live`,
+    # `run-unfinished`, `runs-unread`, `work-left`, `store-refused`,
+    # `uncommitted-edit`) and `blocking_run` a run id (or empty); `detail` is
+    # dropped by name.
+    "initiative-chain-next": frozenset({"passed_over_why"}),
+    "initiative-chain-end": frozenset({"end", "passed_over_why", "waiting_on_status"}),
+    "initiative-chain": frozenset({"previous_run"}),
+    "initiative-close-skipped": frozenset({"why", "blocking_run"}),
 }
 
 # Policy keys whose values can carry secrets/paths/free text. Dropped or reduced

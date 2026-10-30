@@ -1,11 +1,14 @@
 """`bmad_loop.tickettree`: contract rows against the vendored `tickets.py` on
 `project_v7`, plus error mapping through fake scripts and canned child results.
 
-Real-spawn budget: **14 spawns of the vendored `tickets.py`** — next 1, status 1,
+Real-spawn budget: **24 spawns of the vendored `tickets.py`** — next 1, status 1,
 find 2 (a hit and a miss), capability 2 (`--help`, `mark --help`; the cached
-second call spawns nothing), and the mark chokepoint 8 (write + read back: find
+second call spawns nothing), the mark chokepoint 8 (write + read back: find
 and mark, 2; refused below built: find, 1; missing plan: find, 1; park then
-re-arm: 2 × find and mark, 4). The fake-script rows add 5 short Python children
+re-arm: 2 × find and mark, 4), and a parent initiative's child folder 4
+(`next <parent>`, 1; `next <child>`, then find and mark, 3), and closing a
+drained child 6 (LF, CRLF and BOM files: the close's `next <parent>` and the
+check's, 2 each). The fake-script rows add 5 short Python children
 (timeout 1, exit-2 JSON 1, exit-2 text 1, capability 2); every other row maps a
 canned `childrun.ChildRun`, answers `find`/`mark` in-process, or refuses before
 spawning, at no spawn cost. The Windows leg sits at its time budget, so keep new
@@ -13,6 +16,7 @@ rows on the canned path."""
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import dataclasses
 import json
@@ -23,6 +27,7 @@ from pathlib import Path
 
 import pytest
 from conftest import (
+    DEFAULT_TREE,
     V7_USER_CONFIG_REL,
     EntrySpec,
     EpicSpec,
@@ -36,18 +41,20 @@ from conftest import (
     write_ticket_tree,
 )
 
-from bmad_loop import childrun, frontmatter, platform_util, runs, tickettree
+from bmad_loop import childrun, frontmatter, platform_util, runs, ticketlayout, tickettree
 from bmad_loop.childrun import ChildRun
 from bmad_loop.journal import Journal
-from bmad_loop.statemachine import PlanTransitionRefused
+from bmad_loop.statemachine import InitiativeCloseRefused, PlanTransitionRefused
 from bmad_loop.ticketmodel import NEXT_GROUPS, capability_problems
 from bmad_loop.tickettree import (
     TicketsCrashed,
     TicketsError,
     TicketsFault,
+    TicketsInitiativeRefused,
     TicketsInterrupted,
     TicketsLockBusy,
     TicketsNoMatch,
+    TicketsParentInitiative,
     TicketsPinMismatch,
     TicketsPlanIOError,
     TicketsPlanMismatch,
@@ -452,6 +459,378 @@ def test_find_passes_the_ref_after_a_separator(tmp_path, monkeypatch):
     with pytest.raises(TicketsNoMatch):
         tree_at(tmp_path).find("-x")
     assert seen[0][-3:] == ["find", "--", "-x"]
+
+
+# ---------------------------------------------------------------- child folder
+
+
+@pytest.mark.parametrize("folder", [None, "child"], ids=["active", "child-folder"])
+def test_dir_positional_rides_only_with_a_folder(tmp_path, monkeypatch, folder):
+    """Every tree read names the child folder as `<dir>` when the tree has one,
+    and the argv is the active initiative's, unchanged, when it has none. No
+    spawn (canned child). Ablation: drop `*self._dir()` from a verb's tail and
+    its child-folder row reddens."""
+    seen = canned(monkeypatch, ChildRun(1, "", '{"error": "stop here"}'))
+    child = tmp_path / "out" / "initiative-auth"
+    tree = tree_at(tmp_path, folder=child if folder else None)
+    for call in (tree.next, tree.status, lambda: tree.find("1.1")):
+        with pytest.raises(TicketsFault):
+            call()
+    tails = [argv[argv.index("--project-root") + 2 :] for argv in seen]
+    if folder is None:
+        assert tree.folder is None
+        assert tails == [["next"], ["status"], ["find", "--", "1.1"]]
+    else:
+        assert tree.folder == child
+        assert tails == [
+            ["next", str(child)],
+            ["status", str(child)],
+            ["find", str(child), "--", "1.1"],
+        ]
+
+
+def test_explicit_status_folder_overrides_the_tree_folder(tmp_path, monkeypatch):
+    seen = canned(monkeypatch, ChildRun(1, "", '{"error": "stop here"}'))
+    other = tmp_path / "elsewhere"
+    with pytest.raises(TicketsFault):
+        tree_at(tmp_path, folder=tmp_path / "child").status(other)
+    assert seen[0][-2:] == ["status", str(other)]
+
+
+PARENT = "initiative-platform"
+AUTH, BILLING, REPORTS = "initiative-auth", "initiative-billing", "initiative-reports"
+
+
+def _parent_initiative(project: V7Layout) -> tuple[Path, V7Layout, V7Layout]:
+    """Turn `project_v7` into a parent initiative made active: `PARENT` lists
+    `AUTH`, `BILLING` (after `AUTH`) and `REPORTS` (declared, no folder), and
+    both existing children hold `DEFAULT_TREE` — the same refs in each, so only
+    the `<dir>` tells them apart. Returns the parent folder and the two child
+    layouts."""
+    root = project.project
+    parent = project.output_folder / PARENT
+    (parent / ticketlayout.TICKETS).mkdir(parents=True)
+    (parent / f"{PARENT}.md").write_text(
+        "---\ntype: initiative\ntitle: Platform\nparent: none\n---\n\n# Platform\n",
+        encoding="utf-8",
+    )
+    (parent / ticketlayout.TICKETS / ticketlayout.BREAKDOWN).write_text(
+        f'[[initiative]]\nid = 1\nslug = "{AUTH}"\ntitle = "Auth"\n\n'
+        f'[[initiative]]\nid = 2\nslug = "{BILLING}"\ntitle = "Billing"\n'
+        'after = [{ initiative = 1, needs = "auth live" }]\n\n'
+        f'[[initiative]]\nid = 3\nslug = "{REPORTS}"\ntitle = "Reports"\n',
+        encoding="utf-8",
+    )
+    children = []
+    for slug in (AUTH, BILLING):
+        layout = v7_layout(root, initiative=slug)
+        write_ticket_tree(layout, DEFAULT_TREE)
+        children.append(layout)
+    (root / V7_USER_CONFIG_REL).write_text(
+        f'[core]\nactive_initiative = "{PARENT}"\n', encoding="utf-8"
+    )
+    return parent, children[0], children[1]
+
+
+def test_parent_next_against_vendored_tickets_py(project_v7: V7Layout, spawns):
+    """`next <parent>` on the live script parses as a `ParentView`: build order,
+    the waiting child not ready, the folder-less child ready. 1 real spawn."""
+    parent, _, _ = _parent_initiative(project_v7)
+    view = TicketTree(project_v7.project, pinned_initiative=PARENT).parent_next(parent)
+    assert spawns[0][-2:] == ["next", str(parent)] and len(spawns) == 1
+    assert (view.store, view.folder) == ("repo", PARENT)
+    assert [c.slug for c in view.initiatives] == [AUTH, BILLING, REPORTS]
+    assert view.ready == (AUTH, REPORTS)
+    auth, billing, reports = view.initiatives
+    assert (auth.folder, auth.status, auth.counts["total"], auth.ready) == (AUTH, "", 4, True)
+    assert billing.waiting_on == (AUTH,) and not billing.ready
+    assert billing.after[0].initiative == AUTH and billing.after[0].needs == "auth live"
+    assert (reports.folder, reports.ready, dict(reports.counts)) == (None, True, {})
+
+
+def test_child_folder_reads_and_marks_a_child_ticket_under_the_parent_pin(
+    project_v7: V7Layout, spawns, journal
+):
+    """With the parent active and pinned, a tree on `BILLING`'s folder reads its
+    `next` and marks its 1.1 — the plan in `BILLING`, never `AUTH`'s twin. 3 real
+    spawns (next, then the mark's find and mark).
+
+    Ablation: drop the `<dir>` from `find`/`mark` and the script, reading the
+    active parent, refuses with "a parent initiative holds initiatives" (a
+    `TicketsFault`), so this reddens."""
+    _, auth, billing = _parent_initiative(project_v7)
+    tree = TicketTree(
+        project_v7.project, pinned_initiative=PARENT, folder=billing.initiative_folder
+    )
+    view = tree.next()
+    assert view.folder == BILLING and [r.ref for r in view.ready_to_start] == ["1.1"]
+    assert view.backlog is None
+    plan = _cart_plan(billing, "built")
+    twin = _cart_plan(auth, "built")
+
+    result = tree.mark("1.1", "done", reason="accept", expected_plan=plan, journal=journal)
+
+    assert (result.plan, result.outcome) == (plan, "written")
+    assert _fields(plan) == ("done", "") and _fields(twin) == ("built", "")
+    child = str(billing.initiative_folder)
+    tails = [a[a.index("--project-root") + 2 :] for a in spawns]
+    assert tails == [
+        ["next", child],
+        ["find", child, "--", "1.1"],
+        ["mark", child, "--", "1.1", "done"],
+    ]
+
+
+def test_child_folder_pin_still_names_the_parent(project_v7: V7Layout, monkeypatch):
+    """The pin stays the parent's: the live value naming the child is a
+    mismatch, and nothing is spawned."""
+    seen = canned(monkeypatch, ChildRun(0, "{}", ""))
+    _parent_initiative(project_v7)
+    (project_v7.project / V7_USER_CONFIG_REL).write_text(
+        f'[core]\nactive_initiative = "{BILLING}"\n', encoding="utf-8"
+    )
+    folder = project_v7.output_folder / BILLING
+    tree = TicketTree(project_v7.project, pinned_initiative=PARENT, folder=folder)
+    for call in (tree.next, lambda: tree.find("1.1"), lambda: tree.parent_next(folder.parent)):
+        with pytest.raises(TicketsPinMismatch) as caught:
+            call()
+        assert (caught.value.pinned, caught.value.live) == (PARENT, BILLING)
+    assert seen == []
+
+
+def test_parent_next_on_a_plain_initiative_is_a_schema_error(tmp_path, monkeypatch):
+    """`next` on a folder that is no parent lists no `ready` children: version
+    skew or a wrong folder, never an empty parent. No spawn (canned child)."""
+    doc = {"store": "repo", "folder": "initiative-demo", "ready_to_start": []}
+    canned(monkeypatch, ChildRun(0, json.dumps(doc), ""))
+    with pytest.raises(TicketsSchemaError) as caught:
+        tree_at(tmp_path).parent_next(tmp_path / "initiative-demo")
+    assert not isinstance(caught.value, TicketsParentInitiative)
+    assert caught.value.field == "ready"
+
+
+# ------------------------------------------------- closing a drained child initiative
+#
+# The real-spawn rows (6 spawns, stated above) drain AUTH and close it against the
+# vendored script; every other row answers `next <parent>` with a canned document.
+
+AUTH_PLANS = (
+    ("epic-cart", "story-cart-model-plan", 1),
+    ("epic-cart", "story-cart-rules-plan", 2),
+    ("epic-checkout", "story-checkout-form-plan", 1),
+    ("epic-checkout", "bug-checkout-crash-plan", 2),
+)
+
+
+def _initiative_marks(journal: Journal) -> list[dict[str, object]]:
+    return [e for e in journal.entries() if e["kind"] == "initiative-mark"]
+
+
+@pytest.mark.parametrize("shape", ["lf", "crlf", "bom"])
+def test_mark_initiative_done_closes_a_drained_child_for_the_script(
+    project_v7: V7Layout, spawns, journal, shape
+):
+    """AUTH's tickets all done and its file carrying no `status:` line: the close
+    inserts `status: done` before the closing `---` (the block's own line ending,
+    a BOM kept), every other byte stays, and the script then reads AUTH done and
+    BILLING ready. 2 real spawns per shape (the close's `next`, the check's).
+
+    Ablation: make the key insert a no-op (`_edit_frontmatter_block` returns None
+    for a missing key) and the read-back raises `TicketsReadBackMismatch`."""
+    parent, auth, _ = _parent_initiative(project_v7)
+    for epic, stem, ticket in AUTH_PLANS:
+        write_plan(auth, epic, stem, ticket, "done")
+    file = auth.initiative_folder / f"{AUTH}.md"
+    nl, bom = ("\r\n" if shape == "crlf" else "\n"), ("\ufeff" if shape == "bom" else "")
+    lf = file.read_text(encoding="utf-8")
+    assert "status" not in lf
+    original = (bom + lf.replace("\n", nl)).encode("utf-8")
+    assert original.startswith(codecs.BOM_UTF8) == (shape == "bom")
+    file.write_bytes(original)
+    tree = TicketTree(project_v7.project, pinned_initiative=PARENT)
+
+    result = tree.mark_initiative_done(parent, AUTH, journal=journal)
+
+    assert (result.slug, result.file, result.outcome) == (AUTH, file, "written")
+    assert (result.before, result.after, result.preimage) == ("", "done", original)
+    closed = lf.replace("parent: none\n---", "parent: none\nstatus: done\n---")
+    assert file.read_bytes() == (bom + closed.replace("\n", nl)).encode("utf-8")
+    view = tree.parent_next(parent)
+    assert len(spawns) == 2 and spawns[0][-2:] == ["next", str(parent)]
+    auth_row, billing_row = view.child(AUTH), view.child(BILLING)
+    assert auth_row is not None and billing_row is not None
+    assert auth_row.status == "done" and dict(auth_row.counts) == {"total": 4, "done": 4}
+    assert billing_row.ready and billing_row.waiting_on == () and BILLING in view.ready
+    (mark,) = _initiative_marks(journal)
+    assert {k: mark[k] for k in ("parent", "slug", "file", "before", "after", "outcome")} == {
+        "parent": PARENT,
+        "slug": AUTH,
+        "file": str(file),
+        "before": "",
+        "after": "done",
+        "outcome": "written",
+    }
+
+
+def _child_doc(slug: str, status: str | None, counts: dict[str, int]) -> dict[str, object]:
+    """One `initiatives` row as upstream prints it; ``status`` None is a child
+    with no folder (no `status`, no `counts`)."""
+    row: dict[str, object] = {
+        "id": slug[-1],
+        "slug": slug,
+        "title": slug,
+        "after": [],
+        "folder": None,
+        "waiting_on": [],
+    }
+    if status is not None:
+        row.update(folder=slug, status=status, counts=counts)
+    return row
+
+
+def _closing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    counts: dict[str, int] | None = None,
+) -> tuple[TicketTree, Path, Path, list[list[str]]]:
+    """A parent `PARENT` under `tmp_path / "out"` whose child AUTH's file holds
+    ``status`` (no line when ``""``), and every spawn answered with the parent's
+    `next`: AUTH at ``status`` with ``counts`` (drained by default) and the
+    folder-less REPORTS. Returns the tree, the parent, AUTH's file and the argvs."""
+    out = tmp_path / "out"
+    parent = out / PARENT
+    parent.mkdir(parents=True)
+    file = out / AUTH / f"{AUTH}.md"
+    file.parent.mkdir()
+    line = f"status: {status}\n" if status else ""
+    file.write_text(f"---\ntype: initiative\ntitle: Auth\n{line}---\n\n# Auth\n", encoding="utf-8")
+    counts = {"total": 2, "done": 2} if counts is None else counts
+    doc = {
+        "store": "repo",
+        "folder": PARENT,
+        "initiatives": [_child_doc(AUTH, status, counts), _child_doc(REPORTS, None, {})],
+        "ready": [REPORTS],
+        "order_conflict": [],
+    }
+    seen = canned(monkeypatch, ChildRun(0, json.dumps(doc), ""))
+    return tree_at(tmp_path), parent, file, seen
+
+
+def test_mark_initiative_done_from_in_progress_writes(tmp_path, monkeypatch, journal):
+    """in-progress -> done replaces the line in place, under the file's lock, and
+    the pre-image is the file as it was. Dropped tickets count as closed."""
+    tree, parent, file, seen = _closing(
+        tmp_path, monkeypatch, "in-progress", {"total": 3, "done": 1, "dropped": 2}
+    )
+    original = file.read_bytes()
+    real = tree.parent_next
+    held: list[bool] = []
+
+    def probe(folder: Path):
+        held.append(_lock_is_held(file))
+        return real(folder)
+
+    monkeypatch.setattr(tree, "parent_next", probe)
+
+    result = tree.mark_initiative_done(parent, AUTH, journal=journal)
+
+    assert (result.before, result.after, result.outcome) == ("in-progress", "done", "written")
+    assert result.preimage == original
+    assert file.read_bytes() == original.replace(b"status: in-progress", b"status: done")
+    assert held == [True] and not _lock_is_held(file) and len(seen) == 1
+    assert [e["outcome"] for e in _initiative_marks(journal)] == ["written"]
+
+
+def test_mark_initiative_done_on_a_done_child_is_a_noop(tmp_path, monkeypatch, journal):
+    tree, parent, file, _ = _closing(tmp_path, monkeypatch, "done")
+    before = (file.read_bytes(), file.stat().st_mtime_ns)
+
+    result = tree.mark_initiative_done(parent, AUTH, journal=journal)
+
+    assert (result.before, result.after, result.outcome) == ("done", "done", "noop")
+    assert result.preimage is None
+    assert (file.read_bytes(), file.stat().st_mtime_ns) == before
+    assert [e["outcome"] for e in _initiative_marks(journal)] == ["noop"]
+
+
+@pytest.mark.parametrize(
+    ("status", "counts", "why"),
+    [
+        ("dropped", None, "a dropped initiative is final"),
+        ("in-progress", {"total": 4, "done": 3}, "not drained: 3 of 4"),
+        ("", {"total": 4, "done": 2, "in-progress": 2}, "not drained: 2 of 4"),
+        ("", {"total": 0}, "not drained: 0 of 0"),
+    ],
+)
+def test_mark_initiative_done_refusals_leave_the_file(
+    tmp_path, monkeypatch, journal, status, counts, why
+):
+    """A dropped child is never overridden, and an open child with a ticket left
+    open (or no tickets) is not drained: refused, the file untouched.
+
+    Ablation: delete the drained check (the dropped arm) in
+    `check_initiative_close` and the not-drained rows (the dropped row) redden."""
+    tree, parent, file, _ = _closing(tmp_path, monkeypatch, status, counts)
+    before = (file.read_bytes(), file.stat().st_mtime_ns)
+
+    with pytest.raises(TicketsInitiativeRefused, match=why) as caught:
+        tree.mark_initiative_done(parent, AUTH, journal=journal)
+
+    assert isinstance(caught.value, InitiativeCloseRefused) and caught.value.kind == "refused"
+    assert (file.read_bytes(), file.stat().st_mtime_ns) == before
+    marks = _initiative_marks(journal)
+    assert [(m["before"], m["after"], m["outcome"]) for m in marks] == [(status, status, "refused")]
+
+
+@pytest.mark.parametrize(("slug", "shown"), [(BILLING, "no such child"), (REPORTS, "no folder")])
+def test_mark_initiative_done_refuses_a_child_the_parent_does_not_list(
+    tmp_path, monkeypatch, journal, slug, shown
+):
+    """A slug the parent does not list, or the folder-less REPORTS, is refused
+    before any decision: the cross-check `mark` makes with `find`."""
+    tree, parent, file, _ = _closing(tmp_path, monkeypatch, "")
+    original = file.read_bytes()
+
+    with pytest.raises(TicketsPlanMismatch, match=shown):
+        tree.mark_initiative_done(parent, slug, journal=journal)
+
+    assert file.read_bytes() == original
+    marks = _initiative_marks(journal)
+    assert [(m["slug"], m["outcome"]) for m in marks] == [(slug, "refused")]
+    assert marks[0]["file"] == str(parent.parent / slug / f"{slug}.md")
+
+
+def test_mark_initiative_done_lock_busy(tmp_path, monkeypatch, journal):
+    """A held lock is a typed `TicketsLockBusy` that spawns, reads and writes nothing."""
+    tree, parent, file, seen = _closing(tmp_path, monkeypatch, "")
+    original = file.read_bytes()
+
+    @contextlib.contextmanager
+    def busy(path, *, blocking=True):
+        raise platform_util.LockUnavailableError(f"{path} is held")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(platform_util, "file_lock", busy)
+    with pytest.raises(TicketsLockBusy):
+        tree.mark_initiative_done(parent, AUTH, journal=journal)
+    assert seen == [] and file.read_bytes() == original
+    assert [e["outcome"] for e in _initiative_marks(journal)] == ["failed"]
+
+
+def test_restore_preimage_undoes_an_initiative_close(tmp_path, monkeypatch, journal):
+    """The close's pre-image, handed to `restore_preimage`, puts the original
+    bytes back — the undo a later caller makes."""
+    tree, parent, file, _ = _closing(tmp_path, monkeypatch, "")
+    original = file.read_bytes()
+    result = tree.mark_initiative_done(parent, AUTH, journal=journal)
+    assert result.preimage == original and file.read_bytes() != original
+
+    tree.restore_preimage(result.file, result.preimage, journal)
+
+    assert file.read_bytes() == original
+    restored = [e for e in journal.entries() if e["kind"] == "ticket-plan-restored"]
+    assert [(e["before"], e["after"], e["outcome"]) for e in restored] == [("done", "", "restored")]
 
 
 # ---------------------------------------------------------------- fake

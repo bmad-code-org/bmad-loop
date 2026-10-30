@@ -467,6 +467,41 @@ def test_usage_reason_names_the_reset(resets):
         assert "resets" not in plain.replace(_USAGE_EVIDENCE, "")
 
 
+def test_usage_limited_decisions_carry_the_pause_facts():
+    """DW-591: each decider arm that gives the usage-limit reason carries the
+    facts the engine records with the pause — the reset only when it resolved,
+    the limit class always. ABLATION: drop `usage_limit=` from one arm and its
+    assertion fails."""
+    for result in _usage_limited_results("stalled"):
+        resolved = dataclasses.replace(
+            result, usage_limit_resets="2026-10-25T19:20:00+07:00", usage_limit_class="wait"
+        )
+        for decision in (
+            decide_dev(_task(attempt=1), resolved, None, POLICY),
+            decide_review_session(_task(attempt=1), resolved, POLICY),
+        ):
+            assert decision.usage_limit == escalation.UsageLimitPause(
+                reset_at="2026-10-25T19:20:00+07:00", limit_class="wait"
+            )
+        raw = dataclasses.replace(
+            result, usage_limit_resets="7:20pm (Mars/Olympus_Mons)", usage_limit_class="blocked"
+        )
+        decision = decide_dev(_task(attempt=1), raw, None, POLICY)
+        assert decision.usage_limit == escalation.UsageLimitPause(None, "blocked")
+        assert "resets 7:20pm (Mars/Olympus_Mons)" in decision.reason
+
+
+def test_non_usage_pauses_carry_no_usage_facts():
+    """A plain env-fault or parked pause carries no usage-limit facts."""
+    env = SessionResult(status="timeout", env_fault=True, env_fault_evidence="ECONNRESET")
+    parked = SessionResult(status="stalled", parked=True, parked_evidence="permission")
+    for result in (env, parked):
+        dev = decide_dev(_task(attempt=1), result, None, POLICY)
+        review = decide_review_session(_task(attempt=1), result, POLICY)
+        assert dev.action == review.action == Action.PAUSE
+        assert dev.usage_limit is None and review.usage_limit is None
+
+
 def test_usage_limit_reason_keeps_the_lost_session_suffix():
     """Composed over `session_failure_reason` (#489), like its siblings."""
     vanished = SessionResult(status="stalled", usage_limited="x", session_vanished=True)

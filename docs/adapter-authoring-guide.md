@@ -79,6 +79,7 @@ Rules that span methods:
 - `window_alive(session, window_id)`: `True` while the window is listed AND its pane is alive; a window the multiplexer keeps listed after its pane exited (`remain-on-exit on`) is not alive. Membership alone is `list_window_ids`. Raise when liveness cannot be known; never answer `False` for that.
 - `kill_window(target)`: tolerate the window already being gone; no-op on a transport failure.
 - `select_window(target)`: make the window current; best-effort.
+- `rename_window(target, name)` (default: raises `MultiplexerError`): rename the window so a by-name lookup finds it under `name`, which must stick against any automatic rename. Checked: raise `MultiplexerError` when the rename did not land.
 - `set_window_option(target, option, value)` / `unset_window_option(target, option)`: best-effort. An unset option must read back as unset, not empty.
 - `show_window_option(target, option)`: the value, or `''` when unset or on failure.
 - `pipe_pane(window_id, log_file)`: tee the pane to `log_file`; tolerate a dead window.
@@ -304,34 +305,35 @@ a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` reso
 
 ### `CLIProfile`
 
-| Field                              | Required | Default                                                                        | Meaning                                                                                                                                                                                                           |
-| ---------------------------------- | -------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                             | ✅       | —                                                                              | Profile id: the `--cli` value, the policy `[adapter] name`, and the override key.                                                                                                                                 |
-| `binary`                           | ✅       | —                                                                              | Executable resolved on `PATH`. `validate` runs `--version` only on binary names a packaged profile declares (`adapter.binary-unrunnable`).                                                                        |
-| `[hooks]`                          | ✅       | —                                                                              | The [`HookSpec`](#hookspec-the-hooks-table) table.                                                                                                                                                                |
-| `adapter`                          |          | `generic` (`opencode-http` if `dialect=none`)                                  | Adapter kind, resolved against the live [registry](#shipping-a-new-adapter-class-out-of-tree) at run start and by `validate` (`adapter.kind`). `generic` with `dialect = "none"` is refused.                      |
-| `skill_tree`                       |          | `.claude/skills`                                                               | Project-relative tree the CLI reads skills from; `init` installs the `bmad-loop-*` skills here. Must stay inside the project.                                                                                     |
-| `prompt_template`                  |          | `{prompt}`                                                                     | Renders the canonical `/skill args` prompt. Placeholders: `{prompt}` (whole string), `{skill}` (command name, no `/`), `{args}` (the rest).                                                                       |
-| `launch_args`                      |          | `[]`                                                                           | Argv after `binary` (`["-i"]` keeps gemini/copilot interactive). Under `opencode-http` it precedes `serve`; `validate` warns on unservable shapes.                                                                |
-| `bypass_args`                      |          | `[]`                                                                           | Permission-bypass flags for unattended runs, launched under `permission_mode = "bypass"`. A policy `extra_args` replaces them; `validate` warns (`policy.bypass-dropped`) when one is dropped.                    |
-| `model_flag`                       |          | `--model`                                                                      | Flag passed with the model name when one is configured.                                                                                                                                                           |
-| `env`                              |          | `{}`                                                                           | `[env]` table of extra session environment variables. It cannot override the run's state-root pin.                                                                                                                |
-| `usage_parser`                     |          | `none`                                                                         | Transcript token parser: `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events` or `none`.                                                                                                              |
-| `usage_grace_s`                    |          | `0.0`                                                                          | Seconds to keep polling the transcript for token totals after the session ends; `0` reads once. Must be ≥ 0.                                                                                                      |
-| `stop_without_result_nudges`       |          | unset                                                                          | Per-profile default for Stop-without-result nudges. An `[adapter]` / `[adapter.<stage>]` value overrides it; unset inherits `[limits] stop_without_result_nudges`. Must be ≥ 0.                                   |
-| `subagent_stop_without_transcript` |          | `false`                                                                        | When `true`, a `Stop` with no transcript path is a subagent turn-end and is ignored.                                                                                                                              |
-| `first_run_note`                   |          | `""`                                                                           | Note `init` prints about a manual first-run or auth step.                                                                                                                                                         |
-| `seed_files`                       |          | `[]`                                                                           | Project-relative gitignored files copied into each provisioned worktree. Must stay inside the project.                                                                                                            |
-| `env_fault_patterns`               |          | `[]`                                                                           | Regexes that classify a non-completed session as an environment fault. See [Environment-fault patterns](#environment-fault-patterns).                                                                             |
-| `parked_prompt_patterns`           |          | `[]`                                                                           | Regexes matched against the visible pane at each stall-grace expiry and at the timeout. See [Parked-session signals](#parked-session-signals).                                                                    |
-| `usage_limit_patterns`             |          | `[]`                                                                           | Regexes for a usage-limit line the CLI stays blocked behind until an operator acts. See [Usage-limit signals](#usage-limit-signals).                                                                              |
-| `usage_wait_patterns`              |          | `[]`                                                                           | Regexes for a usage-limit line the CLI waits out and continues from by itself. Disjoint from `usage_limit_patterns`. See [Usage-limit signals](#usage-limit-signals).                                             |
-| `auto_deny_patterns`               |          | `[]`                                                                           | Regexes for the CLI's auto-deny countdown on a permission prompt, with named groups `min` and `sec`. See [Parked-session signals](#parked-session-signals).                                                       |
-| `[workspace_trust]`                |          | unset                                                                          | The [`WorkspaceTrustSpec`](#workspacetrustspec-the-workspace_trust-table) table. Unset: nothing under `~` is read or written.                                                                                     |
-| `[parked_answers]`                 |          | unset                                                                          | The [`[parked_answers]`](#answer-keys-the-parked_answers-table) table. Unset: the TUI offers no answer keys.                                                                                                      |
-| `[permission_modes.<mode>]`        |          | unset                                                                          | Launch args for a non-bypass `[adapter] permission_mode`. See [Permission modes](#permission-modes). Unset: the profile refuses that mode.                                                                        |
-| `session_id_flag`                  |          | `""`                                                                           | Launch flag for a caller-chosen session id (claude: `--session-id`). The generic adapter appends `[flag, uuid4]` and pins attribution to that id.                                                                 |
-| `subagent_transcript_dir`          |          | derived from `usage_parser` (`{stem}/subagents` for `claude-jsonl`, else `""`) | Subagent transcript tree beside the transcript, walked recursively and stat-only; its writes count as idle-notice activity. Must contain `{stem}` (the transcript's filename stem) and stay relative; `""` = off. |
+| Field                              | Required | Default                                                                        | Meaning                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------- | -------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                             | ✅       | —                                                                              | Profile id: the `--cli` value, the policy `[adapter] name`, and the override key.                                                                                                                                                                                                                          |
+| `binary`                           | ✅       | —                                                                              | Executable resolved on `PATH`. `validate` runs `--version` only on binary names a packaged profile declares (`adapter.binary-unrunnable`).                                                                                                                                                                 |
+| `[hooks]`                          | ✅       | —                                                                              | The [`HookSpec`](#hookspec-the-hooks-table) table.                                                                                                                                                                                                                                                         |
+| `adapter`                          |          | `generic` (`opencode-http` if `dialect=none`)                                  | Adapter kind, resolved against the live [registry](#shipping-a-new-adapter-class-out-of-tree) at run start and by `validate` (`adapter.kind`). `generic` with `dialect = "none"` is refused.                                                                                                               |
+| `skill_tree`                       |          | `.claude/skills`                                                               | Project-relative tree the CLI reads skills from; `init` installs the `bmad-loop-*` skills here. Must stay inside the project.                                                                                                                                                                              |
+| `prompt_template`                  |          | `{prompt}`                                                                     | Renders the canonical `/skill args` prompt. Placeholders: `{prompt}` (whole string), `{skill}` (command name, no `/`), `{args}` (the rest).                                                                                                                                                                |
+| `launch_args`                      |          | `[]`                                                                           | Argv after `binary` (`["-i"]` keeps gemini/copilot interactive). Under `opencode-http` it precedes `serve`; `validate` warns on unservable shapes.                                                                                                                                                         |
+| `bypass_args`                      |          | `[]`                                                                           | Permission-bypass flags for unattended runs, launched under `permission_mode = "bypass"`. A policy `extra_args` replaces them; `validate` warns (`policy.bypass-dropped`) when one is dropped.                                                                                                             |
+| `model_flag`                       |          | `--model`                                                                      | Flag passed with the model name when one is configured.                                                                                                                                                                                                                                                    |
+| `env`                              |          | `{}`                                                                           | `[env]` table of extra session environment variables. It cannot override the run's state-root pin.                                                                                                                                                                                                         |
+| `usage_parser`                     |          | `none`                                                                         | Transcript token parser: `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events` or `none`.                                                                                                                                                                                                       |
+| `usage_grace_s`                    |          | `0.0`                                                                          | Seconds to keep polling the transcript for token totals after the session ends; `0` reads once. Must be ≥ 0.                                                                                                                                                                                               |
+| `stop_without_result_nudges`       |          | unset                                                                          | Per-profile default for Stop-without-result nudges. An `[adapter]` / `[adapter.<stage>]` value overrides it; unset inherits `[limits] stop_without_result_nudges`. Must be ≥ 0.                                                                                                                            |
+| `subagent_stop_without_transcript` |          | `false`                                                                        | When `true`, a `Stop` with no transcript path is a subagent turn-end and is ignored.                                                                                                                                                                                                                       |
+| `subagent_spawn_marker`            |          | unset                                                                          | File a parent conversation writes when it spawns a child, relative to a conversation folder, with `{session_id}` as the child's id. A `Stop` whose id has this marker in a sibling folder is ignored; the children a parent's own folder lists this way have their writes counted as idle-notice activity. |
+| `first_run_note`                   |          | `""`                                                                           | Note `init` prints about a manual first-run or auth step.                                                                                                                                                                                                                                                  |
+| `seed_files`                       |          | `[]`                                                                           | Project-relative gitignored files copied into each provisioned worktree. Must stay inside the project.                                                                                                                                                                                                     |
+| `env_fault_patterns`               |          | `[]`                                                                           | Regexes that classify a non-completed session as an environment fault. See [Environment-fault patterns](#environment-fault-patterns).                                                                                                                                                                      |
+| `parked_prompt_patterns`           |          | `[]`                                                                           | Regexes matched against the visible pane at each stall-grace expiry and at the timeout. See [Parked-session signals](#parked-session-signals).                                                                                                                                                             |
+| `usage_limit_patterns`             |          | `[]`                                                                           | Regexes for a usage-limit line the CLI stays blocked behind until an operator acts. See [Usage-limit signals](#usage-limit-signals).                                                                                                                                                                       |
+| `usage_wait_patterns`              |          | `[]`                                                                           | Regexes for a usage-limit line the CLI waits out and continues from by itself. Disjoint from `usage_limit_patterns`. See [Usage-limit signals](#usage-limit-signals).                                                                                                                                      |
+| `auto_deny_patterns`               |          | `[]`                                                                           | Regexes for the CLI's auto-deny countdown on a permission prompt, with named groups `min` and `sec`. See [Parked-session signals](#parked-session-signals).                                                                                                                                                |
+| `[workspace_trust]`                |          | unset                                                                          | The [`WorkspaceTrustSpec`](#workspacetrustspec-the-workspace_trust-table) table. Unset: nothing under `~` is read or written.                                                                                                                                                                              |
+| `[parked_answers]`                 |          | unset                                                                          | The [`[parked_answers]`](#answer-keys-the-parked_answers-table) table. Unset: the TUI offers no answer keys.                                                                                                                                                                                               |
+| `[permission_modes.<mode>]`        |          | unset                                                                          | Launch args for a non-bypass `[adapter] permission_mode`. See [Permission modes](#permission-modes). Unset: the profile refuses that mode.                                                                                                                                                                 |
+| `session_id_flag`                  |          | `""`                                                                           | Launch flag for a caller-chosen session id (claude: `--session-id`). The generic adapter appends `[flag, uuid4]` and pins attribution to that id.                                                                                                                                                          |
+| `subagent_transcript_dir`          |          | derived from `usage_parser` (`{stem}/subagents` for `claude-jsonl`, else `""`) | Subagent transcript tree beside the transcript, walked recursively and stat-only; its writes count as idle-notice activity. Must contain `{stem}` (the transcript's filename stem) and stay relative; `""` = off.                                                                                          |
 
 `session_id_flag` must be one `-`-prefixed token with no whitespace or `=`, and is refused
 on hookless profiles. Set it only when the CLI's `SessionStart` payload reports the id you
@@ -339,6 +341,17 @@ passed.
 
 An overlay that changes `usage_parser` away from `claude-jsonl` must set
 `subagent_transcript_dir` itself; it is refused on hookless profiles.
+
+`subagent_spawn_marker` applies to a `Stop` whose transcript sits under a folder named by its
+session id; that folder's parent holds the conversation folders searched for the marker. A
+`Stop` it cannot judge (no id, no transcript path, no such folder) or a marker it cannot read
+is admitted and journaled once (`subagent-marker-unjudged`, `subagent-marker-unreadable`); a
+dropped child is journaled once per id (`subagent-stop-ignored`). The idle notice also walks
+each child the parent's folder lists (`<store root>/<childId>/`, its `*.jsonl` files only,
+stat-only) as it walks `subagent_transcript_dir`; when the parent's folder cannot be judged it
+watches no children, and a listing fault joins `subagent-scan-failed`. Like
+`subagent_transcript_dir`, it must contain its placeholder (here `{session_id}`), stay relative
+with no `..`, and is refused on hookless profiles.
 
 ### `HookSpec` (the `[hooks]` table)
 
@@ -431,11 +444,14 @@ is in [Environment faults](escalations-guide.md#environment-faults).
   and matched with the `regex` module under a per-pattern timeout.
 - Seeded for `claude` (connection loss and two captured provider 5xx errors) and
   `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit`,
-  `provider.quota` and `provider.transport` events on 2.x). Empty means inert.
+  `provider.transport`, `provider.internal`, `provider.auth` and `provider.no-route` events
+  on 2.x, whose `provider.quota` is a usage limit instead).
+  Empty means inert.
 - The tail scan also covers `usage_limit_patterns` and `usage_wait_patterns` as ordinary
   pattern families, under the same token-usage overrule: a session that got past a limit
-  and later failed for another reason is charged. Only a live pane sighting of a usage
-  line exempts a session from the overrule; see [Usage-limit signals](#usage-limit-signals).
+  and later failed for another reason is charged. Only a live sighting of a usage line
+  (on the visible pane, or an opencode 2.x provider-error line written while the session
+  runs) exempts a session from the overrule; see [Usage-limit signals](#usage-limit-signals).
 
 ### Parked-session signals
 
@@ -448,7 +464,8 @@ generic adapter tell them apart:
   its subtypes in `[hooks.notification_types]`. The shipped `claude` profile parks
   `permission_prompt`, `idle_prompt`, `quota_auto_resume_stale`,
   `quota_auto_resume_disabled`, `elicitation_dialog` and `elicitation_url_dialog`; every
-  other subtype is ignored. The adapter latches the signal, and a `Stop` clears it.
+  other subtype is ignored. The adapter latches the signal, and a `Stop` clears it; a
+  `PermissionPrompt` latch also clears once the transcript is written after it.
 - **Pane-matched.** `parked_prompt_patterns` are matched against the visible pane
   (`mux.capture_pane`) at every stall-grace expiry with no latch set, including the final
   one. A backend that cannot capture, a capture failure, or a regex timeout reads as no
@@ -465,7 +482,8 @@ patterns against their own lines wrapped at widths 10 to 60.
 
 Neither signal acts on arrival. At the stall-grace expiry, a parked signal suppresses the
 nudge and ends the session `stalled` with `SessionResult.parked` / `parked_evidence` set (a
-window already dead still ends `crashed`). At the timeout, a latched signal or a
+window already dead still ends `crashed`), except a `PermissionPrompt` latch the transcript
+has moved past, which gets the nudge. At the timeout, a latched signal or a
 pane-matched prompt marks the `timeout` result parked, but only while the window is alive
 and the transcript is idle. The engine and sweep then pause for a human; an `env_fault`
 outranks it. Re-arm restores the attempt without charging it.
@@ -515,10 +533,25 @@ deny_guard = ['Do you want to procee[d]\?']
 default) launches `bypass_args`. Any other mode launches the args of the profile's
 `[permission_modes.<mode>]` table in their place:
 
-| Field       | Required | Meaning                                                                                                  |
-| ----------- | -------- | -------------------------------------------------------------------------------------------------------- |
-| `args`      | ✅       | Launch args that stand in for `bypass_args`. A policy `extra_args` still replaces them.                  |
-| `platforms` |          | `sys.platform` values the mapping works on (`linux`, `darwin`, `win32`). Empty or unset: every platform. |
+| Field                  | Required | Meaning                                                                                                                                    |
+| ---------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `args`                 | ✅       | Launch args that stand in for `bypass_args`. A policy `extra_args` still replaces them.                                                    |
+| `platforms`            |          | `sys.platform` values the mapping works on (`linux`, `darwin`, `win32`). Empty or unset: every platform.                                   |
+| `linked_worktree_args` |          | Args appended after `args` when the session runs in a linked worktree, with `{gitdir}` and `{common_dir}` filled in. Empty or unset: none. |
+
+`linked_worktree_args` is for a sandbox that must be granted a linked worktree's git
+directories explicitly. When the session's cwd is in a linked worktree (as under
+`scm.isolation = "worktree"`), the generic adapter asks git for that worktree's gitdir
+(`<main>/.git/worktrees/<name>`) and the common dir (`<main>/.git`), resolves both, and
+appends the list after the mode's `args` with each `{gitdir}` / `{common_dir}` replaced by
+that path written as a TOML basic string, quotes included. In a main checkout nothing is
+appended. Under `bypass`, or when a policy `extra_args` replaces the mode's args, nothing is
+appended and git is not asked.
+
+If git cannot answer, or a path cannot be written as TOML, the session refuses to launch
+rather than start without the grant. Each entry must be a non-empty string, and at least one
+entry must use a placeholder: an arg with no path in it belongs in `args`. The config digest
+hashes the unfilled list, so a resumed run's digest does not depend on the worktree path.
 
 A profile without the table, or on an excluded platform, refuses the mode at run start and
 in `validate` (`adapter.permission-mode-unsupported`). `opencode-http` never launches
@@ -533,14 +566,22 @@ return to the agent as an error. The shipped mappings, both for `linux` and `dar
   sandbox with no unsandboxed retry. Sandboxed Bash can run git and write `.git`; network is
   denied. On Linux the Bash sandbox needs bubblewrap and socat installed, or the session
   refuses to start.
-- **codex:** a `-c` permission profile extending `:workspace` with a `.git` write grant,
-  plus `--ask-for-approval never`. Network is off. In a linked worktree the gitdir under
-  the main repo's `.git/worktrees/` stays read-only, so git add and commit fail there;
-  `validate` warns about sandboxed Codex under `scm.isolation = "worktree"`.
+- **codex:** a `-c` permission profile `bmad_loop` extending `:workspace` with a `.git`
+  write grant, plus `--ask-for-approval never`. Network is off. Its `linked_worktree_args`
+  define a child profile `bmad_loop_worktree` that extends `bmad_loop` with write grants
+  for the linked worktree's gitdir and the common dir, and select it with a later
+  `default_permissions`, so git add and commit work in a worktree checkout. `validate`
+  warns about sandboxed Codex under `scm.isolation = "worktree"` only when that grant
+  cannot ride: an `extra_args` override, or a profile whose mode declares no
+  `linked_worktree_args` or a grant that names only one of `{gitdir}` and `{common_dir}`
+  (Codex needs both to commit).
 
 The sandbox confines the session, not what bmad-loop later runs from the checkout. Both
 mappings leave `.git` writable, hooks and config included, and the orchestrator runs
-`[verify] commands` and its own git commits there unsandboxed.
+`[verify] commands` and its own git commits there unsandboxed. In a linked worktree,
+Codex's common-dir grant opens the main repo's `.git` (hooks, config, the main index and
+refs) to the session, the same exposure a sandboxed session in the main checkout already
+has through the `.git` grant.
 
 Both CLIs show a one-time workspace-trust dialog in a directory they have not seen.
 `validate` reports each role's posture as `adapter.permission-mode`.
@@ -550,7 +591,9 @@ Both CLIs show a one-time workspace-trust dialog in a directory they have not se
 A CLI stopped by a subscription or credit limit either stays blocked until someone acts
 (credit exhaustion) or waits for the limit's reset and continues by itself (a
 session-window limit under Claude Code's auto-continue). Two opt-in profile lists name
-those lines, both matched line by line against the ANSI-stripped visible pane:
+those lines. The tmux adapters match both line by line against the ANSI-stripped visible
+pane; `opencode-http` has no pane and matches them against its provider-error lines (see
+below):
 
 - **`usage_limit_patterns`**: the CLI is blocked and will not continue on its own.
 - **`usage_wait_patterns`**: the CLI is blocked and waiting for a reset it continues from.
@@ -558,9 +601,25 @@ those lines, both matched line by line against the ANSI-stripped visible pane:
 The lists are disjoint by contract; "usage-limited" means either one matched. They follow
 the env-fault evidentiary bar: reproduce the captured sentence prefix (never a bare
 `session limit`, `resets` or `usage credits`), use single-character classes so a pattern
-cannot match its own profile line, and seed only lines captured off the CLI's screen. The
-shipped `claude` profile seeds one line in each list; every other profile leaves both
+cannot match its own profile line, and seed only lines captured live from the CLI: off its
+screen, or from the adapter's record of its own events (opencode's provider-error lines). The
+shipped `claude` profile seeds one line in each list, and `opencode` seeds
+`usage_limit_patterns` with its 2.x `provider.quota` line; every other profile leaves both
 empty, which keeps them inert.
+
+**opencode-http's sighting.** On OpenCode 2.x the adapter matches each provider-error line
+it writes to `<task-id>.provider-errors.log` against `usage_limit_patterns`, then
+`usage_wait_patterns`, as the frame arrives for this session. The first match is the
+session's sighting: when the session ends `timeout`, `stalled` or `crashed`, the result
+carries it as `usage_limited` with its class, and no `usage_limit_resets`, since the frame
+names no reset time; a completed, aborted or over-budget result carries none. A frame of
+this session seen while it ran is live evidence, so the sighting is exempt from the
+token-usage overrule like a pane sighting. The shipped pattern matches
+`type=provider.quota`, a blocking limit: OpenCode builds that type from billing and
+credit-exhaustion codes and never retries it. `provider.rate-limit` and
+`provider.transport`, which OpenCode retries, stay `env_fault_patterns`. A match that blows
+the per-pattern timeout counts as no match and leaves a `usage-limit-match-failed`
+lifecycle crumb. OpenCode 1.x writes no provider-error lines and has no sighting.
 
 **At stall-grace expiry** the pane is captured once and checked against the parked
 patterns and both usage lists. A usage match withholds the nudge (even when a hook latch
@@ -619,7 +678,7 @@ name = "copilot"
 binary = "copilot"
 skill_tree = ".agents/skills"
 launch_args = ["-i"]
-bypass_args = ["--allow-all-tools", "--allow-all-paths"]
+bypass_args = ["--allow-all-tools", "--allow-all-paths", "--allow-all-urls"]
 usage_parser = "copilot-events"
 usage_grace_s = 8.0        # token totals land ~1s after agentStop, on session.shutdown
 stop_without_result_nudges = 5   # agentStop fires per response turn

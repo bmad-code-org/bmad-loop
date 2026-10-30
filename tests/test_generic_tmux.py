@@ -24,12 +24,14 @@ from pathlib import Path
 
 import pytest
 import regex
-from conftest import REAL_MUX_HANG_CEILING_S, json_recursion_payload, real_mux_e2e
+from conftest import REAL_MUX_HANG_CEILING_S, git, json_recursion_payload, real_mux_e2e
 
 from bmad_loop import devcontract, runs
 from bmad_loop.adapters import base as adapter_base
 from bmad_loop.adapters import env_fault, generic, tmux_base
 from bmad_loop.adapters.base import (
+    USAGE_LIMIT_BLOCKED,
+    USAGE_LIMIT_WAIT,
     ZERO_TOKEN_TIMEOUT_EVIDENCE,
     AdapterTaskDirectoryError,
     SessionHandle,
@@ -39,12 +41,18 @@ from bmad_loop.adapters.base import (
 )
 from bmad_loop.adapters.generic import GenericDevAdapter, GenericTmuxAdapter
 from bmad_loop.adapters.multiplexer import MultiplexerError
-from bmad_loop.adapters.profile import PARKED_EVENTS, PermissionModeSpec, get_profile
+from bmad_loop.adapters.profile import (
+    PARKED_EVENTS,
+    PermissionModeSpec,
+    get_profile,
+    toml_basic_string,
+)
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS, Journal
 from bmad_loop.model import TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.signals import HookEvent
+from bmad_loop.verify import GitTimeoutError
 
 # A bump the filesystem can actually record. NTFS stores ~100ns ticks (FAT, 2s),
 # so a 1ns increment rounds away on Windows and the rewritten marker never reads
@@ -465,6 +473,102 @@ def test_a_sandboxed_profile_launches_its_mode_args_in_the_bypass_slot(tmp_path)
     cmd = adapter.build_command(make_spec(tmp_path))
     assert shlex.quote(settings) in cmd
     assert shlex.split(cmd)[prompt_at + 2] == settings
+
+
+def _grant_adapter(tmp_path, profile_name="codex", mode="sandboxed", extra_args=None):
+    adapter = make_adapter(tmp_path, profile_name=profile_name, extra_args=extra_args)
+    adapter.profile = get_profile(profile_name).for_permission_mode(mode, platform="linux")
+    return adapter
+
+
+def _linked_worktree(project) -> Path:
+    wt = project.project.parent / "wt"
+    git(project.project, "worktree", "add", "-q", "--detach", str(wt), "HEAD")
+    (wt / "nested").mkdir()  # a nested project's sessions run below the worktree root
+    return wt
+
+
+def test_sandboxed_codex_in_a_linked_worktree_is_granted_its_gitdir_and_common_dir(
+    tmp_path, project
+):
+    """DW-599: Codex's sandbox keeps a linked worktree's gitdir and the shared
+    common dir read-only, so the sandboxed launch appends the mode's
+    `linked_worktree_args` with both exact paths, after the mode args (its later
+    `default_permissions` must win) and before the model flag.
+
+    ABLATION: return () from `_linked_worktree_grant` and this reddens."""
+    wt = _linked_worktree(project)
+    adapter = _grant_adapter(tmp_path)
+    mode_args = list(adapter.profile.bypass_args)
+    gitdir = toml_basic_string(str((project.project / ".git" / "worktrees" / "wt").resolve()))
+    common = toml_basic_string(str((project.project / ".git").resolve()))
+    grant = [
+        "-c",
+        'permissions.bmad_loop_worktree.extends="bmad_loop"',
+        "-c",
+        f'permissions.bmad_loop_worktree.filesystem={{{gitdir}="write",{common}="write"}}',
+        "-c",
+        'default_permissions="bmad_loop_worktree"',
+    ]
+    for cwd in (wt, wt / "nested"):
+        argv = adapter.interactive_argv(dataclasses.replace(make_spec(tmp_path), cwd=cwd))
+        start = argv.index(mode_args[0])
+        assert argv[start:] == [*mode_args, *grant, "--model", "sonnet"]
+
+
+def test_no_linked_worktree_grant_in_a_main_checkout(tmp_path, project):
+    adapter = _grant_adapter(tmp_path)
+    argv = adapter.interactive_argv(dataclasses.replace(make_spec(tmp_path), cwd=project.project))
+    assert argv[-4:-2] == ["--ask-for-approval", "never"]  # the mode args end the slot
+    assert not any("bmad_loop_worktree" in a for a in argv)
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "mode", "extra_args"),
+    [
+        ("codex", "bypass", None),
+        ("claude", "sandboxed", None),  # a sandbox that needs no grant declares none
+        ("codex", "sandboxed", ("--custom",)),  # extra_args replaces the mode args, grant too
+    ],
+    ids=["bypass", "non-codex", "extra-args"],
+)
+def test_no_linked_worktree_grant_without_a_declaring_mode(
+    tmp_path, project, monkeypatch, profile_name, mode, extra_args
+):
+    """No grant, and git is not even asked: a broken git must not fail a launch
+    that owes no grant."""
+    wt = _linked_worktree(project)
+
+    def no_git(*_a, **_k):
+        raise AssertionError("git asked for a launch that owes no grant")
+
+    monkeypatch.setattr(generic, "git_bytes", no_git)
+    adapter = _grant_adapter(tmp_path, profile_name, mode, extra_args)
+    argv = adapter.interactive_argv(dataclasses.replace(make_spec(tmp_path), cwd=wt))
+    assert not any("bmad_loop_worktree" in a for a in argv)
+
+
+def test_a_linked_worktree_grant_fault_refuses_the_launch(tmp_path, monkeypatch):
+    """A git fault while resolving the paths raises rather than launching a
+    session that could not commit. Covers a cwd git disowns (rc != 0) and a git
+    that raises (timeout / spawn failure).
+
+    ABLATION: return None from `_linked_worktree_git_dirs` on a fault and both
+    cases launch."""
+    adapter = _grant_adapter(tmp_path)
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    spec = dataclasses.replace(make_spec(tmp_path), cwd=plain)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    with pytest.raises(generic.LinkedWorktreeGrantError, match="could not read the git dirs"):
+        adapter.build_command(spec)
+
+    def hung(*_a, **_k):
+        raise GitTimeoutError("git timed out")
+
+    monkeypatch.setattr(generic, "git_bytes", hung)
+    with pytest.raises(generic.LinkedWorktreeGrantError, match="git timed out"):
+        adapter.interactive_argv(spec)
 
 
 def test_read_result_variants(tmp_path):
@@ -1928,6 +2032,269 @@ def test_wait_for_completion_skips_transcriptless_subagent_stop(tmp_path):
     assert result.session_id == "main-sess"  # the subagent's toolu_ id is never recorded
 
 
+def _agy_stop(session_id, transcript_path, fully_idle):
+    return HookEvent(
+        ts=1,
+        event="Stop",
+        task_id="3-1-dev-1",
+        session_id=session_id,
+        transcript_path=transcript_path,
+        path=Path("x"),
+        fully_idle=fully_idle,
+    )
+
+
+def test_wait_for_completion_skips_a_fully_idle_false_yield_stop(tmp_path):
+    """DW-548 (pinned on agy 1.4.9): a parent that spawns a foreground subagent
+    fires Stop with `fullyIdle: false` while it yields, then Stop with
+    `fullyIdle: true` when it really finishes. The yield is no turn end. The
+    terminal spec is already on disk here, so a yield read as a turn end would
+    complete on the first event; the session must complete on the FINAL Stop,
+    and the yield is journaled once with its count.
+
+    Ablation, performed: delete the `fully_idle is False` branch in the wait
+    loop and this fails — the result completes on the yield, with its transcript."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_stop("agy-parent", "/yield.jsonl", False),
+            _agy_stop("agy-parent", "/yield.jsonl", False),
+            _agy_stop("agy-parent", "/final.jsonl", True),
+        ]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert result.transcript_path == "/final.jsonl"
+    assert adapter.watcher.calls == 3  # completion waited for the final Stop
+    yields = [e for e in _lifecycle_lines(adapter) if e["event"] == "hook-stop-yield-ignored"]
+    assert yields == [
+        {
+            "ts": yields[0]["ts"],
+            "event": "hook-stop-yield-ignored",
+            "session_id": "agy-parent",
+            "ignored_so_far": 1,
+        }
+    ]
+
+
+def test_a_lone_fully_idle_false_stop_never_completes(tmp_path, monkeypatch):
+    """DW-548: a yield Stop with no final Stop after it leaves the session
+    running, so it takes the timeout path with no stop seen, and the yield count
+    is on the `timeout-fired` crumb where an operator looks.
+
+    Ablation, performed: delete the `fully_idle is False` branch and this fails
+    — the yield sets stop_seen, and the result-less Stop ends the dev session as
+    stalled instead of timing out."""
+    adapter, clock = _timeout_clock_adapter(tmp_path, monkeypatch)
+    adapter._stall_grace_s = 0.0
+
+    def advance(call_n):
+        if call_n > 1:
+            clock["mono"] += 1000.0
+
+    adapter.watcher = _ScriptedWatcher(
+        [_agy_stop("agy-parent", None, False)],
+        on_call=advance,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path, timeout_s=100.0))
+
+    assert result.status == "timeout"
+    assert result.stop_seen is False
+    assert result.session_id == "agy-parent"  # the session's own event: tracked
+    (fired,) = _lifecycle_events(adapter, "timeout-fired")
+    assert fired["stop_yields_ignored"] == 1
+
+
+_AGY_MARKER = ".system_generated/subagents/{session_id}.json"
+
+
+def _agy_brain(tmp_path, parent="agy-parent", child="agy-child"):
+    """A brain store as agy 1.4.9 lays it out: one folder per conversation, the
+    parent's holding the spawn marker it wrote for the child. Returns the two
+    transcript paths (strings, as a hook reports them)."""
+    brain = tmp_path / "brain"
+    transcripts = []
+    for conv in (parent, child):
+        logs = brain / conv / ".system_generated" / "logs"
+        logs.mkdir(parents=True)
+        (logs / "transcript_full.jsonl").write_text("")
+        transcripts.append(str(logs / "transcript_full.jsonl"))
+    marker = brain / parent / _AGY_MARKER.format(session_id=child)
+    marker.parent.mkdir(parents=True)
+    marker.write_text("{}")
+    return transcripts[0], transcripts[1]
+
+
+def test_spawn_marker_verdict_reads_a_sibling_marker_as_a_child(tmp_path):
+    parent_t, child_t = _agy_brain(tmp_path)
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-child", child_t) == "child"
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t) == "own"
+
+
+def test_spawn_marker_verdict_ignores_a_marker_in_the_conversations_own_folder(tmp_path):
+    """Only a SIBLING folder's marker names a child: a conversation never spawns
+    itself, so its own folder is skipped."""
+    parent_t, _ = _agy_brain(tmp_path)
+    own = tmp_path / "brain" / "agy-parent" / _AGY_MARKER.format(session_id="agy-parent")
+    own.write_text("{}")
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t) == "own"
+
+
+@pytest.mark.parametrize(
+    ("session_id", "transcript"),
+    [
+        (None, "brain/agy-child/t.jsonl"),
+        ("", "brain/agy-child/t.jsonl"),
+        ("agy-child", None),
+        ("agy-child", ""),
+        ("agy-child", "brain/elsewhere/t.jsonl"),  # no ancestor named by the id
+        ("..", "brain/../t.jsonl"),
+        ("agy-child", "brain/agy-child/t\0.jsonl"),
+    ],
+)
+def test_spawn_marker_verdict_is_unjudged_without_a_conversation_folder(
+    tmp_path, session_id, transcript
+):
+    _agy_brain(tmp_path)
+    if transcript:
+        transcript = str(tmp_path / transcript)
+    assert generic._spawn_marker_verdict(_AGY_MARKER, session_id, transcript) == "unjudged"
+
+
+def test_spawn_marker_verdict_propagates_a_store_read_fault(tmp_path, monkeypatch):
+    """A fault listing the store or statting a marker propagates for the caller
+    to crumb; only an absent marker reads as absent."""
+    parent_t, _ = _agy_brain(tmp_path)
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(generic.os, "scandir", denied)
+    with pytest.raises(PermissionError):
+        generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t)
+    monkeypatch.undo()
+    monkeypatch.setattr(generic.os, "stat", denied)
+    with pytest.raises(PermissionError):
+        generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t)
+
+
+def _agy_child_run(tmp_path, adapter, impl):
+    """parent yield -> child yield -> child final -> parent final, with the
+    terminal spec already on disk: whichever Stop is first read as a turn end
+    completes the session."""
+    parent_t, child_t = _agy_brain(tmp_path)
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_stop("agy-parent", parent_t, False),
+            _agy_stop("agy-child", child_t, False),
+            _agy_stop("agy-child", child_t, True),
+            _agy_stop("agy-parent", parent_t, True),
+        ]
+    )
+    return parent_t, child_t
+
+
+def test_wait_for_completion_drops_a_spawned_child_conversations_stop(tmp_path):
+    """DW-548 (pinned on agy 1.4.9): a subagent is a sibling conversation whose
+    Stops reach the parent's stream unannounced. Its final `fully_idle: true`
+    Stop must not complete the parent: the session completes on the PARENT's
+    final Stop, with the parent's id and transcript, and the child is journaled
+    once however many of its Stops arrive.
+
+    Ablation, performed: delete the spawn-marker branch in the wait loop and
+    this fails — the result completes on the child's final Stop, with its id."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    assert adapter.profile.subagent_spawn_marker == _AGY_MARKER
+    parent_t, _ = _agy_child_run(tmp_path, adapter, impl)
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert result.transcript_path == parent_t
+    assert adapter.watcher.calls == 4
+    ignored = _lifecycle_events(adapter, "subagent-stop-ignored")
+    assert ignored == [
+        {
+            "ts": ignored[0]["ts"],
+            "event": "subagent-stop-ignored",
+            "child_session_id": "agy-child",
+            "fully_idle": False,
+        }
+    ]
+    assert _lifecycle_events(adapter, "subagent-marker-unjudged") == []
+    assert _lifecycle_events(adapter, "subagent-marker-unreadable") == []
+
+
+def test_wait_for_completion_without_a_spawn_marker_is_unchanged(tmp_path):
+    """Gating: a profile without the key reads the child's final Stop as the
+    turn end, exactly as before — the rule must not leak to other CLIs."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    adapter.profile = dataclasses.replace(adapter.profile, subagent_spawn_marker=None)
+    _, child_t = _agy_child_run(tmp_path, adapter, impl)
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-child"
+    assert result.transcript_path == child_t
+    assert adapter.watcher.calls == 3
+    assert _lifecycle_events(adapter, "subagent-stop-ignored") == []
+
+
+def test_an_unjudged_stop_is_admitted_and_crumbed_once(tmp_path):
+    """A Stop the rule cannot judge (no folder named by its id) is admitted as
+    before, never silently read as own: the crumb fires once per attempt."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [_agy_stop("agy-parent", "/yield.jsonl", False), _agy_stop("agy-parent", None, True)]
+    )
+
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert adapter.watcher.calls == 2
+    (crumb,) = _lifecycle_events(adapter, "subagent-marker-unjudged")
+    assert crumb["session_id"] == "agy-parent"
+    assert crumb["transcript_path"] == "/yield.jsonl"
+
+
+def test_an_unreadable_marker_store_admits_the_stop_and_crumbs_once(tmp_path, monkeypatch):
+    """A store read fault admits the Stop as before (failing toward acceptance)
+    and is journaled once with the error — never folded into "not a child"."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    _, child_t = _agy_child_run(tmp_path, adapter, impl)
+    real_scandir = os.scandir
+
+    def denied(path):
+        if Path(path).name == "brain":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(generic.os, "scandir", denied)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-child"  # admitted: the fault judged nothing
+    assert result.transcript_path == child_t
+    (crumb,) = _lifecycle_events(adapter, "subagent-marker-unreadable")
+    assert crumb["session_id"] == "agy-parent"
+    assert crumb["error"].startswith("PermissionError")
+    assert _lifecycle_events(adapter, "subagent-stop-ignored") == []
+
+
 def test_wait_for_completion_ignores_foreign_identified_lifecycle_events(tmp_path):
     """A nested CLI inherits the relay environment and writes into the parent's
     stream (#767). Its announced SessionStart marks its id foreign, so neither
@@ -2346,7 +2713,9 @@ def test_wait_for_completion_copilot_bound_subagent_stop_not_crumbed(tmp_path):
 
 def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_path):
     """A Stop-only profile (no SessionStart) never binds, so attribution admits
-    every event and its established identified-Stop completion stays intact."""
+    every event and its established identified-Stop completion stays intact. The
+    transcript sits under no folder named by the id, so the spawn-marker rule
+    (DW-548) cannot judge it: admitted, with that one crumb."""
     adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
     (impl / "spec-3-1-foo.md").write_text(
         "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
@@ -2360,7 +2729,7 @@ def test_wait_for_completion_keeps_identified_stop_for_stop_only_profile(tmp_pat
     assert result.status == "completed"
     assert result.session_id == "stop-only-session"
     assert result.transcript_path == "/legacy.jsonl"
-    assert _lifecycle_lines(adapter) == []
+    assert [e["event"] for e in _lifecycle_lines(adapter)] == ["subagent-marker-unjudged"]
 
 
 CODEX_SESSION = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"
@@ -3995,6 +4364,7 @@ def test_heartbeat_written_and_throttled(tmp_path, monkeypatch):
         "probe_failures": 0,
         "usage_sample_failures": 0,
         "foreign_hook_events": 0,  # no nested CLI's events were dropped (#767)
+        "stop_yields_ignored": 0,  # no Stop was a subagent yield (DW-548)
     }
     assert [w["remaining_s"] for w in writes] == [100.0, 59.0]  # tick 2 was throttled
     hb = json.loads((adapter.tasks_dir / "3-1-dev-1" / "heartbeat.json").read_text())
@@ -5547,11 +5917,16 @@ def test_usage_limited_env_fault_is_not_overruled_by_tokens(tmp_path, status):
     evidence = _usage_evidence(adapter)
     handle = SessionHandle(task_id=_ENV_FAULT_TASK, native_id="@1")
     live = SessionResult(
-        status=status, parked=True, parked_evidence=evidence, usage_limited=evidence
+        status=status,
+        parked=True,
+        parked_evidence=evidence,
+        usage_limited=evidence,
+        usage_limit_class=USAGE_LIMIT_BLOCKED,
     )
     spec = make_spec(adapter.run_dir, task_id=_ENV_FAULT_TASK)
     result = adapter._classify_env_fault(handle, spec, live)
     assert result.env_fault is True
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED  # the live class survives
     assert result.env_fault_evidence == evidence
     assert result.env_fault_overruled is None
     assert reads == []
@@ -5588,6 +5963,7 @@ def test_tail_only_usage_match_is_still_overruled(tmp_path):
     assert kept.env_fault is True
     assert "Run /usage-credits" in kept.env_fault_evidence
     assert kept.usage_limited is None  # the tail never sets the live field
+    assert kept.usage_limit_class is None  # ...nor its class (DW-591)
 
 
 def test_run_overruled_timeout_is_plain_timeout(tmp_path):
@@ -11207,6 +11583,212 @@ def test_subagent_activity_in_the_final_interval_closes_the_stretch(tmp_path, mo
     assert [e["kind"] for e in adapter.journal.entries] == ["session-idle", "session-active"]
 
 
+# DW-548: agy runs a foreground subagent as a SIBLING conversation and writes
+# nothing to the parent's folder meanwhile; the children the parent lists
+# through its spawn marker are walked like the subagent tree.
+
+
+def _agy_idle_run(tmp_path, monkeypatch, *, session_ids=("agy-parent",), on_call=None):
+    """An antigravity idle adapter over `_agy_brain`'s store, named by the
+    parent's `fullyIdle: false` yield Stops, one per tick from tick 1 with the
+    ids in `session_ids` (agy's only id-bearing event), with the pane
+    repainting from tick 2. The child's transcript grows
+    from tick 2 unless `on_call` replaces that; the loop ends on tick 7.
+    Returns (adapter, heartbeats, brain)."""
+    adapter, _, log, _t, clock, heartbeats = _idle_adapter(
+        tmp_path, monkeypatch, profile_name="antigravity"
+    )
+    assert adapter.profile.subagent_transcript_root == ""  # children only
+    parent_t, child_t = _agy_brain(tmp_path)
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+            _grow(log, "\r⠋".encode())
+            if on_call is None:
+                _grow(Path(child_t), b'{"step_index":1}\n')
+        if on_call is not None:
+            on_call(call_n)
+        if call_n == 7:
+            clock["t"] += 10_000.0
+
+    stops = [_agy_stop(sid, parent_t, False) for sid in session_ids]
+    adapter.watcher = _ScriptedWatcher(stops, on_call=script)
+    return adapter, heartbeats, tmp_path / "brain"
+
+
+def test_spawned_child_activity_keeps_a_silent_agy_parent_active(tmp_path, monkeypatch):
+    """The parent's transcript sits still while the child it listed through the
+    spawn marker keeps writing: the idle clock reads the child's writes, so no
+    stretch opens.
+
+    ABLATION, performed: drop the `_spawned_children` roots from
+    `_sample_subagent_tree` and a `session-idle` opens."""
+    adapter, heartbeats, _ = _agy_idle_run(tmp_path, monkeypatch)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "timeout"
+    assert adapter.journal.entries == []
+    assert all(hb["transcript_idle_s"] == 0.0 for hb in heartbeats[1:])
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "3-1-dev-1")]
+    assert not [c for c in crumbs if c.startswith("subagent-scan-")]
+
+
+@pytest.mark.parametrize("case", ["no-marker-key", "no-marker-file", "unjudged"])
+def test_spawned_child_is_not_watched_without_a_listing(tmp_path, monkeypatch, case):
+    """The same growing child is no activity when the parent does not list it:
+    a profile without `subagent_spawn_marker` (unchanged behaviour), a parent
+    folder holding no marker, or a Stop whose id names no ancestor folder of its
+    transcript (the parent's folder cannot be judged, so no child is guessed).
+    The silent parent opens its stretch at the grace crossing."""
+    adapter, _, brain = _agy_idle_run(
+        tmp_path, monkeypatch, session_ids=("elsewhere" if case == "unjudged" else "agy-parent",)
+    )
+    if case == "no-marker-key":
+        adapter.profile = dataclasses.replace(adapter.profile, subagent_spawn_marker=None)
+    elif case == "no-marker-file":
+        (brain / "agy-parent" / _AGY_MARKER.format(session_id="agy-child")).unlink()
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "3-1-dev-1")]
+    assert not [c for c in crumbs if c.startswith("subagent-scan-")]
+
+
+def test_spawned_child_appearing_mid_run_closes_the_stretch(tmp_path, monkeypatch):
+    """No child is listed when the parent goes quiet, so the stretch opens at
+    the grace crossing; the spawn then writes the marker and the child's
+    transcript, which reads as movement from the empty children's (0, 0, 0):
+    one `session-active` carrying the stretch's full length.
+
+    ABLATION: drop `or sub_moved` and the `session-active` is missing."""
+    marker = tmp_path / "brain" / "agy-parent" / _AGY_MARKER.format(session_id="agy-child")
+    child_dir = tmp_path / "brain" / "agy-child"
+    stash = tmp_path / "stash"
+
+    def script(call_n):
+        if call_n == 1:  # the store before the spawn: the parent alone
+            stash.mkdir()
+            marker.rename(stash / "marker.json")
+            child_dir.rename(stash / "agy-child")
+        if call_n == 5:  # heartbeat 5: 120 s
+            (stash / "marker.json").rename(marker)
+            (stash / "agy-child").rename(child_dir)
+        if call_n > 5:
+            _grow(child_dir / ".system_generated/logs/transcript_full.jsonl", b"{}\n")
+
+    adapter, _, _ = _agy_idle_run(tmp_path, monkeypatch, on_call=script)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle", "session-active"]
+    assert entries[0]["since_ts"] == 5000.0
+    assert entries[1]["idle_s"] == 120.0
+
+
+def test_children_coming_into_view_rebaseline_the_subagent_key(tmp_path, monkeypatch):
+    """A profile declaring both a tree and a spawn marker, named first by an
+    id-less Stop (the parent's folder cannot be judged: the tree alone is
+    watched) and then by the parent's id: the static children now in view
+    change what the key covers, which is a baseline, not movement, so the
+    stretch still opens from the naming.
+
+    ABLATION: drop the `sub_children_judged` rebaseline and the newly watched
+    children read as movement on tick 2, moving `since_ts`."""
+    adapter, _, _ = _agy_idle_run(
+        tmp_path, monkeypatch, session_ids=(None, "agy-parent"), on_call=lambda n: None
+    )
+    adapter.profile = dataclasses.replace(
+        adapter.profile, subagent_transcript_dir="{stem}/subagents"
+    )
+    parent_t = tmp_path / "brain/agy-parent/.system_generated/logs/transcript_full.jsonl"
+    _subagent_file(parent_t, "agent-a.jsonl")
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+
+
+def test_spawn_marker_listing_fault_is_crumbed_and_degrades_to_the_parent(tmp_path, monkeypatch):
+    """A marker listing that raises is never "no children": it joins the
+    `subagent-scan-failed` streak (`path` = the parent's conversation folder),
+    and the tick degrades to the parent alone, so the silent parent still opens
+    its stretch on time although the child writes.
+
+    ABLATION: swallow the fault into `[]` and the crumb is never written."""
+    calls: list[Path] = []
+
+    def denied(template, conversation):
+        calls.append(conversation)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(generic, "_spawned_children", denied)
+    adapter, _, brain = _agy_idle_run(tmp_path, monkeypatch)
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    adapter.wait_for_completion(_dev_handle(), spec)
+    assert len(calls) > 3
+    entries = adapter.journal.entries
+    assert [e["kind"] for e in entries] == ["session-idle"]
+    assert entries[0]["since_ts"] == 5000.0
+    (failed,) = _lifecycle_events(adapter, "subagent-scan-failed")
+    assert failed["path"] == str(brain / "agy-parent")
+    assert failed["error"] == "PermissionError: [Errno 13] Permission denied"
+    assert _lifecycle_events(adapter, "subagent-scan-recovered") == []
+
+
+# `_spawned_children` directly: the marker listing's match/skip/raise rules.
+
+
+def test_spawned_children_lists_each_marked_sibling(tmp_path):
+    """A listed child's folder is named whether or not it exists yet; the
+    parent's own id, names the template does not match, and an empty listing
+    directory's absence are not children."""
+    _agy_brain(tmp_path)
+    brain = tmp_path / "brain"
+    parent = brain / "agy-parent"
+    subagents = parent / ".system_generated" / "subagents"
+    (subagents / "agy-late.json").write_text("{}")  # spawned, folder not yet written
+    (subagents / "agy-parent.json").write_text("{}")  # its own id never counts
+    (subagents / "notes.txt").write_text("x")
+    assert generic._spawned_children(_AGY_MARKER, parent) == [
+        brain / "agy-child",
+        brain / "agy-late",
+    ]
+    assert generic._spawned_children(_AGY_MARKER, brain / "agy-child") == []
+
+
+def test_spawned_children_matches_the_id_in_a_middle_component(tmp_path):
+    """The id may sit in a directory component: a candidate counts only when
+    the whole filled-in marker stats, and literal braces stay literal."""
+    template = "kids/{session_id}/{{spawned}}.json"
+    conversation = tmp_path / "store" / "p"
+    (conversation / "kids" / "c1").mkdir(parents=True)
+    (conversation / "kids" / "c1" / "{spawned}.json").write_text("{}")
+    (conversation / "kids" / "c2").mkdir()  # no marker inside: not a child
+    assert generic._spawned_children(template, conversation) == [tmp_path / "store" / "c1"]
+
+
+def test_spawned_children_propagates_a_listing_or_stat_fault(tmp_path, monkeypatch):
+    """Only an absent listing directory or marker reads as absent; every other
+    fault propagates for the caller to crumb."""
+    _agy_brain(tmp_path)
+    parent = tmp_path / "brain" / "agy-parent"
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(generic.os, "scandir", denied)
+    with pytest.raises(PermissionError):
+        generic._spawned_children(_AGY_MARKER, parent)
+    monkeypatch.undo()
+    monkeypatch.setattr(generic.os, "stat", denied)
+    with pytest.raises(PermissionError):
+        generic._spawned_children(_AGY_MARKER, parent)
+
+
 # `_subagent_tree_key` directly: the stat-only walk's skip/raise rules.
 
 
@@ -12175,25 +12757,25 @@ def test_profile_without_parked_patterns_never_captures(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("line", "field"),
+    ("line", "field", "usage_class"),
     [
-        (USAGE_CREDITS_LINE, "usage_limit_patterns"),
-        (USAGE_SESSION_LINE, "usage_wait_patterns"),
+        (USAGE_CREDITS_LINE, "usage_limit_patterns", USAGE_LIMIT_BLOCKED),
+        (USAGE_SESSION_LINE, "usage_wait_patterns", USAGE_LIMIT_WAIT),
     ],
 )
 @pytest.mark.parametrize("nudges", [0, 2])
 def test_stall_expiry_on_usage_limit_line_is_parked_and_usage_limited(
-    tmp_path, monkeypatch, line, field, nudges
+    tmp_path, monkeypatch, line, field, usage_class, nudges
 ):
     """No hook latch, a usage-limit line on the visible pane: the stall-grace
     expiry ends the session `stalled` + `parked`, with `usage_limited` naming
     the matched pattern and quoting the line — whether a nudge was due (2) or
-    none is configured (0). Either list counts; one capture serves both the
-    parked and the usage patterns.
+    none is configured (0). Either list counts, and `usage_limit_class` names
+    which one (DW-591); one capture serves the parked and both usage sets.
 
-    Ablation: drop `self._usage_pane_patterns` from the stall gate's
-    `_pane_evidence` call (usage_now stays None) and this fails on an unparked
-    stall with `usage_limited` None."""
+    Ablation: drop the usage sets from the stall gate's `_pane_evidence` call
+    (usage_now stays None) and this fails on an unparked stall with
+    `usage_limited` None."""
     screen = f"\x1b[2m{line}\x1b[0m\r\n\r\n❯ \r\n"
     adapter, mux = _parked_adapter(tmp_path, monkeypatch, [], screen=screen, nudges=nudges)
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
@@ -12201,9 +12783,47 @@ def test_stall_expiry_on_usage_limit_line_is_parked_and_usage_limited(
     assert result.usage_limited is not None
     pattern = getattr(adapter.profile, field)[0]
     assert result.usage_limited == f"pane matched {pattern!r}: {line.strip()}"
+    assert result.usage_limit_class == usage_class
     assert result.parked_evidence == result.usage_limited  # no latch: the limit IS the park
     assert mux.sent == []
     assert mux.captures == ["@1"]
+
+
+def test_blocked_line_outranks_a_wait_line_on_one_screen(tmp_path, monkeypatch):
+    """The two lists are disjoint by contract, but a screen showing both a
+    session-window wait line and, BELOW it, a credit-exhaustion line is
+    `blocked` (DW-591): an operator must act. The wait line comes first in row
+    order, so a merged search would have picked it. Same at the stall-expiry
+    gate and the timeout-fired look, each still one capture.
+
+    Ablation: swap `_usage_hit`'s order (wait checked first) and this fails
+    on `wait`."""
+    both = f"{USAGE_SESSION_LINE}\n{USAGE_CREDITS_LINE}\n❯ \n"
+    stall_dir = tmp_path / "stall"
+    stall_dir.mkdir()
+    adapter, mux = _parked_adapter(stall_dir, monkeypatch, [], screen=both, nudges=0)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(stall_dir))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert result.usage_limited == _usage_evidence(adapter)
+    assert result.usage_limit_resets is None  # the credits line names no reset
+    assert mux.captures == ["@1"]
+
+    timeout_dir = tmp_path / "timeout"
+    timeout_dir.mkdir()
+    timed, clock = _timeout_clock_adapter(timeout_dir, monkeypatch)
+    timed_mux = _UnitMux(screen=both)
+    timed.mux = timed_mux
+
+    def advance(call_n):
+        clock["mono"] += 11.0
+
+    timed.watcher = _ScriptedWatcher([], on_call=advance)
+    late = timed.wait_for_completion(_dev_handle(), _short_spec(timeout_dir))
+    assert late.status == "timeout"
+    assert late.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert late.usage_limited == _usage_evidence(timed)
+    assert timed_mux.captures == ["@1"]
 
 
 @pytest.mark.parametrize(
@@ -12218,8 +12838,8 @@ def test_usage_line_withholds_the_stall_nudge(tmp_path, monkeypatch, events):
     `idle_prompt` latch already supplying the parked evidence, the usage look
     still runs and is still recorded.
 
-    Ablation: drop `self._usage_pane_patterns` from the stall gate's
-    `_pane_evidence` call and the no-latch case sends two STALL_NUDGE_TEXTs; the
+    Ablation: drop the usage sets from the stall gate's `_pane_evidence` call
+    and the no-latch case sends two STALL_NUDGE_TEXTs; the
     latched case loses `usage_limited` from the crumb and the result."""
     adapter, mux = _parked_adapter(
         tmp_path, monkeypatch, events, screen=f"{USAGE_CREDITS_LINE}\n", nudges=2
@@ -12229,6 +12849,7 @@ def test_usage_line_withholds_the_stall_nudge(tmp_path, monkeypatch, events):
     assert _stall_nudges(mux) == []
     assert (result.status, result.parked) == ("stalled", True)
     assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
     (withheld,) = _lifecycle_events(adapter, "stall-nudge-withheld")
     assert withheld["usage_limited"] == evidence
     assert withheld["nudge_due"] is True
@@ -12256,6 +12877,7 @@ def test_timeout_with_usage_line_visible_is_usage_limited(tmp_path, monkeypatch)
     assert result.status == "timeout"
     pattern = adapter.profile.usage_wait_patterns[0]
     assert result.usage_limited == f"pane matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
     assert mux.captures == ["@1"]
 
     mux.screen = "working…\n❯ \n"
@@ -12264,6 +12886,7 @@ def test_timeout_with_usage_line_visible_is_usage_limited(tmp_path, monkeypatch)
     clean = adapter.wait_for_completion(_dev_handle(), _short_spec(tmp_path))
     assert clean.status == "timeout"
     assert clean.usage_limited is None
+    assert clean.usage_limit_class is None
 
 
 def test_timeout_with_wrapped_usage_line_is_usage_limited(tmp_path, monkeypatch):
@@ -12304,6 +12927,7 @@ def test_dead_window_is_never_usage_limited(tmp_path, monkeypatch):
     assert result.status == "crashed"
     assert result.parked is False
     assert result.usage_limited is None
+    assert result.usage_limit_class is None
     assert _stall_nudges(mux) == []
     assert mux.captures == ["@1"]  # the line WAS seen: the probe is what declined it
 
@@ -12321,6 +12945,7 @@ def test_dead_window_is_never_usage_limited(tmp_path, monkeypatch):
     late = timed.wait_for_completion(_dev_handle(), _short_spec(timeout_dir))
     assert late.status == "timeout"
     assert late.usage_limited is None
+    assert late.usage_limit_class is None
     assert timed_mux.captures == ["@1"]
 
 
@@ -12691,10 +13316,11 @@ def test_idle_prompt_latch_journals_no_parked_notice(tmp_path, monkeypatch):
     assert mux.captures == ["@1"]  # the timeout's own look only
 
 
-def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, monkeypatch):
-    """The notice observes only: after it closes on transcript activity, the
-    latch it rode on is untouched, so the stall gate still withholds the nudge
-    and ends the session `stalled` + `parked` on it."""
+def _approved_latch_run(tmp_path, monkeypatch, *, approved):
+    """A PermissionPrompt latch naming a transcript, then silence past the 40 s
+    stall grace (11 s per idle tick, a heartbeat every 30 s). `approved` writes
+    to the transcript on the second watcher call, after the latch: the prompt
+    was answered and the CLI is working again."""
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
     mux = _UnitMux()
@@ -12713,7 +13339,7 @@ def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, mon
 
         def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
             self.calls += 1
-            if self.calls == 2:
+            if approved and self.calls == 2:
                 _grow(transcript, b'{"type":"assistant"}\n')
             if script:
                 return script.pop(0)
@@ -12721,10 +13347,77 @@ def test_activity_unpark_leaves_the_parked_latch_to_the_stall_gate(tmp_path, mon
             return None
 
     adapter.watcher = _Watcher()
-    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    return adapter, mux, adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+
+def test_activity_unpark_clears_a_permission_latch_the_transcript_moved_past(tmp_path, monkeypatch):
+    """An approved prompt (a transcript write after the latch) followed by a
+    silent stretch is a working session gone quiet, not a parked one: the
+    notice closes on the activity and takes the latch with it, so the stall
+    gate sends its wake nudges and the session ends an ordinary stall (DW-594).
+
+    ABLATION: drop the latch clearing beside `_note_session_unparked(...,
+    "activity")` and this ends `stalled` + `parked` with no nudge sent."""
+    adapter, mux, result = _approved_latch_run(tmp_path, monkeypatch, approved=True)
     assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["activity"]
+    assert (result.status, result.parked) == ("stalled", False)
+    assert result.parked_evidence is None
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+
+
+def test_an_unmoved_permission_latch_still_parks_the_stall(tmp_path, monkeypatch):
+    """No transcript write after the latch: the prompt is still unanswered, so
+    the heartbeat samples leave the notice open and the latch set, and the stall
+    gate withholds the nudge and ends the session `stalled` + `parked`."""
+    adapter, mux, result = _approved_latch_run(tmp_path, monkeypatch, approved=False)
+    assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["ended"]
     assert (result.status, result.parked) == ("stalled", True)
     assert result.parked_evidence == "Notification(permission_prompt) -> PermissionPrompt"
+    assert _stall_nudges(mux) == []
+
+
+def test_a_failed_transcript_stat_leaves_the_permission_latch(tmp_path, monkeypatch):
+    """The transcript grows between its first sample and the latch, then cannot
+    be stat'ed: `idle.last_key` is still the pre-latch sample, which differs
+    from the latch's key though the prompt still waits. A failed stat is no
+    sample, so the notice stays open, the latch stays set, and the stall gate
+    withholds the nudge and ends the session `stalled` + `parked`.
+
+    ABLATION: compare `idle.last_key` without the `sampled` gate and the notice
+    closes on `activity`, the latch goes with it and both nudges are sent."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    adapter._stall_grace_s = 40.0
+    adapter._stall_nudges = 2
+    adapter._window_alive = lambda handle: True
+    adapter.journal = _FakeJournal()
+    clock = _frozen_stall_clock(monkeypatch)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+
+    class _Watcher:
+        calls = 0
+
+        def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
+            self.calls += 1
+            if self.calls == 1:  # names the transcript: its first sample
+                return _hook_event("SessionStart", transcript_path=str(transcript))
+            if self.calls == 2:
+                _grow(transcript, b'{"type":"assistant"}\n')
+                return _hook_event(
+                    "Notification", "permission_prompt", transcript_path=str(transcript)
+                )
+            if self.calls == 3:
+                transcript.unlink()
+            clock["t"] += 11.0
+            return None
+
+    adapter.watcher = _Watcher()
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert [e["how"] for e in _journaled(adapter, "session-unparked")] == ["ended"]
+    assert (result.status, result.parked) == ("stalled", True)
     assert _stall_nudges(mux) == []
 
 
@@ -13772,6 +14465,7 @@ def test_reset_beyond_cap_skips_the_wait(tmp_path, monkeypatch):
     assert (result.status, result.parked) == ("stalled", True)
     assert result.parked_evidence == result.usage_limited == q.wait_evidence()
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
     assert result.result_json is None
     assert result.quota_wait_s == 0.0
     assert q.quota_kinds() == []
@@ -13811,6 +14505,7 @@ def test_reset_within_cap_waits(tmp_path, monkeypatch):
     )
     assert result.status == "completed"
     assert result.usage_limit_resets is None  # it continued: no usage verdict
+    assert result.usage_limit_class is None
     assert _lifecycle_events(q.adapter, "quota-wait-skipped") == []
     assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
     started = next(e for e in q.adapter.journal.entries if e["kind"] == "quota-wait-started")
@@ -13828,7 +14523,7 @@ def test_reset_within_cap_waits(tmp_path, monkeypatch):
 def test_usage_limited_result_carries_the_parsed_reset(tmp_path, monkeypatch):
     """Every usage-limited exit carries the reset parsed from the matched line:
     the stall-expiry gate (quota wait off, silent pane), the timeout-fired look,
-    and the quota-wait cap."""
+    and the quota-wait cap; each also names the wait list it matched (DW-591)."""
     for sub in ("stall", "timeout", "cap"):
         (tmp_path / sub).mkdir()
     stall = _quota_adapter(tmp_path / "stall", monkeypatch, grace=120.0)
@@ -13836,18 +14531,21 @@ def test_usage_limited_result_carries_the_parsed_reset(tmp_path, monkeypatch):
     assert (result.status, result.parked) == ("stalled", True)
     assert result.usage_limited == stall.wait_evidence()
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT  # the session-window line
 
     timeout = _quota_adapter(tmp_path / "timeout", monkeypatch)
     result = _drive_quota(timeout, _quota_spec(tmp_path, cap_s=0.0))
     assert result.status == "timeout"
     assert result.usage_limited == timeout.wait_evidence()
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT  # the session-window line
 
     cap = _quota_adapter(tmp_path / "cap", monkeypatch)
     result = _drive_quota(cap, _quota_spec(tmp_path, cap_s=600.0))
     assert (result.status, result.parked) == ("stalled", True)
     assert _lifecycle_events(cap.adapter, "quota-wait-cap")
     assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT  # the session-window line
     for q in (stall, timeout, cap):
         assert _lifecycle_events(q.adapter, "usage-reset-unparsed") == []
 

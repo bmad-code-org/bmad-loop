@@ -72,6 +72,7 @@ from bmad_loop.tui.screens.dashboard import (
     _MIN_SIDEBAR,
     DashboardScreen,
     _Snapshot,
+    load_policy_noting_deprecations,
 )
 from bmad_loop.tui.screens.modals import (
     ConfirmModal,
@@ -566,6 +567,142 @@ async def test_empty_project_shows_hint(project_tree):
         assert screen.query_one("#runs", DataTable).row_count == 0
         header = str(screen.query_one("#runheader", RunHeader).content)
         assert "no runs found" in header
+
+
+def _write_policy(project: Path, text: str) -> Path:
+    path = project / ".bmad-loop" / "policy.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+_DEPRECATED_POLICY = '[engine]\neditor_mode = "shared"\n'
+
+
+async def test_policy_deprecation_toasts_once_on_mount(project_tree):
+    """DW-603: a deprecated policy.toml key reaches the dashboard user as one
+    persistent warning toast carrying the CLI's advice text, not as a warning
+    lost in Textual's stderr capture.
+
+    ABLATION: drop the `notify` in `note_policy_deprecations` and the
+    single-toast assertion fails."""
+    policy_file = _write_policy(project_tree.project, _DEPRECATED_POLICY)
+    with pytest.warns(policy_mod.PolicyDeprecationWarning) as caught:
+        policy_mod.load(policy_file)
+    (message,) = [str(w.message) for w in caught]
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.pause()
+        toasts = [e for e in emitted(app) if "deprecated" in e.message]
+        assert [(e.message, e.severity) for e in toasts] == [(message, "warning")]
+        (shown,) = [n for n in app._notifications if n.message == message]
+        assert shown.timeout >= 60 * 60  # stays up, not the 5s default
+        assert not shown.markup  # "[engine]" is advice text, not markup
+
+
+async def _open_and_cancel_start_run(pilot, app) -> None:
+    """Drive the start-run gesture, whose `_stories_defaults` reads policy.toml
+    in-session, then cancel back to the dashboard."""
+    await pilot.press("r")
+    await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+    await pilot.press("escape")
+    await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+    await pilot.pause()
+
+
+async def test_policy_deprecation_toast_never_repeats_in_a_session(project_tree, monkeypatch):
+    """The in-session re-read of a policy whose notice the mount already toasted
+    shows it again on no later read."""
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    _write_policy(project_tree.project, _DEPRECATED_POLICY)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.pause()
+        (first,) = dashboard(app).policy_deprecations
+        await _open_and_cancel_start_run(pilot, app)
+        toasts = [e.message for e in emitted(app) if "deprecated" in e.message]
+        assert toasts == [first]
+
+
+async def test_policy_deprecation_added_mid_session_toasts_on_next_read(project_tree, monkeypatch):
+    """A key deprecated after the dashboard mounted toasts on the next in-session
+    policy read, once: a second read adds none.
+
+    ABLATION: revert `_stories_defaults` to a bare `policy.load` and no toast is
+    shown at all."""
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    _write_policy(project_tree.project, '[adapter]\nname = "claude"\n')
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.pause()
+        assert not [e for e in emitted(app) if "deprecated" in e.message]
+        _write_policy(project_tree.project, _DEPRECATED_POLICY)
+        await _open_and_cancel_start_run(pilot, app)
+        toasts = [(e.message, e.severity) for e in emitted(app) if "deprecated" in e.message]
+        assert len(toasts) == 1 and toasts[0][1] == "warning"
+        await _open_and_cancel_start_run(pilot, app)
+        assert [
+            (e.message, e.severity) for e in emitted(app) if "deprecated" in e.message
+        ] == toasts
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[adapter]\nname = "claude"\n',
+        # warns, then refuses the wrong-typed name: the dashboard keeps its defaults
+        "[engine]\nname = 5\n",
+    ],
+    ids=["clean", "broken"],
+)
+async def test_policy_without_a_loadable_deprecation_raises_no_toast(project_tree, text):
+    _write_policy(project_tree.project, text)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.pause()
+        assert dashboard(app).policy_deprecations == ()
+        assert not [e for e in emitted(app) if "deprecated" in e.message]
+
+
+def test_policy_deprecation_captures_run_one_at_a_time(tmp_path, monkeypatch):
+    """`catch_warnings` swaps process-wide warning state, so a second capture
+    (the replan worker beside a UI-thread load) waits for the first to finish
+    rather than restoring its state out of order.
+
+    ABLATION: drop `_POLICY_LOAD_LOCK` from the capture and the second load
+    enters while the first is still inside."""
+    policy_file = _write_policy(tmp_path, '[adapter]\nname = "claude"\n')
+    real_load = policy_mod.load
+    inside, release = threading.Event(), threading.Event()
+    entered: list[str] = []
+
+    def load(path):
+        entered.append(threading.current_thread().name)
+        if len(entered) == 1:
+            inside.set()
+            release.wait(5)
+        return real_load(path)
+
+    monkeypatch.setattr(policy_mod, "load", load)
+    first = threading.Thread(
+        target=load_policy_noting_deprecations, args=(policy_file,), name="first"
+    )
+    second = threading.Thread(
+        target=load_policy_noting_deprecations, args=(policy_file,), name="second"
+    )
+    first.start()
+    assert inside.wait(5)
+    second.start()
+    second.join(0.2)
+    assert entered == ["first"]
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert entered == ["first", "second"]
 
 
 async def test_dashboard_survives_project_root_resolve_refusal(project_tree, monkeypatch):
@@ -3196,6 +3333,55 @@ async def test_start_run_modal_drops_a_superseded_tickets_preview(project, monke
         assert "init-stale" not in str(body.render())
 
 
+async def test_start_run_modal_previews_a_parent_initiative(project, monkeypatch):
+    """On a parent active initiative the tickets preview lists the children in
+    build order with their tags and what each waits on, then the first ready
+    child's board, and points at `run --dry-run` for the exact chain. Canned
+    board: nothing here runs tickets.py.
+
+    Ablation (performed): drop the `board.parent` branch in
+    `_show_tickets_preview` and no child line renders — this FAILS."""
+    from bmad_loop.initiativechain import WaitingOn
+
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(BmadLoopApp, "_stories_defaults", lambda self: ("tickets", ""))
+    children = (
+        data.ChainChild("initiative-auth", "open", 1, 4, "first ready", ()),
+        data.ChainChild(
+            "initiative-billing",
+            "open",
+            0,
+            4,
+            "waiting",
+            (WaitingOn("initiative-billing", "initiative-auth", "open"),),
+        ),
+    )
+    board = data.TicketsBoard(
+        (ticket_row("1.1", status="done"), ticket_row("1.2", plan_checkpoint=True)),
+        None,
+        "initiative-auth",
+        parent="initiative-platform",
+        children=children,
+    )
+    monkeypatch.setattr(data, "project_tickets_overview", lambda proj: board)
+    app = BmadLoopApp(project.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await pilot.press("r")
+        await until(pilot, lambda: isinstance(app.screen, StartRunModal))
+        await ready(pilot, "#ok")
+        body = app.screen.query_one("#preview-body", Static)
+        await until(pilot, lambda: "parent initiative initiative-platform" in str(body.render()))
+        rendered = str(body.render())
+        assert "2 children in build order" in rendered
+        assert "1. initiative-auth  (open; 1 of 4 tickets closed)  [first ready]" in rendered
+        assert "2. initiative-billing  (open; 0 of 4 tickets closed)  [waiting]" in rendered
+        assert "waits on: initiative-auth (open)" in rendered
+        assert "first ready: initiative-auth · 2 tickets" in rendered
+        assert "plan checkpoint: 1.2" in rendered
+        assert "run --dry-run prints the exact chain prediction" in rendered
+
+
 async def test_start_run_modal_epic_text_validation_per_mode(project, monkeypatch):
     """The epic input is text: outside tickets mode it must still be a number
     (`run --epic` exits 2 on anything else there), so a slug keeps the modal open
@@ -5761,6 +5947,206 @@ def test_epic_closure_summary_surfaces_a_layout_probe_fault(project_tree, monkey
     assert f"retrospective: {flat}" not in summary
 
 
+# `R` and the closure viewer on a tickets epic boundary open the epic-close resolve:
+# `bmad-loop resolve <run>` in a ctl window, the CLI's plain call shape. Canned
+# state only; `start_resolve_detached` is stubbed with the two-positional shape, so a
+# keyword argument would fail the call.
+
+_EPIC_REASON = "close epic-cart with bmad-agent-po (closure check) — then resume"
+
+
+def _epic_close_launches(monkeypatch, *, live: str = "dead") -> list[tuple[Path, str]]:
+    launched: list[tuple[Path, str]] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: live)
+
+    def fake_start_resolve(proj, rid):
+        launched.append((proj, rid))
+        return ""  # no window id: the launch is the assertion, not the attach
+
+    monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
+    return launched
+
+
+def _retro_pending_run(root: Path) -> Path:
+    """An epic-boundary pause on epic-cart, which this run committed ticket 1.1 of
+    with no closure recorded: the classifier's retro-pending refusal."""
+    run_dir, plan = _tickets_paused_run(
+        root, stage="epic-boundary", key="epic-cart", reason=_EPIC_REASON
+    )
+    state = load_state(run_dir)
+    task = StoryTask(story_key="1.1", epic=0, phase=Phase.DONE, commit_sha="abc")
+    task.ticket = _ticket_binding(plan, "1.1")
+    state.tasks = {"1.1": task}
+    save_state(run_dir, state)
+    return run_dir
+
+
+async def _press_resolve(app, pilot):
+    await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+    await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+    await pilot.press("R")
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_resolve_epic_boundary_opens_the_epic_close(project_tree, monkeypatch):
+    """`R` on a tickets epic boundary with a recorded closure confirms for the epic
+    and launches the plain resolve, which opens bmad-agent-po in the ctl window.
+    Ablation (performed): drop the epic-close admission in `action_resolve_run` and
+    `R` notifies "only available for a run paused at an escalation" (FAILS)."""
+    launched: list[tuple[Path, str]] = []
+    selected: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+
+    def fake_start_resolve(proj, rid):
+        launched.append((proj, rid))
+        return "@7"
+
+    monkeypatch.setattr(launch, "start_resolve_detached", fake_start_resolve)
+    monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
+    monkeypatch.setattr(launch, "ctl_window_reachable", lambda proj, rid, wid: True)
+    calls, _stamps = _patch_attach_exec(monkeypatch)
+    _tickets_paused_run(
+        project_tree.project,
+        stage="epic-boundary",
+        key="epic-cart",
+        reason=_EPIC_REASON,
+        closures={"epic-cart": "approved"},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        assert render(app.screen.query_one(".title").content).strip() == "close epic"
+        body = render(app.screen.query_one("#body Static", Static).content)
+        assert "open bmad-agent-po for epic epic-cart?" in body
+        assert "the run resumes in that window" in body
+        assert "stays held" not in body
+        await click(pilot, await ready(pilot, "#ok"))
+        await until(pilot, lambda: bool(calls))
+    assert launched == [(project_tree.project, "20260611-100000-aaaa")]
+    assert selected == ["@7"]
+
+
+async def test_resolve_epic_boundary_rejected_closure_names_the_hold(project_tree, monkeypatch):
+    """A rejected closure holds the run until the epic is closed: the confirm says so."""
+    _epic_close_launches(monkeypatch)
+    _tickets_paused_run(
+        project_tree.project,
+        stage="epic-boundary",
+        key="epic-cart",
+        reason=_EPIC_REASON,
+        closures={"epic-cart": "rejected"},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(pilot, lambda: isinstance(app.screen, ConfirmModal))
+        body = render(app.screen.query_one("#body Static", Static).content)
+        assert "open bmad-agent-po for epic epic-cart?" in body
+        assert "The run stays held until this epic is closed." in body
+
+
+@pytest.mark.parametrize("cause", ["retro-pending", "no-epic"])
+async def test_resolve_epic_boundary_refusal_notifies_the_step(project_tree, monkeypatch, cause):
+    """A boundary no closure answers (the retrospective is owed, or the pause names
+    no epic) is refused with the classifier's step; nothing is launched."""
+    launched = _epic_close_launches(monkeypatch)
+    if cause == "retro-pending":
+        _retro_pending_run(project_tree.project)
+        step = "the retrospective of epic-cart has not run or is not committed"
+    else:
+        _tickets_paused_run(
+            project_tree.project, stage="epic-boundary", key=None, reason="retro leftovers"
+        )
+        step = "commit or clean the retrospective's leftovers"
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(pilot, lambda: any(step in m for m in notifications(app)))
+        assert not isinstance(app.screen, ConfirmModal)
+        assert not any("only available for a run paused" in m for m in notifications(app))
+    assert launched == []
+
+
+async def test_resolve_stories_epic_boundary_keeps_the_escalation_refusal(
+    project_tree, monkeypatch
+):
+    """Only a tickets run's epic boundary is an epic-close: a sprint run's pause at
+    the same stage keeps the escalation refusal."""
+    launched = _epic_close_launches(monkeypatch)
+    make_run(
+        project_tree.project,
+        "20260611-100000-aaaa",
+        paused_stage="epic-boundary",
+        paused_reason="epic 1 complete",
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(
+            pilot,
+            lambda: any(
+                "only available for a run paused at an escalation" in m for m in notifications(app)
+            ),
+        )
+    assert launched == []
+
+
+async def test_resolve_epic_boundary_refused_while_possibly_live(project_tree, monkeypatch):
+    """A possibly-live engine refuses the epic-close before the confirm, as it
+    refuses an escalation resolve."""
+    launched = _epic_close_launches(monkeypatch, live="alive")
+    _tickets_paused_run(
+        project_tree.project,
+        stage="epic-boundary",
+        key="epic-cart",
+        reason=_EPIC_REASON,
+        closures={"epic-cart": "approved"},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _press_resolve(app, pilot)
+        await until(pilot, lambda: any("may still be live" in m for m in notifications(app)))
+        assert not isinstance(app.screen, ConfirmModal)
+    assert launched == []
+
+
+async def test_epic_closure_viewer_offers_the_epic_close(project_tree, monkeypatch):
+    """The closure viewer of a closure target offers `Close with bmad-agent-po`,
+    which launches the plain resolve. Ablation (performed): drop the viewer's
+    `close-epic` action and the button is absent (FAILS)."""
+    launched = _epic_close_launches(monkeypatch)
+    _tickets_paused_run(
+        project_tree.project,
+        stage="epic-boundary",
+        key="epic-cart",
+        reason=_EPIC_REASON,
+        closures={"epic-cart": "rejected"},
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        button = await ready(pilot, "#act-close-epic")
+        assert "Close with bmad-agent-po" in str(button.label)
+        await click(pilot, button)
+        await until(pilot, lambda: bool(launched))
+    assert launched == [(project_tree.project, "20260611-100000-aaaa")]
+
+
+async def test_epic_closure_viewer_refusal_offers_no_epic_close(project_tree, monkeypatch):
+    """A retro-pending boundary is no closure target: the viewer keeps only its
+    existing verbs (the reason already names the step)."""
+    _epic_close_launches(monkeypatch)
+    _retro_pending_run(project_tree.project)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, PauseReasonModal)
+        await ready(pilot, "#act-resume")
+        assert not app.screen.query("#act-close-epic")
+
+
 async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatch):
     """R13: "Request replan" on a tickets run re-opens the plan to `draft` only
     through `TicketTree.mark(reason="replan")` — pinned to the run's initiative, on
@@ -5790,7 +6176,7 @@ async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatc
     tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
     opened: list[tuple[Path, str | None]] = []
 
-    def factory(root: Path, pin: str | None):
+    def factory(root: Path, pin: str | None, *, folder: Path | None = None):
         opened.append((root, pin))
         return tree
 
@@ -5811,6 +6197,55 @@ async def test_replan_in_tickets_mode_goes_through_mark(project_tree, monkeypatc
     assert [(e["reason"], e["after"]) for e in marks] == [("replan", "draft")]
 
 
+async def test_replan_of_a_chained_run_marks_the_child_through_the_parent(
+    project_tree, monkeypatch
+):
+    """A chained run's replan marks the plan through the main-checkout tree pinned
+    as its engine pins it — the parent the live config names, routed through the
+    child's folder — read from the run state re-read under the lock. Ablation
+    (performed): pass the run's initiative and `folder=None` again and this FAILS."""
+    from bmad_loop import bmadconfig
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    root = project_tree.project
+    run_dir, plan = _tickets_paused_run(
+        root, stage="plan-checkpoint", plan_status="ready-for-dev", initiative="init-child"
+    )
+    state = load_state(run_dir)
+    state.parent_initiative = "init-a"
+    save_state(run_dir, state)
+    parent = root / "_bmad-output" / "init-a"
+    loaded = bmadconfig.ProjectPaths(
+        project=root,
+        implementation_artifacts=parent,
+        planning_artifacts=parent,
+        era="v7",
+        active_initiative="init-a",
+        initiative_folder=parent,
+    )
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda _p, *, want_tickets=False: loaded)
+    tree = _replan_tree(plan)
+    opened: list[tuple[Path, str | None, Path | None]] = []
+
+    def factory(tree_root: Path, pin: str | None, *, folder: Path | None = None):
+        opened.append((tree_root, pin, folder))
+        return tree
+
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", factory)
+    _no_store_conflict(monkeypatch)
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(pilot, lambda: calls == ["20260611-100000-aaaa"])
+    assert opened == [(root, "init-a", root / "_bmad-output" / "init-child")]
+    assert [(m.target, m.reason) for m in tree.marks] == [("draft", "replan")]
+
+
 async def test_replan_in_tickets_mode_refused_mark_does_not_resume(project_tree, monkeypatch):
     """A transition the chokepoint refuses (here: the plan is already `draft`, a
     no-op) or a `tickets.py` fault leaves the run paused with a visible error.
@@ -5829,7 +6264,7 @@ async def test_replan_in_tickets_mode_refused_mark_does_not_resume(project_tree,
     row = ticket_row("1.1", status="draft")
     tree = FakeTicketTree(plan.parent, finds={"1.1": fake_find(row, plan.parent)})
     tree.finds["1.1"] = dataclasses.replace(tree.finds["1.1"], plan=str(plan))
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     _no_store_conflict(monkeypatch)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
@@ -5887,7 +6322,7 @@ async def test_replan_in_tickets_mode_refuses_a_changed_store(project_tree, monk
 
     monkeypatch.setattr(ticketstore, "store_conflict", conflict)
     tree = _replan_tree(plan)
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
@@ -5899,6 +6334,49 @@ async def test_replan_in_tickets_mode_refuses_a_changed_store(project_tree, monk
     assert seen == [("tickets", recorded)]
     assert tree.marks == []
     assert calls == []
+
+
+@pytest.mark.parametrize("chained", [True, False], ids=["chained", "unchained"])
+async def test_replan_judges_a_chained_childs_own_store(project_tree, monkeypatch, chained):
+    """The replan's ticket-store refusal judges a chained run's CHILD store
+    (`initiative=<child>`), as the detached resume does; an unchained run's call
+    carries no `initiative`. Ablation (performed): drop the `initiative` in
+    `_ticket_replan_worker`'s store check and the chained row FAILS."""
+    from bmad_loop import ticketstore
+    from bmad_loop.tui import app as app_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "resume_detached", lambda proj, rid: calls.append(rid))
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
+    run_dir, plan = _tickets_paused_run(
+        project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
+    )
+    if chained:
+        state = load_state(run_dir)
+        state.initiative, state.parent_initiative = "initiative-child", "initiative-platform"
+        save_state(run_dir, state)
+    seen: list[dict] = []
+
+    def conflict(_project, _source, _isolation, **kw):
+        seen.append(kw)
+        return "the ticket store changed since this run started"
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    tree = _replan_tree(plan)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await _open_review(app, pilot, SpecReviewModal)
+        await click(pilot, await ready(pilot, "#act-replan"))
+        await until(
+            pilot,
+            lambda: any("ticket store changed" in m for m in notifications(app)),
+        )
+    (kw,) = seen
+    assert ("initiative" in kw) == chained
+    assert kw.get("initiative") == ("initiative-child" if chained else None)
+    assert (tree.marks, calls) == ([], [])
 
 
 async def test_replan_in_tickets_mode_refuses_a_worktree_isolation_conflict(
@@ -5925,7 +6403,7 @@ async def test_replan_in_tickets_mode_refuses_a_worktree_isolation_conflict(
         project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
     )
     tree = _replan_tree(plan)
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
@@ -5963,7 +6441,7 @@ async def test_replan_in_tickets_mode_refuses_a_worktree_mount_swapped_for_a_lin
     roots: list[Path] = []
     tree = _replan_tree(plan)
 
-    def make_tree(root, _pin):
+    def make_tree(root, _pin, folder=None):
         roots.append(root)
         return tree
 
@@ -6001,7 +6479,7 @@ async def test_replan_in_tickets_mode_refuses_a_newer_checkpoint(project_tree, m
         project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
     )
     tree = _replan_tree(plan)
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
@@ -7636,6 +8114,12 @@ _LIFECYCLE_WORKERS = {"D": "_delete_run_worker", "A": "_archive_run_worker"}
             runs_mod.StateRootError("no usable state root"),
             "archive failed",
         ),
+        (
+            "A",
+            "archive_run",
+            runs_mod.HeldSweepClosesError("20260611-100000-aaaa", ["DW-1"], action="archive"),
+            "archive failed",
+        ),
     ],
 )
 def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_visible(
@@ -7649,7 +8133,7 @@ def test_lifecycle_workers_report_authoritative_failures_and_keep_the_run_visibl
     Ablation: omit either new exception type from the worker catch and its rows
     raise out of the worker body instead of posting the toast. Verified. The same
     holds for `HeldSweepClosesError` (a sweep run holding unlanded ledger closes,
-    DW-571) in the delete worker's catch."""
+    DW-571, DW-572) in the delete and archive workers' catches."""
 
     def fail(*_args, **_kwargs):
         raise failure
@@ -9471,6 +9955,46 @@ def test_escalation_rearm_judges_a_v7_sweeps_store_as_a_tickets_run(project_v7, 
     assert "the ticket store is not supported" in notes
 
 
+@pytest.mark.parametrize("chained", [True, False], ids=["chained", "unchained"])
+def test_escalation_rearm_judges_a_chained_childs_own_store(project_v7, monkeypatch, chained):
+    """The re-arm's ticket-store refusal judges a chained child's sweep on the
+    CHILD's store (`initiative=<child>`), as the resume it folds in does; an
+    unchained sweep's call carries no `initiative`. Ablation (performed): drop the
+    `initiative` in `_do_rearm`'s store check and the chained row FAILS."""
+    from conftest import escalated_run
+
+    from bmad_loop import runs, ticketstore
+    from bmad_loop.journal import load_state
+
+    run_dir = escalated_run(project_v7.project, "r1", story_key="1", run_type="sweep").run_dir
+    state = load_state(run_dir)
+    if chained:  # a chained child's sweep, as `compose_sweep` pins it
+        state.initiative, state.parent_initiative = "initiative-child", project_v7.initiative
+    else:
+        state.initiative = project_v7.initiative
+    save_state(run_dir, state)
+    seen: list[dict] = []
+
+    def conflict(_project, _source, _isolation, **kw):
+        seen.append(kw)
+        return "the ticket store is not supported"
+
+    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
+    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
+    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed"))
+    notes: list[str] = []
+    app = BmadLoopApp(project_v7.project)
+    monkeypatch.setattr(app, "notify", lambda msg, **_k: notes.append(str(msg)))
+    monkeypatch.setattr(app, "_do_resume", lambda _run_id: None)
+
+    app._do_rearm(run_dir.name, run_dir, "1")
+
+    assert "the ticket store is not supported" in notes
+    (kw,) = seen
+    assert ("initiative" in kw) == chained
+    assert kw.get("initiative") == ("initiative-child" if chained else None)
+
+
 def test_escalation_rearm_refuses_a_sweep_on_a_switched_initiative(project_v7, monkeypatch):
     """`cli.cmd_resolve`'s re-arm parity for the sweep's initiative pin: a v7 sweep
     started with no initiative active, re-armed while one is, is toasted with the
@@ -9510,7 +10034,7 @@ def test_escalation_rearm_rejudges_a_sweeps_initiative_under_the_lock(project_v7
     run_dir = escalated_run(project_v7.project, "r1", story_key="1", run_type="sweep").run_dir
     judged: list = []
 
-    def judge(state, paths):
+    def judge(state, paths, **_kw):
         judged.append(state)
         return "initiative switched" if len(judged) > 1 else None
 
@@ -12350,7 +12874,7 @@ async def test_replan_locked_reread_refuses_a_runs_dir_swapped_for_a_foreign_tre
         project_tree.project, stage="plan-checkpoint", plan_status="ready-for-dev"
     )
     tree = _replan_tree(plan)
-    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin: tree)
+    monkeypatch.setattr(app_mod, "_replan_ticket_tree", lambda _root, _pin, folder=None: tree)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)

@@ -34,9 +34,16 @@ events = { SessionStart = "SessionStart", Stop = "Stop" }
 # grant instead (it replaces `--sandbox`: Codex refuses `sandbox_mode` beside
 # `default_permissions`). Network stays off. Per Codex's agent-approvals-security
 # and permissions docs; live-checked 2026-10-27 on codex-cli 0.164.0.
-# KNOWN GAP: in a linked worktree (`scm.isolation = "worktree"`) the gitdir lives
-# under the main repo's `.git/worktrees/<name>` and stays read-only (Codex grants
-# only exact paths there, no globs), so git add/commit fail in that checkout.
+# In a linked worktree (`scm.isolation = "worktree"`) `.git` is a file, and git
+# writes the worktree's gitdir (`<main>/.git/worktrees/<name>`, its index) and the
+# common dir (`<main>/.git`, objects and refs), both read-only to the sandbox.
+# `linked_worktree_args` grants the two exact paths (Codex grants no globs): the
+# adapter appends them after `args` only when the session's cwd is a linked
+# worktree, each placeholder rendered as a TOML string. A child profile extends
+# `bmad_loop` (its filesystem map merges) and a later `default_permissions` selects
+# it: a second `filesystem` table on `bmad_loop` would REPLACE the one above, and a
+# dotted per-path key cannot work since Codex splits `-c` keys on every `.`. Both
+# grants are needed. Live-checked 2026-10-28 on codex-cli 0.165.0.
 # Windows is unverified, hence the platform list.
 [permission_modes.sandboxed]
 args = [
@@ -50,3 +57,11 @@ args = [
   "never",
 ]
 platforms = ["linux", "darwin"]
+linked_worktree_args = [
+  "-c",
+  'permissions.bmad_loop_worktree.extends="bmad_loop"',
+  "-c",
+  'permissions.bmad_loop_worktree.filesystem={{gitdir}="write",{common_dir}="write"}',
+  "-c",
+  'default_permissions="bmad_loop_worktree"',
+]

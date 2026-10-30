@@ -306,7 +306,7 @@ description = "reasoning effort, free-form (provider/model-specific, e.g. high, 
 [[section.field]]
 key = "extra_args"
 kind = "args"
-description = "when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts"
+description = "when set, replaces the CLI profile's permission-bypass flags (its bypass_args), so repeat them (e.g. claude: --permission-mode bypassPermissions) or unattended sessions may stall on permission prompts · under a sandboxed permission_mode it also drops the mode's linked-worktree gitdir grant, so a sandboxed codex session under worktree isolation cannot commit"
 [[section.field]]
 key = "permission_mode"
 kind = "select"

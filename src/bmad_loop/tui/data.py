@@ -38,6 +38,7 @@ from rich.text import Text
 from .. import (
     bmadconfig,
     deferredwork,
+    initiativechain,
     parked,
     policy,
     sprintstatus,
@@ -80,7 +81,9 @@ from ..runs import (
     _StatSig,
     list_run_dirs,
     liveness,
+    paths_for_state,
     rebase_recorded_project_path,
+    tree_pin,
 )
 
 # ------------------------------------------------------------- run watching
@@ -1130,16 +1133,42 @@ def _stories_board(project: Path, state: RunState) -> list[stories.StoryRow] | N
 
 
 @dataclass(frozen=True)
+class ChainChild:
+    """One child of a parent initiative on the start-run preview, in build order:
+    its status as a prerequisite (:func:`~bmad_loop.initiativechain.prerequisite_status`),
+    its closed and total ticket counts (0 and 0 without a folder), its tag
+    (:func:`_chain_tag`), and each prerequisite it still waits on with that
+    prerequisite's status."""
+
+    slug: str
+    status: str
+    closed: int
+    total: int
+    tag: str
+    waiting_on: tuple[initiativechain.WaitingOn, ...]
+
+
+@dataclass(frozen=True)
 class TicketsBoard:
     """The tickets-mode board for one initiative: ``tickets.py status``'s rows in
     the script's order, or why the tree could not be read. A read that failed
     carries ``fault`` (and no rows), never an empty board that would read as "no
     tickets". ``initiative`` is the one the board was read for (``""`` when there
-    was none to read)."""
+    was none to read).
+
+    On a parent initiative (the start-run preview only) ``parent`` names it and
+    ``children`` lists its children in build order; the rows are those of the
+    child a run would build first (``initiative``), or, when no child can start,
+    there are none, ``initiative`` is ``""`` and ``chain_end`` says why
+    (:data:`~bmad_loop.initiativechain.ChainEnd`). A fault reading that child's
+    board keeps ``children``."""
 
     rows: tuple[ticketmodel.TicketRow, ...]
     fault: str | None
     initiative: str
+    parent: str = ""
+    children: tuple[ChainChild, ...] = ()
+    chain_end: str | None = None
 
 
 # A board read that failed is retried after this long even when no file changed:
@@ -1147,9 +1176,9 @@ class TicketsBoard:
 # next edit could outlive its cause. An answer is kept until a file changes.
 TICKETS_FAULT_RETRY_S = 30.0
 
-# (project, initiative, initiative folder) -> (tree signature, board, monotonic
-# time of the read)
-_tickets_cache: dict[tuple[Path, str, Path], tuple[object, TicketsBoard, float]] = {}
+# (project, initiative, initiative folder, parent the tree is pinned to or None)
+# -> (tree signature, board, monotonic time of the read)
+_tickets_cache: dict[tuple[Path, str, Path, str | None], tuple[object, TicketsBoard, float]] = {}
 
 
 def _tickets_tree_sig(project: Path, folder: Path) -> object:
@@ -1193,20 +1222,37 @@ def _tickets_tree_sig(project: Path, folder: Path) -> object:
     )
 
 
-def _board_ticket_tree(project: Path, initiative: str) -> tickettree.TicketTreeLike:
+def _board_ticket_tree(
+    project: Path, initiative: str, *, folder: Path | None = None
+) -> tickettree.TicketTreeLike:
     """The tree the board reads: the project's installed ``tickets.py``, pinned
     to ``initiative`` so a switched ``active_initiative`` reads as a fault, not
-    as another initiative's board. A seam: tests swap in a ``FakeTicketTree``."""
-    return tickettree.TicketTree(project, pinned_initiative=initiative)
+    as another initiative's board, through a parent's child ``folder`` when
+    given. A seam: tests swap in a ``FakeTicketTree``."""
+    return tickettree.TicketTree(project, pinned_initiative=initiative, folder=folder)
 
 
-def initiative_board(project: Path, initiative: str, folder: Path) -> TicketsBoard:
+def _parent_view(project: Path, parent: str, folder: Path) -> ticketmodel.ParentView:
+    """``tickets.py next <folder>`` on the parent initiative ``parent``, pinned to
+    it: its children, which are ready and what each waits on."""
+    return tickettree.TicketTree(project, pinned_initiative=parent).parent_next(folder)
+
+
+def initiative_board(
+    project: Path, initiative: str, folder: Path, *, parent: str | None = None
+) -> TicketsBoard:
     """``initiative``'s board, stat-gated on :func:`_tickets_tree_sig`: the
     script is spawned only when that signature changes (or a cached fault is
     older than :data:`TICKETS_FAULT_RETRY_S`). ``tickets.py`` is project code (it
     imports the project's ``config_utils``) and may run for seconds, so call this
-    from a worker thread, never the UI thread."""
-    key = (project, initiative, folder)
+    from a worker thread, never the UI thread.
+
+    With ``parent``, ``initiative`` is a child of that parent initiative: the
+    tree is pinned to the parent (the live ``[core] active_initiative`` names it)
+    and reads through ``folder``, as a chained run's tree does
+    (:func:`~bmad_loop.runs.tree_pin`). Without, it is pinned to ``initiative``
+    and reads the active initiative."""
+    key = (project, initiative, folder, parent)
     sig = _tickets_tree_sig(project, folder)  # before the read: an edit mid-read re-reads
     cached = _tickets_cache.get(key)
     if cached is not None and cached[0] == sig:
@@ -1214,7 +1260,11 @@ def initiative_board(project: Path, initiative: str, folder: Path) -> TicketsBoa
         if board.fault is None or time.monotonic() - cached[2] < TICKETS_FAULT_RETRY_S:
             return board
     try:
-        view = _board_ticket_tree(project, initiative).status()
+        if parent is None:
+            tree = _board_ticket_tree(project, initiative, folder=None)
+        else:
+            tree = _board_ticket_tree(project, parent, folder=folder)
+        view = tree.status()
     except tickettree.TicketsError as e:
         board = TicketsBoard((), f"tickets.py {e.kind}: {e}", initiative)
     else:
@@ -1229,9 +1279,18 @@ def tickets_overview(project: Path, state: RunState) -> TicketsBoard:
     :func:`initiative_board` reads it — off the UI thread. The recorded folder
     moves with a renamed project (:func:`~bmad_loop.runs.rebase_recorded_project_path`),
     so the signature watches the tree the script reads. A run with no pinned
-    initiative has no tree to read and says so in ``fault``."""
+    initiative has no tree to read and says so in ``fault``.
+
+    A chained child run (``RunState.parent_initiative`` set) is pinned and read
+    as ``bmad-loop status`` reads it (``runs.recorded_tree_pin`` in the main
+    checkout): :func:`~bmad_loop.runs.tree_pin` over the live paths re-rooted on
+    the child (:func:`~bmad_loop.runs.paths_for_state`), from the stat-gated
+    tickets-mode paths. A config that cannot be read, or no longer names the
+    parent, is the board's ``fault``."""
     if not state.initiative or not state.initiative_folder:
         return TicketsBoard((), "this run pinned no initiative", state.initiative)
+    if state.parent_initiative is not None:
+        return _chained_run_board(project, state)
     folder = Path(state.initiative_folder)
     if not folder.is_absolute():
         folder = project / folder
@@ -1239,19 +1298,110 @@ def tickets_overview(project: Path, state: RunState) -> TicketsBoard:
     return initiative_board(project, state.initiative, folder)
 
 
+def _chained_run_board(project: Path, state: RunState) -> TicketsBoard:
+    """:func:`tickets_overview` for a chained child run (see there)."""
+    paths = _project_paths(project, want_tickets=True)
+    if paths is None:
+        why = _tickets_paths_fault.get(project, "the project is not initialized")
+        return TicketsBoard((), f"BMAD config unreadable: {why}", state.initiative)
+    try:
+        pin, folder = tree_pin(state, paths_for_state(paths, state))
+    except (bmadconfig.BmadConfigError, ValueError) as e:
+        return TicketsBoard((), str(e), state.initiative)
+    if pin is None or folder is None:  # tree_pin always roots a chained run on its child
+        return TicketsBoard((), "this run pinned no initiative", state.initiative)
+    return initiative_board(project, state.initiative, folder, parent=pin)
+
+
 def project_tickets_overview(project: Path) -> TicketsBoard:
     """The board a new tickets run would start from: the project's live ``[core]
     active_initiative``. A project that is not v7, or names no initiative, says
     so in ``fault``. Resolves as ``bmad-loop run`` does in tickets mode, so a mixed
     v6/v7 install previews its v7 initiative. Spawns like :func:`initiative_board`
-    — off the UI thread."""
+    — off the UI thread.
+
+    A parent initiative (its ``tickets.toml`` lists ``[[initiative]]`` children,
+    read as ``bmad-loop run`` detects one) previews as its chain:
+    :func:`_parent_board`. A ``tickets.toml`` that cannot be read is a fault."""
+    from .. import install  # lazy: pulls the adapters; keep this module import-light
+
     paths = _project_paths(project, want_tickets=True)
     if paths is None:
         why = _tickets_paths_fault.get(project, "the project is not initialized")
         return TicketsBoard((), f"BMAD config unreadable: {why}", "")
     if paths.era != "v7" or paths.initiative_folder is None or not paths.active_initiative:
         return TicketsBoard((), "no v7 active initiative ([core] active_initiative)", "")
+    children, breakdown, fault = install._initiative_children(paths.initiative_folder)
+    if fault:
+        return TicketsBoard((), f"cannot read {breakdown}: {fault}", "")
+    if children is not None:
+        return _parent_board(project, paths)
     return initiative_board(project, paths.active_initiative, paths.initiative_folder)
+
+
+def _chain_tag(child: ticketmodel.ChildInitiative, pick: initiativechain.ChildPick) -> str:
+    """The start-run preview's tag for one child of a parent initiative, read from
+    the re-judged child (``pick.children``): ``first ready`` (the child
+    :func:`_parent_board` shows the board of), ``closes first`` (drained, so a run
+    marks it done before its first pick), ``done``/``dropped``, ``waiting``,
+    ``no folder``, or ``ready``."""
+    if pick.child is not None and child.slug == pick.child.slug:
+        return "first ready"
+    if child.slug in pick.closed:
+        return "closes first"
+    if child.status in ("done", "dropped"):
+        return child.status
+    if not child.ready:
+        return "waiting"
+    if child.folder is None:
+        return "no folder"
+    return "ready"
+
+
+def _parent_board(project: Path, paths: bmadconfig.ProjectPaths) -> TicketsBoard:
+    """The start-run preview of the parent active initiative ``paths`` name: its
+    children (``tickets.py next <parent>``, pinned to the parent) and the board of
+    the first ready child once a run has closed every drained child, as it does
+    before its first pick (:func:`~bmad_loop.initiativechain.next_child_after_close`),
+    read through that child's folder with the tree pinned to the parent. Each
+    child's tag and waits come from the re-judged view; its status and counts
+    are the tree as it reads now.
+
+    An approximation of the chain ``bmad-loop run`` builds: its pick also passes
+    over a ready child whose fresh pick dispatches nothing, and it leaves open a
+    drained child whose fresh pick still finds work, which takes a
+    ``next``/``status`` read per child; ``run --dry-run`` prints that prediction."""
+    parent = paths.active_initiative
+    folder = paths.initiative_folder
+    assert parent and folder is not None  # project_tickets_overview
+    try:
+        view = _parent_view(project, parent, folder)
+    except tickettree.TicketsError as e:
+        return TicketsBoard((), f"tickets.py {e.kind}: {e}", "", parent=parent)
+    pick = initiativechain.next_child_after_close(view)
+    children = tuple(
+        ChainChild(
+            slug=c.slug,
+            status=initiativechain.prerequisite_status(view, c.slug),
+            closed=initiativechain.closed_tickets(c),
+            total=c.counts.get("total", 0),
+            tag=_chain_tag(c, pick),
+            waiting_on=tuple(w for w in pick.waiting_on if w.slug == c.slug),
+        )
+        for c in pick.children
+    )
+    if pick.child is None:
+        return TicketsBoard((), None, "", parent=parent, children=children, chain_end=pick.end)
+    slug = pick.child.slug
+    try:
+        child_folder = paths.with_initiative(slug).initiative_folder
+    except ValueError as e:
+        return TicketsBoard(
+            (), f"initiative chain {parent}: {e}", slug, parent=parent, children=children
+        )
+    assert child_folder is not None  # with_initiative
+    board = initiative_board(project, slug, child_folder, parent=parent)
+    return TicketsBoard(board.rows, board.fault, slug, parent=parent, children=children)
 
 
 def _tickets_board(project: Path, state: RunState) -> TicketsBoard:

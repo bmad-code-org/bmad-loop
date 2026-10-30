@@ -50,15 +50,18 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Description:** An opt-in third story source for BMAD v7 projects. It drives the same pipeline from the active initiative's ticket tree through the project's own `tickets.py`, dispatching each ticket as `/<dev skill> ticket <ref>` in initiative build order, and, under the default `mark_done`, marks a verified ticket `done` itself.
 - **Properties:**
   - A run is pinned to `[core] active_initiative` at start; a changed initiative pauses the run at `ticket-tree` instead of building another initiative's ticket.
-  - The tree is read in the layout the installed `tickets.py` uses: a `tickets/` folder inside each initiative and epic, or the preview-era flat layout. A parent initiative is refused (`tickets.initiative-parent`), and an epic declared but not sliced yet holds no tickets.
+  - The tree is read in the layout the installed `tickets.py` uses: a `tickets/` folder inside each initiative and epic, or the preview-era flat layout. A parent initiative passes the preflight only under worktree isolation without `gates.retrospective = "auto"`, with the store checks run for each sliced child (`tickets.initiative-parent`), and an epic declared but not sliced yet holds no tickets.
+  - `run` on a parent initiative builds its children one run each in build order, writing every drained child's initiative `status: done` before each pick (one a stopped chain left open included), under one `--max-stories` budget; a child run that does not finish holds the chain until `resume` or `resolve` drives it to finished, and the chain's end names what each waiting child waits on. Each child's run pauses at `epic-boundary` after every epic it finishes, as a one-initiative run does.
+  - `run --dry-run` on a parent initiative writes nothing: it lists the children in build order with a tag, the child a run builds first and that child's dry run; the TUI start-run preview lists the children and the first ready child's board, and a chained child run's dashboard board shows that child.
   - A hitl ticket pauses at `ticket-hitl` and a ticket that needs refining at `ticket-refine`, both before any session runs for it.
   - bmad-loop writes a plan's `status` and `blocked_*` only through `tickets.py mark`, under a lock, read back afterwards and checked against one plan transition table; it never writes `dropped` or an epic file.
   - Tickets this run did not start are never dispatched or marked.
+  - A resume never rebinds a unit it started: a ticket moved with `tickets.py move`, or a plan gone, while the run was paused pauses it at `ticket-tree`, naming the old and new ref and plan.
   - A store tracked in the checkout is marked inside the unit's commit; a shared store's mark is latched and made after the code lands, and a store with its own repository gets a plan-only commit.
   - `run` refuses a tracker store and the multi-repo workspace layout before creating a run directory; resume and resolve refuse a store whose layout changed.
   - When a run without `--story` finishes an epic, it runs the retrospective and pauses once at `epic-boundary` for a person to close the epic; a `rejected` verdict pauses every later pick while the epic stays open, and an epic gated on an open one waits for its closure.
 - **Config:** `[stories] source = "tickets"`, `[core] active_initiative`, `[tickets] mark_done`, `[tickets] thorough_review`, `[gates] retrospective`; `bmad-loop run --epic ID|SLUG`, `--story REF`, `--dry-run`; `bmad-loop confirm <ref>`
-- **Tested by:** `tests/test_tickets_engine.py`, `tests/test_tickets_source.py`, `tests/test_tickettree.py`, `tests/test_ticketmodel.py`, `tests/test_ticketstore.py`, `tests/test_statemachine.py`, `tests/test_tickets_e2e.py`
+- **Tested by:** `tests/test_tickets_engine.py`, `tests/test_tickets_source.py`, `tests/test_tickettree.py`, `tests/test_ticketmodel.py`, `tests/test_ticketstore.py`, `tests/test_statemachine.py`, `tests/test_initiativechain.py`, `tests/test_cli.py`, `tests/test_tui_data.py`, `tests/test_tickets_e2e.py`
 - **Docs:** [Ticket-tree mode guide](tickets-guide.md), [Setup: BMAD v7](setup-guide.md#installing-on-bmad-v7-bmad-setup), [Configuration: [tickets]](reference/configuration.md#tickets), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [TUI: tickets mode](tui-guide.md#tickets-mode)
 
 ### Trust-nothing verification
@@ -102,6 +105,8 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
   - A dev, review, fix, triage, migration or blocking-workflow session that did no work, or sat parked on a prompt only a human should answer, pauses the run instead of being charged; a non-blocking workflow's is journaled and the run continues.
   - Parked-prompt and usage-limit patterns match a pane line even when a narrow window wraps it across two or three rows, so a wrapped dialog footer still withholds the stall nudge.
+  - `validate --probes` launches each distinct role launch whose `generic`-adapter profile declares `parked_prompt_patterns` once, with its permission args and no prompt, never types into it, and fails when the first screen shows a startup dialog that would park an unattended session. A profile without patterns is reported as not launched.
+  - A permission-prompt latch clears once the transcript is written after it, so a session that was approved and then went silent gets the stall nudge instead of ending `stalled` and parked.
   - A session whose window is alive when the timeout fires ends `timeout` marked parked, and pauses instead of retrying, when a parked hook signal is latched and the transcript has not been written since it, or when a parked-prompt pane pattern is present and the transcript is idle. A latch the transcript has been written past is no evidence, at any idle age.
   - While the visible pane shows the coding CLI waiting out a usage-limit reset and the transcript is idle, the session timeout is frozen and the stall nudge held, for at most `[limits] quota_wait_max_min` (default 300; 0 = off) cumulative minutes per session; past the cap, or when the parsed reset lies beyond it, the session pauses with a usage-limit reason.
   - Before an attempt is reset, its commits go to an `attempt-preserve/<run>-<tip8>` branch and uncommitted work to a `refs/attempt-preserve-dirty/*` snapshot.
@@ -126,7 +131,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 ### Typed escalations and resolve
 
 - **Stability:** stable
-- **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, or adopting a kept branch.
+- **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, or adopting a kept branch, and closes a tickets epic at an `epic-boundary` pause.
 - **Properties:**
   - A CRITICAL escalation marks the story `escalated`, sends a `CRITICAL escalation: <story>` notice and pauses the run at `escalation`.
   - A pause that is not a CRITICAL contradiction is titled by its reason: `Paused (parked prompt): <story>`, `Paused (no work): <story>`, `Paused (usage limit): <story>` or `Paused (environment fault): <story>`.
@@ -137,9 +142,10 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Re-arming resets the story to `pending` with fresh dev-attempt and review-cycle budgets.
   - `--reverify` re-runs `[verify]` on a deferred or environment-fault story's kept work without a dev session; on a finished run it replays a kept worktree unit in a new run.
   - In tickets mode the re-arm moves the ticket's plan through `tickets.py mark` and clears its `blocked_*` fields; a refused move puts the plan back byte for byte.
-- **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`
-- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`, `tests/test_runs.py`, `tests/test_tui_app.py`
-- **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [resolve CLI reference](reference/cli.md#resolve)
+  - On a tickets `epic-boundary` pause, resolve opens bmad-agent-po on the paused epic (`--no-interactive`: no session), then resumes only when the epic reads `done` or `dropped` and its epic folder has no uncommitted change; the session's exit code is never trusted, and a failed check exits 1 with the run still paused.
+- **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`, `--at-reset`, `--margin-min`
+- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`, `tests/test_runs.py`, `tests/test_tui_app.py`, `tests/test_tickets_source.py`, `tests/test_tickets_e2e.py`
+- **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [Epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [resolve CLI reference](reference/cli.md#resolve)
 
 ### Human-only actions
 
@@ -166,12 +172,13 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `bmad-loop resume` re-runs the probes; if they pass, the withheld session launches with no rollback, and otherwise the run pauses again unchanged.
   - A verify command exiting 126, 127 or `[verify] env_fault_rc` is an environment fault, not a code failure.
   - A non-completed session whose log tail matches its profile's `env_fault_patterns` pauses instead of spending a dev attempt.
-  - opencode is classified from model-free files only: the server's stdout, plus on OpenCode 2.x the adapter-written `provider-errors.log` (one line per provider-error event). Its 2.x patterns cover the `provider.rate-limit`, `provider.quota` and `provider.transport` error types.
+  - opencode is classified from model-free files only: the server's stdout, plus on OpenCode 2.x the adapter-written `provider-errors.log` (one line per provider-error event). Its 2.x environment-fault patterns cover the `provider.rate-limit`, `provider.transport`, `provider.internal` (a provider 5xx), `provider.auth` and `provider.no-route` error types; `provider.quota` is a usage limit, and error types the session's own request can cause (`provider.invalid-request`, `provider.invalid-output`) stay unclassified.
   - A pattern match is overruled when the session's tracked token usage is nonzero; that session is charged like any failure.
-  - A session whose visible pane shows a usage-limit line from its profile's `usage_limit_patterns` or `usage_wait_patterns`, on an idle session at stall-grace expiry or when the timeout fires, pauses with a `usage limit:` reason and is never charged, whatever its token usage; the same line found only in the log tail stays subject to the overrule.
+  - A session that times out, stalls or crashes after a live usage-limit sighting pauses with a `usage limit:` reason and is never charged, whatever its token usage. A live sighting is a match for the profile's `usage_limit_patterns` or `usage_wait_patterns` from one of two sources: the visible pane of a tmux-hosted CLI such as claude, on an idle session at stall-grace expiry or when the timeout fires; or an opencode 2.x provider-error line, matched as the adapter writes it while the session runs (opencode's shipped profile lists `provider.quota` there as a blocking limit). The same line found only in the log tail stays subject to the overrule.
   - When the usage-limit line names a reset time, the pause reason ends its evidence with `; resets <time>` (ISO-8601 when the time resolves, the raw text otherwise).
+  - `bmad-loop resolve --at-reset` on a usage-limit pause the CLI waits out waits in the foreground until the recorded reset plus `--margin-min` (default 2), then re-arms and resumes; a credit-exhaustion pause, an unresolved reset or one past `[limits] quota_wait_max_min` is refused before any wait.
 - **Config:** `[environment] probes`, `[environment] probe_timeout_s`, `[verify] env_fault_rc`, `[limits] quota_wait_max_min`; profile keys `env_fault_patterns`, `usage_limit_patterns`, `usage_wait_patterns`
-- **Tested by:** `tests/test_engine.py`, `tests/test_escalation.py`, `tests/test_env_fault_patterns.py`, `tests/test_env_fault.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`, `tests/test_usagereset.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_env_fault_patterns.py`, `tests/test_env_fault.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`, `tests/test_usagereset.py`
 - **Docs:** [Environment faults](escalations-guide.md#environment-faults), [Usage-limit pauses](escalations-guide.md#usage-limit-pauses), [Usage-limit signals](adapter-authoring-guide.md#usage-limit-signals), [[environment] reference](reference/configuration.md#environment), [[verify] reference](reference/configuration.md#verify), [Profile field reference](adapter-authoring-guide.md#cliprofile)
 
 ### Resumable runs and graceful stop
@@ -217,9 +224,9 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - An auto retro succeeds only if the session completed, result.json says done, the board reads done and a retro doc exists. It is then committed as `chore(retro): epic N retrospective`.
   - A failed or refused auto retro (unless already done) tells you to run it by hand and never fails the run. If it leaves uncommitted changes, the run pauses at the epic boundary.
   - The retro doc's verdict is reported in the done notice. A `rejected` verdict sends an extra attention notice, and the run continues.
-  - Tickets mode keys the epic by slug. Once this run finishes an epic, `auto` runs `/bmad-retrospective -H <epic-slug>` and commits only `<epic-slug>-retrospective.md`; a valid document already there counts as done. Whatever the mode, the run records the verdict and pauses at `epic-boundary` for you to close the epic with bmad-agent-po. A `rejected` verdict pauses again at every pick while the epic stays open; any other pauses once.
+  - Tickets mode keys the epic by slug. Once this run finishes an epic, `auto` runs `/bmad-retrospective -H <epic-slug>` and commits only `<epic-slug>-retrospective.md`; a valid document already there counts as done. Whatever the mode, the run records the verdict and pauses at `epic-boundary` for you to close the epic with bmad-agent-po, which `bmad-loop resolve` opens and then verifies before it resumes. A `rejected` verdict pauses again at every pick while the epic stays open; any other pauses once.
 - **Config:** `[gates] retrospective`, `[adapter.retro] name` / `model` / `effort` / `extra_args`
-- **Tested by:** `tests/test_engine.py`, `tests/test_policy.py`, `tests/test_tickets_engine.py`, `tests/test_tickets_e2e.py`
+- **Tested by:** `tests/test_engine.py`, `tests/test_policy.py`, `tests/test_tickets_engine.py`, `tests/test_tickets_e2e.py`, `tests/test_cli.py`
 - **Docs:** [Escalations: epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [Tickets guide: retrospective and closure](tickets-guide.md#epic-retrospective-and-closure), [Configuration: [gates]](reference/configuration.md#gates), [Configuration: [adapter.retro]](reference/configuration.md#adapterretro), [Pointing retrospectives at run journals](setup-guide.md#pointing-retrospectives-at-run-journals), [Roadmap: automate epic retro action items](ROADMAP.md#automate-epic-retro-action-items)
 
 ## Deferred work
@@ -354,7 +361,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A stage inherits the base mode even when it switches client; `[adapter.<stage>] permission_mode` overrides it.
   - `bmad-loop resolve` sessions, where a human is present, keep the bypass flags whatever the mode.
   - `validate` reports each role's permission posture as `adapter.permission-mode`, suggesting `sandboxed` for an unsandboxed role without worktree isolation when the profile maps it. The note is advisory: a worktree is not a security boundary.
-  - Sandboxed Codex under `scm.isolation = "worktree"` is a warning: the sandbox keeps a linked worktree's gitdir read-only, so git add and commit fail.
+  - A sandboxed Codex session in a linked worktree (`scm.isolation = "worktree"`) gets exact-path write grants for that worktree's gitdir and the main repo's shared `.git`, so git add and commit work. `validate` warns only when the grant cannot ride: an `extra_args` override replaces the mode's args and drops it, or the profile's mode declares no `linked_worktree_args` or a grant missing `{gitdir}` or `{common_dir}`.
   - `tickets.store-sandbox` also warns when a sandboxed role writes a ticket store outside its cwd.
 - **Config:** `[adapter] permission_mode`, `[adapter.dev]` / `[adapter.review]` / `[adapter.triage]` / `[adapter.retro]` `permission_mode`; profile table `[permission_modes.<mode>]`
 - **Tested by:** `tests/test_policy.py`, `tests/test_profile.py`, `tests/test_runsetup.py`, `tests/test_cli.py`, `tests/test_codex_trust.py`, `tests/test_install.py`
@@ -499,7 +506,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `init` appends only the `.gitignore` lines that are missing, so running it again changes nothing.
   - `validate` exits 1 only when a finding has severity `problem`. Warnings never change the exit code.
   - Every finding carries a stable check id taken from a fixed, documented registry.
-  - `validate` runs no project-controlled commands unless `--render-probe` or `--probes` is given. The one exception is tickets mode, which runs `tickets.py next` while an unlanded ledger entry declares a `gate:`.
+  - `validate` runs no project-controlled commands, and launches no coding CLI, unless `--render-probe` or `--probes` is given. The one exception is tickets mode, which runs `tickets.py next` while an unlanded ledger entry declares a `gate:`.
   - On a BMAD v7 project `validate` reports the era, the active initiative, the ticket-store layout and the `tickets.*` preflight.
 - **Config:** `bmad-loop init --cli PROFILE --no-skills --force-skills`; `bmad-loop validate --spec FOLDER --render-probe --probes --json`
 - **Tested by:** `tests/test_cli.py`, `tests/test_install.py`

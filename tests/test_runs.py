@@ -1,6 +1,7 @@
 """Run-directory helper tests."""
 
 import contextlib
+import dataclasses
 import errno
 import json
 import os
@@ -11905,6 +11906,86 @@ def test_delete_run_removes_a_sweep_run_that_holds_nothing(project_v7_store_repo
     assert not engine.run_dir.exists()
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_archive_run_refuses_a_run_holding_unlanded_sweep_closes(project_v7_store_repo, force):
+    """DW-572: `archive_run` refuses a held run as `delete_run` does, since nothing
+    restores an archive for `resume` to land or reopen the closes from. The error
+    names the run, DW-1, `archive` and `bmad-loop resume`. No archive dir or
+    tarball is created, and the run dir, its state and the ledger are untouched.
+    `force` waives only the session guard.
+
+    Ablation: delete the `refuse_held_sweep_closes` call in `archive_run` and
+    both rows fail (the run is archived)."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    state_before = (engine.run_dir / "state.json").read_bytes()
+    ledger_before = paths.deferred_work.read_bytes()
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.archive_run(paths.project, engine.run_dir, force=force)
+
+    assert info.value.run_id == ts.HELD_RUN_ID and info.value.dw_ids == ["DW-1"]
+    message = str(info.value)
+    assert "refusing to archive it" in message and "DW-1" in message
+    assert f"bmad-loop resume {ts.HELD_RUN_ID}" in message
+    assert not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert (engine.run_dir / "state.json").read_bytes() == state_before
+    assert paths.deferred_work.read_bytes() == ledger_before
+
+
+def test_archive_run_refuses_a_run_it_cannot_check_for_held_closes(project_v7_store_repo):
+    """Fail safe, as on delete: an unreadable `state.json` might hold closes, so
+    `archive_run` refuses it, names the fault and writes no tarball."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    (engine.run_dir / "state.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(runs.HeldSweepClosesError) as info:
+        runs.archive_run(paths.project, engine.run_dir)
+
+    assert info.value.dw_ids == [] and "could not be read" in (info.value.reason or "")
+    assert not (paths.project / runs.ARCHIVE_DIR).exists()
+    assert (engine.run_dir / "state.json").read_text(encoding="utf-8") == "{not json"
+
+
+def test_archive_run_checks_held_closes_under_the_lock_after_the_liveness_guard(
+    project_v7_store_repo, monkeypatch
+):
+    """The archive gate runs under the run's state lock, after the liveness guard."""
+    ts = _seam()
+    engine, paths, *_ = ts._held_sweep_run(project_v7_store_repo)
+    real = runs.held_sweep_closes
+    checked: list[Path] = []
+
+    def held(project, run_dir):
+        assert_run_state_lock_held(run_dir)
+        checked.append(run_dir)
+        return real(project, run_dir)
+
+    monkeypatch.setattr(runs, "held_sweep_closes", held)
+    with pytest.raises(runs.HeldSweepClosesError):
+        runs.archive_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]
+
+    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
+    with pytest.raises(runs.LiveEngineError):
+        runs.archive_run(paths.project, engine.run_dir)
+    assert checked == [engine.run_dir]  # the liveness guard refused first
+    assert engine.run_dir.is_dir()
+
+
+def test_archive_run_archives_a_sweep_run_that_holds_nothing(project_v7_store_repo):
+    """A sweep run whose bundle landed holds no close, so it is archived as before."""
+    ts = _seam()
+    engine, paths, *_, task = ts._held_sweep_run(project_v7_store_repo, phase=Phase.DONE)
+    task.isolated_ledger_carried = True  # the merge-back's latch
+    engine._save()
+
+    dest = runs.archive_run(paths.project, engine.run_dir, warn=lambda _note: None)
+
+    assert dest.is_file() and not engine.run_dir.exists()
+
+
 def test_delete_run_failed_launch_unwind_skips_the_held_closes_check(
     project_v7_store_repo, monkeypatch
 ):
@@ -11997,3 +12078,80 @@ def test_prior_sweep_closes_records_a_liveness_probe_fault_as_a_fault_row(tmp_pa
     [row] = runs.prior_sweep_closes(tmp_path, exclude="x")
     assert row.run_id == "20260101-000000-aaaa" and row.dw_ids == ()
     assert row.fault and "bogus" in row.fault
+
+
+# ---------------------------------------- a chained run's recorded paths and pin
+
+CHILD = "initiative-child"
+
+
+def _chained(parent: str | None, initiative: str = CHILD) -> RunState:
+    return RunState(
+        run_id="r-chained",
+        project="/p",
+        started_at="now",
+        source="tickets",
+        initiative=initiative,
+        parent_initiative=parent,
+    )
+
+
+def test_paths_for_state_keeps_an_unchained_runs_paths(project_v7):
+    """An ordinary run reopens on the loaded paths themselves."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    assert runs.paths_for_state(paths, _chained(None, project_v7.initiative)) is paths
+
+
+def test_paths_for_state_reroots_a_chained_run_on_its_child(project_v7):
+    """A chained run reopens on its child initiative: the folder is the parent's
+    sibling named for the child, and the ledger, sprint path and both artifact
+    dirs move onto it. Ablation (performed): return `paths` unconditionally and
+    this FAILS."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    child = runs.paths_for_state(paths, _chained(project_v7.initiative))
+    folder = project_v7.initiative_folder.parent / CHILD
+    assert child.active_initiative == CHILD and child.initiative_folder == folder
+    assert child.implementation_artifacts == child.planning_artifacts == folder
+    assert child.deferred_work == folder / "deferred-work.md"
+    assert child.sprint_status == folder / "sprint-status.yaml"
+
+
+def test_paths_for_state_refuses_a_chained_run_whose_parent_moved(project_v7):
+    """A live `active_initiative` that no longer names the run's parent refuses
+    with a config error naming the value to restore — never the loaded (other)
+    initiative's paths, nor a child located from them."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match="set it back to 'initiative-platform'"):
+        runs.paths_for_state(paths, _chained("initiative-platform"))
+
+
+def test_paths_for_state_refuses_a_child_it_cannot_locate(project_v7):
+    """A child slug that is no folder name is a config error, not a ValueError
+    escaping past every `load_paths` caller's handler."""
+    paths = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    with pytest.raises(bmadconfig.BmadConfigError, match="cannot locate child initiative"):
+        runs.paths_for_state(paths, _chained(project_v7.initiative, initiative="a/b"))
+
+
+def test_tree_pin_refuses_parent_rooted_paths(project_v7):
+    """`tree_pin` on a chained run handed the parent's own paths (`load_paths`
+    output, not re-rooted) refuses instead of routing the tree through the
+    parent's folder as if it were the child's; so does a folder not named for the
+    child. Ablation (performed): delete the guard and this FAILS."""
+    parent = bmadconfig.load_paths(project_v7.project, want_tickets=True)
+    state = _chained(project_v7.initiative)
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        runs.tree_pin(state, parent)
+    elsewhere = parent.with_initiative(CHILD)
+    misfiled = dataclasses.replace(elsewhere, initiative_folder=parent.initiative_folder)
+    with pytest.raises(ValueError, match="re-root them with paths_for_state"):
+        runs.tree_pin(state, misfiled)
+    assert runs.tree_pin(state, elsewhere) == (project_v7.initiative, elsewhere.initiative_folder)
+
+
+def test_recorded_tree_pin_pins_a_mount_to_the_child(tmp_path, monkeypatch):
+    """A tree built in a worktree mount pins the chained run's child with no
+    folder — the mount's config names it — and reads no config at all."""
+    monkeypatch.setattr(bmadconfig, "load_paths", lambda *a, **k: pytest.fail("read config"))
+    state = _chained("initiative-platform")
+    assert runs.recorded_tree_pin(state, tmp_path, tmp_path / "wt" / "u1") == (CHILD, None)

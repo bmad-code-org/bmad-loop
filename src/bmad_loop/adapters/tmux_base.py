@@ -955,6 +955,24 @@ class BaseTmuxBackend(TerminalMultiplexer):
         except (subprocess.SubprocessError, OSError):
             pass
 
+    def rename_window(self, target: str, name: str) -> None:
+        # Checked, unlike select_window: the caller must be able to say the
+        # rename did not land, so every failure raises the seam type. The new
+        # name sticks on both binaries with no option write: measured on tmux
+        # 3.8, rename-window turns the window's `automatic-rename` off, and
+        # psmux 3.4.0 sets the window's `manual_rename` flag (the one its
+        # automatic rename skips). Both expand `#{...}` in the name as a
+        # format, so a caller passes a name with no `#` in it.
+        try:
+            proc = self._run(["rename-window", "-t", target, name], check=False)
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise TmuxError(f"{self._BINARY} rename-window on {target} failed: {exc}") from exc
+        if proc.returncode != 0:
+            raise TmuxError(
+                f"{self._BINARY} rename-window on {target} exited {proc.returncode}: "
+                f"{proc.stderr.strip() or '(no stderr)'}"
+            )
+
     def set_window_option(self, target: str, option: str, value: str) -> None:
         try:
             self._run(["set-option", "-w", "-t", target, option, value], check=False)
