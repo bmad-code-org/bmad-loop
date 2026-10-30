@@ -4652,7 +4652,11 @@ def _close_drained_children(
       (:func:`_fresh_pick`) still finds work — an epic awaiting closure or not yet
       broken down, which a run of the child does; a finished run vouches for its
       own child;
-    * ``store-refused``: its store is one tickets runs refuse.
+    * ``store-refused``: its store is one tickets runs refuse;
+    * ``uncommitted-edit``: its store is versioned and the child's file holds a
+      change git reports (``verify.path_clean``). The close commits the whole
+      file, so it would carry a person's edit in progress into its bookkeeping
+      commit.
 
     Returns None, or why the chain cannot go on: a close that could not be
     committed (``store-commit-failed`` / ``store-commit-foreign-dirt`` journaled).
@@ -4687,6 +4691,9 @@ def _close_drained_children(
                 skip = ("store-refused", "", store)
             else:
                 topology = store
+                edited = _child_file_edited(paths, parent_folder, slug, topology)
+                if edited is not None:
+                    skip = ("uncommitted-edit", "", edited)
         if skip is not None:
             why, run_id, detail = skip
             journal.append(
@@ -4721,6 +4728,30 @@ def _close_drained_children(
             )
         journal.append("store-committed", story_key=slug, commit=result.sha)
     return None
+
+
+def _child_file_edited(
+    paths: bmadconfig.ProjectPaths,
+    parent_folder: Path,
+    slug: str,
+    topology: ticketstore.StoreTopology | None,
+) -> str | None:
+    """Why closing child ``slug`` would commit a change the chain does not own:
+    its file ``<parent_folder>/../<slug>/<slug>.md`` (the one
+    ``TicketTree.mark_initiative_done`` writes) differs from HEAD in the repo
+    its close commits in, or None. An unversioned store commits nothing, and a
+    file outside that repo is one ``StoreCommitter`` does not stage."""
+    if topology is None or topology.versioning == "none":
+        return None
+    repo = topology.store_repo if topology.store_repo is not None else paths.repo_root
+    file = parent_folder.parent / slug / f"{slug}.md"
+    try:
+        rel = file.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return None
+    if verify.path_clean(repo, rel):
+        return None
+    return f"{rel} has uncommitted changes in {repo} — commit or stash them"
 
 
 def _chain_budget(state: RunState) -> int | None:

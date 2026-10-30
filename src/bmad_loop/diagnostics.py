@@ -634,8 +634,9 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # `open`, `no-folder`, `?`), and `previous_run` a run id; the slugs are
     # kind-aliased or kind-keylisted, which runs first, and `error` is dropped by
     # name. `initiative-close-skipped`'s `why` is a closed skip token (`run-live`,
-    # `run-unfinished`, `runs-unread`, `work-left`, `store-refused`) and
-    # `blocking_run` a run id (or empty); `detail` is dropped by name.
+    # `run-unfinished`, `runs-unread`, `work-left`, `store-refused`,
+    # `uncommitted-edit`) and `blocking_run` a run id (or empty); `detail` is
+    # dropped by name.
     "initiative-chain-next": frozenset({"passed_over_why"}),
     "initiative-chain-end": frozenset({"end", "passed_over_why", "waiting_on_status"}),
     "initiative-chain": frozenset({"previous_run"}),

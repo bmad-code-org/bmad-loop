@@ -60,7 +60,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `run` refuses a tracker store and the multi-repo workspace layout before creating a run directory; resume and resolve refuse a store whose layout changed.
   - When a run without `--story` finishes an epic, it runs the retrospective and pauses once at `epic-boundary` for a person to close the epic; a `rejected` verdict pauses every later pick while the epic stays open, and an epic gated on an open one waits for its closure.
 - **Config:** `[stories] source = "tickets"`, `[core] active_initiative`, `[tickets] mark_done`, `[tickets] thorough_review`, `[gates] retrospective`; `bmad-loop run --epic ID|SLUG`, `--story REF`, `--dry-run`; `bmad-loop confirm <ref>`
-- **Tested by:** `tests/test_tickets_engine.py`, `tests/test_tickets_source.py`, `tests/test_tickettree.py`, `tests/test_ticketmodel.py`, `tests/test_ticketstore.py`, `tests/test_statemachine.py`, `tests/test_tickets_e2e.py`
+- **Tested by:** `tests/test_tickets_engine.py`, `tests/test_tickets_source.py`, `tests/test_tickettree.py`, `tests/test_ticketmodel.py`, `tests/test_ticketstore.py`, `tests/test_statemachine.py`, `tests/test_initiativechain.py`, `tests/test_cli.py`, `tests/test_tickets_e2e.py`
 - **Docs:** [Ticket-tree mode guide](tickets-guide.md), [Setup: BMAD v7](setup-guide.md#installing-on-bmad-v7-bmad-setup), [Configuration: [tickets]](reference/configuration.md#tickets), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [TUI: tickets mode](tui-guide.md#tickets-mode)
 
 ### Trust-nothing verification

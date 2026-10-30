@@ -16611,6 +16611,43 @@ def test_pre_pick_close_skips_a_drained_child_whose_store_is_refused(project, mo
     assert not _initiative_status(project, CHAIN_AUTH)
 
 
+def test_pre_pick_close_skips_a_drained_child_whose_file_holds_an_edit(
+    project, monkeypatch, capsys
+):
+    """A drained child whose file holds an uncommitted edit is left open
+    (`uncommitted-edit`) with nothing marked or committed: the close commits the
+    whole file, so it would carry the edit into its bookkeeping commit.
+    Ablation (performed): drop the edit check and AUTH is marked and committed
+    with the edit inside — this FAILS."""
+    _chain_project(project, monkeypatch, capsys, [])
+    root = project.project
+    _drain_child(root, CHAIN_AUTH)
+    file = v7_layout(root, initiative=CHAIN_AUTH).initiative_folder / f"{CHAIN_AUTH}.md"
+    with file.open("a", encoding="utf-8") as f:
+        f.write("\nhalf-written note\n")
+    head = git(root, "rev-parse", "HEAD")
+    paths = bmadconfig.load_paths(root, want_tickets=True)
+    pol = cli.policy_mod.load(cli._policy_path(root))
+    log = cli._ChainStartLog()
+
+    assert cli._close_drained_children(root, paths, pol, CHAIN_PARENT, log) is None
+
+    (row,) = log.rows
+    assert _row(row, "parent", "slug", "why", "blocking_run") == {
+        "kind": "initiative-close-skipped",
+        "parent": CHAIN_PARENT,
+        "slug": CHAIN_AUTH,
+        "why": "uncommitted-edit",
+        "blocking_run": "",
+    }
+    assert f"initiative chain {CHAIN_PARENT}: leaves {CHAIN_AUTH} open (uncommitted-edit: " in (
+        capsys.readouterr().out
+    )
+    assert git(root, "rev-parse", "HEAD") == head
+    assert not _initiative_status(project, CHAIN_AUTH)
+    assert "half-written note" in file.read_text(encoding="utf-8")
+
+
 def test_chain_driver_ignores_a_chained_childs_sweep(project, monkeypatch):
     """A chained child's run-end sweep carries the parent too: resumed to finished,
     it is not a child run, so the driver neither closes, picks nor launches.
