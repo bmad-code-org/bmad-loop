@@ -28,7 +28,6 @@ from pathlib import Path
 import pytest
 from conftest import grant_plugin
 
-from bmad_loop import policy as policy_mod
 from bmad_loop import runs
 from bmad_loop.plugins import (
     GrantSet,
@@ -517,26 +516,6 @@ def test_manifest_swapped_back_before_the_hash_is_fatal_and_never_runs(tmp_path,
     with pytest.raises(PluginTrustError, match="changed while it was being verified"):
         reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
         emit(reg, "pre_run", tmp_path)
-    assert not marker.exists()
-
-
-def test_legacy_engine_fold_does_not_grant_a_project_unity_override(tmp_path):
-    # `[engine] name = "unity"` folds into [plugins] enabled — a name, which must
-    # not vouch for a project dir that happens to carry it.
-    pdir = tmp_path / USER_PLUGINS_REL / "unity"
-    pdir.mkdir(parents=True)
-    shutil.copy(BUILTIN_UNITY / "plugin.toml", pdir / "plugin.toml")
-    marker = marker_for(tmp_path, "unity")
-    (pdir / "unity_plugin.py").write_text(
-        PY_MODULE.format(cls="UnityPlugin", marker=str(marker), tag="yes")
-    )
-    policy_path = tmp_path / "policy.toml"
-    policy_path.write_text('[engine]\nname = "unity"\n')
-    with pytest.warns(policy_mod.PolicyDeprecationWarning, match=r"\[engine\]"):
-        pol = policy_mod.load(policy_path)
-    assert "unity" in pol.plugins.enabled
-    with pytest.raises(PluginTrustError, match="plugins enable unity"):
-        PluginRegistry.build(tmp_path, policy=pol)
     assert not marker.exists()
 
 

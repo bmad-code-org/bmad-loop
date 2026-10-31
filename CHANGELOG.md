@@ -120,6 +120,9 @@ breaking changes may land in a minor release.
 
 ### Removed
 
+- Remove the `[engine]` policy alias: a named `[engine]` block now fails to load with the
+  `[plugins] enabled` + `[plugins.<name>]` migration, and an empty-name block is ignored
+  with a warning to delete it. 0.13.2 is the last release that folds it (#810).
 - psmux: stop refusing an `@` option value that starts with `-`; psmux 3.4.0 stores it
   verbatim (#879).
 
@@ -159,8 +162,8 @@ breaking changes may land in a minor release.
   dropped (#913).
 - Keep a parked story's follow-up review recommendation on the park record, the
   notification, `confirm` and `status --json` (#888).
-- Show the legacy `[engine]` deprecation notice: once on stderr as
-  `bmad-loop: warning: …`, as a TUI toast, and as `validate`'s `policy.deprecated` (#835).
+- Show `policy.toml` deprecation notices: once on stderr as `bmad-loop: warning: …`, as a
+  TUI toast, and as `validate`'s `policy.deprecated` (#835).
 - Fix `resolve <finished-run> --reverify` refusing to replay a kept unit after the project
   was moved.
 - Fix `delete` leaving a paused run's kept worktree registered with git.

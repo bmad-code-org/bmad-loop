@@ -342,6 +342,9 @@ REFUSAL_HELPER_DEFS = {
     ("engine.py", "_refuse_gated_story"),
     ("platform_util.py", "_refuse_unwritable_target"),
     ("platform_util.py", "_refuse_unwritable_target_at"),
+    # #810: a named or wrong-typed [engine] block; test_policy.py
+    # test_engine_block_with_a_name_is_refused, test_engine_name_of_wrong_type_is_refused
+    ("policy.py", "_refuse_removed_engine"),
     ("resolve.py", "_reject_json_constant"),
     ("runs.py", "_refuse_live_session"),
     ("runs.py", "_refuse_uncontained_run_dir"),

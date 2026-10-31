@@ -1,6 +1,7 @@
 import json
 import re
 import sys
+import warnings
 
 import pytest
 
@@ -1031,18 +1032,22 @@ def test_policy_deprecation_warning_is_shown_to_end_users():
     assert not issubclass(policy.PolicyDeprecationWarning, DeprecationWarning)
 
 
-@pytest.mark.parametrize("bad", ["5", "true"])
-def test_deprecated_engine_name_rejects_non_string(bad):
-    """The deprecated `[engine]` fold reads `name` to decide which plugin to enable,
-    so a wrong-typed one stringified into a bogus plugin name on the way out of a
-    block that is already warning the user it is going away. The deprecation warning
-    still fires: the type check runs after it, not instead of it.
+@pytest.mark.parametrize(("bad", "shown"), [("5", "5"), ("true", "True")])
+def test_engine_name_of_wrong_type_is_refused(bad, shown):
+    """A wrong-typed `[engine] name` is not an empty one: it cannot be read as the
+    inert leftover that only warns, so it is refused with the `[plugins]`
+    migration and the bad value, and nothing warns first.
 
-    Ablation: delete `_typed_str`'s conditional and raise; both rows fail because the
-    name is stringified and enables a plugin named "5"/"True"."""
-    with pytest.warns(policy.PolicyDeprecationWarning):
-        with pytest.raises(policy.PolicyError, match=r"engine\.name must be a string"):
+    Ablations: read a wrong-typed name as empty in `_refuse_removed_engine` instead
+    of refusing it → both rows fail (the block warns and loads)."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(policy.PolicyError) as exc:
             policy.loads(f"[engine]\nname = {bad}\n")
+    msg = str(exc.value)
+    assert '[plugins] enabled = ["<name>"]' in msg
+    assert f"engine.name must be a string: got {shown}" in msg
+    assert not [w for w in caught if issubclass(w.category, policy.PolicyDeprecationWarning)]
 
 
 @pytest.mark.parametrize("bad", ["true", '"0.5"'])
@@ -1604,10 +1609,10 @@ def test_scm_invalid_values(tmp_path):
         policy.load(p)
 
 
-# The game-engine layer is now the "unity" plugin. A legacy [engine] block still
-# loads — with a deprecation warning — by folding onto [plugins] + [plugins.unity].
-# The editor_mode↔scm.isolation coupling moved to the plugin (UnityPlugin.validate,
-# exercised in test_engine_plugin.py); policy.loads no longer enforces it.
+# The game-engine layer is the "unity" plugin. A named [engine] block is refused
+# with the [plugins] migration; an empty-name one is ignored with a warning. The
+# editor_mode↔scm.isolation coupling lives in the plugin (UnityPlugin.validate,
+# exercised in test_engine_plugin.py); policy.loads does not enforce it.
 
 
 def test_no_engine_block_by_default():
@@ -1616,50 +1621,57 @@ def test_no_engine_block_by_default():
     assert pol.plugins.settings == {}
 
 
-def test_deprecated_engine_folds_to_unity_plugin(tmp_path):
+def test_engine_block_with_a_name_is_refused(tmp_path):
+    """`loads` never rejects unknown sections, so ignoring a named `[engine]` block
+    would silently disable the plugin it names. It is refused with the migration
+    instead, and the refusal is not preceded by a deprecation warning.
+
+    Ablations: delete the named-block refusal in `_refuse_removed_engine` → the
+    test fails (the block warns and loads with no plugin enabled)."""
     p = tmp_path / "policy.toml"
     p.write_text("""
 [engine]
 name = "unity"
 editor_mode = "shared"
 mcp = "coplaydev"
-unity_path = "/opt/Unity/Editor/Unity"
-ready_timeout_sec = 120
-ready_grace_sec = 90
 """)
-    with pytest.warns(policy.PolicyDeprecationWarning, match=r'enabled = \["unity"\]'):
-        pol = policy.load(p)
-    assert "unity" in pol.plugins.enabled
-    assert pol.plugin_setting("unity", "mcp") == "coplaydev"
-    assert pol.plugin_setting("unity", "unity_path") == "/opt/Unity/Editor/Unity"
-    assert pol.plugin_setting("unity", "ready_timeout_sec") == 120
-    assert pol.plugin_setting("unity", "ready_grace_sec") == 90
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(policy.PolicyError, match=r'enabled = \["unity"\]') as exc:
+            policy.load(p)
+    assert "[plugins.unity]" in str(exc.value)
+    assert "editor_mode, mcp" in str(exc.value)
+    assert not [w for w in caught if issubclass(w.category, policy.PolicyDeprecationWarning)]
 
 
-def test_deprecated_engine_disabled_when_name_empty(tmp_path):
-    """name = "" was the old "disabled" state: warn, but enable nothing, and advise
-    deleting the block rather than enabling Unity.
+@pytest.mark.parametrize(
+    "engine_block",
+    [
+        '[engine]\nname = ""\neditor_mode = "shared"\n',
+        '[engine]\nname = "  "\neditor_mode = "shared"\n',
+        '[engine]\neditor_mode = "shared"\n',
+        "[engine]\n",
+    ],
+    ids=["empty-name", "whitespace-name", "no-name", "bare-table"],
+)
+def test_engine_block_without_a_name_is_ignored_with_a_warning(tmp_path, engine_block):
+    """An empty-name `[engine]` block (what the v0.4.3/v0.4.4 init templates wrote)
+    never enabled anything: it loads, enables nothing, leaves `scm.isolation` alone,
+    and warns once to delete the section. A bare `[engine]` table warns too —
+    presence, not content, is what is checked.
 
-    Ablation: restore the fixed Unity advice → the message asserts fail."""
+    Ablations: delete the `warnings.warn` → every row fails; key the tombstone on
+    `engine_d` truthiness instead of `"engine" in doc` → the bare-table row fails."""
     p = tmp_path / "policy.toml"
-    p.write_text('[engine]\neditor_mode = "shared"\n[scm]\nisolation = "worktree"\n')
+    p.write_text(engine_block + '[scm]\nisolation = "worktree"\n')
     with pytest.warns(policy.PolicyDeprecationWarning) as caught:
         pol = policy.load(p)
     assert pol.plugins.enabled == ()
-    # Following the notice must not enable a plugin the block never enabled.
+    assert pol.plugins.settings == {}
+    assert pol.scm.isolation == "worktree"
     (msg,) = [str(w.message) for w in caught]
     assert "remove the [engine] section" in msg
     assert "unity" not in msg
-
-
-def test_explicit_plugin_settings_win_over_folded_engine(tmp_path):
-    p = tmp_path / "policy.toml"
-    p.write_text(
-        '[engine]\nname = "unity"\nmcp = "ivanmurzak"\n' '[plugins.unity]\nmcp = "coplaydev"\n'
-    )
-    with pytest.warns(policy.PolicyDeprecationWarning):
-        pol = policy.load(p)
-    assert pol.plugin_setting("unity", "mcp") == "coplaydev"
 
 
 def test_template_parses():

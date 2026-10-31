@@ -69,11 +69,6 @@ _MUX_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _TOML_SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*(?:#.*)?$")
 _MUX_KEY_RE = re.compile(r"^\s*#?\s*backend\s*=")
 
-# Deprecated [engine] keys, folded into [plugins.unity] at load time. The
-# game-engine layer is now a plugin; [engine] is a one-release compatibility
-# alias (see _fold_deprecated_engine).
-_ENGINE_SETTING_KEYS = ("editor_mode", "mcp", "unity_path", "ready_timeout_sec", "ready_grace_sec")
-
 
 class PolicyError(Exception):
     pass
@@ -998,7 +993,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     sweep_d = _section(doc, "sweep")
     scm_d = _section(doc, "scm")
     cleanup_d = _section(doc, "cleanup")
-    engine_d = _section(doc, "engine")  # deprecated; folded into [plugins] below
+    engine_d = _section(doc, "engine")  # removed; refused or ignored below, never read
     plugins_d = _section(doc, "plugins")
     tui_d = _section(doc, "tui")
     operator_d = _section(doc, "operator")
@@ -1456,11 +1451,8 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     plugin_settings = {
         str(k): dict(v) for k, v in plugins_d.items() if k != "enabled" and isinstance(v, dict)
     }
-    # The game-engine layer is now a plugin. Fold a deprecated [engine] block into
-    # [plugins] (enable the named plugin + map its keys to [plugins.<name>]) so
-    # existing Unity configs keep working for one release; explicit [plugins.*]
-    # values win over the folded ones.
-    _fold_deprecated_engine(engine_d, enabled, plugin_settings)
+    if "engine" in doc:
+        _refuse_removed_engine(engine_d)
     if plugin_schemas:
         for name, raw_settings in plugin_settings.items():
             _validate_plugin_settings(name, raw_settings, plugin_schemas.get(name))
@@ -1518,41 +1510,36 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     )
 
 
-def _fold_deprecated_engine(
-    engine_d: dict[str, Any], enabled: list[str], plugin_settings: dict[str, dict[str, Any]]
-) -> None:
-    """Translate a legacy ``[engine]`` block into the plugin surface in place.
+def _refuse_removed_engine(engine_d: dict[str, Any]) -> None:
+    """Refuse a named ``[engine]`` block; warn on an empty-name one.
 
-    ``[engine] name = "unity"`` becomes ``[plugins] enabled = ["unity"]`` plus a
-    ``[plugins.unity]`` table carrying editor_mode/mcp/unity_path/ready_*; the
-    editor_mode↔scm.isolation coupling is now validated by the plugin itself
-    (``UnityPlugin.validate``), not here. A no-op when ``[engine]`` is absent or
-    its ``name`` is empty (the old "disabled" state)."""
-    if not engine_d:
-        return
-    # Advice names the configured engine; an empty name (the old "disabled" state)
-    # enables nothing, so the only migration is deleting the block. Read leniently:
-    # a wrong-typed name still warns before `_typed_str` refuses it below.
+    The game-engine layer is a plugin (``[plugins] enabled`` + ``[plugins.<name>]``).
+    A named block is refused rather than ignored because ``loads`` never rejects
+    unknown sections: dropping it silently would disable the Unity plugin, its
+    editor_mode↔scm.isolation check and its Editor readiness gate with no signal.
+    An absent, empty or whitespace ``name`` (a bare ``[engine]`` table included)
+    only warns: the v0.4.3/v0.4.4 init templates wrote an inert
+    ``[engine] name = ""`` into every project, and it never enabled anything, so
+    its keys are ignored and the advice is to delete the section."""
     raw_name = engine_d.get("name", "")
-    advised = raw_name.strip() if isinstance(raw_name, str) else ""
-    if advised:
-        advice = f'Use [plugins] enabled = ["{advised}"] with a [plugins.{advised}] table.'
-    else:
-        advice = "Its empty name enables nothing; remove the [engine] section."
+    if not isinstance(raw_name, str):
+        raise PolicyError(
+            '[engine] was removed — use [plugins] enabled = ["<name>"] with a '
+            f"[plugins.<name>] table instead (engine.name must be a string: got {raw_name!r})"
+        )
+    name = raw_name.strip()
+    if name:
+        raise PolicyError(
+            "[engine] was removed — the game-engine layer is a plugin: use [plugins] "
+            f'enabled = ["{name}"] and move editor_mode, mcp, unity_path, '
+            f"ready_timeout_sec and ready_grace_sec into [plugins.{name}]"
+        )
     warnings.warn(
-        "[engine] in policy.toml is deprecated; the game-engine layer is now a "
-        f"plugin. {advice} [engine] will be removed in a future release.",
+        "[engine] in policy.toml is ignored: the game-engine layer is a plugin and an "
+        "empty name enables nothing; remove the [engine] section.",
         PolicyDeprecationWarning,
         stacklevel=3,
     )
-    name = _typed_str(engine_d, "engine", "name", "").strip()
-    if not name:
-        return
-    if name not in enabled:
-        enabled.append(name)
-    folded = {k: engine_d[k] for k in _ENGINE_SETTING_KEYS if k in engine_d}
-    # explicit [plugins.<name>] values take precedence over the folded [engine] ones
-    plugin_settings[name] = {**folded, **plugin_settings.get(name, {})}
 
 
 POLICY_TEMPLATE = """\
@@ -1761,8 +1748,6 @@ enabled = []                 # e.g. ["unity"]
 #   unity_path = ""              # Editor binary for a per_worktree launch ("" = auto-detect)
 #   ready_timeout_sec = 600      # how long the readiness gate waits for the Editor + MCP
 #   ready_grace_sec = -1         # delay before the first probe (-1 = auto: per_worktree waits)
-# (The legacy [engine] block still loads with a deprecation warning, folded into
-#  [plugins.unity] — migrate to [plugins] when convenient.)
 
 [tui]
 # low_frame_rate = true caps Textual to 15fps and disables animations (sets

@@ -114,8 +114,7 @@ live Editor MCP in **shared** mode (agent works in place on the operator's open 
 gate blocks until the Editor + MCP are up) and in **per_worktree** mode (one managed Editor per
 worktree, with reflink/CoW `Library` priming, setup/teardown hooks, and MCP-skill seeding via
 `seed_globs`). The game-engine layer is a plugin built on the
-general [plugin system](plugin-authoring-guide.md) (the legacy `[engine]` block is a deprecated
-compatibility shim, folded onto `[plugins.unity]` at load time). Next steps: batchmode `verify_cmd`
+general [plugin system](plugin-authoring-guide.md). Next steps: batchmode `verify_cmd`
 and Godot/Unreal plugins on the same `plugin.toml`+scripts shape — the authoring path is documented
 in [Writing a Game Engine plugin](game-engine-plugin-guide.md) and
 [Writing a plugin for a specific Editor MCP](game-engine-mcp-guide.md).

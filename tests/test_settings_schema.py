@@ -413,14 +413,8 @@ def test_unity_plugin_is_trust_gated_and_renders_settings():
     assert editor_mode.widget_id == "plugins-unity-editor_5fmode"  # plugin_field_wid-encoded
 
 
-def test_deprecated_engine_block_folds_into_unity_plugin():
-    """A legacy [engine] block loads (with a deprecation warning) by folding onto
-    [plugins] enabled + [plugins.unity]; explicit [plugins.unity] values win."""
-    with pytest.warns(policy_mod.PolicyDeprecationWarning):
-        pol = policy_mod.loads(
-            '[engine]\nname = "unity"\neditor_mode = "per_worktree"\nmcp = "coplaydev"\n'
-            '[scm]\nisolation = "worktree"\n'
-        )
-    assert "unity" in pol.plugins.enabled
-    assert pol.plugin_setting("unity", "editor_mode") == "per_worktree"
-    assert pol.plugin_setting("unity", "mcp") == "coplaydev"
+def test_named_engine_block_is_refused_with_the_unity_plugin_migration():
+    """The unity settings live only under [plugins.unity]: a named [engine] block is
+    refused with the migration, never read onto the plugin."""
+    with pytest.raises(policy_mod.PolicyError, match=r"\[plugins\.unity\]"):
+        policy_mod.loads('[engine]\nname = "unity"\neditor_mode = "per_worktree"\n')

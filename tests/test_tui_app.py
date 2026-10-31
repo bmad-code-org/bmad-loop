@@ -594,7 +594,7 @@ async def test_policy_deprecation_toasts_once_on_mount(project_tree):
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.pause()
-        toasts = [e for e in emitted(app) if "deprecated" in e.message]
+        toasts = [e for e in emitted(app) if "[engine]" in e.message]
         assert [(e.message, e.severity) for e in toasts] == [(message, "warning")]
         (shown,) = [n for n in app._notifications if n.message == message]
         assert shown.timeout >= 60 * 60  # stays up, not the 5s default
@@ -622,7 +622,7 @@ async def test_policy_deprecation_toast_never_repeats_in_a_session(project_tree,
         await pilot.pause()
         (first,) = dashboard(app).policy_deprecations
         await _open_and_cancel_start_run(pilot, app)
-        toasts = [e.message for e in emitted(app) if "deprecated" in e.message]
+        toasts = [e.message for e in emitted(app) if "[engine]" in e.message]
         assert toasts == [first]
 
 
@@ -638,22 +638,20 @@ async def test_policy_deprecation_added_mid_session_toasts_on_next_read(project_
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.pause()
-        assert not [e for e in emitted(app) if "deprecated" in e.message]
+        assert not [e for e in emitted(app) if "[engine]" in e.message]
         _write_policy(project_tree.project, _DEPRECATED_POLICY)
         await _open_and_cancel_start_run(pilot, app)
-        toasts = [(e.message, e.severity) for e in emitted(app) if "deprecated" in e.message]
+        toasts = [(e.message, e.severity) for e in emitted(app) if "[engine]" in e.message]
         assert len(toasts) == 1 and toasts[0][1] == "warning"
         await _open_and_cancel_start_run(pilot, app)
-        assert [
-            (e.message, e.severity) for e in emitted(app) if "deprecated" in e.message
-        ] == toasts
+        assert [(e.message, e.severity) for e in emitted(app) if "[engine]" in e.message] == toasts
 
 
 @pytest.mark.parametrize(
     "text",
     [
         '[adapter]\nname = "claude"\n',
-        # warns, then refuses the wrong-typed name: the dashboard keeps its defaults
+        # refuses the wrong-typed name without warning: the dashboard keeps its defaults
         "[engine]\nname = 5\n",
     ],
     ids=["clean", "broken"],
@@ -665,7 +663,7 @@ async def test_policy_without_a_loadable_deprecation_raises_no_toast(project_tre
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
         await pilot.pause()
         assert dashboard(app).policy_deprecations == ()
-        assert not [e for e in emitted(app) if "deprecated" in e.message]
+        assert not [e for e in emitted(app) if "[engine]" in e.message]
 
 
 def test_policy_deprecation_captures_run_one_at_a_time(tmp_path, monkeypatch):

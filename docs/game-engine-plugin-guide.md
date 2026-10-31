@@ -61,15 +61,15 @@ editor_mode = "shared"
 mcp = "ivanmurzak"
 ```
 
-> **Legacy `[engine]` still works.** A pre-migration `[engine] name = "unity"`
-> block loads, printing a `bmad-loop: warning:` deprecation line on stderr (and a
-> `policy.deprecated` warning in `validate`), folded into the `[plugins]` allowlist
-> plus a `[plugins.unity]` table. The _policy block_ is the only thing folded,
-> though — project-local plugin overrides are now discovered under
-> `.bmad-loop/plugins/<name>/`, so move an old `.bmad-loop/engines/unity/`
-> override dir to `.bmad-loop/plugins/unity/`, and grant it there with
-> `bmad-loop plugins enable unity` — the folded allowlist does not grant a
-> project override. Migrate to `[plugins]` when convenient.
+> **An `[engine]` block is not read.** A named `[engine] name = "unity"` block
+> fails to load, and the error names the migration: `[plugins] enabled = ["unity"]`
+> plus a `[plugins.unity]` table carrying `editor_mode`, `mcp`, `unity_path`,
+> `ready_timeout_sec` and `ready_grace_sec`. An empty-name `[engine]` block enables
+> nothing; it loads with a `bmad-loop: warning:` line on stderr (and a
+> `policy.deprecated` warning in `validate`) telling you to delete it. Project-local
+> plugin overrides are discovered under `.bmad-loop/plugins/<name>/`, so move an old
+> `.bmad-loop/engines/unity/` override dir to `.bmad-loop/plugins/unity/`, and grant
+> it there with `bmad-loop plugins enable unity`.
 
 ## Mapping the Editor lifecycle onto hook stages
 
