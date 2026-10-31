@@ -2696,14 +2696,26 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     continue
                 if action == "transient":
                     # The result-less Stop's nudge, at the event: same budget,
-                    # same quota guard. Unrecovered, the session stalls as
-                    # before and is charged (#764).
+                    # same quota guard. A session with no result-file nudge
+                    # (the dev skill writes no result.json, so its stop budget
+                    # is 0) gets the wake nudge instead, from the stall budget
+                    # and cap, rather than sitting out the stall grace first.
+                    # Unrecovered, the session stalls as before and is
+                    # charged (#764).
+                    stall_nudge_due = (
+                        stall_deadline is not None
+                        and stall_nudges_left > 0
+                        and (
+                            spec.stall_nudges_cap is None
+                            or stall_nudges_sent + stall_nudges_failed < spec.stall_nudges_cap
+                        )
+                    )
                     if quota.waiting:
                         self._note_lifecycle(
                             handle.task_id,
                             "stop-nudge-withheld",
                             reason="quota-wait",
-                            nudge_due=nudges_left > 0,
+                            nudge_due=nudges_left > 0 or stall_nudge_due,
                             hook_event="StopFailure",
                         )
                     elif nudges_left > 0:
@@ -2712,6 +2724,31 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             self.send_text(handle, NUDGE_TEXT)
                         except MultiplexerError as e:
                             self._note_nudge_send_failed(handle, "stop-failure", e)
+                    elif stall_nudge_due and parked_evidence is not None:
+                        # A CLI latched as waiting on a human is never typed at
+                        # (#727); the stall expiry parks it.
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "stop-nudge-withheld",
+                            reason="parked",
+                            evidence=parked_evidence,
+                            nudge_due=True,
+                            hook_event="StopFailure",
+                        )
+                    elif stall_nudge_due:
+                        # Counted exactly as a grace-expiry wake nudge: it
+                        # closes the #727 pre-nudge activity window and re-arms
+                        # the grace.
+                        stall_nudges_left -= 1
+                        try:
+                            self.send_text(handle, STALL_NUDGE_TEXT)
+                        except MultiplexerError as e:
+                            stall_nudges_failed += 1
+                            self._note_nudge_send_failed(handle, "stop-failure", e)
+                        else:
+                            stall_nudges_sent += 1
+                        stall_deadline = time.monotonic() + self._stall_grace_s
+                        last_activity = self._log_activity_key(handle.task_id)
                     else:
                         self._note_lifecycle(
                             handle.task_id, "stop-failure-nudge-exhausted", error=error

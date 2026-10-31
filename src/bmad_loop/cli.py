@@ -802,8 +802,11 @@ def _check_hook_events_complete(
 
     A missing event the version gate would leave out again names its floor and
     the version found, not a bare "re-run init" that would change nothing. The
-    gate probes ``<binary> --version`` only when something is missing and the
-    profile has floors."""
+    gate probes ``<binary> --version`` only when something is missing, the
+    profile has floors, and the profile is packaged: `binary` and `env` of an
+    overlay or entry-point profile are project-controlled, and validate never
+    executes them (#294). Such a profile's floored events are named with their
+    floor and no version."""
     detail: dict[str, object] = {"profile": profile.name, "config_path": str(hook_config)}
     missing = install.missing_relay_events(parsed, profile.hooks.dialect, profile.hooks.events)
     if not missing:
@@ -813,7 +816,17 @@ def _check_hook_events_complete(
             detail,
         )
         return
-    registrable, gate_notes = install.gated_hook_events(profile)
+    if profile.packaged:
+        registrable, gate_notes = install.gated_hook_events(profile)
+    else:
+        floors = profile.hooks.event_min_versions
+        registrable = {n: c for n, c in profile.hooks.events.items() if n not in floors}
+        gate_notes = [
+            f"{native} hook needs {profile.binary} >= {floor} ({profile.name}; version "
+            f"not probed for a project-owned profile) — on such a version, re-run "
+            f"`bmad-loop init --cli {profile.name}`"
+            for native, floor in floors.items()
+        ]
     rerun = [native for native in missing if native in registrable]
     gated = [native for native in missing if native not in registrable]
     detail["missing"] = missing

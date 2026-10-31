@@ -14843,15 +14843,75 @@ def test_transient_stop_failure_withholds_the_nudge_during_a_quota_wait(tmp_path
     assert result.stop_failure == "overloaded"
 
 
-def test_transient_stop_failure_after_the_nudges_run_out_falls_to_the_stall(tmp_path, monkeypatch):
-    """No stop nudge left: crumbed, and the session keeps today's stall path — the
-    wake nudges at grace expiry, then a charged `stalled` (#764: an unrecovered
-    transient error is not a pause)."""
-    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_stop_failure_event("server_error")])
-    adapter._stop_nudges = 0
+def test_transient_stop_failure_in_a_dev_session_types_the_wake_nudge(tmp_path, monkeypatch):
+    """The dev adapter's real knobs: no result-file nudge (the skill writes no
+    result.json), a wake-nudge budget. The transient error gets the wake nudge at
+    the event, from the stall budget, instead of after the grace runs out in
+    silence; unanswered, the next expiry spends the rest and the session stalls.
+
+    ABLATION: drop the `stall_nudge_due` branch and the first `send_text` comes
+    one grace later, after a `stop-failure-nudge-exhausted` crumb."""
+    sends: list[int] = []
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_stop_failure_event("overloaded")])
+    assert adapter._stop_nudges == 0
+    send = mux.send_text
+
+    def counting_send(window_id, text):
+        sends.append(len(_lifecycle_events(adapter, "stop-failure")))
+        return send(window_id, text)
+
+    mux.send_text = counting_send
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
     assert _stop_nudges(mux) == []
     assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    # the first wake nudge went out on the StopFailure tick, not a grace later
+    assert sends[0] == 1
+    assert _lifecycle_events(adapter, "stop-failure-nudge-exhausted") == []
+    assert (result.status, result.parked, result.stop_failure) == ("stalled", False, "overloaded")
+
+
+def test_transient_stop_failure_wake_nudge_honors_the_cap(tmp_path, monkeypatch):
+    """The wake nudge at the event is bounded by the session's attempt cap like one
+    at grace expiry: a grace expiry spends the cap of 1 first, so the later
+    StopFailure types nothing.
+
+    ABLATION: drop the cap clause from `stall_nudge_due` and a second wake nudge
+    goes out at the event."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [None, _stop_failure_event("server_error")]
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), stall_nudges_cap=1)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT]
+    assert result.status == "stalled"
+
+
+def test_transient_stop_failure_never_types_into_a_parked_cli(tmp_path, monkeypatch):
+    """A parked latch (a CLI waiting on a human) withholds the wake nudge at the
+    event too, and the stall expiry ends the session parked (#727)."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt"), _stop_failure_event("server_error")],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stall_nudges(mux) == []
+    (withheld,) = _lifecycle_events(adapter, "stop-nudge-withheld")
+    assert (withheld["reason"], withheld["hook_event"]) == ("parked", "StopFailure")
+    assert (result.status, result.parked) == ("stalled", True)
+
+
+def test_transient_stop_failure_after_the_nudges_run_out_falls_to_the_stall(tmp_path, monkeypatch):
+    """No stop nudge and no wake nudge left: crumbed, and the session keeps today's
+    stall path, a charged `stalled` (#764: an unrecovered transient error is not a
+    pause)."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("server_error")], nudges=0
+    )
+    adapter._stop_nudges = 0
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stop_nudges(mux) == []
+    assert _stall_nudges(mux) == []
     assert (result.status, result.parked, result.usage_limited) == ("stalled", False, None)
     (exhausted,) = _lifecycle_events(adapter, "stop-failure-nudge-exhausted")
     assert exhausted["error"] == "server_error"

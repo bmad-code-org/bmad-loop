@@ -30,6 +30,7 @@ from conftest import (
     refuse_to_resolve,
     render_probe_stub_skill_md,
     windows_relay_builder,
+    write_script_launcher,
 )
 
 import bmad_loop.install as install_mod
@@ -1615,6 +1616,34 @@ def test_cli_version_reads_the_binarys_version_output(monkeypatch):
     assert _REAL_CLI_VERSION(python) == tuple(sys.version_info[:3])
     missing = dataclasses.replace(claude, binary="bmad-loop-no-such-cli-865", env={})
     assert _REAL_CLI_VERSION(missing) is None
+
+
+def test_cli_version_runs_the_binary_under_the_profile_env(tmp_path, monkeypatch):
+    """The probe runs the binary in the session's environment, not only resolves
+    it there: a launcher whose answer depends on the profile's `env` (a
+    version-manager shim, an `env node` launcher) reads the version the session
+    would run. The cache is keyed by that env, so a second profile over the same
+    binary is probed again.
+
+    ABLATION: drop `env=` from the `run_argv` call and the first read is None."""
+    monkeypatch.setattr(install_mod, "_cli_versions", {})
+    launcher = write_script_launcher(
+        tmp_path,
+        "envcli",
+        "import os\nv = os.environ.get('BMAD_LOOP_TEST_CLI_VERSION')\n"
+        "print(v if v else 'no version')\n",
+    )
+    monkeypatch.delenv("BMAD_LOOP_TEST_CLI_VERSION", raising=False)
+    claude = get_profile("claude")
+    old = dataclasses.replace(
+        claude, binary=str(launcher), env={"BMAD_LOOP_TEST_CLI_VERSION": "2.1.77"}
+    )
+    new = dataclasses.replace(
+        claude, binary=str(launcher), env={"BMAD_LOOP_TEST_CLI_VERSION": "2.1.80"}
+    )
+    assert _REAL_CLI_VERSION(old) == (2, 1, 77)
+    assert _REAL_CLI_VERSION(new) == (2, 1, 80)
+    assert _REAL_CLI_VERSION(dataclasses.replace(claude, binary=str(launcher), env={})) is None
 
 
 def test_install_unknown_cli(tmp_path):

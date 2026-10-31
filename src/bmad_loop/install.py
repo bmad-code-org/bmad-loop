@@ -2568,33 +2568,44 @@ def _confined_to(target: Path, root: Path) -> bool:
 
 # Bound on one `<binary> --version` probe for the hook-event version gate.
 CLI_VERSION_TIMEOUT_S = 10.0
-# Successful probes by resolved binary path: one launch per binary per process,
-# so worktree provisioning does not respawn the CLI for every story. A failed
-# probe is not cached — the next registration tries again.
-_cli_versions: dict[str, tuple[int, int, int]] = {}
+# Successful probes by resolved binary path and profile env: one launch per
+# binary per process, so worktree provisioning does not respawn the CLI for every
+# story. The env is part of the key because a launcher's answer can depend on it
+# (a version-manager shim, an `env node` launcher). A failed probe is not cached
+# — the next registration tries again.
+_cli_versions: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[int, int, int]] = {}
 
 
 def cli_version(profile: CLIProfile) -> tuple[int, int, int] | None:
     """The installed CLI's version from ``<binary> --version``, or None when the
     binary is not on PATH, the run fails (spawn error, timeout, stop, nonzero exit)
     or prints no ``X.Y.Z``. Never raises: every None is an answer the caller turns
-    into a visible "version unknown" note. The PATH is the session's own (the
-    profile's ``env`` over this process's), as `codex_trust` resolves it."""
-    resolved = shutil.which(profile.binary, path={**os.environ, **profile.env}.get("PATH"))
+    into a visible "version unknown" note. The environment is the session's own
+    (the profile's ``env`` over this process's), both to resolve the binary, as
+    `codex_trust` does, and to run it: a launcher that finds its interpreter on
+    the profile's PATH must find it here too."""
+    session_env = {**os.environ, **profile.env}
+    resolved = shutil.which(profile.binary, path=session_env.get("PATH"))
     if resolved is None:
         return None
-    cached = _cli_versions.get(resolved)
+    key = (resolved, tuple(sorted(profile.env.items())))
+    cached = _cli_versions.get(key)
     if cached is not None:
         return cached
     try:
-        run = childrun.run_argv([resolved, "--version"], cwd=None, timeout=CLI_VERSION_TIMEOUT_S)
+        run = childrun.run_argv(
+            [resolved, "--version"],
+            cwd=None,
+            timeout=CLI_VERSION_TIMEOUT_S,
+            env=session_env if profile.env else None,
+        )
     except (OSError, subprocess.SubprocessError, ProcessHostError):
         return None
     if run.timed_out or run.interrupted or run.returncode != 0:
         return None
     version = parse_cli_version((run.stdout or "") + "\n" + (run.stderr or ""))
     if version is not None:
-        _cli_versions[resolved] = version
+        _cli_versions[key] = version
     return version
 
 

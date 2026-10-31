@@ -509,13 +509,17 @@ instead of `Stop`. Map the native event to the canonical `StopFailure` and name 
 `error` values in `[hooks.stop_failure_types]`. The relay forwards the payload's `error`,
 `error_details` and `last_assistant_message` (the rendered API error, not the model's
 prose). A missing `error` reads as `unknown`. `StopFailure` is never a completion: it
-never marks the turn ended, never reads a result, and never re-arms the stall grace.
+never marks the turn ended, never reads a result, and never restores a nudge budget.
 The generic adapter acts on it when it arrives, by action:
 
 - **`transient`**: the stop nudge goes out at once, from the same budget and with the
   same quota-wait guard as a result-less `Stop` (`stop-nudge-withheld` carries
-  `hook_event="StopFailure"`). A turn that never recovers stalls as before and is
-  charged; with the budget spent, the adapter leaves `stop-failure-nudge-exhausted`.
+  `hook_event="StopFailure"`). A session with no stop nudge (a dev session: its skill
+  writes no result file) gets the stall wake nudge at once instead, from the stall
+  budget and attempt cap, and the stall grace restarts; a parked latch withholds it
+  (`stop-nudge-withheld`, `reason="parked"`). A turn that never recovers stalls as
+  before and is charged; with both budgets spent, the adapter leaves
+  `stop-failure-nudge-exhausted`.
 - **`account`**: the session ends `stalled` + `parked` with the evidence
   `StopFailure(<error>): <message, else details, else "no message">`. The log-tail
   env-fault scan is skipped, so the run pauses with a `parked:` reason naming the error,
@@ -550,7 +554,9 @@ event out below its floor or when the version cannot be read. `init` prints
 `warning: StopFailure hook not registered (claude): …` and strips a relay it gated out;
 provisioning journals `worktree-hook-gated`. A project initialized before the event was
 mapped gets it by re-running `bmad-loop init`, and `bmad-loop validate` warns
-(`hooks.events-incomplete`) until then. Downgrading the CLI after `init` keeps the entry
+(`hooks.events-incomplete`) until then. `validate` reads the version only for a packaged
+profile; for an overlay or entry-point profile it names the floor without running the
+binary. Downgrading the CLI after `init` keeps the entry
 until `init` runs again.
 
 ### Answer keys (the `[parked_answers]` table)

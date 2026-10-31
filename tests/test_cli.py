@@ -15269,6 +15269,57 @@ def test_validate_names_the_version_floor_for_a_gated_unregistered_event(
     assert finding["message"].startswith("StopFailure hook not registered (claude)")
 
 
+def test_validate_never_probes_the_version_of_an_overlay_profile(project, capsys, monkeypatch):
+    """The hook-event version gate is a `<binary> --version` launch, and an
+    overlay profile's `binary` and `env` arrive with a clone: validate never runs
+    it (#294). A floored event that overlay leaves unregistered is named with its
+    floor and no version.
+
+    ABLATION: drop the `profile.packaged` gate in `_check_hook_events_complete`
+    and the probe records the overlay profile."""
+    from bmad_loop import install
+
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "overlaycli"\n')
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "overlaycli.toml").write_text(
+        'name = "overlaycli"\nbinary = "overlaycli"\nbypass_args = ["--yes"]\n'
+        "\n[hooks]\n"
+        'dialect = "claude-settings-json"\n'
+        'config_path = ".overlaycli/settings.json"\n'
+        'events = { Stop = "Stop", StopFailure = "StopFailure" }\n'
+        "\n[hooks.stop_failure_types]\n"
+        'server_error = "transient"\n'
+        "\n[hooks.event_min_versions]\n"
+        'StopFailure = "2.1.78"\n',
+        encoding="utf-8",
+    )
+    probed: list[str] = []
+    monkeypatch.setattr(
+        install, "cli_version", lambda profile: probed.append(profile.name) or (9, 9, 9)
+    )
+    assert install.install_into(project.project, clis=("overlaycli",), skills=False) == 0
+    config = project.project / ".overlaycli/settings.json"
+    data = json.loads(config.read_text(encoding="utf-8"))
+    del data["hooks"]["StopFailure"]
+    config.write_text(json.dumps(data), encoding="utf-8")
+    capsys.readouterr()
+    probed.clear()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    assert probed == []
+    [finding] = [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.events-incomplete" and f["detail"]["profile"] == "overlaycli"
+    ]
+    assert finding["severity"] == "warning"
+    assert finding["detail"]["gated"] == ["StopFailure"]
+    assert finding["message"].startswith("StopFailure hook needs overlaycli >= 2.1.78")
+    assert "not probed" in finding["message"]
+
+
 def test_validate_ignores_unused_legacy_copy(project, capsys):
     from bmad_loop.install import install_into
 
