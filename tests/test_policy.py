@@ -58,8 +58,7 @@ def test_review_on_timeout_invalid():
 def test_review_on_status_contradiction_default_parse_and_template():
     import tomllib
 
-    # default is the new behavior: the released retry-until-budget loop is the
-    # defect (#334), "retry" is the compatibility opt-out.
+    # "escalate" is the default and the only legal value (#334, #813).
     assert policy.loads("").review.on_status_contradiction == "escalate"
     for mode in sorted(policy.REVIEW_ON_STATUS_CONTRADICTION_MODES):
         loaded = policy.loads(f'[review]\non_status_contradiction = "{mode}"\n')
@@ -67,6 +66,22 @@ def test_review_on_status_contradiction_default_parse_and_template():
     # the emitted template documents the knob at its dataclass default
     doc = tomllib.loads(policy.POLICY_TEMPLATE)
     assert doc["review"]["on_status_contradiction"] == policy.ReviewPolicy.on_status_contradiction
+
+
+def test_review_on_status_contradiction_retry_is_refused():
+    """The removed `retry` mode is refused with its own migration text, not the
+    generic membership error, and nothing warns first.
+
+    Ablations: delete the inline `retry` refusal in `loads()` → fails (the
+    generic "must be one of ['escalate']" error carries no `was removed`)."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(policy.PolicyError) as exc:
+            policy.loads('[review]\non_status_contradiction = "retry"\n')
+    msg = str(exc.value)
+    assert 'review.on_status_contradiction = "retry" was removed' in msg
+    assert 'set it to "escalate"' in msg
+    assert not caught
 
 
 def test_review_on_status_contradiction_invalid():

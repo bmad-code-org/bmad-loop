@@ -59,6 +59,18 @@ Every other reason keeps the `CRITICAL escalation: <story>` title. Fix the cause
 
 A story stays escalated until you resolve it. A plain `bmad-loop resume` warns `story '<key>' is still escalated — resume skips it`, skips it and runs the rest of the queue, then pauses again with `story '<key>' is still escalated — run bmad-loop resolve <id>`. A run is never marked finished while a story is escalated. A resume clears the pause before its engine starts, so an engine that exits before run end (killed, stopped, crashed) leaves the run with no pause stage and the story still escalated; resolve it the same way.
 
+### A review revoked the sign-off
+
+A review session that disagrees with the dev pass escalates as a contradiction instead of burning review cycles:
+
+- **sprint-status mode:** the orchestrator advanced the board to `done` after dev verified, and the review wrote it back to an earlier stage while the spec stayed `done`;
+- **tickets mode:** the review left the plan at an earlier status than the one it entered at (`built` or `done`), for example back at `in-progress`.
+
+The reason names both sides. The work is kept: uncommitted in the checkout, or on the unit's worktree branch under isolation. Editing the board or plan back to `done` and running `bmad-loop resume` does not clear it: the story stays escalated and the run pauses again. Either:
+
+- **Finish the work and re-arm.** Commit what you want kept (in place, the re-drive resets uncommitted changes onto a preserve ref; under isolation it discards the kept worktree), then `bmad-loop resolve <run-id>` ([re-arm](#re-arm-with-the-resolve-agent)). The story re-drives from `ready-for-dev` with its attempt and review budgets reset.
+- **Accept the kept branch** (worktree isolation only): `bmad-loop resolve <run-id> --adopt-branch` ([details](#adopt-the-kept-branch)) commits and merges the work as is and advances the board or plan itself. Review and the `[verify]` commands are not re-run.
+
 ## Resolving an escalation
 
 `bmad-loop resolve <run-id>` works on a run paused at `escalation`, or on an unfinished run with no pause stage and a story still escalated, whose engine is not running. A tickets run paused at `epic-boundary` gets the [epic-close resolve](#epic-closure-in-tickets-mode) instead. Any other pause stage, a finished run, and a sweep with no pause stage are refused. `--story <key>` picks a story other than the default: the paused story, or with no pause stage the first escalated one (`--story` must then name an escalated story). By default it asks before it re-arms and then resumes the run itself:

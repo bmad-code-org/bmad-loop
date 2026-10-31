@@ -10341,10 +10341,9 @@ def verify_review(
     this gate accepts below). A board now sitting *earlier* than ``done``
     is therefore not a stage the story never reached — it is a review session
     deliberately revoking the sign-off. Nothing in the review loop re-advances
-    the board, so retrying only replays the same failure until the budget runs
-    out and the work is rolled back; under
-    ``review.on_status_contradiction = "escalate"`` (the default) the gate
-    escalates instead, naming both sides. See #334.
+    the board, so retrying would only replay the same failure until the budget
+    ran out and the work was rolled back; the gate escalates instead, naming
+    both sides. See #334.
 
     ``(awaiting-operator, awaiting-operator)`` is the second accepted pair, on
     the same observed-spec-status selection ``verify_dev`` uses: this is the gate
@@ -10387,7 +10386,7 @@ def verify_review(
 
     sprint = story_status(paths.sprint_status, task.story_key)
     if sprint != expected:
-        if expected == "done" and _is_signoff_regression(sprint, sprint_reached_done, policy):
+        if expected == "done" and _is_signoff_regression(sprint, sprint_reached_done):
             return VerifyOutcome.escalate(
                 f"review revoked the sprint sign-off for {task.story_key}: the "
                 f"orchestrator advanced the board to 'done' after dev verified, "
@@ -10397,10 +10396,10 @@ def verify_review(
                 f"reconcile them — the review loop never re-advances the board, so "
                 f"the remaining cycles would burn down onto a defer that rolls the "
                 f"work back. Resolve by either completing the outstanding work and "
-                f"re-arming the escalation (the attempt budget resets on re-arm), "
-                f"or accepting the story and advancing the board yourself; set "
-                f'review.on_status_contradiction = "retry" to restore the legacy '
-                f"retry-until-budget behavior.",
+                f"re-arming with bmad-loop resolve (the attempt budget resets on "
+                f"re-arm), or, under worktree isolation, accepting the kept branch "
+                f"with bmad-loop resolve --adopt-branch; see "
+                f"docs/escalations-guide.md#a-review-revoked-the-sign-off.",
                 contradiction=True,
             )
         return VerifyOutcome.retry(
@@ -10410,16 +10409,16 @@ def verify_review(
     return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
-def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool, policy: Policy) -> bool:
+def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool) -> bool:
     """Whether a non-``done`` sprint status is a review deliberately walking the
     board backward, as opposed to a stage the story simply never reached.
 
-    Conservative on every uncertainty: without the launch-time guarantee, with
-    the knob set to ``retry``, or when the fresh read yields no status at all
-    (missing story entry) or a token outside the known lifecycle (a hand-edited
-    or future board), the caller falls through to the ordinary retry — a wrong
-    escalation halts an otherwise healthy run."""
-    if not sprint_reached_done or policy.review.on_status_contradiction != "escalate":
+    Conservative on every uncertainty: without the launch-time guarantee, or
+    when the fresh read yields no status at all (missing story entry) or a token
+    outside the known lifecycle (a hand-edited or future board), the caller
+    falls through to the ordinary retry — a wrong escalation halts an otherwise
+    healthy run."""
+    if not sprint_reached_done:
         return False
     if sprint is None or sprint not in STATUS_ORDER:
         return False
@@ -10477,9 +10476,8 @@ def verify_review_tickets(
     The plan is the only artifact, so the board's sign-off-regression arm becomes
     a monotonic read-back of the plan itself: a status that sits EARLIER in
     ``statemachine.PLAN_STATUS_ORDER`` than the one the review entered at is the
-    review walking the ticket backward. Under ``review.on_status_contradiction =
-    "escalate"`` (the default) that escalates as a contradiction, since no
-    further review cycle re-advances it; under ``"retry"`` it retries. Any other
+    review walking the ticket backward, and it escalates as a contradiction: the
+    review's converged result disagrees with the plan it left. Any other
     mismatch retries. A ``dropped`` plan always escalates as a contradiction.
 
     ``on_results`` / ``on_probes`` go straight to ``_verify_review_commands``,
@@ -10504,28 +10502,31 @@ def verify_review_tickets(
         return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
     expected = PLAN_DONE if entered_status == PLAN_DONE else PLAN_BUILT
     if status != expected:
-        if _is_plan_regression(status, entered_status, policy):
+        if _is_plan_regression(status, entered_status):
             return VerifyOutcome.escalate(
                 f"review walked ticket plan {plan} back from {entered_status!r} to "
                 f"{status!r}. The orchestrator verified it at {entered_status!r} before "
-                f"the review, and no further review cycle moves it forward again. "
-                f"Resolve by finishing the outstanding work and re-arming the "
-                f"escalation, or by accepting the ticket yourself; set "
-                f'review.on_status_contradiction = "retry" to retry instead.',
+                f"the review, so the review's converged result disagrees with the plan "
+                f"it left, and a re-run would route the plan by its new status (from "
+                f"'in-progress', a build leg under the review role that never passes "
+                f"the dev gate). Resolve by finishing the outstanding work and "
+                f"re-arming with bmad-loop resolve, or, under worktree isolation, "
+                f"accepting the kept branch with bmad-loop resolve --adopt-branch; "
+                f"see docs/escalations-guide.md#a-review-revoked-the-sign-off.",
                 contradiction=True,
             )
         return VerifyOutcome.retry(f"plan status is {status!r}, expected {expected!r}: {plan}")
     return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
 
 
-def _is_plan_regression(status: str, entered_status: str, policy: Policy) -> bool:
+def _is_plan_regression(status: str, entered_status: str) -> bool:
     """Whether ``status`` sits strictly earlier in the plan lifecycle than the
     status the review entered at. Conservative like :func:`_is_signoff_regression`:
     a token outside ``PLAN_STATUS_ORDER`` (``blocked``, an unknown value), a
     blank one (``""``: no plan status read, the shape an unreadable or torn plan
-    leaves), an unknown entry status, or the ``retry`` knob all fall through to
-    the ordinary retry."""
-    if policy.review.on_status_contradiction != "escalate" or not status:
+    leaves) or an unknown entry status all fall through to the ordinary
+    retry."""
+    if not status:
         return False
     if status not in PLAN_STATUS_ORDER or entered_status not in PLAN_STATUS_ORDER:
         return False

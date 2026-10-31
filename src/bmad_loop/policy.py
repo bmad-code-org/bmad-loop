@@ -35,7 +35,7 @@ SESSION_BUDGET_MODES = {"off", "warn", "enforce"}
 SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
 REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
-REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate", "retry"}
+REVIEW_ON_STATUS_CONTRADICTION_MODES = {"escalate"}
 OPERATOR_ON_REVIEW_DEMOTION_MODES = {"escalate", "park"}
 # [adapter] permission_mode: "bypass" (default) launches a profile's bypass_args;
 # any other mode launches the profile's `[permission_modes.<mode>]` args instead,
@@ -296,11 +296,10 @@ class ReviewPolicy:
     # stage contradicts that — and nothing in the review loop re-advances the
     # board, so every remaining cycle re-reads the same failure and the story
     # ends deferred + rolled back.
-    #   "escalate" (default) — pause the run naming both sides of the
-    #       disagreement, so a human resolves it instead of the budget burning
-    #       down onto a rollback.
-    #   "retry" — legacy behavior: treat it as an ordinary verify failure, burn
-    #       review cycles to limits.max_review_cycles, then defer.
+    # "escalate" is the only legal value: a revoked sign-off always pauses the
+    # run naming both sides of the disagreement, so a human resolves it instead
+    # of the budget burning down onto a rollback. `loads()` refuses the removed
+    # "retry" mode with migration text.
     # Keys on sprint-status only: the spec's own frontmatter status legitimately
     # cycles (in-review/in-progress) while a review patches, and `status: blocked`
     # remains the sanctioned way for a review to hand a story back to a human.
@@ -1210,6 +1209,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             f"review.on_timeout must be one of {sorted(REVIEW_ON_TIMEOUT_MODES)}:"
             f" got {review.on_timeout!r}"
         )
+    if review.on_status_contradiction == "retry":
+        raise PolicyError(
+            'review.on_status_contradiction = "retry" was removed — a review that walks'
+            " sprint-status or a ticket plan back from done now always pauses with an"
+            ' escalation naming both sides; delete the key or set it to "escalate"'
+        )
     if review.on_status_contradiction not in REVIEW_ON_STATUS_CONTRADICTION_MODES:
         raise PolicyError(
             "review.on_status_contradiction must be one of "
@@ -1612,11 +1617,10 @@ trigger = "recommended"
 #                        commit it and refile the outstanding follow-up to deferred work.
 #   "defer"           -> give up on the first timeout-like verdict.
 on_timeout = "retry"
-# What a review that writes sprint-status back off `done` (the sign-off the
-# orchestrator recorded at dev time) costs. Nothing in the review loop
-# re-advances the board, so every remaining cycle re-reads the same failure:
-#   "escalate" -> pause the run naming both sides of the disagreement (default).
-#   "retry"    -> legacy: burn review cycles to max_review_cycles, then defer.
+# A review that writes sprint-status back off `done` (the sign-off the
+# orchestrator recorded at dev time) pauses the run naming both sides of the
+# disagreement: nothing in the review loop re-advances the board.
+# "escalate" is the only value.
 on_status_contradiction = "escalate"
 
 [stories]

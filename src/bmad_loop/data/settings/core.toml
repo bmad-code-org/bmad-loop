@@ -57,13 +57,10 @@ options_ref = "REVIEW_ON_TIMEOUT_MODES"
 default_ref = "ReviewPolicy.on_timeout"
 label = "review timeout policy"
 description = "retry: burn a review cycle per timeout (default) · salvage-if-done: commit the verified dev product and refile the follow-up · defer: give up on the first timeout"
-[[section.field]]
-key = "on_status_contradiction"
-kind = "select"
-options_ref = "REVIEW_ON_STATUS_CONTRADICTION_MODES"
-default_ref = "ReviewPolicy.on_status_contradiction"
-label = "review revokes sprint sign-off"
-description = "escalate: pause naming both sides when a review writes sprint-status back off done (default) · retry: legacy — burn review cycles, then defer + roll back"
+# `on_status_contradiction` is reserved and deliberately has no field here (HIDDEN
+# in tests/test_settings_schema.py): `escalate` is its only value and the default.
+# policy.py parses it, but a review that revokes the sign-off always pauses,
+# naming both sides.
 
 [[section]]
 name = "stories"

@@ -123,6 +123,9 @@ breaking changes may land in a minor release.
 - Remove the `[engine]` policy alias: a named `[engine]` block now fails to load with the
   `[plugins] enabled` + `[plugins.<name>]` migration, and an empty-name block is ignored
   with a warning to delete it. 0.13.2 is the last release that folds it (#810).
+- Remove the legacy `[review] on_status_contradiction = "retry"` mode: it now fails to load
+  with a pointer to `escalate`, and a review that walks sprint-status or a ticket plan back
+  from done always pauses. 0.13.2 is the last release that honours it (#813).
 - psmux: stop refusing an `@` option value that starts with `-`; psmux 3.4.0 stores it
   verbatim (#879).
 
