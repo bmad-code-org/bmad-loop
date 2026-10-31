@@ -91,7 +91,7 @@ def test_module_validate_json_smoke(tmp_path):
 
 
 def test_module_prints_policy_deprecation_once_on_stderr(tmp_path):
-    """A legacy ``[engine]`` block reaches a CLI user as one clean stderr line
+    """An empty-name ``[engine]`` block's warning reaches a CLI user as one clean stderr line
     (#835). It was a ``DeprecationWarning``, which Python hides outside
     ``__main__``, so a real run printed nothing. ``init`` loads policy without
     needing a BMAD install (``plugins list`` fails on the bmad-config gate first).
@@ -102,13 +102,13 @@ def test_module_prints_policy_deprecation_once_on_stderr(tmp_path):
     project = _engine_policy_project(tmp_path)
     proc = _run_module("init", "--project", str(project), cwd=tmp_path, env=_clean_warning_env())
     assert proc.returncode == 0, proc.stderr
-    assert proc.stderr.count("bmad-loop: warning: [engine] in policy.toml is deprecated") == 1
+    assert proc.stderr.count("bmad-loop: warning: [engine] in policy.toml is ignored") == 1
     assert "FutureWarning" not in proc.stderr
     assert "policy.py" not in proc.stderr
 
 
 def test_module_validate_reports_policy_deprecation_as_finding(tmp_path):
-    """``validate`` reports the ``[engine]`` deprecation as a ``policy.deprecated``
+    """``validate`` reports the empty-name ``[engine]`` warning as a ``policy.deprecated``
     warning finding and does not also print it on stderr (#835): the incidental
     ``_configure_mux`` load ignores it, and validate's own load records it.
 
@@ -125,6 +125,29 @@ def test_module_validate_reports_policy_deprecation_as_finding(tmp_path):
     assert deprecated[0]["severity"] == "warning"
     assert "[engine]" in deprecated[0]["message"]
     assert "bmad-loop: warning:" not in proc.stderr
+
+
+def test_module_validate_refuses_a_named_engine_block(tmp_path):
+    """A named ``[engine]`` block fails ``validate``'s ``policy`` check with the
+    ``[plugins]`` migration, and no ``policy.deprecated`` finding rides along: the
+    refusal is the whole notice.
+
+    Ablations: delete the named-block refusal in ``_refuse_removed_engine`` → the
+    ``policy`` check passes and the warning becomes a ``policy.deprecated`` finding."""
+    (tmp_path / ".bmad-loop").mkdir()
+    (tmp_path / ".bmad-loop" / "policy.toml").write_text(
+        '[engine]\nname = "unity"\n', encoding="utf-8"
+    )
+    proc = _run_module(
+        "validate", "--json", "--project", str(tmp_path), cwd=tmp_path, env=_clean_warning_env()
+    )
+    assert proc.returncode != 0, proc.stderr
+    doc = json.loads(proc.stdout)
+    (pol_check,) = [f for f in doc["findings"] if f["check"] == "policy"]
+    assert pol_check["severity"] != "ok", pol_check
+    assert 'enabled = ["unity"]' in pol_check["message"]
+    assert "[plugins.unity]" in pol_check["message"]
+    assert not [f for f in doc["findings"] if f["check"] == "policy.deprecated"]
 
 
 # The child of test_extra_less_install_core_works_and_tui_hints. Kept as a module

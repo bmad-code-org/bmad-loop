@@ -16,9 +16,9 @@ only after you **grant** it with `bmad-loop plugins enable <name>`, which record
 a sha256 of the whole plugin directory outside the repo. See
 [Trust & safety](#trust--safety).
 
-> Already wrote a [CLI adapter profile](../README.md#other-coding-clis) or the old
-> `[engine]` block? Same idea — declarative TOML + optional scripts, discovered and
-> overlaid. The plugin system generalizes both.
+> Already wrote a [CLI adapter profile](../README.md#other-coding-clis)? Same idea —
+> declarative TOML + optional scripts, discovered and overlaid. The plugin system
+> generalizes it.
 
 ---
 
