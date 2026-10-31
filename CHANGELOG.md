@@ -81,6 +81,13 @@ breaking changes may land in a minor release.
 - Add `[verify] command_timeout_min` (default 30), previously fixed at 30 minutes; a
   timed-out command's failure names the limit (#857).
 - Add every TUI command to the command palette (`ctrl+p`).
+- Act on Claude Code's `StopFailure` hook (Claude Code 2.1.78+) when an API error ends a
+  turn: transient errors get the stall nudge at once, account errors pause uncharged, and
+  `rate_limit` is split by its message into a usage-limit pause or the quota wait. Older
+  CLIs are left unregistered with a warning; re-run `bmad-loop init` to register it in
+  place (#865).
+- Add the `hooks.events-incomplete` validate warning: a profile hook event whose relay is
+  not registered, with the `init` that registers it or the CLI version it needs.
 
 ### Changed
 

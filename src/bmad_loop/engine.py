@@ -8474,6 +8474,11 @@ class Engine:
         # present-only like the reset.
         if result.usage_limit_class:
             extras["usage_limit_class"] = result.usage_limit_class
+        # the API error a Claude Code `StopFailure` hook reported (#865):
+        # present-only, so a grep finds exactly the sessions whose last turn
+        # ended on one that no later Stop cleared.
+        if result.stop_failure:
+            extras["stop_failure"] = result.stop_failure
         # usage-limit quota wait (DW-396): present-only — the seconds the session
         # sat behind a usage-window reset with its timeout frozen.
         if result.quota_wait_s > 0:

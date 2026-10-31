@@ -36,7 +36,14 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, NamedTuple
 
 from . import bmadconfig, childrun, ticketlayout, ticketmodel, ticketstore, tickettree
-from .adapters.profile import ALIASES, CANONICAL_EVENTS, CLIProfile, ProfileError, load_profiles
+from .adapters.profile import (
+    ALIASES,
+    CANONICAL_EVENTS,
+    CLIProfile,
+    ProfileError,
+    load_profiles,
+    parse_cli_version,
+)
 from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
@@ -2346,6 +2353,31 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
     return all(native in satisfied for native in stop_natives)
 
 
+def missing_relay_events(config: dict, dialect: str, events: Mapping[str, str]) -> list[str]:
+    """Native events in ``events`` with no executed relay reporting their canonical
+    event, in map order.
+
+    `relay_registered` answers only for the completion signal: a config written
+    before a profile mapped a newer event (claude's ``StopFailure``) still passes
+    it while that event never reaches the loop. This names what such a config
+    lacks; ``bmad-loop init`` registers it in place. A relay that reports a
+    different canonical event does not count — `relay_registered` refuses that
+    config outright.
+    """
+    container = hook_event_container(config, dialect)
+    missing: list[str] = []
+    for native, canonical in events.items():
+        handlers = container.get(native)
+        present = isinstance(handlers, list) and any(
+            _relay_canonical_event(command) == canonical
+            for handler in handlers
+            for command in _executed_commands_in_handler(handler)
+        )
+        if not present:
+            missing.append(native)
+    return missing
+
+
 def foreign_group_relay_hazards(
     config: dict, dialect: str, events: Mapping[str, str]
 ) -> list[tuple[str, str]]:
@@ -2534,6 +2566,90 @@ def _confined_to(target: Path, root: Path) -> bool:
         return False
 
 
+# Bound on one `<binary> --version` probe for the hook-event version gate.
+CLI_VERSION_TIMEOUT_S = 10.0
+# Successful probes by resolved binary path and profile env: one launch per
+# binary per process, so worktree provisioning does not respawn the CLI for every
+# story. The env is part of the key because a launcher's answer can depend on it
+# (a version-manager shim, an `env node` launcher). A failed probe is not cached
+# — the next registration tries again.
+_cli_versions: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[int, int, int]] = {}
+
+
+def cli_version(profile: CLIProfile) -> tuple[int, int, int] | None:
+    """The installed CLI's version from ``<binary> --version``, or None when the
+    binary is not on PATH, the run fails (spawn error, timeout, stop, nonzero exit)
+    or prints no ``X.Y.Z``. Never raises: every None is an answer the caller turns
+    into a visible "version unknown" note. The environment is the session's own
+    (the profile's ``env`` over this process's), both to resolve the binary, as
+    `codex_trust` does, and to run it: a launcher that finds its interpreter on
+    the profile's PATH must find it here too."""
+    session_env = {**os.environ, **profile.env}
+    resolved = shutil.which(profile.binary, path=session_env.get("PATH"))
+    if resolved is None:
+        return None
+    key = (resolved, tuple(sorted(profile.env.items())))
+    cached = _cli_versions.get(key)
+    if cached is not None:
+        return cached
+    try:
+        run = childrun.run_argv(
+            [resolved, "--version"],
+            cwd=None,
+            timeout=CLI_VERSION_TIMEOUT_S,
+            env=session_env if profile.env else None,
+        )
+    except (OSError, subprocess.SubprocessError, ProcessHostError):
+        return None
+    if run.timed_out or run.interrupted or run.returncode != 0:
+        return None
+    version = parse_cli_version((run.stdout or "") + "\n" + (run.stderr or ""))
+    if version is not None:
+        _cli_versions[key] = version
+    return version
+
+
+def gated_hook_events(profile: CLIProfile) -> tuple[dict[str, str], list[str]]:
+    """The profile's ``native -> canonical`` events this CLI install can carry, and
+    one note per event left out (#865).
+
+    A native event in ``hooks.event_min_versions`` is registered only when
+    :func:`cli_version` reads a version at or above its floor: an older CLI may
+    reject the whole hook config over one unknown key (Claude Code before 2.1.78
+    skips the entire settings file, Stop relay included), so an unreadable
+    version leaves the event out too. A profile with no floors never spawns the
+    probe, and the validator refuses a floor on a Stop carrier, so the
+    completion signal is never gated. Every caller surfaces the notes."""
+    events = dict(profile.hooks.events)
+    floors = profile.hooks.event_min_versions
+    if not floors:
+        return events, []
+    version = cli_version(profile)
+    notes: list[str] = []
+    for native, floor in floors.items():
+        need = parse_cli_version(floor)
+        if native not in events or (version is not None and need is not None and version >= need):
+            continue
+        del events[native]
+        found = "an unreadable version" if version is None else ".".join(map(str, version))
+        notes.append(
+            f"{native} hook not registered ({profile.name}): it needs {profile.binary} "
+            f">= {floor}, found {found} — upgrade it and re-run "
+            f"`bmad-loop init --cli {profile.name}`"
+        )
+    return events, notes
+
+
+def strip_event_relays(config: dict, dialect: str, natives: Iterable[str]) -> bool:
+    """Drop managed relay commands registered under ``natives``. True if any went.
+
+    The other half of the version gate: a config written while the CLI was new
+    enough keeps its gated relay after a downgrade, and that one entry can make
+    the older CLI skip the whole file — so registration strips what it gated out.
+    User handlers under the same native event stay."""
+    return _strip_commands(hook_event_container(config, dialect), _relay_command, natives)
+
+
 def _register_hooks(project: Path, profile: CLIProfile) -> int:
     if profile.hookless:
         print(f"  no hooks needed ({profile.name}): HTTP/SSE transport")
@@ -2550,15 +2666,21 @@ def _register_hooks(project: Path, profile: CLIProfile) -> int:
         except json.JSONDecodeError:
             print(f"FAIL: {config_path} is not valid JSON; fix it and re-run init")
             return 1
+    events, gate_notes = gated_hook_events(profile)
     try:
         registrations = {
             native: _hook_command(project, profile, canonical)
-            for native, canonical in profile.hooks.events.items()
+            for native, canonical in events.items()
         }
     except ProfileError as e:
         print(f"FAIL: {e}")
         return 1
+    gated_out = [native for native in profile.hooks.events if native not in events]
+    stripped = strip_event_relays(config, profile.hooks.dialect, gated_out)
     config, changed = merge_hooks(config, registrations, profile.hooks.dialect)
+    changed |= stripped
+    for note in gate_notes:
+        print(f"  warning: {note}")
     if changed:
         # atomic_write_text, never write_text (#379), the same rule
         # `_worktree_local_exclude` states for its bytes sibling. This is a

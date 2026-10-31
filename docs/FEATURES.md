@@ -105,12 +105,13 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
   - A session that did no work, or is still parked on a prompt only a human should answer when it stalls or times out, pauses the run instead of being charged; a non-blocking workflow's is journaled and the run continues.
   - A session approved past its permission prompt that then goes silent gets the stall nudge, not a parked pause.
+  - When a Claude Code turn ends on an API error (its `StopFailure` hook), the adapter acts at once and never counts it as a completion: a transient error gets the stall nudge right away and is charged if never recovered, and an account error (billing, authentication, an account hold) pauses the run uncharged with a reason naming the error.
   - `validate --probes` launches each role's CLI once with no prompt and fails when its first screen shows a startup dialog that would park an unattended session.
   - While the pane shows the CLI waiting out a usage-limit reset, the session timeout and stall nudge are held for at most `[limits] quota_wait_max_min` (default 300; 0 = off) minutes; past that the session pauses with a usage-limit reason.
   - Before an attempt is reset, its commits go to an `attempt-preserve/<run>-<tip8>` branch and uncommitted work to a `refs/attempt-preserve-dirty/*` snapshot.
 - **Config:** `[limits] max_dev_attempts`, `[limits] max_review_cycles`, `[limits] session_timeout_min`, `[limits] dev_stall_grace_s`, `[limits] dev_stall_nudges`, `[limits] dev_stall_nudges_cap`, `[limits] quota_wait_max_min`, `[scm] preserve_keep`
-- **Tested by:** `tests/test_escalation.py`, `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_panematch.py`, `tests/test_sweep.py`, `tests/test_verify.py`, `tests/test_recovery_flow.py`
-- **Docs:** [Preserved attempts](escalations-guide.md#preserved-attempts), [[limits] reference](reference/configuration.md#limits), [[scm] reference](reference/configuration.md#scm)
+- **Tested by:** `tests/test_escalation.py`, `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_panematch.py`, `tests/test_sweep.py`, `tests/test_verify.py`, `tests/test_recovery_flow.py`, `tests/test_stories_e2e.py`
+- **Docs:** [Preserved attempts](escalations-guide.md#preserved-attempts), [StopFailure signals](adapter-authoring-guide.md#stopfailure-signals), [[limits] reference](reference/configuration.md#limits), [[scm] reference](reference/configuration.md#scm)
 
 ### Plateau-defer
 
@@ -173,10 +174,11 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - On OpenCode 2.x, provider outages (rate limit, transport, 5xx, auth, no route) are environment faults and a provider quota failure is a usage limit; errors the session's own request can cause stay unclassified.
   - A pattern match is overruled when the session's tracked token usage is nonzero; that session is charged like any failure.
   - A session that times out, stalls or crashes after a live usage-limit sighting (its profile's `usage_limit_patterns` or `usage_wait_patterns` on the pane, or an opencode 2.x quota error) pauses with a `usage limit:` reason and is never charged; the reason names the reset time when the line gives one.
+  - A Claude Code `StopFailure` reporting `rate_limit` is matched by its message against the same usage lists: a blocking limit pauses as a usage limit, and a waiting limit can start the quota wait without a pane capture.
   - `bmad-loop resolve --at-reset` waits until a usage-limit pause's reset plus `--margin-min` (default 2), then re-arms and resumes; credit exhaustion and an unknown or too-distant reset are refused.
 - **Config:** `[environment] probes`, `[environment] probe_timeout_s`, `[verify] env_fault_rc`, `[limits] quota_wait_max_min`; profile keys `env_fault_patterns`, `usage_limit_patterns`, `usage_wait_patterns`
 - **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_env_fault_patterns.py`, `tests/test_env_fault.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`, `tests/test_usagereset.py`
-- **Docs:** [Environment faults](escalations-guide.md#environment-faults), [Usage-limit pauses](escalations-guide.md#usage-limit-pauses), [Usage-limit signals](adapter-authoring-guide.md#usage-limit-signals), [[environment] reference](reference/configuration.md#environment), [[verify] reference](reference/configuration.md#verify), [Profile field reference](adapter-authoring-guide.md#cliprofile)
+- **Docs:** [Environment faults](escalations-guide.md#environment-faults), [Usage-limit pauses](escalations-guide.md#usage-limit-pauses), [Usage-limit signals](adapter-authoring-guide.md#usage-limit-signals), [StopFailure signals](adapter-authoring-guide.md#stopfailure-signals), [[environment] reference](reference/configuration.md#environment), [[verify] reference](reference/configuration.md#verify), [Profile field reference](adapter-authoring-guide.md#cliprofile)
 
 ### Resumable runs and graceful stop
 

@@ -320,6 +320,31 @@ idfile="$rd/tasks/$tid/fake-child.pid"
 """
 )
 
+# Claude Code's API-error turn end (#865): SessionStart, then a `StopFailure` event
+# carrying the relay's `stop_error` / `stop_message` keys instead of any Stop — so
+# only the adapter's StopFailure branch can end the session before the timeout.
+# Derived from TIMEOUT_FAKE_CLI: the inserted block exits before its sleep-child
+# tail ever runs, so no child identity is recorded and there is nothing to reap.
+_STOP_FAILURE_EVENT = r"""ts2=$(( ts + 1 ))
+printf '{"ts": %s, "event": "StopFailure", "task_id": "%s", "session_id": "fake-1", "stop_error": "billing_error", "stop_message": "Credit balance is too low"}' \
+    "$ts2" "$tid" > "$ed/$ts2-$tid-StopFailure.json"
+sleep 30
+exit 0
+"""
+assert TIMEOUT_FAKE_CLI.count(_PARENT_START) == 1
+STOP_FAILURE_FAKE_CLI = TIMEOUT_FAKE_CLI.replace(_PARENT_START, _PARENT_START + _STOP_FAILURE_EVENT)
+
+# PROFILE_TOML with the canonical StopFailure mapped and one account error, as
+# claude's own profile maps it.
+_PROFILE_EVENTS = 'events = {{ SessionStart = "SessionStart", Stop = "Stop" }}\n'
+assert PROFILE_TOML.count(_PROFILE_EVENTS) == 1
+STOP_FAILURE_PROFILE_TOML = PROFILE_TOML.replace(
+    _PROFILE_EVENTS,
+    'events = {{ SessionStart = "SessionStart", Stop = "Stop", StopFailure = "StopFailure" }}\n'
+    "\n[hooks.stop_failure_types]\n"
+    'billing_error = "account"\n',
+)
+
 # DW-159: publication must not precede the session transition. `$!` names the child
 # the instant fork(2) returns, but `setsid(2)` runs in that child AFTERWARDS, so an
 # identity published straight off `$!` merely ASSUMES the escape it is supposed to
@@ -561,7 +586,11 @@ def _scaffold_renderer(
 
 
 def _scaffold_sprint(
-    root: Path, story_key: str, fake_cli: str = FAKE_CLI, extra_policy: str = ""
+    root: Path,
+    story_key: str,
+    fake_cli: str = FAKE_CLI,
+    extra_policy: str = "",
+    profile_toml: str = PROFILE_TOML,
 ) -> None:
     """A committed, clean SPRINT-mode sandbox carrying the SAME new folder+id-
     capable bmad-dev-auto skill stub as `_scaffold` (with the folder+id dispatch
@@ -569,7 +598,7 @@ def _scaffold_sprint(
     the default sprint path. sprint-status.yaml holds one ready-for-dev story; the
     policy has NO [stories] section, so the run is plain sprint mode. ``fake_cli``
     swaps the CLI script (e.g. a never-Stop timeout fake); ``extra_policy`` appends
-    to policy.toml (e.g. a [limits] block)."""
+    to policy.toml (e.g. a [limits] block); ``profile_toml`` swaps the profile."""
     root.mkdir(parents=True, exist_ok=True)
     (root / "src.txt").write_text("original\n", encoding="utf-8")
     (root / ".gitignore").write_text(".bmad-loop/runs/\n", encoding="utf-8")
@@ -608,7 +637,7 @@ def _scaffold_sprint(
     profiles = root / ".bmad-loop" / "profiles"
     profiles.mkdir(parents=True)
     (profiles / "fakestories.toml").write_text(
-        PROFILE_TOML.format(binary=str(fake)), encoding="utf-8"
+        profile_toml.format(binary=str(fake)), encoding="utf-8"
     )
     (root / ".bmad-loop" / "policy.toml").write_text(
         '[adapter]\nname = "fakestories"\n\n'
@@ -1971,6 +2000,71 @@ def test_e2e_session_timeout_teardown(
     if force_live_reap_assertion:
         assert str(poll_failure).splitlines()[0] == f"sleep child {poll_pid} survived teardown"
         assert injected_exit == -signal.SIGKILL
+
+
+def test_e2e_stop_failure_account_error_pauses_uncharged(
+    tmp_path, monkeypatch, private_tmux_server
+):
+    """#865 end to end through the real binary + real tmux, zero tokens: a turn that
+    ends on an account API error fires `StopFailure(billing_error)` and never a Stop.
+    The adapter ends the session parked at the event — no stall grace, no nudge —
+    and the engine PAUSEs with a reason naming the error, without charging a retry:
+    two dev attempts are allowed and exactly one session ran. The session-end
+    journal carries `stop_failure`, and the agent window is torn down. The 120 s
+    session timeout is far beyond the run's bound, so only the StopFailure exit can
+    end the session in time."""
+    root = tmp_path / "sbx"
+    story = "1-1-stopfail"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=STOP_FAILURE_FAKE_CLI,
+        extra_policy="\n[limits]\nmax_dev_attempts = 2\nteardown_grace_s = 5\n",
+        profile_toml=STOP_FAILURE_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=90)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") == "escalation", state
+        reason = str(state.get("paused_reason", ""))
+        assert reason.startswith("parked: dev session stalled (StopFailure(billing_error)"), reason
+        assert "Credit balance is too low" in reason, reason
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        # uncharged: the pause did not spend the second attempt on a retry
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert len(ends) == 1, [j["kind"] for j in journal]
+        [end] = ends
+        assert end["status"] == "stalled", end
+        assert end["parked"] is True, end
+        assert end["stop_failure"] == "billing_error", end
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert [d["action"] for d in decisions] == ["pause"], decisions
+        assert state["tasks"][story]["attempt"] == 1, state["tasks"][story]
+
+        # the agent window is gone; the paused run keeps only its root shell window
+        session_name = f"bmad-loop-{run_id}"
+        windows = _tmux_window_names(private_tmux_server, session_name)
+        assert end["task_id"][-40:] not in windows and len(windows) == 1, windows
+    finally:
+        # The paused run left its session for a resume that never comes.
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
 
 
 @pytest.mark.parametrize(

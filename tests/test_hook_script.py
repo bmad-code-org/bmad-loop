@@ -83,6 +83,34 @@ def test_notification_payload_carries_its_subtype(tmp_path):
     assert json.loads(stop.read_text())["notification_type"] is None
 
 
+def test_stop_failure_payload_carries_its_api_error(tmp_path):
+    """#865: a claude StopFailure's `error` and `last_assistant_message` ride the
+    event file as `stop_error` / `stop_message`, so the adapter can tell a
+    transient API error from an account one; a Stop carries neither key."""
+    env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}
+    proc = run_hook(
+        "StopFailure",
+        env,
+        {
+            "session_id": "s1",
+            "hook_event_name": "StopFailure",
+            "error": "server_error",
+            "last_assistant_message": "API Error: Connection lost mid-response",
+        },
+    )
+    assert proc.returncode == 0
+    event = json.loads(
+        next((tmp_path / "events").glob("*-StopFailure.json")).read_text(encoding="utf-8")
+    )
+    assert event["event"] == "StopFailure"
+    assert event["stop_error"] == "server_error"
+    assert event["stop_message"] == "API Error: Connection lost mid-response"
+    assert "stop_error_details" not in event  # optional, and absent here
+    assert run_hook("Stop", env, {"session_id": "s1"}).returncode == 0
+    stop = json.loads(next((tmp_path / "events").glob("*-Stop.json")).read_text(encoding="utf-8"))
+    assert not {"stop_error", "stop_error_details", "stop_message"} & set(stop)
+
+
 def test_conversation_id_fallback(tmp_path):
     """Cursor-style payloads carry conversation_id instead of session_id."""
     env = {"BMAD_LOOP_RUN_DIR": str(tmp_path), "BMAD_LOOP_TASK_ID": "t1"}

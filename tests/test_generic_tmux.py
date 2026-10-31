@@ -14759,3 +14759,468 @@ def test_session_start_missing_journal_write_failure_is_swallowed(tmp_path, monk
     assert result.status == "timeout"
     assert attempts == ["session-start-missing", "session-start-missing"]
     assert [e["waited_s"] for e in _start_missing_entries(adapter)] == [150]
+
+
+# --------------------------------------------- Claude Code StopFailure (#865)
+#
+# Claude Code fires `StopFailure` INSTEAD of `Stop` when an API error ends a
+# turn. claude's `[hooks.stop_failure_types]` maps the hook's `error` to an
+# action the wait loop takes at the event: a transient error gets the stop
+# nudge, an account error ends the session parked, and `rate_limit` is split by
+# its message against the usage-limit lists. It never completes a session.
+
+
+def _stop_failure_event(error, message=None, *, details=None, transcript_path=None):
+    return dataclasses.replace(
+        _hook_event("StopFailure", transcript_path=transcript_path),
+        stop_error=error,
+        stop_error_details=details,
+        stop_message=message,
+    )
+
+
+def _stop_nudges(mux):
+    return [text for _, text in mux.sent if text == generic.NUDGE_TEXT]
+
+
+@pytest.mark.parametrize("error", ["server_error", "overloaded", "unknown"])
+def test_transient_stop_failure_types_the_stop_nudge(tmp_path, monkeypatch, error):
+    """A transient API error ends the turn with no Stop: the result-less Stop's
+    nudge goes out at the event, from the same budget. It completes nothing and
+    latches no `stop_seen`; unanswered, the grace expiry stalls the session as
+    before and the error rides out on the result."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event(error, "Connection lost")], nudges=0
+    )
+    adapter._stop_nudges = 1
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert mux.sent == [("@1", generic.NUDGE_TEXT)]
+    assert result.status == "stalled"
+    assert result.stop_seen is False
+    assert result.parked is False
+    assert result.stop_failure == error
+    (crumb,) = _lifecycle_events(adapter, "stop-failure")
+    assert (crumb["error"], crumb["action"], crumb["message"]) == (
+        error,
+        "transient",
+        "Connection lost",
+    )
+
+
+def test_transient_stop_failure_nudge_send_failure_is_crumbed(tmp_path, monkeypatch):
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("server_error")], nudges=0
+    )
+    adapter._stop_nudges = 1
+
+    def fail_send(window_id, text):
+        raise MultiplexerError("window gone")
+
+    mux.send_text = fail_send
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    (failed,) = _lifecycle_events(adapter, "nudge-send-failed")
+    assert failed["nudge"] == "stop-failure"
+
+
+def test_transient_stop_failure_withholds_the_nudge_during_a_quota_wait(tmp_path, monkeypatch):
+    """A quota wait is open (the CLI waits out a usage-window reset): typing the
+    nudge into it can only reproduce the limit line, so it is withheld, crumbed
+    like the result-less Stop's, and the wait runs on to its cap."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    q.adapter._stop_nudges = 1
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0),
+        events={7: _stop_failure_event("overloaded")},
+    )
+    assert q.mux.sent == []
+    (withheld,) = _lifecycle_events(q.adapter, "stop-nudge-withheld")
+    assert withheld["reason"] == "quota-wait"
+    assert withheld["hook_event"] == "StopFailure"
+    assert withheld["nudge_due"] is True
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.stop_failure == "overloaded"
+
+
+def test_transient_stop_failure_in_a_dev_session_types_the_wake_nudge(tmp_path, monkeypatch):
+    """The dev adapter's real knobs: no result-file nudge (the skill writes no
+    result.json), a wake-nudge budget. The transient error gets the wake nudge at
+    the event, from the stall budget, instead of after the grace runs out in
+    silence; unanswered, the next expiry spends the rest and the session stalls.
+
+    ABLATION: drop the `stall_nudge_due` branch and the first `send_text` comes
+    one grace later, after a `stop-failure-nudge-exhausted` crumb."""
+    sends: list[int] = []
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_stop_failure_event("overloaded")])
+    assert adapter._stop_nudges == 0
+    send = mux.send_text
+
+    def counting_send(window_id, text):
+        sends.append(len(_lifecycle_events(adapter, "stop-failure")))
+        return send(window_id, text)
+
+    mux.send_text = counting_send
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stop_nudges(mux) == []
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    # the first wake nudge went out on the StopFailure tick, not a grace later
+    assert sends[0] == 1
+    assert _lifecycle_events(adapter, "stop-failure-nudge-exhausted") == []
+    assert (result.status, result.parked, result.stop_failure) == ("stalled", False, "overloaded")
+
+
+def test_transient_stop_failure_wake_nudge_honors_the_cap(tmp_path, monkeypatch):
+    """The wake nudge at the event is bounded by the session's attempt cap like one
+    at grace expiry: a grace expiry spends the cap of 1 first, so the later
+    StopFailure types nothing.
+
+    ABLATION: drop the cap clause from `stall_nudge_due` and a second wake nudge
+    goes out at the event."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [None, _stop_failure_event("server_error")]
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), stall_nudges_cap=1)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT]
+    assert result.status == "stalled"
+
+
+def test_transient_stop_failure_never_types_into_a_parked_cli(tmp_path, monkeypatch):
+    """A parked latch (a CLI waiting on a human) withholds the wake nudge at the
+    event too, and the stall expiry ends the session parked (#727)."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt"), _stop_failure_event("server_error")],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stall_nudges(mux) == []
+    (withheld,) = _lifecycle_events(adapter, "stop-nudge-withheld")
+    assert (withheld["reason"], withheld["hook_event"]) == ("parked", "StopFailure")
+    assert (result.status, result.parked) == ("stalled", True)
+
+
+def test_transient_stop_failure_never_types_the_stop_nudge_into_a_parked_cli(tmp_path, monkeypatch):
+    """A result-file session with stop-nudge budget left: a StopFailure after a
+    permission prompt does not prove the prompt was answered, so the result-file
+    nudge (and its Enter) is withheld like the wake nudge, and the stall expiry
+    ends the session parked (#727).
+
+    ABLATION: check the parked latch only before the wake nudge and NUDGE_TEXT is
+    typed into the permission dialog."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt"), _stop_failure_event("overloaded")],
+        nudges=0,
+    )
+    adapter._stop_nudges = 1
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert mux.sent == []
+    (withheld,) = _lifecycle_events(adapter, "stop-nudge-withheld")
+    assert (withheld["reason"], withheld["hook_event"]) == ("parked", "StopFailure")
+    assert (result.status, result.parked) == ("stalled", True)
+
+
+def test_transient_stop_failure_after_the_nudges_run_out_falls_to_the_stall(tmp_path, monkeypatch):
+    """No stop nudge and no wake nudge left: crumbed, and the session keeps today's
+    stall path, a charged `stalled` (#764: an unrecovered transient error is not a
+    pause)."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("server_error")], nudges=0
+    )
+    adapter._stop_nudges = 0
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stop_nudges(mux) == []
+    assert _stall_nudges(mux) == []
+    assert (result.status, result.parked, result.usage_limited) == ("stalled", False, None)
+    (exhausted,) = _lifecycle_events(adapter, "stop-failure-nudge-exhausted")
+    assert exhausted["error"] == "server_error"
+    from bmad_loop.escalation import Action, decide_dev
+    from bmad_loop.model import StoryTask
+
+    decision = decide_dev(
+        StoryTask(story_key="3-1", epic=3, attempt=1), result, None, Policy(limits=LimitsPolicy())
+    )
+    assert decision.action == Action.RETRY
+
+
+def test_account_stop_failure_exits_parked(tmp_path, monkeypatch):
+    """An account error only an operator can fix ends the session at once,
+    `stalled` + `parked` with the error as evidence, and nothing typed into it.
+    The engine's dev decider pauses it uncharged, naming the error."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("billing_error", "Credit balance is too low")],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.parked_evidence == "StopFailure(billing_error): Credit balance is too low"
+    assert result.usage_limited is None
+    assert result.stop_failure == "billing_error"
+    assert result.stop_seen is False
+    assert mux.sent == []
+    from bmad_loop.escalation import Action, decide_dev
+    from bmad_loop.model import StoryTask
+
+    decision = decide_dev(
+        StoryTask(story_key="3-1", epic=3, attempt=1), result, None, Policy(limits=LimitsPolicy())
+    )
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session stalled (StopFailure(billing_error)")
+
+
+@pytest.mark.parametrize(
+    ("message", "details", "said"),
+    [(None, "402 Payment Required", "402 Payment Required"), (None, None, "no message")],
+)
+def test_account_stop_failure_evidence_falls_back_to_details(
+    tmp_path, monkeypatch, message, details, said
+):
+    adapter, _ = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("authentication_failed", message, details=details)],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.parked_evidence == f"StopFailure(authentication_failed): {said}"
+
+
+def test_rate_limit_stop_failure_matching_a_blocked_pattern_is_usage_limited(tmp_path, monkeypatch):
+    """A `rate_limit` whose message is the credit-exhaustion line: the CLI will
+    not continue by itself, so the session ends usage-limited (BLOCKED) at once,
+    the evidence naming the hook message rather than a pane look."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", USAGE_CREDITS_LINE)]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    pattern = adapter.profile.usage_limit_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_CREDITS_LINE.strip()}"
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.parked_evidence == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert result.usage_limit_resets is None
+    assert result.stop_failure == "rate_limit"
+    assert mux.sent == []
+
+
+def test_rate_limit_stop_failure_matching_a_wait_pattern_admits_the_quota_wait_without_a_pane_hit(
+    tmp_path, monkeypatch
+):
+    """A `rate_limit` whose message is the session-limit line, on a pane that
+    shows nothing (herdr cannot capture one): the quota wait admits on the hook's
+    line at the usual idle gate, parses its reset, and runs to its cap.
+
+    Ablation: drop the admission's StopFailure fallback and no wait opens; the
+    session times out instead."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+    )
+    pattern = q.adapter.profile.usage_wait_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    (pending,) = _lifecycle_events(q.adapter, "stop-failure-quota-wait-pending")
+    assert pending["evidence"] == evidence
+    (started,) = _lifecycle_events(q.adapter, "quota-wait-started")
+    assert started["evidence"] == evidence
+    assert _lifecycle_events(q.adapter, "timeout-fired") == []
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.stop_failure == "rate_limit"
+    # The heartbeat carries the latched error only once it is latched.
+    assert "stop_failure" not in q.heartbeats[0]
+    assert q.heartbeats[-1]["stop_failure"] == "rate_limit"
+
+
+def test_unmatched_rate_limit_stop_failure_keeps_the_stall_timing(tmp_path, monkeypatch):
+    """A `rate_limit` whose message matches neither usage list (an ordinary 429):
+    crumbed, and the grace expiry decides as it does today."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("rate_limit", "API Error: 429 Too Many Requests")],
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+    assert crumb["error"] == "rate_limit"
+    assert _stop_nudges(mux) == []
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    assert (result.status, result.parked, result.usage_limited) == ("stalled", False, None)
+    assert result.stop_failure == "rate_limit"
+
+
+def test_rate_limit_stop_failure_match_timeout_is_crumbed(tmp_path, monkeypatch):
+    adapter, _ = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", USAGE_CREDITS_LINE)]
+    )
+    monkeypatch.setattr(
+        generic, "match_rows", lambda rows, pats, **kw: generic.MatchTimeout("p", "TimeoutError: x")
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    failed = _lifecycle_events(adapter, "stop-failure-probe-failed")
+    assert [f["reason"] for f in failed] == ["match-timeout", "match-timeout"]
+    assert result.usage_limited is None
+    assert _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+
+
+def test_unmapped_stop_failure_error_is_crumbed(tmp_path, monkeypatch):
+    """An `error` value the profile does not map (a newer CLI's): a visible
+    degrade, and today's stall timing."""
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_stop_failure_event("brand_new_error")])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-unmapped")
+    assert crumb["error"] == "brand_new_error"
+    (seen,) = _lifecycle_events(adapter, "stop-failure")
+    assert seen["action"] is None
+    assert _stop_nudges(mux) == []
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    assert result.stop_failure == "brand_new_error"
+
+
+def test_stop_failure_without_an_error_reads_as_unknown(tmp_path, monkeypatch):
+    adapter, mux = _parked_adapter(tmp_path, monkeypatch, [_stop_failure_event(None)], nudges=0)
+    adapter._stop_nudges = 1
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert _stop_nudges(mux) == [generic.NUDGE_TEXT]  # claude maps unknown as transient
+    assert result.stop_failure == "unknown"
+
+
+def test_a_later_stop_clears_the_stop_failure_latch(tmp_path, monkeypatch):
+    """The nudge recovered the turn: the next Stop completes the session as
+    usual, and the cleared latch leaves `stop_failure` unset.
+
+    Ablation: drop the Stop branch's latch clear and `stop_failure` survives."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("server_error"), _stop_event("3-1-dev-1", "sess", None)],
+    )
+    adapter._stop_nudges = 1
+    (tmp_path / "impl" / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert mux.sent == [("@1", generic.NUDGE_TEXT)]
+    assert result.status == "completed"
+    assert result.stop_seen is True
+    assert result.stop_failure is None
+
+
+def test_the_wait_loop_asks_the_watcher_for_stop_failure(tmp_path, monkeypatch):
+    """The production kind filter handed to `watcher.wait_for` must admit
+    `StopFailure`; the scripted watchers above ignore `kinds`.
+
+    Ablation: drop "StopFailure" from `generic.EVENT_KINDS` and this fails."""
+    adapter, _ = _parked_adapter(tmp_path, monkeypatch, [], nudges=0)
+    seen: list[set] = []
+    inner = adapter.watcher
+
+    class _Recording:
+        def wait_for(self, task_id, kinds, timeout_s, since_ns=0):
+            seen.append(set(kinds))
+            return inner.wait_for(task_id, kinds, timeout_s, since_ns)
+
+    adapter.watcher = _Recording()
+    adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert seen
+    assert "StopFailure" in seen[0]
+
+
+@pytest.mark.parametrize("error", ["server_error", "billing_error", "rate_limit"])
+def test_stop_failure_never_completes(tmp_path, monkeypatch, error):
+    """A finished spec on disk does not let a StopFailure complete the session:
+    only a Stop or window death vouches for a result."""
+    adapter, _ = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event(error, USAGE_CREDITS_LINE)], nudges=0
+    )
+    adapter._stop_nudges = 1
+    (tmp_path / "impl" / "spec-3-1-foo.md").write_text(_DONE_SPEC, encoding="utf-8")
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "stalled"
+    assert result.result_json is None
+    assert result.stop_seen is False
+    assert result.stop_failure == error
+
+
+def test_profiles_without_a_stop_failure_map_only_crumb_it(tmp_path, monkeypatch):
+    """A profile that maps no StopFailure error (every built-in but claude) reads
+    any it is sent as unmapped: nothing typed, today's timing."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, profile_name="codex", mux=mux)
+    assert adapter._stop_failure_types == {}
+    adapter._stall_grace_s = 10.0
+    adapter._stall_nudges = 0
+    adapter._window_alive = lambda handle: True
+    clock = _frozen_stall_clock(monkeypatch)
+
+    def on_call(n):
+        if n > 1:
+            clock["t"] += 11.0
+
+    adapter.watcher = _ScriptedWatcher([_stop_failure_event("server_error")], on_call=on_call)
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert mux.sent == []
+    assert _lifecycle_events(adapter, "stop-failure-unmapped")
+    assert result.status == "stalled"
+
+
+# The classifier half (#865): a parked StopFailure result keeps its own evidence.
+
+
+def test_classify_env_fault_skips_the_tail_scan_for_a_parked_stop_failure(tmp_path):
+    """A session parked on an account StopFailure whose pane log ALSO holds an
+    env-fault line: the tail is not scanned, so the result stays parked and the
+    pause reason names `StopFailure(<error>)`, not the transport line.
+
+    Ablation: drop the `stop_failure` skip and env_fault comes back True."""
+    adapter = make_adapter(tmp_path)
+    _write_task_log(adapter, b"API Error: Unable to connect to API (ConnectionRefused)\n")
+    handle = SessionHandle(task_id=_ENV_FAULT_TASK, native_id="@1")
+    parked = SessionResult(
+        status="stalled",
+        parked=True,
+        parked_evidence="StopFailure(billing_error): Credit balance is too low",
+        stop_failure="billing_error",
+    )
+    spec = make_spec(adapter.run_dir, task_id=_ENV_FAULT_TASK)
+    result = adapter._classify_env_fault(handle, spec, parked)
+    assert result == parked
+    events = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert [e["event"] for e in events] == ["env-fault-classified"]
+    assert events[0]["skipped"] == "stop-failure"
+    assert events[0]["stop_failure"] == "billing_error"
+    # The control: the same log without the StopFailure is an env fault.
+    plain = adapter._classify_env_fault(
+        handle, spec, dataclasses.replace(parked, stop_failure=None)
+    )
+    assert plain.env_fault is True
+
+
+def test_classify_env_fault_usage_shortcut_still_wins_over_a_stop_failure(tmp_path):
+    """A BLOCKED rate_limit StopFailure is usage-limited: the veto-exempt usage
+    shortcut stamps env_fault ahead of the StopFailure skip."""
+    adapter = make_adapter(tmp_path)
+    evidence = "StopFailure(rate_limit) message matched 'x': y"
+    handle = SessionHandle(task_id=_ENV_FAULT_TASK, native_id="@1")
+    live = SessionResult(
+        status="stalled",
+        parked=True,
+        parked_evidence=evidence,
+        usage_limited=evidence,
+        usage_limit_class=USAGE_LIMIT_BLOCKED,
+        stop_failure="rate_limit",
+    )
+    spec = make_spec(adapter.run_dir, task_id=_ENV_FAULT_TASK)
+    result = adapter._classify_env_fault(handle, spec, live)
+    assert result.env_fault is True
+    assert result.env_fault_evidence == evidence
+    (crumb,) = _lifecycle_lines(adapter, _ENV_FAULT_TASK)
+    assert crumb["usage_limited"] is True
+    assert "skipped" not in crumb

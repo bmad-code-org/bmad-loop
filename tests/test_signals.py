@@ -122,6 +122,39 @@ def test_parse_event_keeps_boolean_fully_idle_only(tmp_path, extra, expected):
     assert event.fully_idle is expected
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (
+            {
+                "stop_error": "billing_error",
+                "stop_error_details": "402 Payment Required",
+                "stop_message": "Credit balance is too low",
+            },
+            ("billing_error", "402 Payment Required", "Credit balance is too low"),
+        ),
+        ({"stop_error": "server_error"}, ("server_error", None, None)),
+        # a non-string is dropped, not coerced
+        (
+            {"stop_error": 3, "stop_error_details": ["429"], "stop_message": {"m": 1}},
+            (None, None, None),
+        ),
+        ({}, (None, None, None)),  # every other event, or an older relay
+    ],
+)
+def test_parse_event_reads_the_stop_failure_fields(tmp_path, extra, expected):
+    """#865: the relay's forwarded StopFailure fields land on the HookEvent only
+    as strings, so the profile's `stop_failure_types` lookup never keys on a
+    stray value.
+
+    Ablation: drop any of the three `isinstance(..., str)` gates and the
+    non-string row fails."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "StopFailure", **extra)
+    (event,) = watcher.poll()
+    assert (event.stop_error, event.stop_error_details, event.stop_message) == expected
+
+
 @pytest.mark.parametrize("value", [["A", "B"], {"id": "A"}, 3], ids=["list", "dict", "int"])
 def test_parse_event_drops_a_non_string_session_id(tmp_path, value):
     """#767: a non-string id reads as absent, so attribution never hashes it —

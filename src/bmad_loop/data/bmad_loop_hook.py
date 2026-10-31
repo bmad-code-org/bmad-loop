@@ -9,8 +9,11 @@ orchestrator only ever sees canonical events. Payload keys vary too: snake_case
 transcriptPath, agy's conversationId/transcriptPath — protojson encoding); the
 field extraction below tries each. agy alone carries no cwd, sending the
 workspacePaths list instead, and alone sends `fullyIdle`, forwarded as
-`fully_idle` only when it is a boolean. Reads the hook payload
-from stdin and writes one event file
+`fully_idle` only when it is a boolean. Claude Code's StopFailure payload
+carries the API error that ended the turn: its `error`, `error_details` and
+`last_assistant_message` are forwarded as `stop_error`, `stop_error_details` and
+`stop_message`, each only when it is a string and cut to RELAY_TEXT_MAX
+characters. Reads the hook payload from stdin and writes one event file
 into the orchestrator's events directory. No-ops (exit 0) unless the session was
 spawned by bmad-loop (detected via env vars set on the tmux window), so
 normal interactive sessions are unaffected.
@@ -92,6 +95,31 @@ def _fully_idle(payload):
     # CLI's event stays unchanged.
     value = payload.get("fullyIdle")
     return value if isinstance(value, bool) else None
+
+
+# Longest string a relay forwards from a free-text payload field (#865): enough
+# for an API error's rendered text, small enough that a runaway value cannot
+# bloat every event file the orchestrator reads.
+RELAY_TEXT_MAX = 2000
+
+
+def _bounded_text(payload, key):
+    # A free-text payload field, forwarded only when it is a string and cut to
+    # RELAY_TEXT_MAX characters; anything else reads as absent (None), so the
+    # caller writes the key only when there is text to carry.
+    value = payload.get(key)
+    return value[:RELAY_TEXT_MAX] if isinstance(value, str) else None
+
+
+# A StopFailure payload's free-text fields (#865), as (event key, payload key):
+# Claude Code sends `error` (the failure class the profile maps onto an action),
+# optional `error_details` and `last_assistant_message` (the rendered API error).
+# Each is written only when present, so every other event stays unchanged.
+_STOP_FAILURE_FIELDS = (
+    ("stop_error", "error"),
+    ("stop_error_details", "error_details"),
+    ("stop_message", "last_assistant_message"),
+)
 
 
 # How long after the launched CLI the rest of its launch chain may start
@@ -438,6 +466,10 @@ def main() -> int:
     fully_idle = _fully_idle(payload)
     if fully_idle is not None:
         event["fully_idle"] = fully_idle
+    for event_key, payload_key in _STOP_FAILURE_FIELDS:
+        text = _bounded_text(payload, payload_key)
+        if text is not None:
+            event[event_key] = text
     # Only when set, so a readable payload's event is unchanged.
     if payload_error:
         event["payload_error"] = payload_error

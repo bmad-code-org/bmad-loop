@@ -291,6 +291,21 @@ def test_dev_parked_session_pauses_whatever_the_budget(attempt):
     assert "the stall nudge was withheld" in decision.reason
 
 
+def test_dev_stop_failure_account_pause_names_the_error():
+    """#865: a session the adapter parked on an account `StopFailure` (the
+    classifier skipped its log tail) PAUSEs uncharged, and both the reason and
+    the notification title name it as a parked stop, carrying the error."""
+    evidence = "StopFailure(billing_error): Credit balance is too low"
+    parked = SessionResult(
+        status="stalled", parked=True, parked_evidence=evidence, stop_failure="billing_error"
+    )
+    decision = decide_dev(_task(attempt=1), parked, None, POLICY)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session stalled (StopFailure(billing_error)")
+    assert evidence in decision.reason
+    assert pause_title(decision.reason, "1-1") == "Paused (parked prompt): 1-1"
+
+
 def test_dev_env_fault_outranks_parked():
     both = SessionResult(
         status="stalled",

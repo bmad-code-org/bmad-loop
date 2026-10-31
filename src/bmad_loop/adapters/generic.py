@@ -86,6 +86,7 @@ from .env_fault import ENV_FAULT_MATCH_TIMEOUT_S as ENV_FAULT_MATCH_TIMEOUT_S
 from .env_fault import ENV_FAULT_STATUSES as ENV_FAULT_STATUSES
 from .env_fault import ENV_FAULT_TAIL_BYTES as ENV_FAULT_TAIL_BYTES
 from .env_fault import EnvFaultMixin
+from .env_fault import _excerpt as _env_excerpt
 from .multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
 from .panematch import MatchTimeout, match_rows, screen_rows
 from .profile import PARKED_EVENTS, CLIProfile
@@ -242,6 +243,24 @@ class _QuotaWait:
 
 
 @dataclass
+class _StopFailureLatch:
+    """Per-session state of a Claude Code ``StopFailure`` (#865), owned by one
+    `wait_for_completion` call so the result it returns can carry it.
+
+    `error` is the ``error`` value of the latest StopFailure the wait loop saw
+    (``"unknown"`` when the hook sent none), stamped onto the returned
+    ``SessionResult.stop_failure``. `wait_hit` is a ``rate_limit``
+    StopFailure's message matched against ``usage_wait_patterns``, as
+    ``(evidence, matched_line)``: the quota-wait admission takes it as the wait
+    line when the pane shows none (a backend without ``capture_pane`` never
+    does). A ``Stop`` clears both: a turn that ended proves the failure was
+    recovered. `wait_hit` also clears when a quota wait admits or ends."""
+
+    error: str | None = None
+    wait_hit: tuple[str, str] | None = None
+
+
+@dataclass
 class _ParkedNotice:
     """Per-session state of the live parked notice (#855), owned by one
     `wait_for_completion` call: the `session-parked` / `session-unparked`
@@ -306,7 +325,14 @@ FIRST_FRAME_S = 30.0
 # expiry, where it withholds the wake nudge and ends the session parked (see
 # `_parked_hook_evidence`). With claude's `idle_prompt` mapped, that is the usual
 # end of a result-less turn: the wake nudge is replaced by a pause.
-EVENT_KINDS = {"SessionStart", "Stop", "SessionEnd", "Notification"} | set(PARKED_EVENTS)
+# `StopFailure` (#865, Claude Code >= 2.1.78) never completes one either: it
+# fires INSTEAD of `Stop` when an API error ends the turn, and the profile's
+# `[hooks.stop_failure_types]` maps its `error` to an action the wait loop takes
+# at once — a stop nudge (transient), a parked exit (account), or the usage-limit
+# split by message (rate_limit). Every exit it takes goes through `stall_exit`.
+EVENT_KINDS = {"SessionStart", "Stop", "SessionEnd", "Notification", "StopFailure"} | set(
+    PARKED_EVENTS
+)
 # Wall-clock bound on EACH `parked_prompt_patterns` search over a captured pane
 # line (DW-350) — the `regex` module's per-search timeout, the env-fault
 # classifier's doctrine (`env_fault.ENV_FAULT_MATCH_TIMEOUT_S`). A pattern that
@@ -1149,6 +1175,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         self.run_dir = run_dir
         self.policy = policy
         self.profile = profile
+        # Claude Code `StopFailure` error value -> action (#865); empty for a
+        # profile that maps none, so the event is then only crumbed.
+        self._stop_failure_types: dict[str, str] = dict(profile.hooks.stop_failure_types)
         # env-fault patterns compile lazily off self.profile — see EnvFaultMixin.
         self.mux = mux or get_multiplexer()
         # None = use the profile's default bypass flags; a tuple replaces them
@@ -1420,10 +1449,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         window death, a hard stop, the cap) is closed here, so every
         `quota-wait-started` gets its `quota-wait-ended`. A parked notice still
         open at the exit gets its `session-unparked` (`how="ended"`) the same
-        way (#855)."""
+        way (#855). An uncleared Claude Code StopFailure's error is stamped onto
+        the result's `stop_failure` (#865)."""
         quota = _QuotaWait()
         notice = _ParkedNotice()
-        result = self._wait_loop(handle, spec, quota, notice)
+        stop_failure = _StopFailureLatch()
+        result = self._wait_loop(handle, spec, quota, notice, stop_failure)
+        if stop_failure.error is not None:
+            # The one funnel every wait-loop exit passes (#865): a StopFailure no
+            # later Stop cleared rides out on the result, whatever ended it.
+            result = dataclasses.replace(result, stop_failure=stop_failure.error)
         if quota.waiting:
             self._end_quota_wait(handle, quota, "session-exit")
         if notice.open:
@@ -1438,6 +1473,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         spec: SessionSpec,
         quota: _QuotaWait,
         notice: _ParkedNotice,
+        stop_failure: _StopFailureLatch,
     ) -> SessionResult:
         deadline = time.monotonic() + spec.timeout_s
         # Wall-clock co-bound (#157): a host suspend freezes time.monotonic(),
@@ -1993,6 +2029,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         self._end_quota_wait(handle, quota, "transcript-active")
                         if quota.line is not None:
                             quota.spent.add(quota.line.strip())
+                        stop_failure.wait_hit = None
                 elif (
                     quota_enabled
                     and transcript_path
@@ -2010,9 +2047,20 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     (wait_hit,) = self._pane_evidence(
                         handle, self._usage_wait_patterns, skip=quota.spent
                     )
+                    if (
+                        wait_hit is None
+                        and stop_failure.wait_hit is not None
+                        and stop_failure.wait_hit[1].strip() not in quota.spent
+                    ):
+                        # A rate_limit StopFailure whose message matched a wait
+                        # pattern (#865) stands in for the pane line the look
+                        # did not find (herdr has no pane capture). Every other
+                        # gate is unchanged.
+                        wait_hit = stop_failure.wait_hit
                     if wait_hit is not None and not self._quota_wait_tool_open(
                         handle, transcript_path
                     ):
+                        stop_failure.wait_hit = None
                         local_now = _local_now()
                         reset = self._usage_reset(handle, wait_hit[1], local_now)
                         resets = reset.value if reset is not None else None
@@ -2096,6 +2144,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         **(
                             {"quota_resets_at": quota.resets}
                             if quota.waiting and quota.resets is not None
+                            else {}
+                        ),
+                        # the uncleared Claude Code StopFailure's error (#865),
+                        # present only while one is latched.
+                        **(
+                            {"stop_failure": stop_failure.error}
+                            if stop_failure.error is not None
                             else {}
                         ),
                     },
@@ -2615,6 +2670,129 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     if quota.waiting and parked_kind in QUOTA_WAIT_BLOCKING_KINDS:
                         self._end_quota_wait(handle, quota, "latch")
                 continue
+            if event.event == "StopFailure":
+                # An API error ended the turn (#865): Claude Code fires this
+                # INSTEAD of `Stop`, so it is never a completion — no
+                # `stop_seen`, no result read, no grace re-arm, no restored
+                # stall-nudge budget. The profile maps `error` to an action
+                # taken now, rather than after the stall grace runs out in
+                # silence; every exit goes through `stall_exit`.
+                error = event.stop_error or "unknown"
+                action = self._stop_failure_types.get(error)
+                message = event.stop_message
+                stop_failure.error = error
+                self._note_lifecycle(
+                    handle.task_id,
+                    "stop-failure",
+                    error=error,
+                    action=action,
+                    details=event.stop_error_details,
+                    message=_env_excerpt(message, 0) if message else None,
+                )
+                if action is None:
+                    # An error value the profile does not map: today's stall
+                    # timing, made visible.
+                    self._note_lifecycle(handle.task_id, "stop-failure-unmapped", error=error)
+                    continue
+                if action == "transient":
+                    # The result-less Stop's nudge, at the event: same budget,
+                    # same quota guard. A session with no result-file nudge
+                    # (the dev skill writes no result.json, so its stop budget
+                    # is 0) gets the wake nudge instead, from the stall budget
+                    # and cap, rather than sitting out the stall grace first.
+                    # Unrecovered, the session stalls as before and is
+                    # charged (#764).
+                    stall_nudge_due = (
+                        stall_deadline is not None
+                        and stall_nudges_left > 0
+                        and (
+                            spec.stall_nudges_cap is None
+                            or stall_nudges_sent + stall_nudges_failed < spec.stall_nudges_cap
+                        )
+                    )
+                    nudge_due = nudges_left > 0 or stall_nudge_due
+                    if quota.waiting:
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "stop-nudge-withheld",
+                            reason="quota-wait",
+                            nudge_due=nudge_due,
+                            hook_event="StopFailure",
+                        )
+                    elif nudge_due and parked_evidence is not None:
+                        # A CLI latched as waiting on a human is never typed at
+                        # (#727), by either nudge: unlike a `Stop`, a
+                        # StopFailure does not prove the prompt was answered,
+                        # so the latch stands and the stall expiry parks it.
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "stop-nudge-withheld",
+                            reason="parked",
+                            evidence=parked_evidence,
+                            nudge_due=True,
+                            hook_event="StopFailure",
+                        )
+                    elif nudges_left > 0:
+                        nudges_left -= 1
+                        try:
+                            self.send_text(handle, NUDGE_TEXT)
+                        except MultiplexerError as e:
+                            self._note_nudge_send_failed(handle, "stop-failure", e)
+                    elif stall_nudge_due:
+                        # Counted exactly as a grace-expiry wake nudge: it
+                        # closes the #727 pre-nudge activity window and re-arms
+                        # the grace.
+                        stall_nudges_left -= 1
+                        try:
+                            self.send_text(handle, STALL_NUDGE_TEXT)
+                        except MultiplexerError as e:
+                            stall_nudges_failed += 1
+                            self._note_nudge_send_failed(handle, "stop-failure", e)
+                        else:
+                            stall_nudges_sent += 1
+                        stall_deadline = time.monotonic() + self._stall_grace_s
+                        last_activity = self._log_activity_key(handle.task_id)
+                    else:
+                        self._note_lifecycle(
+                            handle.task_id, "stop-failure-nudge-exhausted", error=error
+                        )
+                    continue
+                if action == "account":
+                    # Only an operator can fix it: an uncharged parked pause.
+                    if message:
+                        said = _env_excerpt(message, 0)
+                    elif event.stop_error_details:
+                        said = event.stop_error_details
+                    else:
+                        said = "no message"
+                    return stall_exit(f"StopFailure({error}): {said}", None)
+                if action == "rate_limit":
+                    # A 429 and a subscription limit share `rate_limit`: the
+                    # message decides, against the profile's usage lists.
+                    hit = self._stop_failure_usage(handle, message)
+                    if hit is None:
+                        self._note_lifecycle(
+                            handle.task_id, "stop-failure-rate-limit-unmatched", error=error
+                        )
+                        continue
+                    evidence, line, usage_class = hit
+                    if usage_class == USAGE_LIMIT_BLOCKED:
+                        reset = self._usage_reset(handle, line, _local_now())
+                        return stall_exit(
+                            evidence,
+                            evidence,
+                            reset.value if reset is not None else None,
+                            USAGE_LIMIT_BLOCKED,
+                        )
+                    # A wait limit: the CLI continues by itself after the
+                    # reset, so the quota wait may admit on this line.
+                    stop_failure.wait_hit = (evidence, line)
+                    self._note_lifecycle(
+                        handle.task_id, "stop-failure-quota-wait-pending", evidence=evidence
+                    )
+                    continue
+                # "ignore"
+                continue
             if event.event == "Stop" and event.fully_idle is False:
                 # agy fires Stop with `fullyIdle: false` when the parent yields
                 # to a foreground subagent (DW-548): the session's own event, so
@@ -2637,6 +2815,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 parked_evidence = None
                 parked_kind = None
                 parked_key = None
+                # ...and that any API error an earlier StopFailure reported was
+                # recovered from (#865).
+                stop_failure.error = None
+                stop_failure.wait_hit = None
                 if notice.open:
                     self._note_session_unparked(handle, notice, "stop")
                 # A turn ENDED — the one canonical event that proves the CLI did
@@ -3433,6 +3615,42 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return (blocked[0], blocked[1], USAGE_LIMIT_BLOCKED)
         if waiting is not None:
             return (waiting[0], waiting[1], USAGE_LIMIT_WAIT)
+        return None
+
+    def _stop_failure_usage(
+        self, handle: SessionHandle, message: str | None
+    ) -> tuple[str, str, str] | None:
+        """A ``rate_limit`` StopFailure's message (#865: the hook's
+        ``last_assistant_message``, the rendered API error) matched against
+        ``usage_limit_patterns`` then ``usage_wait_patterns``, in
+        ``_usage_hit``'s ``(evidence, matched_line, usage_limit_class)`` shape
+        (evidence ``StopFailure(rate_limit) message matched <pattern>: <line>``);
+        None for no message or no match. A search that blows
+        ``PARKED_PROMPT_MATCH_TIMEOUT_S`` is no match for its list, crumbed
+        ``stop-failure-probe-failed`` (``reason="match-timeout"``)."""
+        if not message:
+            return None
+        for patterns, usage_class in (
+            (self._usage_limit_patterns, USAGE_LIMIT_BLOCKED),
+            (self._usage_wait_patterns, USAGE_LIMIT_WAIT),
+        ):
+            if not patterns:
+                continue
+            found = match_rows([message], patterns, timeout=PARKED_PROMPT_MATCH_TIMEOUT_S)
+            if isinstance(found, MatchTimeout):
+                self._note_lifecycle(
+                    handle.task_id,
+                    "stop-failure-probe-failed",
+                    reason="match-timeout",
+                    pattern=found.pattern,
+                    error=found.error,
+                )
+                continue
+            if found is not None:
+                # The matcher words its evidence for a pane look; this line came
+                # from the hook, and the evidence says so.
+                evidence = "StopFailure(rate_limit) message" + found.evidence.removeprefix("pane")
+                return (evidence, found.line, usage_class)
         return None
 
     def _session_vanished(self, task_id: str) -> bool:

@@ -28,7 +28,8 @@ from typing import Callable
 @dataclass(frozen=True)
 class HookEvent:
     ts: int
-    event: str  # Stop | SessionStart | SessionEnd | PreCompact | Notification | parked kinds
+    # Stop | StopFailure | SessionStart | SessionEnd | PreCompact | Notification | parked kinds
+    event: str
     task_id: str
     session_id: str | None
     transcript_path: str | None
@@ -58,6 +59,15 @@ class HookEvent:
     # other CLI, on an older vendored relay that predates the field, and for a
     # non-boolean value. APPENDED with a default, like the fields above.
     fully_idle: bool | None = None
+    # A StopFailure event's API error (#865), forwarded by the relay from the
+    # payload's `error` / `error_details` / `last_assistant_message`: the failure
+    # class the profile's `hooks.stop_failure_types` maps onto an action, the
+    # optional HTTP status text, and the rendered error message. None on every
+    # other event, on an older vendored relay that predates the fields, and for a
+    # non-string value. APPENDED with defaults, like the fields above.
+    stop_error: str | None = None
+    stop_error_details: str | None = None
+    stop_message: str | None = None
 
 
 # The relays' lineage tags (DW-507, events._lineage). Anything else parses as None.
@@ -90,6 +100,9 @@ def _parse_event(entry: Path) -> HookEvent | None:
     lineage = data.get("lineage")
     payload_error = data.get("payload_error")
     fully_idle = data.get("fully_idle")
+    stop_error = data.get("stop_error")
+    stop_error_details = data.get("stop_error_details")
+    stop_message = data.get("stop_message")
     # Payload values are forwarded from the CLI unvalidated, so a non-string one
     # reads as absent rather than reaching attribution's set arithmetic (#767).
     return HookEvent(
@@ -104,6 +117,9 @@ def _parse_event(entry: Path) -> HookEvent | None:
         lineage=lineage if isinstance(lineage, str) and lineage in LINEAGE_TAGS else None,
         payload_error=payload_error if isinstance(payload_error, str) else None,
         fully_idle=fully_idle if isinstance(fully_idle, bool) else None,
+        stop_error=stop_error if isinstance(stop_error, str) else None,
+        stop_error_details=(stop_error_details if isinstance(stop_error_details, str) else None),
+        stop_message=stop_message if isinstance(stop_message, str) else None,
     )
 
 

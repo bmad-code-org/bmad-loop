@@ -71,6 +71,7 @@ from .install import (
     _walk_traversable_files,
     _worktree_local_exclude,
     dev_primitive_or_default,
+    gated_hook_events,
     merge_hooks,
     missing_stories_support,
     renderer_stub_resolved,
@@ -78,6 +79,7 @@ from .install import (
 )
 from .install import skills_root as _skills_root
 from .install import (
+    strip_event_relays,
     strip_relay_hooks,
 )
 from .model import Phase
@@ -1197,6 +1199,7 @@ def provision_worktree(
     on_degraded: Callable[[str], None] | None = None,
     on_pinned: Callable[[str, str, str], None] | None = None,
     project: Path | None = None,
+    on_hook_gated: Callable[[str], None] | None = None,
 ) -> list[str]:
     """Make a freshly-created git worktree a self-sufficient bmad-loop project.
 
@@ -1634,10 +1637,17 @@ def provision_worktree(
                     "terminal, so repairing the file alone does not put the story "
                     "back in the run (#592)"
                 ) from e
+        # The same version gate `init` applies (#865): a hook event the installed
+        # CLI is too old for (or whose version cannot be read) stays out, because
+        # one unknown key can make the CLI skip the whole config — Stop included.
+        events, gate_notes = gated_hook_events(profile)
+        if on_hook_gated is not None:
+            for note in gate_notes:
+                on_hook_gated(note)
         try:
             registrations = {
                 native: _hook_command(src_root, profile, canonical)
-                for native, canonical in profile.hooks.events.items()
+                for native, canonical in events.items()
             }
         except ProfileError as e:
             raise verify.GitError(f"cannot register worktree relay: {e}") from e
@@ -1653,6 +1663,13 @@ def provision_worktree(
         if config_path not in stripped_paths:
             strip_relay_hooks(config, profile.hooks.dialect)
             stripped_paths.add(config_path)
+        # A seeded relay under a gated-out event goes too, even on a later
+        # profile's pass over a shared config (the full strip above runs once).
+        strip_event_relays(
+            config,
+            profile.hooks.dialect,
+            [native for native in profile.hooks.events if native not in events],
+        )
         config, _ = merge_hooks(config, registrations, profile.hooks.dialect)
         # Write — and pin — only when the strip+merge actually changed the parsed
         # config. A tracked config may already carry exactly the installed command,
@@ -2653,6 +2670,11 @@ class WorktreeFlow:
                 on_degraded=lambda msg: self._exclude_degraded(task.story_key, msg),
                 on_pinned=_record_pin,
                 project=self.paths.project,
+                # A hook event the installed CLI is too old for stays out of the
+                # worktree's config (#865); journaled so the gap is visible.
+                on_hook_gated=lambda note: self.journal.append(
+                    "worktree-hook-gated", story_key=task.story_key, reason=note
+                ),
             )
         except verify.GitError as e:
             # Every provisioning refusal carries its own cause — an unresolvable

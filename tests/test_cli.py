@@ -15198,6 +15198,128 @@ def test_validate_passes_hooks_registered_without_the_notification_relay(project
     assert [f["severity"] for f in registered] == ["ok"]
 
 
+def _claude_findings(doc, check):
+    return [
+        f for f in doc["findings"] if f["check"] == check and f["detail"]["profile"] == "claude"
+    ]
+
+
+def test_validate_warns_when_a_mapped_hook_event_is_unregistered(project, capsys):
+    """A `.claude/settings.json` written before claude's profile mapped
+    `StopFailure` keeps its Stop relay, so `hooks.registered` stays ok — but the
+    event never reaches the loop. Validate warns (rc unchanged), names the event
+    and the init that registers it, and reads ok once init has run again."""
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    complete = config.read_text(encoding="utf-8")
+    capsys.readouterr()
+    rc_complete, doc = _validate_json(project.project, capsys)
+    assert [f["severity"] for f in _claude_findings(doc, "hooks.events-incomplete")] == ["ok"]
+
+    data = json.loads(complete)
+    del data["hooks"]["StopFailure"]
+    config.write_text(json.dumps(data), encoding="utf-8")
+
+    rc, doc = _validate_json(project.project, capsys)
+    assert rc == rc_complete  # a warning never moves validate's exit code
+    assert [f["severity"] for f in _claude_findings(doc, "hooks.registered")] == ["ok"]
+    [finding] = _claude_findings(doc, "hooks.events-incomplete")
+    assert finding["severity"] == "warning"
+    assert finding["detail"]["missing"] == ["StopFailure"]
+    assert finding["detail"]["gated"] == []
+    assert finding["message"] == (
+        "StopFailure not registered for claude — re-run `bmad-loop init --cli claude`"
+    )
+
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    capsys.readouterr()
+    _rc, doc = _validate_json(project.project, capsys)
+    assert [f["severity"] for f in _claude_findings(doc, "hooks.events-incomplete")] == ["ok"]
+
+
+def test_validate_names_the_version_floor_for_a_gated_unregistered_event(
+    project, capsys, monkeypatch
+):
+    """On a CLI below the event's floor, init would leave `StopFailure` out again,
+    so the warning names the floor and the version found instead of a bare
+    "re-run init"."""
+    from bmad_loop import install
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text(encoding="utf-8"))
+    del data["hooks"]["StopFailure"]
+    config.write_text(json.dumps(data), encoding="utf-8")
+    capsys.readouterr()
+    monkeypatch.setattr(install, "cli_version", lambda profile: (2, 1, 77))
+
+    _rc, doc = _validate_json(project.project, capsys)
+    [finding] = _claude_findings(doc, "hooks.events-incomplete")
+    assert finding["severity"] == "warning"
+    assert finding["detail"]["gated"] == ["StopFailure"]
+    assert "re-run `bmad-loop init --cli claude` " not in finding["message"]
+    assert ">= 2.1.78, found 2.1.77" in finding["message"]
+    assert finding["message"].startswith("StopFailure hook not registered (claude)")
+
+
+def test_validate_never_probes_the_version_of_an_overlay_profile(project, capsys, monkeypatch):
+    """The hook-event version gate is a `<binary> --version` launch, and an
+    overlay profile's `binary` and `env` arrive with a clone: validate never runs
+    it (#294). A floored event that overlay leaves unregistered is named with its
+    floor and no version.
+
+    ABLATION: drop the `profile.packaged` gate in `_check_hook_events_complete`
+    and the probe records the overlay profile."""
+    from bmad_loop import install
+
+    install_bmad_config(project)
+    _write_policy(project.project, '[adapter]\nname = "overlaycli"\n')
+    profiles = project.project / ".bmad-loop" / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "overlaycli.toml").write_text(
+        'name = "overlaycli"\nbinary = "overlaycli"\nbypass_args = ["--yes"]\n'
+        "\n[hooks]\n"
+        'dialect = "claude-settings-json"\n'
+        'config_path = ".overlaycli/settings.json"\n'
+        'events = { Stop = "Stop", StopFailure = "StopFailure" }\n'
+        "\n[hooks.stop_failure_types]\n"
+        'server_error = "transient"\n'
+        "\n[hooks.event_min_versions]\n"
+        'StopFailure = "2.1.78"\n',
+        encoding="utf-8",
+    )
+    probed: list[str] = []
+    monkeypatch.setattr(
+        install, "cli_version", lambda profile: probed.append(profile.name) or (9, 9, 9)
+    )
+    assert install.install_into(project.project, clis=("overlaycli",), skills=False) == 0
+    config = project.project / ".overlaycli/settings.json"
+    data = json.loads(config.read_text(encoding="utf-8"))
+    del data["hooks"]["StopFailure"]
+    config.write_text(json.dumps(data), encoding="utf-8")
+    capsys.readouterr()
+    probed.clear()
+
+    _rc, doc = _validate_json(project.project, capsys)
+    assert probed == []
+    [finding] = [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.events-incomplete" and f["detail"]["profile"] == "overlaycli"
+    ]
+    assert finding["severity"] == "warning"
+    assert finding["detail"]["gated"] == ["StopFailure"]
+    assert finding["message"].startswith("StopFailure hook needs overlaycli >= 2.1.78")
+    assert "not probed" in finding["message"]
+
+
 def test_validate_ignores_unused_legacy_copy(project, capsys):
     from bmad_loop.install import install_into
 
@@ -15334,6 +15456,24 @@ def test_validate_json_clean_project_is_a_pure_document_at_rc_0(project, capsys,
     assert doc["counts"]["problem"] == 0
     assert doc["findings"], "a passing validate still reports what it checked"
     assert {f["check"] for f in doc["findings"]} >= {"bmad-config", "policy", "git.worktree-clean"}
+
+
+def test_validate_json_hook_event_warning_keeps_rc_0(project, capsys, monkeypatch):
+    """`hooks.events-incomplete` is a warning: a passing project missing one
+    mapped relay (claude's `StopFailure`) still validates ok at rc 0."""
+    _make_validate_pass(project, monkeypatch, capsys)
+    config = project.project / ".claude/settings.json"
+    data = json.loads(config.read_text(encoding="utf-8"))
+    del data["hooks"]["StopFailure"]
+    config.write_text(json.dumps(data), encoding="utf-8")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "drop the StopFailure relay")
+
+    rc, doc = _validate_json(project.project, capsys)
+    assert rc == 0
+    assert doc["ok"] is True
+    [finding] = _claude_findings(doc, "hooks.events-incomplete")
+    assert finding["severity"] == "warning"
 
 
 def test_validate_json_failing_check_emits_whole_document_at_rc_1(project, capsys):

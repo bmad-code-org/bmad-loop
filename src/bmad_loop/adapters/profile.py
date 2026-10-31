@@ -33,6 +33,7 @@ profile state a TOML author would have been refused.
 from __future__ import annotations
 
 import importlib.metadata
+import re
 import string
 import sys
 import tomllib
@@ -78,9 +79,34 @@ HOOK_DIALECTS = {
 # event straight to one, or through the `Notification` carrier plus
 # `hooks.notification_types` (native subtype -> parked kind).
 PARKED_EVENTS = frozenset({"PermissionPrompt", "IdlePrompt", "QuotaPrompt"})
-CANONICAL_EVENTS = {"SessionStart", "Stop", "SessionEnd", "PreCompact", "Notification"} | set(
-    PARKED_EVENTS
-)
+# `StopFailure` is Claude Code's turn-ended-on-an-API-error event: it fires
+# INSTEAD of `Stop`, so it is never a completion. It is not a parked kind — the
+# profile's `hooks.stop_failure_types` maps its native `error` value onto one of
+# STOP_FAILURE_ACTIONS, the closed set the generic adapter knows how to act on.
+CANONICAL_EVENTS = {
+    "SessionStart",
+    "Stop",
+    "SessionEnd",
+    "PreCompact",
+    "Notification",
+    "StopFailure",
+} | set(PARKED_EVENTS)
+STOP_FAILURE_ACTIONS = frozenset({"transient", "rate_limit", "account", "ignore"})
+# A CLI version as `hooks.event_min_versions` spells it and `--version` prints
+# it: the first dotted MAJOR.MINOR.PATCH triple.
+_CLI_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_cli_version(text: str) -> tuple[int, int, int] | None:
+    """The first ``X.Y.Z`` in ``text`` as an int triple, or None when there is
+    none. Claude Code prints ``2.1.316 (Claude Code)``."""
+    match = _CLI_VERSION_RE.search(text)
+    if match is None:
+        return None
+    major, minor, patch = (int(group) for group in match.groups())
+    return major, minor, patch
+
+
 USER_PROFILES_REL = Path(".bmad-loop") / "profiles"
 
 # Legacy adapter names from older policy.toml files, plus friendly short names.
@@ -118,6 +144,22 @@ class HookSpec:
     # Non-empty requires some native event mapped to `Notification`. APPENDED
     # with a default so every positional HookSpec construction stays valid.
     notification_types: dict[str, str] = field(default_factory=dict)
+    # Values of the canonical `StopFailure` event's `error` field (the relay
+    # forwards it as `stop_error`) -> an action in STOP_FAILURE_ACTIONS — e.g.
+    # claude's `billing_error` -> `account`. An unmapped value is crumbed and
+    # otherwise ignored. Non-empty requires some native event mapped to
+    # `StopFailure`. APPENDED with a default so every positional HookSpec
+    # construction stays valid.
+    stop_failure_types: dict[str, str] = field(default_factory=dict)
+    # Native events the CLI added in a later release -> the minimum CLI version
+    # ("X.Y.Z") that knows them (#865). Hook registration (`init`, worktree
+    # provisioning, `probe-adapter`) probes `<binary> --version` and leaves a gated
+    # event out below its floor or when the version cannot be read, because an
+    # older CLI may reject its WHOLE hook config over one unknown event key —
+    # Claude Code before 2.1.78 drops the entire settings file, Stop relay
+    # included. Keys must be mapped in `events`, and a Stop carrier can never be
+    # gated. APPENDED with a default, like the tables above.
+    event_min_versions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -520,10 +562,16 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     if hooks.dialect == "none":
         # hookless: nothing is ever registered, so a config_path or events map
         # is a contradiction — reject rather than silently ignore.
-        if hooks.config_path or hooks.events or hooks.notification_types:
+        if (
+            hooks.config_path
+            or hooks.events
+            or hooks.notification_types
+            or hooks.stop_failure_types
+            or hooks.event_min_versions
+        ):
             raise fail(
-                'hookless profiles (dialect = "none") must not set '
-                "hooks.config_path/events/notification_types"
+                'hookless profiles (dialect = "none") must not set hooks.config_path/'
+                "events/notification_types/stop_failure_types/event_min_versions"
             )
     else:
         if (
@@ -557,6 +605,36 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 raise fail(
                     "hooks.notification_types needs a native event mapped to the "
                     "canonical 'Notification' carrier in hooks.events"
+                )
+        if hooks.stop_failure_types:
+            bad_actions = sorted(set(hooks.stop_failure_types.values()) - STOP_FAILURE_ACTIONS)
+            if bad_actions:
+                raise fail(
+                    "hooks.stop_failure_types values must be actions "
+                    f"{sorted(STOP_FAILURE_ACTIONS)}: got {bad_actions}"
+                )
+            if "StopFailure" not in hooks.events.values():
+                raise fail(
+                    "hooks.stop_failure_types needs a native event mapped to the "
+                    "canonical 'StopFailure' event in hooks.events"
+                )
+        for native, floor in hooks.event_min_versions.items():
+            canonical = hooks.events.get(native)
+            if canonical is None:
+                raise fail(
+                    f"hooks.event_min_versions names {native!r}, which hooks.events " "does not map"
+                )
+            if canonical == "Stop":
+                # The completion signal: gating it out would leave every session to
+                # end on the stall path.
+                raise fail(
+                    f"hooks.event_min_versions must not gate {native!r}: it carries "
+                    "the canonical 'Stop' completion event"
+                )
+            if parse_cli_version(floor) is None:
+                raise fail(
+                    f"hooks.event_min_versions[{native!r}] must be an X.Y.Z version: "
+                    f"got {floor!r}"
                 )
 
     # Shape only — membership against the registered kinds is deliberately NOT
@@ -911,6 +989,16 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         isinstance(v, str) for v in notification_d.values()
     ):
         raise fail("hooks.notification_types must map notification subtypes to parked kinds")
+    stop_failure_d = hooks_d.get("stop_failure_types", {})
+    if not isinstance(stop_failure_d, dict) or not all(
+        isinstance(v, str) for v in stop_failure_d.values()
+    ):
+        raise fail("hooks.stop_failure_types must map StopFailure error values to actions")
+    min_versions_d = hooks_d.get("event_min_versions", {})
+    if not isinstance(min_versions_d, dict) or not all(
+        isinstance(v, str) for v in min_versions_d.values()
+    ):
+        raise fail("hooks.event_min_versions must map native event names to versions")
 
     # Optional table; SHAPE here (a table of two strings), values in
     # `_validate_profile`. A bare `str()` coercion would turn an array into the
@@ -1005,6 +1093,8 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             config_path=str(hooks_d.get("config_path", "")),
             events={str(k): str(v) for k, v in events_d.items()},
             notification_types={str(k): v for k, v in notification_d.items()},
+            stop_failure_types={str(k): v for k, v in stop_failure_d.items()},
+            event_min_versions={str(k): v for k, v in min_versions_d.items()},
         ),
         adapter=raw_adapter.strip(),
         skill_tree=str(doc.get("skill_tree", ".claude/skills")),

@@ -246,7 +246,12 @@ class EnvFaultMixin:
         A LIVE usage-limit sighting (``result.usage_limited``, #610) short-cuts
         all of that: ``env_fault`` is stamped with that evidence and no veto and
         no tail scan, crumbed ``env-fault-classified`` with
-        ``usage_limited=True``."""
+        ``usage_limited=True``.
+
+        A parked result carrying ``stop_failure`` (#865) and no live usage
+        sighting skips the tail scan too and is returned unchanged, crumbed
+        ``env-fault-classified`` with ``skipped="stop-failure"``: the parked
+        pause reason then names the hook's ``StopFailure(<error>)``."""
         if result.status not in ENV_FAULT_STATUSES or result.result_json is not None:
             return result
         if result.usage_limited is not None:
@@ -263,6 +268,22 @@ class EnvFaultMixin:
             return dataclasses.replace(
                 result, env_fault=True, env_fault_evidence=result.usage_limited
             )
+        if result.parked and result.stop_failure is not None:
+            # A session the wait loop parked on a Claude Code `StopFailure`
+            # (#865): the hook named the API error that ended the turn, which
+            # is better evidence than a log-tail line. A tail match would take
+            # the env-fault arm ahead of the parked one and hide the error from
+            # the pause reason, so the scan is skipped and the parked arm's
+            # reason names `StopFailure(<error>)`. A usage-limited one took the
+            # shortcut above.
+            self._note_lifecycle(
+                handle.task_id,
+                "env-fault-classified",
+                status=result.status,
+                skipped="stop-failure",
+                stop_failure=result.stop_failure,
+            )
+            return result
         if not self._tail_scan_patterns:
             return result
         evidence = self._env_fault_evidence(handle.task_id)

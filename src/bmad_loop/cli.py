@@ -791,6 +791,56 @@ def _check_codex_version(report: ValidationReport, profile: CLIProfile, resolved
         )
 
 
+def _check_hook_events_complete(
+    report: ValidationReport, profile: CLIProfile, parsed: dict, hook_config: Path
+) -> None:
+    """``hooks.events-incomplete``: once the Stop relay is registered, whether
+    every other native event the profile maps runs its relay too. A config written
+    before the profile mapped an event (claude's ``StopFailure``) still completes
+    sessions but never delivers that event. OK or a warning, never a problem:
+    validate's rc is a compatibility contract.
+
+    A missing event the version gate would leave out again names its floor and
+    the version found, not a bare "re-run init" that would change nothing. The
+    gate probes ``<binary> --version`` only when something is missing, the
+    profile has floors, and the profile is packaged: `binary` and `env` of an
+    overlay or entry-point profile are project-controlled, and validate never
+    executes them (#294). Such a profile's floored events are named with their
+    floor and no version."""
+    detail: dict[str, object] = {"profile": profile.name, "config_path": str(hook_config)}
+    missing = install.missing_relay_events(parsed, profile.hooks.dialect, profile.hooks.events)
+    if not missing:
+        report.ok(
+            "hooks.events-incomplete",
+            f"every {profile.name} hook event runs the bmad-loop relay",
+            detail,
+        )
+        return
+    if profile.packaged:
+        registrable, gate_notes = install.gated_hook_events(profile)
+    else:
+        floors = profile.hooks.event_min_versions
+        registrable = {n: c for n, c in profile.hooks.events.items() if n not in floors}
+        gate_notes = [
+            f"{native} hook needs {profile.binary} >= {floor} ({profile.name}; version "
+            f"not probed for a project-owned profile) — on such a version, re-run "
+            f"`bmad-loop init --cli {profile.name}`"
+            for native, floor in floors.items()
+        ]
+    rerun = [native for native in missing if native in registrable]
+    gated = [native for native in missing if native not in registrable]
+    detail["missing"] = missing
+    detail["gated"] = gated
+    parts: list[str] = []
+    if rerun:
+        parts.append(
+            f"{', '.join(rerun)} not registered for {profile.name} — re-run "
+            f"`bmad-loop init --cli {profile.name}`"
+        )
+    parts.extend(note for note in gate_notes if note.split(" ", 1)[0] in gated)
+    report.warn("hooks.events-incomplete", "; ".join(parts), detail)
+
+
 def _report_bmad_config(report: ValidationReport, paths: bmadconfig.ProjectPaths) -> None:
     """The `bmad-config` ok line, plus the v7 warnings. A v6 config reports exactly
     as it always has; a v7 one names the era and the active initiative, warns when
@@ -1264,6 +1314,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"bmad-loop hooks registered for {profile.name}",
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
+            _check_hook_events_complete(report, profile, parsed, hook_config)
         else:
             report.fail(
                 "hooks.registered",
