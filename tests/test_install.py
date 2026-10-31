@@ -425,6 +425,35 @@ def test_relay_registered_without_the_notification_relay(tmp_path):
     assert _registered(profile, config)
 
 
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+def test_missing_relay_events_is_empty_after_fresh_init(tmp_path, name):
+    profile = get_profile(name)
+    assert install_into(tmp_path, clis=(name,), skills=False) == 0
+    config = json.loads((tmp_path / profile.hooks.config_path).read_text(encoding="utf-8"))
+    events = profile.hooks.events
+    assert install_mod.missing_relay_events(config, profile.hooks.dialect, events) == []
+
+
+def test_missing_relay_events_names_unregistered_and_mislabelled_natives():
+    """A config written before claude mapped `StopFailure` lacks it; a relay under
+    a mapped native that reports a different canonical event does not count, and
+    neither does a non-executed (`prompt`) handler."""
+    profile = get_profile("claude")
+    events = profile.hooks.events
+    config = _hook_config(
+        profile,
+        {
+            "Stop": [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")],
+            "SessionStart": [_relay_handler(profile, f"{_RELAY_EXE} relay SessionEnd")],
+            "PreCompact": [
+                _relay_handler(profile, f"{_RELAY_EXE} relay PreCompact", handler_type="prompt")
+            ],
+        },
+    )
+    missing = install_mod.missing_relay_events(config, profile.hooks.dialect, events)
+    assert missing == [native for native in events if native != "Stop"]
+
+
 @pytest.mark.parametrize("kind", ["Notification", "PermissionPrompt", "IdlePrompt", "QuotaPrompt"])
 def test_parked_kind_relay_commands_are_managed(kind):
     """A profile may map a native event straight to a parked kind (DW-348); its
@@ -1496,6 +1525,98 @@ def test_install_no_skills(tmp_path):
     assert not (tmp_path / ".claude" / "skills").exists()
 
 
+# The real `<binary> --version` probe, captured before conftest's autouse stub
+# replaces it for every test.
+_REAL_CLI_VERSION = install_mod.cli_version
+
+
+def _claude_hooks(project: Path) -> dict:
+    return json.loads((project / ".claude" / "settings.json").read_text(encoding="utf-8"))["hooks"]
+
+
+def test_init_registers_the_stop_failure_relay(tmp_path):
+    """#865: init writes `relay StopFailure` under claude's native `StopFailure`
+    (the conftest stub reports a Claude Code new enough to know the event)."""
+    assert install_into(tmp_path, skills=False) == 0
+    hooks = _claude_hooks(tmp_path)
+    assert _installed_relay_suffix("StopFailure") in hooks["StopFailure"][0]["hooks"][0]["command"]
+
+
+@pytest.mark.parametrize(
+    ("version", "found"), [((2, 1, 77), "found 2.1.77"), (None, "an unreadable version")]
+)
+def test_init_leaves_stop_failure_out_below_its_floor(
+    tmp_path, monkeypatch, capsys, version, found
+):
+    """#865: Claude Code before 2.1.78 skips the WHOLE settings file over the unknown
+    `StopFailure` key, Stop relay included — so below the floor, or when the
+    version cannot be read, init leaves that one event out and says so.
+
+    Ablation: drop the `del events[native]` in `gated_hook_events` and the
+    `"StopFailure" not in hooks` assertion fails."""
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: version)
+    assert install_into(tmp_path, skills=False) == 0
+    hooks = _claude_hooks(tmp_path)
+    assert "StopFailure" not in hooks
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+    out = capsys.readouterr().out
+    assert "warning: StopFailure hook not registered (claude)" in out
+    assert found in out and "re-run `bmad-loop init --cli claude`" in out
+
+
+def test_init_registers_stop_failure_at_exactly_its_floor(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: (2, 1, 78))
+    assert install_into(tmp_path, skills=False) == 0
+    assert "StopFailure" in _claude_hooks(tmp_path)
+    assert "StopFailure hook not registered" not in capsys.readouterr().out
+
+
+def test_init_strips_a_gated_relay_after_a_downgrade(tmp_path, monkeypatch):
+    """A config written while Claude Code was new enough keeps its StopFailure
+    relay after a downgrade, and that entry alone makes the older CLI skip the
+    file — so re-running init strips it. The operator's own StopFailure handler
+    stays.
+
+    Ablation: drop the `strip_event_relays` call in `_register_hooks` and the
+    relay survives."""
+    assert install_into(tmp_path, skills=False) == 0
+    config = tmp_path / ".claude" / "settings.json"
+    data = json.loads(config.read_text(encoding="utf-8"))
+    data["hooks"]["StopFailure"].append({"hooks": [{"type": "command", "command": "notify-me"}]})
+    config.write_text(json.dumps(data), encoding="utf-8")
+
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: (2, 1, 77))
+    assert install_into(tmp_path, skills=False) == 0
+    hooks = _claude_hooks(tmp_path)
+    commands = [h["command"] for group in hooks["StopFailure"] for h in group["hooks"]]
+    assert commands == ["notify-me"]
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_gated_hook_events_never_probes_a_profile_without_floors(monkeypatch):
+    """Only a profile declaring `hooks.event_min_versions` spawns `--version`: every
+    other built-in registers exactly as before, with no process launched."""
+
+    def boom(profile):
+        raise AssertionError(f"probed {profile.name}")
+
+    monkeypatch.setattr(install_mod, "cli_version", boom)
+    for name in ("codex", "gemini"):
+        profile = get_profile(name)
+        assert install_mod.gated_hook_events(profile) == (dict(profile.hooks.events), [])
+
+
+def test_cli_version_reads_the_binarys_version_output(monkeypatch):
+    """The real probe, against a binary every host has: `python --version` prints
+    `Python X.Y.Z`. A binary that is not on PATH reads None, never raises."""
+    monkeypatch.setattr(install_mod, "_cli_versions", {})
+    claude = get_profile("claude")
+    python = dataclasses.replace(claude, binary=sys.executable, env={})
+    assert _REAL_CLI_VERSION(python) == tuple(sys.version_info[:3])
+    missing = dataclasses.replace(claude, binary="bmad-loop-no-such-cli-865", env={})
+    assert _REAL_CLI_VERSION(missing) is None
+
+
 def test_install_unknown_cli(tmp_path):
     assert install_into(tmp_path, clis=("acme-cli",)) == 1
     assert not (tmp_path / ".bmad-loop").exists()
@@ -2360,6 +2481,35 @@ def test_provision_worktree_merge_preserves_the_operators_own_settings(tmp_path)
     hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
     assert set(claude.hooks.events) <= set(hooks)
     assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+
+
+def test_provision_worktree_gates_stop_failure_on_the_cli_version(tmp_path, monkeypatch):
+    """#865: provisioning applies init's version gate. A seeded config carrying a
+    StopFailure relay (written while the CLI was newer) loses it below the
+    floor, the Stop relay stays, and the omission reaches `on_hook_gated` — the
+    engine journals it as `worktree-hook-gated`.
+
+    Ablation: drop the `on_hook_gated` loop in `provision_worktree` and `notes`
+    stays empty."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    repo.mkdir()
+    claude = get_profile("claude")
+    config = wt / claude.hooks.config_path
+    config.parent.mkdir(parents=True)
+    seeded = json.loads(_OPERATOR_SETTINGS)
+    seeded.setdefault("hooks", {})["StopFailure"] = [
+        {"hooks": [{"type": "command", "command": "/opt/bin/bmad-loop relay StopFailure"}]}
+    ]
+    config.write_text(json.dumps(seeded), encoding="utf-8")
+    monkeypatch.setattr(install_mod, "cli_version", lambda profile: (2, 1, 77))
+    notes: list[str] = []
+
+    provision_worktree(wt, [claude], repo, on_hook_gated=notes.append)
+
+    hooks = json.loads(config.read_text(encoding="utf-8"))["hooks"]
+    assert "StopFailure" not in hooks
+    assert _installed_relay_suffix("Stop") in hooks["Stop"][0]["hooks"][0]["command"]
+    assert len(notes) == 1 and notes[0].startswith("StopFailure hook not registered (claude)")
 
 
 def test_provision_worktree_write_failure_raises_and_leaves_the_config_entire(

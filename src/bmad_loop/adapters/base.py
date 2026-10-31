@@ -389,6 +389,15 @@ class SessionResult:
     # `usage_wait_patterns` (it continues after the reset). None exactly when
     # `usage_limited` is None. Journaled present-only. APPENDED.
     usage_limit_class: str | None = None
+    # The `error` value of the latest Claude Code `StopFailure` hook event (#865)
+    # this session saw and no later `Stop` cleared: the API error that ended the
+    # turn (`server_error`, `billing_error`, `rate_limit`, ...). None = no
+    # uncleared StopFailure. Diagnostic only: routing never reads it, except that
+    # `_classify_env_fault` skips the log-tail scan for a parked result carrying
+    # it, so the parked pause reason names the error. Stamped on every result
+    # `wait_for_completion` returns; journaled on `session-end` present-only.
+    # APPENDED.
+    stop_failure: str | None = None
 
 
 class CodingCLIAdapter(ABC):

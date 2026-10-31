@@ -6,7 +6,8 @@ contract (its docstring says so) and cannot import ``bmad_loop`` to reach this
 module — and this module cannot import it back, since it ships as package DATA
 rather than as an importable module. Hence a twin rather than shared code:
 ``_LINK_REPARSE_TAGS``, ``_first_workspace``, ``_notification_type``,
-``_source``, ``_fully_idle``, the DW-507 lineage block (``_LAUNCH_SHIM_WINDOW_S``,
+``_source``, ``_fully_idle``, the StopFailure field block (``RELAY_TEXT_MAX``,
+``_bounded_text``, ``_STOP_FAILURE_FIELDS``), the DW-507 lineage block (``_LAUNCH_SHIM_WINDOW_S``,
 ``_proc_stat``, ``_cmdline``, ``_HOOK_SHELLS``, ``_runs_relay``,
 ``_is_hook_wrapper``, ``_lineage``), ``_is_link_like``,
 ``_write_all`` and ``_write_event`` below are byte-identical copies of the
@@ -83,6 +84,31 @@ def _fully_idle(payload):
     # CLI's event stays unchanged.
     value = payload.get("fullyIdle")
     return value if isinstance(value, bool) else None
+
+
+# Longest string a relay forwards from a free-text payload field (#865): enough
+# for an API error's rendered text, small enough that a runaway value cannot
+# bloat every event file the orchestrator reads.
+RELAY_TEXT_MAX = 2000
+
+
+def _bounded_text(payload, key):
+    # A free-text payload field, forwarded only when it is a string and cut to
+    # RELAY_TEXT_MAX characters; anything else reads as absent (None), so the
+    # caller writes the key only when there is text to carry.
+    value = payload.get(key)
+    return value[:RELAY_TEXT_MAX] if isinstance(value, str) else None
+
+
+# A StopFailure payload's free-text fields (#865), as (event key, payload key):
+# Claude Code sends `error` (the failure class the profile maps onto an action),
+# optional `error_details` and `last_assistant_message` (the rendered API error).
+# Each is written only when present, so every other event stays unchanged.
+_STOP_FAILURE_FIELDS = (
+    ("stop_error", "error"),
+    ("stop_error_details", "error_details"),
+    ("stop_message", "last_assistant_message"),
+)
 
 
 # How long after the launched CLI the rest of its launch chain may start
@@ -386,7 +412,10 @@ def shape_event(
     own parent chain rather than anything in the payload. ``payload_error`` is
     :func:`_read_payload`'s tag, written only when set so a readable payload's
     event is unchanged; ``fully_idle`` (DW-548) likewise appears only when the
-    payload carries a boolean ``fullyIdle``."""
+    payload carries a boolean ``fullyIdle``, and ``stop_error`` /
+    ``stop_error_details`` / ``stop_message`` (#865) only when a StopFailure
+    payload carries ``error`` / ``error_details`` / ``last_assistant_message`` as
+    a string, each cut to ``RELAY_TEXT_MAX`` characters."""
     event = {
         "ts": ts,
         "event": event_name,
@@ -420,6 +449,10 @@ def shape_event(
     fully_idle = _fully_idle(payload)
     if fully_idle is not None:
         event["fully_idle"] = fully_idle
+    for event_key, payload_key in _STOP_FAILURE_FIELDS:
+        text = _bounded_text(payload, payload_key)
+        if text is not None:
+            event[event_key] = text
     if payload_error:
         event["payload_error"] = payload_error
     return event

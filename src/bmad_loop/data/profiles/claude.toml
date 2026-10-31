@@ -178,7 +178,7 @@ CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1"
 [hooks]
 dialect = "claude-settings-json"
 config_path = ".claude/settings.json"
-events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEnd", PreCompact = "PreCompact", Notification = "Notification" }
+events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEnd", PreCompact = "PreCompact", Notification = "Notification", StopFailure = "StopFailure" }
 
 # Parked-session signals (DW-348): the relay forwards each Notification payload's
 # `notification_type`, and these subtypes mean the CLI is waiting on a human. The
@@ -212,6 +212,52 @@ quota_auto_resume_stale = "QuotaPrompt"
 quota_auto_resume_disabled = "QuotaPrompt"
 elicitation_dialog = "PermissionPrompt"
 elicitation_url_dialog = "PermissionPrompt"
+
+# StopFailure signals (#865): when an API error ends a turn, Claude Code fires
+# `StopFailure` INSTEAD of `Stop`, so the turn never reports a completion. The
+# relay forwards the payload's `error`, `error_details` and
+# `last_assistant_message` (the rendered API error, not the model's prose), and
+# this table maps the `error` value onto an adapter action: `transient` gets the
+# stop nudge at once, `account` ends the session parked (an uncharged pause),
+# `rate_limit` is split by its message, `ignore` does nothing. An unmapped value
+# is crumbed and otherwise ignored. StopFailure is never a completion event.
+#
+# Values verified 2026-10-30 against code.claude.com/docs/en/hooks.md (12
+# documented) and the Claude Code 2.1.316 build, which adds an undocumented
+# `verification_required`; a missing `error` reads as `unknown`. The event needs
+# Claude Code 2.1.78 or newer, and an older CLI must never see it: 2.1.77 checks
+# `hooks` keys against a fixed event list and skips the WHOLE settings file on
+# an unknown one, Stop relay included (npm bundle, checked 2026-10-31). Hence
+# `[hooks.event_min_versions]` below — registration probes `claude --version` and
+# leaves StopFailure out (with a warning) below 2.1.78 or on an unreadable
+# version; re-run `bmad-loop init` after upgrading. Residual risk: DOWNGRADING
+# Claude Code after init keeps the entry until init runs again.
+#
+# `rate_limit` is ambiguous: an ordinary 429 and a subscription usage limit share
+# it, so the adapter matches the message against this profile's usage patterns.
+# `invalid_request` mostly means a context-shape failure (prompt too long,
+# compaction thrashing, a mismatched tool history) that a fresh session fixes —
+# not an account error. `unknown` also covers model-output failures (a malformed
+# tool call, an empty completion).
+[hooks.stop_failure_types]
+overloaded = "transient"
+server_error = "transient"
+unknown = "transient"
+max_output_tokens = "transient"
+invalid_request = "transient"
+rate_limit = "rate_limit"
+billing_error = "account"
+authentication_failed = "account"
+oauth_org_not_allowed = "account"
+account_on_hold = "account"
+verification_required = "account"
+cloud_credential_error = "account"
+model_not_found = "account"
+
+# Native events an older Claude Code does not know -> the first version that
+# does (see StopFailure signals above for why the gate exists).
+[hooks.event_min_versions]
+StopFailure = "2.1.78"
 
 # `adapter.permission_mode = "sandboxed"` (#727): never prompt, deny instead.
 # `dontAsk` denies every tool call no allow rule covers, back to the model as an

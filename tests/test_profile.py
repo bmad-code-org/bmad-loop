@@ -17,6 +17,7 @@ from bmad_loop.adapters.profile import (
     ProfileError,
     get_profile,
     load_profiles,
+    parse_cli_version,
 )
 
 MINIMAL_PROFILE = """
@@ -206,6 +207,7 @@ def test_parked_signal_fields_default_empty_when_unset(tmp_path):
     (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(MINIMAL_PROFILE)
     prof = load_profiles(tmp_path)["mycli"]
     assert prof.hooks.notification_types == {}
+    assert prof.hooks.stop_failure_types == {}
     assert prof.parked_prompt_patterns == ()
 
 
@@ -249,6 +251,65 @@ def test_claude_maps_its_parked_notification_subtypes():
         if name != "claude":
             assert prof.hooks.notification_types == {}, name
             assert prof.parked_prompt_patterns == (), name
+
+
+def test_claude_maps_its_stop_failure_types():
+    """#865: the claude profile relays `StopFailure` and maps every `error` value
+    the hooks reference documents, plus the 2.1.316 build's undocumented
+    `verification_required`, onto an action. `invalid_request` is context-shape (a
+    fresh session fixes it), so it is transient, not an account error. Every
+    other built-in stays `{}`: none has a StopFailure event."""
+    claude = get_profile("claude")
+    assert claude.hooks.events["StopFailure"] == "StopFailure"
+    assert claude.hooks.stop_failure_types == {
+        "overloaded": "transient",
+        "server_error": "transient",
+        "unknown": "transient",
+        "max_output_tokens": "transient",
+        "invalid_request": "transient",
+        "rate_limit": "rate_limit",
+        "billing_error": "account",
+        "authentication_failed": "account",
+        "oauth_org_not_allowed": "account",
+        "account_on_hold": "account",
+        "verification_required": "account",
+        "cloud_credential_error": "account",
+        "model_not_found": "account",
+    }
+    # Claude Code before 2.1.78 skips the WHOLE settings file over an unknown hook
+    # key, so registration gates the event on the installed version.
+    assert claude.hooks.event_min_versions == {"StopFailure": "2.1.78"}
+    for name, prof in load_profiles().items():
+        if name != "claude":
+            assert prof.hooks.stop_failure_types == {}, name
+            assert "StopFailure" not in prof.hooks.events.values(), name
+            assert prof.hooks.event_min_versions == {}, name
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2.1.316 (Claude Code)", (2, 1, 316)),
+        ("codex-cli 0.164.0", (0, 164, 0)),
+        ("Python 3.12.3\n", (3, 12, 3)),
+        ("v2.1", None),
+        ("", None),
+    ],
+)
+def test_parse_cli_version(text, expected):
+    assert parse_cli_version(text) == expected
+
+
+def test_stop_failure_types_parse_from_overlay(tmp_path):
+    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
+    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(
+        MINIMAL_PROFILE.replace('Stop = "Stop" }', 'Stop = "Stop", Fail = "StopFailure" }')
+        + '[hooks.stop_failure_types]\nquota = "rate_limit"\nnoise = "ignore"\n',
+        encoding="utf-8",
+    )
+    prof = load_profiles(tmp_path)["mycli"]
+    assert prof.hooks.stop_failure_types == {"quota": "rate_limit", "noise": "ignore"}
+    assert prof.hooks.events["Fail"] == "StopFailure"
 
 
 # The #727 captured pane lines (Claude Code 2.1.246, run 20260826-114252-3da1),
@@ -1370,6 +1431,64 @@ def test_user_profile_overlay(tmp_path):
         (
             MINIMAL_PROFILE + "[hooks.notification_types]\npermission_prompt = 1\n",
             "notification_types must map",
+        ),
+        # StopFailure signals (#865): an error value must map onto an ACTION, not
+        # a canonical event or parked kind...
+        (
+            MINIMAL_PROFILE.replace(
+                'Stop = "Stop" }', 'Stop = "Stop", StopFailure = "StopFailure" }'
+            )
+            + '[hooks.stop_failure_types]\nbilling_error = "PermissionPrompt"\n',
+            "stop_failure_types values must be actions",
+        ),
+        # ...needs a native event mapped to the canonical StopFailure it rides on...
+        (
+            MINIMAL_PROFILE + '[hooks.stop_failure_types]\nbilling_error = "account"\n',
+            "canonical 'StopFailure' event",
+        ),
+        # ...is hook plumbing a hookless profile must not carry...
+        (
+            HOOKLESS_PROFILE + '[hooks.stop_failure_types]\nbilling_error = "account"\n',
+            "hookless",
+        ),
+        # ...and must be a table of strings, funnelled rather than coerced.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "[hooks]\nstop_failure_types = 5"),
+            "stop_failure_types must map",
+        ),
+        (
+            MINIMAL_PROFILE + "[hooks.stop_failure_types]\nbilling_error = 1\n",
+            "stop_failure_types must map",
+        ),
+        # hook-event version floors (#865): the key must be a mapped native event...
+        (
+            MINIMAL_PROFILE + '[hooks.event_min_versions]\nStopFailure = "2.1.78"\n',
+            "which hooks.events does not map",
+        ),
+        # ...never the Stop carrier (gating it out would end every session on the
+        # stall path)...
+        (
+            MINIMAL_PROFILE + '[hooks.event_min_versions]\nStop = "2.1.78"\n',
+            "carries the canonical 'Stop' completion event",
+        ),
+        # ...must be an X.Y.Z version...
+        (
+            MINIMAL_PROFILE + '[hooks.event_min_versions]\nSessionStart = "latest"\n',
+            "must be an X.Y.Z version",
+        ),
+        # ...is hook plumbing a hookless profile must not carry...
+        (
+            HOOKLESS_PROFILE + '[hooks.event_min_versions]\nStopFailure = "2.1.78"\n',
+            "hookless",
+        ),
+        # ...and must be a table of strings.
+        (
+            MINIMAL_PROFILE.replace("[hooks]", "[hooks]\nevent_min_versions = 5"),
+            "event_min_versions must map",
+        ),
+        (
+            MINIMAL_PROFILE + "[hooks.event_min_versions]\nSessionStart = 2\n",
+            "event_min_versions must map",
         ),
         # a parked_prompt_patterns entry that is not a valid regex fails fast at parse
         (

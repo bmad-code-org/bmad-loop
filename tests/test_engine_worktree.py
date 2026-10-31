@@ -8495,6 +8495,35 @@ def test_engine_deferred_teardown_degrades_are_journaled(project, monkeypatch):
     assert "worktree-teardown-degraded" in journal_kinds(engine)
 
 
+def test_isolated_hook_event_gate_is_journaled(project, monkeypatch):
+    """#865: a hook event the installed CLI is too old for stays out of the
+    worktree's hook config, and the run journals it — a `worktree-hook-gated`
+    line per provisioned unit naming the event — rather than dropping it unseen.
+    The gate is a degrade, not a stop: the unit still merges.
+
+    Ablation: delete the `on_hook_gated=` lambda at the `provision_worktree` call
+    in `run_isolated` and the journal line is gone."""
+    from bmad_loop import install
+    from bmad_loop.adapters.profile import get_profile
+
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    monkeypatch.setattr(install, "cli_version", lambda profile: (2, 1, 77))
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(),
+    )
+    # the real claude profile, so provisioning registers claude's hook events
+    adapter.profile = get_profile("claude")
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    entries = [e for e in engine.journal.entries() if e["kind"] == "worktree-hook-gated"]
+    assert entries and all(e["story_key"] == "1-1-a" for e in entries)
+    assert entries[0]["reason"].startswith("StopFailure hook not registered (claude)")
+    assert "unit-merged" in journal_kinds(engine)
+
+
 def test_isolated_exclude_degrade_is_journaled_and_notified(project, monkeypatch):
     """#359: `provision_worktree`'s local-exclude write is best-effort, so the sole
     caller has to give the degrade somewhere to land — otherwise a swallowed fault

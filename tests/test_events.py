@@ -40,6 +40,10 @@ TWINNED = (
     "_notification_type",
     "_source",
     "_fully_idle",
+    # #865's StopFailure fields: the bound, the str-only cut and the key map.
+    "RELAY_TEXT_MAX",
+    "_bounded_text",
+    "_STOP_FAILURE_FIELDS",
     # DW-507's lineage block: the tag both relays stamp on every event.
     "_LAUNCH_SHIM_WINDOW_S",
     "_proc_stat",
@@ -221,6 +225,67 @@ def test_both_relay_twins_forward_the_notification_type(tmp_path, monkeypatch, p
     from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text())
     assert from_hook["notification_type"] == expected
     assert from_relay["notification_type"] == expected
+
+
+_STOP_KEYS = ("stop_error", "stop_error_details", "stop_message")
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {
+                "error": "server_error",
+                "error_details": "529 Overloaded",
+                "last_assistant_message": "API Error: Connection lost mid-response",
+            },
+            {
+                "stop_error": "server_error",
+                "stop_error_details": "529 Overloaded",
+                "stop_message": "API Error: Connection lost mid-response",
+            },
+        ),
+        # optional fields absent -> their keys are absent, the present one still rides
+        ({"error": "billing_error"}, {"stop_error": "billing_error"}),
+        # not a StopFailure payload at all -> no key written
+        ({}, {}),
+        # only a string is forwarded — a profile table keys on str
+        ({"error": 7, "error_details": None, "last_assistant_message": ["x"]}, {}),
+        # over-long text is cut to RELAY_TEXT_MAX, never dropped
+        (
+            {"error": "unknown", "last_assistant_message": "x" * (events.RELAY_TEXT_MAX + 50)},
+            {"stop_error": "unknown", "stop_message": "x" * events.RELAY_TEXT_MAX},
+        ),
+    ],
+)
+def test_both_relay_twins_forward_the_stop_failure_fields(tmp_path, monkeypatch, payload, expected):
+    """#865: a StopFailure payload's `error` / `error_details` /
+    `last_assistant_message` reach the event file from BOTH writers as
+    `stop_error` / `stop_error_details` / `stop_message` — present-only, str-only,
+    bounded. The hook shapes inline in `main()`, so this pins it behaviorally.
+
+    Ablation: drop the `_STOP_FAILURE_FIELDS` loop from either writer and the
+    present cases fail on that side alone."""
+    hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
+    proc = subprocess.run(
+        [sys.executable, str(HOOK), "StopFailure"],
+        input=json.dumps(payload),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            **({"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")} if os.name == "nt" else {}),
+            "BMAD_LOOP_RUN_DIR": str(hook_run),
+            "BMAD_LOOP_TASK_ID": "1-1-a-dev-1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _relay("StopFailure", payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
+    from_hook = json.loads(next((hook_run / "events").glob("*.json")).read_text(encoding="utf-8"))
+    from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text(encoding="utf-8"))
+    assert {k: from_hook[k] for k in _STOP_KEYS if k in from_hook} == expected
+    assert {k: from_relay[k] for k in _STOP_KEYS if k in from_relay} == expected
 
 
 @pytest.mark.parametrize(
