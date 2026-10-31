@@ -64,11 +64,11 @@ A story stays escalated until you resolve it. A plain `bmad-loop resume` warns `
 A review session that disagrees with the dev pass escalates as a contradiction instead of burning review cycles:
 
 - **sprint-status mode:** the orchestrator advanced the board to `done` after dev verified, and the review wrote it back to an earlier stage while the spec stayed `done`;
-- **tickets mode:** the review left the plan at an earlier status than the one it entered at (`built` or `done`), for example back at `in-progress`.
+- **tickets mode:** the review entered on a plan a human had already accepted (`done`) and finalized it at `built`. A review that leaves its plan before `built` (`in-review`, `in-progress`) has not finished, so it is not a contradiction: the review loop runs another cycle.
 
 The reason names both sides. The work is kept: uncommitted in the checkout, or on the unit's worktree branch under isolation. Editing the board or plan back to `done` and running `bmad-loop resume` does not clear it: the story stays escalated and the run pauses again. Either:
 
-- **Finish the work and re-arm.** Commit what you want kept (in place, the re-drive resets uncommitted changes onto a preserve ref; under isolation it discards the kept worktree), then `bmad-loop resolve <run-id>` ([re-arm](#re-arm-with-the-resolve-agent)). The story re-drives from `ready-for-dev` with its attempt and review budgets reset.
+- **Finish the work and re-arm.** Commit what you want kept, then `bmad-loop resolve <run-id>` ([re-arm](#re-arm-with-the-resolve-agent)). In place, commit in the checkout: the re-drive resets uncommitted changes onto a preserve ref. Under isolation, commit on the run's target branch in the main checkout: the re-drive discards the kept worktree and its branch and cuts a fresh one from the target branch, so commits left only on the kept branch do not reach it. The story re-drives from `ready-for-dev` with its attempt and review budgets reset.
 - **Accept the kept branch** (worktree isolation only): `bmad-loop resolve <run-id> --adopt-branch` ([details](#adopt-the-kept-branch)) commits and merges the work as is and advances the board or plan itself. Review and the `[verify]` commands are not re-run.
 
 ## Resolving an escalation

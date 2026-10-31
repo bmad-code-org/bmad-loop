@@ -1507,26 +1507,35 @@ def test_review_converges_on_a_built_plan(project_v7, monkeypatch):
 
 
 def test_tickets_review_walked_back_plan_escalates(project_v7, monkeypatch):
-    """A review that converges yet leaves its plan walked back from `built` to
-    `in-progress` pauses the run with a contradiction naming both statuses: no
-    second review cycle (which would route a build leg through the review role),
-    no defer, and no done mark. Ablation (performed): make `_is_plan_regression`
-    return False and the gate retries instead — the loop burns its review cycles
-    and this FAILS."""
+    """A review that enters at `done` (a human accepted the plan once dev
+    verified) and converges with the plan finalized at `built` pauses the run
+    with a contradiction naming both statuses: no second review cycle, no defer,
+    and no done mark. The result is the one the adapter synthesizes from that
+    plan (frontmatter `built`): a walk-back to a pre-`built` status is a
+    non-terminal pass that never reaches this gate. Ablation (performed): make
+    `_is_plan_regression` return False and the gate retries instead — the loop
+    burns its review cycles and this FAILS."""
     tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
     plan = Path(tree.finds["1.1"].plan)
     _marking_tree(tree, plan, monkeypatch)
     pol = dataclasses.replace(_policy(), review=ReviewPolicy(enabled=True, trigger="always"))
 
-    def walks_back(spec: SessionSpec) -> SessionResult:
+    def finalizes_built(spec: SessionSpec) -> SessionResult:
         here = Path(spec.cwd) / plan.relative_to(project_v7.project)
-        _write_plan(here, "in-progress", baseline=verify.rev_parse_head(Path(spec.cwd)))
+        _write_plan(here, "built", baseline=verify.rev_parse_head(Path(spec.cwd)))
         result = {"workflow": "auto-dev", "spec_file": str(here), "status": "built"}
         result["followup_review_recommended"] = False
         return SessionResult(status="completed", result_json=result)
 
-    script = [_builds(project_v7, tree, plan)] + [walks_back] * 3
+    script = [_builds(project_v7, tree, plan)] + [finalizes_built] * 3
     engine, adapter = make_engine(project_v7, tree, policy=pol, script=script, max_stories=1)
+    real_reset = engine._reset_spec_for_review
+
+    def accepted_then_reset(task):
+        _write_plan(plan, "done", baseline=task.baseline_commit)
+        return real_reset(task)
+
+    monkeypatch.setattr(engine, "_reset_spec_for_review", accepted_then_reset)
 
     summary = engine.run()
 
@@ -1535,7 +1544,7 @@ def test_tickets_review_walked_back_plan_escalates(project_v7, monkeypatch):
     assert task.phase == Phase.ESCALATED and not task.defer_reason
     assert len(adapter.sessions) == 2  # the build and one review pass
     [escalated] = _kinds(engine, "story-escalated")
-    assert "back from 'built' to 'in-progress'" in escalated["reason"]
+    assert "back from 'done' to 'built'" in escalated["reason"]
     assert tree.marks == []
 
 

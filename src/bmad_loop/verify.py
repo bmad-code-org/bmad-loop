@@ -10477,8 +10477,11 @@ def verify_review_tickets(
     a monotonic read-back of the plan itself: a status that sits EARLIER in
     ``statemachine.PLAN_STATUS_ORDER`` than the one the review entered at is the
     review walking the ticket backward, and it escalates as a contradiction: the
-    review's converged result disagrees with the plan it left. Any other
-    mismatch retries. A ``dropped`` plan always escalates as a contradiction.
+    review's converged result disagrees with the plan it left. The gate runs only
+    on a converged pass (the plan at ``built`` or ``done``), so in practice that is
+    a ``done`` plan the review finalized at ``built``; a pass that leaves the plan
+    before ``built`` is non-terminal and the review loop runs another cycle. Any
+    other mismatch retries. A ``dropped`` plan always escalates as a contradiction.
 
     ``on_results`` / ``on_probes`` go straight to ``_verify_review_commands``,
     as for every review gate."""
@@ -10505,14 +10508,12 @@ def verify_review_tickets(
         if _is_plan_regression(status, entered_status):
             return VerifyOutcome.escalate(
                 f"review walked ticket plan {plan} back from {entered_status!r} to "
-                f"{status!r}. The orchestrator verified it at {entered_status!r} before "
-                f"the review, so the review's converged result disagrees with the plan "
-                f"it left, and a re-run would route the plan by its new status (from "
-                f"'in-progress', a build leg under the review role that never passes "
-                f"the dev gate). Resolve by finishing the outstanding work and "
-                f"re-arming with bmad-loop resolve, or, under worktree isolation, "
-                f"accepting the kept branch with bmad-loop resolve --adopt-branch; "
-                f"see docs/escalations-guide.md#a-review-revoked-the-sign-off.",
+                f"{status!r}. The plan entered the review at {entered_status!r}, so the "
+                f"review's converged result disagrees with the plan it left, and no "
+                f"further review cycle moves it forward again. Resolve by finishing the "
+                f"outstanding work and re-arming with bmad-loop resolve, or, under "
+                f"worktree isolation, accepting the kept branch with bmad-loop resolve "
+                f"--adopt-branch; see docs/escalations-guide.md#a-review-revoked-the-sign-off.",
                 contradiction=True,
             )
         return VerifyOutcome.retry(f"plan status is {status!r}, expected {expected!r}: {plan}")
