@@ -100,6 +100,9 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "git.version",
         "hooks.config-parse",
         "hooks.registered",
+        # the Stop relay is registered but another mapped native event is not
+        # (a config written before the profile mapped it, e.g. claude StopFailure)
+        "hooks.events-incomplete",
         "hooks.trust",
         "hooks.relay-present",
         "hooks.relay-stale",

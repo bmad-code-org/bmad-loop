@@ -425,6 +425,35 @@ def test_relay_registered_without_the_notification_relay(tmp_path):
     assert _registered(profile, config)
 
 
+@pytest.mark.parametrize("name", ["claude", "codex", "gemini", "copilot", "antigravity"])
+def test_missing_relay_events_is_empty_after_fresh_init(tmp_path, name):
+    profile = get_profile(name)
+    assert install_into(tmp_path, clis=(name,), skills=False) == 0
+    config = json.loads((tmp_path / profile.hooks.config_path).read_text(encoding="utf-8"))
+    events = profile.hooks.events
+    assert install_mod.missing_relay_events(config, profile.hooks.dialect, events) == []
+
+
+def test_missing_relay_events_names_unregistered_and_mislabelled_natives():
+    """A config written before claude mapped `StopFailure` lacks it; a relay under
+    a mapped native that reports a different canonical event does not count, and
+    neither does a non-executed (`prompt`) handler."""
+    profile = get_profile("claude")
+    events = profile.hooks.events
+    config = _hook_config(
+        profile,
+        {
+            "Stop": [_relay_handler(profile, f"{_RELAY_EXE} relay Stop")],
+            "SessionStart": [_relay_handler(profile, f"{_RELAY_EXE} relay SessionEnd")],
+            "PreCompact": [
+                _relay_handler(profile, f"{_RELAY_EXE} relay PreCompact", handler_type="prompt")
+            ],
+        },
+    )
+    missing = install_mod.missing_relay_events(config, profile.hooks.dialect, events)
+    assert missing == [native for native in events if native != "Stop"]
+
+
 @pytest.mark.parametrize("kind", ["Notification", "PermissionPrompt", "IdlePrompt", "QuotaPrompt"])
 def test_parked_kind_relay_commands_are_managed(kind):
     """A profile may map a native event straight to a parked kind (DW-348); its

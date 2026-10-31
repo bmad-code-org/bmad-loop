@@ -2353,6 +2353,31 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
     return all(native in satisfied for native in stop_natives)
 
 
+def missing_relay_events(config: dict, dialect: str, events: Mapping[str, str]) -> list[str]:
+    """Native events in ``events`` with no executed relay reporting their canonical
+    event, in map order.
+
+    `relay_registered` answers only for the completion signal: a config written
+    before a profile mapped a newer event (claude's ``StopFailure``) still passes
+    it while that event never reaches the loop. This names what such a config
+    lacks; ``bmad-loop init`` registers it in place. A relay that reports a
+    different canonical event does not count — `relay_registered` refuses that
+    config outright.
+    """
+    container = hook_event_container(config, dialect)
+    missing: list[str] = []
+    for native, canonical in events.items():
+        handlers = container.get(native)
+        present = isinstance(handlers, list) and any(
+            _relay_canonical_event(command) == canonical
+            for handler in handlers
+            for command in _executed_commands_in_handler(handler)
+        )
+        if not present:
+            missing.append(native)
+    return missing
+
+
 def foreign_group_relay_hazards(
     config: dict, dialect: str, events: Mapping[str, str]
 ) -> list[tuple[str, str]]:

@@ -355,12 +355,14 @@ with no `..`, and is refused on hookless profiles.
 
 ### `HookSpec` (the `[hooks]` table)
 
-| Field                | Required                     | Default | Meaning                                                                                                                                                          |
-| -------------------- | ---------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `dialect`            | ✅                           | —       | Hook-config format: `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `antigravity-hooks-json`, or `none` (hookless). |
-| `config_path`        | ✅ unless `dialect = "none"` | `""`    | Project-relative path the hook config is written to. Must stay inside the project; empty when hookless.                                                          |
-| `events`             | ✅ unless `dialect = "none"` | `{}`    | Native event → canonical event (`SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, `Notification`, or a parked kind). Empty when hookless.                      |
-| `notification_types` |                              | `{}`    | `[hooks.notification_types]`: notification subtype → parked kind. Unmapped subtypes are ignored. Needs an event mapped to `Notification`.                        |
+| Field                | Required                     | Default | Meaning                                                                                                                                                            |
+| -------------------- | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `dialect`            | ✅                           | —       | Hook-config format: `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `antigravity-hooks-json`, or `none` (hookless).   |
+| `config_path`        | ✅ unless `dialect = "none"` | `""`    | Project-relative path the hook config is written to. Must stay inside the project; empty when hookless.                                                            |
+| `events`             | ✅ unless `dialect = "none"` | `{}`    | Native event → canonical event (`SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, `Notification`, `StopFailure`, or a parked kind). Empty when hookless.         |
+| `notification_types` |                              | `{}`    | `[hooks.notification_types]`: notification subtype → parked kind. Unmapped subtypes are ignored. Needs an event mapped to `Notification`.                          |
+| `stop_failure_types` |                              | `{}`    | `[hooks.stop_failure_types]`: `StopFailure` error value → `transient`, `rate_limit`, `account` or `ignore`. Needs an event mapped to `StopFailure`.                |
+| `event_min_versions` |                              | `{}`    | `[hooks.event_min_versions]`: native event → minimum CLI version (`X.Y.Z`). Registration leaves the event out below it. Keys must be mapped; never a Stop carrier. |
 
 ### Session identity and nested CLIs
 
@@ -500,6 +502,57 @@ turn without a result and sits idle pauses as parked instead of being nudged. A 
 overlay (`.bmad-loop/profiles/claude.toml`) that drops `idle_prompt` from
 `[hooks.notification_types]` restores the wake nudge.
 
+### StopFailure signals
+
+When an API error ends a turn, Claude Code (2.1.78 and newer) fires `StopFailure`
+instead of `Stop`. Map the native event to the canonical `StopFailure` and name its
+`error` values in `[hooks.stop_failure_types]`. The relay forwards the payload's `error`,
+`error_details` and `last_assistant_message` (the rendered API error, not the model's
+prose). A missing `error` reads as `unknown`. `StopFailure` is never a completion: it
+never marks the turn ended, never reads a result, and never re-arms the stall grace.
+The generic adapter acts on it when it arrives, by action:
+
+- **`transient`**: the stop nudge goes out at once, from the same budget and with the
+  same quota-wait guard as a result-less `Stop` (`stop-nudge-withheld` carries
+  `hook_event="StopFailure"`). A turn that never recovers stalls as before and is
+  charged; with the budget spent, the adapter leaves `stop-failure-nudge-exhausted`.
+- **`account`**: the session ends `stalled` + `parked` with the evidence
+  `StopFailure(<error>): <message, else details, else "no message">`. The log-tail
+  env-fault scan is skipped, so the run pauses with a `parked:` reason naming the error,
+  and the attempt is not charged.
+- **`rate_limit`**: an ordinary 429 and a subscription limit share this value, so the
+  message is matched against the profile's usage lists (see
+  [Usage-limit signals](#usage-limit-signals)). A `usage_limit_patterns` match ends the
+  session usage-limited, the same pause as a pane match. A `usage_wait_patterns` match
+  (`stop-failure-quota-wait-pending`) becomes the quota wait's evidence when the pane
+  offers none, so a backend that cannot capture its pane can still admit the wait. No
+  match leaves `stop-failure-rate-limit-unmatched` and the usual stall timing. A match
+  that blows the per-pattern timeout leaves `stop-failure-probe-failed` and counts as no
+  match.
+- **`ignore`**: nothing beyond the crumb.
+
+Every event leaves a `stop-failure` lifecycle crumb (error, action, details, a message
+excerpt); an unmapped value also leaves `stop-failure-unmapped` and keeps the usual stall
+timing. A later `Stop` clears the latch. `SessionResult.stop_failure` carries the last
+uncleared error, as does the heartbeat and the `session-end` journal entry.
+
+The shipped `claude` profile maps the documented values: `overloaded`, `server_error`,
+`unknown`, `max_output_tokens` and `invalid_request` (a context-shape failure that a fresh
+session fixes) are `transient`; `rate_limit` is `rate_limit`; `billing_error`,
+`authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`,
+`verification_required`, `cloud_credential_error` and `model_not_found` are `account`.
+
+**Version gate.** Claude Code before 2.1.78 skips its whole settings file over an
+unknown hook event key, `Stop` relay included, so claude's
+`[hooks.event_min_versions]` floors `StopFailure` at `2.1.78`. Registration (`init`,
+worktree provisioning, `probe-adapter`) reads `<binary> --version` and leaves a floored
+event out below its floor or when the version cannot be read. `init` prints
+`warning: StopFailure hook not registered (claude): …` and strips a relay it gated out;
+provisioning journals `worktree-hook-gated`. A project initialized before the event was
+mapped gets it by re-running `bmad-loop init`, and `bmad-loop validate` warns
+(`hooks.events-incomplete`) until then. Downgrading the CLI after `init` keeps the entry
+until `init` runs again.
+
 ### Answer keys (the `[parked_answers]` table)
 
 The TUI's `Y` and `N` keys answer a live permission prompt by pressing keys in the
@@ -597,6 +650,9 @@ below):
 
 - **`usage_limit_patterns`**: the CLI is blocked and will not continue on its own.
 - **`usage_wait_patterns`**: the CLI is blocked and waiting for a reset it continues from.
+
+A Claude Code `StopFailure` with `error` `rate_limit` is matched against the same two lists
+(see [StopFailure signals](#stopfailure-signals)).
 
 The lists are disjoint by contract; "usage-limited" means either one matched. They follow
 the env-fault evidentiary bar: reproduce the captured sentence prefix (never a bare
