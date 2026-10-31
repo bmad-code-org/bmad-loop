@@ -2330,6 +2330,9 @@ JOURNAL_KINDS = frozenset(
         "unit-merged",
         "unit-merged-unverified",
         "worktree-exclude-degraded",
+        # #865: a hook event the installed CLI is too old for, left out of the
+        # worktree's config; `reason` is presence-only.
+        "worktree-hook-gated",
         "worktree-kept",
         "worktree-module-skills-dropped",
         "worktree-open-failed",

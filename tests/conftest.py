@@ -30,6 +30,7 @@ from bmad_loop import (
     cli,
     documents,
     envvars,
+    install,
     platform_util,
     runs,
     ticketlayout,
@@ -1082,6 +1083,24 @@ PINNED_PWSH = r"C:\Program Files\PowerShell\7\pwsh.exe"
 # The absolute psmux the parked-window trailer calls under the suite: a space
 # and an apostrophe, so every trailer assertion exercises the quoting.
 PINNED_PSMUX = r"C:\Program Files\psmux's build\psmux.exe"
+
+
+# What the stubbed `install.cli_version` reports: newer than any floor a shipped
+# profile declares in `hooks.event_min_versions`.
+STUB_CLI_VERSION = (999, 0, 0)
+
+
+@pytest.fixture(autouse=True)
+def _stub_cli_version(monkeypatch):
+    """Answer the hook-event version gate (#865) without running a real CLI.
+
+    `install.gated_hook_events` spawns `<binary> --version` for a profile that
+    declares `hooks.event_min_versions` (claude). Unstubbed, what `init` and
+    worktree provisioning register would depend on whether the host happens to
+    have `claude` on PATH, and how new it is — a developer box and a CI runner
+    would register different events. Tests of the gate itself patch over this, or
+    call the real probe they captured at import."""
+    monkeypatch.setattr(install, "cli_version", lambda profile: STUB_CLI_VERSION)
 
 
 @pytest.fixture(autouse=True)

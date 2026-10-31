@@ -55,7 +55,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib import resources
 from pathlib import Path
@@ -68,7 +68,7 @@ from .adapters.generic import PARKED_PROMPT_MATCH_TIMEOUT_S
 from .adapters.multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
 from .adapters.panematch import Hit, MatchTimeout, match_rows, screen_rows
 from .adapters.profile import CLIProfile
-from .install import merge_hooks, relay_registered
+from .install import gated_hook_events, merge_hooks, relay_registered
 from .process_host import ProcessHostError, get_process_host
 
 # cmd_probe catches `probe.LeakDetected` around the renderers, mirroring
@@ -851,9 +851,13 @@ def probe(
         hook_path.write_text(hook_src.read_text(encoding="utf-8"), encoding="utf-8")
         host = get_process_host()
         interp = host.hook_interpreter()
+        # `init`'s version gate (#865): an event the probed CLI is too old for
+        # would make it skip this whole config, so it stays out — and says so.
+        events, gate_notes = gated_hook_events(replace(profile, binary=binary))
+        finding.warnings.extend(gate_notes)
         registrations = {
             native: f"{interp} {host.shell_quote(str(hook_path))} {canonical}"
-            for native, canonical in profile.hooks.events.items()
+            for native, canonical in events.items()
         }
         config, _ = merge_hooks({}, registrations, profile.hooks.dialect)
         config_path = tmpdir / profile.hooks.config_path
