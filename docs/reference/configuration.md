@@ -57,7 +57,6 @@ Separate adversarial review session toggle.
 | `enabled` | boolean | `true` |  | ON: adversarial review runs in a dedicated 2nd session · OFF: the dev pass runs its own review layers inline, story straight to done |
 | `trigger` | string | `"recommended"` | `always` / `recommended` | recommended: run the 2nd-opinion review only when the dev pass flags it · always: run it every story (both bounded by limits.max_review_cycles) |
 | `on_timeout` | string | `"retry"` | `defer` / `retry` / `salvage-if-done` | retry: burn a review cycle per timeout (default) · salvage-if-done: commit the verified dev product and refile the follow-up · defer: give up on the first timeout |
-| `on_status_contradiction` | string | `"escalate"` | `escalate` / `retry` | escalate: pause naming both sides when a review writes sprint-status back off done (default) · retry: legacy — burn review cycles, then defer + roll back |
 
 ### `[stories]`
 

@@ -9731,39 +9731,10 @@ def test_review_signoff_regression_escalates(project):
     assert "story-deferred" not in kinds
 
 
-def test_review_signoff_regression_retry_mode_keeps_legacy_defer(project):
-    """`review.on_status_contradiction = "retry"` is the compatibility opt-out:
-    the same regression burns all three review cycles and defers + rolls back,
-    exactly as the released build does."""
-    write_sprint(project, {"1-1-a": "ready-for-dev"})
-    legacy = Policy(
-        gates=GatesPolicy(mode="none"),
-        notify=QUIET,
-        scm=ScmPolicy(rollback_on_failure=True),
-        review=ReviewPolicy(on_status_contradiction="retry"),
-    )
-    engine, adapter = make_engine(
-        project,
-        [dev_effect(project, "1-1-a")]
-        + [_signoff_revoking_review(project, "1-1-a", clean=True) for _ in range(3)],
-        policy=legacy,
-    )
-    summary = engine.run()
-
-    assert summary.deferred == 1 and summary.escalated == 0 and not summary.paused
-    task = engine.state.tasks["1-1-a"]
-    assert task.phase == Phase.DEFERRED and task.review_cycle == 3
-    assert "did not converge" in task.defer_reason
-    assert [s.role for s in adapter.sessions] == ["dev", "review", "review", "review"]
-    assert (project.project / "src.txt").read_text() == "original\n"  # rolled back
-    failed = [e for e in engine.journal.entries() if e["kind"] == "review-verify-failed"]
-    assert failed and all(e["contradiction"] is False for e in failed)
-
-
 def test_review_verify_failure_without_regression_still_retries(project):
     """The new gate must not swallow ordinary review-verify failures: with the
     board still at `done`, a failing verify command keeps its fixable-retry
-    routing (repair session, then a fresh review) under the default knob."""
+    routing (repair session, then a fresh review)."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     marker = project.project / "fixed.marker"
 

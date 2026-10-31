@@ -1506,6 +1506,48 @@ def test_review_converges_on_a_built_plan(project_v7, monkeypatch):
     assert git(project_v7.project, "status", "--porcelain") == ""
 
 
+def test_tickets_review_walked_back_plan_escalates(project_v7, monkeypatch):
+    """A review that enters at `done` (a human accepted the plan once dev
+    verified) and converges with the plan finalized at `built` pauses the run
+    with a contradiction naming both statuses: no second review cycle, no defer,
+    and no done mark. The result is the one the adapter synthesizes from that
+    plan (frontmatter `built`): a walk-back to a pre-`built` status is a
+    non-terminal pass that never reaches this gate. Ablation (performed): make
+    `_is_plan_regression` return False and the gate retries instead — the loop
+    burns its review cycles and this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    pol = dataclasses.replace(_policy(), review=ReviewPolicy(enabled=True, trigger="always"))
+
+    def finalizes_built(spec: SessionSpec) -> SessionResult:
+        here = Path(spec.cwd) / plan.relative_to(project_v7.project)
+        _write_plan(here, "built", baseline=verify.rev_parse_head(Path(spec.cwd)))
+        result = {"workflow": "auto-dev", "spec_file": str(here), "status": "built"}
+        result["followup_review_recommended"] = False
+        return SessionResult(status="completed", result_json=result)
+
+    script = [_builds(project_v7, tree, plan)] + [finalizes_built] * 3
+    engine, adapter = make_engine(project_v7, tree, policy=pol, script=script, max_stories=1)
+    real_reset = engine._reset_spec_for_review
+
+    def accepted_then_reset(task):
+        _write_plan(plan, "done", baseline=task.baseline_commit)
+        return real_reset(task)
+
+    monkeypatch.setattr(engine, "_reset_spec_for_review", accepted_then_reset)
+
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["1.1"]
+    assert task.phase == Phase.ESCALATED and not task.defer_reason
+    assert len(adapter.sessions) == 2  # the build and one review pass
+    [escalated] = _kinds(engine, "story-escalated")
+    assert "back from 'done' to 'built'" in escalated["reason"]
+    assert tree.marks == []
+
+
 def test_mark_done_undone_on_commit_failure(project_v7, monkeypatch):
     """The mark is made just BEFORE `finalize_commit` so it rides the unit's
     commit — but that commit can still fail. A plan left `done` for a commit that

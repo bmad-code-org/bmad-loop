@@ -42,7 +42,7 @@ from conftest import (
 
 from bmad_loop import childrun, platform_util, verify
 from bmad_loop.model import StoryTask
-from bmad_loop.policy import EnvironmentPolicy, Policy, ReviewPolicy, VerifyPolicy
+from bmad_loop.policy import EnvironmentPolicy, Policy, VerifyPolicy
 
 
 def make_task(paths, story_key="1-1-a"):
@@ -1903,29 +1903,19 @@ def _signoff_regression_task(project, sprint_status="in-progress"):
 
 
 def test_verify_review_signoff_regression_escalates(project):
-    """The default knob turns a review's board regression into a CRITICAL pause
-    that names both sides, instead of a retry no later cycle can satisfy."""
+    """A review's board regression is a CRITICAL pause that names both sides,
+    instead of a retry no later cycle can satisfy."""
     task = _signoff_regression_task(project)
     out = verify.verify_review(task, project, Policy(), sprint_reached_done=True)
 
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL" and out.contradiction is True
     assert not out.fixable  # no repair session can reconcile a disagreement
-    # both sides are named, plus the two ways out and the opt-out knob
+    # both sides are named, plus the guide's ways out; the removed knob is not
     assert "'in-progress'" in out.reason and "'done'" in out.reason
     assert "1-1-a" in out.reason
-    assert 'review.on_status_contradiction = "retry"' in out.reason
-
-
-def test_verify_review_signoff_regression_retry_mode_is_legacy(project):
-    """`retry` restores the pre-#334 routing verbatim: an ordinary retryable
-    sprint-status failure that burns review cycles and ends in a defer."""
-    task = _signoff_regression_task(project)
-    pol = Policy(review=ReviewPolicy(on_status_contradiction="retry"))
-    out = verify.verify_review(task, project, pol, sprint_reached_done=True)
-
-    assert not out.ok and out.retryable and out.contradiction is False
-    assert out.reason == "sprint-status for 1-1-a is 'in-progress', expected 'done'"
+    assert "docs/escalations-guide.md" in out.reason
+    assert "retry" not in out.reason
 
 
 def test_verify_review_signoff_regression_needs_the_launch_flag(project):
@@ -4891,24 +4881,20 @@ def test_verify_review_tickets_needs_a_recorded_plan(project):
 def test_verify_review_tickets_monotonic(project, entered, now):
     """The board's sign-off-regression arm, rebuilt as a monotonic read-back of
     the plan: a status strictly earlier in `PLAN_STATUS_ORDER` than the review's
-    entry status is the review walking the ticket backward. Escalates as a
-    contradiction under the default knob; `retry` restores the plain retry.
+    entry status is the review walking the ticket backward, and escalates as a
+    contradiction.
 
     Ablation: delete the `_is_plan_regression` arm in `verify_review_tickets` (or
-    make `_is_plan_regression` return False) and the default-policy half retries
-    instead — so it asserts `not out.retryable` and `contradiction`."""
-    task, plan = _reviewed_ticket(project, now)
+    make `_is_plan_regression` return False) and it retries instead — so it
+    asserts `not out.retryable` and `contradiction`."""
+    task, _ = _reviewed_ticket(project, now)
 
     out = verify.verify_review_tickets(task, project, Policy(), entered_status=entered)
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL" and out.contradiction is True
     assert f"back from {entered!r} to {now!r}" in out.reason
-    assert 'review.on_status_contradiction = "retry"' in out.reason
-
-    pol = Policy(review=ReviewPolicy(on_status_contradiction="retry"))
-    legacy = verify.verify_review_tickets(task, project, pol, entered_status=entered)
-    assert not legacy.ok and legacy.retryable and legacy.contradiction is False
-    assert legacy.reason == f"plan status is {now!r}, expected {entered!r}: {plan}"
+    assert "docs/escalations-guide.md" in out.reason
+    assert "retry" not in out.reason
 
 
 @pytest.mark.parametrize(
@@ -4948,14 +4934,12 @@ def test_verify_review_tickets_unreadable_status_is_a_plain_retry(project, shape
 
 
 @pytest.mark.parametrize("entered", ["built", "done"])
-@pytest.mark.parametrize("pol", ["escalate", "retry"])
-def test_verify_review_tickets_dropped_is_contradiction(project, entered, pol):
-    """A plan dropped during its review escalates under EITHER knob value — the
-    `retry` opt-out covers regressions, not a withdrawn ticket."""
+def test_verify_review_tickets_dropped_is_contradiction(project, entered):
+    """A plan dropped during its review escalates as a contradiction from either
+    entry status: a withdrawn ticket has nothing to land."""
     task, plan = _reviewed_ticket(project, "dropped")
-    policy = Policy(review=ReviewPolicy(on_status_contradiction=pol))
 
-    out = verify.verify_review_tickets(task, project, policy, entered_status=entered)
+    out = verify.verify_review_tickets(task, project, Policy(), entered_status=entered)
 
     assert not out.ok and not out.retryable
     assert out.severity == "CRITICAL" and out.contradiction is True
