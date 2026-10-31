@@ -2710,23 +2710,20 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             or stall_nudges_sent + stall_nudges_failed < spec.stall_nudges_cap
                         )
                     )
+                    nudge_due = nudges_left > 0 or stall_nudge_due
                     if quota.waiting:
                         self._note_lifecycle(
                             handle.task_id,
                             "stop-nudge-withheld",
                             reason="quota-wait",
-                            nudge_due=nudges_left > 0 or stall_nudge_due,
+                            nudge_due=nudge_due,
                             hook_event="StopFailure",
                         )
-                    elif nudges_left > 0:
-                        nudges_left -= 1
-                        try:
-                            self.send_text(handle, NUDGE_TEXT)
-                        except MultiplexerError as e:
-                            self._note_nudge_send_failed(handle, "stop-failure", e)
-                    elif stall_nudge_due and parked_evidence is not None:
+                    elif nudge_due and parked_evidence is not None:
                         # A CLI latched as waiting on a human is never typed at
-                        # (#727); the stall expiry parks it.
+                        # (#727), by either nudge: unlike a `Stop`, a
+                        # StopFailure does not prove the prompt was answered,
+                        # so the latch stands and the stall expiry parks it.
                         self._note_lifecycle(
                             handle.task_id,
                             "stop-nudge-withheld",
@@ -2735,6 +2732,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             nudge_due=True,
                             hook_event="StopFailure",
                         )
+                    elif nudges_left > 0:
+                        nudges_left -= 1
+                        try:
+                            self.send_text(handle, NUDGE_TEXT)
+                        except MultiplexerError as e:
+                            self._note_nudge_send_failed(handle, "stop-failure", e)
                     elif stall_nudge_due:
                         # Counted exactly as a grace-expiry wake nudge: it
                         # closes the #727 pre-nudge activity window and re-arms

@@ -14901,6 +14901,28 @@ def test_transient_stop_failure_never_types_into_a_parked_cli(tmp_path, monkeypa
     assert (result.status, result.parked) == ("stalled", True)
 
 
+def test_transient_stop_failure_never_types_the_stop_nudge_into_a_parked_cli(tmp_path, monkeypatch):
+    """A result-file session with stop-nudge budget left: a StopFailure after a
+    permission prompt does not prove the prompt was answered, so the result-file
+    nudge (and its Enter) is withheld like the wake nudge, and the stall expiry
+    ends the session parked (#727).
+
+    ABLATION: check the parked latch only before the wake nudge and NUDGE_TEXT is
+    typed into the permission dialog."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_hook_event("Notification", "permission_prompt"), _stop_failure_event("overloaded")],
+        nudges=0,
+    )
+    adapter._stop_nudges = 1
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert mux.sent == []
+    (withheld,) = _lifecycle_events(adapter, "stop-nudge-withheld")
+    assert (withheld["reason"], withheld["hook_event"]) == ("parked", "StopFailure")
+    assert (result.status, result.parked) == ("stalled", True)
+
+
 def test_transient_stop_failure_after_the_nudges_run_out_falls_to_the_stall(tmp_path, monkeypatch):
     """No stop nudge and no wake nudge left: crumbed, and the session keeps today's
     stall path, a charged `stalled` (#764: an unrecovered transient error is not a
