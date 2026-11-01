@@ -10257,6 +10257,21 @@ class Engine:
             # Last, so a stash fault after the reset cannot cost the ledger repair
             # above: the snapshot it restores from exists only in memory.
             self._finish_deferred_stash(task, staged)
+            if snapshot is not None:
+                # The restore above left the ledger dirty in the MAIN checkout, and
+                # nothing will squash it now that this unit is terminal: the next
+                # unit's sessions would start on the engine's dirt and the build
+                # skill's finalization HALTs on any leftover change (#772), as does
+                # the run-end sweep's clean-tree gate. Commit that one file, hooks
+                # off. It persists on the target branch like the other ledger chore
+                # commits; best-effort and journaled, never raised.
+                self._commit_engine_ledger(
+                    task,
+                    site="defer",
+                    message=(
+                        "chore(deferred-work): restore ledger after deferring " f"{task.story_key}"
+                    ),
+                )
         self._record_defer(task, reason)
 
     def _restore_defer_ledger(self, task: StoryTask, snapshot: str) -> None:

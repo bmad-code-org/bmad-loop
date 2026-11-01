@@ -10169,6 +10169,117 @@ def test_defer_preserves_deferred_work_additions(project):
     assert "defer-ledger-restore-diverged" not in kinds
 
 
+def _plateau_defer_engine(project, **kwargs):
+    """A seeded, tracked ledger and three non-converging reviews, the first filing
+    DW-1 — the plateau defer `test_defer_preserves_deferred_work_additions` drives."""
+    from conftest import review_effect as make_review
+
+    project.deferred_work.write_text("# Deferred Work\n")
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "seed deferred-work")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        if not filed:  # one finding, three review sessions
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: pre-existing flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    return make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+        **kwargs,
+    )
+
+
+def test_inplace_defer_commits_the_restored_ledger(project):
+    """#772. The in-place defer's reset erases the review-found DW-1 and the restore
+    puts it back — dirty in the MAIN checkout, where no squash will ever collect it.
+    The engine now commits that one file, so the next unit starts clean and HEAD
+    holds the restored text.
+
+    Ablation: delete the `_commit_engine_ledger` call in `_defer` and the porcelain,
+    HEAD and journal asserts all fail."""
+    engine, _ = _plateau_defer_engine(project)
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    assert git(project.project, "status", "--porcelain", "--", _LEDGER_REL) == ""
+    assert "DW-1: pre-existing flaky retry" in git(project.project, "show", f"HEAD:{_LEDGER_REL}")
+    assert git(project.project, "log", "-1", "--format=%s") == (
+        "chore(deferred-work): restore ledger after deferring 1-1-a"
+    )
+    (row,) = [e for e in _bookkeeping_rows(engine) if e.get("site") == "defer"]
+    assert row["kind"] == "engine-ledger-commit" and row["story_key"] == "1-1-a"
+    assert row["commit"] == verify.rev_parse_head(project.project)
+    assert [e for e in _bookkeeping_rows(engine) if e["kind"] != "engine-ledger-commit"] == []
+
+
+def test_inplace_defer_of_a_gitignored_ledger_commits_nothing(project):
+    """The default setup: a gitignored ledger is invisible to git, so the defer's
+    commit is a silent no-op — no commit, no failed or refused row.
+
+    Ablation: delete the `path_clean` gate in `_commit_engine_ledger` and the
+    ignored operand makes `commit_paths` raise, journaling a failed row."""
+    from conftest import review_effect as make_review
+
+    gitignore = project.project / ".gitignore"
+    gitignore.write_text(gitignore.read_text() + f"{_LEDGER_REL}\n")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore the ledger")
+    project.deferred_work.write_text("# Deferred Work\n")
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    filed: list[bool] = []
+
+    def reviewing_with_defer(spec):
+        if not filed:
+            filed.append(True)
+            with project.deferred_work.open("a") as f:
+                f.write("\n### DW-1: review-found flaky retry\n\nstatus: open\n")
+        return make_review(project, "1-1-a", clean=False, patched=1, finalized=False)(spec)
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a")] + [reviewing_with_defer for _ in range(3)],
+    )
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    assert "DW-1: review-found flaky retry" in project.deferred_work.read_text()
+    assert _bookkeeping_rows(engine) == []
+    assert "deferred-work" not in git(project.project, "log", "--format=%s")
+
+
+def test_run_end_auto_sweep_is_not_refused_after_an_inplace_defer(project):
+    """#772. The restored ledger used to stay dirty after an in-place defer, so the
+    run-end auto-sweep's clean-tree gate refused the sweep (`sweep-auto-skipped-dirty`)
+    on the engine's own bookkeeping. Committed now, the sweep starts.
+
+    Ablation: delete the `_commit_engine_ledger` call in `_defer` and `calls` stays
+    empty while the skipped-dirty row appears."""
+    calls: list[str] = []
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        sweep=SweepPolicy(auto="run-end"),
+    )
+    engine, _ = _plateau_defer_engine(
+        project, policy=policy, sweep_factory=recording_factory(calls)
+    )
+    # `write_sprint` leaves the board untracked, which the gate would read as dirt
+    # of its own; a real project tracks it.
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "track the sprint board")
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    assert _skipped_dirty(engine) == []
+    assert calls == ["run-end"]
+
+
 @contextlib.contextmanager
 def _rival_appending_ledger_lock(monkeypatch, ledger, addition):
     """A `ledger_lock` spy that lands one foreign append BEFORE acquiring, and

@@ -40159,3 +40159,57 @@ def test_bundle_review_commits_an_untracked_visible_ledger_as_added(project):
     touched = git(project.project, "show", "--name-only", "--format=", task.commit_sha)
     assert ledger_rel(project) in touched.splitlines()
     assert _bookkeeping_subjects(project) == []
+
+
+def test_inplace_bundle_defer_commits_the_reopened_ledger(project):
+    """#772. An in-place bundle defer resets, restores the review-found ledger
+    knowledge, and reopens the bundle's accepted close — leaving the MAIN checkout's
+    ledger dirty with nothing left to squash it. The engine commits that one file,
+    so the next bundle (and the run-end tree) starts clean, and HEAD holds DW-1
+    reopened beside the review's DW-2.
+
+    Ablation: delete the `_commit_engine_ledger` call in `Engine._defer` and the
+    porcelain, HEAD and journal asserts fail."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(max_review_cycles=1),
+    )
+
+    def review_files_then_dies(spec):
+        with project.deferred_work.open("a", encoding="utf-8") as f:
+            f.write("\n### DW-2: review-found flaky retry\n\nstatus: open\n")
+        return SessionResult(status="died")
+
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False),
+            review_files_then_dies,
+        ],
+        policy=pol,
+    )
+
+    summary = engine.run()
+
+    assert summary.deferred == 1 and not summary.paused
+    rel = ledger_rel(project)
+    assert git(project.project, "status", "--porcelain", "--", rel) == ""
+    head_text = git(project.project, "show", f"HEAD:{rel}")
+    assert deferredwork.open_ids(head_text) == {"DW-1", "DW-2"}
+    assert "resolved by sweep bundle dw-fix" not in head_text
+    assert git(project.project, "log", "-1", "--format=%s") == (
+        "chore(deferred-work): restore ledger after deferring dw-fix"
+    )
+    (row,) = [r for r in _ledger_commit_rows(engine) if r["site"] == "defer"]
+    assert row["story_key"] == "dw-fix"
+    assert row["commit"] == git(project.project, "rev-parse", "HEAD")
+    assert _ledger_commit_rows(engine, "engine-ledger-commit-failed") == []
