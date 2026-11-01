@@ -212,9 +212,15 @@ class SessionRecord:
     # fix session — lookups of the attempt's own result skip labeled records
     # (DW-522). "" also for every record written before the field existed.
     label: str = ""
+    # the distinct model ids the session was observed to run (TokenUsage.models,
+    # first-seen order, main session first), copied by attach_session_usage. ()
+    # means none observed OR the CLI is untracked; the journal's session-end row
+    # (`models` / `models_unresolved`) carries that distinction. Never the
+    # configured `model` above, which keeps its meaning. APPENDED.
+    models: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "task_id": self.task_id,
             "role": self.role,
             "status": self.status,
@@ -226,10 +232,20 @@ class SessionRecord:
             "result_json": self.result_json,
             "label": self.label,
         }
+        # written only when observed, so legacy-shaped state stays byte-stable
+        if self.models:
+            d["models"] = list(self.models)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "SessionRecord":
         usage = d.get("usage")
+        raw_models: object = d.get("models")
+        models: tuple[str, ...] = ()
+        if isinstance(raw_models, list):
+            items = cast(list[object], raw_models)
+            if all(isinstance(m, str) for m in items):
+                models = tuple(cast(list[str], items))
         return cls(
             task_id=d["task_id"],
             role=d["role"],
@@ -241,6 +257,7 @@ class SessionRecord:
             usage=TokenUsage.from_dict(usage) if usage else None,
             result_json=d.get("result_json"),
             label=str(d.get("label", "") or ""),
+            models=models,
         )
 
 
@@ -868,7 +885,8 @@ class StoryTask:
     def attach_session_usage(self, task_id: str, usage: TokenUsage | None) -> None:
         """Fold usage into the most recent session for `task_id`. Usage is
         best-effort metadata attached after the session itself is saved, so a
-        failed usage read never costs the recorded session."""
+        failed usage read never costs the recorded session. Observed
+        ``usage.models`` also land on the record's ``models`` when non-empty."""
         if usage is None:
             return
         for record in reversed(self.sessions):
@@ -877,6 +895,8 @@ class StoryTask:
             if record.usage is None:
                 record.usage = usage
                 self.tokens.add(usage)
+            if usage.models:
+                record.models = tuple(usage.models)
             return
         raise KeyError(task_id)
 

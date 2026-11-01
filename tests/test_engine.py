@@ -16037,6 +16037,25 @@ def test_session_end_omits_models_when_untracked(project):
     assert all("models" not in e and "models_unresolved" not in e for e in ends)
 
 
+def test_session_record_persists_observed_models(project):
+    """Observed models land on the persisted SessionRecord (state.json
+    `sessions[].models`) beside the configured `model`, which keeps its value
+    (#859).
+
+    ABLATION: drop the `usage.models` copy in `attach_session_usage` and the
+    `models` key is absent from state.json."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    timeout = SessionResult(status="timeout")
+    engine, adapter = make_engine(project, [timeout, timeout])
+    adapter.usage_per_session = TokenUsage(input_tokens=10, output_tokens=5, models=("m1", "m2"))
+    engine.run()
+    doc = json.loads((engine.run_dir / "state.json").read_text(encoding="utf-8"))
+    sessions = doc["tasks"]["1-1-a"]["sessions"]
+    assert sessions and all(s["models"] == ["m1", "m2"] for s in sessions)
+    assert all(s["model"] == "" for s in sessions)
+    assert all(r.models == ("m1", "m2") for r in load_state(engine.run_dir).tasks["1-1-a"].sessions)
+
+
 def test_engine_attaches_its_journal_to_every_adapter(project):
     """The engine hands its `Journal` to the adapters it owns (#680), so an
     adapter-side `session-idle` lands in the same file with the same

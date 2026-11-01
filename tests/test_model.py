@@ -531,6 +531,20 @@ def test_attach_session_usage_does_not_double_count_existing_usage():
     assert task.tokens.total == 15
 
 
+def test_attach_session_usage_copies_observed_models():
+    task = _task_with_session()
+    task.attach_session_usage("1-1-a-dev-1", TokenUsage(input_tokens=1, models=("m1", "m2")))
+    assert task.sessions[0].models == ("m1", "m2")
+    assert task.sessions[0].model == ""  # the configured model is untouched
+
+
+@pytest.mark.parametrize("models", [None, ()])
+def test_attach_session_usage_leaves_models_empty_when_unobserved(models):
+    task = _task_with_session()
+    task.attach_session_usage("1-1-a-dev-1", TokenUsage(input_tokens=1, models=models))
+    assert task.sessions[0].models == ()
+
+
 def test_token_usage_unread_is_diagnostic_only():
     """`unread` qualifies a figure without changing it: equality, `add` and the
     persisted dict ignore it, so a skip never alters stored totals or `--json`.
@@ -608,6 +622,21 @@ def test_session_record_label_round_trips_and_defaults_for_legacy_state():
     doc = record.to_dict()
     del doc["label"]  # state.json from before the field existed
     assert SessionRecord.from_dict(doc).label == ""
+
+
+def test_session_record_models_round_trip_and_default():
+    record = SessionRecord(task_id="1-1-a-dev-1", role="dev", status="completed")
+    doc = record.to_dict()
+    assert "models" not in doc  # empty is not written
+    assert SessionRecord.from_dict(doc).models == ()  # absent key (legacy state)
+    record.models = ("claude-opus-5-5", "claude-haiku-5-5")
+    doc = record.to_dict()
+    assert doc["models"] == ["claude-opus-5-5", "claude-haiku-5-5"]
+    assert SessionRecord.from_dict(doc).models == ("claude-opus-5-5", "claude-haiku-5-5")
+    # only a list of str is accepted from a hand-edited or foreign state file
+    for bad in ("claude-opus-5-5", ["claude-opus-5-5", 3], {"m": 1}, None):
+        doc["models"] = bad
+        assert SessionRecord.from_dict(doc).models == ()
 
 
 def test_followup_review_recommended_round_trips():
