@@ -236,9 +236,9 @@ def test_tally_models_empty_when_no_assistant_model(tmp_path):
     assert usage.models == ()
 
 
-def test_parser_without_model_source_leaves_models_none(tmp_path):
-    # A parser that does not read models keeps the `None` default, so the
-    # engine journals neither `models` nor `models_unresolved` for it.
+def test_gemini_chat_models_empty_without_model(tmp_path):
+    # A tracking parser that finds no model returns `()`, never `None`, so the
+    # engine journals `models_unresolved` for it.
     path = tmp_path / "session.jsonl"
     path.write_text(
         json.dumps({"id": "g1", "type": "gemini", "tokens": {"input": 4, "output": 2}}) + "\n",
@@ -247,7 +247,7 @@ def test_parser_without_model_source_leaves_models_none(tmp_path):
 
     usage = tally_gemini_chat(path)
     assert usage is not None
-    assert usage.models is None
+    assert usage.models == ()
 
 
 def test_tally_dedupes_across_forked_subagents(tmp_path):
@@ -510,17 +510,21 @@ def _local_ts(day, hour=12, minute=0):
     return datetime.datetime(year, month, dom, hour, minute).timestamp()
 
 
-def _codex_thread(home, day, clock, thread_id, *, session_id=None, parent=None, usage=None):
+def _codex_thread(
+    home, day, clock, thread_id, *, session_id=None, parent=None, usage=None, models=()
+):
     """A rollout at ``home/sessions/<day>/rollout-<day>T<clock>-<id>.jsonl``
-    whose session_meta carries the given tree fields, plus one cumulative
-    token_count when ``usage`` = (input, cached, output). Its mtime is pinned
-    to noon of its LOCAL ``day``, which bounds the sibling search window."""
+    whose session_meta carries the given tree fields, one `turn_context` line
+    per entry of ``models``, plus one cumulative token_count when ``usage`` =
+    (input, cached, output). Its mtime is pinned to noon of its LOCAL ``day``,
+    which bounds the sibling search window."""
     payload = {"id": thread_id}
     if session_id is not None:
         payload["session_id"] = session_id
     if parent is not None:
         payload["parent_thread_id"] = parent
     lines = [{"type": "session_meta", "payload": payload}]
+    lines.extend({"type": "turn_context", "payload": {"model": model}} for model in models)
     if usage is not None:
         input_tokens, cached, output = usage
         totals = {
@@ -577,6 +581,99 @@ def test_codex_tally_sums_subagent_rollouts(tmp_path):
     assert tally_codex_rollout(parent) == TokenUsage(
         input_tokens=60 + 40 + 20, output_tokens=17, cache_read_tokens=50
     )
+
+
+def test_codex_tally_collects_turn_context_models(tmp_path):
+    """#859: the distinct `turn_context` model ids, parent first, then each
+    child, in first-seen order; a repeated turn adds nothing and an unrelated
+    rollout's model is not the session's.
+
+    Ablation: drop the `turn_context` branch in `_codex_rollout_total` and
+    `models` is `()`; drop the child merge and the child's model is missing."""
+    parent = _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-00-00",
+        ROOT,
+        session_id=ROOT,
+        usage=(10, 0, 1),
+        models=("gpt-5.5-codex", "gpt-5.5-codex", "gpt-5.5"),
+    )
+    _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-05-00",
+        CHILD,
+        session_id=ROOT,
+        parent=ROOT,
+        usage=(5, 0, 5),
+        models=("gpt-5.5", "gpt-5.5-mini", ""),
+    )
+    _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-07-00",
+        OTHER,
+        session_id=OTHER,
+        usage=(1, 0, 1),
+        models=("other-model",),
+    )
+
+    usage = tally_codex_rollout(parent)
+    assert usage is not None
+    assert usage.models == ("gpt-5.5-codex", "gpt-5.5", "gpt-5.5-mini")
+
+
+def test_codex_tally_models_empty_without_turn_context(tmp_path):
+    """A rollout with usage but no `turn_context` line tracks models and found
+    none: `()`, never `None`.
+
+    Ablation: build the TokenUsage without `models=` and it is `None`."""
+    parent = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT, usage=(10, 0, 1)
+    )
+
+    usage = tally_codex_rollout(parent)
+    assert usage is not None
+    assert usage.models == ()
+
+
+def test_codex_tally_unreadable_child_adds_no_models(tmp_path):
+    """A child whose body fails to decode after its `turn_context` line is
+    named in `unread` and contributes no model, even the one read before the
+    fault.
+
+    Ablation: scan the child into the shared `models` dict directly and its
+    model leaks in."""
+    parent = _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-00-00",
+        ROOT,
+        session_id=ROOT,
+        usage=(10, 0, 1),
+        models=("gpt-5.5",),
+    )
+    broken = _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-06-00",
+        GRANDCHILD,
+        session_id=ROOT,
+        parent=ROOT,
+        models=("gpt-5.5-mini",),
+    )
+    # Pad past the text reader's first decode chunk so the `turn_context`
+    # line is yielded before the fault, as in a large real rollout.
+    filler = json.dumps({"type": "event_msg", "payload": {"type": "noise", "pad": "x" * 200}})
+    with broken.open("ab") as f:
+        f.write((filler + "\n").encode("utf-8") * 200)
+        f.write(b'{"type": "event_msg", "payload": "\xff\xfe"}\n')
+
+    usage = tally_codex_rollout(parent)
+    assert usage is not None
+    assert usage.unread == (f"{broken.name}: UnicodeDecodeError",)
+    assert usage.models == ("gpt-5.5",)
 
 
 def test_codex_tally_child_across_midnight(tmp_path):
@@ -967,6 +1064,34 @@ def test_gemini_chat_dedupes_reemitted_messages(tmp_path):
     assert usage.output_tokens == (45 + 87) + (2 + 16)  # output + thoughts
 
 
+def test_gemini_chat_collects_models(tmp_path):
+    """#859: the distinct `model` ids of `type == "gemini"` messages in file
+    order; a re-emitted message repeats its model once, and a user message's
+    `model` (or an empty one) is ignored.
+
+    Ablation: drop the `type == "gemini"` check and the user message's model
+    appears."""
+    lines = [
+        {"$set": {"messages": [{"id": "u1", "type": "user", "model": "user-side", "content": []}]}},
+        {"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 4}},
+        {"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 4}},
+        {"id": "g2", "type": "gemini", "model": "", "tokens": {"input": 1}},
+        {
+            "$set": {
+                "messages": [
+                    {"id": "g3", "type": "gemini", "model": "gemini-3-flash", "tokens": {}}
+                ]
+            }
+        },
+    ]
+    path = tmp_path / "session.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+    usage = tally_gemini_chat(path)
+    assert usage is not None
+    assert usage.models == ("gemini-3-pro", "gemini-3-flash")
+
+
 def test_gemini_chat_without_tokens_is_none(tmp_path):
     path = tmp_path / "session.jsonl"
     path.write_text(json.dumps({"id": "u1", "type": "user", "content": []}) + "\n")
@@ -1022,6 +1147,50 @@ def test_copilot_events_last_cumulative_across_models(tmp_path):
     assert usage.cache_creation_tokens == 30
 
 
+def test_copilot_events_models_are_metric_keys(tmp_path):
+    """#859: the models are the LAST modelMetrics' keys, in insertion order;
+    an earlier snapshot's model that the last one drops is not listed.
+
+    Ablation: read the keys of every snapshot and `gpt-5-old` appears."""
+    lines = [
+        {"data": {"modelMetrics": {"gpt-5-old": {"usage": {"inputTokens": 1}}}}},
+        {
+            "data": {
+                "modelMetrics": {
+                    "gpt-5-mini": {"usage": {"inputTokens": 5}},
+                    "gpt-5": {"usage": {"inputTokens": 2}},
+                }
+            }
+        },
+    ]
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+    usage = tally_copilot_events(path)
+    assert usage is not None
+    assert usage.models == ("gpt-5-mini", "gpt-5")
+
+
+def test_copilot_events_models_empty_without_named_model(tmp_path):
+    """An empty `modelMetrics` carries no usage (None); the only reachable
+    tracked-but-unnamed case is a metrics dict whose sole key is empty: `()`.
+
+    Ablation: build the TokenUsage without `models=` and it is `None`; drop
+    the empty-key filter and it is `("",)`."""
+    path = tmp_path / "events.jsonl"
+    path.write_text(json.dumps({"data": {"modelMetrics": {}}}) + "\n", encoding="utf-8")
+    assert tally_copilot_events(path) is None
+
+    path.write_text(
+        json.dumps({"data": {"modelMetrics": {"": {"usage": {"inputTokens": 3}}}}}) + "\n",
+        encoding="utf-8",
+    )
+    usage = tally_copilot_events(path)
+    assert usage is not None
+    assert usage.input_tokens == 3
+    assert usage.models == ()
+
+
 def test_copilot_events_without_metrics_is_none(tmp_path):
     path = tmp_path / "events.jsonl"
     path.write_text(json.dumps({"id": "e0", "type": "message", "data": {"content": "hi"}}) + "\n")
@@ -1040,3 +1209,33 @@ def test_read_usage_dispatch(tmp_path):
         json.dumps({"data": {"modelMetrics": {"m": {"usage": {"inputTokens": 7}}}}}) + "\n"
     )
     assert read_usage("copilot-events", cop).input_tokens == 7
+
+
+def test_read_usage_tracked_parsers_report_models(tmp_path):
+    """#859: each of the four tracked parsers, reached through the dispatcher,
+    returns a non-None `models` naming the fixture's model."""
+    claude = tmp_path / "claude.jsonl"
+    _write_jsonl(claude, [_with_model(_assistant("msg_1", input_tokens=1), "claude-opus-5-5")])
+    codex = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, usage=(1, 0, 1), models=("gpt-5.5",)
+    )
+    gemini = tmp_path / "gemini.jsonl"
+    gemini.write_text(
+        json.dumps({"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {}}) + "\n",
+        encoding="utf-8",
+    )
+    copilot = tmp_path / "events.jsonl"
+    copilot.write_text(
+        json.dumps({"data": {"modelMetrics": {"gpt-5": {"usage": {"inputTokens": 1}}}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    for parser, path, model in [
+        ("claude-jsonl", claude, "claude-opus-5-5"),
+        ("codex-rollout", codex, "gpt-5.5"),
+        ("gemini-chat", gemini, "gemini-3-pro"),
+        ("copilot-events", copilot, "gpt-5"),
+    ]:
+        usage = read_usage(parser, path)
+        assert usage is not None, parser
+        assert usage.models == (model,), parser

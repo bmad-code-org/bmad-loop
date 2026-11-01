@@ -251,14 +251,23 @@ def tally(transcript_path: Path) -> TokenUsage | None:
 # ----------------------------------------------------------- codex-rollout
 
 
-def _codex_rollout_total(transcript_path: Path) -> dict[str, Any] | None:
+def _codex_rollout_total(transcript_path: Path, models: dict[str, None]) -> dict[str, Any] | None:
     """The rollout's last cumulative `token_count` totals, or None when it has
     none. A subagent's rollout holds only its own turns, so this rule holds
-    for children as well as for the parent. OSError/ValueError propagate."""
+    for children as well as for the parent. The same read records each
+    `turn_context` line's `payload.model` (a non-empty str) in `models`, an
+    insertion-ordered set. OSError/ValueError propagate."""
     last: dict[str, Any] | None = None
     for entry in _jsonl_entries(transcript_path):
         payload = entry.get("payload")
-        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        if not isinstance(payload, dict):
+            continue
+        if entry.get("type") == "turn_context":
+            model = payload.get("model")
+            if isinstance(model, str) and model:
+                models.setdefault(model, None)
+            continue
+        if payload.get("type") != "token_count":
             continue
         info = payload.get("info")
         if not isinstance(info, dict):
@@ -427,8 +436,13 @@ def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
     still means no usage signal anywhere: a skip can only qualify a figure
     that exists. The budget guard's live samples ignore `unread`, since a
     child mid-write can tear a UTF-8 read; the engine's post-session read
-    journals it."""
-    parent_totals = _codex_rollout_total(transcript_path)
+    journals it.
+
+    `models` holds the distinct `turn_context` model ids, the parent's first,
+    then each read child's, `()` when none was found; an unreadable child adds
+    none."""
+    models: dict[str, None] = {}  # distinct, first-seen order
+    parent_totals = _codex_rollout_total(transcript_path, models)
     unread: list[str] = []
     try:
         parent_meta = _codex_meta(transcript_path)
@@ -460,16 +474,19 @@ def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
                     grew = True
         by_thread = {metas[path][0]: Path(path) for path in sorted(members)}
         for child in by_thread.values():
+            child_models: dict[str, None] = {}
             try:
-                child_totals = _codex_rollout_total(child)
+                child_totals = _codex_rollout_total(child, child_models)
             except (OSError, ValueError) as e:
                 unread.append(f"{child.name}: {type(e).__name__}")
                 continue
+            for model in child_models:
+                models.setdefault(model, None)
             if child_totals is not None:
                 totals.append(child_totals)
     if not totals:
         return None
-    usage = TokenUsage(unread=tuple(unread))
+    usage = TokenUsage(unread=tuple(unread), models=tuple(models))
     for each in totals:
         usage.add(_codex_usage(each))
     return usage
@@ -491,16 +508,25 @@ def _gemini_messages(entry: dict[str, Any]):
 
 
 def tally_gemini_chat(transcript_path: Path) -> TokenUsage | None:
+    """Sum the last `tokens` record per message id, or None when none has one.
+
+    `models` holds the distinct `model` ids of `type == "gemini"` messages in
+    file order (a re-appended message repeats its id), `()` when none was
+    found."""
     by_id: dict[str, dict[str, Any]] = {}
+    models: dict[str, None] = {}  # distinct, first-seen order
     for entry in _jsonl_entries(transcript_path):
         for message in _gemini_messages(entry):
+            model = message.get("model")
+            if message.get("type") == "gemini" and isinstance(model, str) and model:
+                models.setdefault(model, None)
             tokens = message.get("tokens")
             message_id = message.get("id")
             if isinstance(tokens, dict) and isinstance(message_id, str):
                 by_id[message_id] = tokens
     if not by_id:
         return None
-    total = TokenUsage()
+    total = TokenUsage(models=tuple(models))
     for tokens in by_id.values():
         cached = _int(tokens.get("cached"))
         total.add(
@@ -531,7 +557,8 @@ def tally_copilot_events(transcript_path: Path) -> TokenUsage | None:
             last = metrics
     if last is None:
         return None
-    total = TokenUsage()
+    # The models are the last modelMetrics' keys, in insertion order.
+    total = TokenUsage(models=tuple(key for key in last if isinstance(key, str) and key))
     for model_metrics in last.values():
         if not isinstance(model_metrics, dict):
             continue
