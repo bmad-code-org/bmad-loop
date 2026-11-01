@@ -517,6 +517,42 @@ for _fake in (DETACHED_WRITER_FAKE_CLI, PUBLICATION_FAULT_FAKE_CLI):
     assert _fake.index(AWAIT_DETACHED_SESSION_SH) < _fake.index(RECORD_CHILD_IDENTITY_SH)
 del _fake
 
+# #772: the sprint branch as bmad-build-auto behaves with review ON. The dev leg leaves
+# its own work committed, as the real skill's finalization does. The review leg (routed
+# on the review prompt's ledger hands-off clause, ahead of the spec-status routing: a
+# review re-invokes the skill on the `done` spec) finalizes like step-04: it writes its
+# result, commits the files it owns (its spec and the reviewed code), then HALTs
+# `blocked` — "finalization left repository dirty" — if ANYTHING else is left over. The
+# engine's own uncommitted ledger bookkeeping is exactly that leftover.
+_SPRINT_STATUS_READ = """    [ -f "$spec" ] && status=$(sed -n 's/^status:[[:space:]]*//p' "$spec" | head -1 | tr -d "'\\" ")
+"""
+_REVIEW_FINALIZE = r"""    if printf '%s' "$prompt" | grep -qF "deferred-work ledger entries"; then
+        printf -- '---\ntitle: %s\nstatus: done\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: done\n\nSummary: reviewed.\n' \
+            "$story" "$baseline" > "$spec"
+        git add -- "$spec" src.txt
+        git diff --cached --quiet || git commit -q -m "review: $story"
+        if [ -n "$(git status --porcelain)" ]; then
+            printf -- '---\ntitle: %s\nstatus: blocked\nbaseline_commit: %s\n---\n\n## Intent\n\nx\n\n## Auto Run Result\n\n- Status: blocked\n\nfinalization left repository dirty\n' \
+                "$story" "$baseline" > "$spec"
+        fi
+        ts2=$(( ts + 1 ))
+        printf '{"ts": %s, "event": "Stop", "task_id": "%s", "session_id": "fake-1"}' \
+            "$ts2" "$tid" > "$ed/$ts2-$tid-Stop.json"
+        sleep 30
+        exit 0
+    fi
+"""
+_SPRINT_DEV_DONE = r"""Summary: sprint.\n' \
+            "$story" "$baseline" > "$spec"
+"""
+assert FAKE_CLI.count(_SPRINT_STATUS_READ) == 1 and FAKE_CLI.count(_SPRINT_DEV_DONE) == 1
+REVIEW_FINALIZE_FAKE_CLI = FAKE_CLI.replace(
+    _SPRINT_STATUS_READ, _SPRINT_STATUS_READ + _REVIEW_FINALIZE
+).replace(
+    _SPRINT_DEV_DONE,
+    _SPRINT_DEV_DONE + '        git add -A\n        git commit -q -m "dev: $story"\n',
+)
+
 
 def _git(root: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True)
@@ -2555,6 +2591,59 @@ def test_e2e_sweep_intent_gap_patch_restore(tmp_path):
     run_dir = root / ".bmad-loop" / "runs" / run_id
     prompts = [p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/prompt.txt")]
     assert any(str(spec) in p for p in prompts)
+
+
+def test_e2e_sweep_review_finalizes_clean_over_engine_ledger_bookkeeping(tmp_path):
+    """#772 through the real CLI and real tmux, zero tokens. A sweep bundle with
+    review ON: the dev leg commits its own work, then the engine closes DW-1 in the
+    tracked ledger — uncommitted, for the squash. The review fake finalizes like
+    bmad-build-auto's step-04: it commits the files it owns and HALTs `blocked`
+    ("finalization left repository dirty") on anything left over. The engine now
+    commits its ledger bookkeeping right before the review launches, so the review
+    finishes `done`, the bundle lands, and no escalation is raised.
+
+    Ablation: drop `commit_engine_ledger=True` at the review launch (engine.py) and
+    the review HALTs on the dirty ledger — the run escalates and the bundle never
+    reaches done."""
+    assert REVIEW_FINALIZE_FAKE_CLI != FAKE_CLI, "the review splice did not take"
+    root = tmp_path / "sbx"
+    _scaffold_sweep(root)
+    (root / ".bmad-loop" / "fake-cli.sh").write_text(REVIEW_FINALIZE_FAKE_CLI, encoding="utf-8")
+    (root / ".bmad-loop" / "policy.toml").write_text(
+        '[adapter]\nname = "fakestories"\n\n'
+        '[review]\nenabled = true\ntrigger = "always"\n\n'
+        '[gates]\nmode = "none"\n',
+        encoding="utf-8",
+    )
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "review on, finalizing fake")
+    story = "dw-fix"  # triage names the bundle "fix" → task key dw-fix
+    spec = root / "_bmad-output" / "implementation-artifacts" / f"spec-{story}.md"
+
+    proc = _run(root, "sweep", "--no-prompt")
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+
+    run_dir = root / ".bmad-loop" / "runs" / _run_id(root)
+    rows = [
+        json.loads(ln)
+        for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+    ]
+    kinds = [r["kind"] for r in rows]
+    # premise: a review session really ran on the finalizing fake
+    prompts = [p.read_text(encoding="utf-8") for p in (run_dir / "tasks").glob("*/fake-prompt.txt")]
+    assert any("deferred-work ledger entries" in p for p in prompts), prompts
+    assert "story-escalated" not in kinds, [r for r in rows if r["kind"] == "story-escalated"]
+    review_commits = [
+        r for r in rows if r["kind"] == "engine-ledger-commit" and r.get("site") == "review"
+    ]
+    assert review_commits, kinds
+    assert all(r["story_key"] == story for r in review_commits)
+    state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["tasks"][story]["phase"] == "done", state["tasks"][story]
+    assert not state.get("paused_stage"), state
+    assert "status: done" in spec.read_text(encoding="utf-8")
+    assert _dw_status(root, "DW-1").startswith("done")
 
 
 def test_e2e_a_relay_that_only_knows_the_legacy_events_dir_still_completes(tmp_path):
