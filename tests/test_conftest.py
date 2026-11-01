@@ -1685,7 +1685,7 @@ _EXPECTED_E2E_DEF_COUNTS: dict[str, dict[str, int]] = {
     "test_tmux_locale_e2e.py": {"test_e2e_": 1},
     "test_launch_probe.py": {"test_e2e_": 1},
     "test_stories_e2e.py": {
-        "test_e2e_": 19,
+        "test_e2e_": 20,
         "test_reap_e2e_": 3,
         # Not asserted, and deliberately so — see the residual note above. Today these are
         # the local-process identity harness defs: `test_detach_gate_*`,

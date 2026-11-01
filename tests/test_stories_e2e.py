@@ -333,6 +333,11 @@ exit 0
 """
 assert TIMEOUT_FAKE_CLI.count(_PARENT_START) == 1
 STOP_FAILURE_FAKE_CLI = TIMEOUT_FAKE_CLI.replace(_PARENT_START, _PARENT_START + _STOP_FAILURE_EVENT)
+# #959: the CLI's window dies right after the StopFailure (as when an operator's own
+# StopFailure hook kills it to rotate accounts). The watcher's 1 s poll reads the
+# event only after the window is gone, so the stall re-probe finds it dead.
+assert STOP_FAILURE_FAKE_CLI.count("sleep 30\nexit 0\n") == 1
+STOP_FAILURE_DIES_FAKE_CLI = STOP_FAILURE_FAKE_CLI.replace("sleep 30\nexit 0\n", "exit 0\n")
 
 # PROFILE_TOML with the canonical StopFailure mapped and one account error, as
 # claude's own profile maps it.
@@ -2057,6 +2062,61 @@ def test_e2e_stop_failure_account_error_pauses_uncharged(
         session_name = f"bmad-loop-{run_id}"
         windows = _tmux_window_names(private_tmux_server, session_name)
         assert end["task_id"][-40:] not in windows and len(windows) == 1, windows
+    finally:
+        # The paused run left its session for a resume that never comes.
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
+
+
+def test_e2e_stop_failure_then_window_death_pauses_uncharged(
+    tmp_path, monkeypatch, private_tmux_server
+):
+    """#959 end to end through the real binary + real tmux, zero tokens: the CLI
+    fires `StopFailure(billing_error)` and its window dies at once. The session
+    ends `crashed`, but the latched account error labels it parked, so the engine
+    PAUSEs uncharged instead of retrying: two dev attempts are allowed and exactly
+    one session ran."""
+    root = tmp_path / "sbx"
+    story = "1-1-stopfail-dies"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=STOP_FAILURE_DIES_FAKE_CLI,
+        extra_policy="\n[limits]\nmax_dev_attempts = 2\nteardown_grace_s = 5\n",
+        profile_toml=STOP_FAILURE_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=90)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") == "escalation", state
+        reason = str(state.get("paused_reason", ""))
+        assert reason.startswith("parked: dev session crashed (StopFailure(billing_error)"), reason
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert len(ends) == 1, [j["kind"] for j in journal]
+        [end] = ends
+        assert end["status"] == "crashed", end
+        assert end["parked"] is True, end
+        assert end["stop_failure"] == "billing_error", end
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert [d["action"] for d in decisions] == ["pause"], decisions
+        assert state["tasks"][story]["attempt"] == 1, state["tasks"][story]
     finally:
         # The paused run left its session for a resume that never comes.
         if run_id is not None:

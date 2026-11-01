@@ -207,6 +207,8 @@ breaking changes may land in a minor release.
 - Name a displaced psmux registry that belongs to another project (or this one before a
   rename) as such in `cleanup` and the TUI, instead of calling its sessions `not migrated`
   (#906).
+- Pause a Claude session uncharged, instead of charging a dev attempt for a crash, when
+  its window dies after a usage-limit or account StopFailure or during a quota wait (#959).
 
 ### Security
 

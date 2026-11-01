@@ -254,10 +254,29 @@ class _StopFailureLatch:
     ``(evidence, matched_line)``: the quota-wait admission takes it as the wait
     line when the pane shows none (a backend without ``capture_pane`` never
     does). A ``Stop`` clears both: a turn that ended proves the failure was
-    recovered. `wait_hit` also clears when a quota wait admits or ends."""
+    recovered. `wait_hit` also clears when a quota wait admits or ends.
+
+    `kind` classifies the latest StopFailure for a window that dies after it
+    (#959): ``"account"``, ``"blocked"`` or ``"wait"`` (None for an unmapped,
+    transient, ignored or unmatched error). `evidence` is the label the live
+    exit would carry and `resets` its parsed reset (`UsageReset.value`), so the
+    funnel can relabel a result-less ``crashed`` exit as the same uncharged
+    pause. `baseline` is the transcript's (mtime_ns, size) stat'ed fresh at the
+    latch (None when none was named or the stat failed; the next heartbeat
+    sample then adopts one). A Stop clears all four, and so does a heartbeat
+    sample whose key differs from `baseline`: a CLI that wrote its transcript
+    after the failure recovered by itself."""
 
     error: str | None = None
     wait_hit: tuple[str, str] | None = None
+    kind: str | None = None
+    evidence: str | None = None
+    resets: str | None = None
+    baseline: tuple[int, int] | None = None
+
+    def clear_kind(self) -> None:
+        self.kind = self.evidence = self.resets = None
+        self.baseline = None
 
 
 @dataclass
@@ -1457,14 +1476,60 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         result = self._wait_loop(handle, spec, quota, notice, stop_failure)
         if stop_failure.error is not None:
             # The one funnel every wait-loop exit passes (#865): a StopFailure no
-            # later Stop cleared rides out on the result, whatever ended it.
-            result = dataclasses.replace(result, stop_failure=stop_failure.error)
+            # later Stop cleared rides out on the result, whatever ended it,
+            # with its mapped action.
+            result = dataclasses.replace(
+                result,
+                stop_failure=stop_failure.error,
+                stop_failure_action=self._stop_failure_types.get(stop_failure.error),
+            )
+        result = self._relabel_dead_window(handle, result, quota, stop_failure)
         if quota.waiting:
             self._end_quota_wait(handle, quota, "session-exit")
         if notice.open:
             self._note_session_unparked(handle, notice, "ended")
         if quota.closed_s > 0:
             result = dataclasses.replace(result, quota_wait_s=round(quota.closed_s, 3))
+        return result
+
+    def _relabel_dead_window(
+        self,
+        handle: SessionHandle,
+        result: SessionResult,
+        quota: _QuotaWait,
+        stop_failure: _StopFailureLatch,
+    ) -> SessionResult:
+        """A window that died while the session waited on a usage limit or an
+        operator keeps that classification (#959): a result-less ``crashed``
+        exit after a latched account StopFailure is ``parked``, after a
+        blocked or wait one ``usage_limited``, and during a pane-only quota
+        wait ``usage_limited`` with the wait class. The status stays
+        ``crashed``; only labels are added, so routing gives the same
+        uncharged pause as the live exit instead of charging a crash. A crash
+        whose read-back found a result is never relabeled: the result wins."""
+        if result.status != "crashed" or result.result_json is not None:
+            return result
+        kind = stop_failure.kind
+        if kind in ("blocked", "wait"):
+            result = dataclasses.replace(
+                result,
+                usage_limited=stop_failure.evidence,
+                usage_limit_class=USAGE_LIMIT_BLOCKED if kind == "blocked" else USAGE_LIMIT_WAIT,
+                usage_limit_resets=stop_failure.resets,
+            )
+        elif kind == "account":
+            result = dataclasses.replace(result, parked=True, parked_evidence=stop_failure.evidence)
+        elif quota.waiting and quota.evidence is not None:
+            kind = "quota-wait"
+            result = dataclasses.replace(
+                result,
+                usage_limited=quota.evidence,
+                usage_limit_class=USAGE_LIMIT_WAIT,
+                usage_limit_resets=quota.resets,
+            )
+        else:
+            return result
+        self._note_lifecycle(handle.task_id, "crash-relabeled", kind=kind, error=stop_failure.error)
         return result
 
     def _wait_loop(
@@ -1770,6 +1835,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 return True
             return self._quota_wait_tool_open(handle, path)
 
+        def latch_kind(kind: str, evidence: str, resets: str | None) -> None:
+            """Classify the StopFailure just latched (#959), with a fresh
+            transcript stat as the activity baseline that clears it."""
+            stop_failure.kind = kind
+            stop_failure.evidence = evidence
+            stop_failure.resets = resets
+            stop_failure.baseline = (
+                self._transcript_activity_key(transcript_path) if transcript_path else None
+            )
+
         def stall_exit(
             parked_now: str | None,
             usage_now: str | None,
@@ -1777,9 +1852,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             class_now: str | None = None,
         ) -> SessionResult:
             """The non-completion exit of a stalled session (DW-348, #610):
-            resolve, then re-probe liveness. A now-dead window is ``crashed``
-            (never parked or usage-limited: nothing waits on a human once the CLI
-            is gone). Otherwise ``stalled`` with ``accept_result=False``: an
+            resolve, then re-probe liveness. A now-dead window is ``crashed``,
+            unlabeled here: nothing waits on a human once the CLI is gone. The
+            funnel (`_relabel_dead_window`) labels it parked or usage-limited
+            when a latched StopFailure or an open quota wait classified it
+            (#959). Otherwise ``stalled`` with ``accept_result=False``: an
             artifact on disk cannot upgrade the stall to completed (it may be
             stale or mid-write; only a Stop or window death vouches for it), and
             ``parked_now`` / ``usage_now`` / ``resets_now`` / ``class_now``
@@ -2017,6 +2094,21 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             parked_key is None or idle.last_key != parked_key
                         ):
                             parked_evidence = parked_kind = parked_key = None
+                if stop_failure.kind is not None and sampled:
+                    # A transcript write after the StopFailure is a CLI that
+                    # recovered by itself (#959): a window that dies later is
+                    # no longer that failure's. Only a stat taken this tick
+                    # counts, as for the parked notice above.
+                    if stop_failure.baseline is None:
+                        stop_failure.baseline = idle.last_key
+                    elif idle.last_key != stop_failure.baseline:
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "stop-failure-kind-cleared",
+                            error=stop_failure.error,
+                            stop_failure_kind=stop_failure.kind,
+                        )
+                        stop_failure.clear_kind()
                 if quota.waiting:
                     # The transcript moved: the CLI continued after the reset.
                     # The timeout resumes from the remaining time frozen at
@@ -2681,6 +2773,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 action = self._stop_failure_types.get(error)
                 message = event.stop_message
                 stop_failure.error = error
+                # The latest StopFailure owns the classification (#959): an
+                # unmapped, transient, ignored or unmatched one leaves none.
+                stop_failure.clear_kind()
                 self._note_lifecycle(
                     handle.task_id,
                     "stop-failure",
@@ -2765,7 +2860,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         said = event.stop_error_details
                     else:
                         said = "no message"
-                    return stall_exit(f"StopFailure({error}): {said}", None)
+                    evidence = f"StopFailure({error}): {said}"
+                    latch_kind("account", evidence, None)
+                    return stall_exit(evidence, None)
                 if action == "rate_limit":
                     # A 429 and a subscription limit share `rate_limit`: the
                     # message decides, against the profile's usage lists.
@@ -2776,16 +2873,14 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         )
                         continue
                     evidence, line, usage_class = hit
+                    reset = self._usage_reset(handle, line, _local_now())
+                    resets = reset.value if reset is not None else None
                     if usage_class == USAGE_LIMIT_BLOCKED:
-                        reset = self._usage_reset(handle, line, _local_now())
-                        return stall_exit(
-                            evidence,
-                            evidence,
-                            reset.value if reset is not None else None,
-                            USAGE_LIMIT_BLOCKED,
-                        )
+                        latch_kind("blocked", evidence, resets)
+                        return stall_exit(evidence, evidence, resets, USAGE_LIMIT_BLOCKED)
                     # A wait limit: the CLI continues by itself after the
                     # reset, so the quota wait may admit on this line.
+                    latch_kind("wait", evidence, resets)
                     stop_failure.wait_hit = (evidence, line)
                     self._note_lifecycle(
                         handle.task_id, "stop-failure-quota-wait-pending", evidence=evidence
@@ -2819,6 +2914,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # recovered from (#865).
                 stop_failure.error = None
                 stop_failure.wait_hit = None
+                stop_failure.clear_kind()
                 if notice.open:
                     self._note_session_unparked(handle, notice, "stop")
                 # A turn ENDED — the one canonical event that proves the CLI did
