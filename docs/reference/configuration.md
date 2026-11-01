@@ -103,6 +103,8 @@ Cycle/attempt caps, timeout & token budget.
 | `session_budget_mode` | string | `"warn"` | `enforce` / `off` / `warn` | mid-session guard on the weighted per-session spend, sampled every ~30s · off: no sampling · warn: one ATTENTION + breadcrumb · enforce: wrap-up nudge then over_budget termination (retry→defer) |
 | `max_tokens_per_session` | integer | `4000000` | ≥ 1 | weighted (cache-discounted) token cap a single session may spend before the budget guard trips; healthy sessions run ~1-2.5M weighted, so the default trips only true runaways |
 | `session_budget_grace_s` | integer | `240` | ≥ 0 | enforce mode: seconds a tripped session gets to wrap up after the nudge before it is terminated over_budget · 0 = terminate at trip, no nudge |
+| `usage_limit_action` | string | `"pause"` | `pause` / `relaunch` | what a session that ends on a usage limit or an account StopFailure does · pause: the uncharged usage-limit pause `resolve` clears · relaunch: relaunch it at once as an uncharged retry (BMAD_LOOP_USAGE_RELAUNCH=&lt;n&gt; in the session env, for account rotation), capped by max_usage_relaunches |
+| `max_usage_relaunches` | integer | `3` | ≥ 0 | relaunch mode: uncharged usage relaunches per story (dev, fix and review together) · at the cap the session takes the usage-limit pause instead · 0 = always pause |
 
 ### `[verify]`
 

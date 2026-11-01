@@ -775,6 +775,37 @@ def test_quota_wait_max_min_default_parse_and_template():
         policy.loads("[limits]\nquota_wait_max_min = -1\n")
 
 
+def test_usage_limit_action_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").limits.usage_limit_action == "pause"
+    loaded = policy.loads('[limits]\nusage_limit_action = "relaunch"\n')
+    assert loaded.limits.usage_limit_action == "relaunch"
+    # surrounding whitespace is stripped before the membership check
+    padded = policy.loads('[limits]\nusage_limit_action = "  relaunch "\n')
+    assert padded.limits.usage_limit_action == "relaunch"
+    assert policy.USAGE_LIMIT_ACTIONS == frozenset({"pause", "relaunch"})
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["usage_limit_action"] == policy.LimitsPolicy.usage_limit_action
+    assert policy.loads(policy.POLICY_TEMPLATE).limits.usage_limit_action == "pause"
+    with pytest.raises(policy.PolicyError, match="usage_limit_action"):
+        policy.loads('[limits]\nusage_limit_action = "rotate"\n')
+
+
+def test_max_usage_relaunches_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").limits.max_usage_relaunches == 3
+    assert policy.loads("[limits]\nmax_usage_relaunches = 0\n").limits.max_usage_relaunches == 0
+    assert policy.loads("[limits]\nmax_usage_relaunches = 5\n").limits.max_usage_relaunches == 5
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["max_usage_relaunches"] == policy.LimitsPolicy.max_usage_relaunches
+    with pytest.raises(policy.PolicyError, match="max_usage_relaunches"):
+        policy.loads("[limits]\nmax_usage_relaunches = -1\n")
+
+
 def test_dev_contract_nudge_default_parse_and_template():
     import tomllib
 

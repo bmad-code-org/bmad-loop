@@ -252,6 +252,15 @@ class SessionSpec:
     # keep the plain timeout. The engine sets limits.quota_wait_max_min * 60 for
     # every session it drives. Kept LAST so positional constructions stay valid.
     quota_wait_max_s: float = 0.0
+    # Usage relaunch (#959, `limits.usage_limit_action = "relaunch"`), set by the
+    # engine on primary story sessions (dev, fix, review) only; False on every
+    # other session and on constructions outside the engine.
+    # `usage_relaunch_mode`: a usage limit or account StopFailure relaunches this
+    # session. `usage_relaunch_left`: relaunch mode with relaunch budget left, so
+    # the session should end at once on a limit rather than wait it out.
+    # Appended after `quota_wait_max_s` so positional constructions stay valid.
+    usage_relaunch_mode: bool = False
+    usage_relaunch_left: bool = False
 
 
 @dataclass(frozen=True)

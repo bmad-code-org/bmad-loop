@@ -60,6 +60,7 @@ from .escalation import (
     session_failure_reason,
     unresolved_escalation_keys,
     usage_limit_pause,
+    usage_relaunch,
 )
 from .frontmatter import FrontmatterWriteError
 from .install import dev_primitive_or_default
@@ -2693,6 +2694,7 @@ class Engine:
                 task.reverify_replayed = ""
                 task.generation += 1
                 task.review_cycle = 0
+                task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
                 task.followup_reviews_spent = 0
                 task.salvage_refile_pending = False
                 self._save()
@@ -3714,6 +3716,10 @@ class Engine:
                 result_json=result.result_json,
                 already_env_fault=env_fault,
             )
+            if decision.uncharged:
+                # An uncharged usage relaunch (#959): refund this attempt before
+                # the journal and the save below, so both record the same count.
+                task.dev_usage_relaunches += 1
             self._journal_dev_decision(task, result, decision, env_fault=env_fault)
             if decision.action == Action.PROCEED:
                 # DEV_VERIFY + spec_file is not itself proof of acceptance: this
@@ -3745,10 +3751,17 @@ class Engine:
                 # `task.attempt` are known-good for this decision, and it is before
                 # `_rollback_or_pause` can raise `RunPaused` and skip the notice for
                 # exactly the attempt whose loss most needs announcing.
+                if decision.uncharged:
+                    title = (
+                        f"dev relaunch: {task.story_key} (usage limit, relaunch "
+                        f"{task.usage_relaunches}/{self.policy.limits.max_usage_relaunches})"
+                    )
+                else:
+                    title = f"dev retry: {task.story_key} (attempt {task.attempt})"
                 gates.notify(
                     self.policy,
                     self.run_dir,
-                    f"dev retry: {task.story_key} (attempt {task.attempt})",
+                    title,
                     decision.reason.strip() or "dev attempt rejected with no reason recorded",
                 )
                 if outcome is not None and outcome.fixable:
@@ -3873,6 +3886,10 @@ class Engine:
                 # non-completed result to the parked PAUSE.
                 parked=result.parked,
                 parked_evidence=result.parked_evidence,
+                # An uncharged usage relaunch (#959) and the story's running
+                # count of them (dev and review together).
+                uncharged=decision.uncharged,
+                usage_relaunches=task.usage_relaunches,
             )
         else:
             self.journal.append(
@@ -3887,6 +3904,8 @@ class Engine:
                 produced_work=result.produced_work,
                 parked=result.parked,
                 parked_evidence=result.parked_evidence,
+                uncharged=decision.uncharged,
+                usage_relaunches=task.usage_relaunches,
                 env_fault_site=decision.env_site,
             )
 
@@ -4003,7 +4022,12 @@ class Engine:
         # replay branch below skips the re-increment, so no extra budget is
         # burned. resume_result is nulled after it is consumed, so every later
         # iteration falls back to the normal budget guard.
-        while resume_result is not None or task.review_cycle < self.policy.limits.max_review_cycles:
+        # The budget counts charged cycles only: an uncharged usage relaunch
+        # (#959) bumps `review_cycle` for session identity and refunds it.
+        while (
+            resume_result is not None
+            or task.charged_review_cycles < self.policy.limits.max_review_cycles
+        ):
             if resume_result is None:
                 # DW-523: probe before the cycle is charged; a pause here resumes
                 # through the DEV_VERIFY or completed-pass replay arms.
@@ -4055,6 +4079,19 @@ class Engine:
                 result_json=result.result_json,
                 already_env_fault=result.env_fault,
             )
+            if decision.uncharged:
+                # An uncharged usage relaunch (#959): refund this cycle before the
+                # journal, and persist it, so the next pass's budget check and
+                # state.json agree.
+                task.review_usage_relaunches += 1
+                self._save()
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"review relaunch: {task.story_key} (usage limit, relaunch "
+                    f"{task.usage_relaunches}/{self.policy.limits.max_usage_relaunches})",
+                    decision.reason,
+                )
             if decision.action != Action.SALVAGE and task.salvage_refile_pending:
                 task.salvage_refile_pending = False
                 self._save()
@@ -4065,7 +4102,11 @@ class Engine:
                 return
             if decision.action == Action.RETRY:
                 self.journal.append(
-                    "review-retry", story_key=task.story_key, reason=decision.reason
+                    "review-retry",
+                    story_key=task.story_key,
+                    reason=decision.reason,
+                    uncharged=decision.uncharged,
+                    usage_relaunches=task.usage_relaunches,
                 )
                 continue
             if decision.action == Action.SALVAGE:
@@ -4092,7 +4133,11 @@ class Engine:
                     self._defer(task, fallback.reason)
                     return
                 self.journal.append(
-                    "review-retry", story_key=task.story_key, reason=fallback.reason
+                    "review-retry",
+                    story_key=task.story_key,
+                    reason=fallback.reason,
+                    uncharged=fallback.uncharged,
+                    usage_relaunches=task.usage_relaunches,
                 )
                 continue
 
@@ -4240,7 +4285,10 @@ class Engine:
                 )
                 if gated.action == Action.PAUSE:
                     self._escalate_decision(task, gated)
-                if outcome.fixable and task.review_cycle < self.policy.limits.max_review_cycles:
+                if (
+                    outcome.fixable
+                    and task.charged_review_cycles < self.policy.limits.max_review_cycles
+                ):
                     # failing verify commands are dev work, not review work: a
                     # re-review of the same tree cannot make them pass. Repair
                     # with the failing output as feedback, then re-review. This
@@ -6997,7 +7045,10 @@ class Engine:
             return self._env_gate_claim(task, decision, claim, role=role)
         if not self.policy.environment.probes:
             return decision
-        charges = decision.action in (Action.RETRY, Action.DEFER) or decision.budget_exhausted
+        # An uncharged usage relaunch (#959) charges nothing, so it never probes.
+        charges = (
+            decision.action in (Action.RETRY, Action.DEFER) and not decision.uncharged
+        ) or decision.budget_exhausted
         if not charges:
             return decision
         site = f"probe:decision:{role}"
@@ -8584,6 +8635,16 @@ class Engine:
             # them so the generic adapter can stamp them onto the synthesized
             # result.json, keeping verify_dev_bundle's dw_ids cross-check live.
             env["BMAD_LOOP_DW_IDS"] = ",".join(task.dw_ids)
+        # Usage relaunch (#959) applies to primary story sessions only — dev
+        # (including the fix phase) and review. Injected workflow, sweep-triage
+        # and retro sessions have no relaunch arm.
+        relaunch_session = label is None and role in ("dev", "review")
+        relaunch_mode = self.policy.limits.usage_limit_action == "relaunch"
+        if relaunch_session and task.usage_relaunches > 0:
+            # The story's uncharged usage relaunches so far: the rotation signal
+            # a wrapper `binary` or `pre_session` plugin keys an account switch on.
+            # Engine-injected, so not registered in `envvars.py`.
+            env["BMAD_LOOP_USAGE_RELAUNCH"] = str(task.usage_relaunches)
         if role == "dev" and not self.policy.review.enabled:
             # signals that the orchestrator will run no follow-up review session.
             # bmad-build-auto always self-reviews inline (step-03 → step-04) and
@@ -8725,6 +8786,15 @@ class Engine:
             # usage-limit quota wait cap (DW-396): the timeout freezes while the
             # CLI waits out a usage-window reset, for at most this long in total.
             quota_wait_max_s=float(self.policy.limits.quota_wait_max_min * 60),
+            # usage relaunch mode (#959), primary story sessions only: whether a
+            # usage limit relaunches this session, and whether relaunch budget is
+            # left for it (the adapter exits at once rather than waiting).
+            usage_relaunch_mode=relaunch_session and relaunch_mode,
+            usage_relaunch_left=(
+                relaunch_session
+                and relaunch_mode
+                and task.usage_relaunches < self.policy.limits.max_usage_relaunches
+            ),
             # Launch-state snapshot of a review session's spec (#276 M1); None for
             # every other session and on a crash-resume (process-transient).
             spec_snapshot=spec_snapshot,
@@ -9505,7 +9575,9 @@ class Engine:
         # Empty whenever the last attempt completed: the verify failure `reason`
         # already describes that, and the callers' own wording is the honest one.
         session_failure = ""
-        while task.attempt < self.policy.limits.max_dev_attempts:
+        # Charged attempts only: an uncharged usage relaunch (#959) bumps
+        # `attempt` for session identity and refunds it.
+        while task.charged_attempts < self.policy.limits.max_dev_attempts:
             preserve_chain_snapshot = self._preserves_dispatched_spec_snapshot_for_repair(task)
             task.attempt += 1
             feedback = self._write_feedback(task, reason)
@@ -9586,6 +9658,17 @@ class Engine:
                 verification_stage=verified.stage,
                 verification_sequence=verified.sequence,
             )
+            critical_reason = critical_session_reason("fix", result.result_json)
+            # relaunch mode (#959): a usage-limited repair is relaunched uncharged,
+            # ahead of the env_fault/parked escalates below that would pause this
+            # same result. Never over a CRITICAL, which outranks it as in
+            # `decide_dev`. Refunded before the journal so `fix-decision` and
+            # state.json record the same count.
+            relaunch = (
+                usage_relaunch(task, result, self.policy) if critical_reason is None else None
+            )
+            if relaunch is not None:
+                task.dev_usage_relaunches += 1
             self.journal.append(
                 "fix-decision",
                 story_key=task.story_key,
@@ -9602,6 +9685,9 @@ class Engine:
                 parked_evidence=result.parked_evidence,
                 # No work at all (#727): what routed it to the no-work escalate below.
                 produced_work=result.produced_work,
+                # An uncharged usage relaunch (#959) and the story's running count.
+                uncharged=relaunch is not None,
+                usage_relaunches=task.usage_relaunches,
             )
             # CRITICAL routing, deliberately AFTER the emit and the journal record
             # above, and deliberately AHEAD of the env-fault/retryable arms below.
@@ -9616,9 +9702,21 @@ class Engine:
             # session reporting the same thing fired one. The hook is named for
             # the verification, the verification ran, and a plugin correlating
             # verify passes cannot have half of them silently withheld.
-            critical_reason = critical_session_reason("fix", result.result_json)
             if critical_reason is not None:
                 self._escalate(task, critical_reason)
+            if relaunch is not None:
+                # Relaunch the repair the way a failed repair continues: the tree
+                # is kept and the next pass gets the same feedback. Uncharged, so
+                # no environment probe and no end-of-loop budget gate.
+                self._save()
+                gates.notify(
+                    self.policy,
+                    self.run_dir,
+                    f"fix relaunch: {task.story_key} (usage limit, relaunch "
+                    f"{task.usage_relaunches}/{self.policy.limits.max_usage_relaunches})",
+                    relaunch.reason,
+                )
+                continue
             if result.status != "completed" and result.env_fault:
                 # A fix session whose CLI lost its API connection (#194) did no
                 # repair work — another attempt cannot fix the run environment, so
@@ -9674,7 +9772,7 @@ class Engine:
                 return Decision(Action.PROCEED)
             # A failed repair is charged — the next attempt, or the budget-spent
             # DEFER below — so re-probe the environment first (DW-523).
-            budget_left = task.attempt < self.policy.limits.max_dev_attempts
+            budget_left = task.charged_attempts < self.policy.limits.max_dev_attempts
             gated = self._env_gate_decision(
                 task,
                 Decision(

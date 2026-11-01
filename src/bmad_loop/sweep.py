@@ -3272,7 +3272,9 @@ class SweepEngine(Engine):
         task.restore_patch = None
         task.preserve_from_attempt = False
         task.attempt = 0
+        task.dev_usage_relaunches = 0  # refunds never exceed attempt (#959)
         task.review_cycle = 0
+        task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
         task.followup_reviews_spent = 0
         task.defer_reason = None
         _rearm_generation(task)
@@ -4687,6 +4689,7 @@ class SweepEngine(Engine):
             )
             if task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
+                task.dev_usage_relaunches = 0  # refunds never exceed attempt (#959)
                 _rearm_generation(task)  # ...and into a fresh session-id namespace
                 task.migration_commit_escalated = False
             if dirty:
@@ -5259,9 +5262,11 @@ class SweepEngine(Engine):
             self.journal.append("resume-restart", story_key=triage_key, phase=str(task.phase))
             if selector_cache_mismatch:
                 task.attempt = 0
+                task.dev_usage_relaunches = 0  # refunds never exceed attempt (#959)
                 _rearm_generation(task)
             elif task.phase == Phase.ESCALATED:
                 task.attempt = 0  # the human resumed deliberately; fresh budget
+                task.dev_usage_relaunches = 0  # refunds never exceed attempt (#959)
                 _rearm_generation(task)  # ...and into a fresh session-id namespace
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
 

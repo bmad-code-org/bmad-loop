@@ -78,6 +78,10 @@ class Decision:
     # Set by a decider whose PAUSE reason is the usage-limit reason (DW-591):
     # the facts the engine records with the pause. None on every other decision.
     usage_limit: UsageLimitPause | None = None
+    # A RETRY that charges no budget (#959): a usage relaunch from
+    # :func:`usage_relaunch`. The engine adds it to the story's refund counter
+    # before journaling, and the environment seam never re-probes for it.
+    uncharged: bool = False
 
 
 def _escalation_list(result_json: dict[str, Any] | None) -> list[Any]:
@@ -423,6 +427,46 @@ def session_failure_reason(role: str, result: SessionResult) -> str:
     return reason
 
 
+USAGE_RELAUNCH_REASON_PREFIX = "usage relaunch "
+
+
+def usage_relaunch(task: StoryTask, result: SessionResult, policy: Policy) -> Decision | None:
+    """The uncharged RETRY for a session that ended on a usage limit (#959), or
+    None when it does not qualify.
+
+    Qualifies only in relaunch mode (``limits.usage_limit_action =
+    "relaunch"``), while the story's uncharged relaunches stay under
+    ``limits.max_usage_relaunches``, for a non-completed session the adapter saw
+    behind a usage limit (``usage_limited``, any adapter) or a StopFailure mapped
+    to the account action. At the cap it returns None, so the caller falls
+    through to the usage-limit pause the same result gets in pause mode: a
+    repeated or forged limit signal buys at most the cap, never a loop.
+
+    The reason never starts with ``"usage limit: "``: :func:`pause_title` keys on
+    that prefix, and this is a relaunch, not a pause."""
+    limits = policy.limits
+    if limits.usage_limit_action != "relaunch":
+        return None
+    if task.usage_relaunches >= limits.max_usage_relaunches:
+        return None
+    if result.status == "completed":
+        return None
+    if result.usage_limited is None and result.stop_failure_action != "account":
+        return None
+    evidence = (
+        result.usage_limited
+        or result.parked_evidence
+        or result.stop_failure
+        or f"session {result.status}"
+    )
+    return Decision(
+        Action.RETRY,
+        f"{USAGE_RELAUNCH_REASON_PREFIX}({task.usage_relaunches + 1}/"
+        f"{limits.max_usage_relaunches}): {evidence}",
+        uncharged=True,
+    )
+
+
 def decide_dev(
     task: StoryTask,
     result: SessionResult,
@@ -434,10 +478,16 @@ def decide_dev(
     if critical_reason is not None:
         return Decision(Action.PAUSE, critical_reason)
 
-    budget_left = task.attempt < policy.limits.max_dev_attempts
+    budget_left = task.charged_attempts < policy.limits.max_dev_attempts
     exhausted = _exhausted_action(task)
 
     if result.status != "completed":
+        relaunch = usage_relaunch(task, result, policy)
+        if relaunch is not None:
+            # relaunch mode (#959): an uncharged RETRY ahead of the env_fault and
+            # parked arms that would pause this same result, and ahead of the
+            # budget, so it relaunches even on the last attempt.
+            return relaunch
         if result.env_fault:
             # A transport/API failure (the CLI never reached the API, #194): the
             # attempt did no real work, so pause for a human instead of charging
@@ -536,6 +586,11 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
         return Decision(Action.PAUSE, critical_reason)
 
     if result.status != "completed":
+        relaunch = usage_relaunch(task, result, policy)
+        if relaunch is not None:
+            # relaunch mode (#959): an uncharged RETRY ahead of the pause arms and
+            # the `review.on_timeout` routing (see decide_dev).
+            return relaunch
         if result.env_fault:
             # transport/API failure (#194): pause rather than charge a review
             # cycle for a session that never reached the API (see decide_dev).
@@ -578,7 +633,7 @@ def review_retry_or_exhaust(task: StoryTask, policy: Policy, reason: str) -> Dec
     cycle budget lasts, then plateau-defer (or re-escalate mid re-drive). Module-
     level so the engine can fall back through it when a SALVAGE attempt turns out
     not to be applicable (#271)."""
-    if task.review_cycle < policy.limits.max_review_cycles:
+    if task.charged_review_cycles < policy.limits.max_review_cycles:
         return Decision(Action.RETRY, reason)
     return review_exhausted(task, reason)
 
