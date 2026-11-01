@@ -202,14 +202,14 @@ In place, `[scm] rollback_on_failure` defaults to `false`: instead of resetting,
 3. `git -C <root> reset --hard <baseline>` and remove leftover untracked files.
 4. `bmad-loop resume <run-id>`.
 
-To keep the commits instead, check `git log --oneline <baseline>..HEAD`, then run `bmad-loop resume <run-id> --accept-baseline`. It adopts everything at HEAD as the new baseline of each in-place story the resume restarts, and treats every current untracked file as pre-existing. Uncommitted tracked changes still go through the normal rollback. You do not need it right after `resolve` (the re-arm already advances the baseline), but commits you made after `resolve --no-resume` do.
+To keep the commits instead, check `git log --oneline <baseline>..HEAD` (a `chore(deferred-work): engine bookkeeping before …` commit is the run's own ledger record, not the session's work), then run `bmad-loop resume <run-id> --accept-baseline`. It adopts everything at HEAD as the new baseline of each in-place story the resume restarts, and treats every current untracked file as pre-existing. Uncommitted tracked changes still go through the normal rollback. You do not need it right after `resolve` (the re-arm already advances the baseline), but commits you made after `resolve --no-resume` do.
 
 ## Plateau-defer
 
 When a story runs out of budget without a CRITICAL reason (`[limits] max_dev_attempts`, default 2; `[limits] max_review_cycles`, default 3; or a review timeout with `[review] on_timeout = "defer"`), it is deferred and you get a `story deferred: <story>` notice. What happens next depends on where the attempt ran:
 
 - **In place, `[scm] rollback_on_failure = false` (the default), with attempt work in the tree:** the tree is not rolled back and the run pauses for a [manual rollback](#manual-rollback-pause). The notice points to `bmad-loop resolve <run-id> --reverify` for the kept work.
-- **In place with `rollback_on_failure = true`, or a clean tree:** the attempt is parked and reset, its spec is stashed under the run's `deferred/<story>/`, and the run continues. The notice gives the recovery ref and the `git merge --ff-only` line that restores it (marked commits-only when the uncommitted part could not be saved).
+- **In place with `rollback_on_failure = true`, or a clean tree:** the attempt is parked and reset, its spec is stashed under the run's `deferred/<story>/`, the deferred-work ledger is restored and committed as `chore(deferred-work): restore ledger after deferring <story>`, and the run continues. The notice gives the recovery ref and the `git merge --ff-only` line that restores it (marked commits-only when the uncommitted part could not be saved).
 - **Under worktree isolation:** the unit's branch is kept, the run continues, and the notice names the branch plus any earlier attempt's ref.
 
 To finish a deferred story, use [`resolve --reverify`](#resolve-reverify) while the run is paused on that defer, or for a kept worktree unit. After an auto-rollback, restore the ref and re-run the story instead. A story being re-driven after you resolved it re-escalates instead of deferring.

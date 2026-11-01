@@ -197,6 +197,15 @@ The sweep commits each ledger or store change it makes as its own file-scoped co
 
 `bmad-loop decisions` commits each file it wrote separately as `chore(decisions): pre-answer <id>`: the ledger only if a `decision:` line landed, and the project store only for `build` or `keep-open`. A ledger the sweep marked as in doubt blocks every further ledger publish for that run (`sweep-ledger-commit-withheld`).
 
+Every run, sweep or not, also commits the ledger changes it left uncommitted itself (harvested deferrals, bundle closes, a restored ledger), so a session that refuses to finish on a dirty tree never stops on the engine's own writes:
+
+| Commit message                                                   | When                                                                                                                                                                             |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chore(deferred-work): engine bookkeeping before <role> (<key>)` | right before a review session (every cycle), a repair dev session, or a dev retry after a rollback; `<role>` is `review` or `dev`. Squashed into the unit's commit when it lands |
+| `chore(deferred-work): restore ledger after deferring <key>`     | after an in-place defer resets the attempt and restores the ledger; stays on the target branch                                                                                   |
+
+Each commits the ledger file alone, with repository hooks and commit signing disabled, and holds only bytes the engine had already written. Nothing is committed when the ledger is gitignored, outside the repository, in a ticket store, or unchanged. A rollback treats these commits as the run's own: it restores a ledger they added and parks no `attempt-preserve` ref for a range that holds only them. A failed commit is journaled (`engine-ledger-commit-failed`) and the session launches anyway.
+
 ### Publication refusals
 
 Before committing, the sweep checks the target file. A refusal journals `sweep-ledger-commit-refused` with a `refuse_cause`. A ledger refusal also marks the ledger as in doubt, which withholds later bundles. `bmad-loop decisions` reports the same causes in a `not committed to git: <file> (<cause>)` note, keeps the answer on disk, and still exits 0.
@@ -229,6 +238,9 @@ An empty ledger is publishable. A store that is not valid JSON is still publisha
 | `sweep-repeat-done`                 | a repeat run stopped (`stop_cause`)                                                                                       |
 | `sweep-prior-run-holds-closes`      | at a sweep's start: an earlier run still holds closes whose code never landed (`run_id`, `dw_ids`)                        |
 | `sweep-prior-run-closes-unknown`    | at a sweep's start: an earlier run could not be checked (`run_id`, absent when the runs dir could not be listed; `error`) |
+| `engine-ledger-commit`              | the engine committed its own ledger changes (`story_key`, `site`, `commit`, `added`)                                      |
+| `engine-ledger-commit-failed`       | that commit failed or found nothing to commit; the session launched anyway (`story_key`, `site`, `error`)                 |
+| `engine-ledger-commit-refused`      | the ledger failed the publication check, so nothing was committed (`story_key`, `site`, `refuse_cause`, `error`)          |
 
 A ledger `git status` fault other than "not a repository", or a commit git refuses, ends the sweep as a crash: the run records `run-crash` and writes `crash.txt` in the run dir.
 

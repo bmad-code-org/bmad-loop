@@ -128,6 +128,16 @@ For a shared store, the unit's commit cannot carry its plan, so the ticket's ter
 
 A store that is its own git repository (T3 nested, T4 external) then gets a plan-only commit there, `chore(tickets): <ref> <status> [bmad-loop <run>]`, holding the marked plan and the deferred-work ledger when the task wrote to it. Its `Bmad-Code-Repo`, `Bmad-Code-Commit` and `Bmad-Code-Range` trailers name the code it describes. Nothing else in the store is staged, and an epic's retrospective document is committed there the same way. A store commit is bookkeeping: a failure (`store-commit-failed`), or a human's staged version of a path it would overwrite (`store-commit-foreign-dirt`), keeps the latch, never pauses mid-run, and is listed by `bmad-loop status`. The run retries it before it can finish (`run-end-ticket-mark`); one still owed pauses at `ticket-tree` (`store-commit-owed`), and the resume retries it. A retrospective document whose store commit fails pauses at `epic-boundary` before the epic's closure is recorded, and the resume commits it before recording the closure. An unversioned store (T2, or a plain folder outside the checkout) journals `store-unversioned` once per run.
 
+Before a review session, a repair dev session or a dev retry after a rollback, and after an in-place defer, the engine commits the deferred-work ledger changes it left uncommitted itself (the commits are listed in the [sweep guide](../sweep-guide.md#what-gets-published)). Each journals one row:
+
+| Kind                           | Fields                                       | Meaning                                                                                          |
+| ------------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `engine-ledger-commit`         | `story_key`, `site`, `commit`, `added`       | committed; `site` is `review`, `dev` or `defer`; `added` is true when the baseline had no ledger |
+| `engine-ledger-commit-failed`  | `story_key`, `site`, `error`                 | a git or filesystem fault, or nothing to commit; the session launches anyway                     |
+| `engine-ledger-commit-refused` | `story_key`, `site`, `refuse_cause`, `error` | the ledger failed the publication check (`refuse_cause` as in `sweep-ledger-commit-refused`)     |
+
+A gitignored, external, store-held or unchanged ledger journals nothing. The task records these commits in `state.json` as `bookkeeping_ledger` (`baseline`, `added`, `shas`), saved before each commit and ignored once `baseline_commit` moves. A rollback restores a ledger they added, and the attempt-preserve step leaves out a commit that the record names and that touches only the ledger. If that check fails, the step journals `attempt-preserve-filter-failed` (`story_key`, `error`) and preserves the whole range.
+
 ## Task directory
 
 `tasks/<task_id>/` is created per agent session. The task id is `<story_key>-<part>-<n>`, where `part` is `dev`, `review`, `triage` or a workflow label and `n` is the attempt or review cycle; a re-armed story adds `-g<generation>`.

@@ -147,6 +147,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Commit the engine's own deferred-work ledger changes before review, repair and retry
+  sessions and after an in-place defer, so a tracked ledger no longer pauses the run with
+  `finalization left repository dirty` (#772).
 - Count Claude Code usage once per API response and include subagent transcripts:
   totals were over-counted ~2× without subagents and under-counted with them, so budgets
   tuned on old figures may trip differently (#836).
