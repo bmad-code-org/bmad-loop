@@ -288,7 +288,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -874,7 +874,8 @@ class V1Protocol(OpencodeProtocol):
     def usage(
         self, client: Any, session_id: str, transcript: Any
     ) -> tuple[TokenUsage | None, UsageFault | None]:
-        """The assistant-message token sum over the transcript (:func:`_sum_usage`)."""
+        """The assistant-message token sum over the transcript (:func:`_sum_usage`),
+        its ``models`` the ``"<providerID>/<modelID>"`` ids those messages ran."""
         usage, fault = _tally_messages(transcript)
         return usage, None if fault is None else UsageFault("payload", fault)
 
@@ -1331,7 +1332,12 @@ class V2Protocol(OpencodeProtocol):
         (:func:`_sum_usage`): an in-flight first step reports zeros, and the
         step an interrupt cancelled is stamped completed with
         ``error.type == "aborted"`` and no tokens. (V1 still counts the parent
-        alone.) Never raises."""
+        alone.) Never raises.
+
+        ``models`` is the ``"<providerID>/<id>"`` of each assistant message in
+        ``transcript`` (:func:`_v2_models`): None when the transcript was not
+        read. Descendant sessions' messages are not fetched, so a subagent's
+        model is missing unless the parent also ran it."""
         try:
             resp = client.get(f"/api/session/{session_id}")
             if resp.status_code != 200:
@@ -1349,7 +1355,7 @@ class V2Protocol(OpencodeProtocol):
         usage.add(children)
         if usage.total == 0 and not _any_completed_assistant(transcript):
             return None, None
-        return usage, None
+        return replace(usage, models=_v2_models(transcript)), None
 
     def sample_usage(self, client: Any, session_id: str) -> tuple[TokenUsage | None, str | None]:
         """The budget guard's sample: the same parent-plus-descendants sum as
@@ -1496,6 +1502,28 @@ def _any_completed_assistant(messages: Any) -> bool:
     return False
 
 
+def _v2_models(messages: Any) -> tuple[str, ...] | None:
+    """The distinct ``"<providerID>/<id>"`` model ids of a V2 transcript's
+    assistant messages (``model`` is a required ``Model.Ref``; its ``variant``
+    is ignored), first-seen order. None when ``messages`` is not a list (the
+    transcript read failed: unknown, never "none"); ``()`` when no assistant
+    message names one. A wrong-shaped entry is skipped, never a fault — models
+    are diagnostic, and the token figure must not hinge on them."""
+    if not isinstance(messages, list):
+        return None
+    seen: dict[str, None] = {}
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("type") != "assistant":
+            continue
+        ref = msg.get("model")
+        if not isinstance(ref, dict):
+            continue
+        provider, model_id = ref.get("providerID"), ref.get("id")
+        if isinstance(provider, str) and provider and isinstance(model_id, str) and model_id:
+            seen.setdefault(f"{provider}/{model_id}", None)
+    return tuple(seen)
+
+
 # The characters V2's permission-rule matcher reads as wildcards.
 _V2_RULE_WILDCARDS = frozenset("*?")
 
@@ -1532,7 +1560,11 @@ def _sum_usage(messages: Any) -> TokenUsage | None:
     still-in-flight response must not read as a measured zero.
 
     A malformed payload (not a list, or an entry the walk cannot read) is None
-    too; :func:`_tally_messages` says why, for the callers that crumb it."""
+    too; :func:`_tally_messages` says why, for the callers that crumb it.
+
+    A tracked usage's ``models`` holds the distinct ``"<providerID>/<modelID>"``
+    of every assistant message naming both (required on a V1
+    ``AssistantMessage``), first-seen order; ``()`` when none does."""
     return _tally_messages(messages)[0]
 
 
@@ -1555,10 +1587,14 @@ def _sum_message_list(messages: list[Any]) -> TokenUsage | None:
     """The :func:`_sum_usage` walk over a list; raises on a wrong-shaped entry."""
     usage: TokenUsage | None = None
     any_completed = False
+    models: dict[str, None] = {}
     for msg in messages:
         info = (msg or {}).get("info") or {}
         if info.get("role") != "assistant":
             continue
+        provider, model_id = info.get("providerID"), info.get("modelID")
+        if isinstance(provider, str) and provider and isinstance(model_id, str) and model_id:
+            models.setdefault(f"{provider}/{model_id}", None)
         error = info.get("error")
         aborted = isinstance(error, dict) and error.get("name") == "MessageAbortedError"
         if (info.get("time") or {}).get("completed") and not aborted:
@@ -1577,6 +1613,6 @@ def _sum_message_list(messages: list[Any]) -> TokenUsage | None:
                 cache_creation_tokens=int(cache.get("write") or 0),
             )
         )
-    if usage is not None and usage.total == 0 and not any_completed:
+    if usage is None or (usage.total == 0 and not any_completed):
         return None
-    return usage
+    return replace(usage, models=tuple(models))
