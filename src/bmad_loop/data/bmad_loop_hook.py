@@ -13,7 +13,8 @@ workspacePaths list instead, and alone sends `fullyIdle`, forwarded as
 carries the API error that ended the turn: its `error`, `error_details` and
 `last_assistant_message` are forwarded as `stop_error`, `stop_error_details` and
 `stop_message`, each only when it is a string and cut to RELAY_TEXT_MAX
-characters. Reads the hook payload from stdin and writes one event file
+characters. A payload's `model` (Claude's SessionStart, Codex on every hook) is
+forwarded the same way, only when it is a non-empty string. Reads the hook payload from stdin and writes one event file
 into the orchestrator's events directory. No-ops (exit 0) unless the session was
 spawned by bmad-loop (detected via env vars set on the tmux window), so
 normal interactive sessions are unaffected.
@@ -21,10 +22,12 @@ normal interactive sessions are unaffected.
 Where that directory is: $BMAD_LOOP_EVENTS_DIR when the orchestrator names one,
 else the legacy $BMAD_LOOP_RUN_DIR/events. The channel moved out of the project
 tree in #494 so a branch switch or a worktree mount cannot take a live run's
-control plane away, and this script is COPIED into the target project at init
-time — so an upgraded orchestrator regularly drives sessions whose installed
-copy is this file's older self, which knows only the legacy path. That pairing
-is what the orchestrator's own dual poll (signals.SignalWatcher) covers.
+control plane away, and older inits COPIED this script into the target project
+(init now registers `bmad-loop relay <Event>` and recognizes a copied-script
+registration only as legacy) — so an upgraded orchestrator can still drive
+sessions whose installed copy is this file's older self, which knows only the
+legacy path. That pairing is what the orchestrator's own dual poll
+(signals.SignalWatcher) covers.
 
 $BMAD_LOOP_EVENTS_DIR is deliberately NOT part of the no-op detector above: the
 mirror-image skew — an older orchestrator that sets only RUN_DIR/TASK_ID driving
@@ -470,6 +473,12 @@ def main() -> int:
         text = _bounded_text(payload, payload_key)
         if text is not None:
             event[event_key] = text
+    # The model the CLI reports on its hook payload (#859): Claude's SessionStart,
+    # Codex on every hook. Only when it is a non-empty string, so every other
+    # event stays unchanged.
+    model = _bounded_text(payload, "model")
+    if model:
+        event["model"] = model
     # Only when set, so a readable payload's event is unchanged.
     if payload_error:
         event["payload_error"] = payload_error

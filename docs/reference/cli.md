@@ -558,6 +558,8 @@ Built from the run's `state.json`.
 
 Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `followup_review_recommended` (bool: the build session recommended a follow-up review), `adapters_used` (`{role: {name, model}}`), `ticket` (object or null, below).
 
+`adapters_used` reports each role's last session that stamped an adapter. Its `model` is the configured model (`""` for the CLI default). `models_used` lists the models that session was observed to run (see the [run directory](run-state.md#run-directory)) and is present only when some were observed, so a role whose latest session observed none shows no `models_used` even when an earlier one did.
+
 `epic` is always an integer. A unit of a source with no integer epics (stories, sweep, tickets) reports `0`; a ticket's epic is in its `ticket` object.
 
 `tickets` (run level): `initiative` and `initiative_folder` (the pinned initiative), `parent_initiative` (the parent initiative whose child the run builds, or null), `epic_filter` (the `--epic` slug, or null), `store_topology` (`{layout, placement, versioning, store_root, store_repo}`, or null when none was recorded), `epic_closures` (epic slug → recorded closure verdict) and `epic_closures_acked` (epic slugs whose closure pause was resumed past).

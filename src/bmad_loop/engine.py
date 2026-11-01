@@ -8546,6 +8546,17 @@ class Engine:
         # exactly the sessions whose `tokens` is a lower bound.
         if usage is not None and usage.unread:
             extras["usage_unread"] = list(usage.unread)
+        # observed models (#859): the distinct model ids the parser saw, main
+        # session first. Three states stay distinct: `models` = observed,
+        # `models_unresolved: true` = tracked but none found, both absent = this
+        # CLI's parser has no model source (or no usage was read). Only this
+        # normal session-end row carries them; the raise-path and aborted rows
+        # have no usage, so they carry neither, matching their `tokens=None`.
+        if usage is not None and usage.models is not None:
+            if usage.models:
+                extras["models"] = list(usage.models)
+            else:
+                extras["models_unresolved"] = True
         return extras
 
     @staticmethod

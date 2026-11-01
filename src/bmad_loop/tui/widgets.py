@@ -265,8 +265,11 @@ class RunHeader(Static):
             # A session is open: show the live agent, its model and stage role.
             text.append("\nagent ", style="dim")
             text.append(agent.name, style="bold cyan")
-            if agent.model:
-                text.append(f" · {agent.model}", style="cyan")
+            # The CLI-reported model (#859) when the hook sent one, else the
+            # configured one (omitted when "", the CLI default).
+            shown_model = agent.reported_model if agent.reported_model is not None else agent.model
+            if shown_model:
+                text.append(f" · {shown_model}", style="cyan")
             if agent.role:
                 text.append(f" · {agent.role}", style="dim")
             if agent.parked_since is not None:

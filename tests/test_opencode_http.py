@@ -2040,6 +2040,41 @@ def test_sum_usage_maps_opencode_tokens():
     )
 
 
+def _v1_assistant(provider: str | None, model: str | None, **tokens) -> dict:
+    info: dict = {"role": "assistant", "tokens": {"input": 1, **tokens}, "time": {"completed": 1}}
+    if provider is not None:
+        info["providerID"] = provider
+    if model is not None:
+        info["modelID"] = model
+    return {"info": info}
+
+
+def test_v1_usage_collects_provider_models():
+    """V1 usage carries the distinct `"<providerID>/<modelID>"` ids of the
+    assistant messages, first-seen order; a user message's ids are ignored, and
+    a message missing either half (or naming an empty one) adds none."""
+    messages = [
+        {"info": {"role": "user", "providerID": "openai", "modelID": "gpt-user"}},
+        _v1_assistant("anthropic", "claude-sonnet-4-5"),
+        _v1_assistant("openai", "gpt-5"),
+        _v1_assistant("anthropic", "claude-sonnet-4-5"),
+        _v1_assistant("openai", None),
+        _v1_assistant("", "orphan"),
+    ]
+    usage, fault = V1Protocol().usage(None, "ses_1", messages)
+    assert fault is None and usage is not None
+    assert usage.input_tokens == 5
+    assert usage.models == ("anthropic/claude-sonnet-4-5", "openai/gpt-5")
+
+
+def test_v1_usage_tracks_models_found_none():
+    """A tracked V1 usage whose assistant messages name no model is `()` —
+    tracked, nothing found — never None ("not tracked")."""
+    usage, fault = V1Protocol().usage(None, "ses_1", [_v1_assistant(None, None)])
+    assert fault is None and usage is not None
+    assert usage.models == ()
+
+
 def test_missing_httpx_names_the_extra(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "httpx", None)
     with pytest.raises(OpencodeServerError, match=r"bmad-loop\[opencode\]"):
@@ -2659,6 +2694,15 @@ def test_read_usage_returns_stash_by_session_id(tmp_path):
     assert adapter.read_usage(SessionResult(status="completed", session_id="ses_1")).total == 1
     assert adapter.read_usage(SessionResult(status="completed", session_id="ses_2")) is None
     assert adapter.read_usage(SessionResult(status="completed")) is None
+
+
+def test_read_usage_keeps_the_stashed_models(tmp_path):
+    """The stash hands back the captured TokenUsage itself: `models` (out of
+    equality, so asserted directly) survives `_stash_usage` → `read_usage`."""
+    adapter = make_adapter(tmp_path)
+    adapter._stash_usage("ses_1", TokenUsage(input_tokens=1, models=("openai/gpt-5",)))
+    got = adapter.read_usage(SessionResult(status="completed", session_id="ses_1"))
+    assert got is not None and got.models == ("openai/gpt-5",)
 
 
 def test_stash_usage_bounded_by_cap_evicting_oldest_first(tmp_path):
@@ -4873,6 +4917,63 @@ def test_v2_capture_usage_reads_session_tokens(tmp_path):
         TokenUsage(input_tokens=96, output_tokens=48, cache_read_tokens=5, cache_creation_tokens=2)
     )
     assert _lifecycle_lines(adapter, "t-cap") == []
+
+
+def test_v2_capture_usage_collects_message_models(tmp_path):
+    """V2 usage carries the `"<providerID>/<id>"` of each assistant message's
+    `model` ref (variant ignored), distinct and first-seen, read from the
+    transcript `_capture_usage` already fetched; user messages are ignored."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sonnet = {"id": "claude-sonnet-4-5", "providerID": "anthropic", "variant": "high"}
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [
+                _v2_page(
+                    {"id": "msg_u", "type": "user", "model": {"id": "x", "providerID": "y"}},
+                    _v2_assistant(1, model=sonnet),
+                    _v2_assistant(2, model={"id": "gpt-5", "providerID": "openai"}),
+                    _v2_assistant(3, model={**sonnet, "variant": "low"}),
+                )
+            ],
+            _V2_INFO: [_v2_info(input=10)],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    got = adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID))
+    assert got == TokenUsage(input_tokens=10)
+    assert got.models == ("anthropic/claude-sonnet-4-5", "openai/gpt-5")
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        pytest.param([{"id": "msg_u", "type": "user", "time": {"created": 1}}], id="no-assistant"),
+        pytest.param([_v2_assistant(1)], id="no-model"),
+        pytest.param([_v2_assistant(1, model={"id": "", "providerID": "openai"})], id="empty-id"),
+    ],
+)
+def test_v2_usage_tracks_models_found_none(messages):
+    """A tracked V2 usage whose transcript names no assistant model is `()`."""
+    usage, fault = V2Protocol().usage(
+        _V2RouteClient(**{_V2_INFO: [_v2_info(input=4)]}), _V2_SID, messages
+    )
+    assert fault is None and usage is not None
+    assert usage.models == ()
+
+
+def test_v2_usage_models_unknown_without_a_transcript():
+    """No transcript (its read failed) leaves `models` None — unknown, never
+    `()` — while the session-endpoint tokens still count."""
+    usage, fault = V2Protocol().usage(
+        _V2RouteClient(**{_V2_INFO: [_v2_info(input=4)]}), _V2_SID, None
+    )
+    assert fault is None and usage == TokenUsage(input_tokens=4)
+    assert usage.models is None
 
 
 @pytest.mark.parametrize(

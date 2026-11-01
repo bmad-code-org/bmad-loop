@@ -575,6 +575,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # (`codex_trust.DAEMON_ENV_HINT`), never session or operator text. Kind-scoped
     # because both names are generic.
     "session-start-missing": frozenset({"cli", "hint"}),
+    # `session-model` (#859): `cli` is the session's CLI profile name, as on
+    # `session-start-missing`. Kind-scoped because the name is generic.
+    "session-model": frozenset({"cli"}),
     "root-identity-recorded": frozenset({"dev", "ino"}),
     # DW-446: the `st_dev` a locked resume/re-arm re-bound (`old_dev` -> `dev`) under
     # a still-matching `ino` — integers only, kept for the same comparison.
@@ -1116,6 +1119,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # running count of them (an int).
         "uncharged",
         "usage_relaunches",
+        # `session-end` (#859): the distinct model ids the session's usage parser
+        # observed (a list `diagnostics._scrub_model_id` keeps element-wise while
+        # model-id shaped), and the bare boolean marking a tracked parser that
+        # found none.
+        "models",
+        "models_unresolved",
         "verification_sequence",
         "verification_stage",
         "via",
@@ -1303,6 +1312,8 @@ JOURNAL_SPLAT_FIELDS = {
             "quota_wait_s",
             "usage_limit_resets",
             "usage_limit_class",
+            "models",
+            "models_unresolved",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys
@@ -1481,6 +1492,10 @@ JOURNAL_KINDS = frozenset(
         # `waited_s`/`grace_s` (declared benign), `cli` and, on a Codex profile,
         # the constant `hint` (declared benign on this kind).
         "session-start-missing",
+        # One `session-model` on a session's first admitted SessionStart whose
+        # hook carries a `model` (#859): `task_id` (routed), `model` (benign by
+        # name) and `cli` (declared benign on this kind).
+        "session-model",
         # checkpoints.py
         "checkpoint-pause",
         "checkpoint-resume",

@@ -1489,6 +1489,79 @@ def test_unrelated_raw_presence_field_is_not_suppressed():
     assert scrubbed["patch_present"] is False
 
 
+def test_session_end_models_survive_scrub():
+    """`session-end` `models` (#859) keeps each model-id-shaped element — an
+    opencode `provider/model` and a claude `…[1m]` id included, which the
+    `scrub_json` fallback would blank — and redacts a secret-shaped or path-ish
+    element on its own; `models_unresolved` is a bool and passes as is.
+
+    Ablation: drop the `models` branch in `_scrub_entry` and `scrub_json`
+    redacts the `/` and `[1m]` ids, failing the first assertion."""
+    # Model-id shaped, so only `looks_like_secret` stands between it and the dump.
+    secret = "sk-ant-api03-" + "Zx8Qw3Rt7Yu1Io5Pa9Sd2Fg6Hj0Kl4ZxCvBn"
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "session-end",
+            "models": [
+                "claude-opus-5-5",
+                "anthropic/claude-sonnet-4-5",
+                "claude-opus-4-6[1m]",
+                secret,
+                "/home/alice/.claude/model",
+                "has space",
+                7,
+            ],
+            "models_unresolved": True,
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+    assert scrubbed["models"] == [
+        "claude-opus-5-5",
+        "anthropic/claude-sonnet-4-5",
+        "claude-opus-4-6[1m]",
+        "<redacted:str>",
+        "<redacted:str>",
+        "<redacted:str>",
+        "<redacted:str>",
+    ]
+    assert scrubbed["models_unresolved"] is True
+    for value in ("claude-opus-5-5", "x\n"):
+        not_a_list = diagnostics._scrub_entry(
+            {"kind": "session-end", "models": value},
+            sanitize.Pseudonymizer(salt=b"fixed"),
+            {},
+            None,
+        )
+        assert not_a_list["models"] == "<redacted:str>"
+    assert diagnostics._scrub_model_id("claude-opus-5-5\n") == "<redacted:str>"
+
+
+def test_session_model_row_keeps_model_id():
+    """`session-model` `model` (#859) keeps a model-id-shaped value — a claude
+    `…[1m]` id included, which the `scrub_json` fallback would blank — and
+    redacts a secret-shaped or non-string one.
+
+    Ablation: drop the `session-model` branch in `_scrub_entry` and `scrub_json`
+    redacts the `[1m]` id, failing the first assertion."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    secret = "sk-ant-api03-" + "Zx8Qw3Rt7Yu1Io5Pa9Sd2Fg6Hj0Kl4ZxCvBn"
+    kept = diagnostics._scrub_entry(
+        {"kind": "session-model", "model": "claude-opus-4-6[1m]", "cli": "claude"},
+        pseudo,
+        {},
+        None,
+    )
+    assert kept["model"] == "claude-opus-4-6[1m]"
+    assert kept["cli"] == "claude"
+    for value in (secret, "/home/alice/model", 7, None):
+        redacted = diagnostics._scrub_entry(
+            {"kind": "session-model", "model": value}, pseudo, {}, None
+        )
+        assert redacted["model"] == "<redacted:str>"
+
+
 def test_unpinned_artifact_observation_keeps_the_fs_type_and_drops_the_paths():
     """`artifact-observation-unpinned` (DW-444) names the absolute artifacts root
     and a filesystem label that embeds its volume path — both host paths, routed

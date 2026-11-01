@@ -1112,6 +1112,26 @@ def _reserved_output_names(
     return frozenset(generated)
 
 
+# A model id as the coding CLIs report it: `claude-opus-4-6[1m]`,
+# `anthropic/claude-sonnet-4-5`, `gpt-5.5-codex`, `models/gemini-3-pro@001`.
+# Starts alphanumeric, so an absolute path (`/home/…`) never matches.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,127}$")
+_REDACTED_STR = "<redacted:str>"
+
+
+def _scrub_model_id(value: object) -> str:
+    """`value` verbatim while it is a model-id-shaped string that does not look
+    like a credential, else `<redacted:str>`. Shared by every journal field that
+    carries an observed model id."""
+    if (
+        isinstance(value, str)
+        and _MODEL_ID_RE.fullmatch(value)
+        and not sanitize.looks_like_secret(value)
+    ):
+        return value
+    return _REDACTED_STR
+
+
 def _scrub_entry(
     entry: dict,
     pseudo: sanitize.Pseudonymizer,
@@ -1201,6 +1221,15 @@ def _scrub_entry(
             # Kept only while identifier-shaped, so a label that somehow still
             # carries a path or prose never ships.
             out[k] = v if isinstance(v, str) and sanitize.looks_like_identifier(v) else None
+        elif kind == "session-end" and k == "models":
+            # #859: observed model ids. `scrub_json` would blank every
+            # `provider/model` (opencode) and `…[1m]` (claude) id, because `/`
+            # and brackets fail `looks_like_identifier`; keep each element that
+            # is model-id shaped, redact the rest one by one.
+            out[k] = [_scrub_model_id(each) for each in v] if isinstance(v, list) else _REDACTED_STR
+        elif kind == "session-model" and k == "model":
+            # #859: the hook-reported launch model, one id of the same shapes.
+            out[k] = _scrub_model_id(v)
         elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
             # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
             # `scrub_json` fallback with a fail-closed one, because on such a kind an

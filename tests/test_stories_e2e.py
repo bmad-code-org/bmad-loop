@@ -248,12 +248,16 @@ LEGACY_EVENTS_FAKE_CLI = FAKE_CLI.replace('ed="$BMAD_LOOP_EVENTS_DIR"', 'ed="$rd
 # Stop and SessionEnd land in the parent's stream, before the parent has written a
 # result. Fresh timestamps (and a pause so they reach the watcher as their own ticks)
 # order every child event ahead of the parent's Stop, which is re-stamped too, so the
-# parent's completion cannot overtake them in one poll.
+# parent's completion cannot overtake them in one poll. Each event is published by a
+# rename, as the real relay does: SignalWatcher consumes a `.json` name on first
+# sight, so a poll landing mid-`printf` would drop a truncated child SessionStart for
+# good and no foreign crumb would follow.
 _NESTED_CHILD_EVENTS = r"""
 for kind in SessionStart Stop SessionEnd; do
     cts=$(date +%s%N)
     printf '{"ts": %s, "event": "%s", "task_id": "%s", "session_id": "child-1"}' \
-        "$cts" "$kind" "$tid" > "$ed/$cts-$tid-$kind.json"
+        "$cts" "$kind" "$tid" > "$ed/$cts-$tid-$kind.json.tmp"
+    mv "$ed/$cts-$tid-$kind.json.tmp" "$ed/$cts-$tid-$kind.json"
 done
 sleep 2
 """

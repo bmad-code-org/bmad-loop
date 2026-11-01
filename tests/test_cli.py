@@ -2453,6 +2453,62 @@ def test_status_json_adapter_identity_absent_for_pre_upgrade_runs(project, capsy
     assert entry["adapters_used"] == {}
 
 
+def test_status_json_adapters_used_carries_models_used(project, capsys):
+    """#859: the observed SessionRecord.models of the last stamped record per role
+    project as ``models_used``, additive — ``model`` stays the configured value and
+    the schema version does not move."""
+    from bmad_loop.model import Phase, SessionRecord, StoryTask, TokenUsage
+
+    task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    task.tokens = TokenUsage(input_tokens=10)
+    task.sessions = [
+        SessionRecord(task_id="t", role="dev", status="ok", adapter="claude", models=("old",)),
+        SessionRecord(
+            task_id="t",
+            role="dev",
+            status="ok",
+            adapter="claude",
+            model="opus",
+            models=("claude-opus-5-5", "claude-haiku-5-5"),
+        ),
+        SessionRecord(task_id="t", role="review", status="ok", adapter="codex"),
+    ]
+    _make_run_with_tokens(project, {"1-1-login": task}, weight=0.1)
+
+    doc = _status_json(project, capsys)
+    assert doc["schema_version"] == cli.STATUS_SCHEMA_VERSION == 1
+    (entry,) = doc["tasks"]
+    assert entry["adapters_used"] == {
+        "dev": {
+            "name": "claude",
+            "model": "opus",
+            "models_used": ["claude-opus-5-5", "claude-haiku-5-5"],
+        },
+        "review": {"name": "codex", "model": ""},
+    }
+
+
+def test_status_json_omits_models_used_when_unobserved(project, capsys):
+    """Present-only: a record with no observed models carries no ``models_used``
+    key (never ``[]``), so a consumer cannot mistake "unobserved" for a value.
+
+    ABLATION: write ``models_used`` unconditionally in ``status_document`` and
+    the key appears as ``[]``, failing the assertion."""
+    from bmad_loop.model import Phase, SessionRecord, StoryTask, TokenUsage
+
+    task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    task.tokens = TokenUsage(input_tokens=10)
+    task.sessions = [
+        SessionRecord(task_id="t", role="dev", status="ok", adapter="claude", model="opus")
+    ]
+    _make_run_with_tokens(project, {"1-1-login": task}, weight=0.1)
+
+    doc = _status_json(project, capsys)
+    (entry,) = doc["tasks"]
+    assert entry["adapters_used"] == {"dev": {"name": "claude", "model": "opus"}}
+    assert "models_used" not in entry["adapters_used"]["dev"]
+
+
 def test_status_json_weight_from_snapshot_and_per_task_rounding(project, capsys):
     """The run-level weighted total must be the sum of per-task weighted totals
     (sum-of-rounds), never weighted_total of the summed counters: two tasks of

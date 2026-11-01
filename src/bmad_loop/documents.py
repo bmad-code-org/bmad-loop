@@ -335,6 +335,8 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
       sessions, ``{role: {"name", "model"}}``. ``{}`` for a task whose sessions
       predate stamping (``adapter == ""``). Configured need not equal used — a
       policy edited mid-run, or a role that never ran, diverge.
+      ``models_used`` (additive, no schema bump) lists the models that record was
+      observed to run, present only when non-empty; ``model`` stays configured.
 
     Tickets mode adds two keys, additive with no schema bump: per task
     ``ticket`` (:func:`_ticket_projection`, null for a task with no ticket) and
@@ -369,10 +371,15 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
         tokens["weighted"] = task.tokens.weighted_total(weight)
         # Last stamped session per role wins (iteration is chronological); a role
         # whose only sessions predate stamping (adapter "") contributes nothing.
-        adapters_used: dict[str, dict[str, str]] = {}
+        # `models_used` (observed SessionRecord.models) only when non-empty;
+        # `model` stays the configured value.
+        adapters_used: dict[str, dict[str, object]] = {}
         for record in task.sessions:
             if record.adapter:
-                adapters_used[record.role] = {"name": record.adapter, "model": record.model}
+                used: dict[str, object] = {"name": record.adapter, "model": record.model}
+                if record.models:
+                    used["models_used"] = list(record.models)
+                adapters_used[record.role] = used
         tasks.append(
             {
                 "story_key": key,

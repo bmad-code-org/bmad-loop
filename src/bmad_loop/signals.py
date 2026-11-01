@@ -9,9 +9,11 @@ Two directories, not one (#494). The channel now lives out of the project tree,
 under the user-scoped state root (``runs.events_dir_for``), because a branch
 switch, a worktree mount or a rollback must not be able to take a live run's
 control plane away. The *legacy* in-tree ``<run_dir>/events`` stays polled as
-well, and that is the whole version-skew guard: the relay a target project has
-installed is a COPY taken at init time, so an upgraded orchestrator routinely
-drives sessions whose hook only knows the old location. Without the second poll
+well, and that is the whole version-skew guard: a target project an older init
+set up may still register a COPY of the relay script (init now registers
+``bmad-loop relay <Event>`` and recognizes the copied script only as a legacy
+registration), so an upgraded orchestrator can drive sessions whose hook only
+knows the old location. Without the second poll
 that pairing loses every Stop event and every session stalls to
 ``session_timeout_min`` — the loudest possible regression, delivered silently.
 """
@@ -68,6 +70,12 @@ class HookEvent:
     stop_error: str | None = None
     stop_error_details: str | None = None
     stop_message: str | None = None
+    # The model the CLI reports on its hook payload (#859), forwarded by the
+    # relay only as a non-empty string: Claude's SessionStart (resolved full id,
+    # may be omitted) and Codex on every hook. None for every other CLI, on an
+    # older vendored relay that predates the field, and for a non-string value.
+    # APPENDED with a default, like the fields above.
+    model: str | None = None
 
 
 # The relays' lineage tags (DW-507, events._lineage). Anything else parses as None.
@@ -103,6 +111,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
     stop_error = data.get("stop_error")
     stop_error_details = data.get("stop_error_details")
     stop_message = data.get("stop_message")
+    model = data.get("model")
     # Payload values are forwarded from the CLI unvalidated, so a non-string one
     # reads as absent rather than reaching attribution's set arithmetic (#767).
     return HookEvent(
@@ -120,6 +129,7 @@ def _parse_event(entry: Path) -> HookEvent | None:
         stop_error=stop_error if isinstance(stop_error, str) else None,
         stop_error_details=(stop_error_details if isinstance(stop_error_details, str) else None),
         stop_message=stop_message if isinstance(stop_message, str) else None,
+        model=model if isinstance(model, str) else None,
     )
 
 

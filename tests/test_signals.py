@@ -57,6 +57,23 @@ def test_parse_event_reads_the_session_start_source(tmp_path, extra, expected):
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
+        ({"model": "claude-opus-4-6[1m]"}, "claude-opus-4-6[1m]"),
+        ({"model": 3}, None),  # a non-string is dropped, not coerced
+        ({}, None),  # an older vendored relay forwards no model at all
+    ],
+)
+def test_parse_event_reads_the_hook_model(tmp_path, extra, expected):
+    """#859: the relay's forwarded hook `model` lands on the HookEvent (str only)."""
+    watcher = SignalWatcher(tmp_path / "events")
+    write_event(watcher.events_dir, 1, "t1", "SessionStart", **extra)
+    (event,) = watcher.poll()
+    assert event.event == "SessionStart"
+    assert event.model == expected
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
         ({"lineage": "match"}, "match"),
         ({"lineage": "mismatch"}, "mismatch"),
         ({"lineage": "unknown"}, "unknown"),

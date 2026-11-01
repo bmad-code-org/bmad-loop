@@ -1049,6 +1049,30 @@ def test_active_agent_idle_since_ignores_other_tasks_and_earlier_sessions():
     assert agent is not None and agent.idle_since is None
 
 
+def test_active_agent_reported_model_from_session_model_row():
+    """#859: the latest `session-model` for the open session's task sets
+    `reported_model`; one for another task, or one left behind by an EARLIER
+    session (before this session-start), is not this session's, and without one
+    `reported_model` stays None while the configured `model` is untouched.
+
+    ABLATION: drop the `_reported_model` fill in `active_agent` and the first
+    assertion reddens; drop the task_id filter and the `other` row wins."""
+    task = "1-1-alpha-dev-3"
+    stale = {"kind": "session-model", "task_id": task, "model": "claude-old"}
+    first = {"kind": "session-model", "task_id": task, "model": "claude-opus-4-6[1m]"}
+    latest = {"kind": "session-model", "task_id": task, "model": "claude-opus-5-5"}
+    other = {"kind": "session-model", "task_id": "2-2-beta-dev-1", "model": "gpt-5.5"}
+    agent = data.active_agent([stale, _stamped_start(), first, latest, other], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert agent.reported_model == "claude-opus-5-5"
+    assert agent.model == "opus"
+
+    agent = data.active_agent([stale, _stamped_start(), other], None)
+    assert isinstance(agent, data.ActiveAgent)
+    assert agent.reported_model is None
+    assert agent.model == "opus"
+
+
 def test_open_quota_wait_renders_as_quota_wait_not_idle():
     """DW-396/#610: the last `quota-wait-started` for the open session's task,
     not closed by a later `quota-wait-ended`, sets `quota_wait_since` to its
