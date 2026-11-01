@@ -15056,6 +15056,451 @@ def test_unmatched_rate_limit_stop_failure_keeps_the_stall_timing(tmp_path, monk
     assert result.stop_failure == "rate_limit"
 
 
+def _decide_dev(result, attempt=1):
+    from bmad_loop.escalation import decide_dev
+    from bmad_loop.model import StoryTask
+
+    return decide_dev(
+        StoryTask(story_key="3-1", epic=3, attempt=attempt),
+        result,
+        None,
+        Policy(limits=LimitsPolicy()),
+    )
+
+
+def _dies_at(q, call):
+    """Kill `q`'s window from wait call `call` on (a `_drive_quota` script)."""
+    alive = {"v": True}
+    q.adapter._window_alive = lambda handle: alive["v"]
+
+    def script(call_n):
+        if call_n >= call:
+            alive["v"] = False
+
+    return script
+
+
+def test_account_stop_failure_then_window_death_is_parked_not_charged(tmp_path, monkeypatch):
+    """#959: the user's own StopFailure hook kills the window, so the stall
+    re-probe finds it dead. The latched account error still labels the crash
+    parked, with the live exit's evidence, and the dev decider pauses it
+    uncharged instead of retrying.
+
+    Ablation: drop the account arm of `_relabel_dead_window` and this fails on
+    `parked is False` (and a RETRY)."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("billing_error", "Credit balance is too low")],
+        alive=lambda handle: False,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert (result.status, result.parked) == ("crashed", True)
+    assert result.parked_evidence == "StopFailure(billing_error): Credit balance is too low"
+    assert result.usage_limited is None
+    assert result.stop_failure == "billing_error"
+    assert result.stop_failure_action == "account"
+    assert result.stop_seen is False
+    assert mux.sent == []
+    (crumb,) = _lifecycle_events(adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("account", "billing_error")
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev(result)
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("parked: dev session crashed (StopFailure(billing_error)")
+
+
+def test_blocked_rate_limit_stop_failure_then_window_death_is_usage_limited(tmp_path, monkeypatch):
+    """#959: a blocked usage StopFailure, then a dead window at the stall
+    re-probe: the crash carries the usage-limit labels, so the env-fault
+    classifier's usage shortcut stamps it and the decider pauses uncharged.
+
+    Ablation: drop the blocked/wait arm of `_relabel_dead_window` and this fails
+    on `usage_limited is None` (and a RETRY)."""
+    adapter, _ = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("rate_limit", USAGE_CREDITS_LINE)],
+        alive=lambda handle: False,
+    )
+    spec = _dev_spec(tmp_path)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    pattern = adapter.profile.usage_limit_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_CREDITS_LINE.strip()}"
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_BLOCKED
+    assert result.usage_limit_resets is None
+    assert result.stop_failure_action == "rate_limit"
+    result = adapter._classify_env_fault(_dev_handle(), spec, result)
+    assert result.env_fault is True
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev(result)
+    assert decision.action == Action.PAUSE
+    assert decision.usage_limit is not None
+    assert decision.usage_limit.limit_class == USAGE_LIMIT_BLOCKED
+
+
+def test_wait_rate_limit_stop_failure_then_window_death_is_usage_limited(tmp_path, monkeypatch):
+    """#959: a wait-class usage StopFailure latches its reset; the window dies
+    before any quota wait admits. The crash is usage-limited WAIT with the
+    reset carried.
+
+    Ablation: drop the blocked/wait arm of `_relabel_dead_window` and this fails
+    on `usage_limited is None`."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+        script=_dies_at(q, 3),
+    )
+    pattern = q.adapter.profile.usage_wait_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    (crumb,) = _lifecycle_events(q.adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("wait", "rate_limit")
+    result = q.adapter._classify_env_fault(_dev_handle(), _quota_spec(tmp_path), result)
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev(result)
+    assert decision.action == Action.PAUSE
+    assert decision.usage_limit is not None
+
+
+def test_pane_quota_wait_then_window_death_is_usage_limited(tmp_path, monkeypatch):
+    """#959: no StopFailure (a pre-2.1.78 claude, or another CLI); the pane's
+    wait line opened a quota wait and the window died inside it. The crash
+    carries the wait's evidence and reset as a WAIT usage limit.
+
+    Ablation: drop the quota-wait arm of `_relabel_dead_window` and this fails
+    on `usage_limited is None`."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(q, _quota_spec(tmp_path), script=_dies_at(q, 8))
+    assert len(_lifecycle_events(q.adapter, "quota-wait-started")) == 1
+    assert result.status == "crashed"
+    assert result.usage_limited == q.wait_evidence()
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.stop_failure is None
+    assert result.stop_failure_action is None
+    (crumb,) = _lifecycle_events(q.adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("quota-wait", None)
+    # The open wait is still closed for the journal on the way out.
+    assert q.quota_kinds() == ["quota-wait-started", "quota-wait-ended"]
+
+
+def test_unmatched_rate_limit_then_window_death_stays_charged(tmp_path, monkeypatch):
+    """An ordinary 429 (`rate_limit` matching neither usage list) leaves no
+    classification: the dead window is a plain crash, charged as today."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={2: _stop_failure_event("rate_limit", "API Error: 429 Too Many Requests")},
+        script=_dies_at(q, 3),
+    )
+    assert result.status == "crashed"
+    assert (result.usage_limited, result.parked) == (None, False)
+    assert result.stop_failure == "rate_limit"
+    assert result.stop_failure_action == "rate_limit"
+    assert _lifecycle_events(q.adapter, "crash-relabeled") == []
+    from bmad_loop.escalation import Action
+
+    assert _decide_dev(result).action == Action.RETRY
+
+
+def test_a_stop_clears_the_stop_failure_kind(tmp_path, monkeypatch):
+    """A Stop after a wait-class StopFailure proves the turn recovered: the
+    window dying afterwards is a plain crash. (An account StopFailure exits at
+    once, so no Stop can follow it.)"""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={
+            2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE),
+            3: _stop_event("3-1-dev-1", "sess", str(q.transcript)),
+        },
+        script=_dies_at(q, 4),
+    )
+    assert result.status == "crashed"
+    assert (result.usage_limited, result.parked) == (None, False)
+    assert (result.stop_failure, result.stop_failure_action) == (None, None)
+    assert _lifecycle_events(q.adapter, "crash-relabeled") == []
+
+
+def test_transcript_activity_clears_a_wait_kind(tmp_path, monkeypatch):
+    """A transcript write after a wait-class StopFailure is a CLI that went on
+    by itself: the classification clears (crumbed), and a later window death is
+    a plain crash. The error itself stays latched.
+
+    Ablation: drop the `stop-failure-kind-cleared` clear and this fails on a
+    usage-limited result."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    dies = _dies_at(q, 5)
+
+    def script(call_n):
+        if call_n == 3:
+            _grow(q.transcript, _assistant_line())
+        dies(call_n)
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+        script=script,
+    )
+    (cleared,) = _lifecycle_events(q.adapter, "stop-failure-kind-cleared")
+    assert (cleared["error"], cleared["stop_failure_kind"]) == ("rate_limit", "wait")
+    assert result.status == "crashed"
+    assert (result.usage_limited, result.parked) == (None, False)
+    assert result.stop_failure == "rate_limit"
+    assert _lifecycle_events(q.adapter, "crash-relabeled") == []
+
+
+def test_crash_with_a_result_json_is_not_relabeled(tmp_path, monkeypatch):
+    """The crash-path read-back still wins: a window that dies after a latched
+    wait-class StopFailure but with the terminal spec on disk completes, with
+    no usage-limit or parked label."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    dies = _dies_at(q, 3)
+
+    def script(call_n):
+        if call_n == 3:
+            _grow(q.log, b"worked on the story\n" * 200)  # the #261 proof of work
+            q.finish_spec()
+        dies(call_n)
+
+    result = _drive_quota(
+        q,
+        _quota_spec(tmp_path),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+        script=script,
+    )
+    assert result.status == "completed"
+    assert result.result_json is not None
+    assert (result.usage_limited, result.parked, result.usage_limit_class) == (None, False, None)
+    assert _lifecycle_events(q.adapter, "crash-relabeled") == []
+
+
+@pytest.mark.parametrize("alive", [True, False])
+def test_stop_failure_action_is_stamped_on_every_exit(tmp_path, monkeypatch, alive):
+    """The mapped action rides out with the error on the live (stalled) exit
+    and the dead-window (crashed) one alike."""
+    adapter, _ = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("authentication_failed", "Invalid API key")],
+        alive=lambda handle: alive,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == ("stalled" if alive else "crashed")
+    assert result.parked is True
+    assert (result.stop_failure, result.stop_failure_action) == ("authentication_failed", "account")
+
+
+# --- usage-relaunch mode (#959): the adapter ends a usage-limited session at
+# once so the engine can relaunch it uncharged ---
+
+HTTP_429 = "API Error: 429 Too Many Requests"
+
+
+def _relaunch_spec(spec: SessionSpec, *, left: bool = True) -> SessionSpec:
+    return dataclasses.replace(spec, usage_relaunch_mode=True, usage_relaunch_left=left)
+
+
+def _decide_dev_relaunch(result, *, usage_relaunches=0):
+    from bmad_loop.escalation import decide_dev
+    from bmad_loop.model import StoryTask
+
+    task = StoryTask(story_key="3-1", epic=3, attempt=1 + usage_relaunches)
+    task.dev_usage_relaunches = usage_relaunches
+    return decide_dev(
+        task, result, None, Policy(limits=LimitsPolicy(usage_limit_action="relaunch"))
+    )
+
+
+def test_relaunch_mode_wait_stop_failure_exits_at_once(tmp_path, monkeypatch):
+    """Relaunch budget left: a wait-class usage StopFailure ends the session at
+    the event, stalled + usage-limited WAIT with the reset carried, instead of
+    waiting for the quota wait to admit. The decider relaunches it uncharged.
+
+    Ablation: drop the WAIT arm's `usage_relaunch_left` exit and the quota wait
+    admits on the hook's line instead (`quota-wait-started`)."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _relaunch_spec(_quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0)),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+    )
+    pattern = q.adapter.profile.usage_wait_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert q.adapter.watcher.calls == 2  # the StopFailure's own tick
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert (skipped["reason"], skipped["evidence"]) == ("usage-relaunch", evidence)
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.stop_seen is False
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+
+
+@pytest.mark.parametrize("left", [True, False])
+def test_relaunch_mode_unmatched_rate_limit_exits_usage_limited(tmp_path, monkeypatch, left):
+    """Relaunch mode reads a `rate_limit` matching neither usage list as a
+    wait-class usage limit and ends the session at the event, both with budget
+    left (the engine relaunches) and at the cap (the engine pauses uncharged at
+    once instead of after a stall grace).
+
+    Ablation: drop the unmatched arm's relaunch-mode exit and the session
+    stalls unlabeled after the wake nudges, as outside the mode."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", HTTP_429)]
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), _relaunch_spec(_dev_spec(tmp_path), left=left)
+    )
+    evidence = f"StopFailure(rate_limit): {HTTP_429}"
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+    assert (crumb["error"], crumb["relaunch_mode"]) == ("rate_limit", True)
+    assert mux.sent == []
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.parked_evidence == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets is None
+    from bmad_loop.escalation import Action
+
+    if left:
+        decision = _decide_dev_relaunch(result)
+        assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+    else:
+        decision = _decide_dev_relaunch(result, usage_relaunches=3)
+        assert decision.action == Action.PAUSE
+        assert decision.usage_limit is not None
+
+
+def test_unmatched_rate_limit_without_relaunch_mode_keeps_the_stall_timing(tmp_path, monkeypatch):
+    """Outside relaunch mode an unmatched `rate_limit` stays an unclassified
+    error: crumbed without `relaunch_mode`, no early exit, and the grace expiry
+    stalls it unlabeled after the wake nudges."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", HTTP_429)]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+    assert "relaunch_mode" not in crumb
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    assert (result.status, result.parked, result.usage_limited) == ("stalled", False, None)
+    assert _lifecycle_events(adapter, "quota-wait-skipped") == []
+
+
+def test_relaunch_mode_at_the_cap_keeps_the_quota_wait(tmp_path, monkeypatch):
+    """At the relaunch cap (`left` False) the pane's wait line admits the quota
+    wait as in pause mode: the engine would only pause, so the session may as
+    well wait out the reset."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(
+        q, _relaunch_spec(_quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0), left=False)
+    )
+    assert len(_lifecycle_events(q.adapter, "quota-wait-started")) == 1
+    assert _lifecycle_events(q.adapter, "quota-wait-skipped") == []
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == q.wait_evidence()
+    assert result.quota_wait_s is not None and result.quota_wait_s > 0
+
+
+def test_relaunch_left_skips_the_quota_wait_admission(tmp_path, monkeypatch):
+    """Relaunch budget left: where the pane's wait line would admit the quota
+    wait, the session ends stalled + usage-limited WAIT instead, crumbed
+    `quota-wait-skipped` with `reason="usage-relaunch"`.
+
+    Ablation: drop the admission's `usage_relaunch_left` exit and the wait opens
+    (`quota-wait-started`)."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(q, _relaunch_spec(_quota_spec(tmp_path)))
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert skipped["reason"] == "usage-relaunch"
+    assert skipped["evidence"] == q.wait_evidence()
+    assert skipped["resets_at"] == QUOTA_RESETS
+    assert q.clock["mono"] == 1090.0  # the admission tick, not a later one
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == q.wait_evidence()
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert not result.quota_wait_s  # no wait ever opened
+
+
+def test_relaunch_skip_then_window_death_at_the_reprobe_keeps_the_pane_evidence(
+    tmp_path, monkeypatch
+):
+    """Relaunch budget left, a pane-only wait line (no StopFailure latch, no
+    quota wait opened), and a window that dies between the admission's pane
+    look and the stall exit's liveness re-probe: the crash keeps the evidence
+    read while it was alive, so the decider relaunches it uncharged.
+
+    Ablation: drop the `usage_now` labels on `stall_exit`'s dead branch and this
+    fails on `usage_limited is None`."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    probe = q.adapter._probe_liveness
+    q.adapter._probe_liveness = lambda handle, site: (
+        False if site == "stall" else probe(handle, site)
+    )
+    result = _drive_quota(q, _relaunch_spec(_quota_spec(tmp_path)))
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert skipped["reason"] == "usage-relaunch"
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == q.wait_evidence()
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    (crumb,) = _lifecycle_events(q.adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("stall-exit", None)
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+
+
+def test_relaunch_mode_unmatched_then_window_death_is_usage_limited(tmp_path, monkeypatch):
+    """Relaunch mode, an unmatched `rate_limit`, and a window already dead at
+    the exit's liveness re-probe: the funnel labels the crash a WAIT usage
+    limit, so the decider relaunches it uncharged instead of charging a crash.
+
+    Ablation: drop the unmatched arm of `_relabel_dead_window` and this fails on
+    `usage_limited is None`."""
+    adapter, _ = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("rate_limit", HTTP_429)],
+        alive=lambda handle: False,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _relaunch_spec(_dev_spec(tmp_path)))
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == f"StopFailure(rate_limit): {HTTP_429}"
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets is None
+    (crumb,) = _lifecycle_events(adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("unmatched", "rate_limit")
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+
+
 def test_rate_limit_stop_failure_match_timeout_is_crumbed(tmp_path, monkeypatch):
     adapter, _ = _parked_adapter(
         tmp_path, monkeypatch, [_stop_failure_event("rate_limit", USAGE_CREDITS_LINE)]

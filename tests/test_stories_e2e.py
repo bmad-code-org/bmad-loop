@@ -333,6 +333,30 @@ exit 0
 """
 assert TIMEOUT_FAKE_CLI.count(_PARENT_START) == 1
 STOP_FAILURE_FAKE_CLI = TIMEOUT_FAKE_CLI.replace(_PARENT_START, _PARENT_START + _STOP_FAILURE_EVENT)
+# #959: the CLI's window dies right after the StopFailure (as when an operator's own
+# StopFailure hook kills it to rotate accounts). The watcher's 1 s poll reads the
+# event only after the window is gone, so the stall re-probe finds it dead.
+assert STOP_FAILURE_FAKE_CLI.count("sleep 30\nexit 0\n") == 1
+STOP_FAILURE_DIES_FAKE_CLI = STOP_FAILURE_FAKE_CLI.replace("sleep 30\nexit 0\n", "exit 0\n")
+
+# #959 usage-limit relaunch: FAKE_CLI with a launch counter in the run dir. Every
+# launch records the `BMAD_LOOP_USAGE_RELAUNCH` it got; launch 1 then ends its turn
+# on a `rate_limit` StopFailure whose message matches no usage pattern (the profile
+# declares none) and sleeps, so only relaunch mode's at-once exit ends it in time.
+# Launch 2 falls through to FAKE_CLI's sprint path and completes the story.
+_RELAUNCH_ONCE = r"""n=$(cat "$rd/fake-launches" 2>/dev/null || echo 0)
+n=$(( n + 1 ))
+printf '%s' "$n" > "$rd/fake-launches"
+printf '%s' "${BMAD_LOOP_USAGE_RELAUNCH-unset}" > "$rd/tasks/$tid/usage-relaunch.txt"
+if [ "$n" = 1 ]; then
+    ts2=$(( ts + 1 ))
+    printf '{"ts": %s, "event": "StopFailure", "task_id": "%s", "session_id": "fake-1", "stop_error": "rate_limit", "stop_message": "API Error: 429 Too Many Requests"}' \
+        "$ts2" "$tid" > "$ed/$ts2-$tid-StopFailure.json"
+    sleep 30
+    exit 0
+fi
+"""
+USAGE_RELAUNCH_FAKE_CLI = FAKE_CLI.replace(_PARENT_START, _PARENT_START + _RELAUNCH_ONCE)
 
 # PROFILE_TOML with the canonical StopFailure mapped and one account error, as
 # claude's own profile maps it.
@@ -343,6 +367,9 @@ STOP_FAILURE_PROFILE_TOML = PROFILE_TOML.replace(
     'events = {{ SessionStart = "SessionStart", Stop = "Stop", StopFailure = "StopFailure" }}\n'
     "\n[hooks.stop_failure_types]\n"
     'billing_error = "account"\n',
+)
+USAGE_RELAUNCH_PROFILE_TOML = STOP_FAILURE_PROFILE_TOML.replace(
+    'billing_error = "account"\n', 'billing_error = "account"\nrate_limit = "rate_limit"\n'
 )
 
 # DW-159: publication must not precede the session transition. `$!` names the child
@@ -2059,6 +2086,128 @@ def test_e2e_stop_failure_account_error_pauses_uncharged(
         assert end["task_id"][-40:] not in windows and len(windows) == 1, windows
     finally:
         # The paused run left its session for a resume that never comes.
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
+
+
+def test_e2e_stop_failure_then_window_death_pauses_uncharged(
+    tmp_path, monkeypatch, private_tmux_server
+):
+    """#959 end to end through the real binary + real tmux, zero tokens: the CLI
+    fires `StopFailure(billing_error)` and its window dies at once. The session
+    ends `crashed`, but the latched account error labels it parked, so the engine
+    PAUSEs uncharged instead of retrying: two dev attempts are allowed and exactly
+    one session ran."""
+    root = tmp_path / "sbx"
+    story = "1-1-stopfail-dies"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=STOP_FAILURE_DIES_FAKE_CLI,
+        extra_policy="\n[limits]\nmax_dev_attempts = 2\nteardown_grace_s = 5\n",
+        profile_toml=STOP_FAILURE_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=90)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") == "escalation", state
+        reason = str(state.get("paused_reason", ""))
+        assert reason.startswith("parked: dev session crashed (StopFailure(billing_error)"), reason
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert len(ends) == 1, [j["kind"] for j in journal]
+        [end] = ends
+        assert end["status"] == "crashed", end
+        assert end["parked"] is True, end
+        assert end["stop_failure"] == "billing_error", end
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert [d["action"] for d in decisions] == ["pause"], decisions
+        assert state["tasks"][story]["attempt"] == 1, state["tasks"][story]
+    finally:
+        # The paused run left its session for a resume that never comes.
+        if run_id is not None:
+            subprocess.run(
+                ["tmux", "-S", str(private_tmux_server), "kill-session"]
+                + ["-t", f"=bmad-loop-{run_id}"],
+                capture_output=True,
+            )
+
+
+def test_e2e_usage_limit_relaunch_is_uncharged(tmp_path, monkeypatch, private_tmux_server):
+    """#959 end to end through the real binary + real tmux, zero tokens: in
+    `usage_limit_action = "relaunch"` mode, a `rate_limit` StopFailure matching no
+    usage pattern ends dev session 1 at the event, usage-limited. The engine
+    relaunches the story without charging an attempt (one attempt allowed, two
+    sessions ran), session 2 gets `BMAD_LOOP_USAGE_RELAUNCH=1` and completes the
+    story. The 120 s session timeout is far beyond the run's bound, so only the
+    relaunch-mode exit can end session 1 in time."""
+    root = tmp_path / "sbx"
+    story = "1-1-relaunch"
+    _scaffold_sprint(
+        root,
+        story,
+        fake_cli=USAGE_RELAUNCH_FAKE_CLI,
+        extra_policy=(
+            "\n[limits]\nmax_dev_attempts = 1\nteardown_grace_s = 5\n"
+            'usage_limit_action = "relaunch"\n'
+        ),
+        profile_toml=USAGE_RELAUNCH_PROFILE_TOML,
+    )
+    # inherited by the `bmad-loop run` subprocess (_run passes no env=)
+    monkeypatch.setenv("BMAD_LOOP_SESSION_TIMEOUT_S", "120")
+    run_id: str | None = None
+    try:
+        proc = _run(root, "run", timeout=120)
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        run_id = _run_id(root)
+        run_dir = root / ".bmad-loop" / "runs" / run_id
+
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        assert state.get("paused_stage") is None, state
+        task = state["tasks"][story]
+        assert task["attempt"] == 2, task
+        assert task["dev_usage_relaunches"] == 1, task
+        assert task["phase"] == "done", task
+        assert _sprint_status(root, story) == "done"
+
+        journal = [
+            json.loads(ln)
+            for ln in (run_dir / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        ends = [j for j in journal if j["kind"] == "session-end"]
+        assert [e["status"] for e in ends] == ["stalled", "completed"], ends
+        assert ends[0]["stop_failure"] == "rate_limit", ends[0]
+        decisions = [j for j in journal if j["kind"] == "dev-decision"]
+        assert decisions[0]["action"] == "retry", decisions
+        assert decisions[0]["uncharged"] is True, decisions
+        assert decisions[0]["usage_relaunches"] == 1, decisions
+        assert not any(j["kind"] == "story-deferred" for j in journal), journal
+
+        seen = {
+            e["task_id"]: (run_dir / "tasks" / e["task_id"] / "usage-relaunch.txt").read_text(
+                encoding="utf-8"
+            )
+            for e in ends
+        }
+        assert [seen[e["task_id"]] for e in ends] == ["unset", "1"], seen
+    finally:
         if run_id is not None:
             subprocess.run(
                 ["tmux", "-S", str(private_tmux_server), "kill-session"]

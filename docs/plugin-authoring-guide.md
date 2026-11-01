@@ -711,6 +711,53 @@ before the gate is classified, so it is never published.
 | `pre_session`  | before **every** session (after the role-specific `pre_*_session`, so it sees its mutations) | `proposed_prompt`, `proposed_env`, veto |
 | `post_session` | after every session                                                                          | —                                       |
 
+#### Account rotation
+
+bmad-loop does not switch coding-CLI accounts. With `[limits] usage_limit_action =
+"relaunch"` it relaunches a story whose session ended on a usage limit without charging
+an attempt (see [Usage-limit pauses](escalations-guide.md#usage-limit-pauses)), and the
+relaunched session's environment carries `BMAD_LOOP_USAGE_RELAUNCH=<n>`, the story's
+relaunch count so far. It is unset until the story's first relaunch, and stays set on
+every later dev, fix and review session of that story. Switching accounts is left to you.
+Claude Code keeps one account per config directory, so point `CLAUDE_CONFIG_DIR` at a
+different one:
+
+- **A wrapper `binary`.** A project profile overlay
+  (`.bmad-loop/profiles/claude.toml`, a copy of the shipped profile) names your script as
+  `binary`. The script picks the config directory and `exec`s `claude`.
+- **A `pre_session` plugin.** The hook sees the session environment in
+  `ctx.proposed_env`, `BMAD_LOOP_USAGE_RELAUNCH` included, and sets `CLAUDE_CONFIG_DIR`
+  there.
+
+Rotate once per relaunch, not on every session that carries the variable: remember the
+highest count you rotated on for each run and story (`BMAD_LOOP_RUN_DIR`,
+`BMAD_LOOP_STORY_KEY`), and switch only when the count goes past it. A wrapper sketch:
+
+```bash
+#!/usr/bin/env bash
+accounts=("$HOME/.claude-a" "$HOME/.claude-b")   # each logged in once by hand
+state="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rotate"; mkdir -p "$state"
+idx=$(cat "$state/index" 2>/dev/null || echo 0)
+seen="$state/seen-$(basename "${BMAD_LOOP_RUN_DIR:-none}")-${BMAD_LOOP_STORY_KEY:-none}"
+n="${BMAD_LOOP_USAGE_RELAUNCH:-0}"
+if [ "$n" -gt "$(cat "$seen" 2>/dev/null || echo 0)" ]; then
+    idx=$(( (idx + 1) % ${#accounts[@]} ))
+    printf '%s' "$idx" > "$state/index"; printf '%s' "$n" > "$seen"
+fi
+CLAUDE_CONFIG_DIR="${accounts[$idx]}" exec claude "$@"
+```
+
+Before relying on it:
+
+- Each config directory needs its own one-time setup: log in, trust the project
+  workspace, and accept the bypass-permissions prompt. A directory that skipped a step
+  parks the session on that dialog.
+- Hooks you added to your own user settings (a `StopFailure` hook, for example) live in
+  one config directory; copy them to every directory you rotate through. bmad-loop's own
+  relay hooks are in the project's `.claude/settings.json` and work with any directory.
+- Never commit, ship or log credentials. Keep the config directories outside the project
+  tree, and never echo their contents from a hook or wrapper.
+
 ### Sweep (deferred-work cycle — bundles inherit all per-story stages)
 
 | Stage                                                  | When                             |

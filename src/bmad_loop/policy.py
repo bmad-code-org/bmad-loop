@@ -32,6 +32,8 @@ POLICY_FILE = Path(".bmad-loop") / "policy.toml"
 GATE_MODES = {"none", "per-epic", "per-story-spec-approval"}
 RETRO_MODES = {"never", "notify", "auto"}
 SESSION_BUDGET_MODES = {"off", "warn", "enforce"}
+# [limits] usage_limit_action: what a usage-limited session end does (#959).
+USAGE_LIMIT_ACTIONS = frozenset({"pause", "relaunch"})
 SWEEP_AUTO_MODES = {"never", "per-epic", "run-end"}
 REVIEW_TRIGGER_MODES = {"always", "recommended"}
 REVIEW_ON_TIMEOUT_MODES = {"retry", "salvage-if-done", "defer"}
@@ -199,6 +201,18 @@ class LimitsPolicy:
     # enforce mode: seconds a tripped session gets to wrap up after the nudge
     # before it is terminated over_budget. 0 = terminate at trip, no nudge.
     session_budget_grace_s: int = 240
+    # what a dev/review/fix session that ended without completing because of a
+    # usage limit (or an account-level StopFailure) does (#959). "pause" = the
+    # uncharged usage-limit pause `resolve` clears. "relaunch" = relaunch the
+    # session at once as an UNCHARGED retry (attempt/review_cycle still bump for
+    # session identity; a refund counter keeps the budget whole), so a wrapper
+    # or pre_session plugin can rotate accounts keyed on BMAD_LOOP_USAGE_RELAUNCH.
+    usage_limit_action: str = "pause"
+    # relaunch mode: the per-story cap on uncharged usage relaunches (dev, fix
+    # and review together). At the cap the session falls back to the pause, so
+    # a repeated or forged limit signal can never loop unbounded. 0 = relaunch
+    # mode never relaunches (always pauses).
+    max_usage_relaunches: int = 3
 
 
 @dataclass(frozen=True)
@@ -1081,6 +1095,12 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         session_budget_grace_s=_typed_int(
             limits_d, "limits", "session_budget_grace_s", LimitsPolicy.session_budget_grace_s
         ),
+        usage_limit_action=_typed_str(
+            limits_d, "limits", "usage_limit_action", LimitsPolicy.usage_limit_action
+        ).strip(),
+        max_usage_relaunches=_typed_int(
+            limits_d, "limits", "max_usage_relaunches", LimitsPolicy.max_usage_relaunches
+        ),
     )
     if limits.max_review_cycles < 1 or limits.max_dev_attempts < 1:
         raise PolicyError("limits.max_review_cycles and limits.max_dev_attempts must be >= 1")
@@ -1137,6 +1157,15 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         raise PolicyError(
             f"limits.session_budget_mode must be one of {sorted(SESSION_BUDGET_MODES)}: "
             f"got {limits.session_budget_mode!r}"
+        )
+    if limits.usage_limit_action not in USAGE_LIMIT_ACTIONS:
+        raise PolicyError(
+            f"limits.usage_limit_action must be one of {sorted(USAGE_LIMIT_ACTIONS)}: "
+            f"got {limits.usage_limit_action!r}"
+        )
+    if limits.max_usage_relaunches < 0:
+        raise PolicyError(
+            f"limits.max_usage_relaunches must be >= 0: got {limits.max_usage_relaunches}"
         )
     if limits.max_tokens_per_story < 1:
         raise PolicyError(
@@ -1576,6 +1605,8 @@ cache_read_weight = 0.1      # cache reads bill at ~0.1x input on all vendors; 1
 session_budget_mode = "warn"  # off | warn | enforce — weighted per-SESSION cap sampled every ~30s mid-session; warn = one ATTENTION + breadcrumb; enforce = wrap-up nudge (best-effort courtesy; the kill is the guarantee) then over_budget termination (retry→defer). Live-verified on claude; other transcript parsers sample best-effort (mid-turn flush unverified); inert where no mid-session usage signal exists (usage_parser "none", copilot's shutdown-only flush)
 max_tokens_per_session = 4000000 # weighted cap a single session may spend before the guard trips; healthy sessions run ~1-2.5M weighted, so the default trips only true runaways (#158)
 session_budget_grace_s = 240 # enforce mode: seconds a tripped session gets to wrap up after the nudge before over_budget termination. 0 = terminate at trip, no nudge
+usage_limit_action = "pause" # pause | relaunch — a session that ends on a usage limit or account StopFailure: pause = the uncharged usage-limit pause; relaunch = relaunch it at once as an uncharged retry (BMAD_LOOP_USAGE_RELAUNCH=<n> in the session env, for account rotation) (#959)
+max_usage_relaunches = 3     # relaunch mode: uncharged usage relaunches per story (dev, fix and review together); at the cap the session pauses instead. 0 = always pause
 
 [verify]
 # Deterministic gates run by the orchestrator after a clean review, before commit.

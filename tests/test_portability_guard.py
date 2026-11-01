@@ -1111,6 +1111,11 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `run-paused` (DW-591): a usage-limit pause's resolved reset — always an
         # ISO-8601 instant (`usagereset.resolved_reset`), never the raw clause.
         "usage_limit_reset_at",
+        # `dev-decision` / `fix-decision` / `review-retry` (#959): whether the
+        # routing was an uncharged usage relaunch (a bare boolean), and the story's
+        # running count of them (an int).
+        "uncharged",
+        "usage_relaunches",
         "verification_sequence",
         "verification_stage",
         "via",

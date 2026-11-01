@@ -532,13 +532,44 @@ The generic adapter acts on it when it arrives, by action:
   offers none, so a backend that cannot capture its pane can still admit the wait. No
   match leaves `stop-failure-rate-limit-unmatched` and the usual stall timing. A match
   that blows the per-pattern timeout leaves `stop-failure-probe-failed` and counts as no
-  match.
+  match. In usage-relaunch mode (see below) a wait match and an unmatched value end the
+  session at once instead.
 - **`ignore`**: nothing beyond the crumb.
 
 Every event leaves a `stop-failure` lifecycle crumb (error, action, details, a message
 excerpt); an unmapped value also leaves `stop-failure-unmapped` and keeps the usual stall
 timing. A later `Stop` clears the latch. `SessionResult.stop_failure` carries the last
-uncleared error, as does the heartbeat and the `session-end` journal entry.
+uncleared error, as does the heartbeat and the `session-end` journal entry, and
+`SessionResult.stop_failure_action` its mapped action.
+
+**A window that dies after the event.** An operator's own `StopFailure` hook may kill the
+window, for example to switch accounts. The session then ends `crashed`, but an `account`
+error, or a `rate_limit` that matched a usage list, keeps its classification: the result
+is labeled `parked` (account) or `usage_limited` (blocked or wait class), and the run gets
+the same uncharged pause as the live exit. The adapter leaves a `crash-relabeled`
+lifecycle crumb (`kind`, `error`). A `Stop` clears the classification, and so does a
+transcript write after the event, since the CLI recovered by itself. A crash whose result
+file exists is completed as before and never relabeled. An unmatched `rate_limit` stays an
+unlabeled, charged crash outside usage-relaunch mode.
+
+**Usage-relaunch mode.** With `[limits] usage_limit_action = "relaunch"`, primary dev and
+review sessions are launched with two flags on `SessionSpec`: `usage_relaunch_mode`, and
+`usage_relaunch_left` while the story has relaunches left under
+`limits.max_usage_relaunches`. Then:
+
+- a `rate_limit` that matches neither usage list counts as a wait-class usage limit. The
+  session ends `stalled` + `parked` + `usage_limited` at once, with the evidence
+  `StopFailure(<error>): <message, else "no message">` and no reset. The
+  `stop-failure-rate-limit-unmatched` crumb carries `relaunch_mode=True`. A window that
+  dies after it is relabeled `usage_limited` the same way (`crash-relabeled`,
+  `kind="unmatched"`). This holds at the cap too, where the engine pauses uncharged at
+  once instead of after a stall grace.
+- with relaunches left, a `rate_limit` that matched `usage_wait_patterns` ends the session
+  at the event instead of waiting for the quota wait (`quota-wait-skipped`,
+  `reason="usage-relaunch"`).
+
+The engine relaunches such a session without charging an attempt (see
+[Usage-limit pauses](escalations-guide.md#usage-limit-pauses)).
 
 The shipped `claude` profile maps the documented values: `overloaded`, `server_error`,
 `unknown`, `max_output_tokens` and `invalid_request` (a context-shape failure that a fresh
@@ -691,8 +722,9 @@ matched evidence. **When the session timeout fires**, one capture against both l
 `usage_limited` on the `timeout` result. Neither gate takes a usage match from a session
 that is visibly working: a transcript written within the last 90 s (as of the last
 heartbeat) or an unanswered tool call means the line is left over from a limit it
-recovered from, and the stall or timeout is an ordinary one. A dead window is never
-usage-limited.
+recovered from, and the stall or timeout is an ordinary one. A dead window is
+usage-limited only when it died during a quota wait or after a usage `StopFailure` (see
+[StopFailure signals](#stopfailure-signals)).
 
 A `usage_limited` result is classified as an environment fault with no token-usage
 overrule and no tail scan, and pauses with a `usage limit:` reason (see
@@ -726,6 +758,15 @@ stretch it, the session ends `stalled` + `parked` + `usage_limited` (`quota-wait
 line whose parsed reset lies beyond the remaining cap is not waited on: the session ends
 the same way at once (`quota-wait-skipped`, `reason="reset-beyond-cap"`). An unresolved
 reset is admitted, and the cap bounds it.
+
+A window that dies during the wait ends
+`crashed` with the wait's evidence and reset as a wait-class `usage_limited`
+(`crash-relabeled`, `kind="quota-wait"`).
+
+In usage-relaunch mode with relaunches left (`SessionSpec.usage_relaunch_left`), no wait
+is admitted: where it would open, the session ends `stalled` + `parked` + `usage_limited`
+at once (`quota-wait-skipped`, `reason="usage-relaunch"`), so the engine can relaunch the
+story uncharged. At the cap the wait admits as usual.
 
 The `opencode-http` adapter runs its own wait loop with no pane, so neither the usage gate
 nor the quota wait applies there.

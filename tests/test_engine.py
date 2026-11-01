@@ -26824,3 +26824,272 @@ def test_rollback_discards_frontmatter_only_plan(project_v7):
 
     assert tree.discards == ["1.1"]
     assert tree.marks == []
+
+
+# ---------------------------------------------------------------------------
+# #959: opt-in uncharged usage relaunch (`limits.usage_limit_action = "relaunch"`)
+
+
+def _relaunch_policy(*, review: ReviewPolicy | None = None, **limits) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(usage_limit_action="relaunch", **limits),
+        **({"review": review} if review is not None else {}),
+    )
+
+
+def test_relaunch_mode_relaunches_a_usage_limited_dev_session_uncharged(project):
+    """#959: in relaunch mode a usage-limited dev session is relaunched as an
+    uncharged RETRY, even on the last attempt (`max_dev_attempts=1`): the second
+    session runs, the story commits, `attempt` still bumps (session identity) and
+    the refund keeps the charged count at 1. ABLATION, performed: drop the
+    `usage_relaunch` arm in `decide_dev` and the run pauses on the usage limit
+    after one session."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [_usage_limited(env_fault=True), dev_effect(project, "1-1-a", followup_review=False)],
+        policy=_relaunch_policy(max_dev_attempts=1),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    assert adapter.sessions[0].task_id != adapter.sessions[1].task_id
+    task = engine.state.tasks["1-1-a"]
+    assert (task.attempt, task.dev_usage_relaunches, task.charged_attempts) == (2, 1, 1)
+    on_disk = load_state(engine.run_dir).tasks["1-1-a"]
+    assert on_disk.dev_usage_relaunches == 1
+    first, second = _rows(engine, "dev-decision")
+    assert first["action"] == "retry" and first["uncharged"] is True
+    assert first["usage_relaunches"] == 1
+    assert first["reason"].startswith("usage relaunch (1/3): ")
+    assert second["action"] == "proceed" and second["uncharged"] is False
+
+
+def test_relaunch_cap_pauses_uncharged(project):
+    """#959: at `max_usage_relaunches` the usage-limited session takes today's
+    uncharged usage-limit pause instead of another relaunch. ABLATION, performed:
+    drop the cap check in `usage_relaunch` and a third session is launched (the
+    script runs out and the run crashes instead of pausing)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [_usage_limited(env_fault=True), _usage_limited(env_fault=True)],
+        policy=_relaunch_policy(max_usage_relaunches=1),
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    assert engine.state.paused_reason is not None
+    assert engine.state.paused_reason.startswith("usage limit: dev session stalled")
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert (task.attempt, task.dev_usage_relaunches) == (2, 1)
+    first, second = _rows(engine, "dev-decision")
+    assert first["action"] == "retry" and first["uncharged"] is True
+    assert second["action"] == "pause" and second["uncharged"] is False
+    # the relaunch session knew it was the last one: no budget left for another
+    assert adapter.sessions[0].usage_relaunch_left is True
+    assert adapter.sessions[1].usage_relaunch_left is False
+    assert adapter.sessions[1].usage_relaunch_mode is True
+
+
+def test_review_relaunch_on_the_last_cycle_still_runs(project):
+    """#959: a usage-limited review on the last allowed cycle is relaunched; the
+    review loop's budget counts charged cycles, so the relaunch runs and the
+    story converges. ABLATION, performed: make the review `while` read
+    `task.review_cycle` and the relaunch never runs (the story defers)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            _usage_limited(env_fault=True),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=_relaunch_policy(max_review_cycles=1),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and summary.deferred == 0 and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "review"]
+    task = engine.state.tasks["1-1-a"]
+    assert (task.review_cycle, task.review_usage_relaunches) == (2, 1)
+    assert task.charged_review_cycles == 1
+    (retry,) = _rows(engine, "review-retry")
+    assert retry["uncharged"] is True and retry["usage_relaunches"] == 1
+    assert retry["reason"].startswith("usage relaunch (1/3): ")
+
+
+def test_fix_phase_relaunch_is_uncharged(project, monkeypatch):
+    """#959: a usage-limited repair session in `_fix_phase` is relaunched
+    uncharged: with `max_dev_attempts=2` the dev attempt plus one charged repair
+    fit, so the relaunched repair still runs and the story commits. ABLATION,
+    performed: drop the fix-phase relaunch arm and the usage-limited repair
+    pauses the run on the usage limit."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False),
+            _usage_limited(env_fault=True),
+            dev_effect(project, "1-1-a"),
+        ],
+        policy=_relaunch_policy(review=ReviewPolicy(enabled=False), max_dev_attempts=2),
+    )
+    calls = iter(
+        [
+            [verify.CommandResult("pytest -q", 0, "first", "first-out", "")],
+            [verify.CommandResult("pytest -q", 1, "review fail", "", "review fail")],
+            [verify.CommandResult("pytest -q", 0, "fixed", "fixed-out", "")],
+            [verify.CommandResult("pytest -q", 0, "final", "final-out", "")],
+        ]
+    )
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: next(calls)),
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and summary.deferred == 0 and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "dev", "dev"]
+    task = engine.state.tasks["1-1-a"]
+    assert (task.attempt, task.dev_usage_relaunches, task.charged_attempts) == (3, 1, 2)
+    relaunched, repaired = _rows(engine, "fix-decision")
+    assert relaunched["uncharged"] is True and relaunched["usage_relaunches"] == 1
+    assert relaunched["ok"] is False
+    assert repaired["uncharged"] is False and repaired["ok"] is True
+
+
+def test_uncharged_relaunch_skips_environment_probes(project, tmp_path):
+    """#959: an uncharged relaunch charges nothing, so the decision seam never
+    re-probes the environment for it. The environment dies during the
+    usage-limited session, yet the relaunch still launches: a dev retry
+    dispatches inside `_dev_phase`, past the dispatch gate, so nothing probes
+    between the two sessions. ABLATION, performed: drop `not decision.uncharged`
+    from `_env_gate_decision` and the decision is reclassified at
+    `probe:decision:dev` (a PAUSE, one session)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = dataclasses.replace(
+        _relaunch_policy(), environment=EnvironmentPolicy(probes=(rig.probe,))
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            rig.dies_during(_usage_limited(env_fault=False)),
+            dev_effect(project, "1-1-a", followup_review=False),
+        ],
+        policy=policy,
+    )
+    engine.run()
+
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    first = _rows(engine, "dev-decision")[0]
+    assert first["action"] == "retry" and first["uncharged"] is True
+    assert "env_fault_site" not in first
+    assert not _reclassified(engine)
+    sites = [e["site"] for e in _rows(engine, "env-probe-failed")]
+    assert "probe:decision:dev" not in sites
+    assert engine.state.tasks["1-1-a"].dev_usage_relaunches == 1
+
+
+def test_usage_relaunch_env_var_only_after_a_relaunch(project):
+    """#959: `BMAD_LOOP_USAGE_RELAUNCH=<n>` rides the session env only once the
+    story has relaunched (n > 0) — absent on the first session, "1" on the
+    relaunch. Pause mode sets no relaunch flags. ABLATION, performed: drop the
+    `> 0` guard and the first session carries "0"."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [_usage_limited(env_fault=True), dev_effect(project, "1-1-a", followup_review=False)],
+        policy=_relaunch_policy(),
+    )
+    assert engine.run().done == 1
+
+    first, second = adapter.sessions
+    assert "BMAD_LOOP_USAGE_RELAUNCH" not in first.env
+    assert second.env["BMAD_LOOP_USAGE_RELAUNCH"] == "1"
+    assert (first.usage_relaunch_mode, first.usage_relaunch_left) == (True, True)
+    assert (second.usage_relaunch_mode, second.usage_relaunch_left) == (True, True)
+
+    write_sprint(project, {"1-1-b": "ready-for-dev"})
+    paused_engine, paused_adapter = make_engine(project, [_usage_limited(env_fault=True)])
+    assert paused_engine.run().paused
+    (only,) = paused_adapter.sessions
+    assert (only.usage_relaunch_mode, only.usage_relaunch_left) == (False, False)
+    assert "BMAD_LOOP_USAGE_RELAUNCH" not in only.env
+
+
+def test_relaunch_flags_only_on_primary_story_sessions(project):
+    """#959: only primary story sessions (dev, fix, review) get the relaunch
+    flags and env var; an injected plugin-workflow session — here a `review`
+    role run after the story already relaunched once — gets the defaults.
+    ABLATION, performed: drop `label is None` from the primary-session test and
+    the workflow session carries both flags and the env var."""
+    from bmad_loop.plugins import PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    manifest = PluginManifest(
+        name="wf",
+        api_version=1,
+        workflows=(
+            WorkflowSpec(
+                name="doc",
+                stage="post_dev_phase",
+                role="review",
+                prompt="/doc {story_key}",
+                blocking=False,
+            ),
+        ),
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            _usage_limited(env_fault=True),
+            dev_effect(project, "1-1-a", followup_review=False),
+            SessionResult(status="completed", result_json={}),
+        ],
+        policy=_relaunch_policy(),
+        registry=PluginRegistry([LoadedPlugin(manifest=manifest)]),
+    )
+    engine.run()
+
+    assert len(adapter.sessions) == 3
+    dev_relaunch, workflow = adapter.sessions[1], adapter.sessions[2]
+    assert "wf.doc" in workflow.task_id
+    assert dev_relaunch.usage_relaunch_mode and dev_relaunch.usage_relaunch_left
+    assert dev_relaunch.env["BMAD_LOOP_USAGE_RELAUNCH"] == "1"
+    assert (workflow.usage_relaunch_mode, workflow.usage_relaunch_left) == (False, False)
+    assert "BMAD_LOOP_USAGE_RELAUNCH" not in workflow.env
+
+
+def test_rearm_resets_usage_relaunch_counters(project):
+    """#959: `runs.rearm_escalation` resets `attempt` and `review_cycle`, so it
+    zeroes both refund counters too (refunds never exceed their counter) and the
+    re-driven story gets a fresh relaunch budget. ABLATION, performed: drop the
+    two rearm reset lines and the counters survive the re-arm."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [_usage_limited(env_fault=True), _usage_limited(env_fault=True)],
+        policy=_relaunch_policy(max_usage_relaunches=1),
+    )
+    assert engine.run().paused
+    task = engine.state.tasks["1-1-a"]
+    task.review_cycle = 1
+    task.review_usage_relaunches = 1
+    engine._save()
+
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+
+    rearmed = load_state(engine.run_dir).tasks["1-1-a"]
+    assert (rearmed.attempt, rearmed.dev_usage_relaunches) == (0, 0)
+    assert (rearmed.review_cycle, rearmed.review_usage_relaunches) == (0, 0)
+    assert rearmed.usage_relaunches == 0

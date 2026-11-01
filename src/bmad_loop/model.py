@@ -818,10 +818,39 @@ class StoryTask:
     # keep it); "" when no T1 in-window mark is owed or the plan cannot be read.
     ticket_premark_status: str = ""
     ticket_premark_digest: str = ""
+    # Uncharged usage relaunches (#959, `limits.usage_limit_action = "relaunch"`):
+    # how many of `attempt` (dev + fix sessions) and `review_cycle` (review
+    # sessions) were relaunches of a session that ended on a usage limit or an
+    # account StopFailure. The counters still bump on every launch, so session
+    # task ids and resume identity are untouched; these refunds are subtracted
+    # only in budget checks (`charged_attempts` / `charged_review_cycles`).
+    # Invariant: each refund is <= its counter, so every site that resets
+    # `attempt` (or `review_cycle`) to 0 zeroes its refund too. Their sum is
+    # capped per story by `limits.max_usage_relaunches`.
+    dev_usage_relaunches: int = 0
+    review_usage_relaunches: int = 0
 
     @property
     def terminal(self) -> bool:
         return self.phase in TERMINAL_PHASES
+
+    @property
+    def charged_attempts(self) -> int:
+        """Dev attempts charged against `limits.max_dev_attempts`: every launch
+        minus the uncharged usage relaunches (#959)."""
+        return self.attempt - self.dev_usage_relaunches
+
+    @property
+    def charged_review_cycles(self) -> int:
+        """Review cycles charged against `limits.max_review_cycles`: every launch
+        minus the uncharged usage relaunches (#959)."""
+        return self.review_cycle - self.review_usage_relaunches
+
+    @property
+    def usage_relaunches(self) -> int:
+        """Uncharged usage relaunches this story has spent, dev and review
+        together: the count `limits.max_usage_relaunches` caps (#959)."""
+        return self.dev_usage_relaunches + self.review_usage_relaunches
 
     def record_session(self, record: SessionRecord) -> None:
         self.sessions.append(record)
@@ -853,6 +882,8 @@ class StoryTask:
             "attempt": self.attempt,
             "review_cycle": self.review_cycle,
             "followup_reviews_spent": self.followup_reviews_spent,
+            "dev_usage_relaunches": self.dev_usage_relaunches,
+            "review_usage_relaunches": self.review_usage_relaunches,
             "generation": self.generation,
             "escalations_resolved_upto": self.escalations_resolved_upto,
             "followup_review_recommended": self.followup_review_recommended,
@@ -1112,6 +1143,8 @@ class StoryTask:
             attempt=int(d.get("attempt", 0)),
             review_cycle=int(d.get("review_cycle", 0)),
             followup_reviews_spent=int(d.get("followup_reviews_spent", 0)),
+            dev_usage_relaunches=int(d.get("dev_usage_relaunches", 0)),
+            review_usage_relaunches=int(d.get("review_usage_relaunches", 0)),
             generation=int(d.get("generation", 0)),
             escalations_resolved_upto=int(d.get("escalations_resolved_upto", 0)),
             followup_review_recommended=bool(d.get("followup_review_recommended", False)),

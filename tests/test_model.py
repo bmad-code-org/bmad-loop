@@ -733,6 +733,35 @@ def test_followup_reviews_spent_defaults_zero_for_legacy_state():
     assert StoryTask.from_dict(doc).followup_reviews_spent == 0
 
 
+def test_usage_relaunch_counters_round_trip_and_default_on_old_state():
+    task = StoryTask(
+        story_key="1-1-a",
+        epic=1,
+        attempt=3,
+        review_cycle=4,
+        dev_usage_relaunches=2,
+        review_usage_relaunches=1,
+    )
+    back = StoryTask.from_dict(task.to_dict())
+    assert back.dev_usage_relaunches == 2
+    assert back.review_usage_relaunches == 1
+    # the refunds are subtracted only in the charged views; the raw counters stand
+    assert back.attempt == 3 and back.review_cycle == 4
+    assert back.charged_attempts == 1
+    assert back.charged_review_cycles == 3
+    assert back.usage_relaunches == 3
+    # state.json from before the fields existed reads as no refunds
+    doc = task.to_dict()
+    del doc["dev_usage_relaunches"]
+    del doc["review_usage_relaunches"]
+    old = StoryTask.from_dict(doc)
+    assert old.dev_usage_relaunches == 0
+    assert old.review_usage_relaunches == 0
+    assert old.charged_attempts == 3
+    assert old.charged_review_cycles == 4
+    assert old.usage_relaunches == 0
+
+
 def test_generation_round_trips():
     task = StoryTask(story_key="1-1-a", epic=1, generation=2)
     assert StoryTask.from_dict(task.to_dict()).generation == 2

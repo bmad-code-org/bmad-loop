@@ -227,6 +227,19 @@ kind = "int"
 minimum = 0
 default_ref = "LimitsPolicy.session_budget_grace_s"
 description = "enforce mode: seconds a tripped session gets to wrap up after the nudge before it is terminated over_budget · 0 = terminate at trip, no nudge"
+[[section.field]]
+key = "usage_limit_action"
+kind = "select"
+options_ref = "USAGE_LIMIT_ACTIONS"
+default_ref = "LimitsPolicy.usage_limit_action"
+label = "usage limit action"
+description = "what a session that ends on a usage limit or an account StopFailure does · pause: the uncharged usage-limit pause `resolve` clears · relaunch: relaunch it at once as an uncharged retry (BMAD_LOOP_USAGE_RELAUNCH=<n> in the session env, for account rotation), capped by max_usage_relaunches"
+[[section.field]]
+key = "max_usage_relaunches"
+kind = "int"
+minimum = 0
+default_ref = "LimitsPolicy.max_usage_relaunches"
+description = "relaunch mode: uncharged usage relaunches per story (dev, fix and review together) · at the cap the session takes the usage-limit pause instead · 0 = always pause"
 
 [[section]]
 name = "verify"

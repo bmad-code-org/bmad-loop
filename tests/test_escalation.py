@@ -965,3 +965,140 @@ def test_unresolved_escalation_keys_checkpoint_flow_skips_attempt0_wedges(source
 def test_unresolved_escalation_keys_empty_without_an_escalated_task():
     state = _escalation_state("sprint-status", ("a", Phase.DONE, 1), ("b", Phase.PENDING, 0))
     assert unresolved_escalation_keys(state) == []
+
+
+# --- #959: opt-in uncharged usage relaunch -------------------------------------
+
+RELAUNCH = dataclasses.replace(
+    POLICY, limits=dataclasses.replace(POLICY.limits, usage_limit_action="relaunch")
+)
+_ACCOUNT_EVIDENCE = "StopFailure(authentication_failed): account suspended"
+
+
+def _account_stop_failure() -> SessionResult:
+    """A dead window after an account StopFailure, as S1 relabels it."""
+    return SessionResult(
+        status="crashed",
+        parked=True,
+        parked_evidence=_ACCOUNT_EVIDENCE,
+        stop_failure="authentication_failed",
+        stop_failure_action="account",
+    )
+
+
+@pytest.mark.parametrize("attempt", range(1, POLICY.limits.max_dev_attempts + 1))
+@pytest.mark.parametrize("status", ["stalled", "timeout", "crashed"])
+def test_dev_usage_limited_relaunches_uncharged_in_relaunch_mode(attempt, status):
+    """Relaunch mode turns a usage-limited dev session into an uncharged RETRY,
+    even on the last attempt, ahead of the env_fault and parked pause arms.
+    ABLATION: drop `uncharged=True` from `usage_relaunch`'s Decision and the
+    uncharged assertion fails."""
+    for result in _usage_limited_results(status):
+        decision = decide_dev(_task(attempt=attempt), result, None, RELAUNCH)
+        assert decision.action == Action.RETRY
+        assert decision.uncharged is True
+        assert not decision.budget_exhausted
+        assert decision.reason.startswith("usage relaunch (1/3): ")
+        assert _USAGE_EVIDENCE in decision.reason
+
+
+def test_dev_account_stop_failure_relaunches():
+    """An account StopFailure qualifies with no usage-limit sighting at all; the
+    reason names the StopFailure evidence."""
+    result = _account_stop_failure()
+    assert result.usage_limited is None
+    decision = decide_dev(_task(attempt=2), result, None, RELAUNCH)
+    assert decision.action == Action.RETRY
+    assert decision.uncharged is True
+    assert decision.reason == f"usage relaunch (1/3): {_ACCOUNT_EVIDENCE}"
+    # a parked result with no account action and no usage sighting does not qualify
+    permission = SessionResult(status="stalled", parked=True, parked_evidence="permission")
+    assert escalation.usage_relaunch(_task(attempt=1), permission, RELAUNCH) is None
+
+
+def test_relaunch_cap_falls_back_to_the_usage_pause():
+    """At the per-story cap (dev and review refunds together) the result gets
+    the same uncharged usage-limit PAUSE it gets in pause mode. ABLATION: skip
+    the cap check in `usage_relaunch` and the PAUSE assertions fail."""
+    at_cap = _task(attempt=3, review_cycle=1, dev_usage_relaunches=2, review_usage_relaunches=1)
+    assert at_cap.usage_relaunches == RELAUNCH.limits.max_usage_relaunches
+    for result in [*_usage_limited_results("stalled"), _account_stop_failure()]:
+        expected = decide_dev(at_cap, result, None, POLICY)
+        assert expected.action == Action.PAUSE
+        decision = decide_dev(at_cap, result, None, RELAUNCH)
+        assert decision == expected
+        assert decision.uncharged is False
+        review = decide_review_session(at_cap, result, RELAUNCH)
+        assert review == decide_review_session(at_cap, result, POLICY)
+        assert review.action == Action.PAUSE and review.uncharged is False
+    # a cap of 0: relaunch mode never relaunches
+    zero = dataclasses.replace(
+        RELAUNCH, limits=dataclasses.replace(RELAUNCH.limits, max_usage_relaunches=0)
+    )
+    for result in _usage_limited_results("stalled"):
+        decision = decide_dev(_task(attempt=1), result, None, zero)
+        assert decision.action == Action.PAUSE
+        assert decision.uncharged is False
+        assert escalation.usage_relaunch(_task(attempt=1), result, zero) is None
+
+
+def test_pause_mode_never_relaunches():
+    """The default `usage_limit_action = "pause"` keeps today's pause."""
+    assert POLICY.limits.usage_limit_action == "pause"
+    for result in [*_usage_limited_results("stalled"), _account_stop_failure()]:
+        assert escalation.usage_relaunch(_task(attempt=1), result, POLICY) is None
+        decision = decide_dev(_task(attempt=1), result, None, POLICY)
+        assert decision.action == Action.PAUSE
+        assert decision.uncharged is False
+
+
+def test_completed_session_never_relaunches():
+    """A completed session is judged on its work, never relaunched, even when it
+    carries a usage-limit sighting."""
+    completed = dataclasses.replace(COMPLETED, usage_limited=_USAGE_EVIDENCE)
+    assert escalation.usage_relaunch(_task(attempt=1), completed, RELAUNCH) is None
+    account = dataclasses.replace(COMPLETED, stop_failure_action="account")
+    assert escalation.usage_relaunch(_task(attempt=1), account, RELAUNCH) is None
+    decision = decide_dev(_task(attempt=1), completed, FAILING, RELAUNCH)
+    assert decision.action == Action.RETRY
+    assert decision.uncharged is False
+
+
+@pytest.mark.parametrize("review_cycle", [1, POLICY.limits.max_review_cycles])
+def test_review_usage_limited_relaunches(review_cycle):
+    """The review-side twin, ahead of the pause arms and the on_timeout routing,
+    and even on the last review cycle."""
+    for result in [*_usage_limited_results("timeout"), _account_stop_failure()]:
+        decision = decide_review_session(_task(review_cycle=review_cycle), result, RELAUNCH)
+        assert decision.action == Action.RETRY
+        assert decision.uncharged is True
+        assert decision.reason.startswith("usage relaunch (1/3): ")
+
+
+def test_relaunch_reason_never_reads_as_a_usage_pause():
+    """`pause_title` keys on the `usage limit: ` prefix; a relaunch reason must not
+    carry it, and its count names the next relaunch out of the cap."""
+    for result in [*_usage_limited_results("stalled"), _account_stop_failure()]:
+        task = _task(attempt=1, dev_usage_relaunches=1, review_usage_relaunches=1)
+        decision = decide_dev(task, result, None, RELAUNCH)
+        assert decision.reason.startswith("usage relaunch (3/3): ")
+        assert not decision.reason.startswith("usage limit: ")
+        assert pause_title(decision.reason, "9-0-x") != "Paused (usage limit): 9-0-x"
+
+
+def test_charged_attempts_subtract_refunds():
+    """The budget checks count charged sessions only. ABLATION: revert
+    `decide_dev`'s `budget_left` to `task.attempt` and the dev RETRY becomes a
+    DEFER."""
+    crashed = SessionResult(status="crashed")
+    dev_task = _task(attempt=POLICY.limits.max_dev_attempts, dev_usage_relaunches=1)
+    decision = decide_dev(dev_task, crashed, None, POLICY)
+    assert decision.action == Action.RETRY
+    assert decision.uncharged is False  # a plain crash is charged
+    # without the refund the same attempt count exhausts the budget
+    spent = decide_dev(_task(attempt=POLICY.limits.max_dev_attempts), crashed, None, POLICY)
+    assert spent.action == Action.DEFER
+    review_task = _task(review_cycle=POLICY.limits.max_review_cycles, review_usage_relaunches=1)
+    assert review_retry_or_exhaust(review_task, POLICY, "r").action == Action.RETRY
+    full = _task(review_cycle=POLICY.limits.max_review_cycles)
+    assert review_retry_or_exhaust(full, POLICY, "r").action == Action.DEFER

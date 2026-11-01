@@ -88,6 +88,10 @@ breaking changes may land in a minor release.
   place (#865).
 - Add the `hooks.events-incomplete` validate warning: a profile hook event whose relay is
   not registered, with the `init` that registers it or the CLI version it needs.
+- Add opt-in `[limits] usage_limit_action = "relaunch"`: a session that ends on a usage
+  limit relaunches the story at once without charging an attempt, up to
+  `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
+  session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers (#959).
 
 ### Changed
 
@@ -207,6 +211,8 @@ breaking changes may land in a minor release.
 - Name a displaced psmux registry that belongs to another project (or this one before a
   rename) as such in `cleanup` and the TUI, instead of calling its sessions `not migrated`
   (#906).
+- Pause a Claude session uncharged, instead of charging a dev attempt for a crash, when
+  its window dies after a usage-limit or account StopFailure or during a quota wait (#959).
 
 ### Security
 

@@ -6797,6 +6797,7 @@ def _rearm_escalation_locked(
     # engine._finish_inflight): a clean re-attempt against the corrected spec.
     task.phase = Phase.PENDING
     task.attempt = 0
+    task.dev_usage_relaunches = 0  # refunds never exceed attempt (#959)
     # A new generation of this task. `attempt` going back to 0 (and the next
     # dispatch bumping it to 1) would otherwise re-mint a session task_id
     # byte-equal to one the abandoned attempt already recorded, and
@@ -6817,6 +6818,7 @@ def _rearm_escalation_locked(
     if resolution_recorded:
         task.escalations_resolved_upto = len(task.sessions)
     task.review_cycle = 0
+    task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
     task.followup_reviews_spent = 0  # human-resolved re-drive gets a fresh damping budget
     task.defer_reason = None
     task.env_fault_site = None  # the re-armed story starts with no fault on record (DW-523)
@@ -7953,6 +7955,7 @@ def latch_for_reverify(task: StoryTask, origin: str) -> None:
     task.defer_reason = None
     task.generation += 1  # #705: no session id the earlier attempt minted is reused
     task.review_cycle = 0
+    task.review_usage_relaunches = 0  # refunds never exceed review_cycle (#959)
     task.followup_reviews_spent = 0
     task.salvage_refile_pending = False
     task.adopt_pending = False
