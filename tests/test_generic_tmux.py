@@ -15444,6 +15444,37 @@ def test_relaunch_left_skips_the_quota_wait_admission(tmp_path, monkeypatch):
     assert not result.quota_wait_s  # no wait ever opened
 
 
+def test_relaunch_skip_then_window_death_at_the_reprobe_keeps_the_pane_evidence(
+    tmp_path, monkeypatch
+):
+    """Relaunch budget left, a pane-only wait line (no StopFailure latch, no
+    quota wait opened), and a window that dies between the admission's pane
+    look and the stall exit's liveness re-probe: the crash keeps the evidence
+    read while it was alive, so the decider relaunches it uncharged.
+
+    Ablation: drop the `usage_now` labels on `stall_exit`'s dead branch and this
+    fails on `usage_limited is None`."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    probe = q.adapter._probe_liveness
+    q.adapter._probe_liveness = lambda handle, site: (
+        False if site == "stall" else probe(handle, site)
+    )
+    result = _drive_quota(q, _relaunch_spec(_quota_spec(tmp_path)))
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert skipped["reason"] == "usage-relaunch"
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == q.wait_evidence()
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    (crumb,) = _lifecycle_events(q.adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("stall-exit", None)
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+
+
 def test_relaunch_mode_unmatched_then_window_death_is_usage_limited(tmp_path, monkeypatch):
     """Relaunch mode, an unmatched `rate_limit`, and a window already dead at
     the exit's liveness re-probe: the funnel labels the crash a WAIT usage

@@ -26840,10 +26840,6 @@ def _relaunch_policy(*, review: ReviewPolicy | None = None, **limits) -> Policy:
     )
 
 
-def _rows(engine, kind: str) -> list[dict]:
-    return [e for e in engine.journal.entries() if e["kind"] == kind]
-
-
 def test_relaunch_mode_relaunches_a_usage_limited_dev_session_uncharged(project):
     """#959: in relaunch mode a usage-limited dev session is relaunched as an
     uncharged RETRY, even on the last attempt (`max_dev_attempts=1`): the second

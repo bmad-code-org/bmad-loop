@@ -1511,8 +1511,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         class too. The status stays
         ``crashed``; only labels are added, so routing gives the same
         uncharged pause as the live exit instead of charging a crash. A crash
-        whose read-back found a result is never relabeled: the result wins."""
-        if result.status != "crashed" or result.result_json is not None:
+        whose read-back found a result is never relabeled: the result wins. A
+        crash the stall exit already labeled from live evidence keeps it."""
+        if (
+            result.status != "crashed"
+            or result.result_json is not None
+            or result.usage_limited is not None
+        ):
             return result
         kind = stop_failure.kind
         if kind == "unmatched" and spec.usage_relaunch_mode:
@@ -1865,13 +1870,21 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             usage_now: str | None,
             resets_now: str | None = None,
             class_now: str | None = None,
+            *,
+            admitted: bool = False,
         ) -> SessionResult:
             """The non-completion exit of a stalled session (DW-348, #610):
             resolve, then re-probe liveness. A now-dead window is ``crashed``,
-            unlabeled here: nothing waits on a human once the CLI is gone. The
-            funnel (`_relabel_dead_window`) labels it parked or usage-limited
-            when a latched StopFailure or an open quota wait classified it
-            (#959). Otherwise ``stalled`` with ``accept_result=False``: an
+            never parked here: nothing waits on a human once the CLI is gone.
+            Usage evidence that passed the quota wait's admission gates or ran
+            to its cap (``admitted``) survives a death in the gap as the
+            crash's usage-limit labels, as an open wait's does (#959), crumbed
+            ``crash-relabeled`` with ``kind="stall-exit"``; a bare pane match
+            (the stall gate, the timeout) does not, since a remain-on-exit
+            pane still shows a stale line. A crash whose read-back found a
+            result is never labeled. The funnel (`_relabel_dead_window`) labels the rest
+            parked or usage-limited when a latched StopFailure or an open
+            quota wait classified it. Otherwise ``stalled`` with ``accept_result=False``: an
             artifact on disk cannot upgrade the stall to completed (it may be
             stale or mid-write; only a Stop or window death vouches for it), and
             ``parked_now`` / ``usage_now`` / ``resets_now`` / ``class_now``
@@ -1879,7 +1892,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             carry the rollout."""
             try_resolve()
             if self._probe_liveness(handle, "stall") is False:
-                return self._final(
+                crashed = self._final(
                     handle,
                     spec,
                     "crashed",
@@ -1888,6 +1901,27 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
                     produced_work=produced_work(),
+                )
+                if (
+                    not admitted
+                    or usage_now is None
+                    # A latched StopFailure kind is the funnel's to label.
+                    or stop_failure.kind is not None
+                    or crashed.status != "crashed"
+                    or crashed.result_json is not None
+                ):
+                    return crashed
+                self._note_lifecycle(
+                    handle.task_id,
+                    "crash-relabeled",
+                    kind="stall-exit",
+                    error=stop_failure.error,
+                )
+                return dataclasses.replace(
+                    crashed,
+                    usage_limited=usage_now,
+                    usage_limit_resets=resets_now,
+                    usage_limit_class=class_now,
                 )
             stalled = self._final(
                 handle,
@@ -1932,7 +1966,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     )
                     evidence = quota.evidence
                     self._end_quota_wait(handle, quota, "cap")
-                    return stall_exit(evidence, evidence, quota.resets, USAGE_LIMIT_WAIT)
+                    return stall_exit(
+                        evidence, evidence, quota.resets, USAGE_LIMIT_WAIT, admitted=True
+                    )
                 # The freeze runs on EVERY tick, not only on heartbeats: a wait
                 # admitted with less than a heartbeat interval left would
                 # otherwise time out between samples. This is the one sanctioned
@@ -2182,7 +2218,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 evidence=wait_hit[0],
                                 resets_at=resets,
                             )
-                            return stall_exit(wait_hit[0], wait_hit[0], resets, USAGE_LIMIT_WAIT)
+                            return stall_exit(
+                                wait_hit[0], wait_hit[0], resets, USAGE_LIMIT_WAIT, admitted=True
+                            )
                         cap_left = spec.quota_wait_max_s - quota.closed_s
                         if (
                             reset is not None
@@ -2203,7 +2241,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 resets_at=resets,
                                 cap_left_s=round(cap_left, 3),
                             )
-                            return stall_exit(wait_hit[0], wait_hit[0], resets, USAGE_LIMIT_WAIT)
+                            return stall_exit(
+                                wait_hit[0], wait_hit[0], resets, USAGE_LIMIT_WAIT, admitted=True
+                            )
                         frozen = max(
                             min(remaining, wall_deadline - time.time()),
                             QUOTA_WAIT_MIN_REMAINING_S,
