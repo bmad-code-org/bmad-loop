@@ -251,7 +251,12 @@ LEGACY_EVENTS_FAKE_CLI = FAKE_CLI.replace('ed="$BMAD_LOOP_EVENTS_DIR"', 'ed="$rd
 # parent's completion cannot overtake them in one poll. Each event is published by a
 # rename, as the real relay does: SignalWatcher consumes a `.json` name on first
 # sight, so a poll landing mid-`printf` would drop a truncated child SessionStart for
-# good and no foreign crumb would follow.
+# good and no foreign crumb would follow. The parent's own SessionStart is renamed
+# into place too: dropped the same way, it leaves the child's start as the first
+# one, which the attribution admits as the launched session's — again no crumb.
+_PARENT_START_PUBLISHED = """    "$ts" "$tid" > "$ed/$ts-$tid-SessionStart.json.tmp"
+mv "$ed/$ts-$tid-SessionStart.json.tmp" "$ed/$ts-$tid-SessionStart.json"
+"""
 _NESTED_CHILD_EVENTS = r"""
 for kind in SessionStart Stop SessionEnd; do
     cts=$(date +%s%N)
@@ -270,7 +275,7 @@ ts2=$(( ts + 1 ))
 """
 assert FAKE_CLI.count(_PARENT_START) == 1 and FAKE_CLI.count(_STORY_STOP_TS) == 1
 NESTED_CHILD_FAKE_CLI = FAKE_CLI.replace(
-    _PARENT_START, _PARENT_START + _NESTED_CHILD_EVENTS
+    _PARENT_START, _PARENT_START_PUBLISHED + _NESTED_CHILD_EVENTS
 ).replace(_STORY_STOP_TS, _STORY_STOP_TS.replace("$(( ts + 1 ))", "$(date +%s%N)"))
 
 PROFILE_TOML = """\
