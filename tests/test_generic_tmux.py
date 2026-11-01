@@ -14847,6 +14847,46 @@ def test_later_same_sid_session_start_does_not_rejournal_model(tmp_path, monkeyp
     ]
 
 
+def test_codex_model_less_first_start_latches_against_child_model(tmp_path, monkeypatch):
+    """On Codex the first admitted SessionStart latches even with no `model`: a
+    later same-sid start may be a subagent's, and its model must not label the
+    launch. (Claude stays open — see the test above.)
+
+    ABLATION: drop the codex-dialect arm of the latch and the child's model is
+    journaled as the session's."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch, hooks_from="codex")
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    events = [_model_start(transcript, None), _model_start(transcript, "gpt-5.5-mini")]
+    result = _run_start_missing(adapter, clock, tmp_path, events=events)
+    assert result.status == "timeout"
+    assert _session_model_entries(adapter) == []
+
+
+def test_session_model_journal_failure_is_crumbed(tmp_path, monkeypatch):
+    """An unwritable journal loses the `session-model` row but leaves a
+    `session-model-unjournaled` lifecycle crumb naming the model and the fault,
+    and the session runs to its own end.
+
+    ABLATION: drop the crumb in the `except OSError` and no line is written."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+
+    class _Failing(_FakeJournal):
+        def append(self, kind, **fields):
+            if kind == "session-model":
+                raise OSError("disk full")
+            super().append(kind, **fields)
+
+    adapter.journal = _Failing()
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    events = [_model_start(transcript, "claude-opus-5-5")]
+    result = _run_start_missing(adapter, clock, tmp_path, events=events)
+    assert result.status == "timeout"
+    (crumb,) = _lifecycle_events(adapter, "session-model-unjournaled", task_id="b-1")
+    assert (crumb["model"], crumb["error"]) == ("claude-opus-5-5", "OSError: disk full")
+
+
 # --------------------------------------------- Claude Code StopFailure (#865)
 #
 # Claude Code fires `StopFailure` INSTEAD of `Stop` when an API error ends a

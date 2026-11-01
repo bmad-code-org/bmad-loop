@@ -207,7 +207,8 @@ at `limits.cache_read_weight`.
 The **agent line** names who is driving. While a session is open it reads
 `agent <name> · <model> · <role>` (`model` is the one the CLI reported on its
 SessionStart hook when it sent one, as Claude and Codex do, else the configured
-model, omitted when the CLI profile's default is used; `role` is the session's stage, such as `dev`, `review`,
+model; it is omitted only when the CLI reported none and the profile default is
+configured; `role` is the session's stage, such as `dev`, `review`,
 `triage` or `retro`), with a yellow
 `· idle <age>` once the session's transcript (and any subagent transcripts its
 profile declares) has been quiet past
@@ -270,7 +271,7 @@ One row per story (or sweep bundle and triage task) in the selected run:
 | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `story`  | story key, or the sweep task id                                                                                                                                                                                                                |
 | `phase`  | `pending` → `dev-running` → `dev-verify` → `review-running` → `review-verify` → `committing` → `done`, or `deferred` / `escalated` / `awaiting-operator` (committed, human action owed); sweep triage shows `triage-running` / `triage-verify` |
-| `agent`  | `<name·model>` of the adapter driving or last driving this row (`·model` dropped for the profile default; while a session drives it, the model its CLI reported, as on the agent line); `-` if none recorded                                   |
+| `agent`  | `<name·model>` of the adapter driving or last driving this row (while a session drives it, the model its CLI reported, as on the agent line, else the configured model; `·model` dropped only when neither is known); `-` if none recorded     |
 | `dev`    | dev attempt counter, `×N`                                                                                                                                                                                                                      |
 | `review` | review cycle counter, `×N`                                                                                                                                                                                                                     |
 | `tokens` | cost-weighted token total (cache reads at `limits.cache_read_weight`), the total budgets judge; `-` until known                                                                                                                                |

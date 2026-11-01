@@ -1745,8 +1745,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # notice was journaled; see `_note_session_start_missing`. Observes only.
         saw_session_start = False
         session_start_noted = False
-        # The first admitted SessionStart carrying a hook `model` was seen and its
-        # one `session-model` row attempted (#859); see `_note_session_model`.
+        # The first admitted SessionStart carrying a hook `model` (on Codex, the
+        # first admitted SessionStart) was seen and its one `session-model` row
+        # attempted (#859); see `_note_session_model`.
         session_model_noted = False
 
         # A transcript can grow for an initial user prompt or the loop's own
@@ -2800,12 +2801,18 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
             if event.event == "SessionStart":
                 saw_session_start = True
-                if event.model and not session_model_noted:
+                if not session_model_noted and (
+                    event.model or self.profile.hooks.dialect == "codex-hooks-json"
+                ):
                     # Latched on the attempt, not on a successful write: a later
                     # same-sid SessionStart can be a Codex subagent's, whose model
-                    # is not the launch model.
+                    # is not the launch model. So on Codex the first admitted
+                    # start latches even without a model; Claude, which has no
+                    # same-sid children, stays open for a later start that sends
+                    # one.
                     session_model_noted = True
-                    self._note_session_model(handle, event.model)
+                    if event.model:
+                        self._note_session_model(handle, event.model)
                 continue
             if event.event == "Notification" or event.event in PARKED_EVENTS:
                 # Parked-session signal (DW-348): latch it, never act on it here.
@@ -3454,8 +3461,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         hook counts: Codex subagent hooks reuse the parent session id, so a later
         same-sid SessionStart is admitted too and could carry a child's model, and
         a `/clear` or `compact` rebind keeps the launch model. Observation only:
-        the TUI agent line reads it, nothing decides on it. No journal or an
-        unwritable journal writes nothing, and the session runs on."""
+        the TUI agent line reads it, nothing decides on it. No journal writes
+        nothing; an unwritable journal is crumbed as `session-model-unjournaled`
+        (`model`, `error`) in the session lifecycle, so a lost row is not read as
+        a CLI that reported no model, and the session runs on."""
         if self.journal is None:
             return
         try:
@@ -3465,8 +3474,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 model=model,
                 cli=self.profile.name,
             )
-        except OSError:
-            pass
+        except OSError as e:
+            self._note_lifecycle(
+                handle.task_id,
+                "session-model-unjournaled",
+                model=model,
+                error=f"{type(e).__name__}: {e}",
+            )
 
     def _window_alive(self, handle: SessionHandle) -> bool:
         return self.mux.window_alive(self.session_name, handle.native_id)
