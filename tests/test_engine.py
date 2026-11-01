@@ -27161,3 +27161,334 @@ def test_rearm_resets_usage_relaunch_counters(project):
     assert (rearmed.attempt, rearmed.dev_usage_relaunches) == (0, 0)
     assert (rearmed.review_cycle, rearmed.review_usage_relaunches) == (0, 0)
     assert rearmed.usage_relaunches == 0
+
+
+# --- #772: the engine's own ledger bookkeeping commit ---------------------------
+
+_LEDGER_REL = "_bmad-output/implementation-artifacts/deferred-work.md"
+
+
+def _bookkeeping_engine(project):
+    """An engine with one persisted task whose baseline is the current HEAD — the
+    shape every `_commit_engine_ledger` caller holds right before a launch."""
+    engine, _ = make_engine(project, [])
+    task = StoryTask(story_key="1-1-a", epic=1)
+    task.baseline_commit = verify.rev_parse_head(project.project)
+    engine.state.tasks[task.story_key] = task
+    return engine, task
+
+
+def _install_marker_hooks(repo: Path) -> Path:
+    """Marker-writing `pre-commit` and `commit-msg` hooks; returns the marker dir.
+    Git for Windows runs a hook through its own sh whatever the mode bits, so the
+    chmod is POSIX-only bookkeeping rather than a portability gate."""
+    marker_dir = repo.parent / f"{repo.name}-hook-markers"
+    marker_dir.mkdir(exist_ok=True)
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    for name in ("pre-commit", "commit-msg"):
+        hook = hooks / name
+        hook.write_text(f"#!/bin/sh\nprintf ran > '{(marker_dir / name).as_posix()}'\n")
+        hook.chmod(0o755)
+    return marker_dir
+
+
+def _bookkeeping_rows(engine, prefix="engine-ledger-commit"):
+    return [e for e in engine.journal.entries() if e["kind"].startswith(prefix)]
+
+
+def test_commit_engine_ledger_commits_a_dirty_tracked_ledger_hookless(project):
+    """A tracked ledger the engine left dirty reaches HEAD alone — hooks off, the
+    unrelated dirt left standing, the record saved, the commit journaled.
+
+    Ablation: drop `run_hooks=False` from the helper's `commit_paths` call and the
+    marker rows red."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, task = _bookkeeping_engine(project)
+    marker_dir = _install_marker_hooks(project.project)
+    with project.deferred_work.open("a", encoding="utf-8") as f:
+        f.write("\n### DW-2: harvested\n\nstatus: open\n")
+    (project.project / "src.txt").write_text("unrelated dirt\n")
+
+    engine._commit_engine_ledger(task, site="review")
+
+    porcelain = git(project.project, "status", "--porcelain", "--", _LEDGER_REL)
+    assert porcelain == ""
+    assert "DW-2: harvested" in git(project.project, "show", f"HEAD:{_LEDGER_REL}")
+    assert git(project.project, "status", "--porcelain", "--", "src.txt") != ""
+    assert not (marker_dir / "pre-commit").exists()
+    assert not (marker_dir / "commit-msg").exists()
+    head = verify.rev_parse_head(project.project)
+    assert git(project.project, "log", "-1", "--format=%s") == (
+        "chore(deferred-work): engine bookkeeping before review (1-1-a)"
+    )
+    (event,) = _bookkeeping_rows(engine)
+    assert event["kind"] == "engine-ledger-commit"
+    assert (event["story_key"], event["site"], event["commit"], event["added"]) == (
+        "1-1-a",
+        "review",
+        head,
+        False,
+    )
+    persisted = load_state(engine.run_dir).tasks["1-1-a"]
+    assert persisted.bookkeeping_ledger == {
+        "baseline": task.baseline_commit,
+        "added": False,
+        "shas": [head],
+    }
+
+
+def test_commit_engine_ledger_appends_to_the_record_and_honors_a_message(project):
+    """A second bookkeeping commit on the same baseline extends the recorded shas;
+    `message=` replaces the default subject."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, task = _bookkeeping_engine(project)
+    shas = []
+    for n in (2, 3):
+        with project.deferred_work.open("a", encoding="utf-8") as f:
+            f.write(f"\n### DW-{n}: harvested\n\nstatus: open\n")
+        engine._commit_engine_ledger(task, site="defer", message=f"chore: custom {n}")
+        shas.append(verify.rev_parse_head(project.project))
+
+    assert task.bookkeeping_ledger == {
+        "baseline": task.baseline_commit,
+        "added": False,
+        "shas": shas,
+    }
+    assert git(project.project, "log", "-1", "--format=%s") == "chore: custom 3"
+
+
+def test_commit_engine_ledger_commits_an_untracked_visible_ledger_as_added(project):
+    """An untracked, not-ignored ledger is dirt the build skill halts on too, so it
+    is committed — and recorded `added`, since the baseline tree lacks it."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, task = _bookkeeping_engine(project)
+
+    engine._commit_engine_ledger(task, site="dev")
+
+    assert git(project.project, "status", "--porcelain", "--", _LEDGER_REL) == ""
+    (event,) = _bookkeeping_rows(engine)
+    assert event["kind"] == "engine-ledger-commit"
+    assert event["added"] is True
+    assert task.bookkeeping_for_baseline() == {
+        "baseline": task.baseline_commit,
+        "added": True,
+        "shas": [verify.rev_parse_head(project.project)],
+    }
+
+
+def test_commit_engine_ledger_is_a_silent_noop_for_a_gitignored_ledger(project):
+    """A gitignored ledger reads clean, so it never reaches `commit_paths` — which
+    would RAISE on the ignored operand. No commit, no record, no journal row.
+
+    Ablation: delete the `path_clean` gate and the failed row appears."""
+    gitignore = project.project / ".gitignore"
+    gitignore.write_text(gitignore.read_text() + "_bmad-output/\n")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore artifacts")
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, task = _bookkeeping_engine(project)
+    head = verify.rev_parse_head(project.project)
+
+    engine._commit_engine_ledger(task, site="review")
+
+    assert verify.rev_parse_head(project.project) == head
+    assert task.bookkeeping_ledger is None
+    assert _bookkeeping_rows(engine) == []
+
+
+def test_commit_engine_ledger_is_a_noop_for_an_external_ledger(project, tmp_path):
+    """A ledger outside the workspace root is not this repo's to commit."""
+    paths = dataclasses.replace(
+        project,
+        implementation_artifacts=tmp_path / "shared" / "implementation-artifacts",
+    )
+    paths.implementation_artifacts.mkdir(parents=True)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine, task = _bookkeeping_engine(paths)
+    head = verify.rev_parse_head(project.project)
+
+    engine._commit_engine_ledger(task, site="review")
+
+    assert verify.rev_parse_head(project.project) == head
+    assert task.bookkeeping_ledger is None
+    assert _bookkeeping_rows(engine) == []
+
+
+def test_commit_engine_ledger_is_a_noop_for_an_unchanged_ledger(project):
+    """A tracked ledger that matches HEAD is not dirt: no commit, no row."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, task = _bookkeeping_engine(project)
+    head = verify.rev_parse_head(project.project)
+
+    engine._commit_engine_ledger(task, site="review")
+
+    assert verify.rev_parse_head(project.project) == head
+    assert task.bookkeeping_ledger is None
+    assert _bookkeeping_rows(engine) == []
+
+
+def test_commit_engine_ledger_is_a_noop_for_an_absent_ledger(project):
+    """No ledger file at all is nothing to publish — not a refusal row."""
+    engine, task = _bookkeeping_engine(project)
+    assert not project.deferred_work.exists()
+
+    engine._commit_engine_ledger(task, site="review")
+
+    assert _bookkeeping_rows(engine) == []
+
+
+def test_commit_engine_ledger_journals_a_failed_commit_and_rolls_the_record_back(
+    project, monkeypatch
+):
+    """A git fault never escapes: the failure is journaled, the pending record is
+    cleared, and the record WAS on disk before the commit was attempted.
+
+    Ablation: drop the rollback assignment and the record row reds."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, task = _bookkeeping_engine(project)
+    seen_on_disk = []
+
+    def failing_commit(repo, message, paths, *, run_hooks=True):
+        seen_on_disk.append(load_state(engine.run_dir).tasks["1-1-a"].bookkeeping_ledger)
+        raise verify.GitError("git commit failed: boom")
+
+    monkeypatch.setattr(verify, "commit_paths", failing_commit)
+
+    engine._commit_engine_ledger(task, site="review")
+
+    assert seen_on_disk == [{"baseline": task.baseline_commit, "added": True, "shas": []}]
+    assert task.bookkeeping_ledger is None
+    assert load_state(engine.run_dir).tasks["1-1-a"].bookkeeping_ledger is None
+    (event,) = _bookkeeping_rows(engine)
+    assert event["kind"] == "engine-ledger-commit-failed"
+    assert (event["story_key"], event["site"]) == ("1-1-a", "review")
+    assert "boom" in event["error"]
+
+
+def test_commit_engine_ledger_failure_keeps_earlier_recorded_shas(project, monkeypatch):
+    """A failed second commit restores the record to its first, committed state."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, task = _bookkeeping_engine(project)
+    engine._commit_engine_ledger(task, site="dev")
+    first = dict(task.bookkeeping_ledger or {})
+    with project.deferred_work.open("a", encoding="utf-8") as f:
+        f.write("\n### DW-2: harvested\n\nstatus: open\n")
+
+    def failing_commit(repo, message, paths, *, run_hooks=True):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(verify, "commit_paths", failing_commit)
+    engine._commit_engine_ledger(task, site="review")
+
+    assert task.bookkeeping_ledger == first
+    assert [e["kind"] for e in _bookkeeping_rows(engine)] == [
+        "engine-ledger-commit",
+        "engine-ledger-commit-failed",
+    ]
+
+
+def test_commit_engine_ledger_journals_a_scope_probe_fault(project, monkeypatch):
+    """A ledger whose scope cannot be resolved is a visible degrade, not a raise."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, task = _bookkeeping_engine(project)
+    monkeypatch.setattr(engine, "_ledger_rel", lambda: (None, OSError("resolve failed")))
+
+    engine._commit_engine_ledger(task, site="review")
+
+    (event,) = _bookkeeping_rows(engine)
+    assert event["kind"] == "engine-ledger-commit-failed"
+    assert "resolve failed" in event["error"]
+    assert task.bookkeeping_ledger is None
+
+
+def test_commit_engine_ledger_journals_a_refused_target(project):
+    """A ledger the publication guard refuses (a directory there) is journaled
+    with its closed cause and never reaches git."""
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.mkdir()
+    (project.deferred_work / "stray.md").write_text("x\n")
+    engine, task = _bookkeeping_engine(project)
+    head = verify.rev_parse_head(project.project)
+
+    engine._commit_engine_ledger(task, site="review")
+
+    assert verify.rev_parse_head(project.project) == head
+    (event,) = _bookkeeping_rows(engine)
+    assert event["kind"] == "engine-ledger-commit-refused"
+    assert event["refuse_cause"] == "target-not-a-file"
+
+
+def test_rollback_restores_a_ledger_a_bookkeeping_commit_added(project):
+    """CASE B: the bookkeeping commit put a ledger ABSENT from the baseline into
+    HEAD, so `reset --hard` to that baseline deletes it — and the restore must
+    republish the snapshot, not skip it as a file git never owned.
+
+    Ablation: drop the `bookkeeping_for_baseline()` arm from
+    `_ledger_is_gits_to_restore` and the ledger stays missing."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    snapshot = project.deferred_work.read_text(encoding="utf-8")
+    engine, task = _bookkeeping_engine(project)
+    engine._commit_engine_ledger(task, site="dev")
+    assert task.bookkeeping_for_baseline()["added"] is True
+
+    git(project.project, "reset", "-q", "--hard", task.baseline_commit)
+    assert not project.deferred_work.exists()
+    assert engine._ledger_is_gits_to_restore(task) is True
+
+    engine._restore_ledger(task, snapshot)
+
+    assert project.deferred_work.read_text(encoding="utf-8") == snapshot
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "ledger-restore-skipped-diverged" not in kinds
+
+
+def test_gits_to_restore_ignores_a_record_from_another_baseline(project):
+    """The record is self-invalidating: once `baseline_commit` moves, an `added`
+    record no longer claims the file for the reset."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, task = _bookkeeping_engine(project)
+    task.bookkeeping_ledger = {"baseline": "0" * 40, "added": True, "shas": ["1" * 40]}
+
+    assert engine._ledger_is_gits_to_restore(task) is False
+
+
+def test_harvest_gate_excludes_a_ledger_a_bookkeeping_commit_added(project):
+    """CASE B against proof of work: the added ledger reads as wholly new since
+    baseline, which must not credit a no-code repair. A session-authored ledger
+    change (`ledger_changed_before_harvest`) and a stale record stand it down.
+
+    Ablation: drop `bookkept_add` from `_harvest_gate_exclude` and the first row
+    reds."""
+    engine, task = _bookkeeping_engine(project)
+    assert task.harvest_wrote_ledger is False
+    task.bookkeeping_ledger = {"baseline": task.baseline_commit, "added": True, "shas": []}
+
+    assert engine._harvest_gate_exclude(task) == (_LEDGER_REL,)
+
+    task.ledger_changed_before_harvest = True
+    assert engine._harvest_gate_exclude(task) == ()
+
+    task.ledger_changed_before_harvest = False
+    task.bookkeeping_ledger = {"baseline": task.baseline_commit, "added": False, "shas": []}
+    assert engine._harvest_gate_exclude(task) == ()
+
+    task.bookkeeping_ledger = {"baseline": "0" * 40, "added": True, "shas": []}
+    assert engine._harvest_gate_exclude(task) == ()
+
+
+def test_no_code_repair_over_a_bookkeeping_added_ledger_fails_proof_of_work(project):
+    """End to end through the gate: a case-B bookkeeping commit plus no code is
+    "no changes", not proof of work.
+
+    Ablation: drop `bookkept_add` from `_harvest_gate_exclude` and the ledger alone
+    counts as a change."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    engine, task = _bookkeeping_engine(project)
+    engine._commit_engine_ledger(task, site="dev")
+
+    excluded = engine._harvest_gate_exclude(task)
+    assert excluded == (_LEDGER_REL,)
+    # The control: unexcluded, the committed ledger alone IS a change since baseline.
+    assert verify.has_changes_since(project.project, task.baseline_commit)
+    assert not verify.has_changes_since(project.project, task.baseline_commit, excluded)

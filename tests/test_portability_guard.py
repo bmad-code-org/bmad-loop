@@ -549,6 +549,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     "spec-deferrals-malformed": frozenset({"items"}),
     "spec-deferral-sighting-stale": frozenset({"items"}),
     "board-advance-carried": frozenset({"target"}),
+    # #772: whether the engine's bookkeeping commit put a ledger absent from the
+    # baseline tree into HEAD — a bare boolean. Kind-scoped because `added` is generic.
+    "engine-ledger-commit": frozenset({"added"}),
     "board-advance-carry-failed": frozenset({"target"}),
     "board-advance-carry-foreign-dirt": frozenset({"target"}),
     "board-advance-carry-refused": frozenset({"target"}),
@@ -1669,6 +1672,14 @@ JOURNAL_KINDS = frozenset(
         # paused the run for repair instead (`_pause_for_ledger_repair`, no phase
         # change). Both carry only already-declared fields: `story_key` (routed),
         # `site` (benign), `ledger` (benign) and `error` (dropped).
+        # #772: `Engine._commit_engine_ledger`, the hooks-off commit of the engine's
+        # own ledger bookkeeping before a session — committed, failed (a scope or
+        # git fault, or nothing staged), or refused by the publication guard.
+        # Routed rows in `diagnostics._JOURNAL_KIND_SCHEMAS`; `added` is declared
+        # kind-benign above.
+        "engine-ledger-commit",
+        "engine-ledger-commit-failed",
+        "engine-ledger-commit-refused",
         "ledger-read-degraded",
         "ledger-read-refused",
         "ledger-restore-failed",

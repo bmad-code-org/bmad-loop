@@ -7717,12 +7717,144 @@ class Engine:
             except ValueError:
                 return None, None
 
+    def _commit_engine_ledger(
+        self, task: StoryTask, *, site: str, message: str | None = None
+    ) -> None:
+        """Commit the engine's own uncommitted ledger bookkeeping — that one file,
+        hooks and signing off — so the next session starts on a tree whose only
+        dirt is not the orchestrator's (#772: the build skill's finalization
+        HALTs `blocked` on any leftover change, and the engine's harvests, closes
+        and restores leave the ledger dirty on purpose for `finalize_commit` to
+        squash). It WRITES NO CONTENT: it records bytes the engine already wrote,
+        so the squash still lands the same story commit.
+
+        Best-effort: a git or filesystem fault is journaled
+        (`engine-ledger-commit-failed`), never raised, and the session launches
+        exactly as it did before this existed. Only a run-state save failure
+        propagates, as it does from every `_save()` in the engine — and the one
+        ahead of the commit fails before anything is committed.
+
+        Silent no-op for every ledger git cannot see or that is not dirty: absent,
+        external to the workspace, under the shared ticket store, gitignored
+        (`path_clean` reads clean, and `commit_paths` would RAISE on an ignored
+        operand, so the clean gate is mandatory), or unchanged. A ledger the
+        publication guard refuses is journaled (`engine-ledger-commit-refused`)
+        and left alone.
+
+        `bookkeeping_ledger` is SAVED BEFORE the commit. A record without its
+        commit (a crash between the two) costs at most a stray untracked ledger a
+        later restore declines to unlink; a commit without its record lets a
+        rollback's `reset --hard` delete an added ledger that the restore then
+        never recreates. A stray file beats data loss. A commit that fails or
+        finds nothing to commit rolls the pending entry back."""
+        rel, fault = self._ledger_rel()
+        if fault is not None:
+            self.journal.append(
+                "engine-ledger-commit-failed",
+                story_key=task.story_key,
+                site=site,
+                error=f"ledger scope probe failed: {fault}",
+            )
+            return
+        if rel is None:
+            return
+        ledger = self.workspace.paths.deferred_work
+        if self.workspace.paths.in_shared_store(ledger):
+            return
+        refusal = _publication_refusal(ledger, "ledger")
+        if refusal is not None:
+            cause, detail = refusal
+            if cause == "target-absent":
+                # Nothing there to commit — not a fault, and not the guard's to report.
+                return
+            self.journal.append(
+                "engine-ledger-commit-refused",
+                story_key=task.story_key,
+                site=site,
+                refuse_cause=cause,
+                error=detail,
+            )
+            return
+        root = self.workspace.root
+        try:
+            if verify.path_clean(root, rel):
+                return
+            # The ledger path absent from the baseline's TREE — not membership in
+            # `baseline_untracked`, which misses a ledger a session created itself.
+            added = task.baseline_commit is not None and verify.path_absent_at_revision(
+                root, task.baseline_commit, rel
+            )
+        except (verify.GitError, OSError, RuntimeError) as e:
+            self.journal.append(
+                "engine-ledger-commit-failed",
+                story_key=task.story_key,
+                site=site,
+                error=str(e),
+            )
+            return
+        previous = task.bookkeeping_for_baseline()
+        prior_shas: list[str] = list(previous["shas"]) if previous is not None else []
+        if task.baseline_commit is not None:
+            task.bookkeeping_ledger = {
+                "baseline": task.baseline_commit,
+                # Once any commit in this baseline's record added the ledger, the
+                # ledger stays added relative to that baseline.
+                "added": added or (previous is not None and bool(previous["added"])),
+                "shas": prior_shas,
+            }
+            self._save()
+        error: str
+        try:
+            sha = verify.commit_paths(
+                root,
+                message
+                or f"chore(deferred-work): engine bookkeeping before {site} ({task.story_key})",
+                [ledger],
+                run_hooks=False,
+            )
+        except (verify.GitError, OSError) as e:
+            sha = None
+            error = str(e)
+        else:
+            error = "nothing to commit"
+        if sha is None:
+            if task.baseline_commit is not None:
+                task.bookkeeping_ledger = previous if prior_shas else None
+                self._save()
+            self.journal.append(
+                "engine-ledger-commit-failed",
+                story_key=task.story_key,
+                site=site,
+                error=error,
+            )
+            return
+        if task.bookkeeping_ledger is not None:
+            task.bookkeeping_ledger = {
+                **task.bookkeeping_ledger,
+                "shas": [*prior_shas, sha],
+            }
+            self._save()
+        self.journal.append(
+            "engine-ledger-commit",
+            story_key=task.story_key,
+            site=site,
+            commit=sha,
+            added=added,
+        )
+
     def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
         """Whether git owns the active ledger and reset is responsible for it.
 
         Probe failures degrade toward keeping the file: uncertainty must never
         authorize deleting a tracked ledger that ``reset --hard`` restored.
         """
+        record = task.bookkeeping_for_baseline()
+        if record is not None and record["added"]:
+            # An engine bookkeeping commit (#772) put a ledger ABSENT from the
+            # baseline into HEAD. `reset --hard` to that baseline deletes it, so the
+            # post-reset `path_tracked` probe below would read False and the restore
+            # would skip — losing the snapshot. The reset owns this file.
+            return True
         rel, fault = self._ledger_rel()
         if fault is not None:
             self.journal.append(
@@ -8083,7 +8215,13 @@ class Engine:
         ``tests/test_stories_engine.py::test_accepted_plan_halt_observation_excludes_the_nested_ledger_under_the_monorepo_shape``,
         and ``tests/test_sweep.py::test_bundle_gate_excludes_the_nested_ledger_under_the_monorepo_shape``.
         """
-        if not task.harvest_wrote_ledger or task.ledger_changed_before_harvest:
+        record = task.bookkeeping_for_baseline()
+        # An engine bookkeeping commit (#772) that ADDED the ledger makes the whole
+        # file read as added since baseline — engine bytes, not session work, so a
+        # repair that wrote no code must not pass on them. A ledger already tracked
+        # at baseline needs nothing: its committed and dirty copies diff the same.
+        bookkept_add = record is not None and bool(record["added"])
+        if task.ledger_changed_before_harvest or not (task.harvest_wrote_ledger or bookkept_add):
             return ()
         paths = self.workspace.paths
         root = paths.repo_root

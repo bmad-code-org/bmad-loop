@@ -617,6 +617,13 @@ _JOURNAL_KIND_SCHEMAS: dict[str, frozenset[str]] = {
     # DW-246/250. `dw_ids` is a `_JOURNAL_KEYLIST_FIELDS` name and aliases before
     # this table is consulted; named for the same completeness as `commit` above.
     "sweep-ledger-commit-withheld": frozenset({"message", "file", "reason", "dw_ids"}),
+    # #772: the engine's hooks-off commit of its own ledger bookkeeping before a
+    # session. `story_key` and `commit` alias, `error` drops; `site` is the closed
+    # session role (or `defer`), `added` a bare boolean, `refuse_cause` the closed
+    # `verify.unpublishable_target` enum.
+    "engine-ledger-commit": frozenset({"story_key", "site", "commit", "added"}),
+    "engine-ledger-commit-failed": frozenset({"story_key", "site", "error"}),
+    "engine-ledger-commit-refused": frozenset({"story_key", "site", "refuse_cause", "error"}),
     "sweep-repeat-done": frozenset({"cycles", "reason", "stop_cause"}),
     # DW-337. Both producers (`_cycle`'s dispatch gate and `_loop`'s in-flight
     # recovery withhold) write `cycle` and `bundles_not_run`; `reason` is a DROP
@@ -1611,6 +1618,10 @@ def render_markdown(
                 # `file` names which file, `reason` collapses to presence.
                 "sweep-ledger-commit-withheld",
                 "sweep-repeat-done",
+                # #772: the engine's own pre-session ledger bookkeeping commits.
+                "engine-ledger-commit",
+                "engine-ledger-commit-failed",
+                "engine-ledger-commit-refused",
             }
         ]
         if sweep_entries:

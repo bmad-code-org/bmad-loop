@@ -20,7 +20,8 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISLNK, S_ISREG
@@ -5318,6 +5319,14 @@ def _entry_at_revision(
     return fields[0], fields[1], fields[2]
 
 
+def path_absent_at_revision(repo: Path, revision: str, rel: str) -> bool:
+    """True when ``revision``'s tree has NO entry at literal path ``rel`` — of any
+    type: a blob, symlink, gitlink or tree there all read as present. Absence is
+    the empty successful `ls-tree` answer :func:`_entry_at_revision` gives; a git
+    failure raises GitError, never quietly "absent"."""
+    return _entry_at_revision(repo, revision, rel) is None
+
+
 def file_bytes_at_revision(repo: Path, revision: str, rel: str) -> bytes | None:
     """Read one blob byte-exactly from ``revision``.
 
@@ -6115,6 +6124,42 @@ def commits_above(repo: Path, baseline: str, revision: str = "HEAD") -> list[str
     if rc != 0:
         raise GitError(f"git rev-list {baseline}..{revision} failed in {repo}: {detail}")
     return [line for line in out.splitlines() if line]
+
+
+def bookkeeping_only_commits(repo: Path, shas: Iterable[str], rel: str) -> set[str]:
+    """The subset of ``shas`` whose own change set names ``rel`` and nothing else —
+    `diff-tree --no-commit-id --name-only -r` against the first parent (`--root`
+    for a parentless commit).
+
+    A recorded sha is not proof on its own: the record says the engine minted the
+    commit, this re-reads what the commit actually touches, so a misrecorded sha
+    whose commit carries more than the ledger is never filtered out of a preserve
+    range. A commit that names no path at all — a merge, whose plain
+    diff-tree prints nothing, or an empty commit — is NOT bookkeeping-only.
+
+    `-z` output read verbatim (`_git_raw_out`): `--name-only` quotes a non-ASCII
+    path under the default `core.quotePath`, and a stripped value would eat a
+    path's own edge whitespace. Raises GitError on a git failure, like
+    :func:`commits_above` — a failed probe is never quietly "not bookkeeping"."""
+    found: set[str] = set()
+    for sha in shas:
+        rc, out, detail = _git_raw_out(
+            repo,
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "-r",
+            "-z",
+            "--root",
+            sha,
+        )
+        if rc != 0:
+            raise GitError(f"git diff-tree {sha} failed in {repo}: {detail}")
+        names = {name for name in out.split("\0") if name}
+        if names == {rel}:
+            found.add(sha)
+    return found
 
 
 def preserve_commits(
@@ -11026,7 +11071,34 @@ def unpublishable_target(target: Path, family: Literal["ledger", "store"]) -> (
     assert_never(family)
 
 
-def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
+@contextmanager
+def _hookless_git_config() -> Iterator[tuple[str, ...]]:
+    """Yield the `-c` arguments that run one git command with NO repository hooks
+    and NO commit signing: `core.hooksPath` at a fresh empty directory, and
+    `commit.gpgsign=false`.
+
+    `core.hooksPath`, not `--no-verify`: the flag skips only `pre-commit` and
+    `commit-msg`, leaving `prepare-commit-msg`, `post-commit` and
+    `post-index-change` to run — and it does not exist on `git add`, whose index
+    write fires `post-index-change`. An empty directory pointed at by the config
+    silences every hook, including one a repo-configured `core.hooksPath`
+    names, since the command-line `-c` wins over every config file. Signing is
+    off so a pinentry prompt cannot hang an unattended commit.
+
+    The directory lives for the `with` block alone; a failed mkdir raises
+    `GitError` rather than running the command with hooks live."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        hooks_dir = Path(td) / "no-hooks"
+        try:
+            hooks_dir.mkdir()
+        except OSError as exc:
+            raise GitError(f"hook isolation directory could not be prepared: {exc}") from exc
+        yield ("-c", f"core.hooksPath={hooks_dir}", "-c", "commit.gpgsign=false")
+
+
+def commit_paths(
+    repo: Path, message: str, paths: list[Path], *, run_hooks: bool = True
+) -> str | None:
     """Commit exactly `paths` (and nothing else), leaving any unrelated working
     or staged changes untouched. Unlike commit_story's `add -A`, this is safe to
     call out of band (e.g. `bmad-loop decisions`) when the tree may hold the
@@ -11075,7 +11147,24 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     True — and `lstat` succeeds on it because it does not follow the last component.
     `unpublishable_target`'s RESOLVED-argument paragraph makes the same distinction
     for the same reason. The guard still handles what a probe raises, not what it
-    suppresses; there is simply nothing left here that suppresses."""
+    suppresses; there is simply nothing left here that suppresses.
+
+    ``run_hooks=False`` runs the `add`, `status` and `commit` under
+    :func:`_hookless_git_config` — no repository hook of any kind and no commit
+    signing — for an orchestrator bookkeeping commit that records bytes the engine
+    already wrote and must neither run project code nor block on a pinentry. The
+    default keeps every existing caller's hooks live."""
+    if not run_hooks:
+        with _hookless_git_config() as hookless:
+            return _commit_paths(repo, message, paths, hookless)
+    return _commit_paths(repo, message, paths, ())
+
+
+def _commit_paths(
+    repo: Path, message: str, paths: list[Path], git_config: tuple[str, ...]
+) -> str | None:
+    """:func:`commit_paths`'s body; ``git_config`` prefixes the `-c` arguments
+    onto its `add`, `status` and `commit` (empty for the hooks-live default)."""
     rels: list[str] = []
     # The single per-candidate uncertainty slot, shared by BOTH sources (a failed
     # `resolve()` and a failed presence probe) because they have one contract: omit
@@ -11171,7 +11260,7 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     # this comparison is gone: `.as_posix()` above fixes the separator at the source,
     # and a dead normalizer beside a glob operand reads as protection that isn't there.
     specs = _literal_specs(rels)
-    rc, out = _git(repo, "add", "--", *specs)
+    rc, out = _git(repo, *git_config, "add", "--", *specs)
     if rc != 0:
         raise GitError(f"git add failed: {out}")
     # Stdout ALONE (`_git_out`, #442): this is an EMPTINESS test, and `status` exits 0
@@ -11179,13 +11268,13 @@ def commit_paths(repo: Path, message: str, paths: list[Path]) -> str | None:
     # non-empty, the early-out below is skipped, and `git commit` runs with nothing
     # staged and raises where the contract says return None. The `add` above and the
     # `commit` below stay on `_git`: both are rc-only, and stderr is their diagnostic.
-    rc, out, detail = _git_out(repo, "status", "--porcelain", "--", *specs)
+    rc, out, detail = _git_out(repo, *git_config, "status", "--porcelain", "--", *specs)
     if rc != 0:
         raise GitError(f"git status failed: {detail}")
     if not out:
         return None  # nothing changed in these paths
     # pathspec form commits only `rels`, ignoring any other staged changes
-    rc, out = _git(repo, "commit", "-m", message, "--", *specs)
+    rc, out = _git(repo, *git_config, "commit", "-m", message, "--", *specs)
     if rc != 0:
         raise GitError(f"git commit failed: {out}")
     return rev_parse_head(repo)

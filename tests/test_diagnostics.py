@@ -2064,6 +2064,58 @@ def test_a_withheld_ledger_publish_keeps_its_file_through_a_dump(project):
     assert message_value not in markdown
 
 
+def test_the_engine_ledger_commit_rows_keep_their_identity_through_a_dump(project):
+    """#772: the engine's own pre-session ledger bookkeeping commits — published,
+    failed, refused — are collected into the Markdown dump's JSON block beside the
+    sweep's `_commit_ledger` rows. `site` (the closed session role, or `defer`),
+    the bare `added` boolean and the closed `refuse_cause` survive verbatim;
+    `story_key` and `commit` alias; the free-text `error` collapses to presence.
+
+    Ablation: remove any one of the three kinds from the Markdown collected-kind
+    set and its `next(...)` lookup finds no entry. Drop `site` from its kind's
+    `_JOURNAL_KIND_SCHEMAS` row and that row's `site` assertion fails."""
+    run_dir = _seed_run(project.project)
+    error_value = f"fatal: unable to write {HOME_PATH}/deferred-work.md"
+    journal = Journal(run_dir)
+    journal.append(
+        "engine-ledger-commit", story_key=STORY_KEY, site="review", commit="a" * 40, added=True
+    )
+    journal.append(
+        "engine-ledger-commit-failed", story_key=STORY_KEY, site="dev", error=error_value
+    )
+    journal.append(
+        "engine-ledger-commit-refused",
+        story_key=STORY_KEY,
+        site="defer",
+        refuse_cause="target-unreadable",
+        error=error_value,
+    )
+
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=project.project)
+    markdown = diagnostics.render_markdown(diag, pseudo=pseudo)
+    blocks = re.findall(r"```json\n(.*?)\n```", markdown, flags=re.DOTALL)
+    assert len(blocks) == 1
+    entries = json.loads(blocks[0])
+
+    published = next(e for e in entries if e["kind"] == "engine-ledger-commit")
+    failed = next(e for e in entries if e["kind"] == "engine-ledger-commit-failed")
+    refused = next(e for e in entries if e["kind"] == "engine-ledger-commit-refused")
+    assert published["site"] == "review"
+    assert published["added"] is True
+    assert published["commit"].startswith("commit-")  # aliased, not shipped
+    assert failed["site"] == "dev"
+    assert refused["site"] == "defer"
+    assert refused["refuse_cause"] == "target-unreadable"
+    story_alias = next(a for ns, orig, a in pseudo.entries() if ns == "story" and orig == STORY_KEY)
+    for entry in (published, failed, refused):
+        assert entry["story_key"] == story_alias
+    for entry in (failed, refused):
+        assert entry["error_present"] is True and "error" not in entry
+    for canary in (STORY_KEY, error_value, HOME_PATH, "a" * 40):
+        assert canary not in markdown, f"LEAK: {canary!r}"
+
+
 def test_target_field_routes_by_kind_because_it_carries_two_kinds_of_value():
     """`target` is a BRANCH on the merge kinds and a sprint STATUS on `board-advance-*`.
 
@@ -2791,15 +2843,32 @@ def test_markdown_sweep_unknown_key_fails_closed_before_the_backstop(project):
                 "story_keys": [STORY_KEY],
             },
         ),
+        (
+            "engine-ledger-commit",
+            {"story_key": STORY_KEY, "site": "review", "commit": "a" * 40, "added": True},
+        ),
+        (
+            "engine-ledger-commit-failed",
+            {"story_key": STORY_KEY, "site": "dev", "error": "fatal"},
+        ),
+        (
+            "engine-ledger-commit-refused",
+            {
+                "story_key": STORY_KEY,
+                "site": "defer",
+                "refuse_cause": "target-unreadable",
+                "error": "fatal",
+            },
+        ),
     ],
 )
 def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared):
-    """The seven kinds `render_markdown` prints as a JSON block carry a declared
+    """The ten kinds `render_markdown` prints as a JSON block carry a declared
     schema, so a field a future producer adds WITHOUT routing collapses to a
     presence marker instead of riding `scrub_json` into the pasted dump. Graded
     both ways, as the `preference-escalation` row is: the off-schema value is GONE
     and the declared identity fields (`file`, `refuse_cause`, `stop_cause`,
-    `cycles`, `cycle`, `bundles_not_run`) are NOT — a schema that flattened the
+    `cycles`, `cycle`, `bundles_not_run`, `site`, `added`) are NOT — a schema that flattened the
     record would pass an absence-only assertion while destroying what the block is
     rendered for.
 
@@ -2813,7 +2882,16 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
     assert "customer" not in scrubbed
     assert scrubbed["customer_present"] is True
     assert "AcmeVault" not in json.dumps(scrubbed), "LEAK: off-schema sweep value"
-    for name in ("file", "refuse_cause", "stop_cause", "cycles", "cycle", "bundles_not_run"):
+    for name in (
+        "file",
+        "refuse_cause",
+        "stop_cause",
+        "cycles",
+        "cycle",
+        "bundles_not_run",
+        "site",
+        "added",
+    ):
         if name in declared:
             assert scrubbed[name] == declared[name]
     for name in ("message", "repo", "error", "reason"):
@@ -2827,6 +2905,9 @@ def test_an_unrouted_field_on_a_markdown_sweep_kind_fails_closed(kind, declared)
     if "story_keys" in declared:
         # same precedence for the story-key list on `sweep-bundles-withheld`
         assert len(scrubbed["story_keys"]) == 1 and STORY_KEY not in json.dumps(scrubbed)
+    if "story_key" in declared:
+        assert scrubbed["story_key"].startswith("story-")
+        assert STORY_KEY not in json.dumps(scrubbed)
 
 
 def test_env_tmux_version_folds_a_multi_line_probe(monkeypatch):

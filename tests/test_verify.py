@@ -8903,6 +8903,98 @@ def test_commit_paths_noops_on_unchanged_paths_under_host_noise(project):
     assert verify.rev_parse_head(repo) == head  # and nothing was committed
 
 
+_HOOK_NAMES = ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "post-index-change")
+
+
+def _install_marker_hooks(hooks_dir: Path) -> None:
+    """One marker-writing script per `_HOOK_NAMES` entry. A hook runs at the
+    worktree root, so each marker lands as `hook-<name>` beside `src.txt`."""
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    for name in _HOOK_NAMES:
+        hook = hooks_dir / name
+        hook.write_text(f"#!/bin/sh\nprintf ran > hook-{name}\n")
+        hook.chmod(0o755)
+
+
+@pytest.mark.parametrize("hooks_at", ["git-dir", "configured"])
+def test_commit_paths_run_hooks_false_skips_pre_commit_and_commit_msg_hooks(
+    project, tmp_path, hooks_at
+):
+    """#772: `run_hooks=False` silences every repository hook across `add`, `status`
+    and `commit` — the `--no-verify` pair, and the `prepare-commit-msg`,
+    `post-commit` and `post-index-change` hooks that flag leaves live — whether they
+    sit in `.git/hooks` or in a repo-configured `core.hooksPath`, which the
+    command-line `-c core.hooksPath` outranks.
+
+    The default commit afterwards is the in-test proof that the installed hooks
+    bite: without it, a hook that never runs for an unrelated reason passes the
+    marker assertions too.
+
+    Ablation: make `commit_paths` ignore `run_hooks` (always pass `()`) and every
+    marker appears after the first commit."""
+    repo = project.project
+    if hooks_at == "git-dir":
+        hooks_dir = repo / ".git" / "hooks"
+    else:
+        hooks_dir = tmp_path / "configured-hooks"
+        git(repo, "config", "core.hooksPath", hooks_dir.as_posix())
+    _install_marker_hooks(hooks_dir)
+    base = verify.rev_parse_head(repo)
+    (repo / "src.txt").write_text("bookkeeping\n")
+
+    sha = verify.commit_paths(repo, "chore: ledger", [repo / "src.txt"], run_hooks=False)
+
+    assert sha is not None and sha != base
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "show", "HEAD:src.txt") == "bookkeeping"
+    assert [name for name in _HOOK_NAMES if (repo / f"hook-{name}").exists()] == []
+
+    (repo / "src.txt").write_text("hooks live\n")
+    assert verify.commit_paths(repo, "chore: hooks", [repo / "src.txt"]) is not None
+    assert [name for name in _HOOK_NAMES if (repo / f"hook-{name}").exists()] == list(_HOOK_NAMES)
+
+
+def test_commit_paths_run_hooks_false_ignores_gpgsign(project, tmp_path):
+    """#772: `run_hooks=False` commits with `commit.gpgsign=false`, so a repo that
+    signs every commit cannot block (or, unattended, hang on a pinentry) the
+    engine's bookkeeping commit. A `gpg.program` that does not exist makes signing
+    fail outright — portable, and the default call's `GitError` below proves the
+    configuration bites before the hookless call is trusted.
+
+    Ablation: drop `commit.gpgsign=false` from `_hookless_git_config` and the
+    hookless commit raises the same `GitError`."""
+    repo = project.project
+    git(repo, "config", "commit.gpgsign", "true")
+    git(repo, "config", "gpg.program", (tmp_path / "no-such-gpg").as_posix())
+    base = verify.rev_parse_head(repo)
+    (repo / "src.txt").write_text("signed?\n")
+
+    with pytest.raises(verify.GitError, match="git commit failed"):
+        verify.commit_paths(repo, "chore: signed", [repo / "src.txt"])
+    assert verify.rev_parse_head(repo) == base
+
+    sha = verify.commit_paths(repo, "chore: unsigned", [repo / "src.txt"], run_hooks=False)
+
+    assert sha is not None and sha != base
+    assert sha == verify.rev_parse_head(repo)
+    assert git(repo, "log", "-1", "--format=%s") == "chore: unsigned"
+
+
+def test_commit_paths_default_still_runs_hooks(project):
+    """Characterization: the default `run_hooks=True` keeps every existing caller's
+    hooks live — a `.git/hooks/pre-commit` still runs and the commit still lands."""
+    repo = project.project
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nprintf ran > commit-hook-ran\n")
+    hook.chmod(0o755)
+    (repo / "src.txt").write_text("hooks live\n")
+
+    sha = verify.commit_paths(repo, "chore: hooks", [repo / "src.txt"])
+
+    assert sha is not None and sha == verify.rev_parse_head(repo)
+    assert (repo / "commit-hook-ran").exists()
+
+
 def test_apply_patch_replays_saved_diff(project):
     """A patch saved off the baseline re-applies cleanly onto that same baseline —
     tracked edits AND new (untracked) files — reproducing the reverted attempt."""
@@ -14832,6 +14924,69 @@ def test_commits_above_lists_attempt_commits_newest_first(project):
     head = verify.rev_parse_head(repo)
     commits = verify.commits_above(repo, baseline)
     assert commits == [head]
+
+
+def _commit_files(repo: Path, message: str, files: dict[str, str]) -> str:
+    for rel, text in files.items():
+        (repo / rel).write_text(text)
+    git(repo, "add", "--", *files)
+    git(repo, "commit", "-q", "-m", message)
+    return verify.rev_parse_head(repo)
+
+
+def test_bookkeeping_only_commits_filters_mixed_commits(project):
+    """#772: only a commit whose own change set is exactly the ledger is
+    bookkeeping-only. A commit that ALSO carries other work, one that touches
+    only other work, a merge (whose plain `diff-tree` names nothing) and an empty
+    commit all stay out — a misrecorded sha never filters real work out of a
+    preserve range. A sha git cannot read raises rather than reading as "not
+    bookkeeping".
+
+    Ablation: replace `names == {rel}` with `rel in names` and the mixed commit
+    joins the result; with `names <= {rel}` the merge and the empty commit do."""
+    repo = project.project
+    ledger = "deferred-work.md"
+    trunk = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    only_ledger = _commit_files(repo, "ledger", {ledger: "DW-1\n"})
+    mixed = _commit_files(repo, "ledger + work", {ledger: "DW-2\n", "src.txt": "work\n"})
+    other = _commit_files(repo, "work", {"other.txt": "other\n"})
+    git(repo, "commit", "-q", "--allow-empty", "-m", "empty")
+    empty = verify.rev_parse_head(repo)
+    git(repo, "checkout", "-q", "-b", "side", only_ledger)
+    _commit_files(repo, "side work", {"side.txt": "side\n"})
+    git(repo, "checkout", "-q", trunk)
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+    merge = verify.rev_parse_head(repo)
+
+    found = verify.bookkeeping_only_commits(repo, [only_ledger, mixed, other, empty, merge], ledger)
+
+    assert found == {only_ledger}
+    assert verify.bookkeeping_only_commits(repo, [], ledger) == set()
+    with pytest.raises(verify.GitError, match="diff-tree"):
+        verify.bookkeeping_only_commits(repo, [only_ledger, "0" * 40], ledger)
+
+
+def test_path_absent_at_revision_reads_presence_and_raises_on_git_failure(project):
+    """#772: the ledger's `added` bit — absence is a successful empty `ls-tree`
+    answer; a tracked file or a directory both read as present, and an unreadable
+    revision raises instead of reading as "absent".
+
+    Ablation: make `_entry_at_revision` return None on a nonzero `ls-tree` and the
+    raise below fails."""
+    repo = project.project
+    nested = repo / "dir" / "f.txt"
+    nested.parent.mkdir()
+    nested.write_text("x\n")
+    git(repo, "add", "dir")
+    git(repo, "commit", "-q", "-m", "nested")
+    head = verify.rev_parse_head(repo)
+
+    assert verify.path_absent_at_revision(repo, head, "src.txt") is False
+    assert verify.path_absent_at_revision(repo, head, "dir") is False
+    assert verify.path_absent_at_revision(repo, head, "dir/f.txt") is False
+    assert verify.path_absent_at_revision(repo, head, "missing.md") is True
+    with pytest.raises(verify.GitError, match="ls-tree"):
+        verify.path_absent_at_revision(repo, "not-a-revision", "src.txt")
 
 
 def test_pinned_revision_preservation_does_not_follow_checkout_head(project):

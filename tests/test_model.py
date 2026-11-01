@@ -1868,6 +1868,89 @@ def test_story_task_baseline_artifacts_mangled_shape_reads_as_no_snapshot(mangle
     assert StoryTask.from_dict(d).baseline_artifacts is None
 
 
+# ------------------------------------ the engine's ledger bookkeeping commits (#772)
+
+
+def test_story_task_bookkeeping_ledger_round_trips_and_defaults_none():
+    """`bookkeeping_ledger` — the baseline it was minted on, whether the ledger was
+    absent from that baseline's tree, and the engine's commit shas — survives a
+    JSON `to_dict`/`from_dict` trip, and a pre-upgrade record with no key reads as
+    `None` (no record), the conservative pre-bookkeeping path."""
+    task = StoryTask(story_key="1-1-a", epic=1, baseline_commit="b" * 40)
+    assert task.bookkeeping_ledger is None
+    task.bookkeeping_ledger = {"baseline": "b" * 40, "added": True, "shas": ["c" * 40, "d" * 40]}
+
+    rehydrated = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+
+    assert rehydrated.bookkeeping_ledger == task.bookkeeping_ledger
+    assert rehydrated.bookkeeping_ledger is not task.bookkeeping_ledger
+    empty = StoryTask(story_key="1-1-a", epic=1)
+    empty.bookkeeping_ledger = {"baseline": "b" * 40, "added": False, "shas": []}
+    assert StoryTask.from_dict(empty.to_dict()).bookkeeping_ledger == empty.bookkeeping_ledger
+    legacy = task.to_dict()
+    del legacy["bookkeeping_ledger"]
+    assert StoryTask.from_dict(legacy).bookkeeping_ledger is None
+
+
+@pytest.mark.parametrize(
+    "mangled",
+    [
+        None,
+        "not a mapping",
+        ["b" * 40],
+        {"added": True, "shas": []},
+        {"baseline": "", "added": True, "shas": []},
+        {"baseline": 7, "added": True, "shas": []},
+        {"baseline": "b" * 40, "shas": []},
+        {"baseline": "b" * 40, "added": "true", "shas": []},
+        {"baseline": "b" * 40, "added": 1, "shas": []},
+        {"baseline": "b" * 40, "added": None, "shas": []},
+        {"baseline": "b" * 40, "added": True},
+        {"baseline": "b" * 40, "added": True, "shas": "c" * 40},
+        {"baseline": "b" * 40, "added": True, "shas": {"c" * 40: 1}},
+        {"baseline": "b" * 40, "added": True, "shas": ["c" * 40, 7]},
+        {"baseline": "b" * 40, "added": True, "shas": ["c" * 40, None]},
+        {"baseline": "b" * 40, "added": True, "shas": [""]},
+    ],
+)
+def test_story_task_bookkeeping_ledger_mangled_shape_reads_as_no_record(mangled):
+    """A hand-edited record that is not exactly `{baseline: str, added: bool,
+    shas: [str]}` is not partially trusted: the whole field reads as `None`, which
+    only re-enables the conservative paths (a preserve that parks the commits, a
+    gate that counts the ledger). A truthy `"true"` or `1` is not `added`, and a
+    non-string sha is never coerced into one — nor does it RAISE out of
+    `from_dict`, which would keep the whole run state from loading.
+
+    Ablation: return `raw` from `_bookkeeping_ledger_from` whenever it is a dict
+    and every mapping row fails."""
+    d = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    d["bookkeeping_ledger"] = mangled
+
+    assert StoryTask.from_dict(d).bookkeeping_ledger is None
+
+
+def test_story_task_bookkeeping_for_baseline_drops_a_record_once_baseline_moves():
+    """The record is SELF-INVALIDATING: `bookkeeping_for_baseline()` hands it back
+    only while `baseline_commit` is the baseline it names. A new attempt's
+    baseline, or a cleared one, reads as no record without any reset site having
+    to clear the field — which stays stored untouched either way.
+
+    Ablation: return `self.bookkeeping_ledger` unconditionally and the two `is
+    None` assertions after the baseline moves fail."""
+    record = {"baseline": "b" * 40, "added": False, "shas": ["c" * 40]}
+    task = StoryTask(story_key="1-1-a", epic=1, baseline_commit="b" * 40)
+    assert task.bookkeeping_for_baseline() is None
+    task.bookkeeping_ledger = record
+
+    assert task.bookkeeping_for_baseline() == record
+
+    task.baseline_commit = "e" * 40
+    assert task.bookkeeping_for_baseline() is None
+    task.baseline_commit = None
+    assert task.bookkeeping_for_baseline() is None
+    assert task.bookkeeping_ledger == record
+
+
 # ------------------------------------------- nested mount project (DW-379)
 
 
