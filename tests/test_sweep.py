@@ -39912,3 +39912,250 @@ def test_v7_retro_ingest_skipped_journaled(project_v7, monkeypatch):
     assert row["ingest_cause"] == "no-board"
     assert "error" not in row
     assert _records(engine, "sweep-retro-items-ingested") == []
+
+
+# --- #772: the engine commits its own ledger bookkeeping before a session ----------
+
+
+def _porcelain_spy(project, effect, seen: list[str]):
+    """Wrap a mock-session effect so its first act records the ledger's porcelain
+    at launch — what bmad-build-auto's finalization would find left over. The
+    ledger path only: the mock sessions leave their own code edits uncommitted,
+    which the real skill commits itself."""
+
+    def spying(spec):
+        seen.append(git(project.project, "status", "--porcelain", "--", ledger_rel(project)))
+        return effect(spec)
+
+    return spying
+
+
+_REVIEW_FINDING = {
+    "summary": "Retry loop has no ceiling",
+    "evidence": "the backoff doubles forever: no cap",
+    "location": "src.txt:1",
+    "severity": "medium",
+}
+
+
+def _ledger_commit_rows(engine, kind="engine-ledger-commit"):
+    return [entry for entry in engine.journal.entries() if entry["kind"] == kind]
+
+
+def _bookkeeping_subjects(project) -> list[str]:
+    log = git(project.project, "log", "--format=%s")
+    return [line for line in log.splitlines() if "engine bookkeeping" in line]
+
+
+def test_bundle_review_launches_on_a_clean_ledger(project):
+    """#772. The bundle close (`_post_dev_accepted_sync`) leaves the ledger dirty for
+    `finalize_commit` to squash; the review session that follows used to inherit
+    that dirt and HALT `finalization left repository dirty`. The engine now
+    commits the ledger alone right before the review launches, and the squash
+    still folds it into the one bundle commit — no stray chore commit survives.
+
+    Ablation: drop `commit_engine_ledger=True` at the review launch and the
+    review sees the ledger dirty."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    seen: list[str] = []
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"]),
+            _porcelain_spy(project, bundle_review_effect(project, "fix"), seen),
+        ],
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [s.role for s in adapter.sessions][-1] == "review"
+    assert seen == [""]
+    (row,) = _ledger_commit_rows(engine)
+    assert row["site"] == "review" and row["story_key"] == "dw-fix"
+    assert row["added"] is False
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    # the squashed bundle commit carries the ledger close
+    touched = git(project.project, "show", "--name-only", "--format=", task.commit_sha)
+    assert ledger_rel(project) in touched.splitlines()
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+    # and the bookkeeping commit itself was squashed away
+    assert _bookkeeping_subjects(project) == []
+    assert worktree_clean(project.project)
+
+
+def test_every_bundle_review_cycle_launches_on_a_clean_ledger(project):
+    """#772. Engine ledger writes land between review cycles too — the post-review
+    harvest of a cycle's findings, `_verify_review`'s reclose — so the commit runs
+    at every review launch, not only the first.
+
+    Ablation: drop `commit_engine_ledger=True` at the review launch and both
+    launches see the ledger dirty."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    seen: list[str] = []
+    first = bundle_review_effect(project, "fix", clean=False)
+
+    def review_with_finding(spec):
+        result = first(spec)
+        sp = bundle_spec_path(project, "fix")
+        write_spec(sp, "done", _spec_baseline(sp), deferred=[_REVIEW_FINDING])
+        return result
+
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"]),
+            _porcelain_spy(project, review_with_finding, seen),
+            _porcelain_spy(project, bundle_review_effect(project, "fix"), seen),
+        ],
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [s.role for s in adapter.sessions][-2:] == ["review", "review"]
+    assert seen == ["", ""]
+    assert [row["site"] for row in _ledger_commit_rows(engine)] == ["review", "review"]
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    assert _bookkeeping_subjects(project) == []
+
+
+def test_bundle_fix_phase_repair_launches_on_a_clean_ledger(project):
+    """#772. A clean review whose verify commands fail hands the tree to a
+    `_fix_phase` repair dev session, which inherits the bundle close just like a
+    review would.
+
+    Ablation: drop `commit_engine_ledger=True` at the `_fix_phase` launch and the
+    repair sees the ledger dirty."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    marker = project.project / "bundle-verify-marker"
+    dev = bundle_dev_effect(project, "fix", ["DW-1"])
+    review = bundle_review_effect(project, "fix")
+    seen: list[str] = []
+
+    def dev_with_marker(spec):
+        result = dev(spec)
+        marker.write_text("ok\n", encoding="utf-8")
+        return result
+
+    def breaking_review(spec):
+        marker.unlink()
+        result = review(spec)
+        # a finding the post-review harvest appends to the ledger — engine dirt
+        # the repair session launches on
+        sp = bundle_spec_path(project, "fix")
+        write_spec(sp, "done", _spec_baseline(sp), deferred=[_REVIEW_FINDING])
+        return result
+
+    def repair(_spec):
+        marker.write_text("repaired\n", encoding="utf-8")
+        return SessionResult(
+            status="completed", result_json={"workflow": "auto-dev", "escalations": []}
+        )
+
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=True, trigger="always"),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+        scm=ScmPolicy(rollback_on_failure=True),
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            dev_with_marker,
+            breaking_review,
+            _porcelain_spy(project, repair, seen),
+            bundle_review_effect(project, "fix"),
+        ],
+        policy=policy,
+    )
+
+    summary = engine.run()
+
+    assert not summary.crashed
+    assert [s.role for s in adapter.sessions][1:] == ["dev", "review", "dev", "review"]
+    assert seen == [""]
+    # the review's finding was harvested after the review launch, so only the
+    # repair launch had it to commit
+    sites = [row["site"] for row in _ledger_commit_rows(engine)]
+    assert sites.count("dev") == 1
+    assert _bookkeeping_subjects(project) == []
+
+
+def test_bundle_review_with_a_gitignored_ledger_commits_nothing(project):
+    """#772. A gitignored ledger — the default setup — is invisible to the build
+    skill's clean-tree check, so there is nothing to commit and nothing to report."""
+    ignore_before_commit(project, ledger_rel(project))
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore the ledger")
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    seen: list[str] = []
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"]),
+            _porcelain_spy(project, bundle_review_effect(project, "fix"), seen),
+        ],
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert seen == [""]
+    for kind in (
+        "engine-ledger-commit",
+        "engine-ledger-commit-failed",
+        "engine-ledger-commit-refused",
+    ):
+        assert _ledger_commit_rows(engine, kind) == []
+    assert _bookkeeping_subjects(project) == []
+
+
+def test_bundle_review_commits_an_untracked_visible_ledger_as_added(project):
+    """#772. An untracked ledger git can still see trips the clean-tree check too;
+    it is committed (`added=True`, so a rollback knows the reset now owns it) and
+    lands in the squashed bundle commit."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    seen: list[str] = []
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"]),
+            _porcelain_spy(project, bundle_review_effect(project, "fix"), seen),
+        ],
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert seen == [""]
+    (row,) = _ledger_commit_rows(engine)
+    assert row["site"] == "review" and row["added"] is True
+    task = engine.state.tasks["dw-fix"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    touched = git(project.project, "show", "--name-only", "--format=", task.commit_sha)
+    assert ledger_rel(project) in touched.splitlines()
+    assert _bookkeeping_subjects(project) == []

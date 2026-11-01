@@ -1078,6 +1078,7 @@ class Engine:
             dev_attempt_dispatched=self._dev_attempt_dispatched,
             spec_confine_root=lambda task: self._spec_confine_root(task),
             owned_plan=self._owned_plan_writer(),
+            ledger_rel=lambda: self._ledger_rel(),
         )
 
     def _escalation_pause(
@@ -3493,6 +3494,11 @@ class Engine:
             # retry rebases it onto the tree that retry deliberately keeps.
             task.baseline_ledger_digest = self._ledger_digest(task)
         feedback: Path | None = None
+        # A non-fixable rollback below restores the persisted ledger into the tree
+        # the next attempt starts from. Loop-local on purpose: `task.attempt` survives
+        # resume and re-arm, so it cannot tell a retry after rollback from a resumed
+        # first pass.
+        rolled_back = False
         while True:
             replayed = resume_result is not None
             if resume_result is None:
@@ -3586,6 +3592,10 @@ class Engine:
                     prompt=prompt,
                     seq=task.attempt,
                     preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
+                    # #772: a repair keeps the harvested ledger, and a retry after
+                    # rollback starts on the restored one — both dirty, both the
+                    # engine's. A first-pass launch has no engine ledger dirt.
+                    commit_engine_ledger=feedback is not None or rolled_back,
                 )
             advance(task, Phase.DEV_VERIFY)
             outcome = None
@@ -3779,6 +3789,7 @@ class Engine:
                     task.baseline_ledger_digest = self._ledger_digest(task)
                 else:
                     feedback = None
+                    rolled_back = True
                     try:
                         self._rollback_or_pause(task)
                     finally:
@@ -4062,6 +4073,9 @@ class Engine:
                     prompt=self._review_prompt(task),
                     seq=task.review_cycle,
                     spec_snapshot=snapshot,
+                    # #772: every review cycle follows an engine ledger write (dev
+                    # harvest, bundle close or reclose, post-fix harvest).
+                    commit_engine_ledger=True,
                 )
             advance(task, Phase.REVIEW_VERIFY)
             self._save()
@@ -8721,6 +8735,8 @@ class Engine:
         spec_snapshot: SpecSnapshot | None = None,
         preserve_dispatched_spec_snapshot: bool = False,
         prelaunch_validator: Callable[[], None] | None = None,
+        *,
+        commit_engine_ledger: bool = False,
     ) -> SessionResult:
         # A session may change the environment a probe pass vouched for, so no
         # pass survives a launch (DW-523).
@@ -8905,6 +8921,14 @@ class Engine:
         # after every executable session hook and every prompt/snapshot repair,
         # but before either the session-start record or adapter launch.  The
         # default keeps all existing callers byte-for-byte inert.
+        if commit_engine_ledger:
+            # #772: the build skill's finalization HALTs `blocked` on any leftover
+            # change, and the engine's harvests, closes and restores leave the ledger
+            # dirty on purpose. Commit that one file (hooks and signing off) after
+            # every session hook, so plugin `pre_*_session` ledger writes ride along,
+            # and only here on the live launch path: the veto return above and the
+            # callers' replay arms launch nothing, so they commit nothing.
+            self._commit_engine_ledger(task, site=role)
         if prelaunch_validator is not None:
             prelaunch_validator()
         spec = SessionSpec(
@@ -9746,6 +9770,8 @@ class Engine:
                 seq=task.attempt,
                 session_stage="pre_fix_session",
                 preserve_dispatched_spec_snapshot=preserve_chain_snapshot,
+                # #772: the repair inherits the review leg's harvested ledger.
+                commit_engine_ledger=True,
             )
             advance(task, Phase.DEV_VERIFY)
             outcome = None

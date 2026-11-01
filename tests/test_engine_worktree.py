@@ -2466,6 +2466,10 @@ def test_deferred_carry_commit_failure_resumes_before_terminal_integration(proje
 
     def commit_fails_once(*args, **kwargs):
         nonlocal failures
+        if kwargs.get("run_hooks") is False:
+            # The engine's pre-review ledger bookkeeping commit (#772) is not the
+            # carry under test; let it through so the fault lands on the carry.
+            return real_commit(*args, **kwargs)
         failures += 1
         if failures == 1:
             raise verify.GitError("commit hook rejects deferred carry")

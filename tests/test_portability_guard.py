@@ -1818,6 +1818,9 @@ JOURNAL_KINDS = frozenset(
         "baseline-accepted",
         "attempt-preserve-enumerate-failed",
         "attempt-preserve-failed",
+        # #772: the engine-bookkeeping preserve filter could not answer and kept
+        # the full range. `story_key` aliased, `error` dropped.
+        "attempt-preserve-filter-failed",
         # DW-481: a re-drive's best-effort preserve leg failed and fell through to
         # the reset. `story_key` aliased, `leg` benign, `head` aliased as a commit,
         # `error` (a HEAD read fault) dropped.

@@ -110,6 +110,7 @@ from bmad_loop.policy import (
     SweepPolicy,
     VerifyPolicy,
 )
+from bmad_loop.recovery_flow import retry_preserve_paragraph
 from bmad_loop.runs import (
     STOP_REQUEST_FILE,
     graceful_stop_requested,
@@ -10444,7 +10445,16 @@ def test_defer_skips_restore_for_a_ledger_the_reset_never_touched(project, monke
     # Untracked, and present before the attempt's baseline is stamped, so the
     # reset's cleanup (created-since-baseline files only) leaves it alone. Git
     # never owned this file, so git never put anything back into it either.
+    # Gitignored as well (the default setup): an untracked-VISIBLE ledger is no
+    # longer reset-proof, because the engine's pre-review bookkeeping commit
+    # (#772) puts it into HEAD and `reset --hard` then owns it. An ignored one
+    # stays untracked through every launch.
     project.deferred_work.write_text("# Deferred Work\n")
+    gitignore = project.project / ".gitignore"
+    rel = project.deferred_work.relative_to(project.project).as_posix()
+    gitignore.write_text(gitignore.read_text() + f"{rel}\n")
+    git(project.project, "add", ".gitignore")
+    git(project.project, "commit", "-q", "-m", "ignore the ledger")
     write_sprint(project, {"1-1-a": "ready-for-dev"})
 
     filed: list[bool] = []
@@ -27492,3 +27502,285 @@ def test_no_code_repair_over_a_bookkeeping_added_ledger_fails_proof_of_work(proj
     # The control: unexcluded, the committed ledger alone IS a change since baseline.
     assert verify.has_changes_since(project.project, task.baseline_commit)
     assert not verify.has_changes_since(project.project, task.baseline_commit, excluded)
+
+
+# --- #772: the bookkeeping commit wired into session launches ---------------------
+
+HARVEST_C = {
+    "summary": "Cache key ignores locale",
+    "evidence": "key is built from the path alone",
+    "location": "src/cache.py:40",
+    "severity": "low",
+}
+
+
+def _ledger_spy(project, effect, seen: list[str]):
+    """Record the ledger's porcelain as the session launches. The ledger path only:
+    story runs deliberately leave the sprint board uncommitted, and the mock
+    sessions leave their code edits uncommitted where the real skill commits."""
+
+    def spying(spec):
+        seen.append(git(project.project, "status", "--porcelain", "--", _LEDGER_REL))
+        return effect(spec)
+
+    return spying
+
+
+def _commit_sites(engine) -> list[str]:
+    return [e["site"] for e in engine.journal.entries() if e["kind"] == "engine-ledger-commit"]
+
+
+def test_story_review_and_fix_launches_find_the_harvested_ledger_committed(project):
+    """#772. The dev-leg harvest, the review-leg harvest and the fix-leg harvest each
+    leave the ledger dirty; both review launches and the `_fix_phase` repair launch
+    now find it committed.
+
+    Ablation: drop `commit_engine_ledger=True` at the review launch and the review
+    entries of `seen` go dirty; drop it at the `_fix_phase` launch and the fix
+    entry does."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-0": "done"})
+    marker = project.project / "fixed.marker"
+    seen: list[str] = []
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(project, "1-1-a", deferred=[HARVEST_A])(spec)
+
+    def breaking_review_with_finding(spec):
+        marker.unlink()
+        result = review_effect(project, "1-1-a", clean=True)(spec)
+        sp = spec_path(project, "1-1-a")
+        write_spec(sp, "done", _spec_baseline(sp), deferred=[HARVEST_B])
+        return result
+
+    def fix_with_new_deferral(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(
+            project,
+            "1-1-a",
+            final_status="in-progress",
+            prose_status="done",
+            deferred=[HARVEST_C],
+        )(spec)
+
+    policy = dataclasses.replace(
+        _harvest_policy(review=True),
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
+    )
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_with_marker,
+            _ledger_spy(project, breaking_review_with_finding, seen),
+            _ledger_spy(project, fix_with_new_deferral, seen),
+            _ledger_spy(project, review_effect(project, "1-1-a", clean=True), seen),
+        ],
+        policy=policy,
+    )
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed and not summary.paused
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev", "review"]
+    assert seen == ["", "", ""]
+    assert _commit_sites(engine) == ["review", "dev", "review"]
+    titles = [entry.title for entry in _harvest_entries(project)]
+    for finding in (HARVEST_A, HARVEST_B, HARVEST_C):
+        assert finding["summary"] in titles
+    # finalize squashed every bookkeeping commit into the story commit
+    subjects = git(project.project, "log", "--format=%s").splitlines()
+    assert [s for s in subjects if "engine bookkeeping" in s] == []
+
+
+def test_fixable_retry_launches_on_a_committed_ledger(project, tmp_path):
+    """#772. A fixable retry keeps attempt 1's tree, harvested ledger included; the
+    repair launch commits that ledger first.
+
+    Ablation: drop the `feedback is not None` arm of the dev launch's opt-in and
+    the repair launch sees the ledger dirty."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-0": "done"})
+    marker = tmp_path / "repair-complete"
+    seen: list[str] = []
+
+    def repair(spec):
+        marker.write_text("ok\n", encoding="utf-8")
+        return dev_effect(project, "1-1-a", followup_review=False)(spec)
+
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A]),
+            _ledger_spy(project, repair, seen),
+        ],
+        policy=_fixable_harvest_policy(marker),
+    )
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [decision["action"] for decision in decisions] == ["retry", "proceed"]
+    assert summary.done == 1 and not summary.paused
+    assert seen == [""]
+    assert _commit_sites(engine) == ["dev"]
+    assert HARVEST_A["summary"] in [entry.title for entry in _harvest_entries(project)]
+
+
+def test_rollback_retry_launches_on_a_committed_restored_ledger(project):
+    """#772. A non-fixable rejection resets to the baseline and
+    `_restore_persisted_ledger` republishes the pre-harvest snapshot — here
+    carrying the session's own entry — so the retry would launch on a dirty
+    ledger. The retry launch commits it first.
+
+    Ablation: drop the `rolled_back` arm of the dev launch's opt-in and the
+    retry launch sees the ledger dirty."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-0": "done"})
+    seen: list[str] = []
+    liar = _baseline_liar_effect(project, deferred=[HARVEST_A])
+
+    def session_entry_then_lie(spec):
+        deferredwork.append_entry(
+            project.deferred_work,
+            title="Session's own ledger work",
+            origin="the session itself",
+            source_spec="specs/older.md",
+            reason="filed by the session, not by the harvest",
+        )
+        return liar(spec)
+
+    restored_before_retry: list[str] = []
+    engine, adapter = make_engine(
+        project,
+        [
+            session_entry_then_lie,
+            _ledger_spy(project, dev_effect(project, "1-1-a", followup_review=False), seen),
+        ],
+        policy=_harvest_policy(attempts=2),
+    )
+    real_restore = engine._restore_persisted_ledger
+
+    def observing_restore(task, *, replayed):
+        real_restore(task, replayed=replayed)
+        restored_before_retry.append(
+            git(project.project, "status", "--porcelain", "--", _LEDGER_REL)
+        )
+
+    engine._restore_persisted_ledger = observing_restore  # type: ignore[method-assign]
+
+    summary = engine.run()
+
+    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert [decision["action"] for decision in decisions] == ["retry", "proceed"]
+    assert summary.done == 1 and not summary.paused
+    # the restore re-dirtied the ledger, and the retry still launched clean
+    assert restored_before_retry and restored_before_retry[0] != ""
+    assert seen == [""]
+    assert _commit_sites(engine) == ["dev"]
+    titles = [entry.title for entry in _harvest_entries(project)]
+    assert "Session's own ledger work" in titles
+
+
+def test_first_pass_dev_launch_does_not_commit_the_ledger(project, monkeypatch):
+    """#772 characterization: a first-pass dev launch starts from the baseline
+    the engine has not written to, so it never takes the bookkeeping commit;
+    only the review launch that follows the dev harvest does."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-0": "done"})
+    engine, adapter = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a", deferred=[HARVEST_A]),
+            review_effect(project, "1-1-a", clean=True),
+        ],
+        policy=_harvest_policy(review=True),
+    )
+    calls: list[tuple[str, int]] = []
+    real_commit = engine._commit_engine_ledger
+
+    def recording(task, *, site, message=None):
+        calls.append((site, len(adapter.sessions)))
+        real_commit(task, site=site, message=message)
+
+    monkeypatch.setattr(engine, "_commit_engine_ledger", recording)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    assert calls == [("review", 1)]
+
+
+def test_preserve_skips_a_bookkeeping_only_range_but_parks_a_mixed_one(project):
+    """#772. The engine's recorded, ledger-only bookkeeping commits are not attempt
+    work: a range holding only those parks no `attempt-preserve` ref (so no retry
+    prompt points at one, and no ref fault can pause a clean reset). A range that
+    also holds a real commit still parks.
+
+    Ablation: drop the `_without_engine_bookkeeping` filter and the first
+    preserve parks a ref."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, task = _bookkeeping_engine(project)
+    with project.deferred_work.open("a", encoding="utf-8") as f:
+        f.write("\n### DW-2: harvested\n\nstatus: open\n")
+    engine._commit_engine_ledger(task, site="review")
+    record = task.bookkeeping_for_baseline()
+    assert record is not None and len(record["shas"]) == 1
+
+    flow = engine._recovery_flow
+    assert flow.preserve_attempt_commits(task, allow_pause=True) is None
+    assert git(project.project, "branch", "--list", "attempt-preserve/*") == ""
+    assert task.preserve_ref is None
+    assert retry_preserve_paragraph(project.project, task, engine.state.run_id) == ""
+    assert "attempt-commits-preserved" not in [e["kind"] for e in engine.journal.entries()]
+
+    (project.project / "src.txt").write_text("attempt work\n")
+    git(project.project, "commit", "-q", "-am", "attempt work")
+
+    parked = flow.preserve_attempt_commits(task, allow_pause=True)
+
+    assert parked is not None
+    ref, count = parked
+    assert count == 1  # the bookkeeping commit is not counted as attempt work
+    assert (
+        git(project.project, "branch", "--list", "attempt-preserve/*")
+        .strip()
+        .endswith(ref.removeprefix("refs/heads/"))
+    )
+
+
+def test_preserve_keeps_a_recorded_sha_that_touches_more_than_the_ledger(project):
+    """#772. The record alone never filters: a recorded sha whose commit carries
+    more than the ledger is re-read by `bookkeeping_only_commits` and parked."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, task = _bookkeeping_engine(project)
+    with project.deferred_work.open("a", encoding="utf-8") as f:
+        f.write("\n### DW-2: harvested\n\nstatus: open\n")
+    (project.project / "src.txt").write_text("not bookkeeping\n")
+    git(project.project, "commit", "-q", "-am", "mixed")
+    sha = verify.rev_parse_head(project.project)
+    task.bookkeeping_ledger = {"baseline": task.baseline_commit, "added": False, "shas": [sha]}
+
+    assert engine._recovery_flow.preserve_attempt_commits(task, allow_pause=True) is not None
+
+
+def test_preserve_filter_fault_keeps_the_full_range(project, monkeypatch):
+    """#772. A filter that cannot answer degrades to the unfiltered range —
+    journaled — never to "nothing above baseline", which would let the reset
+    run past work it never parked."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, task = _bookkeeping_engine(project)
+    with project.deferred_work.open("a", encoding="utf-8") as f:
+        f.write("\n### DW-2: harvested\n\nstatus: open\n")
+    engine._commit_engine_ledger(task, site="review")
+
+    def faulting(*_a, **_k):
+        raise verify.GitError("diff-tree timed out")
+
+    monkeypatch.setattr(verify, "bookkeeping_only_commits", faulting)
+
+    assert engine._recovery_flow.preserve_attempt_commits(task, allow_pause=True) is not None
+    (row,) = [e for e in engine.journal.entries() if e["kind"] == "attempt-preserve-filter-failed"]
+    assert row["story_key"] == "1-1-a"
+    assert "diff-tree timed out" in row["error"]
