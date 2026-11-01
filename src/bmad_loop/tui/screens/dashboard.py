@@ -1218,7 +1218,9 @@ class DashboardScreen(Screen[None]):
         driving THIS task, else the last session that stamped an adapter identity
         (#153 phase 1), else "-" (no live agent and no stamped history)."""
         if agent is not None and agent.story_key == key:
-            return agent_label(agent.name, agent.model)
+            # The CLI-reported model (#859) when the hook sent one.
+            model = agent.reported_model if agent.reported_model is not None else agent.model
+            return agent_label(agent.name, model)
         for record in reversed(task.sessions):
             if record.adapter:
                 return agent_label(record.adapter, record.model)

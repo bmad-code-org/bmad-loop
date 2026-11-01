@@ -1,7 +1,9 @@
 """Importable twin of the hardened event write in ``data/bmad_loop_hook.py``.
 
-The hook script is COPIED into every target project and runs inside the coding
-CLI's process under whatever interpreter the host has, so it is stdlib-only by
+Older inits COPIED the hook script into every target project; ``init`` now
+registers ``<bmad-loop exe> relay <Event>`` instead and recognizes a copied-script
+registration only as legacy, but such copies still run inside the coding CLI's
+process under whatever interpreter the host has, so the script is stdlib-only by
 contract (its docstring says so) and cannot import ``bmad_loop`` to reach this
 module — and this module cannot import it back, since it ships as package DATA
 rather than as an importable module. Hence a twin rather than shared code:
@@ -415,7 +417,8 @@ def shape_event(
     payload carries a boolean ``fullyIdle``, and ``stop_error`` /
     ``stop_error_details`` / ``stop_message`` (#865) only when a StopFailure
     payload carries ``error`` / ``error_details`` / ``last_assistant_message`` as
-    a string, each cut to ``RELAY_TEXT_MAX`` characters."""
+    a string, each cut to ``RELAY_TEXT_MAX`` characters; ``model`` (#859) only
+    when the payload carries a non-empty string ``model``, cut the same way."""
     event = {
         "ts": ts,
         "event": event_name,
@@ -453,6 +456,12 @@ def shape_event(
         text = _bounded_text(payload, payload_key)
         if text is not None:
             event[event_key] = text
+    # The model the CLI reports on its hook payload (#859): Claude's SessionStart,
+    # Codex on every hook. Only when it is a non-empty string, so every other
+    # event stays unchanged.
+    model = _bounded_text(payload, "model")
+    if model:
+        event["model"] = model
     if payload_error:
         event["payload_error"] = payload_error
     return event

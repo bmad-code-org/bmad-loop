@@ -12258,6 +12258,7 @@ def _hook_event(
     transcript_path=None,
     source=None,
     lineage=None,
+    model=None,
 ):
     return HookEvent(
         ts=1,
@@ -12269,6 +12270,7 @@ def _hook_event(
         notification_type=notification_type,
         source=source,
         lineage=lineage,
+        model=model,
     )
 
 
@@ -14759,6 +14761,90 @@ def test_session_start_missing_journal_write_failure_is_swallowed(tmp_path, monk
     assert result.status == "timeout"
     assert attempts == ["session-start-missing", "session-start-missing"]
     assert [e["waited_s"] for e in _start_missing_entries(adapter)] == [150]
+
+
+# ------------------------------------------------ session-model notice (#859)
+#
+# Observation only. The first admitted SessionStart whose hook carries a `model`
+# gets one `session-model` row (the CLI's launch model); later SessionStarts —
+# a /clear or compact rebind, or a Codex subagent reusing the parent's id — never
+# re-journal it.
+
+
+def _session_model_entries(adapter):
+    return [e for e in adapter.journal.entries if e["kind"] == "session-model"]
+
+
+def _model_start(transcript, model, **kw):
+    return _hook_event(
+        "SessionStart", task_id="b-1", transcript_path=str(transcript), model=model, **kw
+    )
+
+
+def test_session_model_journaled_once_from_first_session_start(tmp_path, monkeypatch):
+    """A SessionStart carrying `model` journals one `session-model` row naming it,
+    the task and the CLI profile; a later rebind SessionStart does not add another.
+
+    ABLATION: drop the `session_model_noted` latch and the rebind appends a second
+    row."""
+    adapter, clock, sent = _start_missing_adapter(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    events = [
+        _model_start(transcript, "claude-opus-4-6[1m]"),
+        _model_start(transcript, "claude-opus-4-6[1m]", source="clear", session_id="sess2"),
+    ]
+    result = _run_start_missing(adapter, clock, tmp_path, events=events)
+    assert result.status == "timeout"
+    assert sent == []
+    assert _session_model_entries(adapter) == [
+        {
+            "kind": "session-model",
+            "task_id": "b-1",
+            "model": "claude-opus-4-6[1m]",
+            "cli": "claude",
+        }
+    ]
+
+
+def test_session_model_not_journaled_without_hook_model(tmp_path, monkeypatch):
+    """A SessionStart without a hook `model` (Claude may omit it; Gemini, Copilot
+    and agy never send one) journals nothing — and does not latch, so a later one
+    that carries it still journals.
+
+    ABLATION: drop the `event.model` test and the first SessionStart journals a
+    row with `model=None`."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    result = _run_start_missing(adapter, clock, tmp_path, events=[_model_start(transcript, None)])
+    assert result.status == "timeout"
+    assert _session_model_entries(adapter) == []
+
+    second = tmp_path / "second"
+    second.mkdir()
+    adapter, clock, _ = _start_missing_adapter(second, monkeypatch)
+    events = [_model_start(transcript, None), _model_start(transcript, "claude-sonnet-4-6")]
+    _run_start_missing(adapter, clock, second, events=events)
+    assert [e["model"] for e in _session_model_entries(adapter)] == ["claude-sonnet-4-6"]
+
+
+def test_later_same_sid_session_start_does_not_rejournal_model(tmp_path, monkeypatch):
+    """Codex subagent hooks reuse the parent's session id, so a later same-sid
+    SessionStart is admitted and may carry the child's model: only the first
+    (launch) model is journaled.
+
+    ABLATION: drop the `session_model_noted` latch and the child's model lands
+    as a second row."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch, hooks_from="codex")
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    events = [_model_start(transcript, "gpt-5.5-codex"), _model_start(transcript, "gpt-5.5-mini")]
+    result = _run_start_missing(adapter, clock, tmp_path, events=events)
+    assert result.status == "timeout"
+    assert _session_model_entries(adapter) == [
+        {"kind": "session-model", "task_id": "b-1", "model": "gpt-5.5-codex", "cli": "codex"}
+    ]
 
 
 # --------------------------------------------- Claude Code StopFailure (#865)

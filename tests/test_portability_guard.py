@@ -575,6 +575,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # (`codex_trust.DAEMON_ENV_HINT`), never session or operator text. Kind-scoped
     # because both names are generic.
     "session-start-missing": frozenset({"cli", "hint"}),
+    # `session-model` (#859): `cli` is the session's CLI profile name, as on
+    # `session-start-missing`. Kind-scoped because the name is generic.
+    "session-model": frozenset({"cli"}),
     "root-identity-recorded": frozenset({"dev", "ino"}),
     # DW-446: the `st_dev` a locked resume/re-arm re-bound (`old_dev` -> `dev`) under
     # a still-matching `ino` — integers only, kept for the same comparison.
@@ -1489,6 +1492,10 @@ JOURNAL_KINDS = frozenset(
         # `waited_s`/`grace_s` (declared benign), `cli` and, on a Codex profile,
         # the constant `hint` (declared benign on this kind).
         "session-start-missing",
+        # One `session-model` on a session's first admitted SessionStart whose
+        # hook carries a `model` (#859): `task_id` (routed), `model` (benign by
+        # name) and `cli` (declared benign on this kind).
+        "session-model",
         # checkpoints.py
         "checkpoint-pause",
         "checkpoint-resume",

@@ -1538,6 +1538,30 @@ def test_session_end_models_survive_scrub():
     assert diagnostics._scrub_model_id("claude-opus-5-5\n") == "<redacted:str>"
 
 
+def test_session_model_row_keeps_model_id():
+    """`session-model` `model` (#859) keeps a model-id-shaped value — a claude
+    `…[1m]` id included, which the `scrub_json` fallback would blank — and
+    redacts a secret-shaped or non-string one.
+
+    Ablation: drop the `session-model` branch in `_scrub_entry` and `scrub_json`
+    redacts the `[1m]` id, failing the first assertion."""
+    pseudo = sanitize.Pseudonymizer(salt=b"fixed")
+    secret = "sk-ant-api03-" + "Zx8Qw3Rt7Yu1Io5Pa9Sd2Fg6Hj0Kl4ZxCvBn"
+    kept = diagnostics._scrub_entry(
+        {"kind": "session-model", "model": "claude-opus-4-6[1m]", "cli": "claude"},
+        pseudo,
+        {},
+        None,
+    )
+    assert kept["model"] == "claude-opus-4-6[1m]"
+    assert kept["cli"] == "claude"
+    for value in (secret, "/home/alice/model", 7, None):
+        redacted = diagnostics._scrub_entry(
+            {"kind": "session-model", "model": value}, pseudo, {}, None
+        )
+        assert redacted["model"] == "<redacted:str>"
+
+
 def test_unpinned_artifact_observation_keeps_the_fs_type_and_drops_the_paths():
     """`artifact-observation-unpinned` (DW-444) names the absolute artifacts root
     and a filesystem label that embeds its volume path — both host paths, routed

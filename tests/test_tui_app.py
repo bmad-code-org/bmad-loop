@@ -8754,6 +8754,50 @@ async def test_active_agent_shows_in_header_and_task_cell(project_tree, monkeypa
         )
 
 
+async def test_active_agent_shows_reported_model(project_tree, monkeypatch):
+    """#859: a `session-model` row for the open session puts the CLI-reported
+    model on the header's agent line and the task row's agent cell, in place of
+    the configured one — here `""` (the CLI default), which shows no model.
+
+    ABLATION: drop the `reported_model` preference in `show_run` (or in
+    `_agent_cell`) and that surface shows the bare `claude`."""
+    monkeypatch.setattr(data, "liveness", lambda run_dir: "alive")
+    task = StoryTask(story_key="1-1-alpha", epic=1, phase=Phase.DEV_RUNNING)
+    run_dir = make_run(
+        project_tree.project,
+        "20260611-100000-aaaa",
+        alive=True,
+        tasks={"1-1-alpha": task},
+        policy_snapshot={"adapter": {"name": "claude", "model": ""}},
+    )
+    journal = Journal(run_dir)
+    journal.append(
+        "session-start",
+        task_id="1-1-alpha-dev-1",
+        role="dev",
+        adapter="claude",
+        model="",
+        story_key="1-1-alpha",
+    )
+    journal.append(
+        "session-model", task_id="1-1-alpha-dev-1", model="claude-opus-5-5", cli="claude"
+    )
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        screen = dashboard(app)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        header = screen.query_one("#runheader", RunHeader)
+        await until(pilot, lambda: "claude · claude-opus-5-5 · dev" in str(header.content))
+        tasks_table = screen.query_one("#tasks", DataTable)
+        await until(
+            pilot,
+            lambda: (
+                tasks_table.row_count == 1
+                and tasks_table.get_cell("1-1-alpha", "agent") == "claude·claude-opus-5-5"
+            ),
+        )
+
+
 async def test_header_agent_line_shows_open_idle_stretch(project_tree, monkeypatch):
     """#680: with a `session-idle` open for the live session the agent line ends
     `· idle <age>`; after the matching `session-active` the text is gone. Drives

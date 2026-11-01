@@ -333,6 +333,51 @@ def test_both_relay_twins_forward_the_session_start_source(
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
+        ({"model": "claude-opus-4-6[1m]"}, "claude-opus-4-6[1m]"),
+        ({"model": "gpt-5.5-codex"}, "gpt-5.5-codex"),
+        # only a non-empty string is forwarded; anything else leaves the key out
+        ({"model": 7}, None),
+        ({"model": ["gpt-5.5"]}, None),
+        ({"model": ""}, None),
+        ({}, None),
+    ],
+)
+def test_both_relay_twins_forward_the_hook_model(tmp_path, monkeypatch, payload, expected):
+    """#859: a hook payload's `model` reaches the event file from BOTH writers,
+    and only when it is a non-empty string — otherwise the key is absent, so an
+    event without one is unchanged (`test_relay_and_the_hook_shape_the_same_event`).
+
+    Ablation: drop the `model` write from either writer and the string cases fail
+    on that side; write it unconditionally and the absent cases fail."""
+    hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
+    proc = subprocess.run(
+        [sys.executable, str(HOOK), "SessionStart"],
+        input=json.dumps(payload),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            **({"SYSTEMROOT": os.environ.get("SYSTEMROOT", "")} if os.name == "nt" else {}),
+            "BMAD_LOOP_RUN_DIR": str(hook_run),
+            "BMAD_LOOP_TASK_ID": "1-1-a-dev-1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _relay("SessionStart", payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
+    from_hook = json.loads(next((hook_run / "events").glob("*.json")).read_text(encoding="utf-8"))
+    from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text(encoding="utf-8"))
+    if expected is None:
+        assert "model" not in from_hook
+        assert "model" not in from_relay
+    else:
+        assert from_hook["model"] == expected
+        assert from_relay["model"] == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
         ({"fullyIdle": False}, False),
         ({"fullyIdle": True}, True),
         # only a JSON boolean is forwarded; anything else writes no key at all

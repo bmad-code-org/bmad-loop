@@ -1227,6 +1227,9 @@ def _scrub_entry(
             # and brackets fail `looks_like_identifier`; keep each element that
             # is model-id shaped, redact the rest one by one.
             out[k] = [_scrub_model_id(each) for each in v] if isinstance(v, list) else _REDACTED_STR
+        elif kind == "session-model" and k == "model":
+            # #859: the hook-reported launch model, one id of the same shapes.
+            out[k] = _scrub_model_id(v)
         elif declared is not None and k not in declared and k not in SELF_MINTED_FIELDS:
             # A kind with a declared schema (`_JOURNAL_KIND_SCHEMAS`) replaces the
             # `scrub_json` fallback with a fail-closed one, because on such a kind an

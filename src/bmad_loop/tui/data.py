@@ -775,6 +775,21 @@ def _idle_since(journal_entries: list[dict[str, Any]], start: int, task_id: str)
     return since
 
 
+def _reported_model(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> str | None:
+    """The model the open session's CLI reported on its hook (#859), or None:
+    the non-empty string `model` of the last `session-model` for `task_id` after
+    index `start`. None when the CLI sent none, the row predates the session or
+    belongs to another task. Never raises on a malformed entry."""
+    reported: str | None = None
+    for entry in journal_entries[start + 1 :]:
+        if str(entry.get("task_id")) != task_id or entry.get("kind") != "session-model":
+            continue
+        raw = entry.get("model")
+        if isinstance(raw, str) and raw:
+            reported = raw
+    return reported
+
+
 def _idle_tool(journal_entries: list[dict[str, Any]], start: int, task_id: str) -> str | None:
     """The tool call the open session's current idle stretch is waiting on, or
     None: the string `in_tool` of the last `session-idle` for `task_id` after
@@ -907,6 +922,11 @@ class ActiveAgent:
     parked_since: float | None = None
     parked_auto_deny_at: float | None = None
     parked_pane: str | None = None
+    # The model the session's CLI reported on its first SessionStart hook (#859)
+    # — the latest `session-model` row's `model` for this task — or None when the
+    # CLI sent none. The agent line shows it in place of the configured `model`
+    # when set. APPENDED.
+    reported_model: str | None = None
 
 
 def _story_key_from_task_id(task_id: str, role: str) -> str:
@@ -977,6 +997,7 @@ def active_agent(
             parked_since=park.since if park else None,
             parked_auto_deny_at=park.auto_deny_at if park else None,
             parked_pane=park.pane if park else None,
+            reported_model=_reported_model(journal_entries, start_index, task_id),
         )
     except _MALFORMED_AGENT_FAULTS as e:
         return UnreadableAgent(error=f"malformed session-start or snapshot: {_describe(e)}")
