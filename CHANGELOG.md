@@ -88,6 +88,10 @@ breaking changes may land in a minor release.
   place (#865).
 - Add the `hooks.events-incomplete` validate warning: a profile hook event whose relay is
   not registered, with the `init` that registers it or the CLI version it needs.
+- Add opt-in `[limits] usage_limit_action = "relaunch"`: a session that ends on a usage
+  limit relaunches the story at once without charging an attempt, up to
+  `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
+  session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers (#959).
 
 ### Changed
 

@@ -15306,6 +15306,170 @@ def test_stop_failure_action_is_stamped_on_every_exit(tmp_path, monkeypatch, ali
     assert (result.stop_failure, result.stop_failure_action) == ("authentication_failed", "account")
 
 
+# --- usage-relaunch mode (#959): the adapter ends a usage-limited session at
+# once so the engine can relaunch it uncharged ---
+
+HTTP_429 = "API Error: 429 Too Many Requests"
+
+
+def _relaunch_spec(spec: SessionSpec, *, left: bool = True) -> SessionSpec:
+    return dataclasses.replace(spec, usage_relaunch_mode=True, usage_relaunch_left=left)
+
+
+def _decide_dev_relaunch(result, *, usage_relaunches=0):
+    from bmad_loop.escalation import decide_dev
+    from bmad_loop.model import StoryTask
+
+    task = StoryTask(story_key="3-1", epic=3, attempt=1 + usage_relaunches)
+    task.dev_usage_relaunches = usage_relaunches
+    return decide_dev(
+        task, result, None, Policy(limits=LimitsPolicy(usage_limit_action="relaunch"))
+    )
+
+
+def test_relaunch_mode_wait_stop_failure_exits_at_once(tmp_path, monkeypatch):
+    """Relaunch budget left: a wait-class usage StopFailure ends the session at
+    the event, stalled + usage-limited WAIT with the reset carried, instead of
+    waiting for the quota wait to admit. The decider relaunches it uncharged.
+
+    Ablation: drop the WAIT arm's `usage_relaunch_left` exit and the quota wait
+    admits on the hook's line instead (`quota-wait-started`)."""
+    q = _quota_adapter(tmp_path, monkeypatch, screen="")
+    result = _drive_quota(
+        q,
+        _relaunch_spec(_quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0)),
+        events={2: _stop_failure_event("rate_limit", USAGE_SESSION_LINE)},
+    )
+    pattern = q.adapter.profile.usage_wait_patterns[0]
+    evidence = f"StopFailure(rate_limit) message matched {pattern!r}: {USAGE_SESSION_LINE.strip()}"
+    assert q.adapter.watcher.calls == 2  # the StopFailure's own tick
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert (skipped["reason"], skipped["evidence"]) == ("usage-relaunch", evidence)
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert result.stop_seen is False
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+
+
+@pytest.mark.parametrize("left", [True, False])
+def test_relaunch_mode_unmatched_rate_limit_exits_usage_limited(tmp_path, monkeypatch, left):
+    """Relaunch mode reads a `rate_limit` matching neither usage list as a
+    wait-class usage limit and ends the session at the event, both with budget
+    left (the engine relaunches) and at the cap (the engine pauses uncharged at
+    once instead of after a stall grace).
+
+    Ablation: drop the unmatched arm's relaunch-mode exit and the session
+    stalls unlabeled after the wake nudges, as outside the mode."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", HTTP_429)]
+    )
+    result = adapter.wait_for_completion(
+        _dev_handle(), _relaunch_spec(_dev_spec(tmp_path), left=left)
+    )
+    evidence = f"StopFailure(rate_limit): {HTTP_429}"
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+    assert (crumb["error"], crumb["relaunch_mode"]) == ("rate_limit", True)
+    assert mux.sent == []
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == evidence
+    assert result.parked_evidence == evidence
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets is None
+    from bmad_loop.escalation import Action
+
+    if left:
+        decision = _decide_dev_relaunch(result)
+        assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+    else:
+        decision = _decide_dev_relaunch(result, usage_relaunches=3)
+        assert decision.action == Action.PAUSE
+        assert decision.usage_limit is not None
+
+
+def test_unmatched_rate_limit_without_relaunch_mode_keeps_the_stall_timing(tmp_path, monkeypatch):
+    """Outside relaunch mode an unmatched `rate_limit` stays an unclassified
+    error: crumbed without `relaunch_mode`, no early exit, and the grace expiry
+    stalls it unlabeled after the wake nudges."""
+    adapter, mux = _parked_adapter(
+        tmp_path, monkeypatch, [_stop_failure_event("rate_limit", HTTP_429)]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    (crumb,) = _lifecycle_events(adapter, "stop-failure-rate-limit-unmatched")
+    assert "relaunch_mode" not in crumb
+    assert _stall_nudges(mux) == [generic.STALL_NUDGE_TEXT] * 2
+    assert (result.status, result.parked, result.usage_limited) == ("stalled", False, None)
+    assert _lifecycle_events(adapter, "quota-wait-skipped") == []
+
+
+def test_relaunch_mode_at_the_cap_keeps_the_quota_wait(tmp_path, monkeypatch):
+    """At the relaunch cap (`left` False) the pane's wait line admits the quota
+    wait as in pause mode: the engine would only pause, so the session may as
+    well wait out the reset."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(
+        q, _relaunch_spec(_quota_spec(tmp_path, timeout_s=120.0, cap_s=200.0), left=False)
+    )
+    assert len(_lifecycle_events(q.adapter, "quota-wait-started")) == 1
+    assert _lifecycle_events(q.adapter, "quota-wait-skipped") == []
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == q.wait_evidence()
+    assert result.quota_wait_s is not None and result.quota_wait_s > 0
+
+
+def test_relaunch_left_skips_the_quota_wait_admission(tmp_path, monkeypatch):
+    """Relaunch budget left: where the pane's wait line would admit the quota
+    wait, the session ends stalled + usage-limited WAIT instead, crumbed
+    `quota-wait-skipped` with `reason="usage-relaunch"`.
+
+    Ablation: drop the admission's `usage_relaunch_left` exit and the wait opens
+    (`quota-wait-started`)."""
+    q = _quota_adapter(tmp_path, monkeypatch)
+    result = _drive_quota(q, _relaunch_spec(_quota_spec(tmp_path)))
+    assert _lifecycle_events(q.adapter, "quota-wait-started") == []
+    (skipped,) = _lifecycle_events(q.adapter, "quota-wait-skipped")
+    assert skipped["reason"] == "usage-relaunch"
+    assert skipped["evidence"] == q.wait_evidence()
+    assert skipped["resets_at"] == QUOTA_RESETS
+    assert q.clock["mono"] == 1090.0  # the admission tick, not a later one
+    assert (result.status, result.parked) == ("stalled", True)
+    assert result.usage_limited == q.wait_evidence()
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets == QUOTA_RESETS
+    assert not result.quota_wait_s  # no wait ever opened
+
+
+def test_relaunch_mode_unmatched_then_window_death_is_usage_limited(tmp_path, monkeypatch):
+    """Relaunch mode, an unmatched `rate_limit`, and a window already dead at
+    the exit's liveness re-probe: the funnel labels the crash a WAIT usage
+    limit, so the decider relaunches it uncharged instead of charging a crash.
+
+    Ablation: drop the unmatched arm of `_relabel_dead_window` and this fails on
+    `usage_limited is None`."""
+    adapter, _ = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event("rate_limit", HTTP_429)],
+        alive=lambda handle: False,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _relaunch_spec(_dev_spec(tmp_path)))
+    assert (result.status, result.parked) == ("crashed", False)
+    assert result.usage_limited == f"StopFailure(rate_limit): {HTTP_429}"
+    assert result.usage_limit_class == USAGE_LIMIT_WAIT
+    assert result.usage_limit_resets is None
+    (crumb,) = _lifecycle_events(adapter, "crash-relabeled")
+    assert (crumb["kind"], crumb["error"]) == ("unmatched", "rate_limit")
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert (decision.action, decision.uncharged) == (Action.RETRY, True)
+
+
 def test_rate_limit_stop_failure_match_timeout_is_crumbed(tmp_path, monkeypatch):
     adapter, _ = _parked_adapter(
         tmp_path, monkeypatch, [_stop_failure_event("rate_limit", USAGE_CREDITS_LINE)]

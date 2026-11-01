@@ -257,8 +257,10 @@ class _StopFailureLatch:
     recovered. `wait_hit` also clears when a quota wait admits or ends.
 
     `kind` classifies the latest StopFailure for a window that dies after it
-    (#959): ``"account"``, ``"blocked"`` or ``"wait"`` (None for an unmapped,
-    transient, ignored or unmatched error). `evidence` is the label the live
+    (#959): ``"account"``, ``"blocked"`` or ``"wait"``, or ``"unmatched"`` for
+    a ``rate_limit`` that matched neither usage list, latched only in
+    usage-relaunch mode (None for an unmapped, transient or ignored error, and
+    for an unmatched one outside that mode). `evidence` is the label the live
     exit would carry and `resets` its parsed reset (`UsageReset.value`), so the
     funnel can relabel a result-less ``crashed`` exit as the same uncharged
     pause. `baseline` is the transcript's (mtime_ns, size) stat'ed fresh at the
@@ -1483,7 +1485,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 stop_failure=stop_failure.error,
                 stop_failure_action=self._stop_failure_types.get(stop_failure.error),
             )
-        result = self._relabel_dead_window(handle, result, quota, stop_failure)
+        result = self._relabel_dead_window(handle, spec, result, quota, stop_failure)
         if quota.waiting:
             self._end_quota_wait(handle, quota, "session-exit")
         if notice.open:
@@ -1495,6 +1497,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     def _relabel_dead_window(
         self,
         handle: SessionHandle,
+        spec: SessionSpec,
         result: SessionResult,
         quota: _QuotaWait,
         stop_failure: _StopFailureLatch,
@@ -1503,14 +1506,26 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         operator keeps that classification (#959): a result-less ``crashed``
         exit after a latched account StopFailure is ``parked``, after a
         blocked or wait one ``usage_limited``, and during a pane-only quota
-        wait ``usage_limited`` with the wait class. The status stays
+        wait ``usage_limited`` with the wait class; in usage-relaunch mode an
+        unmatched ``rate_limit`` StopFailure is ``usage_limited`` with the wait
+        class too. The status stays
         ``crashed``; only labels are added, so routing gives the same
         uncharged pause as the live exit instead of charging a crash. A crash
         whose read-back found a result is never relabeled: the result wins."""
         if result.status != "crashed" or result.result_json is not None:
             return result
         kind = stop_failure.kind
-        if kind in ("blocked", "wait"):
+        if kind == "unmatched" and spec.usage_relaunch_mode:
+            # Only usage-relaunch mode latches an unmatched rate_limit, and
+            # only that mode reads it as a wait-class limit; otherwise it
+            # stays an unclassified (charged) crash.
+            result = dataclasses.replace(
+                result,
+                usage_limited=stop_failure.evidence,
+                usage_limit_class=USAGE_LIMIT_WAIT,
+                usage_limit_resets=None,
+            )
+        elif kind in ("blocked", "wait"):
             result = dataclasses.replace(
                 result,
                 usage_limited=stop_failure.evidence,
@@ -2156,6 +2171,18 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         local_now = _local_now()
                         reset = self._usage_reset(handle, wait_hit[1], local_now)
                         resets = reset.value if reset is not None else None
+                        if spec.usage_relaunch_left:
+                            # Usage-relaunch mode with budget left (#959): the
+                            # engine relaunches the story uncharged instead of
+                            # freezing the clock for the reset.
+                            self._note_lifecycle(
+                                handle.task_id,
+                                "quota-wait-skipped",
+                                reason="usage-relaunch",
+                                evidence=wait_hit[0],
+                                resets_at=resets,
+                            )
+                            return stall_exit(wait_hit[0], wait_hit[0], resets, USAGE_LIMIT_WAIT)
                         cap_left = spec.quota_wait_max_s - quota.closed_s
                         if (
                             reset is not None
@@ -2868,19 +2895,47 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # message decides, against the profile's usage lists.
                     hit = self._stop_failure_usage(handle, message)
                     if hit is None:
+                        if not spec.usage_relaunch_mode:
+                            self._note_lifecycle(
+                                handle.task_id, "stop-failure-rate-limit-unmatched", error=error
+                            )
+                            continue
+                        # Usage-relaunch mode (#959) reads a rate_limit whose
+                        # message matches neither usage list as a wait-class
+                        # usage limit, and ends the session at once: with
+                        # relaunch budget left the engine relaunches it
+                        # uncharged, at the cap it pauses uncharged.
+                        said = _env_excerpt(message, 0) if message else "no message"
+                        evidence = f"StopFailure({error}): {said}"
                         self._note_lifecycle(
-                            handle.task_id, "stop-failure-rate-limit-unmatched", error=error
+                            handle.task_id,
+                            "stop-failure-rate-limit-unmatched",
+                            error=error,
+                            relaunch_mode=True,
                         )
-                        continue
+                        latch_kind("unmatched", evidence, None)
+                        return stall_exit(evidence, evidence, None, USAGE_LIMIT_WAIT)
                     evidence, line, usage_class = hit
                     reset = self._usage_reset(handle, line, _local_now())
                     resets = reset.value if reset is not None else None
                     if usage_class == USAGE_LIMIT_BLOCKED:
                         latch_kind("blocked", evidence, resets)
                         return stall_exit(evidence, evidence, resets, USAGE_LIMIT_BLOCKED)
+                    latch_kind("wait", evidence, resets)
+                    if spec.usage_relaunch_left:
+                        # Usage-relaunch mode with budget left (#959): the
+                        # engine relaunches the story uncharged, so the session
+                        # ends now instead of waiting out the reset.
+                        self._note_lifecycle(
+                            handle.task_id,
+                            "quota-wait-skipped",
+                            reason="usage-relaunch",
+                            evidence=evidence,
+                            resets_at=resets,
+                        )
+                        return stall_exit(evidence, evidence, resets, USAGE_LIMIT_WAIT)
                     # A wait limit: the CLI continues by itself after the
                     # reset, so the quota wait may admit on this line.
-                    latch_kind("wait", evidence, resets)
                     stop_failure.wait_hit = (evidence, line)
                     self._note_lifecycle(
                         handle.task_id, "stop-failure-quota-wait-pending", evidence=evidence
