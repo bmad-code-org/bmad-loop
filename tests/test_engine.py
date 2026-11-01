@@ -15988,6 +15988,55 @@ def test_session_end_omits_usage_unread_when_clean(project):
     assert ends and all("usage_unread" not in e for e in ends)
 
 
+def test_session_end_carries_models(project):
+    """A parser that observed models leaves the distinct ids on `session-end`
+    in the parser's order (#859), beside the configured session-start `model`.
+
+    ABLATION: delete the `models` block in `_session_end_extras` and the
+    assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    timeout = SessionResult(status="timeout")
+    engine, adapter = make_engine(project, [timeout, timeout])
+    models = ("claude-opus-5-5", "claude-haiku-5-5")
+    adapter.usage_per_session = TokenUsage(input_tokens=10, output_tokens=5, models=models)
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2
+    assert all(e["models"] == list(models) for e in ends)
+    assert all("models_unresolved" not in e for e in ends)
+
+
+def test_session_end_marks_models_unresolved(project):
+    """A tracked parser that found no model journals `models_unresolved: true`,
+    never an empty `models` list (#859).
+
+    ABLATION: delete the `models_unresolved` branch and the assertion fails."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    timeout = SessionResult(status="timeout")
+    engine, adapter = make_engine(project, [timeout, timeout])
+    adapter.usage_per_session = TokenUsage(input_tokens=10, models=())
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2 and all(e["models_unresolved"] is True for e in ends)
+    assert all("models" not in e for e in ends)
+
+
+def test_session_end_omits_models_when_untracked(project):
+    """A parser with no model source (`models=None`) journals neither key, so an
+    untracked CLI never reads as "tracked, none found" (#859).
+
+    ABLATION: drop the `usage.models is not None` gate and `models_unresolved`
+    appears, failing the assertion."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    timeout = SessionResult(status="timeout")
+    engine, adapter = make_engine(project, [timeout, timeout])
+    adapter.usage_per_session = TokenUsage(input_tokens=10, output_tokens=5)
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2 and all(e["tokens"] == 15 for e in ends)
+    assert all("models" not in e and "models_unresolved" not in e for e in ends)
+
+
 def test_engine_attaches_its_journal_to_every_adapter(project):
     """The engine hands its `Journal` to the adapters it owns (#680), so an
     adapter-side `session-idle` lands in the same file with the same

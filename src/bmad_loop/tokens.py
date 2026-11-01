@@ -161,6 +161,25 @@ _CLAUDE_USAGE_KEYS = (
 )
 
 
+# Claude Code's zero-usage placeholder model on a locally synthesized
+# (API-error) assistant entry: not a model the session ran.
+_CLAUDE_SYNTHETIC_MODEL = "<synthetic>"
+
+
+def _note_claude_model(entry: dict[str, Any], models: dict[str, None]) -> None:
+    """Record the entry's `message.model` in `models` (insertion-ordered set).
+
+    Independent of the usage dedupe: every block of a response repeats the
+    same model, and the set keeps only distinct ids. Skips a non-str or empty
+    value and the `<synthetic>` placeholder."""
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return
+    model = message.get("model")
+    if isinstance(model, str) and model and model != _CLAUDE_SYNTHETIC_MODEL:
+        models.setdefault(model, None)
+
+
 def tally(transcript_path: Path) -> TokenUsage | None:
     """Sum the session's assistant `usage` blocks, or None when it holds none.
 
@@ -175,6 +194,9 @@ def tally(transcript_path: Path) -> TokenUsage | None:
     its parent's history, message ids included. Blocks without an id (or the
     top-level `usage` shape) each count, as before.
 
+    `models` holds the distinct assistant `message.model` ids in walk order
+    (main transcript first, then subagents), `()` when none was found.
+
     None (a missing file, or no usage-bearing line in any file) is "no usage
     signal" and must never read as free (DW-364): a zeroed TokenUsage is
     reserved for a session that did report usage — an all-zero block still
@@ -186,9 +208,11 @@ def tally(transcript_path: Path) -> TokenUsage | None:
         paths.extend(sorted(subagents_dir.rglob("*.jsonl")))
     by_id: dict[str, dict[str, int]] = {}
     anon: list[dict[str, int]] = []
+    models: dict[str, None] = {}  # distinct, first-seen order
     seen = False
     for path in paths:
         for entry in _jsonl_entries(path):
+            _note_claude_model(entry, models)
             usage = _usage_block(entry)
             # Absent, empty `{}`, or no recognized token key: no usage signal here.
             if not usage or not any(key in usage for key in _CLAUDE_USAGE_KEYS):
@@ -211,7 +235,7 @@ def tally(transcript_path: Path) -> TokenUsage | None:
                 merged[key] = max(merged[key], value)
     if not seen:
         return None
-    total = TokenUsage()
+    total = TokenUsage(models=tuple(models))
     for counts in [*by_id.values(), *anon]:
         total.add(
             TokenUsage(

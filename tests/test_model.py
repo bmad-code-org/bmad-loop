@@ -544,6 +544,22 @@ def test_token_usage_unread_is_diagnostic_only():
     assert total.unread == ()
 
 
+def test_token_usage_models_is_diagnostic_only():
+    """`models` describes a figure without changing it: equality, `add` and the
+    persisted dict ignore it, and a hand-built TokenUsage defaults to None (no
+    model source), never `()`.
+
+    Ablation: drop `compare=False` and the equality assertion fails."""
+    usage = TokenUsage(input_tokens=10, models=("claude-opus-5-5",))
+    assert usage == TokenUsage(input_tokens=10)
+    assert TokenUsage().models is None
+    assert "models" not in usage.to_dict()
+    total = TokenUsage()
+    total.add(usage)
+    assert total.models is None
+    assert TokenUsage.from_dict(usage.to_dict()).models is None
+
+
 def test_session_record_result_json_round_trips():
     record = SessionRecord(
         task_id="1-1-a-dev-1",

@@ -181,6 +181,75 @@ def test_tally_includes_nested_workflow_subagents(tmp_path):
     assert usage.input_tokens == 140
 
 
+def _with_model(entry, model):
+    entry["message"]["model"] = model
+    return entry
+
+
+def test_tally_collects_distinct_models_main_first(tmp_path):
+    # #859: distinct ids in walk order — main transcript first, then the
+    # subagents — independent of the message.id dedupe; Claude Code's
+    # `<synthetic>` API-error placeholder and empty/non-str values are skipped.
+    path = tmp_path / "sid.jsonl"
+    opus = _with_model(_assistant("msg_1", input_tokens=10), "claude-opus-5-5")
+    _write_jsonl(
+        path,
+        [
+            opus,
+            opus,  # a repeated content block of the same response
+            _with_model(_assistant("msg_err", input_tokens=0), "<synthetic>"),
+            _with_model(_assistant("msg_2", input_tokens=5), "claude-sonnet-5-5"),
+            _with_model(_assistant("msg_3", input_tokens=5), "claude-opus-5-5"),
+            _with_model(_assistant("msg_4", input_tokens=1), ""),
+            _with_model(_assistant("msg_5", input_tokens=1), 7),
+            {"type": "user", "message": {"role": "user", "content": "hi"}},
+        ],
+    )
+    _write_jsonl(
+        tmp_path / "sid" / "subagents" / "agent-a.jsonl",
+        [
+            _with_model(_assistant("msg_a", input_tokens=3), "claude-haiku-5-5"),
+            _with_model(_assistant("msg_b", input_tokens=3), "claude-opus-5-5"),
+        ],
+    )
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.models == ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+    assert usage.input_tokens == 10 + 5 + 5 + 1 + 1 + 3 + 3  # dedupe untouched
+
+
+def test_tally_models_empty_when_no_assistant_model(tmp_path):
+    # Tracked but none found is `()`, never None: the claude parser has a model
+    # source, so the engine journals `models_unresolved` rather than nothing.
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _assistant("msg_1", input_tokens=10),
+            _with_model(_assistant("msg_err", input_tokens=0), "<synthetic>"),
+        ],
+    )
+
+    usage = tally(path)
+    assert usage is not None
+    assert usage.models == ()
+
+
+def test_parser_without_model_source_leaves_models_none(tmp_path):
+    # A parser that does not read models keeps the `None` default, so the
+    # engine journals neither `models` nor `models_unresolved` for it.
+    path = tmp_path / "session.jsonl"
+    path.write_text(
+        json.dumps({"id": "g1", "type": "gemini", "tokens": {"input": 4, "output": 2}}) + "\n",
+        encoding="utf-8",
+    )
+
+    usage = tally_gemini_chat(path)
+    assert usage is not None
+    assert usage.models is None
+
+
 def test_tally_dedupes_across_forked_subagents(tmp_path):
     # A fork subagent copies its parent's history, message ids included, so
     # the dedupe spans every file of the session.

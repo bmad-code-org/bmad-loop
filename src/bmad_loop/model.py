@@ -137,6 +137,14 @@ class TokenUsage:
     # Diagnostic only, and left out of equality, `add` and `to_dict`. The engine
     # journals it on `session-end` as `usage_unread`. APPENDED.
     unread: tuple[str, ...] = field(default=(), compare=False)
+    # The distinct model ids the session ran, as its parser observed them:
+    # None = this parser has no model source (and every hand-built TokenUsage);
+    # () = the parser tracks models and found none; otherwise first-seen order,
+    # main session first, so element 0 is the launched session's model. Parsers
+    # set it through the constructor (`add` drops it). Diagnostic only, and left
+    # out of equality, `add` and `to_dict` like `unread`. The engine journals it
+    # on `session-end` as `models` / `models_unresolved`. APPENDED.
+    models: tuple[str, ...] | None = field(default=None, compare=False)
 
     def add(self, other: "TokenUsage") -> None:
         self.input_tokens += other.input_tokens

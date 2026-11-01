@@ -1116,6 +1116,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # running count of them (an int).
         "uncharged",
         "usage_relaunches",
+        # `session-end` (#859): the distinct model ids the session's usage parser
+        # observed (a list `diagnostics._scrub_model_id` keeps element-wise while
+        # model-id shaped), and the bare boolean marking a tracked parser that
+        # found none.
+        "models",
+        "models_unresolved",
         "verification_sequence",
         "verification_stage",
         "via",
@@ -1303,6 +1309,8 @@ JOURNAL_SPLAT_FIELDS = {
             "quota_wait_s",
             "usage_limit_resets",
             "usage_limit_class",
+            "models",
+            "models_unresolved",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys
