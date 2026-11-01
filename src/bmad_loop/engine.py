@@ -2759,9 +2759,16 @@ class Engine:
                         # checkout BEFORE the rollback so the reset targets HEAD
                         # instead of parking commits made while the run was down.
                         self._accept_current_baseline(task)
-                    self._rollback_or_pause(
-                        task, cause="resolved" if task.rearmed else "stopped", restart=True
-                    )
+                    # After the accept above, which moves the baseline onto the
+                    # bookkeeping commit and so invalidates its record (#772).
+                    added_ledger = self._bookkept_ledger_for_restart(task)
+                    try:
+                        self._rollback_or_pause(
+                            task, cause="resolved" if task.rearmed else "stopped", restart=True
+                        )
+                    finally:
+                        if added_ledger is not None:
+                            self._restore_restart_ledger(task, added_ledger)
                 task.rearmed = False  # past rollback (only reached when not paused)
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
                 self._save()
@@ -7855,6 +7862,72 @@ class Engine:
             commit=sha,
             added=added,
         )
+
+    def _bookkept_ledger_for_restart(self, task: StoryTask) -> str | None:
+        """The ledger text a restart rollback must put back, or None (#772).
+
+        Only for a ledger an engine bookkeeping commit ADDED relative to the live
+        baseline: the commit made a file that was untracked (or absent) at the
+        baseline tracked, so the restart's `reset --hard` deletes it, where before
+        the commit `baseline_untracked` and the artifact-dir shield kept it. A
+        ledger already tracked at baseline needs nothing — the reset republishes
+        its committed bytes, as it always did.
+
+        Read off the tree BEFORE the reset: the whole current text, which is what
+        the untracked file would have kept. Absent or unreadable there (a crash
+        after an earlier restart's reset, or a session that deleted it), the last
+        recorded bookkeeping commit's copy stands in — the record is persisted
+        before each commit, so that sha holds the engine's last known ledger. A
+        probe fault on that fallback is journaled (`ledger-restart-capture-failed`)
+        and answers None: nothing to restore beats restoring bytes nobody can vouch
+        for."""
+        record = task.bookkeeping_for_baseline()
+        if record is None or not record["added"]:
+            return None
+        observed = self._ledger_text(site="ledger-restart-capture", story_key=task.story_key)
+        if isinstance(observed, str):
+            return observed
+        shas: list[str] = list(record["shas"])
+        rel, fault = self._ledger_rel()
+        if not shas or rel is None:
+            if fault is not None:
+                self.journal.append(
+                    "ledger-restart-capture-failed",
+                    story_key=task.story_key,
+                    error=f"ledger scope probe failed: {fault}",
+                )
+            return None
+        try:
+            blob = verify.worktree_file_bytes_at_revision(self.workspace.root, shas[-1], rel)
+            if blob is None:
+                return None
+            return blob.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        except (verify.GitError, OSError, RuntimeError, UnicodeDecodeError) as e:
+            self.journal.append(
+                "ledger-restart-capture-failed",
+                story_key=task.story_key,
+                error=str(e),
+            )
+            return None
+
+    def _restore_restart_ledger(self, task: StoryTask, text: str) -> None:
+        """Republish :meth:`_bookkept_ledger_for_restart`'s capture after the restart
+        rollback, through :meth:`_restore_ledger`'s compare-and-set: the reset's own
+        deletion is the BASELINE anchor (the record makes the file git's to
+        restore), a rollback that paused without resetting reads back the capture
+        and writes nothing, and anything else is a journaled skip.
+
+        Runs in the rollback's ``finally``, so a write or lock fault is journaled
+        (`ledger-restore-failed`) rather than raised — it must not replace an
+        in-flight ``RunPaused`` or reset fault."""
+        try:
+            self._restore_ledger(task, text)
+        except (OSError, StateRootError) as e:
+            self.journal.append(
+                "ledger-restore-failed",
+                story_key=task.story_key,
+                error=f"{type(e).__name__}: {e}",
+            )
 
     def _ledger_is_gits_to_restore(self, task: StoryTask) -> bool:
         """Whether git owns the active ledger and reset is responsible for it.

@@ -1680,6 +1680,10 @@ JOURNAL_KINDS = frozenset(
         "engine-ledger-commit",
         "engine-ledger-commit-failed",
         "engine-ledger-commit-refused",
+        # #772: `Engine._bookkept_ledger_for_restart` could not read a bookkeeping
+        # commit's ledger copy for the restart restore. `story_key` aliased, `error`
+        # dropped.
+        "ledger-restart-capture-failed",
         "ledger-read-degraded",
         "ledger-read-refused",
         "ledger-restore-failed",

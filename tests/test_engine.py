@@ -27770,6 +27770,84 @@ def test_fixable_retry_launches_on_a_committed_ledger(project, tmp_path):
     assert HARVEST_A["summary"] in [entry.title for entry in _harvest_entries(project)]
 
 
+def test_restart_rollback_restores_a_ledger_a_bookkeeping_commit_added(project):
+    """#772. A pre-existing untracked ledger is made tracked by the review launch's
+    bookkeeping commit; a host death mid-review then takes the restart arm, whose
+    `reset --hard` to the baseline deletes it. The restart must put it back, so the
+    restarted dev starts on the operator's rows and the story ends with them.
+
+    Ablation: drop the `_restore_restart_ledger` call in the restart arm and the
+    restarted dev sees no ledger, and none survives the run."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    operator_rows = project.deferred_work.read_text(encoding="utf-8")
+
+    def host_dies_mid_review(spec):
+        raise RuntimeError("host died mid-review")
+
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", deferred=[HARVEST_A]), host_dies_mid_review],
+        policy=_harvest_policy(review=True),
+    )
+    assert engine.run().crashed
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.REVIEW_RUNNING
+    assert _commit_sites(engine) == ["review"]
+    seen: list[str | None] = []
+
+    def restarted_dev(spec):
+        ledger = project.deferred_work
+        seen.append(ledger.read_text(encoding="utf-8") if ledger.is_file() else None)
+        return dev_effect(project, "1-1-a")(spec)
+
+    resumed, _ = resume_engine(
+        project, engine, [restarted_dev, review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = resumed.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    assert "resume-restart" in [e["kind"] for e in resumed.journal.entries()]
+    (at_restart,) = seen
+    assert at_restart is not None and at_restart.startswith(operator_rows.rstrip("\n"))
+    titles = [entry.title for entry in _harvest_entries(project)]
+    assert "item DW-1" in titles and HARVEST_A["summary"] in titles
+
+
+def test_restart_capture_falls_back_to_the_last_bookkeeping_commit(project):
+    """A ledger already gone from the tree before the restart reset (a crash after
+    an earlier restart's reset) is recovered from the last recorded bookkeeping
+    commit — the record is saved before each commit, so that sha holds it.
+
+    Ablation: return None in place of the recorded-sha fallback and the capture
+    comes back empty."""
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    committed = project.deferred_work.read_text(encoding="utf-8")
+    engine, task = _bookkeeping_engine(project)
+    engine._commit_engine_ledger(task, site="review")
+    git(project.project, "reset", "-q", "--hard", task.baseline_commit)
+    assert not project.deferred_work.exists()
+
+    assert engine._bookkept_ledger_for_restart(task) == committed
+
+
+def test_restart_capture_is_none_without_an_added_record(project):
+    """A ledger tracked at the baseline needs no restart restore — the reset
+    republishes its committed bytes — so the capture answers None."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, task = _bookkeeping_engine(project)
+    deferredwork.append_entry(
+        project.deferred_work,
+        title="Engine harvest",
+        origin="test",
+        source_spec="specs/x.md",
+        reason="dirty a tracked ledger",
+    )
+    engine._commit_engine_ledger(task, site="review")
+    assert task.bookkeeping_for_baseline()["added"] is False
+
+    assert engine._bookkept_ledger_for_restart(task) is None
+
+
 def test_rollback_retry_launches_on_a_committed_restored_ledger(project):
     """#772. A non-fixable rejection resets to the baseline and
     `_restore_persisted_ledger` republishes the pre-harvest snapshot — here
