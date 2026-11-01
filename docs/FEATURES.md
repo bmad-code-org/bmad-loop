@@ -467,6 +467,21 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Tested by:** `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`, `tests/test_policy.py`
 - **Docs:** [[limits] settings](reference/configuration.md#limits), [CLI: status](reference/cli.md#status)
 
+### Observed session models
+
+- **Stability:** stable
+- **Description:** Each session's journal records the models its CLI actually ran on, read from the transcript or usage file the CLI wrote, beside the configured model `session-start` records.
+- **Properties:**
+  - A `session-end` entry carries `models` (distinct ids, first-seen, main session first, subagent and fallback models included), or `models_unresolved: true` when a tracked CLI's usage names none; neither key appears for a CLI with no model source.
+  - Claude, Codex, Gemini, Copilot and OpenCode are tracked; antigravity is not.
+  - The configured `model` fields (`session-start`, the session record, `adapters_used.<role>.model`) are never overwritten by an observed one.
+  - `status --json` reports a role's observed models as `adapters_used.<role>.models_used`, only when some were observed.
+  - The first SessionStart hook that names a model (Claude, Codex) journals one `session-model` row, and the TUI agent line shows that model in place of the configured one.
+  - `diagnose` keeps model ids and redacts any element that is not shaped like one.
+- **Config:** none
+- **Tested by:** `tests/test_tokens.py`, `tests/test_opencode_http.py`, `tests/test_engine.py`, `tests/test_model.py`, `tests/test_cli.py`, `tests/test_events.py`, `tests/test_generic_tmux.py`, `tests/test_diagnostics.py`, `tests/test_tui_data.py`, `tests/test_tui_app.py`
+- **Docs:** [Run directory](reference/run-state.md#run-directory), [CLI: status](reference/cli.md#status), [TUI: run header](tui-guide.md#run-header-top-right)
+
 ### TUI dashboard
 
 - **Stability:** stable

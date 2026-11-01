@@ -92,6 +92,11 @@ breaking changes may land in a minor release.
   limit relaunches the story at once without charging an attempt, up to
   `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
   session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers (#959).
+- Record the models a session actually ran on: session-end `models` (Claude, Codex,
+  Gemini, Copilot, OpenCode; `models_unresolved` when none was found), `status --json`
+  `adapters_used.<role>.models_used`, and the CLI-reported launch model (`session-model`
+  journal row) on the TUI agent line. `session-start` `model` still records the configured
+  model (#859).
 
 ### Changed
 
