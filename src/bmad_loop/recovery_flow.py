@@ -2077,9 +2077,12 @@ class RecoveryFlow:
         try:
             head = verify.rev_parse_head(workspace.root)
             commits = verify.commits_above(workspace.root, baseline, head)
-            if commits:
-                commits = self._without_engine_bookkeeping(task, workspace.root, commits)
-            if not commits:
+            # The bookkeeping filter decides only WHETHER to park (#772): a range of
+            # nothing but the engine's ledger commits parks no ref. A mixed range
+            # parks the branch at `head`, which still carries those commits, so the
+            # journaled and noticed count stays the unfiltered range — the count the
+            # notice's `git log baseline..ref` shows the operator.
+            if not commits or not self._without_engine_bookkeeping(task, workspace.root, commits):
                 return None
         except (verify.GitError, OSError) as exc:
             self.journal.append(

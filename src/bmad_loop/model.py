@@ -699,7 +699,7 @@ class StoryTask:
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
     # was also dirty, the `refs/attempt-preserve-dirty/*` snapshot, which is
     # parented at the attempt's HEAD and therefore subsumes the branch (last
-    # writer wins, so one `git merge --ff-only <ref>` recovers the whole attempt
+    # writer wins, so one `git merge --no-edit <ref>` recovers the whole attempt
     # — unless `preserve_partial` is set). Set by RecoveryFlow, cleared at the top
     # of every auto-rollback so it can never name a *previous* attempt's ref; read
     # by `_defer` (notification), projected into `status`, and — once verified

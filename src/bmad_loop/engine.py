@@ -10070,11 +10070,16 @@ class Engine:
 
         A bare reason leaves the operator to find the rolled-back work themselves
         (the reporter used `git log --all`). In-place, the auto-rollback parked the
-        attempt on `task.preserve_ref`, which fast-forwards straight back. Isolated,
+        attempt on `task.preserve_ref`, and one `git merge --no-edit <ref>` takes it
+        back. Not `--ff-only`: the reset target does not stay the tip — the defer's
+        own ledger restore commit (#772) lands on the baseline right after, and
+        later units commit on top — so the parked ref has diverged from the branch
+        by the time anyone reads the notice. A plain merge still fast-forwards
+        when nothing moved. Isolated,
         *this* defer rolls nothing back — a kept-failed unit's branch stays mounted —
         but an EARLIER attempt's in-worktree dev-retry rollback parks on the same
         shared refs, so `preserve_ref` can be set here too. Both are named; the
-        isolated arm deliberately prints no `merge --ff-only` line, because that ref
+        isolated arm deliberately prints no merge line, because that ref
         is not fast-forwardable from either tree (the unit branch has since moved on
         with the deferred attempt's commits, and fast-forwarding it into the
         operator's checkout would land a *discarded* attempt on their branch).
@@ -10092,7 +10097,7 @@ class Engine:
         Selects on the same pair as `_defer` — live isolation OR a recorded mount —
         not on live policy alone. A run flipped `"worktree" -> "none"` while paused
         reaches the defer with the workspace swapped onto its mount, so the in-place
-        arm would advertise `git -C <mount> merge --ff-only` against a directory
+        arm would advertise `git -C <mount> merge` against a directory
         `_integrate_unit` is about to delete (`keep_failed` off), and hide the kept
         branch when it is on."""
         if self._isolated or task.worktree_path:
@@ -10108,7 +10113,7 @@ class Engine:
         if not task.preserve_ref:
             return ""
         recover = (
-            f'; recover with `git -C "{self.workspace.root}" merge --ff-only {task.preserve_ref}`'
+            f'; recover with `git -C "{self.workspace.root}" merge --no-edit {task.preserve_ref}`'
         )
         if task.preserve_partial:
             return (

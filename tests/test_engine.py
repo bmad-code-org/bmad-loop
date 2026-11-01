@@ -9406,7 +9406,7 @@ def test_budget_exhausted_unfinalized_defers(project):
     attention = (engine.run_dir / "ATTENTION").read_text()
     assert "story deferred: 1-1-a" in attention
     assert f"attempt work parked at `{ref}`" in attention
-    assert f'git -C "{project.project}" merge --ff-only {ref}' in attention
+    assert f'git -C "{project.project}" merge --no-edit {ref}' in attention
     deferred_entry = [e for e in engine.journal.entries() if e["kind"] == "story-deferred"][-1]
     assert deferred_entry["preserve_ref"] == ref
 
@@ -9445,7 +9445,7 @@ def test_defer_notification_stays_bare_when_nothing_was_parked(project):
     """Ablation target: make `_defer_recovery_note`'s tail unconditional and this
     fails. Over-budget sessions touch no files, so the exhaustion defer's rollback
     finds a clean tree and parks nothing — there is no ref to name, and the notice
-    must not advertise one (a `merge --ff-only` onto a ref that was never created
+    must not advertise one (a `merge` of a ref that was never created
     is worse than silence)."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     engine, _ = make_engine(
@@ -9463,12 +9463,12 @@ def test_defer_notification_stays_bare_when_nothing_was_parked(project):
     assert "rollback-skipped-clean" in [e["kind"] for e in engine.journal.entries()]
     attention = (engine.run_dir / "ATTENTION").read_text()
     assert "story deferred: 1-1-a" in attention
-    assert "attempt work parked" not in attention and "merge --ff-only" not in attention
+    assert "attempt work parked" not in attention and "merge --no-edit" not in attention
 
 
 def test_defer_recovery_note_is_uniform_across_ref_families(project):
-    """A commits branch and a dirty snapshot both fast-forward, so the recovery
-    line is the same command either way — the caller never has to know which
+    """A commits branch and a dirty snapshot both merge back the same way, so the
+    recovery line is the same command either way — the caller never has to know which
     family parked the attempt."""
     engine, _ = make_engine(project, [])
     task = StoryTask(story_key="1-1-a", epic=1)
@@ -9477,7 +9477,7 @@ def test_defer_recovery_note_is_uniform_across_ref_families(project):
         task.preserve_ref = ref
         note = engine._defer_recovery_note(task)
         assert f"parked at `{ref}`" in note
-        assert f'git -C "{project.project}" merge --ff-only {ref}' in note
+        assert f'git -C "{project.project}" merge --no-edit {ref}' in note
 
 
 def test_defer_recovery_note_flags_a_commits_only_park(project):
@@ -9496,7 +9496,7 @@ def test_defer_recovery_note_flags_a_commits_only_park(project):
     assert f"attempt COMMITS parked at `{ref}`" in note
     assert "did not survive the rollback" in note
     assert "attempt-worktree-preserve-failed" in note  # names the breadcrumb
-    assert f'git -C "{project.project}" merge --ff-only {ref}' in note
+    assert f'git -C "{project.project}" merge --no-edit {ref}' in note
 
     task.preserve_partial = False  # a complete park keeps the unqualified wording
     note = engine._defer_recovery_note(task)
@@ -10215,6 +10215,38 @@ def test_inplace_defer_commits_the_restored_ledger(project):
     assert row["kind"] == "engine-ledger-commit" and row["story_key"] == "1-1-a"
     assert row["commit"] == verify.rev_parse_head(project.project)
     assert [e for e in _bookkeeping_rows(engine) if e["kind"] != "engine-ledger-commit"] == []
+
+
+def test_inplace_defer_recovery_line_works_over_the_ledger_commit(project):
+    """#772. The defer's ledger restore commit lands on the reset baseline, so the
+    parked attempt ref is no longer a descendant of HEAD: the `merge --ff-only` the
+    notice used to print aborted right after the defer. Run the printed line
+    verbatim — it must succeed and bring back the attempt's work alongside the
+    restored ledger.
+
+    Ablation: print `merge --ff-only` again in `_defer_recovery_note` and the
+    recovery command exits nonzero."""
+    import shlex
+
+    engine, _ = _plateau_defer_engine(project)
+    summary = engine.run()
+
+    assert summary.deferred == 1
+    task = engine.state.tasks["1-1-a"]
+    ref = task.preserve_ref
+    assert ref
+    assert git(project.project, "log", "-1", "--format=%s") == (
+        "chore(deferred-work): restore ledger after deferring 1-1-a"
+    )
+    attention = (engine.run_dir / "ATTENTION").read_text()
+    (line,) = re.findall(r"recover with `([^`]+)`", attention)
+    proc = subprocess.run(shlex.split(line), capture_output=True, text=True, check=False)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert git(project.project, "status", "--porcelain", "--untracked-files=no") == ""
+    recovered = (project.project / "src.txt").read_text().strip()
+    assert recovered == git(project.project, "show", f"{ref}:src.txt") != "original"
+    assert "DW-1: pre-existing flaky retry" in project.deferred_work.read_text()
 
 
 def test_inplace_defer_of_a_gitignored_ledger_commits_nothing(project):
@@ -27853,7 +27885,11 @@ def test_preserve_skips_a_bookkeeping_only_range_but_parks_a_mixed_one(project):
 
     assert parked is not None
     ref, count = parked
-    assert count == 1  # the bookkeeping commit is not counted as attempt work
+    # The branch parks at HEAD, so it carries the bookkeeping commit too: the count
+    # the notice and journal report is what its `git log baseline..ref` shows.
+    assert count == 2
+    (row,) = [e for e in engine.journal.entries() if e["kind"] == "attempt-commits-preserved"]
+    assert row["count"] == 2
     assert (
         git(project.project, "branch", "--list", "attempt-preserve/*")
         .strip()
