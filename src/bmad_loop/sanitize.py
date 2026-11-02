@@ -101,7 +101,12 @@ _LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._/+-]{6,}")
 # Any RFC 3986 scheme, not only http(s): connection strings (`postgres://`,
 # `redis://`, `mongodb+srv://`, `amqp://`, `ssh://`) carry `user:password@`
 # userinfo the same way and are as likely to reach a log tail or `--help` blob.
-_URL_CRED_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s]*:[^/@\s]+@")
+# Neither half crosses an authority delimiter (`/`, `?`, `#`), so a port plus a
+# query that happens to hold an `@` (`redis://cache:6379?client=user@cluster`) is
+# not mistaken for a password. The password half may hold `@` and runs to the
+# LAST one in the authority, as URL parsers split it, so `user:p@ss@host` is
+# matched — and redacted by scrub_text — whole rather than up to its first `@`.
+_URL_CRED_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]*:[^/?#\s]+@")
 # The guard constructs whose match can straddle a truncation point AND whose
 # leading fragment would still be sensitive once the rest is clipped away.
 # `scrub_text`'s cut retracts out of these -- see `_truncate_line`. This sits
@@ -148,6 +153,10 @@ _ABS_HOME_RE = re.compile(
 _REDACTED_STR = "<redacted:str>"
 _REDACTED_SECRET = "<redacted:secret>"  # nosec B105 - redaction marker, not a credential
 _REDACTED_EMAIL = "<redacted:email>"
+# Replaces a URL's whole `user:password@`, the `@` included: a marker followed by
+# `@` would itself read as `<user>:<password>@` to `_URL_CRED_RE` and make the
+# guard refuse the very output that was just made safe.
+_REDACTED_USERINFO = "<redacted:userinfo>"
 _REDACTED_DEPTH = "<redacted:depth>"
 
 
@@ -258,8 +267,8 @@ def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = 
     """Sanitize free text (a CLI's ``--help`` / ``--version`` / a log tail).
 
     Less aggressive than :func:`scrub_json` — help text is the CLI's own and
-    flag lines must survive — so we only redact the home dir and any emails,
-    then optionally cap the line count and each line's length.
+    flag lines must survive — so we only redact the home dir, URL credentials
+    and any emails, then optionally cap the line count and each line's length.
 
     ``max_chars`` bounds each line's **content** at ``max_chars``; a truncated
     line is emitted as at most ``max_chars`` characters plus the
@@ -279,6 +288,10 @@ def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = 
     of the redaction step.
     """
     s = redact_home(s)
+    # URL credentials go BEFORE emails: the email rule would otherwise take the
+    # `x@example.com` tail of `redis://bob:hunter2!x@example.com`, leaving
+    # `hunter2!` behind with the `@` gone, so the guard's URL rule no longer sees it.
+    s = _URL_CRED_RE.sub(lambda m: m.group("scheme") + _REDACTED_USERINFO, s)
     s = _EMAIL_RE.sub(_REDACTED_EMAIL, s)
     if max_lines is None and max_chars is None:
         return s

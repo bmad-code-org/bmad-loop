@@ -379,10 +379,32 @@ def test_assert_no_leak_fires(text, rule):
         "ssh://git@github.com:22/org/repo.git",  # user, no password
         "git@github.com:org/repo.git",  # scp-style, no scheme
         "see https://host:8443/path",  # a port is not a password
+        "redis://cache:6379?client=user@cluster",  # `@` past the authority
+        "redis://cache:6379#user@cluster",
     ],
 )
 def test_assert_no_leak_url_rule_needs_a_password(text):
     assert "url-credentials" not in sanitize.assert_no_leak(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Email-shaped tail: the email rule alone would leave `hunter2!` behind.
+        "redis://bob:hunter2!x@example.com",
+        "dsn postgres://app:hunter2@db.example.com:5432/db",
+        # `@` inside the password: redaction must run to the last `@`.
+        "redis://bob:p@ss@localhost:6379",
+        "amqp://bob:a@b@mq.example.com",
+    ],
+)
+def test_scrub_text_redacts_url_credentials_whole(text):
+    out = sanitize.scrub_text(text)
+    for fragment in ("hunter2", "p@ss", "a@b", "bob:", "app:"):
+        assert fragment not in out
+    assert "<redacted:userinfo>" in out
+    # The redacted output must not re-trip the guard on its own marker.
+    assert sanitize.assert_no_leak(out) == []
 
 
 def test_assert_no_leak_sees_wsl_unc_through_the_json_render():
