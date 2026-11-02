@@ -256,14 +256,6 @@ def test_plan_status_order_is_the_lifecycle_and_ticketmodel_reads_it():
     assert set(PLAN_TRANSITIONS) == set(EXPECTED)
 
 
-def test_plan_transition_forward_allowed():
-    """The accept path is strictly forward: built -> done, nothing else."""
-    assert _decide("accept", "built", "done") == "write"
-    assert _decide("accept", "done", "done") == "noop"
-    for state in ("", "draft", "ready-for-dev", "in-progress", "in-review", *_BLOCKED):
-        assert _decide("accept", state, "done") == "refuse", state
-
-
 @pytest.mark.parametrize(
     ("current", "target"),
     [
@@ -286,36 +278,21 @@ def test_plan_regression_refused_without_reason(current, target):
         check_plan_transition("1.1", current, target, "accept", has_plan=True, blocked_reason="")
 
 
-@pytest.mark.parametrize("reason", sorted(EXPECTED))
-@pytest.mark.parametrize("sink", ["done", "dropped"])
-def test_done_and_dropped_are_sinks(reason, sink):
-    """Nothing leaves done or dropped, under any reason; the only answer from a
-    sink other than a refusal is the no-op of writing done onto done.
-
-    Two gates hold this, so one ablation alone stays green by design: delete the
-    final-state refusal in `check_plan_transition` AND add `done` to a reason's
-    sources (say `rearm`'s) and this reddens; either edit alone is caught by the
-    other gate."""
-    for target in PLAN_STATUSES:
-        got = _decide(reason, sink, target)
-        if (sink, target) == ("done", "done") and reason in ("accept", "confirm"):
-            assert got == "noop"
-        else:
-            assert got == "refuse", (reason, sink, target)
-
-
-def test_dropped_is_never_written():
-    for reason in EXPECTED:
-        for state in PLAN_STATES:
-            assert _decide(reason, state, "dropped") == "refuse"
-
-
 @pytest.mark.parametrize(
     ("reason", "state", "target"),
     [(r, c, t) for r in sorted(EXPECTED) for c in PLAN_STATES for t in PLAN_STATUSES],
 )
 def test_plan_transition_table(reason, state, target):
-    """Every (reason, current, target) against the hand-written R1 table."""
+    """Every (reason, current, target) against the hand-written R1 table.
+
+    Ablation: the done/dropped sinks are held by two gates, the final-state
+    refusal in `check_plan_transition` and the rule sources (no reason lists
+    `done` or `dropped`), so one ablation alone stays green by design. Delete the
+    refusal AND add `done` to `rearm`'s sources and the rearm/done/* cells redden;
+    either edit alone is caught by the other gate. Widen the salvage rule's
+    targets to `done` and salvage/{in-progress,in-review}/done redden; widen its
+    sources to every build status and salvage/{draft,ready-for-dev}/built redden;
+    remove the rule and its write cells redden."""
     assert _decide(reason, state, target) == EXPECTED[reason].get((state, target), "refuse")
 
 
@@ -398,23 +375,6 @@ def test_session_declared_park_converts_to_blocked():
     for reason in sorted(set(EXPECTED) - {"park"}):
         for target in PLAN_STATUSES:
             assert _decide(reason, "awaiting-operator", target) == "refuse", (reason, target)
-
-
-def test_salvage_writes_built_and_never_done():
-    """A timed-out review's salvage lands the plan at `built` from in-progress or
-    in-review; it never writes `done` and never starts from a plan the build has
-    not started.
-
-    Ablation: widen the salvage rule's targets to include `done` and the `done`
-    refusal reddens; widen its sources to every build status and the
-    draft/ready-for-dev refusals redden; remove the rule and the writes redden."""
-    assert _decide("salvage", "in-review", "built") == "write"
-    assert _decide("salvage", "in-progress", "built") == "write"
-    assert _decide("salvage", "built", "built") == "noop"
-    for state in ("in-progress", "in-review", "built"):
-        assert _decide("salvage", state, "done") == "refuse", state
-    for state in ("", "draft", "ready-for-dev", *_BLOCKED, "awaiting-operator"):
-        assert _decide("salvage", state, "built") == "refuse", state
 
 
 def test_plan_transition_refused_is_an_illegal_transition():

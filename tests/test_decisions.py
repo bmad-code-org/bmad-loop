@@ -1853,6 +1853,11 @@ def test_the_store_write_refuses_a_symlinked_bmad_loop(project, tmp_path):
     The second assertion is the one that pins the fix — refusing loudly is worth
     nothing if the write already landed outside the project.
 
+    The positive control for this refusal is `test_store_round_trip_and_prune`:
+    the same `record_pre_answer` call on a clean `project`, reading the answer
+    back. Without it this test passes for a `_write_store` wired to refuse
+    everything, which is every reason a file could be absent from `outside/`.
+
     Ablation: revert `_write_store` to
     `atomic_write_text(path, ..., follow_symlinks=False)` and this fails
     `DID NOT RAISE`, with `decisions.json` sitting in `outside/`."""
@@ -1864,16 +1869,6 @@ def test_the_store_write_refuses_a_symlinked_bmad_loop(project, tmp_path):
         _answer(project)
 
     assert list(outside.iterdir()) == []  # nothing escaped the project
-
-
-def test_the_store_write_lands_on_a_clean_tree(project):
-    """The positive control for the refusal above. Without it that test passes for
-    a `_write_store` wired to refuse everything, which is every reason a file
-    could be absent from `outside/`."""
-    _answer(project)
-
-    assert decisions.load_pre_answers(project.project)["DW-7"]["effect"] == "build"
-    assert decisions.store_path(project.project).is_file()
 
 
 def test_the_store_write_refuses_a_readonly_store(project):

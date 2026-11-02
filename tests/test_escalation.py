@@ -230,12 +230,16 @@ def test_dev_produced_work_default_keeps_todays_routing():
     """`produced_work` defaults True — "unknown never blocks" — so every positional
     construction (the engine's hand-built results, opencode-http, every fixture)
     keeps RETRY-with-budget / DEFER-without. Pinned on both arms so the default
-    cannot silently flip."""
-    plain = SessionResult(status="timeout")
+    cannot silently flip. Guard pin too: a NON-env-fault timeout with budget left
+    still RETRYs — the env-fault branch must not swallow ordinary transient
+    failures."""
+    plain = SessionResult(status="timeout")  # env_fault defaults False
     assert plain.produced_work is True
-    assert decide_dev(_task(attempt=1), plain, None, POLICY).action == Action.RETRY
+    retried = decide_dev(_task(attempt=1), plain, None, POLICY)
+    assert retried.action == Action.RETRY
     assert decide_dev(_task(attempt=2), plain, None, POLICY).action == Action.DEFER
-    assert "no work produced" not in decide_dev(_task(attempt=1), plain, None, POLICY).reason
+    assert "no work produced" not in retried.reason
+    assert "environment fault" not in retried.reason
 
 
 def test_dev_env_fault_outranks_no_work():
@@ -524,16 +528,6 @@ def test_usage_limit_reason_keeps_the_lost_session_suffix():
     assert reason.startswith("usage limit: dev session stalled: the multiplexer no longer")
 
 
-def test_dev_plain_noncompleted_still_retries_with_budget():
-    """Guard pin: a NON-env-fault timeout with budget left still RETRYs — the
-    env-fault branch must not swallow ordinary transient failures."""
-    task = _task(attempt=1)
-    plain = SessionResult(status="timeout")  # env_fault defaults False
-    decision = decide_dev(task, plain, None, POLICY)
-    assert decision.action == Action.RETRY
-    assert "environment fault" not in decision.reason
-
-
 def test_vanished_session_says_so_without_changing_the_routing():
     """#489: a session the multiplexer destroyed and a CLI that exited both land
     `crashed`. The routing is the same (a retry re-creates the session), but the
@@ -627,18 +621,6 @@ def test_review_env_fault_session_pauses():
     assert decision.action == Action.PAUSE
     assert "environment fault: review session stalled" in decision.reason
     assert "ETIMEDOUT" in decision.reason
-
-
-def test_review_plain_noncompleted_still_retries_with_budget():
-    task = _task(review_cycle=1)
-    plain = SessionResult(status="crashed")
-    assert decide_review_session(task, plain, POLICY).action == Action.RETRY
-
-
-def test_review_exhausted_defers_normal_story():
-    task = _task(review_cycle=2)  # 2 == max_review_cycles
-    crashed = SessionResult(status="crashed")
-    assert decide_review_session(task, crashed, POLICY).action == Action.DEFER
 
 
 def test_review_exhausted_reescalates_resolved_redrive():

@@ -7160,6 +7160,13 @@ def test_the_stop_request_refuses_a_symlinked_bmad_loop(tmp_path):
     assertion measures a write that had somewhere to land rather than one that
     failed for want of a parent.
 
+    The positive control for this refusal is
+    `test_write_stop_request_survives_an_interleaved_concurrent_writer`: the same
+    `_write_stop_request(run_dir, "hard")` on a clean `_make_state_run` dir,
+    published through the real rename and read back as `mode == "hard"`. Without
+    it this test passes for a `_write_stop_request` wired to refuse everything,
+    which is every reason a file could be absent from `outside/`.
+
     Ablation: revert `_write_stop_request` to
     `atomic_write_text(..., follow_symlinks=False)` and this fails
     `DID NOT RAISE`, with `stop-request.json` sitting in `outside/runs/r1/`."""
@@ -7174,19 +7181,6 @@ def test_the_stop_request_refuses_a_symlinked_bmad_loop(tmp_path):
         runs._write_stop_request(proj / ".bmad-loop" / "runs" / "r1", "hard")
 
     assert list(landing.iterdir()) == []  # nothing escaped the project
-
-
-def test_the_stop_request_lands_on_a_clean_tree(tmp_path):
-    """The positive control for the refusal above — without it that test passes
-    for a `_write_stop_request` wired to refuse everything, which is every reason
-    a file could be absent from `outside/`."""
-    run_dir = _make_state_run(tmp_path, "r1")
-
-    runs._write_stop_request(run_dir, "hard")
-
-    assert json.loads((run_dir / runs.STOP_REQUEST_FILE).read_text(encoding="utf-8"))["mode"] == (
-        "hard"
-    )
 
 
 def test_stop_run_still_signals_when_the_lodge_is_refused_as_unconfined(tmp_path, monkeypatch):

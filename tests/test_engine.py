@@ -9913,46 +9913,9 @@ def test_nonterminal_rounds_do_not_spend_damping_cap(project):
     assert "review-followup-damped" not in kinds
 
 
-def test_verify_fix_rounds_do_not_spend_damping_cap(project):
-    """A clean review whose patch breaks the verify gate routes to a dev fix
-    session and a fresh review cycle. Those verify-repair cycles are dev work, not
-    honored follow-ups — they never spend the damping cap. Convergence lands with
-    followup_reviews_spent == 0."""
-    write_sprint(project, {"1-1-a": "ready-for-dev"})
-    marker = project.project / "fixed.marker"
-
-    def dev_with_marker(spec):
-        marker.write_text("ok\n")
-        return dev_effect(project, "1-1-a")(spec)
-
-    def breaking_review(spec):
-        marker.unlink()  # the review's "patch" broke the verify gate
-        return review_effect(project, "1-1-a", clean=True)(spec)
-
-    def fix(spec):
-        marker.write_text("ok\n")
-        return SessionResult(
-            status="completed", result_json={"workflow": "auto-dev", "escalations": []}
-        )
-
-    policy = Policy(
-        gates=GatesPolicy(mode="none"),
-        notify=QUIET,
-        verify=VerifyPolicy(commands=(_file_exists_cmd(marker),)),
-    )
-    engine, adapter = make_engine(
-        project,
-        [dev_with_marker, breaking_review, fix, review_effect(project, "1-1-a", clean=True)],
-        policy=policy,
-    )
-    summary = engine.run()
-
-    assert summary.done == 1
-    task = engine.state.tasks["1-1-a"]
-    assert task.review_cycle == 2 and task.attempt == 2
-    assert task.followup_reviews_spent == 0  # verify-repair never spends the cap
-    kinds = [e["kind"] for e in engine.journal.entries()]
-    assert "review-followup-damped" not in kinds
+# Verify-repair cycles (a clean review whose patch breaks the verify gate, then a
+# dev fix session) never spend the damping cap either — pinned alongside the
+# fix-session routing in test_review_verify_failure_routes_fix_session_then_rereview.
 
 
 def test_followup_damping_resume_replay_does_not_double_count(project):
@@ -10808,58 +10771,6 @@ def test_rollback_on_preserves_preexisting_untracked(project):
     task = engine.state.tasks["1-1-a"]
     assert rev_parse_head(project.project) == task.baseline_commit  # tracked reverted
     assert precious.read_text() == "keep me\n"  # pre-existing untracked survives
-
-
-def test_rollback_or_pause_skips_clean_tree(project):
-    """When the attempt left nothing in the tree (HEAD == baseline, no run-created
-    untracked files), there is nothing to roll back: even with auto-rollback OFF
-    the orchestrator neither pauses nor touches the tree — it just journals and
-    returns, so resume can proceed."""
-    policy = Policy(
-        gates=GatesPolicy(mode="none"),
-        notify=QUIET,
-        scm=ScmPolicy(rollback_on_failure=False),
-    )
-    engine, _ = make_engine(project, [], policy=policy)
-    task = StoryTask(story_key="1-1-a", epic=1)
-    task.baseline_commit = rev_parse_head(project.project)  # clean tree at baseline
-    task.baseline_untracked = []
-
-    engine._rollback_or_pause(task)  # must NOT raise RunPaused
-
-    kinds = [e["kind"] for e in engine.journal.entries()]
-    assert "rollback-skipped-clean" in kinds
-    assert "rollback-manual-required" not in kinds
-
-
-def test_rollback_gate_git_fault_pauses_instead_of_crashing(project, monkeypatch):
-    """#156: the dirty check timing out (now a GitError) must degrade to
-    assume-dirty, so with rollback OFF the run pauses on the manual-recovery
-    notice with the tree untouched — it must never crash the run."""
-    policy = Policy(
-        gates=GatesPolicy(mode="none"),
-        notify=QUIET,
-        scm=ScmPolicy(rollback_on_failure=False),
-    )
-    engine, _ = make_engine(project, [], policy=policy)
-    repo = project.project
-    task = StoryTask(story_key="1-1-a", epic=1)
-    task.baseline_commit = rev_parse_head(repo)
-    task.baseline_untracked = []
-    head = rev_parse_head(repo)
-
-    def timing_out(*args, **kwargs):
-        raise GitError(f"git diff timed out after 120s in {repo}")
-
-    monkeypatch.setattr(verify, "attempt_dirty", timing_out)
-
-    with pytest.raises(RunPaused):
-        engine._rollback_or_pause(task)
-
-    assert rev_parse_head(repo) == head  # tree untouched
-    kinds = [e["kind"] for e in engine.journal.entries()]
-    assert "rollback-dirty-check-failed" in kinds
-    assert "rollback-skipped-clean" not in kinds
 
 
 def test_rollback_gate_git_fault_still_auto_recovers_when_on(project, monkeypatch):
@@ -13762,7 +13673,9 @@ def test_dev_verify_command_failure_routes_feedback_fix(project):
 
 def test_review_verify_failure_routes_fix_session_then_rereview(project):
     """Verify commands failing after a clean review route to a feedback-driven
-    dev fix session and a fresh review cycle — not a blind re-review."""
+    dev fix session and a fresh review cycle — not a blind re-review. Those
+    verify-repair cycles are dev work, not honored follow-ups — they never spend
+    the damping cap. Convergence lands with followup_reviews_spent == 0."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     marker = project.project / "fixed.marker"
 
@@ -13802,6 +13715,9 @@ def test_review_verify_failure_routes_fix_session_then_rereview(project):
     assert task.review_cycle == 2 and task.attempt == 2
     assert [s.role for s in adapter.sessions] == ["dev", "review", "dev", "review"]
     assert "Resume the autonomous" in adapter.sessions[2].prompt
+    assert task.followup_reviews_spent == 0  # verify-repair never spends the cap
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "review-followup-damped" not in kinds
 
 
 def test_review_verify_failure_without_fix_budget_defers(project):

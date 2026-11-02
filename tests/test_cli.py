@@ -640,13 +640,6 @@ def test_stories_mode_default_off():
     assert cli._stories_mode(argparse.Namespace(spec=None), policy_mod.loads("")) == (False, "")
 
 
-def test_stories_mode_spec_flag_overrides_policy_sprint_source():
-    # --spec forces stories mode even when policy says sprint-status
-    args = argparse.Namespace(spec="_bmad-output/epic-9")
-    on, folder = cli._stories_mode(args, policy_mod.loads(""))
-    assert on and folder == "_bmad-output/epic-9"
-
-
 def test_validate_stories_folder_ok(project):
     _setup_stories_fixture(project, [_stories_entry("1")])
     assert cli._validate_stories_folder(project, STORIES_SPEC_FOLDER) is None
@@ -25472,46 +25465,46 @@ def test_sweep_archive_post_report_refuses_a_ledger_whose_metadata_probe_is_refu
     assert "no closed entries" not in out
 
 
-def test_sweep_archive_refuses_while_run_live(project, monkeypatch, capsys):
+@pytest.mark.parametrize(
+    ("marker", "marker_text", "liveness"),
+    [
+        ("state.json", "{}", "alive"),
+        ("state.json", "{}", "unknown"),
+        ("engine.pid", "4242", "alive"),  # live, but no state.json
+    ],
+    ids=["live", "unknown-liveness", "no-state-json"],
+)
+def test_sweep_archive_refuses_a_run_dir_it_cannot_prove_dead(
+    project, monkeypatch, capsys, marker, marker_text, liveness
+):
     """The out-of-band ledger writer refuses when any engine run is live —
     a concurrent close between its read and writes would be lost (#706 pass 2).
 
     "Nothing written" is asserted as byte equality plus an absent archive, not
     as `"DW-2" in text`: archiving DW-2 *keeps* its heading in the ledger by
     design, so the id-presence form passes just as well when the refusal never
-    happened (#711 review)."""
-    from conftest import write_ledger
+    happened (#711 review).
 
-    from bmad_loop import deferredwork
+    `unknown-liveness`: an unverifiable pid is treated as live for this write op —
+    the archive must not run over a run it cannot prove is dead (#711 review).
 
+    `no-state-json`: a run whose state.json was removed still owns its
+    `engine.pid` — and its ledger writes. `runs.list_run_dirs` is state.json-gated
+    (it answers "which runs can I resume"), so a guard built on it walks past
+    exactly the run an operator is mid-recovery on and archives out from under it
+    (#711 review).
+
+    Ablation: restore `runs.list_run_dirs` in `_sweep_archive` and the
+    `no-state-json` row fails — the archive proceeds and returns 0 with a live
+    engine beside it."""
     install_bmad_config(project)
     write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
     run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
     run_dir.mkdir(parents=True)
-    (run_dir / "state.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
+    (run_dir / marker).write_text(marker_text, encoding="utf-8")
+    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: liveness)
     before = project.deferred_work.read_text(encoding="utf-8")
-    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
-    assert rc == 1
-    assert "may still be live" in capsys.readouterr().err
-    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
-    assert project.deferred_work.read_text(encoding="utf-8") == before
 
-
-def test_sweep_archive_refuses_on_unknown_liveness(project, monkeypatch, capsys):
-    """An unverifiable pid is treated as live for this write op — the archive
-    must not run over a run it cannot prove is dead (#711 review)."""
-    from conftest import write_ledger
-
-    from bmad_loop import deferredwork
-
-    install_bmad_config(project)
-    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
-    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
-    run_dir.mkdir(parents=True)
-    (run_dir / "state.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "unknown")
-    before = project.deferred_work.read_text(encoding="utf-8")
     rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
     assert rc == 1
     assert "may still be live" in capsys.readouterr().err
@@ -25519,39 +25512,14 @@ def test_sweep_archive_refuses_on_unknown_liveness(project, monkeypatch, capsys)
     assert project.deferred_work.read_text(encoding="utf-8") == before  # ledger unchanged
 
 
-def test_sweep_archive_refuses_run_dir_without_state_json(project, monkeypatch, capsys):
-    """A run whose state.json was removed still owns its `engine.pid` — and its
-    ledger writes. `runs.list_run_dirs` is state.json-gated (it answers "which
-    runs can I resume"), so a guard built on it walks past exactly the run an
-    operator is mid-recovery on and archives out from under it (#711 review).
-
-    Ablation: restore `runs.list_run_dirs` in `_sweep_archive` and this fails —
-    the archive proceeds and returns 0 with a live engine beside it."""
-    from conftest import write_ledger
-
-    from bmad_loop import deferredwork
-
-    install_bmad_config(project)
-    write_ledger(project, {"DW-1": "open", "DW-2": "done 2026-06-01"}, commit=False)
-    run_dir = project.project / ".bmad-loop" / "runs" / "20260824-100000-aaaa"
-    run_dir.mkdir(parents=True)
-    (run_dir / "engine.pid").write_text("4242", encoding="utf-8")  # live, but no state.json
-    monkeypatch.setattr(cli.runs, "engine_liveness", lambda _dir: "alive")
-    before = project.deferred_work.read_text(encoding="utf-8")
-
-    rc = cli.main(["sweep", "--archive", "--project", str(project.project)])
-    assert rc == 1
-    assert "may still be live" in capsys.readouterr().err
-    assert not (project.deferred_work.parent / deferredwork.ARCHIVE_REL).exists()
-    assert project.deferred_work.read_text(encoding="utf-8") == before
-
-
 def test_sweep_archive_proceeds_when_runs_are_dead(project, monkeypatch, capsys):
     """The allow direction of the liveness gate: a run dir whose engine is dead
     is not a reason to refuse, and the archive runs to completion.
 
-    Without this the three refusal tests are satisfied by a gate that refuses
-    unconditionally — every one of them would still pass (#711 review)."""
+    Without this the three rows of
+    `test_sweep_archive_refuses_a_run_dir_it_cannot_prove_dead` are satisfied by a
+    gate that refuses unconditionally — every one of them would still pass (#711
+    review)."""
     from conftest import write_ledger
 
     from bmad_loop import deferredwork

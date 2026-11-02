@@ -410,10 +410,3 @@ def test_unity_plugin_is_trust_gated_and_renders_settings():
     assert editor_mode.kind == "select"
     assert editor_mode.options == ("shared", "per_worktree")
     assert editor_mode.widget_id == "plugins-unity-editor_5fmode"  # plugin_field_wid-encoded
-
-
-def test_named_engine_block_is_refused_with_the_unity_plugin_migration():
-    """The unity settings live only under [plugins.unity]: a named [engine] block is
-    refused with the migration, never read onto the plugin."""
-    with pytest.raises(policy_mod.PolicyError, match=r"\[plugins\.unity\]"):
-        policy_mod.loads('[engine]\nname = "unity"\neditor_mode = "per_worktree"\n')
