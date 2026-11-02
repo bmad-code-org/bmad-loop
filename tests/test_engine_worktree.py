@@ -2466,6 +2466,10 @@ def test_deferred_carry_commit_failure_resumes_before_terminal_integration(proje
 
     def commit_fails_once(*args, **kwargs):
         nonlocal failures
+        if kwargs.get("run_hooks") is False:
+            # The engine's pre-review ledger bookkeeping commit (#772) is not the
+            # carry under test; let it through so the fault lands on the carry.
+            return real_commit(*args, **kwargs)
         failures += 1
         if failures == 1:
             raise verify.GitError("commit hook rejects deferred carry")
@@ -3384,7 +3388,7 @@ def test_defer_under_a_recorded_mount_carries_the_harvest_after_an_isolation_fli
 def test_defer_recovery_note_under_a_recorded_mount_names_the_branch_not_a_merge(project):
     """The notice `_record_defer` emits two lines after `_defer` picked its arm must
     pick the SAME arm. Selected on live policy alone, the flipped-policy defer above
-    printed the in-place `git -C <mount> merge --ff-only <ref>` — a command aimed at
+    printed the in-place `git -C <mount> merge --no-edit <ref>` — a command aimed at
     a directory `_integrate_unit` deletes on the way out with `keep_failed` off, and
     with it on, a notice that never names the branch holding the latest failed work.
     An earlier in-worktree dev-retry rollback parks `preserve_ref` on the shared
@@ -3406,7 +3410,7 @@ def test_defer_recovery_note_under_a_recorded_mount_names_the_branch_not_a_merge
 
     note = engine._defer_recovery_note(task)
 
-    assert "merge --ff-only" not in note
+    assert "merge --no-edit" not in note
     assert "failed work kept on branch `bmad-loop/1-1-a`" in note
     assert f"an earlier rolled-back attempt is parked at `{ref}`" in note
 
@@ -8674,7 +8678,7 @@ def test_isolated_defer_names_the_earlier_rolled_back_attempt(project):
     and a notice that mentioned only the branch is exactly the "hunt with
     `git log --all`" failure #333 was filed for.
 
-    No `merge --ff-only` line here on purpose: that ref is not fast-forwardable from
+    No merge line here on purpose: that ref is not fast-forwardable from
     either tree, and offering it would land a discarded attempt on the operator's
     branch.
 
@@ -8704,7 +8708,7 @@ def test_isolated_defer_names_the_earlier_rolled_back_attempt(project):
     assert "story deferred: 1-1-a" in attention
     assert "failed work kept on branch `bmad-loop/test-run/1-1-a`" in attention
     assert f"an earlier rolled-back attempt is parked at `{ref}`" in attention
-    assert "merge --ff-only" not in attention
+    assert "merge --no-edit" not in attention
 
     deferred_entry = [e for e in engine.journal.entries() if e["kind"] == "story-deferred"][-1]
     assert deferred_entry["preserve_ref"] == ref

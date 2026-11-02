@@ -241,6 +241,7 @@ class RecoveryFlow:
         dev_attempt_dispatched: Callable[[StoryTask], bool],
         spec_confine_root: Callable[[StoryTask], Path] | None = None,
         owned_plan: OwnedPlanWriter | None = None,
+        ledger_rel: Callable[[], tuple[str | None, Exception | None]] | None = None,
     ) -> None:
         self.paths = paths
         self.policy = policy
@@ -250,6 +251,9 @@ class RecoveryFlow:
         # Read live (a getter, not a captured ref) so a run that swaps the
         # engine's `self.workspace` to a mounted unit worktree is seen here.
         self._workspace_get = workspace_get
+        # The active ledger relative to the workspace root (`Engine._ledger_rel`),
+        # read live for the same reason. None: no bookkeeping filter (#772).
+        self._ledger_rel = ledger_rel
         # Injected late-bound so a test patching `engine._emit` still wins
         # (recovery_flow's own binding wouldn't).
         self._emit = emit
@@ -2073,7 +2077,12 @@ class RecoveryFlow:
         try:
             head = verify.rev_parse_head(workspace.root)
             commits = verify.commits_above(workspace.root, baseline, head)
-            if not commits:
+            # The bookkeeping filter decides only WHETHER to park (#772): a range of
+            # nothing but the engine's ledger commits parks no ref. A mixed range
+            # parks the branch at `head`, which still carries those commits, so the
+            # journaled and noticed count stays the unfiltered range — the count the
+            # notice's `git log baseline..ref` shows the operator.
+            if not commits or not self._without_engine_bookkeeping(task, workspace.root, commits):
                 return None
         except (verify.GitError, OSError) as exc:
             self.journal.append(
@@ -2117,6 +2126,49 @@ class RecoveryFlow:
             "attempt-commits-preserved", story_key=task.story_key, ref=ref, count=len(commits)
         )
         return ref, len(commits)
+
+    def _without_engine_bookkeeping(
+        self, task: StoryTask, root: Path, commits: list[str]
+    ) -> list[str]:
+        """``commits`` minus the engine's own ledger bookkeeping commits (#772):
+        engine bytes, not attempt work, so a range holding only those parks no
+        ``attempt-preserve`` ref, points no retry prompt at one, and cannot turn a
+        clean reset into a ``preserve_failed`` pause.
+
+        A commit is dropped only when BOTH the persisted record names its sha (for
+        this baseline — never matched by subject, which a session can write) AND
+        :func:`verify.bookkeeping_only_commits` re-reads it as touching the ledger
+        alone. A filter that cannot answer — the ledger's scope unknown, or the
+        diff-tree probe faulting — degrades to the unfiltered range and journals
+        ``attempt-preserve-filter-failed``: an over-eager park is recoverable, a
+        reset past unparked work is not."""
+        record = task.bookkeeping_for_baseline()
+        if record is None or self._ledger_rel is None:
+            return commits
+        recorded = {str(sha) for sha in record["shas"]}
+        candidates = [sha for sha in commits if sha in recorded]
+        if not candidates:
+            return commits
+        rel, fault = self._ledger_rel()
+        error: Exception | None = fault
+        bookkeeping: set[str] = set()
+        if fault is None:
+            if rel is None:
+                # An external ledger was never committed here; a recorded sha that
+                # still shows up is not one this filter can vouch for.
+                return commits
+            try:
+                bookkeeping = verify.bookkeeping_only_commits(root, candidates, rel)
+            except (verify.GitError, OSError) as exc:
+                error = exc
+        if error is not None:
+            self.journal.append(
+                "attempt-preserve-filter-failed",
+                story_key=task.story_key,
+                error=f"{type(error).__name__}: {error}",
+            )
+            return commits
+        return [sha for sha in commits if sha not in bookkeeping]
 
     def _record_fallthrough(
         self,

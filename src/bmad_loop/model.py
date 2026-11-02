@@ -299,6 +299,29 @@ def _rebased_on(path: str | None, root: Path) -> str | None:
     return str(root / path)
 
 
+def _bookkeeping_ledger_from(raw: object) -> dict[str, Any] | None:
+    """Rehydrate `StoryTask.bookkeeping_ledger` from state.json: exactly
+    ``{"baseline": <str>, "added": <bool>, "shas": [<str>, ...]}``. Anything else —
+    a pre-upgrade absent key, or a shape a hand edit mangled — reads as "no
+    record", which only ever re-enables the conservative pre-bookkeeping paths
+    (a restore that skips, a gate that counts the ledger, a preserve that parks)."""
+    if not isinstance(raw, dict):
+        return None
+    record = cast(dict[object, object], raw)
+    baseline = record.get("baseline")
+    added = record.get("added")
+    shas = record.get("shas")
+    if (
+        not isinstance(baseline, str)
+        or not baseline
+        or not isinstance(added, bool)
+        or not isinstance(shas, list)
+        or not all(isinstance(sha, str) and sha for sha in shas)
+    ):
+        return None
+    return {"baseline": baseline, "added": added, "shas": [str(sha) for sha in shas]}
+
+
 def _baseline_artifacts_from(raw: object) -> dict[str, list[int] | None] | None:
     """Rehydrate `StoryTask.baseline_artifacts` from state.json: a mapping of
     path -> `[mtime_ns, size]` or `None`. Anything else — a pre-upgrade absent
@@ -554,6 +577,13 @@ class StoryTask:
     post_engine_ledger_digest: str | None = None
     harvest_wrote_ledger: bool = False
     ledger_changed_before_harvest: bool = False
+    # The engine's own ledger bookkeeping commits above `baseline_commit` (#772):
+    # ``{"baseline": <sha it was minted on>, "added": <ledger absent from that
+    # baseline's tree>, "shas": [<commit sha>, ...]}``. Saved BEFORE each commit so a
+    # crash can only leave a record without its commit, never the reverse. It is
+    # SELF-INVALIDATING — read it through `bookkeeping_for_baseline()`, which drops it
+    # the moment `baseline_commit` moves, so no baseline reset site has to clear it.
+    bookkeeping_ledger: dict[str, Any] | None = None
     # JSON-native containers only; callers persist these through state.json.
     harvested_deferrals: list[dict[str, Any]] = field(default_factory=list)
     bundle_closes_intended: list[str] = field(default_factory=list)
@@ -669,7 +699,7 @@ class StoryTask:
     # — an `attempt-preserve/*` branch (commits above baseline) or, when the tree
     # was also dirty, the `refs/attempt-preserve-dirty/*` snapshot, which is
     # parented at the attempt's HEAD and therefore subsumes the branch (last
-    # writer wins, so one `git merge --ff-only <ref>` recovers the whole attempt
+    # writer wins, so one `git merge --no-edit <ref>` recovers the whole attempt
     # — unless `preserve_partial` is set). Set by RecoveryFlow, cleared at the top
     # of every auto-rollback so it can never name a *previous* attempt's ref; read
     # by `_defer` (notification), projected into `status`, and — once verified
@@ -900,6 +930,18 @@ class StoryTask:
             return
         raise KeyError(task_id)
 
+    def bookkeeping_for_baseline(self) -> dict[str, Any] | None:
+        """`bookkeeping_ledger` while it still describes THIS attempt's baseline, else
+        None. The record names the baseline it was minted on; once `baseline_commit`
+        moves (a new attempt, a re-arm, a mount release that clears it) the recorded
+        shas are no longer "above baseline" in any sense a reader may rely on."""
+        record = self.bookkeeping_ledger
+        if record is None or self.baseline_commit is None:
+            return None
+        if record.get("baseline") != self.baseline_commit:
+            return None
+        return record
+
     def to_dict(self, mount_project: Path | None = None) -> dict[str, Any]:
         """``mount_project`` anchors the relative spec spellings: see
         :meth:`_serialized_worktree_path`. ``RunState.to_dict`` passes each task's."""
@@ -937,6 +979,7 @@ class StoryTask:
             "post_engine_ledger_digest": self.post_engine_ledger_digest,
             "harvest_wrote_ledger": self.harvest_wrote_ledger,
             "ledger_changed_before_harvest": self.ledger_changed_before_harvest,
+            "bookkeeping_ledger": deepcopy(self.bookkeeping_ledger),
             "harvested_deferrals": self.harvested_deferrals,
             "bundle_closes_intended": self.bundle_closes_intended,
             "story_closes_intended": self.story_closes_intended,
@@ -1218,6 +1261,7 @@ class StoryTask:
             ),
             harvest_wrote_ledger=bool(d.get("harvest_wrote_ledger", False)),
             ledger_changed_before_harvest=bool(d.get("ledger_changed_before_harvest", False)),
+            bookkeeping_ledger=_bookkeeping_ledger_from(d.get("bookkeeping_ledger")),
             harvested_deferrals=[deepcopy(dict(item)) for item in d.get("harvested_deferrals", [])],
             bundle_closes_intended=[str(i) for i in d.get("bundle_closes_intended", [])],
             story_closes_intended=[str(i) for i in d.get("story_closes_intended", [])],

@@ -4049,7 +4049,7 @@ def test_dirty_preserve_ref_wins_and_subsumes_the_commits_branch(project):
     `attempt-preserve/*` branch and the still-dirty tree on a dirty snapshot. The
     dirty ref is the one `preserve_ref` keeps, because it is committed parented at
     the attempt's HEAD and therefore already contains the branch — so the single
-    `git merge --ff-only <preserve_ref>` the defer notice prints recovers the
+    `git merge --no-edit <preserve_ref>` the defer notice prints recovers the
     whole attempt, not half of it."""
     repo = project.project
     ws = Workspace.default(project)
@@ -4111,7 +4111,7 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
     re-drive the reset runs anyway. `preserve_ref` then names the commits branch
     alone, so the whole-attempt promise no longer holds — `preserve_partial` records
     that, and the defer notice downgrades its claim instead of telling the operator
-    a `merge --ff-only` restores work the reset just destroyed.
+    a `merge` restores work the reset just destroyed.
 
     Since #340 a *plain* rollback refuses this reset, so the re-drive
     (`cause="resolved"`, contractually pause-free) is the surviving path where the
@@ -4142,7 +4142,7 @@ def test_snapshot_failure_leaves_a_commits_only_ref_flagged_partial(project, mon
     # why it matters: the reset ran regardless, so the tree is back at baseline and
     # the ref the notice names carries the committed half ONLY — the uncommitted
     # edit survives nowhere, which is exactly what the un-downgraded notice's
-    # `merge --ff-only` would have implied it could restore
+    # `merge` would have implied it could restore
     assert "committed" not in (repo / "src.txt").read_text()
     assert git(repo, "show", f"{task.preserve_ref}:src.txt") == "committed"
 

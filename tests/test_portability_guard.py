@@ -549,6 +549,9 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     "spec-deferrals-malformed": frozenset({"items"}),
     "spec-deferral-sighting-stale": frozenset({"items"}),
     "board-advance-carried": frozenset({"target"}),
+    # #772: whether the engine's bookkeeping commit put a ledger absent from the
+    # baseline tree into HEAD — a bare boolean. Kind-scoped because `added` is generic.
+    "engine-ledger-commit": frozenset({"added"}),
     "board-advance-carry-failed": frozenset({"target"}),
     "board-advance-carry-foreign-dirt": frozenset({"target"}),
     "board-advance-carry-refused": frozenset({"target"}),
@@ -1669,6 +1672,18 @@ JOURNAL_KINDS = frozenset(
         # paused the run for repair instead (`_pause_for_ledger_repair`, no phase
         # change). Both carry only already-declared fields: `story_key` (routed),
         # `site` (benign), `ledger` (benign) and `error` (dropped).
+        # #772: `Engine._commit_engine_ledger`, the hooks-off commit of the engine's
+        # own ledger bookkeeping before a session — committed, failed (a scope or
+        # git fault, or nothing staged), or refused by the publication guard.
+        # Routed rows in `diagnostics._JOURNAL_KIND_SCHEMAS`; `added` is declared
+        # kind-benign above.
+        "engine-ledger-commit",
+        "engine-ledger-commit-failed",
+        "engine-ledger-commit-refused",
+        # #772: `Engine._bookkept_ledger_for_restart` could not read a bookkeeping
+        # commit's ledger copy for the restart restore. `story_key` aliased, `error`
+        # dropped.
+        "ledger-restart-capture-failed",
         "ledger-read-degraded",
         "ledger-read-refused",
         "ledger-restore-failed",
@@ -1807,6 +1822,9 @@ JOURNAL_KINDS = frozenset(
         "baseline-accepted",
         "attempt-preserve-enumerate-failed",
         "attempt-preserve-failed",
+        # #772: the engine-bookkeeping preserve filter could not answer and kept
+        # the full range. `story_key` aliased, `error` dropped.
+        "attempt-preserve-filter-failed",
         # DW-481: a re-drive's best-effort preserve leg failed and fell through to
         # the reset. `story_key` aliased, `leg` benign, `head` aliased as a commit,
         # `error` (a HEAD read fault) dropped.
