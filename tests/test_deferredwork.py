@@ -607,23 +607,6 @@ def test_append_decision_missing_file(tmp_path):
     assert not mark_done(tmp_path / "nope.md", "DW-1", "2026-06-11", "x")
 
 
-def test_append_decision_write_failure_raises_and_keeps_the_ledger(tmp_path, monkeypatch):
-    """#328. `Path.write_text` opens `'w'` (truncate) and only THEN encodes, so a
-    failure anywhere in that window left the whole ledger at zero bytes. The
-    atomic helper builds the replacement beside the target, so a raise leaves the
-    original exactly as it was."""
-    path = write_ledger(tmp_path)
-    before = path.read_bytes()
-
-    def boom(path, text):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(deferredwork, "atomic_write_text", boom)
-    with pytest.raises(OSError, match="disk full"):
-        append_decision(path, "DW-3", "2026-06-11", "Keep cap", "frozen intent stands")
-    assert path.read_bytes() == before
-
-
 # ------------------------------------------------- line-break injection (#305)
 #
 # The ledger is line-oriented and every mutator interpolates its arguments, so a
@@ -1694,7 +1677,12 @@ def test_append_entry_leaves_a_clean_value_byte_identical(tmp_path):
 
 
 def test_append_entry_write_failure_raises_and_keeps_the_ledger(tmp_path, monkeypatch):
-    """#328, the `append_entry` half — see the `append_decision` twin above."""
+    """#328. `Path.write_text` opens `'w'` (truncate) and only THEN encodes, so a
+    failure anywhere in that window left the whole ledger at zero bytes. The
+    atomic helper builds the replacement beside the target, so a raise leaves the
+    original exactly as it was. This is the `append_entry` half; the
+    `append_decision` half is the [append_decision] row of
+    `test_a_failed_publish_leaves_as_a_typed_ledger_write_error`."""
     path = write_ledger(tmp_path)
     before = path.read_bytes()
 
@@ -1967,36 +1955,24 @@ def test_mark_done_many_writes_once_and_reports_what_landed(tmp_path):
         assert "resolution: resolved by story 1" in entries[dw].body
 
 
-def test_mark_done_many_is_all_or_nothing_on_a_write_failure(tmp_path, monkeypatch):
-    """A per-id read-modify-write loop leaves earlier marks on disk when it raises
-    partway through — a half-applied closure the caller never gets to journal, so
-    the ledger claims resolutions the run has no record of."""
-    p = tmp_path / "deferred-work.md"
-    p.write_text(LEDGER, encoding="utf-8")
-    before = p.read_bytes()
-    monkeypatch.setattr(
-        "bmad_loop.deferredwork.atomic_write_text",
-        lambda path, text: (_ for _ in ()).throw(OSError("disk full")),
-    )
-
-    # the raise must REACH the caller, not just leave the file alone: a swallowed
-    # error returning [] reads as "nothing declared was open" — the engine disarms
-    # its restore snapshot and no journal line ever records the failed write
-    with pytest.raises(OSError):
-        mark_done_many(p, ["DW-1", "DW-3"], "2026-07-24", "note")
-
-    assert p.read_bytes() == before  # nothing partially applied
-
-
 @pytest.mark.parametrize(
     "mutate",
     [
+        # two ids: a per-id read-modify-write loop would leave the earlier mark on
+        # disk when it raises partway through — a half-applied closure the caller
+        # never gets to journal, so the ledger claims resolutions the run has no
+        # record of. The closure is all or nothing.
         pytest.param(
-            lambda p: mark_done_many(p, ["DW-1"], "2026-07-24", "note"), id="mark_done_many"
+            lambda p: mark_done_many(p, ["DW-1", "DW-3"], "2026-07-24", "note"),
+            id="mark_done_many",
         ),
         pytest.param(
             lambda p: record_decision(p, "DW-1", "2026-07-24", "Keep", "why"),
             id="record_decision",
+        ),
+        pytest.param(
+            lambda p: append_decision(p, "DW-1", "2026-07-24", "Keep", "why"),
+            id="append_decision",
         ),
     ],
 )
@@ -2005,7 +1981,10 @@ def test_a_failed_publish_leaves_as_a_typed_ledger_write_error(tmp_path, monkeyp
     every `except OSError` caller keeps its degrade — that a caller which must fail
     loud on a lost publish can name AHEAD of that arm, where a bare `OSError` was
     indistinguishable from the lock's. The original fault stays chained as
-    `__cause__` and named in the message, and nothing partial reaches disk.
+    `__cause__` and named in the message, and nothing partial reaches disk. The
+    raise must REACH the caller, not just leave the file alone: a swallowed error
+    returning [] reads as "nothing declared was open" — the engine disarms its
+    restore snapshot and no journal line ever records the failed write.
 
     Ablation: make `_publish` a bare `atomic_write_text` call and the
     `isinstance(..., LedgerWriteError)` assertion reds while `OSError` still
@@ -3250,20 +3229,6 @@ def test_archive_skips_already_archived_stubs(tmp_path):
     assert "archived: 2026-08-25" not in archive_path.read_text(encoding="utf-8")
 
 
-def test_archive_default_archive_date_is_today(tmp_path):
-    """When archive_date is not supplied, the stub and archive carry today's date."""
-    from datetime import date as calendar_date
-
-    path = write_ledger(tmp_path)
-    archive_closed(path)
-    today = calendar_date.today().isoformat()
-
-    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
-    assert f"archived: {today}" in entries["DW-2"].body
-    archive_path = path.parent / ARCHIVE_REL
-    assert f"archived: {today}" in archive_path.read_text(encoding="utf-8")
-
-
 def test_archive_multi_entry_reparse(tmp_path):
     """Archiving 2+ done entries in one call leaves stubs that re-parse with
     correct id, title, status, and archived line; open entries are byte-identical."""
@@ -3623,7 +3588,8 @@ def test_archive_crash_recovery_edited_entry_keeps_both_bodies(tmp_path):
 
 
 def test_archive_default_date_flake_fixed(tmp_path, monkeypatch):
-    """`calendar_date` is patched to a fixed clock (both `today()` and
+    """When archive_date is not supplied, the stub and archive carry today's date.
+    `calendar_date` is patched to a fixed clock (both `today()` and
     `fromisoformat()`), so a midnight rollover mid-call cannot fail the
     assertion (docs/testing.md flake policy)."""
     from datetime import date as real_date
@@ -3639,6 +3605,8 @@ def test_archive_default_date_flake_fixed(tmp_path, monkeypatch):
     assert f"archived: {FixedDate.today().isoformat()}" in (path.parent / ARCHIVE_REL).read_text(
         encoding="utf-8"
     )
+    entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
+    assert f"archived: {FixedDate.today().isoformat()}" in entries["DW-2"].body
 
 
 def test_archive_fenced_heading_in_archive_does_not_suppress_reclose(tmp_path):

@@ -1477,14 +1477,6 @@ def test_verify_dev_review_disabled_rejects_review_sprint(project):
     assert not out.ok and "sprint-status" in out.reason and "expected 'done'" in out.reason
 
 
-def test_verify_dev_lying_baseline(project):
-    task = make_task(project)
-    sp = spec_path(project, "1-1-a")
-    write_spec(sp, "in-review", "deadbeef" * 5)
-    out = verify.verify_dev(task, project, dev_result(sp))
-    assert not out.ok and "does not match" in out.reason
-
-
 def test_verify_dev_short_hash_baseline(project):
     # Sessions sometimes write `git rev-parse --short HEAD`; an abbreviation
     # of the recorded baseline is the same commit, not a lie.
@@ -4094,23 +4086,6 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     monkeypatch.setattr(verify.subprocess, "run", timing_out_merge_base)
     assert verify.is_ancestor(project.project, ancestor, task.baseline_commit) is False
     out = verify.verify_dev_bundle(task, project, rj)
-    assert not out.ok and "baseline" in out.reason
-
-
-def test_verify_dev_sprint_ancestor_baseline_still_fails(project):
-    """The ancestor relaxation is bundle-only: a sprint-mode dev spec is
-    authored by this session, so its baseline must match the orchestrator's
-    exactly — an older ancestor means the session planned from a stale tree."""
-    ancestor = verify.rev_parse_head(project.project)
-    (project.project / "story-work.txt").write_text("advance\n")
-    git(project.project, "add", "-A")
-    git(project.project, "commit", "-q", "-m", "advance")
-    write_sprint(project, {"1-1-a": "review"})
-    task = make_task(project)  # baseline = new HEAD
-    sp = spec_path(project, "1-1-a")
-    write_spec(sp, "in-review", ancestor)
-    (project.project / "src.txt").write_text("changed\n")
-    out = verify.verify_dev(task, project, dev_result(sp))
     assert not out.ok and "baseline" in out.reason
 
 

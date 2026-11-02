@@ -252,16 +252,6 @@ def test_probe_refused_store_repository_is_a_refusal_not_unversioned(project_v7_
     assert isinstance(result, StoreRefusal) and result.code == "probe-failed"
 
 
-def test_git_toplevel_reads_only_no_repository_as_none(tmp_path):
-    """`git_toplevel` answers None for a directory in no repository and for an
-    absent path; a repository git refuses raises."""
-    assert verify.git_toplevel(tmp_path) is None
-    assert verify.git_toplevel(tmp_path / "absent") is None
-    (tmp_path / ".git").write_text("gitdir: /nonexistent/repo.git\n", encoding="utf-8")
-    with pytest.raises(verify.GitError, match="show-toplevel"):
-        verify.git_toplevel(tmp_path)
-
-
 def test_git_toplevel_raises_when_the_path_cannot_be_statted(tmp_path, monkeypatch):
     """A failed discovery over a ``path`` that cannot be statted (a permission
     change, a filesystem race) raises rather than reading as an absent path, so

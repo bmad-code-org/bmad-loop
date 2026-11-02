@@ -736,20 +736,6 @@ def test_apply_pre_answer_close_marks_done_no_store(project):
     assert decisions.load_pre_answers(project.project) == {}  # close needs no carry-forward
 
 
-def test_apply_pre_answer_returns_true_when_the_entry_is_there(project):
-    """The positive half of the boolean contract (DW-198), pinned on its own so
-    the two False rows below are not the only thing holding the return value —
-    a function that returned False unconditionally would satisfy them both."""
-    install_bmad_config(project)
-    write_ledger(project, {"DW-1": "open"})
-    from bmad_loop.sweep import Decision
-
-    opt = DecisionOption(key="1", label="Close", effect="close", resolution="superseded")
-    d = Decision(id="DW-1", question="close?", context="", options=(opt,), recommendation="1")
-
-    assert decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13").recorded is True
-
-
 def test_apply_pre_answer_returns_false_when_the_entry_was_retired(project):
     """`record_decision`'s first non-write state, propagated (DW-198): the ledger
     reads fine and simply carries no entry for this id — a rival writer retired it
@@ -973,6 +959,8 @@ def test_apply_pre_answer_recorded_close_still_publishes_the_ledger(project):
 
     result = decisions.apply_pre_answer(project.project, d, opt, date="2026-06-13")
 
+    # the positive half of the DW-198 boolean contract: the False rows alone would
+    # pass a function that returned False unconditionally
     assert result.recorded is True
     assert result.publish_note() is None
     assert "chore(decisions): pre-answer DW-1" in _git_log(project)
