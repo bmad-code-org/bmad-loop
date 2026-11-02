@@ -639,15 +639,59 @@ def test_session_record_models_round_trip_and_default():
         assert SessionRecord.from_dict(doc).models == ()
 
 
-def test_followup_review_recommended_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, followup_review_recommended=True)
-    assert StoryTask.from_dict(task.to_dict()).followup_review_recommended is True
+@pytest.mark.parametrize(
+    ("field", "value", "legacy_default"),
+    [
+        ("followup_review_recommended", True, False),
+        # DW-405/407: the escalated-from-COMMITTING fact
+        ("migration_commit_escalated", True, False),
+        # DW-429: the refused-a-rival latch
+        ("migration_ledger_rival", True, False),
+        # DW-436: the validation-retry rejection latch
+        ("migration_rewrite_rejected", True, False),
+        ("followup_reviews_spent", 2, 0),
+        ("resolved_redrive", True, False),
+        ("plan_checkpoint_pending", True, False),
+        ("sentinel_kind", "unresolved", ""),
+        ("restore_patch", "artifacts/attempt.patch", None),
+        ("token_budget_warned", True, False),
+        (
+            "dispatched_spec_file",
+            "_bmad-output/implementation-artifacts/spec-1-1-a.md",
+            None,
+        ),
+        # a pre-#860 state.json loads fail-closed: no absence was ever observed
+        ("dispatched_spec_absent", True, False),
+    ],
+    ids=[
+        "followup_review_recommended",
+        "migration_commit_escalated",
+        "migration_ledger_rival",
+        "migration_rewrite_rejected",
+        "followup_reviews_spent",
+        "resolved_redrive",
+        "plan_checkpoint_pending",
+        "sentinel_kind",
+        "restore_patch",
+        "token_budget_warned",
+        "dispatched_spec_file",
+        "dispatched_spec_absent",
+    ],
+)
+def test_story_task_scalar_field_round_trips_and_defaults_for_legacy_state(
+    field, value, legacy_default
+):
+    """Each scalar StoryTask field survives a JSON round trip of state.json, and a
+    state.json written before the field existed loads its legacy default. The legacy
+    doc is built from a task holding the non-default value, so a load that ignored
+    the missing key and kept a stale value would fail rather than pass by accident."""
+    task = StoryTask(story_key="1-1-a", epic=1, **{field: value})
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert getattr(restored, field) == value
 
-
-def test_followup_review_recommended_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["followup_review_recommended"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).followup_review_recommended is False
+    doc = task.to_dict()
+    del doc[field]  # state.json from before the field existed
+    assert getattr(StoryTask.from_dict(doc), field) == legacy_default
 
 
 @pytest.mark.parametrize("pending", [False, True])
@@ -692,45 +736,6 @@ def test_migration_delivery_fields_default_for_pre_upgrade_state():
     assert back.migration_delivery_counts is None
 
 
-def test_migration_commit_escalated_round_trips():
-    """DW-405/407: the escalated-from-COMMITTING fact survives state.json."""
-    task = StoryTask(story_key="sweep-migrate", epic=0, migration_commit_escalated=True)
-    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
-    assert back.migration_commit_escalated is True
-
-
-def test_migration_commit_escalated_defaults_false_for_pre_upgrade_state():
-    doc = StoryTask(story_key="sweep-migrate", epic=0).to_dict()
-    del doc["migration_commit_escalated"]
-    assert StoryTask.from_dict(doc).migration_commit_escalated is False
-
-
-def test_migration_ledger_rival_round_trips():
-    """DW-429: the refused-a-rival latch survives state.json."""
-    task = StoryTask(story_key="sweep-migrate", epic=0, migration_ledger_rival=True)
-    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
-    assert back.migration_ledger_rival is True
-
-
-def test_migration_ledger_rival_defaults_false_for_pre_upgrade_state():
-    doc = StoryTask(story_key="sweep-migrate", epic=0, migration_ledger_rival=True).to_dict()
-    del doc["migration_ledger_rival"]
-    assert StoryTask.from_dict(doc).migration_ledger_rival is False
-
-
-def test_migration_rewrite_rejected_round_trips():
-    """DW-436: the validation-retry rejection latch survives state.json."""
-    task = StoryTask(story_key="sweep-migrate", epic=0, migration_rewrite_rejected=True)
-    back = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
-    assert back.migration_rewrite_rejected is True
-
-
-def test_migration_rewrite_rejected_defaults_false_for_pre_upgrade_state():
-    doc = StoryTask(story_key="sweep-migrate", epic=0, migration_rewrite_rejected=True).to_dict()
-    del doc["migration_rewrite_rejected"]
-    assert StoryTask.from_dict(doc).migration_rewrite_rejected is False
-
-
 def test_legacy_park_eligible_state_loads_but_is_not_persisted():
     """Retired authorization state is tolerated but cannot influence new runs."""
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
@@ -765,17 +770,6 @@ def test_verify_outcome_park_fields_are_absent_by_default():
     assert waived.park_proof_skipped is True and waived.park_zero_diff is True
     unknown = VerifyOutcome.passed(park_proof_skipped=True)
     assert unknown.park_proof_skipped is True and unknown.park_zero_diff is None
-
-
-def test_followup_reviews_spent_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, followup_reviews_spent=2)
-    assert StoryTask.from_dict(task.to_dict()).followup_reviews_spent == 2
-
-
-def test_followup_reviews_spent_defaults_zero_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["followup_reviews_spent"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).followup_reviews_spent == 0
 
 
 def test_usage_relaunch_counters_round_trip_and_default_on_old_state():
@@ -835,11 +829,6 @@ def test_escalations_resolved_upto_defaults_zero_for_legacy_state():
     doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
     del doc["escalations_resolved_upto"]  # state.json from before the field existed
     assert StoryTask.from_dict(doc).escalations_resolved_upto == 0
-
-
-def test_resolved_redrive_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, resolved_redrive=True)
-    assert StoryTask.from_dict(task.to_dict()).resolved_redrive is True
 
 
 def test_env_fault_site_round_trips_and_defaults_none():
@@ -957,41 +946,6 @@ def test_env_fault_site_reverifiable_matrix(site, latest_dev_status, expected):
         )
         task.sessions.append(_dev_record(latest_dev_status))
     assert env_fault_site_reverifiable(task) is expected
-
-
-def test_resolved_redrive_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["resolved_redrive"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).resolved_redrive is False
-
-
-def test_dispatched_spec_file_round_trips():
-    task = StoryTask(
-        story_key="1-1-a",
-        epic=1,
-        dispatched_spec_file="_bmad-output/implementation-artifacts/spec-1-1-a.md",
-    )
-    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
-    assert restored.dispatched_spec_file == task.dispatched_spec_file
-
-
-def test_dispatched_spec_file_defaults_none_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["dispatched_spec_file"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).dispatched_spec_file is None
-
-
-def test_dispatched_spec_absent_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, dispatched_spec_absent=True)
-    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
-    assert restored.dispatched_spec_absent is True
-
-
-def test_dispatched_spec_absent_defaults_false_for_legacy_state():
-    """A pre-#860 state.json loads fail-closed: no absence was ever observed."""
-    doc = StoryTask(story_key="1-1-a", epic=1, dispatched_spec_absent=True).to_dict()
-    del doc["dispatched_spec_absent"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).dispatched_spec_absent is False
 
 
 def test_rebase_spec_paths_on_reanchors_both_ownership_fields(tmp_path):
@@ -1239,28 +1193,6 @@ def test_dispatched_spec_snapshot_decode_error_names_story_and_field(encoded, ca
     assert isinstance(caught.value.__cause__, cause_type)
 
 
-def test_plan_checkpoint_pending_round_trips():
-    task = StoryTask(story_key="1", epic=0, plan_checkpoint_pending=True)
-    assert StoryTask.from_dict(task.to_dict()).plan_checkpoint_pending is True
-
-
-def test_plan_checkpoint_pending_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1", epic=0).to_dict()
-    del doc["plan_checkpoint_pending"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).plan_checkpoint_pending is False
-
-
-def test_sentinel_kind_round_trips():
-    task = StoryTask(story_key="1", epic=0, sentinel_kind="unresolved")
-    assert StoryTask.from_dict(task.to_dict()).sentinel_kind == "unresolved"
-
-
-def test_sentinel_kind_defaults_empty_for_legacy_state():
-    doc = StoryTask(story_key="1", epic=0).to_dict()
-    del doc["sentinel_kind"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).sentinel_kind == ""
-
-
 def test_board_advance_intended_round_trips_through_json():
     """#350's carry payload. The JSON leg is the point: this crosses state.json to
     reach the post-merge carry, and `_replay_unlatched_ledger_carries` reads it from
@@ -1409,17 +1341,6 @@ def test_deferred_work_state_container_defaults_are_not_shared():
     assert other.bundle_closes_intended == []
 
 
-def test_restore_patch_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, restore_patch="artifacts/attempt.patch")
-    assert StoryTask.from_dict(task.to_dict()).restore_patch == "artifacts/attempt.patch"
-
-
-def test_restore_patch_defaults_none_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["restore_patch"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).restore_patch is None
-
-
 def test_preserve_ref_round_trips():
     task = StoryTask(
         story_key="1-1-a",
@@ -1470,17 +1391,6 @@ def test_operator_actions_are_not_shared_between_tasks():
     other = StoryTask(story_key="1-2-b", epic=1)
     one.operator_actions.append("buy the domain")
     assert other.operator_actions == []
-
-
-def test_token_budget_warned_round_trips():
-    task = StoryTask(story_key="1-1-a", epic=1, token_budget_warned=True)
-    assert StoryTask.from_dict(task.to_dict()).token_budget_warned is True
-
-
-def test_token_budget_warned_defaults_false_for_legacy_state():
-    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
-    del doc["token_budget_warned"]  # state.json from before the field existed
-    assert StoryTask.from_dict(doc).token_budget_warned is False
 
 
 def test_stopped_round_trips():

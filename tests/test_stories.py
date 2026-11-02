@@ -96,21 +96,18 @@ def test_id_unquoted_composite_is_string(tmp_path):
     assert s.entries[0].id == "3-2"
 
 
-def test_id_float_rejected(tmp_path):
-    # `id: 3.5` -> float -> str "3.5"; the `.` fails the charset (fail loud).
-    write_stories(tmp_path, "- id: 3.5\n  title: t\n  description: d\n")
-    with pytest.raises(stories.StoriesError, match="invalid id"):
-        stories.load_stories(tmp_path)
-
-
-def test_id_bad_charset_rejected(tmp_path):
-    write_stories(tmp_path, '- id: "a_b"\n  title: t\n  description: d\n')
-    with pytest.raises(stories.StoriesError, match="invalid id"):
-        stories.load_stories(tmp_path)
-
-
-def test_id_leading_dash_rejected(tmp_path):
-    write_stories(tmp_path, '- id: "-1"\n  title: t\n  description: d\n')
+@pytest.mark.parametrize(
+    "raw_id",
+    [
+        # `id: 3.5` -> float -> str "3.5"; the `.` fails the charset (fail loud).
+        # Unquoted on purpose, so YAML parses it as a float.
+        pytest.param("3.5", id="float"),
+        pytest.param('"a_b"', id="charset"),
+        pytest.param('"-1"', id="leading-dash"),
+    ],
+)
+def test_invalid_id_rejected(tmp_path, raw_id):
+    write_stories(tmp_path, f"- id: {raw_id}\n  title: t\n  description: d\n")
     with pytest.raises(stories.StoriesError, match="invalid id"):
         stories.load_stories(tmp_path)
 

@@ -28,7 +28,7 @@ from conftest import (
     write_ticket_tree,
 )
 
-from bmad_loop import bmadconfig, deferredwork, platform_util, policy
+from bmad_loop import bmadconfig, platform_util, policy
 from bmad_loop.journal import UNREADABLE_LINE_KIND, Journal, save_state
 from bmad_loop.model import RunState
 from bmad_loop.runs import RUNS_DIR
@@ -421,17 +421,6 @@ def test_journal_tail_marker_matches_the_journal_entries_marker(tmp_path):
     assert tail_entries[0] == {"kind": UNREADABLE_LINE_KIND, "bytes": 15}
 
 
-def test_journal_tail_withholds_a_fragment_until_its_newline_lands(tmp_path):
-    """The byte offset only advances past complete lines, so a partially flushed
-    record is not read as a truncated entry — and `Journal.append`'s heal is what
-    guarantees that newline eventually arrives on the fragment's OWN line."""
-    path = tmp_path / "journal.jsonl"
-    path.write_text('{"ts": 1, "kind": "run-start"}\n{"ts": 2, "kind": "unit-merge-star')
-    tail = data.JournalTail(tmp_path)
-    assert [e["kind"] for e in tail.read_new()] == ["run-start"]
-    assert tail.read_new() == []  # nothing new; the fragment is still withheld
-
-
 def test_journal_tail_sees_both_records_after_a_healed_append(tmp_path):
     """The two-record regression at the TUI's reader: one partial flush costs one
     record, and the SUCCESSOR of the healing append is intact.
@@ -608,17 +597,32 @@ def test_log_view_styles(tmp_path):
     assert styled["X"].name == "#ff0000"
 
 
-def test_log_view_strips_private_marker_sgr(tmp_path):
-    # XTMODKEYS `CSI > 4 ; 2 m` (modifyOtherKeys, emitted at session start by
-    # Claude Code et al.) is not an SGR. pyte 0.8.2 ignores the `>` marker and
-    # misreads the `4` as underline-on with no matching off, underlining the whole
-    # log; we strip private-marker sequences before pyte sees them.
+@pytest.mark.parametrize(
+    ("raw", "text"),
+    [
+        # XTMODKEYS `CSI > 4 ; 2 m` (modifyOtherKeys, emitted at session start by
+        # Claude Code et al.) is not an SGR. pyte 0.8.2 ignores the `>` marker and
+        # misreads the `4` as underline-on with no matching off, underlining the
+        # whole log; we strip private-marker sequences before pyte sees them.
+        pytest.param(b"\x1b[>4;2mhello world\r\n", "hello world", id="xtmodkeys"),
+        # gemini's XTMODKEYS reply `CSI > 4 ; ? m` carries the `?` marker *inside*
+        # the params. Unstripped, pyte 0.8.2 dispatches it with private=True and
+        # select_graphic_rendition rejects the kwarg — the TypeError that killed
+        # the whole TUI in #111.
+        pytest.param(b"\x1b[>4;?mhello world\r\n", "hello world", id="gemini-111-mid-params"),
+        # `CSI ? 4 m` (vim 9+, upstream selectel/pyte#202): marker in first
+        # position but final `m` — must be stripped, not read as underline or
+        # crash pyte.
+        pytest.param(b"\x1b[?4mhello\r\n", "hello", id="vim9-pyte202"),
+    ],
+)
+def test_log_view_strips_private_marker_sgr(tmp_path, raw, text):
     path = tmp_path / "task.log"
-    path.write_bytes(b"\x1b[>4;2mhello world\r\n")
+    path.write_bytes(raw)
     view = data.LogView(path)
     assert view.read_new() is True
     line = view.render()
-    assert "hello world" in line.plain
+    assert text in line.plain
     assert not any(style.underline for _, _, style in line.spans)
 
 
@@ -650,20 +654,6 @@ def test_log_view_strips_private_marker_sgr_split_across_reads(tmp_path):
     assert not any(style.underline for _, _, style in line.spans)
 
 
-def test_log_view_strips_private_marker_mid_params(tmp_path):
-    # gemini's XTMODKEYS reply `CSI > 4 ; ? m` carries the `?` marker *inside* the
-    # params. Unstripped, pyte 0.8.2 dispatches it with private=True and
-    # select_graphic_rendition rejects the kwarg — the TypeError that killed the
-    # whole TUI in #111.
-    path = tmp_path / "task.log"
-    path.write_bytes(b"\x1b[>4;?mhello world\r\n")
-    view = data.LogView(path)
-    assert view.read_new() is True
-    line = view.render()
-    assert "hello world" in line.plain
-    assert not any(style.underline for _, _, style in line.spans)
-
-
 def test_log_view_survives_gemini_startup_preamble(tmp_path):
     # The exact byte prefix from the #111 traceback: the gemini CLI's terminal
     # capability negotiation burst, including the crashing `CSI > 4 ; ? m`.
@@ -674,18 +664,6 @@ def test_log_view_survives_gemini_startup_preamble(tmp_path):
     view = data.LogView(path)
     assert view.read_new() is True
     assert "ready to work" in view.render().plain
-
-
-def test_log_view_strips_vim9_private_sgr(tmp_path):
-    # `CSI ? 4 m` (vim 9+, upstream selectel/pyte#202): marker in first position
-    # but final `m` — must be stripped, not read as underline or crash pyte.
-    path = tmp_path / "task.log"
-    path.write_bytes(b"\x1b[?4mhello\r\n")
-    view = data.LogView(path)
-    assert view.read_new() is True
-    line = view.render()
-    assert "hello" in line.plain
-    assert not any(style.underline for _, _, style in line.spans)
 
 
 def test_log_view_strips_private_marker_mid_params_split_across_reads(tmp_path):
@@ -877,30 +855,6 @@ def test_active_task_id_falls_back_to_newest_log(tmp_path):
     (logs / "t-new.log").write_text("new")
     os.utime(logs / "t-old.log", ns=(1, 1))
     assert data.active_task_id(tmp_path, []) == "t-new"
-
-
-def test_active_task_id_matches_open_session_start(tmp_path):
-    # Regression: extracting _open_session_start must leave active_task_id
-    # byte-identical, including the logs/ fallback tail.
-    entries = [
-        {"kind": "session-start", "task_id": "t1"},
-        {"kind": "session-end", "task_id": "t1"},
-        {"kind": "session-start", "task_id": "t2"},
-    ]
-    assert data.active_task_id(tmp_path, entries) == "t2"
-    assert data._open_session_start(entries) is entries[-1]  # the open entry itself
-
-    closed = entries + [{"kind": "session-end", "task_id": "t2"}]
-    assert data.active_task_id(tmp_path, closed) is None
-    assert data._open_session_start(closed) is None
-
-    # nothing open in the journal -> newest-log fallback still fires
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "t-old.log").write_text("old")
-    (logs / "t-new.log").write_text("new")
-    os.utime(logs / "t-old.log", ns=(1, 1))
-    assert data.active_task_id(tmp_path, closed) == "t-new"
 
 
 def test_active_task_id_ignores_verifier_streams(tmp_path):
@@ -2041,21 +1995,6 @@ def test_deferred_entries_undecodable_ledger_is_unavailable(project_tree):
     project_tree.deferred_work.write_bytes(b"# Deferred Work\n\n### DW-1: bad \xff byte\n")
 
     assert data.deferred_entries(project_tree.project) is None
-
-
-def test_severity_extraction():
-    cases = {
-        "severity: high\n": "high",
-        "Severity: HIGH\n": "high",
-        "priority: blocker\n": "critical",
-        "severity: med\n": "medium",
-        "severity:low\n": "low",
-        "severity: banana\n": None,
-        "no field here\n": None,
-        "the word severity: high inline does not count\n": None,
-    }
-    for body, expected in cases.items():
-        assert deferredwork.field_severity(f"### DW-9: t\n\n{body}status: open\n") == expected, body
 
 
 def test_deferred_entries_does_not_read_severity_from_a_fenced_example(project_tree):

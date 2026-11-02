@@ -566,25 +566,6 @@ def test_skips_done_on_disk_and_resumes_later(project):
     assert dev_prompts == ["/bmad-dev-auto Spec folder: _bmad-output/epic-1. Story id: 2."]
 
 
-def test_blocked_on_disk_pauses_for_resolve(project):
-    folder = setup_stories(project, [entry("1"), entry("2")])
-    write_spec(folder / "stories" / "1-slug.md", "blocked", rev_parse_head(project.project))
-    git(project.project, "add", "-A")
-    git(project.project, "commit", "-q", "-m", "story 1 blocked")
-
-    engine, adapter = make_engine(project, [])  # no session should run
-    summary = engine.run()
-    assert summary.paused
-    persisted = load_state(engine.run_dir)
-    assert persisted.paused_stage == PAUSE_ESCALATION
-    assert persisted.paused_story_key == "1"
-    assert not any(s.role == "dev" for s in adapter.sessions)  # never leapfrogged to story 2
-    # an ESCALATED task is recorded (spec path attached) so resolve/rearm act on it
-    wedged = persisted.tasks["1"]
-    assert wedged.phase == Phase.ESCALATED
-    assert wedged.spec_file == str(folder / "stories" / "1-slug.md")
-
-
 def test_bare_resume_does_not_leapfrog_a_wedged_story(project):
     """MAJOR-A: a wedge (story 1 blocked on disk → ESCALATED task persisted) must
     not be leapfrogged by a plain `bmad-loop resume` that never resolved it. The
@@ -1744,44 +1725,6 @@ def test_story_checkpoint_pause_after_commit(project):
     assert load_state(resumed.run_dir).tasks["2"].phase == Phase.DONE
 
 
-def test_story_checkpoint_still_fires_when_manifest_unreadable_after_commit(project):
-    """A manifest that goes unreadable between the commit and the after-story
-    check makes the done_checkpoint flag unknowable — the conservative default is
-    to pause for review (mirroring _schedule_complete), never to silently drop a
-    checkpoint the manifest may set. The run cannot proceed past the broken
-    manifest anyway; only the human review could be lost by skipping."""
-    setup_stories(project, [entry("1", done_checkpoint=True), entry("2")])
-
-    def corrupting_effect(spec) -> SessionResult:
-        result = stories_dev_effect()(spec)
-        # the session's tree (== project: no isolation in this harness) ends up
-        # with an undecodable stories.yaml right before commit/after-story
-        (Path(spec.cwd) / SPEC_FOLDER / "stories.yaml").write_bytes(b"\xff\xfe not yaml \x80")
-        return result
-
-    engine, _ = make_engine(project, [corrupting_effect])
-    summary = engine.run()
-    assert summary.paused and summary.done == 1
-    persisted = load_state(engine.run_dir)
-    assert persisted.paused_stage == PAUSE_STORY_CHECKPOINT
-    assert persisted.paused_story_key == "1"
-    unreadable = _kinds(engine.journal, "stories-manifest-unreadable")
-    assert unreadable and unreadable[-1]["story_key"] == "1"
-
-
-def test_story_checkpoint_skipped_when_last(project):
-    """done_checkpoint on the final story does NOT pause — the run ends anyway, so
-    there is nothing to come back to review before."""
-    setup_stories(project, [entry("1"), entry("2", done_checkpoint=True)])
-    engine, _ = make_engine(project, [stories_dev_effect(), stories_dev_effect()])
-    summary = engine.run()
-
-    assert summary.done == 2 and not summary.paused
-    assert not load_state(engine.run_dir).paused
-    assert _kinds(engine.journal, "checkpoint-skip-last")
-    assert not _kinds(engine.journal, "checkpoint-pause")
-
-
 def test_done_checkpoint_skipped_when_graceful_stop_pending(project):
     """A pending graceful stop turns a done_checkpoint into a skip, not a pause: the
     loop-head check ends the run `stopped` on the next iteration, so pausing here
@@ -1895,7 +1838,9 @@ def test_pinned_plan_then_story_checkpoint_flow(project):
     ]
 
     resumed, _ = resume_engine(project, engine, [stories_checkpoint_effect()])
-    assert resumed.run().paused
+    s2 = resumed.run()
+    assert s2.paused and s2.done == 1
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
     persisted = load_state(resumed.run_dir)
     assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_STORY_CHECKPOINT, "1")
     assert persisted.paused_reason == "story checkpoint for 1: review, then resume"
@@ -1918,6 +1863,7 @@ def test_pinned_plan_then_story_checkpoint_flow(project):
     final, _ = resume_engine(project, resumed, [stories_dev_effect()])
     assert not final.run().paused
     assert load_state(final.run_dir).finished
+    assert load_state(final.run_dir).tasks["2"].phase == Phase.DONE
     assert len(_checkpoint_records(final)) == 4  # story 2 sets no checkpoint
 
 
@@ -1966,19 +1912,28 @@ def test_pinned_plan_review_owed_flow(project):
 
 
 @pytest.mark.parametrize(
-    ("entries", "graceful", "max_stories", "skip"),
+    ("entries", "graceful", "max_stories", "skip", "done", "absent"),
     [
+        # done_checkpoint on the final story does NOT pause — the run ends anyway,
+        # so there is nothing to come back to review before.
         (
             [entry("1"), entry("2", done_checkpoint=True)],
             False,
             None,
             {"kind": "checkpoint-skip-last", "story_key": "2", "checkpoint": "story"},
+            2,
+            (),
         ),
+        # MINOR-F: with --max-stories=1 the bound ends the run here, so the
+        # checkpoint is SKIPPED — otherwise the pause+resume would reset the loop
+        # counter and leapfrog story 2 past the cap.
         (
             [entry("1", done_checkpoint=True), entry("2")],
             False,
             1,
             {"kind": "checkpoint-skip-last", "story_key": "1", "checkpoint": "story"},
+            1,
+            ("2",),
         ),
         (
             [entry("1", done_checkpoint=True), entry("2")],
@@ -1990,13 +1945,18 @@ def test_pinned_plan_review_owed_flow(project):
                 "checkpoint": "story",
                 "reason": "graceful-stop",
             },
+            1,
+            ("2",),
         ),
     ],
     ids=["last-story", "max-stories", "graceful-stop"],
 )
-def test_pinned_done_checkpoint_skip_records(project, entries, graceful, max_stories, skip):
+def test_pinned_done_checkpoint_skip_records(
+    project, entries, graceful, max_stories, skip, done, absent
+):
     """Each skip-if-last cause writes exactly one skip record, shaped as pinned, and
-    never pauses or notifies."""
+    never pauses or notifies. The stories it ran are counted done, and a story the
+    run ended before is never dispatched."""
     setup_stories(project, entries)
     run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
 
@@ -2009,24 +1969,38 @@ def test_pinned_done_checkpoint_skip_records(project, entries, graceful, max_sto
         return result
 
     engine, _ = make_engine(project, [dev, dev], max_stories=max_stories)
-    assert not engine.run().paused
+    summary = engine.run()
+    assert summary.done == done and not summary.paused
+    persisted = load_state(engine.run_dir)
+    assert not persisted.paused
+    assert all(key not in persisted.tasks for key in absent)  # never dispatched
     assert _checkpoint_records(engine) == [skip]
     assert _attention_lines(engine) == []
 
 
 def test_pinned_done_checkpoint_on_unreadable_manifest(project):
     """An unreadable manifest after the commit: one unreadable record, then the
-    conservative pause, in that order."""
+    conservative pause, in that order.
+
+    The unreadable manifest makes the done_checkpoint flag unknowable, so the
+    conservative default is to pause for review (mirroring _schedule_complete), never
+    to silently drop a checkpoint the manifest may set. The run cannot proceed past
+    the broken manifest anyway; only the human review could be lost by skipping."""
     setup_stories(project, [entry("1", done_checkpoint=True), entry("2")])
 
     def corrupting_effect(spec) -> SessionResult:
         result = stories_dev_effect()(spec)
+        # the session's tree (== project: no isolation in this harness) ends up
+        # with an undecodable stories.yaml right before commit/after-story
         (Path(spec.cwd) / SPEC_FOLDER / "stories.yaml").write_bytes(b"\xff\xfe not yaml \x80")
         return result
 
     engine, _ = make_engine(project, [corrupting_effect])
-    assert engine.run().paused
-    task = load_state(engine.run_dir).tasks["1"]
+    summary = engine.run()
+    assert summary.paused and summary.done == 1
+    persisted = load_state(engine.run_dir)
+    assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_STORY_CHECKPOINT, "1")
+    task = persisted.tasks["1"]
     records = _checkpoint_records(engine)
     assert [r["kind"] for r in records] == ["stories-manifest-unreadable", "checkpoint-pause"]
     assert set(records[0]) == {"kind", "story_key", "error"}
@@ -2048,8 +2022,9 @@ def test_pinned_wedge_pause(project):
     git(project.project, "add", "-A")
     git(project.project, "commit", "-q", "-m", "story 1 blocked")
 
-    engine, _ = make_engine(project, [])
+    engine, adapter = make_engine(project, [])  # no session should run
     assert engine.run().paused
+    assert not any(s.role == "dev" for s in adapter.sessions)  # never leapfrogged to story 2
     persisted = load_state(engine.run_dir)
     assert (persisted.paused_stage, persisted.paused_story_key) == (PAUSE_ESCALATION, "1")
     assert persisted.paused_reason == (
@@ -2159,31 +2134,6 @@ def test_remaining_estimate_none_on_broken_manifest(project, fault):
         )
 
     assert engine._remaining_estimate() is None
-
-
-def test_both_checkpoints_pause_twice(project):
-    """A story with BOTH flags pauses at the plan checkpoint, then (after the
-    resumed implement leg commits) again at the story checkpoint — two pauses for
-    one story, because there is a later story still to dispatch."""
-    setup_stories(project, [entry("1", spec_checkpoint=True, done_checkpoint=True), entry("2")])
-    engine, _ = make_engine(project, [stories_checkpoint_effect()])
-    # pause 1: plan checkpoint
-    assert engine.run().paused
-    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
-
-    # pause 2: story checkpoint, after leg 2 implements + commits on resume
-    resumed, _ = resume_engine(project, engine, [stories_checkpoint_effect()])
-    s2 = resumed.run()
-    assert s2.paused and s2.done == 1
-    persisted = load_state(resumed.run_dir)
-    assert persisted.paused_stage == PAUSE_STORY_CHECKPOINT
-    assert persisted.tasks["1"].phase == Phase.DONE
-    assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
-
-    # final resume drives story 2, no more pauses
-    resumed2, _ = resume_engine(project, resumed, [stories_dev_effect()])
-    assert not resumed2.run().paused
-    assert load_state(resumed2.run_dir).tasks["2"].phase == Phase.DONE
 
 
 # ------------------------------------ blocked → resolve → re-dispatch (E2E)
@@ -2406,20 +2356,6 @@ def test_unknown_story_selector_pauses_not_crashes(project):
     assert persisted.tasks["99"].phase == Phase.ESCALATED
     assert not any(s.role == "dev" for s in adapter.sessions)  # nothing dispatched
     assert _kinds(engine.journal, "stories-selector-unknown")
-
-
-def test_done_checkpoint_skipped_at_max_stories(project):
-    """MINOR-F: with --max-stories=1 a done_checkpoint on the only dispatched story
-    is SKIPPED (the bound ends the run here) — otherwise the pause+resume would
-    reset the loop counter and leapfrog story 2 past the cap."""
-    setup_stories(project, [entry("1", done_checkpoint=True), entry("2")])
-    engine, _ = make_engine(project, [stories_dev_effect()], max_stories=1)
-    summary = engine.run()
-
-    assert summary.done == 1 and not summary.paused
-    assert _kinds(engine.journal, "checkpoint-skip-last")
-    assert not _kinds(engine.journal, "checkpoint-pause")
-    assert "2" not in load_state(engine.run_dir).tasks  # capped, story 2 never dispatched
 
 
 def test_max_stories_survives_a_checkpoint_pause_resume(project):

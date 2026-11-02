@@ -187,13 +187,22 @@ def test_merge_hooks_adds_all_events():
     assert set(profile.hooks.events) <= set(settings["hooks"])
 
 
-def test_merge_hooks_idempotent():
-    profile = get_profile("claude")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "claude",
+        "copilot",  # the bare-handler shape must still dedupe on a re-run
+        "antigravity",  # keyed by hook NAME ("bmad-loop"), flat Stop handler
+    ],
+)
+def test_merge_hooks_idempotent(name):
+    profile = get_profile(name)
     settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
     again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
     assert not changed
+    container = install_mod.hook_event_container(again, profile.hooks.dialect)
     for event in profile.hooks.events:
-        assert len(again["hooks"][event]) == 1
+        assert len(container[event]) == 1
 
 
 def test_merge_hooks_preserves_existing():
@@ -1081,16 +1090,6 @@ def test_merge_hooks_copilot_entry_shape():
     assert handler["command"].endswith("bmad_loop_hook.py Stop")
 
 
-def test_merge_hooks_copilot_idempotent():
-    # the bare-handler shape must still dedupe on a re-run
-    profile = get_profile("copilot")
-    settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
-    again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
-    assert not changed
-    for event in profile.hooks.events:
-        assert len(again["hooks"][event]) == 1
-
-
 def test_merge_hooks_antigravity_entry_shape():
     # agy keys hooks.json by hook NAME at the top level ("bmad-loop"), and its Stop
     # event is FLAT (handler dict directly, no matcher/hooks wrapper).
@@ -1101,15 +1100,6 @@ def test_merge_hooks_antigravity_entry_shape():
     assert handler["type"] == "command"
     assert handler["timeout"] == 60  # agy hook timeouts are seconds
     assert handler["command"].endswith("bmad_loop_hook.py Stop")
-
-
-def test_merge_hooks_antigravity_idempotent():
-    profile = get_profile("antigravity")
-    settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
-    again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
-    assert not changed
-    for event in profile.hooks.events:
-        assert len(again["bmad-loop"][event]) == 1
 
 
 def test_merge_hooks_antigravity_appends_beside_existing_stop():
@@ -5851,16 +5841,6 @@ def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path, primitive):
     assert missing_stories_support(tmp_path, [tree]) == []
 
 
-def test_provision_worktree_seeds_gitignored_config(tmp_path):
-    """A gitignored config present in the main repo is copied into the worktree
-    (a `git worktree add` checkout would omit it)."""
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert (wt / ".mcp.json").read_text() == '{"mcpServers": {}}'
-
-
 def test_provision_worktree_seed_skips_missing_source(tmp_path):
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
@@ -5870,19 +5850,7 @@ def test_provision_worktree_seed_skips_missing_source(tmp_path):
 
 def test_provision_worktree_seed_does_not_clobber_existing(tmp_path):
     """A seed target already present in the worktree (tracked/committed) is left
-    untouched, so no diff is merged back."""
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
-    dst = wt / ".mcp.json"
-    dst.parent.mkdir(parents=True)
-    dst.write_text("IN_WORKTREE", encoding="utf-8")
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert dst.read_text() == "IN_WORKTREE"
-
-
-def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
-    """A seed entry left untouched because the destination exists is REPORTED, so a
+    untouched, so no diff is merged back. The untouched entry is REPORTED, so a
     `worktree_seed` that copies nothing cannot look like applied configuration."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
@@ -5891,6 +5859,7 @@ def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
     dst.parent.mkdir(parents=True)
     dst.write_text("IN_WORKTREE", encoding="utf-8")
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+    assert dst.read_text() == "IN_WORKTREE"
 
 
 def test_provision_preserves_unrelated_bmad_noop_when_internal_sibling_lands(tmp_path):
@@ -6002,8 +5971,9 @@ def test_provision_worktree_seeds_absent_empty_child_dir(tmp_path):
 
 
 def test_provision_worktree_reports_nothing_when_seeding_succeeds(tmp_path):
-    """A seed that actually copies is not reported — the signal stays specific to
-    entries that silently did nothing. A missing source is also not a no-op report:
+    """A gitignored config present in the main repo is copied into the worktree (a
+    `git worktree add` checkout would omit it). A seed that actually copies is not
+    reported — the signal stays specific to entries that silently did nothing. A missing source is also not a no-op report:
     it is already covered as its own case."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()

@@ -882,10 +882,6 @@ def _test_outcome(phases: list[dict[str, Any]]) -> str:
     return "passed"
 
 
-def _seconds(value: float | None) -> float | None:
-    return None if value is None else round(value, 3)
-
-
 def _span(start: float | None, end: float | None) -> float | None:
     return None if start is None or end is None else round(end - start, 3)
 

@@ -1235,6 +1235,25 @@ def test_field_severity_forms():
 
 
 @pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("severity: high\n", "high"),
+        ("Severity: HIGH\n", "high"),
+        ("priority: blocker\n", "critical"),
+        ("severity: med\n", "medium"),
+        ("severity:low\n", "low"),
+        ("severity: banana\n", None),
+        ("no field here\n", None),
+        ("the word severity: high inline does not count\n", None),
+    ],
+)
+def test_field_severity_in_a_multiline_entry(body, expected):
+    """The field is read from a whole multi-line entry, anchored to the line start:
+    an inline mention of `severity: high` mid-sentence does not count."""
+    assert field_severity(f"### DW-9: t\n\n{body}status: open\n") == expected
+
+
+@pytest.mark.parametrize(
     ("text", "expected"),
     [
         ("high (unverified)", "high"),

@@ -113,17 +113,12 @@ def workflow_effect(captured: list, status: str = "completed"):
 
 
 def test_workflow_stages_and_lookup():
+    # no [python] -> declarative tier -> always active (like a declarative hook)
     reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest())])
     assert reg.workflow_stages() == frozenset({"post_dev_phase"})
     found = reg.workflows_for("post_dev_phase")
     assert [w.name for _, w in found] == ["doc"]
     assert reg.workflows_for("post_review_result") == []
-
-
-def test_data_only_workflow_is_active():
-    # no [python] -> declarative tier -> always active (like a declarative hook)
-    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest())])
-    assert reg.workflows_for("post_dev_phase")
 
 
 def test_unenabled_python_workflow_is_inert():
