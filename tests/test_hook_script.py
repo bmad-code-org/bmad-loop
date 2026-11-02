@@ -25,7 +25,9 @@ def _relay_module():
     return module
 
 
-def run_hook(event: str, env: dict, payload) -> subprocess.CompletedProcess:
+def run_hook(
+    event: str, env: dict, payload, cwd: Path | None = None
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), event],
         input=json.dumps(payload) if payload is not None else "",
@@ -33,11 +35,13 @@ def run_hook(event: str, env: dict, payload) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=10,
+        cwd=cwd,
     )
 
 
 def test_noop_without_env(tmp_path):
-    proc = run_hook("Stop", {}, {"session_id": "s1"})
+    # run from tmp_path, so a no-env write relative to the cwd would land there
+    proc = run_hook("Stop", {}, {"session_id": "s1"}, cwd=tmp_path)
     assert proc.returncode == 0
     assert list(tmp_path.iterdir()) == []
 

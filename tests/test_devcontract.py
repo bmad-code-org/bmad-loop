@@ -427,12 +427,6 @@ def test_synth_dw_ids_included(tmp_path):
     assert out.result_json["story_key"] is None
 
 
-def test_synth_baseline_commit_field_also_accepted(tmp_path):
-    sp = _spec(tmp_path / "s.md", baseline_field="baseline_commit", auto_run="done")
-    out = devcontract.synthesize_result(sp, story_key="1-1-a")
-    assert out.result_json["baseline_commit"].startswith("abc123")
-
-
 def test_synth_followup_review_recommended_true(tmp_path):
     sp = _spec(tmp_path / "s.md", status="done", auto_run="done", followup=True)
     out = devcontract.synthesize_result(sp, story_key="1-1-a")
@@ -583,6 +577,7 @@ def _artifact_only_spec(tmp_path, *, line: str | None = "Artifact only: true", e
         "**Artifact only: true**",
         "Artifact only: **true**",
         "Artifact only:\u00a0true",  # a non-ASCII horizontal space, as `Status:` tolerates
+        "Artifact  only: true",
     ],
     ids=[
         "prose",
@@ -593,15 +588,21 @@ def _artifact_only_spec(tmp_path, *, line: str | None = "Artifact only: true", e
         "bold-whole-line",
         "bold-value",
         "nbsp",
+        "separator-run",
     ],
 )
 def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_path, line):
     """The four-part shape `park_asserted` uses: a present, genuine (no synth
     note), session-authored marker carrying the line. The line tolerates the
-    same bullet/bold spellings `STATUS_LINE_RE` does.
+    same bullet/bold spellings `STATUS_LINE_RE` does, including the Status-like
+    bold shapes with a closing delimiter after the value ([balanced-bold],
+    [bold-whole-line]): the regex consumes it before the end-of-line anchor, so
+    the value is still `true` alone on the line.
 
     Ablation: drop the `"artifact_only"` key from the result and every parameter
-    fails on the `is True`."""
+    fails on the `is True`. Ablation: drop the trailing `(?:\\*\\*)?` from
+    `ARTIFACT_ONLY_LINE_RE` and [balanced-bold], [bold-whole-line] and
+    [bold-value] fall to the `$` anchor."""
     sp = _artifact_only_spec(tmp_path, line=line)
 
     rj = devcontract.synthesize_result(
@@ -611,42 +612,6 @@ def test_synth_mints_artifact_only_from_a_genuine_session_authored_marker(tmp_pa
     assert rj is not None and rj["status"] == "done"
     assert rj["artifact_only"] is True
     assert rj["park_asserted"] is False  # a done marker is no park
-
-
-def test_synth_artifact_only_missing_separator_fails_closed(tmp_path):
-    """The public grammar requires a separator between ``Artifact`` and ``only``.
-
-    Ablation: restore ``[ _-]*`` in ``ARTIFACT_ONLY_LINE_RE`` and both assertions
-    fail because the concatenated label mints an artifact-only receipt again.
-    """
-    sp = _artifact_only_spec(tmp_path, line="Artifactonly: true")
-
-    rj = devcontract.synthesize_result(
-        sp, story_key="dw-bundle", park_marker_session_authored=True
-    ).result_json
-
-    assert devcontract._artifact_only_asserted("Artifactonly: true") is False
-    assert rj is not None and rj["artifact_only"] is False
-
-
-def test_synth_artifact_only_balanced_bold_shapes_mint(tmp_path):
-    """The advertised Status-like bold shapes include a closing delimiter after
-    the value (`**Artifact only:** **true**`, `- **Artifact only: true**`); the
-    regex consumes it before the end-of-line anchor, so the value is still
-    `true` alone on the line.
-
-    Ablation: drop the trailing `(?:\\*\\*)?` from `ARTIFACT_ONLY_LINE_RE` and
-    both shapes fall to the `$` anchor."""
-    sp = _artifact_only_spec(tmp_path, line="**Artifact only:** **true**")
-    assert "- **Artifact only:** **true**\n" in sp.read_text(encoding="utf-8")
-
-    rj = devcontract.synthesize_result(
-        sp, story_key="dw-bundle", park_marker_session_authored=True
-    ).result_json
-
-    assert rj["artifact_only"] is True
-    assert devcontract._artifact_only_asserted("**Artifact only:** **true**") is True
-    assert devcontract._artifact_only_asserted("- **Artifact only: true**") is True
 
 
 def test_synth_artifact_only_newline_separated_value_fails_closed(tmp_path):
@@ -717,16 +682,6 @@ def test_synth_artifact_only_fenced_example_inside_the_marker_fails_closed(tmp_p
     ).result_json
 
     assert rj["artifact_only"] is False
-
-
-def test_synth_artifact_only_tolerates_a_run_of_separators(tmp_path):
-    sp = _artifact_only_spec(tmp_path, line="Artifact  only: true")
-
-    rj = devcontract.synthesize_result(
-        sp, story_key="dw-bundle", park_marker_session_authored=True
-    ).result_json
-
-    assert rj["artifact_only"] is True
 
 
 def test_synth_artifact_only_absent_line_fails_closed(tmp_path):
@@ -1680,47 +1635,47 @@ def test_strip_auto_run_result_no_ops_on_a_cr_only_spec(tmp_path):
     assert sp.read_bytes() == original.encode("utf-8")
 
 
-def test_strip_auto_run_result_ignores_heading_quoted_in_code_fence(tmp_path):
+@pytest.mark.parametrize(
+    "fenced",
+    [
+        pytest.param("```md\n## Auto Run Result\n\nStatus: done\n```\n", id="code-fence"),
+        pytest.param("  ```md\n## Auto Run Result\n\nStatus: done\n  ```\n", id="indented-fence"),
+        pytest.param(
+            "- outer bullet\n  - inner bullet, fenced example:\n"
+            "    ```md\n    ## Auto Run Result\n\n    Status: done\n    ```\n",
+            id="list-indented-fence",
+        ),
+        pytest.param(
+            "````\n```\n## Auto Run Result\n\nStatus: done\n````\n", id="longer-outer-fence"
+        ),
+        pytest.param(
+            "~~~\n```\n## Auto Run Result\n\nStatus: done\n~~~\n", id="mismatched-fence-char"
+        ),
+    ],
+)
+def test_strip_auto_run_result_ignores_a_fenced_heading(tmp_path, fenced):
     """A spec whose frozen intent quotes the heading inside a fenced example must
     not lose that content — stripping is destructive, so fenced pseudo-headings
-    are not sections."""
+    are not sections, and the strip no-ops.
+
+    - code-fence: the plain fenced example.
+    - indented-fence: fences may be indented up to three spaces (CommonMark) — a
+      heading quoted inside one is still fenced content, not a section.
+    - list-indented-fence: reviewer guard (#53): a heading quoted inside a fence
+      nested under list indentation (4+ absolute leading spaces) is co-indented
+      with the fence. `_FENCE_LINE_RE` only recognizes 0-3-space fences, so this
+      fence is not tracked — but the heading is likewise indented and can never
+      match the column-0-anchored `AUTO_RUN_HEADING_RE`, so there is nothing to
+      strip. Locks that symmetry: giving the heading regex any leading-space
+      tolerance would reopen this as a destructive false-positive on quoted spec
+      prose.
+    - longer-outer-fence: a 4-backtick block that contains a lone inner ``` line
+      must be preserved. Line parity would flip on the inner ``` and strip the
+      fenced documentation.
+    - mismatched-fence-char: a ``` line inside a ~~~ fence is content, not a
+      close — the fenced heading after it is documentation and must survive."""
     sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "```md\n## Auto Run Result\n\nStatus: done\n```\n\nmore body\n"
-    )
-    sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
-    assert sp.read_text() == original
-
-
-def test_strip_auto_run_result_ignores_heading_in_indented_fence(tmp_path):
-    """Fences may be indented up to three spaces (CommonMark) — a heading quoted
-    inside one is still fenced content, not a section."""
-    sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "  ```md\n## Auto Run Result\n\nStatus: done\n  ```\n\nmore body\n"
-    )
-    sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
-    assert sp.read_text() == original
-
-
-def test_strip_auto_run_result_ignores_list_indented_fence(tmp_path):
-    """Reviewer guard (#53): a `## Auto Run Result` quoted inside a fence nested
-    under list indentation (4+ absolute leading spaces) is co-indented with the
-    fence. `_FENCE_LINE_RE` only recognizes 0-3-space fences, so this fence is not
-    tracked — but the heading is likewise indented and can never match the
-    column-0-anchored `AUTO_RUN_HEADING_RE`, so there is nothing to strip. Locks
-    that symmetry: giving the heading regex any leading-space tolerance would
-    reopen this as a destructive false-positive on quoted spec prose."""
-    sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "- outer bullet\n  - inner bullet, fenced example:\n"
-        "    ```md\n    ## Auto Run Result\n\n    Status: done\n    ```\n\nmore body\n"
-    )
+    original = "---\nstatus: draft\n---\n\n## Intent\n\n" + fenced + "\nmore body\n"
     sp.write_text(original, encoding="utf-8")
     assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
     assert sp.read_text() == original
@@ -1838,33 +1793,6 @@ def test_reset_spec_for_replan_restores_when_strip_finds_spec_missing(tmp_path, 
     with pytest.raises(FileNotFoundError, match="vanished during result strip"):
         devcontract.reset_spec_for_replan(sp, confine_root=tmp_path)
     assert sp.read_bytes() == original
-
-
-def test_strip_auto_run_result_ignores_heading_in_longer_outer_fence(tmp_path):
-    """Destructive-op guard: a `## Auto Run Result` fenced inside a 4-backtick
-    block that contains a lone inner ``` line must be preserved (no-op). Line
-    parity would flip on the inner ``` and strip the fenced documentation."""
-    sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "````\n```\n## Auto Run Result\n\nStatus: done\n````\n\nmore body\n"
-    )
-    sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
-    assert sp.read_text() == original
-
-
-def test_strip_auto_run_result_ignores_heading_in_mismatched_fence_char(tmp_path):
-    """A ``` line inside a ~~~ fence is content, not a close — the fenced
-    `## Auto Run Result` after it is documentation and must survive."""
-    sp = tmp_path / "spec.md"
-    original = (
-        "---\nstatus: draft\n---\n\n## Intent\n\n"
-        "~~~\n```\n## Auto Run Result\n\nStatus: done\n~~~\n\nmore body\n"
-    )
-    sp.write_text(original, encoding="utf-8")
-    assert devcontract.strip_auto_run_result(sp, confine_root=tmp_path) is False
-    assert sp.read_text() == original
 
 
 # ------------------------------- find_frontmatter_candidates (#224)

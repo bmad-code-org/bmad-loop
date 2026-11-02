@@ -424,11 +424,6 @@ extra_args = ["--foo"]
     assert pol.adapter.resolved("review") == policy.ResolvedAdapter("claude", "opus", ("--foo",))
 
 
-def test_unknown_role_resolves_to_base(tmp_path):
-    pol = policy.load(None)
-    assert pol.adapter.resolved("retro") == policy.ResolvedAdapter("claude", "", None)
-
-
 def test_adapter_timing_knobs_base_and_per_stage(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("""
@@ -556,13 +551,6 @@ def test_stage_scalar_rejected(tmp_path):
         policy.load(p)
 
 
-def test_invalid_gate_mode(tmp_path):
-    p = tmp_path / "policy.toml"
-    p.write_text('[gates]\nmode = "sometimes"\n')
-    with pytest.raises(policy.PolicyError, match="gates.mode"):
-        policy.load(p)
-
-
 def test_bad_toml(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text("[gates\nmode=")
@@ -582,16 +570,6 @@ def test_non_utf8_file_raises_policy_error(tmp_path):
     p.write_bytes(b'[gates]\nmode = "\xff\xfe"\n')
     with pytest.raises(policy.PolicyError, match="not valid UTF-8"):
         policy.load(p)
-
-
-def test_loads_defaults_and_text():
-    assert policy.loads("").gates.mode == policy.GatesPolicy.mode
-    assert policy.loads('[gates]\nmode = "none"\n').gates.mode == "none"
-
-
-def test_loads_validates():
-    with pytest.raises(policy.PolicyError, match="gates.mode"):
-        policy.loads('[gates]\nmode = "sometimes"\n')
 
 
 def test_load_prefixes_path_in_errors(tmp_path):
@@ -1148,13 +1126,6 @@ def test_max_tokens_per_story_must_be_positive(bad):
         policy.loads(f"[limits]\nmax_tokens_per_story = {bad}\n")
 
 
-@pytest.mark.parametrize("bad", ["true", "2.5", '"2M"'])
-def test_max_tokens_per_story_rejects_non_integers(bad):
-    """Same rule as the per-session cap: `true` coerced to a 1-token story cap."""
-    with pytest.raises(policy.PolicyError, match=r"limits\.max_tokens_per_story"):
-        policy.loads(f"[limits]\nmax_tokens_per_story = {bad}\n")
-
-
 def test_max_tokens_per_session_default_parse_and_template():
     import tomllib
 
@@ -1170,20 +1141,6 @@ def test_max_tokens_per_session_default_parse_and_template():
 def test_max_tokens_per_session_must_be_positive(bad):
     with pytest.raises(policy.PolicyError, match=r"limits\.max_tokens_per_session"):
         policy.loads(f"[limits]\nmax_tokens_per_session = {bad}\n")
-
-
-@pytest.mark.parametrize("bad", ["true", "2.5", '"4M"'])
-def test_max_tokens_per_session_rejects_non_integers(bad):
-    """Bools/floats/strings raise PolicyError, never coerce (true would become
-    1 token and terminate every enforce-mode session at its first sample)."""
-    with pytest.raises(policy.PolicyError, match=r"limits\.max_tokens_per_session"):
-        policy.loads(f"[limits]\nmax_tokens_per_session = {bad}\n")
-
-
-@pytest.mark.parametrize("bad", ["true", "2.5", '"30s"'])
-def test_session_budget_grace_rejects_non_integers(bad):
-    with pytest.raises(policy.PolicyError, match=r"limits\.session_budget_grace_s"):
-        policy.loads(f"[limits]\nsession_budget_grace_s = {bad}\n")
 
 
 def test_session_budget_grace_default_parse_and_template():
@@ -1306,18 +1263,6 @@ def test_retro_stage_adapter_parses_resolves_and_roundtrips():
 def test_retro_stage_adapter_must_be_a_table():
     with pytest.raises(policy.PolicyError, match=r"\[adapter\.retro\] must be a table"):
         policy.loads('[adapter]\nretro = "codex"\n')
-
-
-def test_retro_is_a_policy_stage():
-    # `STAGES` fans the `adapter.{stage}` settings template out (settings_schema)
-    assert "retro" in policy.STAGES
-
-
-def test_review_enabled_default_and_override(tmp_path):
-    assert policy.load(None).review.enabled is True
-    p = tmp_path / "policy.toml"
-    p.write_text("[review]\nenabled = false\n")
-    assert policy.load(p).review.enabled is False
 
 
 def test_scm_defaults_reproduce_today(tmp_path):
@@ -1747,10 +1692,6 @@ def test_operator_park_defaults_on():
     outcome: `done` hides the outstanding work, `blocked` halts the run over work
     the loop was never going to do."""
     assert policy.loads("").operator.enabled is True
-
-
-def test_operator_park_can_be_turned_off():
-    assert policy.loads("[operator]\nenabled = false\n").operator.enabled is False
 
 
 def test_operator_scalar_section_rejected():

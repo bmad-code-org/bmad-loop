@@ -151,15 +151,15 @@ DRIFTED = """# Changelog
 
 # Each derives from PROMOTED by breaking exactly one thing, so exactly one `check`
 # arm reports — a shared "rc == 1" would pass for the wrong reason.
+# Renamed but never reopened. `has_curated_section` reports False here for the same
+# reason it does for a correctly emptied one, so `prepare` needs the missing/empty
+# distinction that `extract_section`'s None makes.
 NO_UNRELEASED_HEADING = PROMOTED.replace("## [Unreleased]\n\n", "", 1)
 NO_UNRELEASED_REF = PROMOTED.replace(
     "[Unreleased]: https://github.com/bmad-code-org/bmad-loop/compare/v0.5.0...HEAD\n", "", 1
 )
 STALE_UNRELEASED_REF = PROMOTED.replace("/compare/v0.5.0...HEAD", "/compare/v0.4.3...HEAD", 1)
 
-# Renamed but never reopened. `has_curated_section` reports False here for the same
-# reason it does for a correctly emptied one, so `prepare` needs the missing/empty
-# distinction that `extract_section`'s None makes.
 # Renamed and emptied correctly, but the release date never got stamped on. `section_re`
 # accepts any suffix after `]`, so every other guard reads this as a clean promotion.
 UNDATED_RELEASE_HEADING = PROMOTED.replace("## [0.5.0] — 2026-07-01", "## [0.5.0]", 1)
@@ -868,6 +868,9 @@ def test_publish_sends_a_bounded_body_and_says_so(monkeypatch, capsys, tmp_path)
 def test_prepare_warns_on_a_release_star_branch(monkeypatch, capsys, tmp_path):
     # `_prepare_dry_run` pins the branch to `release/0.5.0`, the shape release.yml publishes
     # from on push — the warning is what tells a PR author they are about to self-publish.
+    # The rc == 0 is also the positive control for the `prepare` refusals below: without
+    # it a refusal test passes for a version bump that `prepare` was refusing for some
+    # entirely different precondition.
     assert _prepare_dry_run(monkeypatch, tmp_path, PROMOTED) == 0
     out = capsys.readouterr().out
     assert "matches release.yml's `release/*` trigger" in out
@@ -951,12 +954,6 @@ def test_prepare_refuses_an_unreleased_reopened_below_the_release(monkeypatch, t
     with pytest.raises(SystemExit) as exc:
         _prepare_dry_run(monkeypatch, tmp_path, UNRELEASED_REOPENED_BELOW)
     assert "sits below `## [0.5.0]`" in str(exc.value)
-
-
-def test_prepare_accepts_a_promoted_changelog(monkeypatch, tmp_path):
-    # The positive control: without it the guard above passes for a version bump
-    # that `prepare` was refusing for some entirely different precondition.
-    assert _prepare_dry_run(monkeypatch, tmp_path, PROMOTED) == 0
 
 
 # --- check holds the promote-and-reopen result ------------------------------ #

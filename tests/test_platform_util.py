@@ -3401,18 +3401,6 @@ def test_unconfined_write_error_is_an_oserror(tmp_path):
     assert not stray.exists()
 
 
-def test_atomic_write_text_confined_writes_a_clean_tree(tmp_path):
-    """The positive control for the refusals below — without it they pass for a
-    writer that refuses everything."""
-    root = tmp_path / "project"
-    parent = root / ".bmad-loop"
-    parent.mkdir(parents=True)
-
-    platform_util.atomic_write_text_confined(parent / "policy.toml", "x = 1\n", confine_root=root)
-
-    assert (parent / "policy.toml").read_text(encoding="utf-8") == "x = 1\n"
-
-
 def test_atomic_write_text_confined_lands_the_platform_line_ending(tmp_path):
     """The confined TEXT writer keeps `atomic_write_text`'s translating newline
     default on every arm — LF on POSIX, CRLF on Windows — so anchoring the write
@@ -3449,6 +3437,11 @@ def test_atomic_write_confined_refuses_a_parent_ref_below_the_root(tmp_path):
     Matched on ITS message ("climbs back out"), not merely the type, for the
     reason the out-of-root row gives: refusing for a different reason must not
     grade as refusing for this one.
+
+    Positive control for this refusal and those below — without it they pass for a
+    writer that refuses everything:
+    `test_atomic_write_text_confined_lands_the_platform_line_ending` lands a write on
+    the same clean tree.
 
     Ablation: delete the `has_parent_ref` gate and this fails `DID NOT RAISE` —
     the anchored walk opens `specs`, then `..` twice, and publishes the payload

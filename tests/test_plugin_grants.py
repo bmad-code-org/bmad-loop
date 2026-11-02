@@ -188,13 +188,15 @@ def test_settings_only_project_plugin_has_no_surface():
 
 
 def test_never_granted_project_plugin_is_refused():
-    verdict = run()
+    # the thunk raises AssertionError if called: REFUSED must be decided without it
+    verdict = run(live=never_called)
     assert verdict.state is TrustState.REFUSED
     assert not verdict.active and not verdict.fatal
 
 
 def test_enabled_but_never_granted_is_fatal():
-    verdict = run(enabled=("rogue",))
+    # the thunk raises AssertionError if called: the verdict must not hash the tree
+    verdict = run(enabled=("rogue",), live=never_called)
     assert verdict.state is TrustState.FATAL_ENABLED_UNGRANTED
     assert verdict.fatal and not verdict.active
 
@@ -278,12 +280,6 @@ def test_unclaimed_lists_grants_no_verdict_consulted(tmp_path):
     assert unclaimed(GrantSet((kept,)), verdicts) == ()
     message = missing_message(gone.name, gone.path)
     assert "x/gone" in message and "`bmad-loop plugins revoke gone`" in message
-
-
-def test_unrecorded_plugin_is_never_hashed():
-    # the thunk raises AssertionError if called: REFUSED must be decided without it
-    assert run(live=never_called).state is TrustState.REFUSED
-    assert run(enabled=("rogue",), live=never_called).state is TrustState.FATAL_ENABLED_UNGRANTED
 
 
 # ------------------------------------------------------------ messages

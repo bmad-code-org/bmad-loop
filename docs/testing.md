@@ -451,6 +451,11 @@ Doctrine:
 - **Layered coverage is not duplication.** `test_envvars.py` and `test_engine.py` pin the same
   rejection rows at two layers ("what does the parse return" vs "does the policy default
   survive" are different claims), and each states its parity with the other.
+- **A local positive control stays only when no survivor already proves the success path.** A
+  "lands on a clean tree" control beside a refusal test keeps the refusal from passing for a
+  writer that refuses everything. It is kept only when no same-file test with the same setup
+  already proves the write succeeds. Otherwise the refusal test's docstring names that
+  survivor as its positive control, so the pairing stays findable from the refusal.
 - **A shared parametrized contract module is rejected as over-abstraction.** Hoisting the
   parity blocks into one module parametrized over transport would hide the transport-specific
   setup that is most of each test's meaning, and the divergence _note_ is the valuable

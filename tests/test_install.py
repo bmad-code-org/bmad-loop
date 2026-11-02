@@ -187,13 +187,22 @@ def test_merge_hooks_adds_all_events():
     assert set(profile.hooks.events) <= set(settings["hooks"])
 
 
-def test_merge_hooks_idempotent():
-    profile = get_profile("claude")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "claude",
+        "copilot",  # the bare-handler shape must still dedupe on a re-run
+        "antigravity",  # keyed by hook NAME ("bmad-loop"), flat Stop handler
+    ],
+)
+def test_merge_hooks_idempotent(name):
+    profile = get_profile(name)
     settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
     again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
     assert not changed
+    container = install_mod.hook_event_container(again, profile.hooks.dialect)
     for event in profile.hooks.events:
-        assert len(again["hooks"][event]) == 1
+        assert len(container[event]) == 1
 
 
 def test_merge_hooks_preserves_existing():
@@ -1081,16 +1090,6 @@ def test_merge_hooks_copilot_entry_shape():
     assert handler["command"].endswith("bmad_loop_hook.py Stop")
 
 
-def test_merge_hooks_copilot_idempotent():
-    # the bare-handler shape must still dedupe on a re-run
-    profile = get_profile("copilot")
-    settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
-    again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
-    assert not changed
-    for event in profile.hooks.events:
-        assert len(again["hooks"][event]) == 1
-
-
 def test_merge_hooks_antigravity_entry_shape():
     # agy keys hooks.json by hook NAME at the top level ("bmad-loop"), and its Stop
     # event is FLAT (handler dict directly, no matcher/hooks wrapper).
@@ -1101,15 +1100,6 @@ def test_merge_hooks_antigravity_entry_shape():
     assert handler["type"] == "command"
     assert handler["timeout"] == 60  # agy hook timeouts are seconds
     assert handler["command"].endswith("bmad_loop_hook.py Stop")
-
-
-def test_merge_hooks_antigravity_idempotent():
-    profile = get_profile("antigravity")
-    settings, _ = merge_hooks({}, _registrations(profile), profile.hooks.dialect)
-    again, changed = merge_hooks(settings, _registrations(profile), profile.hooks.dialect)
-    assert not changed
-    for event in profile.hooks.events:
-        assert len(again["bmad-loop"][event]) == 1
 
 
 def test_merge_hooks_antigravity_appends_beside_existing_stop():
@@ -5851,16 +5841,6 @@ def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path, primitive):
     assert missing_stories_support(tmp_path, [tree]) == []
 
 
-def test_provision_worktree_seeds_gitignored_config(tmp_path):
-    """A gitignored config present in the main repo is copied into the worktree
-    (a `git worktree add` checkout would omit it)."""
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert (wt / ".mcp.json").read_text() == '{"mcpServers": {}}'
-
-
 def test_provision_worktree_seed_skips_missing_source(tmp_path):
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
@@ -5870,19 +5850,7 @@ def test_provision_worktree_seed_skips_missing_source(tmp_path):
 
 def test_provision_worktree_seed_does_not_clobber_existing(tmp_path):
     """A seed target already present in the worktree (tracked/committed) is left
-    untouched, so no diff is merged back."""
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
-    dst = wt / ".mcp.json"
-    dst.parent.mkdir(parents=True)
-    dst.write_text("IN_WORKTREE", encoding="utf-8")
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert dst.read_text() == "IN_WORKTREE"
-
-
-def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
-    """A seed entry left untouched because the destination exists is REPORTED, so a
+    untouched, so no diff is merged back. The untouched entry is REPORTED, so a
     `worktree_seed` that copies nothing cannot look like applied configuration."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
@@ -5891,6 +5859,7 @@ def test_provision_worktree_reports_seed_skipped_as_noop(tmp_path):
     dst.parent.mkdir(parents=True)
     dst.write_text("IN_WORKTREE", encoding="utf-8")
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json"]) == [".mcp.json"]
+    assert dst.read_text() == "IN_WORKTREE"
 
 
 def test_provision_preserves_unrelated_bmad_noop_when_internal_sibling_lands(tmp_path):
@@ -6002,8 +5971,9 @@ def test_provision_worktree_seeds_absent_empty_child_dir(tmp_path):
 
 
 def test_provision_worktree_reports_nothing_when_seeding_succeeds(tmp_path):
-    """A seed that actually copies is not reported — the signal stays specific to
-    entries that silently did nothing. A missing source is also not a no-op report:
+    """A gitignored config present in the main repo is copied into the worktree (a
+    `git worktree add` checkout would omit it). A seed that actually copies is not
+    reported — the signal stays specific to entries that silently did nothing. A missing source is also not a no-op report:
     it is already covered as its own case."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
@@ -7901,53 +7871,14 @@ def test_shield_refuses_to_enable_extension_at_the_old_capability_floor(
     assert not _wt_private_exclude(wt).exists()
 
 
-def test_shield_degrade_leaves_no_permanent_repo_format_change(project, tmp_path, monkeypatch):
-    """`extensions.worktreeConfig` is a PERMANENT repo-format change bmad-loop never
-    reverses, so it must not be paid for a shield that then degrades away.
-    `_shield_enable_worktree_config` used to perform the enable itself, ahead of the
-    seed, the mkdir, the write and the activation — so every degrade below it left
-    the operator's repo marked forever for a shield that never applied. It now only
-    PROBES; the write happens one line above the activation.
-
-    Driven through the seed fault, because that is the degrade path this reordering exists
-    for — a fault the old code could not even reach, since it swallowed instead of
-    degrading.
-
-    Read as TEXT rather than via `git config --get`, for the reason the sibling
-    refusal tests give: conftest's git() is check=True and an unset key exits 1.
-
-    Ablation: move the enable back above the seed (into
-    `_shield_enable_worktree_config`, where it was) and this fails —
-    `worktreeConfig` is in the shared config after a degrade that shielded nothing."""
-    repo = project.project
-    wt = tmp_path / "wt"
-    verify.worktree_add(repo, wt, "feat", "main")
-    users = tmp_path / "my-global-ignores"
-    users.write_text("mine.log\n", encoding="utf-8")
-    git(repo, "config", "core.excludesFile", str(users))
-    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
-    real = install_mod.git_bytes
-
-    def unanswerable_excludes_read(worktree, *args):
-        if "core.excludesFile" in args and "--get" in args:
-            raise verify.GitError("git config did not answer")
-        return real(worktree, *args)
-
-    monkeypatch.setattr(install_mod, "git_bytes", unanswerable_excludes_read)
-
-    reason = _worktree_local_exclude(wt, ["/probe-384"])
-
-    assert reason is not None  # it really did degrade
-    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
-
-
 def test_shield_enables_the_extension_on_the_path_that_activates(project, tmp_path):
     """The other half of the deferral: moving the enable down must not lose it. A
     happy path still leaves the repo carrying the extension — that write is what
     `git config --worktree` needs to exist at all, so without it the activation
     fatals and the shield does nothing.
 
-    The sibling above proves the flag is absent after a degrade; this proves the
+    `test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are` proves the
+    flag is absent after a degrade; this proves the
     reordering did not simply stop setting it. Neither alone distinguishes the fix
     from a deletion."""
     repo = project.project
@@ -10596,6 +10527,13 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     and both cases fail — on assertion 1 (`reason` comes back None) and again on
     assertion 3 (`mine.log` shows up untracked, the shadow).
 
+    The degrade also costs no PERMANENT repo-format change: `extensions.worktreeConfig`
+    is written one line above the activation, never ahead of the seed. Read as TEXT,
+    not via `git config --get`: conftest's git() is check=True and an unset key exits 1.
+    Ablation: move the enable back above the seed (into `_shield_enable_worktree_config`,
+    where it was) and both cases fail on the flag assertion — `worktreeConfig` is in
+    the shared config after a degrade that shielded nothing.
+
     Asserts on "did not answer", NOT "timed out": the latter is a lie for
     `GitSpawnError`, and it is the substring the activation-fault test above already
     asserts, so it could not tell which call faulted."""
@@ -10605,6 +10543,7 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     users = tmp_path / "my-global-ignores"
     users.write_text("mine.log\n", encoding="utf-8")
     git(repo, "config", "core.excludesFile", str(users))
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     real = install_mod.git_bytes
 
     def unanswerable_excludes_read(worktree, *args):
@@ -10620,6 +10559,7 @@ def test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are(
     reason = _worktree_local_exclude(wt, ["/probe-389"])
 
     assert reason is not None and "did not answer" in reason
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     assert not _wt_private_exclude(wt).exists()  # nothing to point a shadowing key at
     (wt / "mine.log").write_text("noise\n", encoding="utf-8")
     (wt / "probe-389").write_text("noise\n", encoding="utf-8")

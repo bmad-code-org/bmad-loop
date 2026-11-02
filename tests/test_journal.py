@@ -1516,9 +1516,6 @@ def test_save_state_round_trips_through_load_state(tmp_path, monkeypatch, arm, p
 # --------------------------------------------- pinned run-dir reads (DW-564)
 
 
-_JOURNAL_ROW = '{"ts": 1, "kind": "run-start"}\n'
-
-
 def _plant_run_files(run_dir, run_id="r1"):
     """A real `state.json` and `journal.jsonl` in `run_dir`, bytes the readers parse."""
     run_dir.mkdir(parents=True, exist_ok=True)

@@ -185,11 +185,6 @@ def _window_fake(monkeypatch, new_window_id: str = "@2\n", listed: str = "@1\n@2
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
 
 
-def test_new_window_returns_session_qualified_id(monkeypatch, tmp_path):
-    _window_fake(monkeypatch)
-    assert PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog") == "s:@2"
-
-
 def test_list_window_ids_returns_session_qualified_ids(monkeypatch):
     _window_fake(monkeypatch)
     assert PsmuxMultiplexer().list_window_ids("s") == ["s:@1", "s:@2"]
@@ -305,9 +300,12 @@ def test_new_window_falsy_id_passes_through_unqualified(monkeypatch, tmp_path):
 def test_window_alive_accepts_new_window_id(monkeypatch, tmp_path):
     # Symmetry is the whole contract: the id new_window mints must be found by
     # list_window_ids, or the engine's liveness probe declares an instant crash.
+    # The minted id is session-qualified (#254).
     _window_fake(monkeypatch)
     mux = PsmuxMultiplexer()
-    assert mux.window_alive("s", mux.new_window("s", "n", tmp_path, {}, "prog")) is True
+    window_id = mux.new_window("s", "n", tmp_path, {}, "prog")
+    assert window_id == "s:@2"
+    assert mux.window_alive("s", window_id) is True
 
 
 @pytest.mark.parametrize(
@@ -549,42 +547,39 @@ def _probe_fake(monkeypatch, answers: dict[str, tuple[int, str]]):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
 
 
-def test_return_target_session_qualified(monkeypatch):
-    _probe_fake(monkeypatch, {"#{pane_id}": (0, "%9\n"), "#{session_name}": (0, "main\n")})
-    assert PsmuxMultiplexer().current_return_target() == "=main:%9"
+@pytest.mark.parametrize(
+    ("pane", "session", "expected"),
+    [
+        ((0, "%9\n"), (0, "main\n"), "=main:%9"),
+        ((0, "\n"), (0, "main\n"), None),
+        # A resolvable own pane means we ARE inside the multiplexer; a failed
+        # session-name probe degrades to the bare pane id, never to None (which
+        # callers would record as "detach" and strand the client).
+        ((0, "%9\n"), (1, ""), "%9"),
+        # rc-0 empty stdout from the session probe must degrade the same way a
+        # failed probe does — a "=:%9" target would misparse at replay.
+        ((0, "%9\n"), (0, "\n"), "%9"),
+        # A session name the `=session:%N` grammar cannot carry (a `:` would split
+        # at the wrong colon on replay) degrades to the bare id too.
+        ((0, "%9\n"), (0, "a:b\n"), "%9"),
+    ],
+    ids=[
+        "session-qualified",
+        "none-on-empty-pane",
+        "bare-pane-when-session-probe-fails",
+        "bare-pane-on-empty-session-name",
+        "bare-pane-on-unqualifiable-session-name",
+    ],
+)
+def test_return_target_from_the_pane_and_session_probes(monkeypatch, pane, session, expected):
+    _probe_fake(monkeypatch, {"#{pane_id}": pane, "#{session_name}": session})
+    assert PsmuxMultiplexer().current_return_target() == expected
 
 
 def test_return_target_none_outside_mux(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.setattr(tmux_base.subprocess, "run", _RecordRun())
     assert PsmuxMultiplexer().current_return_target() is None
-
-
-def test_return_target_none_on_empty_pane(monkeypatch):
-    _probe_fake(monkeypatch, {"#{pane_id}": (0, "\n"), "#{session_name}": (0, "main\n")})
-    assert PsmuxMultiplexer().current_return_target() is None
-
-
-def test_return_target_bare_pane_when_session_probe_fails(monkeypatch):
-    # A resolvable own pane means we ARE inside the multiplexer; a failed
-    # session-name probe degrades to the bare pane id, never to None (which
-    # callers would record as "detach" and strand the client).
-    _probe_fake(monkeypatch, {"#{pane_id}": (0, "%9\n"), "#{session_name}": (1, "")})
-    assert PsmuxMultiplexer().current_return_target() == "%9"
-
-
-def test_return_target_bare_pane_on_empty_session_name(monkeypatch):
-    # rc-0 empty stdout from the session probe must degrade the same way a
-    # failed probe does — a "=:%9" target would misparse at replay.
-    _probe_fake(monkeypatch, {"#{pane_id}": (0, "%9\n"), "#{session_name}": (0, "\n")})
-    assert PsmuxMultiplexer().current_return_target() == "%9"
-
-
-def test_return_target_bare_pane_on_unqualifiable_session_name(monkeypatch):
-    # A session name the `=session:%N` grammar cannot carry (a `:` would split
-    # at the wrong colon on replay) degrades to the bare id too.
-    _probe_fake(monkeypatch, {"#{pane_id}": (0, "%9\n"), "#{session_name}": (0, "a:b\n")})
-    assert PsmuxMultiplexer().current_return_target() == "%9"
 
 
 # ------------------------------------------------------------- parked window
@@ -1048,18 +1043,20 @@ def _rows_fake(monkeypatch, rows: str, *, new_window_id: str = "@2\n"):
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
 
 
-def test_parked_window_returns_session_qualified_id(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("session", "expected"),
+    [
+        ("ctl", "ctl:@2"),
+        # Same #221 rule the engine-side mint follows: `a:b:@2` would split at the
+        # wrong colon, so the id stays bare rather than becoming a wrong target.
+        ("a:b", "@2"),
+    ],
+    ids=["session-qualified", "colon-session-bare"],
+)
+def test_parked_window_degrades_on_colon_session(monkeypatch, tmp_path, session, expected):
     _window_fake(monkeypatch)
-    win = PsmuxMultiplexer().new_parked_window("ctl", "run-x", tmp_path, ["prog"], "@ret")
-    assert win == "ctl:@2"
-
-
-def test_parked_window_degrades_on_colon_session(monkeypatch, tmp_path):
-    # Same #221 rule the engine-side mint follows: `a:b:@2` would split at the
-    # wrong colon, so the id stays bare rather than becoming a wrong target.
-    _window_fake(monkeypatch)
-    win = PsmuxMultiplexer().new_parked_window("a:b", "run-x", tmp_path, ["prog"], "@ret")
-    assert win == "@2"
+    win = PsmuxMultiplexer().new_parked_window(session, "run-x", tmp_path, ["prog"], "@ret")
+    assert win == expected
 
 
 def test_qualified_window_id_degrades_on_empty_session():
@@ -1086,11 +1083,6 @@ def test_list_windows_without_id_column_is_untouched(monkeypatch):
     # A names-only listing must pass through unrewritten.
     _rows_fake(monkeypatch, "shell\nrun-x\n")
     assert PsmuxMultiplexer().list_windows("ctl", ["window_name"]) == [("shell",), ("run-x",)]
-
-
-def test_list_windows_degrades_on_colon_session(monkeypatch):
-    _rows_fake(monkeypatch, "@1\tshell\n")
-    assert PsmuxMultiplexer().list_windows("a:b", ["window_id", "window_name"]) == [("@1", "shell")]
 
 
 _CURRENT_FMT = "#{session_name}:#{window_id}"
@@ -1759,6 +1751,18 @@ _DASH_SAFE_CONTROLS = ["-1=x", "--x=y", "-x=", "-a="]
         "",  # empty write is a silent server-side no-op; unset exists for this
         " C:\\p x",  # leading space survives the wire but this backend's reads strip
         "C:\\p x ",  # trailing space, same round-trip loss
+        # Edge whitespace of any kind is not a wire property: this backend's own
+        # reads `.strip()`/`.Trim()`, and both strip Unicode whitespace, so an edge
+        # NBSP or tab reads back short exactly as an edge ASCII space does.
+        # Interior whitespace is fine. An all-whitespace value is the degenerate
+        # case \u2014 it strips to "", i.e. the empty write the gate refuses outright.
+        "\u00a0lead",
+        "trail\u00a0",
+        "\tlead",
+        "trail\t",
+        " lead",
+        "trail ",
+        "   ",
         *_PSMUX_ARGV_SHAPES,
     ],
 )
@@ -1957,22 +1961,6 @@ def test_tmux_backend_forwards_option_columns_to_format(monkeypatch):
     rows = TmuxMultiplexer().list_windows("ctl", ["window_id", "window_name", "@bmad_project"])
     assert "#{@bmad_project}" in recorder.argv[-1]
     assert rows == [("@1", "shell", "proj")]
-
-
-@pytest.mark.parametrize(
-    "value",
-    ["\u00a0lead", "trail\u00a0", "\tlead", "trail\t", " lead", "trail ", "   "],
-)
-def test_set_window_option_refuses_edge_whitespace_of_any_kind(monkeypatch, capsys, value):
-    # Not a wire property: this backend's own reads `.strip()`/`.Trim()`, and
-    # both strip Unicode whitespace, so an edge NBSP or tab reads back short
-    # exactly as an edge ASCII space does. Interior whitespace is fine. An
-    # all-whitespace value is the degenerate case \u2014 it strips to "", i.e. the
-    # empty write the gate refuses outright.
-    rec_ = _option_fake(monkeypatch)
-    PsmuxMultiplexer().set_window_option("ctl:@3", "@bmad_project", value)
-    assert [c[0][1:4] for c in rec_.calls] == [["set-option", "-u", "-t"]]
-    assert "transport" in capsys.readouterr().err
 
 
 # `splitlines()` is the refusal, not a `\n` check: it also cuts on \v, \f, the

@@ -313,21 +313,17 @@ def test_exit_keyboard_interrupt_is_130(tmp_path, capsys, monkeypatch):
 
 def test_exit_code_enum_values():
     """``ExitCode`` names the released rc numbers — the values are the contract, so
-    pin them literally (a rename is fine; a renumber is a breaking change)."""
+    pin them literally (a rename is fine; a renumber is a breaking change). An
+    ``IntEnum`` member *is* its int, so ``main() -> int`` and ``sys.exit`` consume
+    the members transparently and the failure paths can return them as-is."""
     assert cli.ExitCode.OK == 0
     assert cli.ExitCode.FAILURE == 1
     assert cli.ExitCode.USAGE == 2
     assert cli.ExitCode.INTERRUPTED == 130
+    assert isinstance(cli.ExitCode.FAILURE, int)
 
 
 def test_exit_code_enum_has_only_contracted_codes():
     """OK/FAILURE/USAGE/INTERRUPTED are the whole contract — codes 3-129 and 131+ are
     deferred until a consumer needs them, so guard against one sneaking in early."""
     assert {c.value for c in cli.ExitCode} == {0, 1, 2, 130}
-
-
-def test_exit_code_enum_is_int_returnable():
-    """``main() -> int`` and ``sys.exit`` both consume the members transparently:
-    an ``IntEnum`` member *is* its int, so the failure paths can return it as-is."""
-    assert isinstance(cli.ExitCode.FAILURE, int)
-    assert cli.ExitCode.FAILURE == 1

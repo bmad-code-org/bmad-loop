@@ -6942,7 +6942,7 @@ async def test_paused_spec_undecodable_spec_does_not_crash_the_dashboard(project
     entire body with a failure sentence cost the reviewer the WHOLE spec at a gate whose
     only purpose is reading it. The failure body is now reserved for ABSENCE, which is
     the case the anchoring argument is actually about
-    (`test_paused_spec_missing_at_the_anchor_reads_as_not_found`).
+    (`test_unreadable_spec_refuses_the_destructive_actions`).
 
     Ablation: restore `path.read_text(encoding="utf-8")` and this reddens — the modal
     never opens, because the worker raised.
@@ -7004,8 +7004,13 @@ async def test_unreadable_spec_refuses_the_destructive_actions(project_tree, mon
     rather than left to fail downstream (replan was safe only by accident: the reset
     returns False and the "could not reset" branch declines).
 
+    An absent spec at the ANCHORED path is the signal that the anchoring failed, so it
+    must not render as `(empty spec)` — which is also what a spec that read fine and is
+    blank renders as.
+
     Ablation: drop `disabled=self._unreadable` from `SpecReviewModal.compose` and this
-    reddens on the button state.
+    reddens on the button state; return `path, ""` from `_paused_spec`'s degrade arm
+    and it reddens on the body.
     """
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
@@ -7016,6 +7021,7 @@ async def test_unreadable_spec_refuses_the_destructive_actions(project_tree, mon
     async with app.run_test() as pilot:
         await _open_review(app, pilot, SpecReviewModal)
         body = render(app.screen.query_one("#spec Static", Static).content)
+        assert "(empty spec)" not in body
         assert "could not be read" in body
         assert app.screen.query_one("#act-approve", Button).disabled
         assert app.screen.query_one("#act-replan", Button).disabled
@@ -7206,23 +7212,6 @@ def test_story_context_and_sentinel_follow_a_moved_project_to_the_tree_the_rearm
 
     assert app._story_context(state, "1") == ("Story 1", "does a thing")
     assert app._sentinel_kind(state, "1") == "unresolved"
-
-
-async def test_paused_spec_missing_at_the_anchor_reads_as_not_found(project_tree, monkeypatch):
-    """An absent spec at the ANCHORED path is the signal that the anchoring failed, so
-    it must not render as `SpecReviewModal`'s `(empty spec)` — which is also what a
-    spec that read fine and is blank renders as. Ablation: return `path, ""` from
-    `_paused_spec`'s degrade arm and this reddens on the `(empty spec)` assertion."""
-    monkeypatch.setattr(launch, "mux_available", lambda: True)
-    monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
-    _run_dir, spec = _stories_paused_run(project_tree.project, stage="plan-checkpoint")
-    spec.unlink()
-    app = BmadLoopApp(project_tree.project)
-    async with app.run_test() as pilot:
-        await _open_review(app, pilot, SpecReviewModal)
-        body = render(app.screen.query_one("#spec Static", Static).content)
-        assert "(empty spec)" not in body
-        assert "could not be read" in body
 
 
 async def test_plan_checkpoint_replan_refuses_a_control_alias_run_before_mutating(
@@ -10932,7 +10921,7 @@ async def test_spec_approval_unreadable_spec_still_uses_spec_viewer(project_tree
     viewer, which pins the branch as `spec_path is None` rather than `not spec_text`.
     The body is now the read failure rather than "" (an absent spec at the anchored
     path is the signal that anchoring failed, so it must not render as "(empty spec)"
-    — see `test_paused_spec_missing_at_the_anchor_reads_as_not_found`); this row
+    — see `test_unreadable_spec_refuses_the_destructive_actions`); this row
     grades only that the viewer, not the reason-only modal, is chosen."""
     monkeypatch.setattr(data, "liveness", lambda run_dir: "dead")
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEV_VERIFY)

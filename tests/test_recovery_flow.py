@@ -305,12 +305,6 @@ def test_owned_spec_restore_validates_missing_target_spelling_before_write(
     refuse_to_resolve(monkeypatch, spec, error=resolve_fault)
     monkeypatch.setattr(
         recovery_flow,
-        "atomic_write_bytes_confined",
-        lambda path, *_args, **_kwargs: writes.append(path),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        recovery_flow,
         "atomic_write_bytes_at",
         lambda _fd, path, *_args, **_kwargs: writes.append(Path(path)),
     )
@@ -4638,6 +4632,9 @@ def test_pause_stopped_wording_no_commits(project, tmp_path):
 
 
 def test_pause_committed_wording_names_at_risk_commits(project, tmp_path):
+    """Shape (c), committed work above the baseline, names the at-risk commits
+    and (DW-371) offers `resume --accept-baseline` for commits that are the
+    operator's own."""
     repo = project.project
     ws = Workspace.default(project)
     flow = _make_flow(workspace=ws, run_dir=tmp_path)
@@ -4652,6 +4649,7 @@ def test_pause_committed_wording_names_at_risk_commits(project, tmp_path):
     reason = excinfo.value.reason
     assert "committed work above its baseline" in reason
     assert "do NOT reset before checking" in reason
+    assert "bmad-loop resume run-1 --accept-baseline" in reason
 
 
 def test_pause_preserve_failed_wording(project, tmp_path):
@@ -4663,20 +4661,6 @@ def test_pause_preserve_failed_wording(project, tmp_path):
         flow.pause_for_manual_recovery(task, task.baseline_commit, preserve_failed=True)
 
     assert "could not be auto-preserved" in excinfo.value.reason
-
-
-def test_pause_committed_wording_offers_accept_baseline(project, tmp_path):
-    """DW-371: shape (c) names `resume --accept-baseline` for commits that are
-    the operator's own."""
-    repo = project.project
-    flow = _make_flow(workspace=Workspace.default(project), run_dir=tmp_path)
-    task = _task(repo)
-    _commit_something(repo)
-
-    with pytest.raises(_Pause) as excinfo:
-        flow.pause_for_manual_recovery(task, task.baseline_commit)
-
-    assert "bmad-loop resume run-1 --accept-baseline" in excinfo.value.reason
 
 
 @pytest.mark.parametrize("deferred", [True, False], ids=["deferred", "escalated"])

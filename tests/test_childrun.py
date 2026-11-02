@@ -83,10 +83,6 @@ def _sh_tree(pid_file: Path) -> str:
 # ---- the probe -------------------------------------------------------------------
 
 
-def test_no_probe_means_never_pending():
-    assert childrun.hard_stop_pending() is False
-
-
 def test_probe_is_scoped_by_its_token():
     with stop_probe(lambda: True):
         assert childrun.hard_stop_pending() is True

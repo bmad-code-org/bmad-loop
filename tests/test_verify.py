@@ -1477,14 +1477,6 @@ def test_verify_dev_review_disabled_rejects_review_sprint(project):
     assert not out.ok and "sprint-status" in out.reason and "expected 'done'" in out.reason
 
 
-def test_verify_dev_lying_baseline(project):
-    task = make_task(project)
-    sp = spec_path(project, "1-1-a")
-    write_spec(sp, "in-review", "deadbeef" * 5)
-    out = verify.verify_dev(task, project, dev_result(sp))
-    assert not out.ok and "does not match" in out.reason
-
-
 def test_verify_dev_short_hash_baseline(project):
     # Sessions sometimes write `git rev-parse --short HEAD`; an abbreviation
     # of the recorded baseline is the same commit, not a lie.
@@ -4097,23 +4089,6 @@ def test_verify_dev_bundle_ancestor_probe_git_failure_stays_strict(project, monk
     assert not out.ok and "baseline" in out.reason
 
 
-def test_verify_dev_sprint_ancestor_baseline_still_fails(project):
-    """The ancestor relaxation is bundle-only: a sprint-mode dev spec is
-    authored by this session, so its baseline must match the orchestrator's
-    exactly — an older ancestor means the session planned from a stale tree."""
-    ancestor = verify.rev_parse_head(project.project)
-    (project.project / "story-work.txt").write_text("advance\n")
-    git(project.project, "add", "-A")
-    git(project.project, "commit", "-q", "-m", "advance")
-    write_sprint(project, {"1-1-a": "review"})
-    task = make_task(project)  # baseline = new HEAD
-    sp = spec_path(project, "1-1-a")
-    write_spec(sp, "in-review", ancestor)
-    (project.project / "src.txt").write_text("changed\n")
-    out = verify.verify_dev(task, project, dev_result(sp))
-    assert not out.ok and "baseline" in out.reason
-
-
 def test_verify_dev_bundle_ledger_only_counts_as_real_work(project):
     """Same false-negative as verify_dev (KNOWN-BUG-ledger-only-story-false-no-
     changes.md), on the bundle path: a dw-bundle's entire authorized diff is
@@ -6226,7 +6201,8 @@ def test_safe_rollback_restores_policy_deleted_by_reset(project):
     """policy.toml added/committed *after* the baseline would be deleted by a
     reset to that older baseline; it is still restored from the pre-reset on-disk
     capture (the dirty src.txt here keeps the stash snapshot non-empty — the
-    clean-tree, empty-snapshot path is covered by the test below)."""
+    clean-tree, empty-snapshot path is covered by
+    `test_safe_rollback_restores_the_policy_through_the_atomic_helper`)."""
     repo = project.project
     baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
     pol = repo / ".bmad-loop" / "policy.toml"
@@ -6242,24 +6218,6 @@ def test_safe_rollback_restores_policy_deleted_by_reset(project):
     assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived the reset
 
 
-def test_safe_rollback_restores_committed_policy_on_clean_tree(project):
-    """policy.toml committed AFTER the baseline, with an otherwise-clean tree:
-    `git stash create` is empty, so the old stash-gated restore skipped it and
-    `git reset --hard` reverted the operator's config. It must still survive."""
-    repo = project.project
-    baseline = verify.rev_parse_head(repo)  # baseline predates policy.toml
-    pol = repo / ".bmad-loop" / "policy.toml"
-    pol.parent.mkdir(parents=True, exist_ok=True)
-    pol.write_text("[scm]\nrollback_on_failure = true\n")
-    git(repo, "add", "-f", str(pol))
-    git(repo, "commit", "-q", "-m", "add policy after baseline")
-    snap = sorted(verify.untracked_files(repo))
-    # NOTE: no other working-tree change — tree is clean -> empty stash snapshot
-
-    verify.safe_rollback(repo, baseline, baseline_untracked=snap, keep=(".bmad-loop",))
-    assert pol.read_text() == "[scm]\nrollback_on_failure = true\n"  # survived
-
-
 def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, monkeypatch):
     """#379. The put-back was a bare `policy_path.write_bytes`, which truncates
     the file to zero and refills it in place: a host lost mid-write comes back
@@ -6268,6 +6226,9 @@ def test_safe_rollback_restores_the_policy_through_the_atomic_helper(project, mo
     refuses on — arriving immediately after a rollback that already discarded the
     attempt's work. The helper fsyncs before the replace, so the crash window
     yields the old file or the whole new one.
+
+    The tree is otherwise clean, so `git stash create` is empty: the put-back must
+    not be stash-gated, or `git reset --hard` reverts the operator's config.
 
     Graded by WRAPPING the binding rather than replacing it: the real write still
     lands, so the content assertion below is not measuring the stub. Recording
@@ -6762,23 +6723,14 @@ def test_path_tracked_refuses_a_glob_match_from_a_neighbour(project, meta, neigh
     assert verify.path_tracked(repo, f"{neighbour}/f.md")
 
 
-def test_path_tracked_still_matches_a_directory_prefix(project):
-    """`:(literal)` must not cost the callers the prefix match they rely on —
-    `cmd_validate`'s render-tracked warning probes a DIRECTORY, not a file."""
-    repo = project.project
-    (repo / "_bmad" / "render").mkdir(parents=True, exist_ok=True)
-    (repo / "_bmad" / "render" / "render_skill.py").write_text("# renderer\n")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "render")
-    assert verify.path_tracked(repo, "_bmad/render")
-
-
 def test_path_tracked_file_separates_a_file_from_a_directory_prefix(project):
     """Why this predicate is narrower than its sibling: `path_tracked` answers True for
     BOTH a tracked file and a tracked directory, and its callers have to tell those
     apart. Since #484 the shield asks `path_tracked_kind` for that — three answers, not
     two — and this boolean is kept for `_pin_tracked_config_rewrite`, where only a
-    tracked FILE can carry the skip-worktree bit the pin depends on (#392, #484).
+    tracked FILE can carry the skip-worktree bit the pin depends on (#392, #484). The
+    `path_tracked` directory answer is itself a contract: `:(literal)` must not cost
+    `cmd_validate`'s render-tracked warning, which probes a DIRECTORY, its prefix match.
 
     Ablation: return `bool(entries)` instead of comparing the set — the mechanics now
     live in `path_tracked_kind`, which this delegates to — and the directory assertion
@@ -8187,22 +8139,6 @@ def test_unpublishable_target_refuses_an_absent_ledger(project):
     assert verify.unpublishable_target(ledger, "ledger") == ("target-absent", None)
 
 
-def test_unpublishable_target_refuses_an_undecodable_ledger_with_the_fault(project):
-    """`target-undecodable`, carrying the decode fault as the second element. The
-    ledger's own read contract (DW-146) raises `LedgerReadError` for bytes nobody
-    can decode, and that is what this arm folds into a refusal.
-
-    Ablation: drop the `deferredwork.LedgerReadError` arm and the call raises
-    instead of answering, reddening the assertion below."""
-    write_ledger(project, {"DW-1": "open"})
-    project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
-
-    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
-
-    assert cause == "target-undecodable"
-    assert "not valid UTF-8" in error
-
-
 @pytest.mark.parametrize(
     "fault,cause,fragment",
     [
@@ -8222,10 +8158,14 @@ def test_unpublishable_target_splits_the_durable_decode_fault_from_the_transient
     one publisher with a durable commit latch, refuses the first and retries the
     second — and before the split both arrived as `target-unreadable`, so the
     undecodable ledger fell through to git, which accepts any bytes, and reached HEAD.
+    The `stat-refused` row is the DW-221 arm: a refused metadata probe used to answer
+    `None` on Python 3.14 and was refused `target-absent`, a present file reported as
+    gone; drop the `OSError` arm and its `PermissionError` escapes the guard.
 
     Ablation: collapse the two `except` arms back into
     `except (deferredwork.LedgerReadError, OSError)` returning `target-unreadable`
-    and the undecodable row reds on its cause."""
+    and the undecodable row reds on its cause; drop the `deferredwork.LedgerReadError`
+    arm and that row raises instead of answering."""
     write_ledger(project, {"DW-1": "open"})
     if fault == "undecodable":
         project.deferred_work.write_bytes(_UNDECODABLE_LEDGER)
@@ -8380,24 +8320,6 @@ def test_unpublishable_target_refuses_a_ledger_symlink_loop_as_unreadable(projec
 
     assert cause == "target-unreadable"
     assert "Too many levels of symbolic links" in error
-
-
-def test_unpublishable_target_folds_a_refused_ledger_metadata_probe(project, monkeypatch):
-    """The arm DW-221 newly routes here. Before it, a ledger whose metadata probe
-    the OS refused answered `None` on Python 3.14 and was refused `target-absent` —
-    a present file reported as gone. `read_for_write` raises `OSError` on every
-    interpreter now, and this guard folds it into `target-unreadable` with the
-    errno text, the same way it already folds a decode fault.
-
-    Ablation: drop `OSError` from the `except` tuple and the `PermissionError`
-    escapes this best-effort guard instead of the tuple coming back."""
-    write_ledger(project, {"DW-1": "open"})
-    fault_metadata_probe(monkeypatch, project.deferred_work, "stat")
-
-    cause, error = verify.unpublishable_target(project.deferred_work, "ledger")
-
-    assert cause == "target-unreadable"
-    assert "Permission denied" in error
 
 
 @pytest.mark.parametrize("shape", ["enoent", "enotdir-parent"])

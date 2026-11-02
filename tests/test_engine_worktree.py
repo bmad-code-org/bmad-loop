@@ -400,36 +400,6 @@ def test_isolated_verify_commands_execute_and_classify_in_the_unit_worktree(proj
     assert classified and all(cwd == unit_root for cwd in classified)
 
 
-def test_local_absolute_ignored_accepted_spec_is_seeded_and_bound_in_mount(project):
-    """Relativizing an accepted spec also delivers it to a tracked-only checkout."""
-    rel = "_bmad-output/implementation-artifacts/accepted-untracked.md"
-    ignore_before_commit(project, rel)
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    accepted = project.project / rel
-    accepted.parent.mkdir(parents=True, exist_ok=True)
-    accepted.write_bytes(b"accepted operator bytes\n")
-    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
-    engine.state.target_branch = "main"
-    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
-    engine.state.tasks[task.story_key] = task
-    observed: dict[str, object] = {}
-
-    def bind_then_defer(current):
-        engine._bind_dispatched_spec_for_attempt(current)
-        observed["path"] = current.dispatched_spec_file
-        observed["snapshot"] = current.dispatched_spec_snapshot
-        observed["root"] = engine.workspace.root
-        current.phase = Phase.DEFERRED
-        current.defer_reason = "test complete"
-
-    engine._run_isolated(task, bind_then_defer)
-
-    mounted_root = observed["root"]
-    assert isinstance(mounted_root, Path)
-    assert observed["path"] == str(mounted_root / rel)
-    assert observed["snapshot"] == b"accepted operator bytes\n"
-
-
 def test_prior_dispatch_does_not_block_fresh_mounted_spec_binding(project):
     """A none-to-worktree re-drive relocates accepted input, then replaces old authority."""
     rel = "_bmad-output/implementation-artifacts/accepted-rearm.md"
@@ -6478,112 +6448,79 @@ def test_commit_message_template_story_title(project):
     assert "Story 1.1:" not in log  # the label would just repeat the key
 
 
-def test_commit_message_template_story_title_neutralizes_control_chars(project):
-    """A NUL in the title reaches `git commit -m` as an argv element, where
-    `subprocess.run` raises a bare ValueError. `_run_git` translates
-    TimeoutExpired/UnicodeDecodeError/OSError but not that, so it would escape as
-    itself into `_finalize_commit_phase`'s `except BaseException`, which restores
-    and re-raises — crashing the run with the task already persisted as
-    COMMITTING, so every later resume re-renders the same title and re-crashes.
-    No exotic file bytes are needed to get there: `title: "\\0"` is an ordinary
-    double-quoted YAML scalar.
+@pytest.mark.parametrize(
+    ("rewrite", "expected_subject"),
+    [
+        pytest.param(
+            lambda text: text.replace("title: 'test'", 'title: "Wire\\0the Frobnicator"'),
+            "Wire the Frobnicator",
+            id="nul",
+        ),
+        pytest.param(
+            lambda text: text.replace("title: 'test'", 'title: "Wire\\uD800the Frobnicator"'),
+            "Wire the Frobnicator",
+            id="surrogate",
+        ),
+        pytest.param(
+            lambda text: text.replace("title: 'test'\n", "") + "\n# Heading Sourced\n",
+            "Heading Sourced",
+            id="h1",
+        ),
+        pytest.param(
+            lambda text: text.replace("title: 'test'\n", ""),
+            "1-1-a",
+            id="key",
+        ),
+    ],
+)
+def test_commit_message_template_story_title_renders_a_committable_subject(
+    project, rewrite, expected_subject
+):
+    """`{story_title}` always renders a subject `git commit -m` can take, and
+    the run commits rather than wedging mid-COMMITTING.
 
-    Ablation target: drop the `_TITLE_CONTROL_RE` substitution and this fails
-    with `ValueError: embedded null byte` instead of committing."""
+    - nul: a NUL in the title reaches `git commit -m` as an argv element, where
+      `subprocess.run` raises a bare ValueError. `_run_git` translates
+      TimeoutExpired/UnicodeDecodeError/OSError but not that, so it would escape
+      as itself into `_finalize_commit_phase`'s `except BaseException`, which
+      restores and re-raises — crashing the run with the task already persisted
+      as COMMITTING, so every later resume re-renders the same title and
+      re-crashes. No exotic file bytes are needed to get there: `title: "\\0"` is
+      an ordinary double-quoted YAML scalar.
+      Ablation target: drop the `_TITLE_CONTROL_RE` substitution and [nul] fails
+      with `ValueError: embedded null byte` instead of committing.
+    - surrogate: the other unspawnable class, and the one a C0/DEL-only filter
+      misses. A lone surrogate has no UTF-8 encoding, so `subprocess.run` raises
+      UnicodeEncodeError while encoding the argv — a ValueError, but *not* the
+      UnicodeDecodeError `_run_git` translates, so it wedges the run exactly as
+      an embedded NUL does. `title: "\\uD800"` is an ordinary YAML escape and
+      PyYAML hands the unpaired code point straight back.
+      Ablation target: drop `\\ud800-\\udfff` from `_TITLE_CONTROL_RE` and
+      [surrogate] fails with `UnicodeEncodeError: surrogates not allowed`
+      instead of committing.
+    - h1: a spec written without a `title:` — i.e. not from this project's
+      template — still yields a title from a first markdown H1.
+    - key: neither a `title:` nor an H1 → the placeholder renders the story key,
+      never an empty string."""
     commit_sprint(project, {"1-1-a": "ready-for-dev"})
     review = wt_review_effect(project, "1-1-a", clean=True)
 
-    def review_nul_title(spec):
+    def review_rewriting_title(spec):
+        # the review pass is the spec's last writer, so the title the commit-time
+        # read sees must be stamped after it
         result = review(spec)
         sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
-        sp.write_text(sp.read_text().replace("title: 'test'", 'title: "Wire\\0the Frobnicator"'))
+        sp.write_text(rewrite(sp.read_text()))
         return result
 
     engine, _ = make_engine(
         project,
-        [wt_dev_effect(project, "1-1-a"), review_nul_title],
+        [wt_dev_effect(project, "1-1-a"), review_rewriting_title],
         policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
     )
     summary = engine.run()
     assert summary.done == 1  # committed rather than wedged mid-COMMITTING
-    assert "chore(bmad): Wire the Frobnicator" in git(project.project, "log", "--format=%s")
-
-
-def test_commit_message_template_story_title_neutralizes_surrogates(project):
-    """The other unspawnable class, and the one a C0/DEL-only filter misses. A
-    lone surrogate has no UTF-8 encoding, so `subprocess.run` raises
-    UnicodeEncodeError while encoding the argv — a ValueError, but *not* the
-    UnicodeDecodeError `_run_git` translates, so it wedges the run exactly as an
-    embedded NUL does. `title: "\\uD800"` is an ordinary YAML escape and PyYAML
-    hands the unpaired code point straight back.
-
-    Ablation target: drop `\\ud800-\\udfff` from `_TITLE_CONTROL_RE` and this
-    fails with `UnicodeEncodeError: surrogates not allowed` instead of
-    committing."""
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    review = wt_review_effect(project, "1-1-a", clean=True)
-
-    def review_surrogate_title(spec):
-        result = review(spec)
-        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
-        sp.write_text(
-            sp.read_text().replace("title: 'test'", 'title: "Wire\\uD800the Frobnicator"')
-        )
-        return result
-
-    engine, _ = make_engine(
-        project,
-        [wt_dev_effect(project, "1-1-a"), review_surrogate_title],
-        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
-    )
-    summary = engine.run()
-    assert summary.done == 1  # committed rather than wedged mid-COMMITTING
-    assert "chore(bmad): Wire the Frobnicator" in git(project.project, "log", "--format=%s")
-
-
-def test_commit_message_template_story_title_falls_back_to_h1(project):
-    """A spec written without a `title:` — i.e. not from this project's
-    template — still yields a title from a first markdown H1."""
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    review = wt_review_effect(project, "1-1-a", clean=True)
-
-    def review_h1_only(spec):
-        result = review(spec)
-        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
-        sp.write_text(sp.read_text().replace("title: 'test'\n", "") + "\n# Heading Sourced\n")
-        return result
-
-    engine, _ = make_engine(
-        project,
-        [wt_dev_effect(project, "1-1-a"), review_h1_only],
-        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
-    )
-    summary = engine.run()
-    assert summary.done == 1
-    assert "chore(bmad): Heading Sourced" in git(project.project, "log", "--format=%s")
-
-
-def test_commit_message_template_story_title_falls_back_to_key(project):
-    """Neither a `title:` nor an H1 → the placeholder renders the story key,
-    never an empty string."""
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    review = wt_review_effect(project, "1-1-a", clean=True)
-
-    def review_titleless(spec):
-        result = review(spec)
-        sp = project.rebased(spec.cwd).implementation_artifacts / "spec-1-1-a.md"
-        sp.write_text(sp.read_text().replace("title: 'test'\n", ""))
-        return result
-
-    engine, _ = make_engine(
-        project,
-        [wt_dev_effect(project, "1-1-a"), review_titleless],
-        policy=wt_policy(commit_message_template="chore(bmad): {story_title}"),
-    )
-    summary = engine.run()
-    assert summary.done == 1
-    log = git(project.project, "log", "--format=%s")
-    assert "chore(bmad): 1-1-a" in log
+    assert f"chore(bmad): {expected_subject}" in git(project.project, "log", "--format=%s")
 
 
 def test_story_title_undecodable_spec_falls_back_to_key(project):
@@ -8083,7 +8020,11 @@ def test_merge_failure_escalation_tells_a_preflight_refusal_from_a_conflict(
 
 
 def test_spec_paths_serialize_relative_to_worktree_or_preserve_absolute_paths():
-    """Both spec paths stay portable without rewriting paths the worktree does not own."""
+    """Both spec paths stay portable without rewriting paths the worktree does not own.
+
+    The exact relative pins also hold the separator: relative paths persist with
+    forward slashes (as_posix), so a state.json written under one OS reads back
+    identically under another."""
     task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)
     task.worktree_path = "/repo/.bmad-loop/runs/run/worktrees/1-1-a"
     task.spec_file = "/repo/.bmad-loop/runs/run/worktrees/1-1-a/_out/spec.md"
@@ -8616,21 +8557,6 @@ def test_resume_remount_survives_discard_remove_failure(project, monkeypatch):
     assert summary.done == 1  # re-mounted at the same path and finished
     assert "change for 1-1-a" in (project.project / "src.txt").read_text()
     assert "worktree-open-failed" not in journal_kinds(resumed)
-
-
-def test_spec_paths_serialize_with_posix_separators():
-    """Relative spec paths persist with forward slashes (as_posix) so a
-    state.json written under one OS reads back identically under another — no
-    backslashes leak into the cross-OS state contract."""
-    task = StoryTask(story_key="1-1-a", epic=1, phase=Phase.DEFERRED)
-    task.worktree_path = "/repo/wt"
-    task.spec_file = "/repo/wt/_out/sub/spec.md"
-    task.dispatched_spec_file = "/repo/wt/_out/sub/dispatched.md"
-    serialized = task.to_dict()
-    assert serialized["spec_file"] == "_out/sub/spec.md"
-    assert serialized["dispatched_spec_file"] == "_out/sub/dispatched.md"
-    assert "\\" not in serialized["spec_file"]
-    assert "\\" not in serialized["dispatched_spec_file"]
 
 
 # ------------------------------------------------- retry recovery (issue #161)

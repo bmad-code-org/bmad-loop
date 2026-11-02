@@ -3311,20 +3311,16 @@ def test_run_captured_streams_keeps_stderr_off_stdout(monkeypatch):
     )
 
 
-def test_run_captured_real_subprocess():
-    """End-to-end: the module really is invocable as `python -m bmad_loop.cli`."""
-    rc, out = launch.run_captured(["--version"])
-    assert rc == 0
-    assert "bmad-loop" in out
-
-
 def test_run_captured_streams_real_subprocess():
-    """The separated form against the real CLI: a `--json` document parses off
-    stdout alone, with stderr empty (the machine.py purity contract)."""
+    """End-to-end: the module really is invocable as `python -m bmad_loop.cli`. The
+    separated form against the real CLI: a `--json` document parses off stdout
+    alone, with stderr empty (the machine.py purity contract)."""
     rc, out, err = launch.run_captured_streams(["--version"])
     assert rc == 0
     assert "bmad-loop" in out
     assert err == ""
+    # with stderr empty, the merging wrapper hands stdout back unchanged
+    assert launch.run_captured(["--version"]) == (rc, out)
 
 
 # ------------------------------------------- stale state-root warning (#731)

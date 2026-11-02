@@ -4957,60 +4957,20 @@ def test_review_leg_reclose_pauses_when_the_ledger_turns_undecodable_under_the_l
         assert saved.bundle_closes_intended == ["DW-1", "DW-2"]
 
 
-def test_generic_bundle_reconcile_closes_ledger_on_stale_frontmatter(project):
-    """Regression for the DW-159/160/162 false-defer: the bundle session finalized
-    in prose (## Auto Run Result: Status done) but left the bundle spec frontmatter
-    at the template default `draft`. The orchestrator reconciles the frontmatter
-    before accepted bookkeeping, so the bundle CLOSES — its dw ids are marked done and
-    not stranded in failed_ids — instead of falsely deferring completed work."""
-    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
-    plan = triage_result(
-        ["DW-1", "DW-2"],
-        bundles=[{"name": "fix-things", "dw_ids": ["DW-1", "DW-2"], "intent": "fix both"}],
-    )
-    pol = Policy(
-        gates=GatesPolicy(mode="none"),
-        notify=QUIET,
-        review=ReviewPolicy(enabled=False),
-        dev=DevPolicy(skill="bmad-dev-auto"),
-        scm=ScmPolicy(rollback_on_failure=True),
-    )
-    engine, _ = make_sweep(
-        project,
-        [
-            triage_effect(plan),
-            # the skill leaves frontmatter at draft but writes prose Status: done
-            bundle_dev_effect(
-                project,
-                "fix-things",
-                ["DW-1", "DW-2"],
-                mark_ledger=False,
-                final_status="draft",
-                prose_status="done",
-            ),
-        ],
-        policy=pol,
-    )
-    summary = engine.run()
+@pytest.mark.parametrize("final_status", ["draft", "in-review"], ids=["draft", "in-review"])
+def test_generic_bundle_reconcile_closes_ledger_on_stale_frontmatter(project, final_status):
+    """The bundle session finalized in prose (## Auto Run Result: Status done) but
+    left the bundle spec frontmatter at a non-terminal status. The orchestrator
+    reconciles the frontmatter before accepted bookkeeping, so the bundle CLOSES —
+    its dw ids are marked done and not stranded in failed_ids — instead of falsely
+    deferring completed work.
 
-    assert not summary.paused
-    assert engine.state.tasks["dw-fix-things"].phase == Phase.DONE
-    entries = ledger_entries(project)
-    assert entries["DW-1"].status.startswith("done")
-    assert entries["DW-2"].status.startswith("done")
-    recon = [e for e in engine.journal.entries() if e["kind"] == "spec-status-reconciled"]
-    assert len(recon) == 1
-    assert recon[0]["frm"] == "draft" and recon[0]["to"] == "done"
-    assert "sweep-bundle-closed" in {e["kind"] for e in engine.journal.entries()}
-
-
-def test_generic_bundle_reconcile_closes_ledger_on_in_review_frontmatter(project):
-    """The Lights-Out DW-153 symptom on the bundle path: the session finalized in
-    prose (## Auto Run Result: Status done) but left the bundle spec frontmatter at
+    [draft]: regression for the DW-159/160/162 false-defer, frontmatter left at the
+    template default `draft`.
+    [in-review]: the Lights-Out DW-153 symptom on the bundle path, frontmatter left at
     the transient `in-review` marker. in-review is never a deliberate terminal on
-    the generic path (the legacy review-handoff fork is retired), so the
-    orchestrator reconciles it to done before accepted bookkeeping — the bundle CLOSES
-    instead of false-deferring + rolling back into an endless re-sweep loop."""
+    the generic path (the legacy review-handoff fork is retired), so it reconciles to
+    done instead of false-deferring + rolling back into an endless re-sweep loop."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
     plan = triage_result(
         ["DW-1", "DW-2"],
@@ -5027,14 +4987,13 @@ def test_generic_bundle_reconcile_closes_ledger_on_in_review_frontmatter(project
         project,
         [
             triage_effect(plan),
-            # the skill leaves frontmatter at the transient in-review marker but
-            # writes prose Status: done
+            # the skill leaves frontmatter at final_status but writes prose Status: done
             bundle_dev_effect(
                 project,
                 "fix-things",
                 ["DW-1", "DW-2"],
                 mark_ledger=False,
-                final_status="in-review",
+                final_status=final_status,
                 prose_status="done",
             ),
         ],
@@ -5049,7 +5008,7 @@ def test_generic_bundle_reconcile_closes_ledger_on_in_review_frontmatter(project
     assert entries["DW-2"].status.startswith("done")
     recon = [e for e in engine.journal.entries() if e["kind"] == "spec-status-reconciled"]
     assert len(recon) == 1
-    assert recon[0]["frm"] == "in-review" and recon[0]["to"] == "done"
+    assert recon[0]["frm"] == final_status and recon[0]["to"] == "done"
     assert "sweep-bundle-closed" in {e["kind"] for e in engine.journal.entries()}
 
 
@@ -15883,8 +15842,8 @@ def test_a_ledger_commit_in_a_non_git_project_keeps_the_write_and_journals(proje
     The git arm does NOT arm the run's doubt (DW-260), and the two trailing
     assertions pin that: git declining to publish a file it could reach says
     nothing about whether the ledger reads, so `sweep_ledger_in_doubt` stays False
-    in memory and on disk — where the RESOLVE arm beside it arms (see the two
-    degrade rows under DW-192/195). Ablation: add
+    in memory and on disk — where the RESOLVE arm beside it arms (see the
+    resolve degrade row under DW-192/195/275). Ablation: add
     `if family == "ledger": self._record_ledger_doubt()` to the git arm too and
     both trailing assertions red. Executed."""
     write_ledger(project, {"DW-1": "open", "DW-2": "open"})
@@ -16103,7 +16062,7 @@ def _resolve_degrade_target(project, family: Literal["ledger", "store"]) -> tupl
     raises before anything probes the file's existence, and its own validator never
     runs, because the resolve fails first. It is kept only for symmetry with the
     ledger family, which is a real file too. Nothing about its bytes is graded: see
-    the contract note in either degrade row."""
+    the contract note in the resolve degrade row."""
     if family == "ledger":
         return project.deferred_work, "deferred-work.md"
     from bmad_loop import decisions as decisions_store
@@ -16114,31 +16073,69 @@ def _resolve_degrade_target(project, family: Literal["ledger", "store"]) -> tupl
     return store, "decisions.json"
 
 
+# The resolve `except (OSError, RuntimeError, ValueError)` tuple, one CLASS per row:
+# `None` is `refuse_to_resolve`'s default WinError-64 `OSError`, `_SYMLINK_LOOP` is
+# built per row (its text names the published path), the rest are ValueErrors.
+_SYMLINK_LOOP = object()
+_RESOLVE_DEGRADE_FAULTS = [
+    pytest.param(None, id="oserror-default"),
+    pytest.param(_SYMLINK_LOOP, id="runtime-symlink-loop"),
+    *NUL_PATH_RESOLVE_FAULTS,
+]
+
+
 @pytest.mark.parametrize("family", ["ledger", "store"])
-def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, monkeypatch, family):
+@pytest.mark.parametrize("fault", _RESOLVE_DEGRADE_FAULTS)
+def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(
+    project, monkeypatch, fault, family
+):
     """DW-192's OTHER degrade arm: the one where `path.resolve()` raises, not git.
 
-    `_commit_ledger` catches `OSError`/`RuntimeError` off the resolve — a broken
-    link chain, a permission-denied component, a symlink loop — and the row it then
-    writes names the LEXICAL parent, because `root` never advanced past its
-    pre-`try` binding. `file` is bound in the same place for the same reason, so
-    the one identifying field a scrubbed dump keeps is present on this arm too and
-    not only on the git-fault arm the row above grades. Without it this arm names
-    nothing at all: `repo`, `message` and `error` are every one of them in
+    `_commit_ledger` catches `OSError`/`RuntimeError`/`ValueError` off the resolve —
+    a broken link chain, a permission-denied component, a symlink loop, an embedded
+    NUL — and the row it then writes names the LEXICAL parent, because `root` never
+    advanced past its pre-`try` binding. `file` is bound in the same place for the
+    same reason, so the one identifying field a scrubbed dump keeps is present on this
+    arm too and not only on the git-fault arm the row above grades. Without it this
+    arm names nothing at all: `repo`, `message` and `error` are every one of them in
     `diagnostics._JOURNAL_DROP_FIELDS`.
 
-    This row grades the `OSError` CLASS of that tuple; the sibling row below grades
-    `RuntimeError`, which the two classes must be driven separately to cover (see
-    that row's docstring). The fault comes from the shared `refuse_to_resolve` seam
-    (DW-195) rather than a local `Path.resolve` stub: a private stub beside a
-    conftest helper that does the same job is the hand-rolled duplicate these
-    conversions exist to remove, and the seam is scoped to the named path exactly
-    as the stub was.
+    Each CLASS of that tuple is its own `fault` row (DW-195, DW-275). A per-CLASS
+    ablation is the only honest one for a multi-class handler: deleting the tuple
+    passes while an untested class hides behind a tested one. Measured on Python
+    3.13.15 before the `RuntimeError` row existed, `uv run pytest -q
+    tests/test_sweep.py` with `OSError` alone dropped reported `1 failed, 526 passed`,
+    and with `RuntimeError` alone dropped reported `527 passed` — fully green.
+    `RuntimeError` was the ungraded half, because its only driver,
+    `test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved_path`,
+    reaches this handler through a real symlink loop behind
+    `if sys.version_info < (3, 13)`: `Path.resolve()` stopped raising `RuntimeError` on
+    a non-strict loop in 3.13, so that coverage is absent on the 3.13 and 3.14 CI legs
+    (`.github/workflows/ci.yml`) and on any modern dev host.
+
+    Every fault comes from the shared `refuse_to_resolve` seam rather than a local
+    `Path.resolve` stub: a private stub beside a conftest helper that does the same job
+    is the hand-rolled duplicate these conversions exist to remove, and the seam is
+    scoped to the named path exactly as the stub was. The rows: [oserror-default] is
+    the seam's default WinError 64; [runtime-symlink-loop] carries CPython's own
+    wording, pre-3.13 `pathlib`'s `RuntimeError("Symlink loop from %r" % e.filename)`,
+    so the injected fault is a faithful stand-in for the real one, and a symlink loop
+    remains the real-world fault it stands for; [nul] and [lone-surrogate] are the
+    `ValueError` class — `Path.resolve()` raises `ValueError` for an embedded NUL and
+    `UnicodeEncodeError` (a `ValueError` subclass) for a lone surrogate outside the
+    `surrogateescape` range on CPython 3.11-3.14 POSIX, and the two-class tuple that
+    stood here let both escape a method whose docstring calls it strictly best
+    effort. Both come from `NUL_PATH_RESOLVE_FAULTS` for the reason the constant
+    states — `ntpath.realpath` tolerates a NUL, so a real NUL path is not a
+    cross-platform driver here — and the injected `nul` fault carries CPython's 3.12+
+    wording (3.11 says `embedded null byte`) so the stand-in is faithful.
 
     The remaining claims below are HANDLER properties rather than class ones — HEAD
-    unmoved, `message`, and the sibling arms staying empty — so both class rows assert
-    the identical set. Splitting them would let a regression that commits, or moves
-    HEAD, on the `OSError` leg specifically land green.
+    unmoved, `message`, and the sibling arms staying empty — so every class row
+    asserts the identical set. Splitting them would let a regression that commits, or
+    moves HEAD, on one class specifically land green. The refusal and clean arms sit
+    immediately after this `except` in `sweep.py`, so their absence is what separates
+    "the resolve degraded" from "the target was refused before git ever ran".
 
     Contract note, not an assertion (DW-242): the published file's bytes are NOT
     compared before and after. `_commit_ledger` never writes the target's bytes on
@@ -16158,9 +16155,10 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     resolve is the run's evidence that `_write_intent`'s `read_for_write` will meet
     the same component, so the ledger leg arms `sweep_ledger_in_doubt` in memory and
     on disk, and the store leg arms nothing — a store path says nothing about the
-    ledger. The parametrization therefore grades a real discriminant, not just a
-    shape. Both grading rows previously passed `family="ledger"` only, so on
-    Python 3.13+ no row drove a store path into this arm at all. Below 3.13 one does:
+    ledger. The arm reads `family` AFTER the row, so a class that escaped the tuple
+    would skip the arm along with the row. The parametrization therefore grades a
+    real discriminant, not just a shape. On Python 3.13+ no other row drives a store
+    path into this arm at all. Below 3.13 one does:
     `test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved_path`
     reaches it with `family="store"` through a REAL symlink loop. The two are not
     duplicates — that row owns the version split as the publisher sees it, this one is
@@ -16179,8 +16177,13 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
         a `NameError` escaping a method the docstring calls strictly best effort —
         which makes the BINDING POSITION, not merely the field, the graded thing;
       * delete `OSError` ALONE from the RESOLVE arm's `except (OSError, RuntimeError,
-        ValueError)` tuple in `_commit_ledger` and this reds with the refusal escaping
-        `_commit_ledger` on BOTH legs;
+        ValueError)` tuple in `_commit_ledger` and only the [oserror-default] rows
+        red, with the refusal escaping `_commit_ledger` on BOTH legs;
+      * delete `RuntimeError` ALONE from that tuple and only the
+        [runtime-symlink-loop] rows red, with the `RuntimeError` escaping, on both
+        legs;
+      * delete `ValueError` ALONE from that tuple and only the [nul] and
+        [lone-surrogate] rows red, all four legs, with the injected fault escaping;
       * hardcode `file="deferred-work.md"` in the unavailable journal row and only
         the STORE legs fail, on the expected `decisions.json` filename. The row
         need not branch on `family` for a ledger-specific regression to be detectable;
@@ -16198,7 +16201,14 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     published, tail = _resolve_degrade_target(project, family)
     head = git(project.project, "rev-parse", "HEAD")
     # scoped to the published file: everything else in the frame still resolves
-    refuse_to_resolve(monkeypatch, published)
+    if fault is None:
+        refuse_to_resolve(monkeypatch, published)
+        expected_error = UNRESOLVABLE
+    else:
+        if fault is _SYMLINK_LOOP:
+            fault = RuntimeError(f"Symlink loop from {str(published)!r}")
+        refuse_to_resolve(monkeypatch, published, error=fault)
+        expected_error = str(fault)
 
     outcome = engine._commit_ledger(
         "chore(sweep): unresolvable", path=published, family=family
@@ -16210,163 +16220,13 @@ def test_the_degrade_row_names_the_file_when_the_resolve_itself_fails(project, m
     assert failed["file"] == tail  # bound before the try, so still here
     # the LEXICAL parent: the resolve that would have replaced it is what failed
     assert failed["repo"] == str(published.parent)
-    assert UNRESOLVABLE in failed["error"]
+    assert expected_error in failed["error"]
     assert git(project.project, "rev-parse", "HEAD") == head  # nothing was committed
     assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
     assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
     assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
     # DW-260: the ledger leg arms the run's doubt — in memory, and on disk through
     # `_record_ledger_doubt`'s `_save()` — and the store leg arms nothing
-    assert engine._ledger_unfit_to_publish() is (family == "ledger")
-    assert load_state(engine.run_dir).sweep_ledger_in_doubt is (family == "ledger")
-
-
-@pytest.mark.parametrize("family", ["ledger", "store"])
-def test_the_degrade_row_survives_a_runtime_error_from_the_resolve(project, monkeypatch, family):
-    """The `RuntimeError` CLASS of the same `except` tuple, driven on its own (DW-195).
-
-    A per-CLASS ablation is the only honest one for a multi-class handler: deleting the
-    pair passes while an untested class hides behind a tested one. Measured on Python
-    3.13.15 at the baseline commit, before this row existed, `uv run pytest -q
-    tests/test_sweep.py` with `OSError` alone dropped reported `1 failed, 526 passed`,
-    and with `RuntimeError` alone dropped reported `527 passed` — fully green.
-    `RuntimeError` was the ungraded half.
-
-    It was ungraded because its only driver,
-    `test_a_dangling_store_link_is_an_absence_because_the_probes_see_the_resolved_path`,
-    reaches this handler through a real symlink loop behind
-    `if sys.version_info < (3, 13)`: `Path.resolve()` stopped raising `RuntimeError` on
-    a non-strict loop in 3.13, so that coverage is absent on the 3.13 and 3.14 CI legs
-    (`.github/workflows/ci.yml`) and on any modern dev host. Injecting the class through
-    `refuse_to_resolve` makes it version-independent, and a symlink loop remains the
-    real-world fault it stands for.
-
-    Beyond the class, two claims the pre-existing `OSError` row did not originally
-    make: HEAD is unmoved, and `sweep-ledger-commit`, `sweep-ledger-commit-refused` and
-    `sweep-ledger-commit-clean` are ALL empty. The refusal and clean arms sit
-    immediately after this `except` in `sweep.py`, so their absence is what separates
-    "the resolve degraded" from "the target was refused before git ever ran".
-
-    Contract note, not an assertion (DW-242): the degrade is about the commit, never
-    the file, and that is a property of `_commit_ledger`'s SHAPE rather than something
-    this row can grade. The method never writes the target's bytes on any path — its
-    only writes are git's, through `verify.commit_paths` — and `path.resolve()` is the
-    first statement inside its `try`, so on this arm nothing runs that could touch the
-    file. A `read_text() == before` line here could not fail for any reason; it was a
-    false guard and was dropped, with no post-write fault to drive in its place.
-
-    Parametrized over both FAMILIES for the reason the sibling row states at length
-    (DW-212): the ROW is family-agnostic by construction — `root` and `name` bind
-    ahead of the resolve `try` and no code between that `try` and this handler reads
-    `family` in composing it — so for the row the store leg is regression coverage of the
-    second call SHAPE, the `path=<store>, family="store"` argument pair, not of a
-    second behavior. The arm's DOUBT half is the exception (DW-260): the ledger leg
-    arms `sweep_ledger_in_doubt` in memory and on disk, the store leg does not, and
-    this row grades that on the `RuntimeError` class as the sibling does on
-    `OSError` — the arm reads `family` AFTER the row, so a class that escaped the
-    tuple would skip the arm along with the row. The SHAPE only, as to where the
-    store path comes from: the two real prune sites derive their store as
-    `store_path(_project_of_run_dir(self.run_dir))` (`sweep.py:1946`, `:2009`) and are
-    never entered here, so their own path derivation stays ungraded by this row. On
-    3.13+ no other row drives `family="store"` into this arm; the dangling-store row
-    named above does so below 3.13 only, and the two are complements, not duplicates.
-
-    Ablations, all performed:
-      * delete `RuntimeError` ALONE from the RESOLVE arm's `except (OSError,
-        RuntimeError, ValueError)` tuple in `_commit_ledger` and this reds with the
-        `RuntimeError` escaping `_commit_ledger`, on both legs;
-      * hardcode `file="deferred-work.md"` in the unavailable journal row and only
-        the STORE legs fail, on the expected `decisions.json` filename, even though
-        the row does not branch on `family`;
-      * delete the resolve arm's `if family == "ledger": self._record_ledger_doubt()`
-        (DW-260) and only the LEDGER legs fail, on the two doubt assertions."""
-    # shared frame for both legs: on the store leg this ledger is deliberately
-    # ignored — never published, never resolved, never asserted on
-    write_ledger(project, {"DW-1": "open"}, commit=False)
-    engine, _ = make_sweep(project, [])
-    engine.run_dir.mkdir(parents=True, exist_ok=True)
-    engine._save()  # a state file for the store leg's `load_state` to read back
-    published, tail = _resolve_degrade_target(project, family)
-    head = git(project.project, "rev-parse", "HEAD")
-    # CPython's own wording, so the injected fault is a faithful stand-in for the real
-    # one: pre-3.13 `pathlib` raises `RuntimeError("Symlink loop from %r" % e.filename)`.
-    loop_error = f"Symlink loop from {str(published)!r}"
-    refuse_to_resolve(monkeypatch, published, error=RuntimeError(loop_error))
-
-    engine._commit_ledger(
-        "chore(sweep): loop target", path=published, family=family
-    )  # must not raise
-
-    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
-    assert failed["message"] == "chore(sweep): loop target"
-    assert failed["file"] == tail  # bound before the try, so still here
-    # the LEXICAL parent: the resolve that would have replaced it is what failed
-    assert failed["repo"] == str(published.parent)
-    assert loop_error in failed["error"]
-    assert git(project.project, "rev-parse", "HEAD") == head  # nothing was committed
-    assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
-    assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
-    assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
-    # DW-260: the ledger leg arms the run's doubt, in memory and on disk; the store
-    # leg arms nothing
-    assert engine._ledger_unfit_to_publish() is (family == "ledger")
-    assert load_state(engine.run_dir).sweep_ledger_in_doubt is (family == "ledger")
-
-
-@pytest.mark.parametrize("family", ["ledger", "store"])
-@pytest.mark.parametrize("fault", NUL_PATH_RESOLVE_FAULTS)
-def test_the_degrade_row_survives_a_value_error_from_the_resolve(
-    project, monkeypatch, fault, family
-):
-    """The `ValueError` CLASS of the same resolve `except` tuple, driven on its own
-    (DW-275), in the shape of the `RuntimeError` row above.
-
-    `Path.resolve()` raises `ValueError` for an embedded NUL and `UnicodeEncodeError`
-    (a `ValueError` subclass) for a lone surrogate outside the `surrogateescape`
-    range on CPython 3.11-3.14 POSIX, and the two-class tuple that stood here let
-    both escape a method whose docstring calls it strictly best effort. Both faults
-    come from `NUL_PATH_RESOLVE_FAULTS` and are injected through `refuse_to_resolve`
-    for the reason the constant states — `ntpath.realpath` tolerates a NUL, so a real
-    NUL path is not a cross-platform driver here — and the injected `nul` fault
-    carries CPython's 3.12+ wording (3.11 says `embedded null byte`) so the stand-in
-    is faithful. Every claim the sibling row makes is made again on this
-    class: the one `sweep-ledger-commit-unavailable` row with `file` the lexical
-    tail and `repo` the lexical parent, HEAD unmoved, no `sweep-ledger-commit`,
-    `-refused` or `-clean`, and the DW-260 doubt half — the ledger leg arms
-    `sweep_ledger_in_doubt` in memory and on disk, the store leg does not — since the
-    arm reads `family` AFTER the row, and a class that escaped the tuple would skip
-    the arm along with the row.
-
-    Ablation, per class: delete `ValueError` ALONE from the RESOLVE arm's
-    `except (OSError, RuntimeError, ValueError)` tuple in `_commit_ledger` and all
-    four legs red with the injected fault escaping `_commit_ledger`, while the
-    `OSError` and `RuntimeError` rows above stay green."""
-    # shared frame for both legs: on the store leg this ledger is deliberately
-    # ignored — never published, never resolved, never asserted on
-    write_ledger(project, {"DW-1": "open"}, commit=False)
-    engine, _ = make_sweep(project, [])
-    engine.run_dir.mkdir(parents=True, exist_ok=True)
-    engine._save()  # a state file for the store leg's `load_state` to read back
-    published, tail = _resolve_degrade_target(project, family)
-    head = git(project.project, "rev-parse", "HEAD")
-    refuse_to_resolve(monkeypatch, published, error=fault)
-
-    engine._commit_ledger(
-        "chore(sweep): nul target", path=published, family=family
-    )  # must not raise
-
-    [failed] = _records(engine, "sweep-ledger-commit-unavailable")
-    assert failed["message"] == "chore(sweep): nul target"
-    assert failed["file"] == tail  # bound before the try, so still here
-    # the LEXICAL parent: the resolve that would have replaced it is what failed
-    assert failed["repo"] == str(published.parent)
-    assert str(fault) in failed["error"]
-    assert git(project.project, "rev-parse", "HEAD") == head  # nothing was committed
-    assert _records(engine, "sweep-ledger-commit") == []  # nothing published...
-    assert _records(engine, "sweep-ledger-commit-refused") == []  # ...not a target refusal...
-    assert _records(engine, "sweep-ledger-commit-clean") == []  # ...and not a clean skip either
-    # DW-260: the ledger leg arms the run's doubt, in memory and on disk; the store
-    # leg arms nothing
     assert engine._ledger_unfit_to_publish() is (family == "ledger")
     assert load_state(engine.run_dir).sweep_ledger_in_doubt is (family == "ledger")
 
@@ -16677,7 +16537,9 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     crash on them at `_loop`'s own bare `read_for_write` regardless. So: the run
     ends reported rather than crashed, cycle 1's work is kept, HEAD does NOT carry
     the undecodable bytes, they stay dirty for a human to repair, and cycle 2 never
-    triages.
+    triages. The plan carries no bundles, so the stop writes no
+    `sweep-bundles-withheld` row: remove `if bundles:` around that row in `_cycle`
+    and a zero-count row appears.
 
     Ablation: delete the `if self._prune_ledger_unreadable:` arm from `_loop`.
     Every assertion below that names the stop reddens, `sweep-ledger-commit` goes
@@ -16688,7 +16550,13 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     asserts, which is exactly why the commit count and `_ledger_differs_from_head`
     are the assertions carrying the ablation now. Setting the flag without reading
     it reds the same way for the same reason. The separate no-progress row below
-    establishes ordering against `not progressed`."""
+    establishes ordering against `not progressed`.
+
+    Ordering inside the prune: the `_ledger_unfit_to_publish()` refusal sits BELOW
+    the three read arms, so this ledger still takes DW-182's arm (its own token,
+    its own carry, the "could not be decoded mid-sweep" headline rather than the
+    generic one) even though `_ledger_in_doubt` is armed here too. Move that
+    refusal above the read and the prune refuses on `ledger-in-doubt` instead."""
     engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
         project,
         lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
@@ -16701,7 +16569,10 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     assert [spec.role for spec in adapter.sessions] == ["triage"]  # cycle 2 never triaged
     assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # the window really opened
     [refused] = _records(engine, "sweep-preanswer-prune-refused")
-    assert refused["reason"] == "ledger-unreadable"
+    assert refused["reason"] == "ledger-unreadable"  # DW-182 wins...
+    assert "not valid UTF-8" in refused["error"]
+    assert engine._ledger_in_doubt  # ...though the in-doubt refusal's precondition holds
+    assert engine._prune_ledger_unreadable  # the carry the in-doubt arm does not set
     # The scaffolding every row here rests on, pinned rather than assumed: the fault
     # lands inside `prompter.ask`, so DW-2's own `close` effect necessarily meets the
     # same corrupt bytes and takes DW-186's degrade. Were that arm to raise instead,
@@ -16713,6 +16584,7 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     assert done["reason"] == "ledger-unreadable"
     assert done["stop_cause"] == done["reason"]
     assert done["cycles"] == 1  # the cycle COMPLETED, unlike `legacy-appeared`'s cycle - 1
+    assert _records(engine, "sweep-bundles-withheld") == []  # no bundles, no withheld claim
     # cycle 1's close was published; the boundary commit was NOT taken, so the
     # bytes nobody can decode are absent from HEAD and still dirty on disk.
     assert len(_records(engine, "sweep-ledger-commit")) == 1
@@ -16725,6 +16597,7 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     assert f"repair {project.deferred_work} by hand" in attention
     assert f"commit or stash any changes in {project.repo_root}" in attention
     assert attention.count("the deferred-work ledger could not be decoded mid-sweep:") == 1
+    assert "not fit to publish" not in attention
 
 
 def test_an_undecodable_prune_in_cycle_two_keeps_the_completed_bundle(project):
@@ -16846,7 +16719,16 @@ def test_a_faulted_decision_effect_withholds_the_same_cycles_bundles(project):
 
 
 def test_a_healthy_decision_phase_still_dispatches_the_cycles_bundles(project):
-    """A healthy phase dispatches every bundle.
+    """A healthy phase dispatches every bundle and arms nothing: neither the
+    cycle-scoped close latch nor the run-scoped mirror (DW-218/219), in memory
+    or on disk. The positive healthy row for the persisted flag: arming the
+    mirror unconditionally, or leaving `_record_ledger_doubt` ungated at
+    `_decisions_phase`'s `=` publish, would pass every withholding row while
+    withholding every resume.
+
+    The close latch's per-cycle RESET is defense-in-depth no row can grade:
+    `_loop` stops at the boundary of any cycle that armed it, so no later
+    `_close_resolved` re-enters with it set.
 
     Ablation: make `_cycle`'s ledger-in-doubt guard unconditional; dev/review
     sessions disappear and a withheld row appears."""
@@ -16861,28 +16743,12 @@ def test_a_healthy_decision_phase_still_dispatches_the_cycles_bundles(project):
     assert _records(engine, "sweep-bundles-withheld") == []
     assert engine.state.tasks["dw-ledger-fix"].phase == Phase.DONE
     assert "change for dw-ledger-fix" in git(project.project, "show", "HEAD:src.txt")
+    assert not engine._close_ledger_in_doubt and not engine._ledger_unfit_to_publish()
+    assert engine.state.sweep_ledger_in_doubt is False
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is False
     # Everything closed, so cycle 2 stops on `no-open` rather than on the gate.
     [done] = _records(engine, "sweep-repeat-done")
     assert done["reason"] == "no-open"
-
-
-def test_a_faulted_cycle_with_no_bundles_writes_no_withheld_row(project):
-    """An empty bundle list still stops, without claiming withheld work.
-
-    Ablation: remove `if bundles:` around the withheld row; a zero-count row appears."""
-    engine, _ = _sweep_with_ledger_fault_at_the_decision_prompt(
-        project,
-        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
-        policy=repeat_policy(),
-    )
-
-    summary = engine.run()
-
-    assert not summary.crashed and not summary.paused
-    assert _records(engine, "sweep-bundles-withheld") == []
-    [done] = _records(engine, "sweep-repeat-done")
-    assert done["reason"] == "ledger-unreadable"
-    assert done["stop_cause"] == done["reason"]
 
 
 def test_a_decodable_decision_fault_withholds_the_bundle_that_would_publish_it(
@@ -17160,54 +17026,6 @@ def test_a_faulted_close_phase_withholds_the_same_cycles_bundles(project, monkey
     assert attention.count("the deferred-work ledger is not fit to publish:") == 1
     assert "could not be decoded" not in attention
     assert f"repair {project.deferred_work} by hand" in attention
-
-
-def test_a_healthy_close_phase_dispatches_its_bundles(project):
-    """The close latch is CYCLE-scoped, so one bad cycle cannot withhold the rest of
-    the run. Nothing faults here, so nothing is ever armed.
-
-    The RESET itself is defense-in-depth, not a property this row can grade, and no
-    row can: `_loop` stops (or returns) at the boundary of any cycle that armed the
-    latch, so no later `_close_resolved` ever re-enters with it set and the
-    "cycle 1 faults, cycle 2 does not" run is unreachable. The latch is already
-    cycle-bound by that stop; the reset is what keeps it so if a future caller ever
-    continues past one. Kept for that reason, asserted for none.
-
-    Ablation: make `_cycle`'s dispatch gate unconditional and every assertion below
-    reds — which is the claim this row actually carries: a healthy close phase arms
-    nothing and withholds nothing."""
-    write_ledger(project, {"DW-1": "open", "DW-3": "open"})
-    plan = triage_result(
-        ["DW-1", "DW-3"],
-        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
-        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
-    )
-    engine, adapter = make_sweep(
-        project,
-        [
-            triage_effect(plan),
-            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
-            bundle_review_effect(project, "ledger-fix"),
-        ],
-        policy=repeat_policy(),
-    )
-
-    summary = engine.run()
-
-    assert not summary.crashed and not summary.paused
-    assert not engine._close_ledger_in_doubt and not engine._ledger_unfit_to_publish()
-    # ...and the RUN-scoped mirror (DW-218/219) is False in memory AND on disk. The
-    # positive healthy row for the persisted flag: without it, arming the mirror
-    # unconditionally — or leaving `_record_ledger_doubt` ungated at
-    # `_decisions_phase`'s `=` publish, which runs on every cycle — would pass every
-    # withholding row in this file while withholding the whole archive of resumes.
-    assert engine.state.sweep_ledger_in_doubt is False
-    assert load_state(engine.run_dir).sweep_ledger_in_doubt is False
-    assert [spec.role for spec in adapter.sessions] == ["triage", "dev", "review"]
-    assert _records(engine, "sweep-bundles-withheld") == []
-    assert engine.state.tasks["dw-ledger-fix"].phase == Phase.DONE
-    [done] = _records(engine, "sweep-repeat-done")
-    assert done["reason"] == "no-open"  # everything closed, so cycle 2 stops cleanly
 
 
 # ------------------- DW-218/219: the cycle's verdict has to survive the process
@@ -18719,33 +18537,6 @@ def test_a_decodable_fault_keeps_the_pre_answer_it_would_have_pruned(project, mo
     assert _records(engine, "sweep-ledger-commit-clean") == []
 
 
-def test_an_undecodable_ledger_still_takes_the_dw182_prune_arm(project):
-    """Ordering, stated: the new refusal sits BELOW the three read arms, so a ledger
-    that will not decode still takes DW-182's arm — its own token, its own carry,
-    and the "could not be decoded mid-sweep" headline rather than the generic one —
-    even though `_ledger_in_doubt` is armed here too.
-
-    Ablation: move the `_ledger_unfit_to_publish()` refusal above the read and every
-    assertion below reds; the run would report a decodable ledger it never read."""
-    engine, _ = _sweep_with_ledger_fault_at_the_decision_prompt(
-        project,
-        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
-        policy=repeat_policy(),
-    )
-
-    summary = engine.run()
-
-    assert not summary.crashed and not summary.paused
-    assert engine._ledger_in_doubt  # the new arm's precondition holds...
-    [refused] = _records(engine, "sweep-preanswer-prune-refused")
-    assert refused["reason"] == "ledger-unreadable"  # ...and DW-182 still wins
-    assert "not valid UTF-8" in refused["error"]
-    assert engine._prune_ledger_unreadable  # the carry the new arm does not set
-    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
-    assert attention.count("the deferred-work ledger could not be decoded mid-sweep:") == 1
-    assert "not fit to publish" not in attention
-
-
 # ------------------- DW-201: every repeat stop keeps its token through a dump
 
 
@@ -18762,42 +18553,14 @@ _REPEAT_STOP_TOKENS = frozenset(
 )
 
 
-def test_a_repeat_stop_journals_a_stop_cause_beside_its_reason(project):
-    """DW-201, live. `sweep-repeat-done` says WHY the repeat loop stopped through
-    `reason`, and `reason` is in `diagnostics._JOURNAL_DROP_FIELDS` — so
-    `bmad-loop diagnose` rendered `reason_present: true` and every stop
-    collapsed into one indistinguishable row. `max-cycles` ("your budget ran out")
-    and `ledger-unreadable` ("a human has to repair the file") are opposite
-    findings, and a dump could tell them apart only by inferring from other rows.
-
-    `stop_cause` is added BESIDE `reason`, never in place of it: the raw journal
-    and the existing rows above all name `reason`, so both are
-    written and both carry the same token. Same closed-slug convention as
-    `regen_cause` (DW-164) and `drop_cause`.
-
-    One stop is driven for real here — a cycle whose triage skips everything, so
-    nothing is addressable and the loop stops on `no-progress` — which is what
-    grades that the field reaches the journal at all. The row below is the TOTAL
-    half, covering the four stops no single run can reach at once.
-
-    Ablation: drop `stop_cause` from the `not progressed` arm and this reds on the
-    missing key."""
-    write_ledger(project, {"DW-1": "open"})
-    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "not this cycle"}])
-    engine, _ = make_sweep(project, [triage_effect(plan)], policy=repeat_policy())
-
-    summary = engine.run()
-
-    assert not summary.crashed and not summary.paused
-    [done] = _records(engine, "sweep-repeat-done")
-    assert done["reason"] == "no-progress"  # unchanged, still written
-    assert done["stop_cause"] == "no-progress"  # ...and now a copy that survives a dump
-    assert done["stop_cause"] in _REPEAT_STOP_TOKENS
-
-
 def test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause():
     """The TOTAL half of DW-201: all nine `sweep-repeat-done` writes in `sweep.py`,
     graded at the source rather than by nine separate runs.
+
+    `reason` is in `diagnostics._JOURNAL_DROP_FIELDS`, so a dump collapses every
+    stop into one row; `stop_cause` is written BESIDE it, never in place of it.
+    The live half is `test_repeat_stops_on_no_progress`, a real stop whose
+    journal row carries both fields.
 
     Three claims a behavioral row cannot make together: every write passes BOTH
     fields, the two are the SAME literal on each write (a `stop_cause` that drifted
@@ -20205,49 +19968,27 @@ def test_stored_answers_with_a_non_dict_top_level_degrade_to_none(project):
     assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
 
 
-def test_unreadable_stored_answers_degrade_to_none(project):
-    """DW-134. Truncated JSON (a crash mid-write) — caught, journaled with the
-    exception text, and the sweep carries on."""
-    write_ledger(project, {"DW-1": "open"})
-    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
-    engine, _ = make_sweep(project, [])
-    engine.run_dir.mkdir(parents=True, exist_ok=True)
-    (engine.run_dir / "decisions.json").write_text('{"DW-1": {"key": "1"', encoding="utf-8")
+@pytest.mark.parametrize("fault", ["truncated-json", "non-utf8", "oserror"])
+def test_unreadable_stored_answers_degrade_to_none(project, monkeypatch, fault):
+    """DW-134. A stored answer file the sweep cannot read is caught, journaled with
+    the exception text, and the sweep carries on down the pending path.
 
-    answers, closed, _unlanded = engine._decisions_phase(plan)
-
-    assert answers == {} and closed == 0
-    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
-    assert reload_failed["errors"][0].startswith("unreadable: ")
-    assert [r["dw_id"] for r in _records(engine, "decision-skipped-unattended")] == ["DW-1"]
-
-
-def test_undecodable_stored_answers_degrade_to_none(project):
-    """DW-134. The third caught fault: bytes that are not UTF-8 at all."""
-    write_ledger(project, {"DW-1": "open"})
-    plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
-    engine, _ = make_sweep(project, [])
-    engine.run_dir.mkdir(parents=True, exist_ok=True)
-    (engine.run_dir / "decisions.json").write_bytes(b'{"DW-1": {"key": "\xff"}}')
-
-    answers, closed, _unlanded = engine._decisions_phase(plan)
-
-    assert answers == {}
-    [reload_failed] = _records(engine, "sweep-decisions-reload-failed")
-    assert reload_failed["errors"][0].startswith("unreadable: ")
-
-
-def test_oserror_reading_stored_answers_degrades_to_none(project, monkeypatch):
-    """DW-134. The read-side I/O arm is distinct from JSON and UTF-8 decoding:
-    a filesystem refusal must journal and take the same pending path. Ablation:
-    remove `OSError` from `_decisions_phase`'s catch tuple and this raises."""
+    [truncated-json]: a crash mid-write. [non-utf8]: bytes that are not UTF-8 at
+    all. [oserror]: the read-side I/O arm, distinct from JSON and UTF-8 decoding — a
+    filesystem refusal must journal and take the same pending path. Ablation:
+    remove `OSError` from `_decisions_phase`'s catch tuple and [oserror] raises."""
     write_ledger(project, {"DW-1": "open"})
     plan = TriagePlan(open_ids=frozenset({"DW-1"}), decisions=(_decision_for("DW-1"),))
     engine, _ = make_sweep(project, [])
     engine.run_dir.mkdir(parents=True, exist_ok=True)
     store = engine.run_dir / "decisions.json"
-    store.write_text(json.dumps({"DW-1": {"key": "1"}}), encoding="utf-8")
-    fault_read_text(monkeypatch, store)
+    if fault == "truncated-json":
+        store.write_text('{"DW-1": {"key": "1"', encoding="utf-8")
+    elif fault == "non-utf8":
+        store.write_bytes(b'{"DW-1": {"key": "\xff"}}')
+    else:
+        store.write_text(json.dumps({"DW-1": {"key": "1"}}), encoding="utf-8")
+        fault_read_text(monkeypatch, store)
 
     answers, closed, _unlanded = engine._decisions_phase(plan)
 
@@ -36397,18 +36138,6 @@ def _assert_escalation_held(project, engine, detail: str):
     return resumed
 
 
-def test_escalation_from_triage_verify_holds_over_a_non_legacy_ledger(project, monkeypatch):
-    """DW-426: a format-1 migration ESCALATED from TRIAGE_VERIFY, whose live
-    ledger is the accepted-but-uncommitted rewrite, stays paused on a plain
-    resume: no triage over text the migration never accepted.
-
-    Ablation, performed: drop the DW-426 `elif` in `_loop` and this reddens:
-    the cycle reader triages the migrated ledger with the task still ESCALATED."""
-    engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
-
-    _assert_escalation_held(project, engine, _dw426_non_legacy_detail(engine.run_dir))
-
-
 def test_escalation_holds_over_an_absent_ledger(project, monkeypatch):
     """DW-426: a vanished ledger is not the restored legacy text, so it refuses
     like a non-legacy one instead of reaching the cycle reader.
@@ -36456,22 +36185,6 @@ def test_escalation_from_triage_running_holds_over_an_unreadable_ledger(
     assert _records(resumed, "sweep-repeat-done") == []
 
 
-@needs_dir_fd_recovery
-def test_escalation_on_a_non_legacy_rival_holds_and_keeps_the_rival(project, monkeypatch):
-    """DW-426: a refused non-legacy rival (`migration_ledger_rival` latched) is
-    not the operator remedy; the next plain resume re-pauses and the rival bytes
-    and the latch survive.
-
-    Ablation, performed: drop the DW-426 `elif` and this reddens: the rival is
-    triaged as if it were an accepted DW ledger."""
-    engine = _escalate_on_a_non_legacy_rival(project, monkeypatch)
-
-    _assert_escalation_held(project, engine, _dw426_non_legacy_detail(engine.run_dir))
-
-    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
-    assert load_state(engine.run_dir).tasks["sweep-migrate"].migration_ledger_rival is True
-
-
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -36485,7 +36198,17 @@ def test_held_escalation_re_enters_the_migration_once_the_legacy_ledger_returns(
 ):
     """DW-426 operator remedy: after the re-pause, restoring the legacy ledger
     (and deleting the migrate-* records, as the remedy says) makes the arm
-    return, and the existing ESCALATED restart re-migrates to DONE."""
+    return, and the existing ESCALATED restart re-migrates to DONE.
+
+    The re-pause half is the DW-426 hold itself: no triage over text the
+    migration never accepted. `triage-verify` holds over the accepted-but-
+    uncommitted rewrite; `rival` holds over a refused non-legacy rival, whose
+    bytes and `migration_ledger_rival` latch survive (`_assert_escalation_held`
+    pins the live bytes and the whole task).
+
+    Ablation, performed: drop the DW-426 `elif` in `_loop` and every row reddens
+    at `_assert_escalation_held`: the cycle reader triages the migrated ledger
+    (or the rival) with the task still ESCALATED."""
     if scenario == "triage-verify":
         engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
         detail = _dw426_non_legacy_detail(engine.run_dir)

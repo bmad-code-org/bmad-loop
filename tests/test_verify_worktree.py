@@ -6906,7 +6906,9 @@ def test_integrated_stray_paths_leaves_the_receipt_sets_to_their_own_readings(pr
 
 def test_git_toplevel_none_outside_repo(tmp_path):
     """A repo answers its canonical working-tree root (from a subdirectory too); a
-    folder in no repository — or one that does not exist — answers None."""
+    folder in no repository — or one that does not exist — answers None. Only "no
+    repository" reads as None: a repository git refuses (a broken `.git` gitdir
+    file) raises."""
     repo = tmp_path / "repo"
     (repo / "sub").mkdir(parents=True)
     git(repo, "init", "-q")
@@ -6915,6 +6917,12 @@ def test_git_toplevel_none_outside_repo(tmp_path):
     outside.mkdir()
     assert verify.git_toplevel(outside) is None
     assert verify.git_toplevel(tmp_path / "missing") is None
+    # its own directory: a broken gitfile at tmp_path would capture `plain` above
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / ".git").write_text("gitdir: /nonexistent/repo.git\n", encoding="utf-8")
+    with pytest.raises(verify.GitError, match="show-toplevel"):
+        verify.git_toplevel(broken)
 
 
 def test_git_toplevel_raises_on_spawn_fault(tmp_path, monkeypatch):

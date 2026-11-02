@@ -166,16 +166,19 @@ def test_enabled_helpers():
 # ----------------------------------------------- THE trust invariant
 
 
-def test_untrusted_python_module_is_never_imported(tmp_path):
+def test_untrusted_python_module_is_never_imported(tmp_path, monkeypatch):
     write_py_plugin(tmp_path, "spy")
+    calls = record_instantiate(monkeypatch)
     journal = FakeJournal()
     reg = PluginRegistry.build(tmp_path, policy=Policy(), journal=journal)  # no grant
     lp = reg.get("spy")
     assert lp is not None
     assert lp.instance is None and lp.trusted is False and not lp.active
     assert lp.verdict is not None and lp.verdict.state is TrustState.REFUSED
-    # the smoking gun: the module's import-time side effect never happened
+    # the smoking gun: the module's import-time side effect never happened, and
+    # `_instantiate` was never even entered
     assert not marker_for(tmp_path, "spy").exists()
+    assert "spy" not in calls
     refused = [e for e in journal.entries if e["kind"] == "plugin-refused"]
     assert [(e["plugin"], e["origin"], e["path"]) for e in refused] == [
         ("spy", "project", ".bmad-loop/plugins/spy")
@@ -197,14 +200,6 @@ def test_unenabled_builtin_python_is_untrusted_not_refused(tmp_path, monkeypatch
     assert "unity" in untrusted
     assert "plugin-refused" not in journal.kinds() and reg.refusals == ()
     assert "unity" not in calls
-
-
-def test_ungranted_project_python_never_imports(tmp_path, monkeypatch):
-    write_py_plugin(tmp_path, "spy")
-    calls = record_instantiate(monkeypatch)
-    reg = PluginRegistry.build(tmp_path, policy=Policy())
-    assert "spy" not in calls and reg.instances() == []
-    assert not marker_for(tmp_path, "spy").exists()
 
 
 def test_enabled_python_module_is_constructed(tmp_path):
@@ -538,12 +533,6 @@ def test_granted_plugin_without_a_snapshot_root_is_refused(tmp_path):
     with pytest.raises(PluginError, match="no snapshot root"):
         PluginRegistry.build(tmp_path, policy=Policy(), grants=grants)
     assert not marker_for(tmp_path, "spy").exists()
-
-
-def test_build_defaults_to_no_grants(tmp_path):
-    write_py_plugin(tmp_path, "spy")
-    reg = PluginRegistry.build(tmp_path, policy=Policy(), grants=GrantSet.empty())
-    assert [r.name for r in reg.refusals] == ["spy"]
 
 
 # ------------------------------------------ granted plugins run the snapshot

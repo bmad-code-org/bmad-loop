@@ -547,10 +547,13 @@ def test_resolve_is_sorted_by_story_key(project):
 def test_drift_names_the_side_that_disagrees(project, spec_status, board, expect_drift):
     """ "The record says parked, the board says done" is a different message and a
     different remedy from "no such story" — so both sides are reported, and the
-    spec is reported first because a spec that moved on explains everything."""
+    spec is reported first because a spec that moved on explains everything.
+    Splitting the predicate changed no `drift()` answer for a readable list:
+    `committed_drift()` gives the same one on every row."""
     _park(project, status=spec_status, board=board)
     (story,) = operatoractions.resolve(project.project, project)
     assert story.drift() == expect_drift
+    assert story.committed_drift() == expect_drift
     assert story.confirmable is (expect_drift is None)
 
 
@@ -762,24 +765,6 @@ def test_committed_drift_is_none_for_a_park_owing_nothing_readable(project):
     assert not story.confirmable
 
 
-@pytest.mark.parametrize(
-    ("spec_status", "board"),
-    [
-        ("awaiting-operator", "awaiting-operator"),
-        ("done", "awaiting-operator"),
-        ("awaiting-operator", "done"),
-        ("in-progress", "in-progress"),
-    ],
-)
-def test_drift_still_answers_exactly_as_it_did_for_a_readable_list(project, spec_status, board):
-    """Characterization: splitting the predicate changed no answer `drift()` gave.
-    Every committed-side cause outranks the empty-actions arm, which is where it
-    already sat."""
-    _park(project, status=spec_status, board=board)
-    (story,) = operatoractions.resolve(project.project, project)
-    assert story.drift() == story.committed_drift()
-
-
 # ------------------------------ the confined writes under `.bmad-loop/` (#593, #597)
 
 
@@ -805,6 +790,14 @@ def test_the_record_write_refuses_a_symlinked_bmad_loop(project, tmp_path):
     `mkdir` ran before the writer — so `outside/` staying EMPTY is what pins the
     confined `mkdir` (`platform_util.make_dirs_confined`).
 
+    The positive control for this refusal is `test_a_park_record_is_visible_to_git`
+    (the same `_record_only` on a clean `project`, asserting the record lands at
+    `record_path`), with `test_load_merges_legacy_entries_under_per_story_records`
+    reading its actions back. Without them this test passes for a `record_park`
+    wired to refuse everything, which is every reason a record could be absent
+    from `outside/` — and a park that cannot record is a story a human can never
+    be told they owe.
+
     Ablation: revert `record_park` to
     `atomic_write_text(path, ..., follow_symlinks=False)` and this fails
     `DID NOT RAISE`, with `1-1-a.json` sitting in `outside/operator/`; revert only
@@ -821,17 +814,6 @@ def test_the_record_write_refuses_a_symlinked_bmad_loop(project, tmp_path):
     assert list(outside.rglob("*.json")) == []  # no record escaped the project
     assert not list(outside.rglob("*.tmp"))  # nor a temp it was staged through
     assert operatoractions.load(project.project) == {}
-
-
-def test_the_record_write_lands_on_a_clean_tree(project):
-    """The positive control for the refusal above. Without it that test passes for
-    a `record_park` wired to refuse everything, which is every reason a record
-    could be absent from `outside/` — and a park that cannot record is a story a
-    human can never be told they owe."""
-    _record_only(project)
-
-    assert operatoractions.record_path(project.project, "1-1-a").is_file()
-    assert operatoractions.load(project.project)["1-1-a"]["actions"] == ACTIONS
 
 
 def test_the_record_write_refuses_a_readonly_record(project):
