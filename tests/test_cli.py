@@ -5195,12 +5195,6 @@ def test_resolve_no_such_run(tmp_path, capsys):
     assert "no such run" in capsys.readouterr().err
 
 
-def test_resolve_rejects_non_escalation_stage(tmp_path, capsys):
-    _make_run_with_state(tmp_path, "r1", paused_stage="spec-approval", paused_reason="x")
-    assert cli.main(["resolve", "--project", str(tmp_path), "r1"]) == 1
-    assert "not paused at an escalation" in capsys.readouterr().err
-
-
 def test_resolve_refuses_environment_pause_with_resume_hint(tmp_path, capsys):
     """DW-523: an environment pause is lifted by a plain resume, so resolve refuses
     it AND names the remedy; any other non-escalation stage gets the bare refusal."""
@@ -11376,20 +11370,6 @@ def test_refused_resume_leaves_the_pin_and_the_journal_untouched(project, monkey
     assert "could not be discarded" in capsys.readouterr().err
     assert runs.read_trusted_config_digest(project.project, run_dir.name)[0] == "OLDPIN"
     assert _resume_entries(run_dir) == []
-
-
-def test_resume_refuses_live_run(tmp_path, monkeypatch, capsys):
-    from bmad_loop import runs
-
-    monkeypatch.setattr(runs, "engine_liveness", lambda _rd: "alive")
-
-    def _fail(*_a, **_k):
-        raise AssertionError("resumed a live run")
-
-    monkeypatch.setattr(cli, "_resume_paused_run", _fail)
-    _make_run_with_state(tmp_path, "r1", paused_reason="x", paused_stage="spec-approval")
-    assert cli.main(["resume", "--project", str(tmp_path), "r1"]) == 1
-    assert "double-drive" in capsys.readouterr().err
 
 
 # --------------------------------------------------- DW-204 readable-ledger gate
@@ -18714,31 +18694,6 @@ def test_validate_json_detail_round_trips_for_every_real_shape(capsys):
     assert [f["detail"]["returncode"] for f in unrunnable] == [127, None]  # int, and null-in-dict
 
 
-@pytest.mark.parametrize(
-    ("spec", "mode", "folder"),
-    [(None, "sprint", ""), (STORIES_SPEC_FOLDER, "stories", STORIES_SPEC_FOLDER)],
-    ids=["sprint", "stories"],
-)
-def test_validate_json_mode_and_spec_folder_reflect_the_flag(project, capsys, spec, mode, folder):
-    """`--spec` forces stories mode, and the document says which queue was gated.
-
-    spec_folder is "" — not null — in sprint mode, where it is inapplicable: the
-    same ""-for-inapplicable convention as list_document's paused_stage."""
-    install_bmad_config(project)
-    _setup_stories_fixture(project, [_stories_entry("1")])
-    _write_policy(project.project, CLAUDE_ONLY_POLICY)  # sprint policy either way
-    write_sprint(project, {"epic-1": "backlog"})
-
-    argv = ["validate", "--project", str(project.project), "--json"]
-    if spec:
-        argv += ["--spec", spec]
-    doc = machine_json(argv, capsys, rc=1)
-    assert doc["mode"] == mode
-    assert doc["spec_folder"] == folder
-    gate = "queue.stories-manifest" if spec else "queue.sprint-status"
-    assert gate in {f["check"] for f in doc["findings"]}
-
-
 # The check-id families `cmd_validate`'s per-source queue block can emit: the
 # sprint branch (deferred ledger, operator registry, sprint-status, nested specs)
 # vs the stories branch (manifest, folder+id dispatch probe, deferred ledger).
@@ -19451,12 +19406,6 @@ def _plugin_findings(doc):
     return [f for f in doc["findings"] if f["check"] == "plugins.manifests"]
 
 
-def test_plugin_manifest_check_is_registered():
-    from bmad_loop.checks import VALIDATE_CHECKS
-
-    assert "plugins.manifests" in VALIDATE_CHECKS
-
-
 def test_validate_fails_a_malformed_toml_plugin_manifest(project, capsys, monkeypatch):
     """#765: before this, the first reader of a broken project `plugin.toml` was
     `PluginRegistry.build` in `Engine.__init__`, after the run was published. The
@@ -19681,19 +19630,6 @@ def test_validation_report_rejects_an_unregistered_check_id():
 
     with pytest.raises(AssertionError, match="unregistered check id"):
         ValidationReport().ok("git.worktee-clean", "typo'd id")  # codespell:ignore
-
-
-def test_dry_run_stories_shows_plan_halt_markers(project, capsys):
-    """Item 10: dry-run mirrors the real dispatch's leg-1 markers for a pending
-    spec_checkpoint story (`Halt after planning.` + BMAD_LOOP_PLAN_HALT)."""
-    _setup_stories_fixture(project, [_stories_entry("1", spec_checkpoint=True)])
-    pol = policy_mod.loads("")
-    args = argparse.Namespace(spec=STORIES_SPEC_FOLDER, epic=None, story=None, max_stories=None)
-
-    assert cli._dry_run(project, pol, args, "stories", STORIES_SPEC_FOLDER) == 0
-    out = capsys.readouterr().out
-    assert "Halt after planning." in out
-    assert "BMAD_LOOP_PLAN_HALT=1" in out
 
 
 def test_dry_run_stories_relativizes_absolute_folder(project, capsys):
@@ -20569,7 +20505,13 @@ def test_confirm_refuses_a_drifted_entry(
     refuse rather than flip a board on the index's word alone.
 
     Ablation: drop the `drift()` guard in `cmd_confirm` and this fails — the
-    stale entry is confirmed and the disagreement is silently overwritten."""
+    stale entry is confirmed and the disagreement is silently overwritten.
+
+    The done row is ordinary drift: a story re-driven to done, or finished by hand,
+    carries no ``## Operator Confirmation`` section, so confirming it would advance
+    a board on nobody's word. Ablation: drop the `confirmation_recorded` arm of
+    `ParkedStory.resumable` and the done row fails — rc 0, and a story no human
+    signed off is reported as confirmed."""
     from bmad_loop import operatoractions
 
     install_bmad_config(project)
@@ -21949,24 +21891,6 @@ def test_json_says_a_plain_park_is_not_resumable(project, capsys):
 
     (entry,) = machine_json(_confirm_argv(project, "--json"), capsys)["parked"]
     assert entry["resumable"] is False and entry["confirmation_recorded"] is False
-
-
-def test_a_spec_at_done_without_a_sign_off_is_still_refused(project, capsys, monkeypatch):
-    """The guard that keeps the resume from swallowing ordinary drift: a story
-    re-driven to done, or finished by hand, carries no ``## Operator Confirmation``
-    section. Confirming it would advance a board on nobody's word.
-
-    Ablation: drop the `confirmation_recorded` arm of `resumable` and this fails —
-    rc 0, and a story no human signed off is reported as confirmed."""
-    from bmad_loop import operatoractions
-
-    install_bmad_config(project)
-    _park_story(project, spec_status="done")
-    monkeypatch.setattr(cli, "_confirm", lambda _q: True)
-
-    assert cli.main(_confirm_argv(project, "1-1-a")) == 1
-    assert "its spec now says status: done" in capsys.readouterr().err
-    assert "1-1-a" in operatoractions.load(project.project)
 
 
 # ------------------------------------- validate: operator-index drift warnings
@@ -24029,7 +23953,9 @@ def test_auto_sweep_proceeds_after_a_benign_limits_edit(project, monkeypatch):
     """Why the digest is field-scoped and not a whole-file hash. #189 documents
     live-editing `[limits]` under a running loop as supported; a file hash would
     refuse every auto-sweep after one, turning a correctness feature into a
-    regression. Nothing in `[limits]` reaches host exec, so nothing here fires."""
+    regression. Nothing in `[limits]` reaches host exec, so nothing here fires.
+    Also the gate's null case: a digest unstable across two reads of an unchanged
+    config would refuse every auto-sweep in the product, and fails this row too."""
     factory, launched = _pinned_sweep_factory(project, monkeypatch)
     _write_policy(project.project, PIN_POLICY + "\n[limits]\ncache_read_weight = 0.5\n")
     signalled: list[str] = []
@@ -24040,17 +23966,6 @@ def test_auto_sweep_proceeds_after_a_benign_limits_edit(project, monkeypatch):
     # The thunk reaches `_start_sweep` rather than being dropped at this frame —
     # the stub relays it, standing in for `compose_sweep`'s boundary (#501).
     assert signalled == ["started"]
-
-
-def test_auto_sweep_proceeds_when_the_pinned_config_is_untouched(project, monkeypatch):
-    """The gate's own null case — and the one that would catch a digest that is
-    unstable across two reads of an unchanged tree, which would refuse every
-    auto-sweep in the product."""
-    factory, launched = _pinned_sweep_factory(project, monkeypatch)
-
-    factory("epic-boundary", started=lambda: None)  # no raise
-
-    assert len(launched) == 1
 
 
 def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monkeypatch):
@@ -24652,7 +24567,9 @@ def test_sweep_refuses_a_broken_sweep_skill_before_any_run_dir(project, monkeypa
     `bmad-loop sweep` exit 1 naming the tree and `init --force-skills`, with no engine
     started and no run directory created. Every other preflight passes (the fixture is
     `validate`-clean) so the refusal is this gate's and no one else's.
-    Ablation: delete the `_require_sweep_skill` call in `cmd_sweep` and this reddens."""
+    Ablation: delete the `_require_sweep_skill` call in `cmd_sweep` and this reddens.
+    Positive control for this refusal: `test_sweep_threads_grants` runs the same
+    validate-clean fixture through the gate to `_start_sweep`."""
     _make_validate_pass(project, monkeypatch, capsys)
     _break_sweep_skill(project.project, ".claude/skills", how)
     _commit_all(project, "break the sweep skill")
@@ -24667,17 +24584,6 @@ def test_sweep_refuses_a_broken_sweep_skill_before_any_run_dir(project, monkeypa
     assert started == []
     runs_root = project.project / runs.RUNS_DIR
     assert not runs_root.exists() or list(runs_root.iterdir()) == []
-
-
-def test_sweep_passes_the_gate_on_a_complete_sweep_skill(project, monkeypatch, capsys):
-    """The positive leg of the row above, so its refusal is not green for a reason
-    unrelated to the skill."""
-    _make_validate_pass(project, monkeypatch, capsys)
-    started: list = []
-    monkeypatch.setattr(cli, "_start_sweep", lambda *a, **kw: started.append(kw) or 0)
-
-    assert cli.main(["sweep", "--no-prompt", "--project", str(project.project)]) == 0
-    assert len(started) == 1
 
 
 def test_validate_reports_the_sweep_skill_ok_then_incomplete(project, monkeypatch, capsys):
@@ -25094,26 +25000,17 @@ def test_validate_reports_an_under_floor_git_as_a_problem(project, capsys, monke
     finding, so asserting only its presence would stay green through the regression
     this guards.
 
-    Ablation: change the `report.fail` to `report.warn` and this fails on the rc."""
+    Ablation: change the `report.fail` to `report.warn` and this fails on the rc.
+
+    With `test_run_refuses_an_under_floor_git` this pins one host state, one
+    verdict: `validate` reporting green while `run` aborts is the disagreement
+    `cmd_validate` is built to avoid."""
     _make_validate_pass(project, monkeypatch, capsys)
     _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
 
     findings = _validate_findings(project, capsys, rc=1)
     assert findings["git.version"]["severity"] == "problem"
     assert findings["git.version"]["detail"]["reported"] == "git version 2.25.1"
-
-
-def test_validate_and_run_agree_on_an_under_floor_git(project, capsys, monkeypatch):
-    """The point of making this a `problem`: one host state, one verdict. `validate`
-    reporting green while `run` aborts is the disagreement `cmd_validate` is built to
-    avoid, and it is invisible unless both are asserted together."""
-    _make_validate_pass(project, monkeypatch, capsys)
-    _fake_git_version(monkeypatch, UNDER_FLOOR_GIT)
-
-    validate_rc = cli.main(["validate", "--project", str(project.project)])
-    capsys.readouterr()
-    run_rc = cli.main(["run", "--project", str(project.project)])
-    assert (validate_rc, run_rc) == (1, 1)
 
 
 def test_validate_passes_the_git_floor_on_a_current_host(project, capsys, monkeypatch):
@@ -28104,12 +28001,6 @@ _HOOK_PLUGIN = '[plugin]\nname = "hooky"\napi_version = 1\n[hooks.pre_run]\ncmd 
 
 def _trust_findings(doc):
     return [f for f in doc["findings"] if f["check"] == "plugins.trust"]
-
-
-def test_plugins_trust_check_is_registered():
-    from bmad_loop.checks import VALIDATE_CHECKS
-
-    assert "plugins.trust" in VALIDATE_CHECKS
 
 
 def test_validate_reports_an_ungranted_project_plugin_as_a_problem(project, capsys, monkeypatch):

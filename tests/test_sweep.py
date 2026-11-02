@@ -16537,7 +16537,9 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     crash on them at `_loop`'s own bare `read_for_write` regardless. So: the run
     ends reported rather than crashed, cycle 1's work is kept, HEAD does NOT carry
     the undecodable bytes, they stay dirty for a human to repair, and cycle 2 never
-    triages.
+    triages. The plan carries no bundles, so the stop writes no
+    `sweep-bundles-withheld` row: remove `if bundles:` around that row in `_cycle`
+    and a zero-count row appears.
 
     Ablation: delete the `if self._prune_ledger_unreadable:` arm from `_loop`.
     Every assertion below that names the stop reddens, `sweep-ledger-commit` goes
@@ -16548,7 +16550,13 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     asserts, which is exactly why the commit count and `_ledger_differs_from_head`
     are the assertions carrying the ablation now. Setting the flag without reading
     it reds the same way for the same reason. The separate no-progress row below
-    establishes ordering against `not progressed`."""
+    establishes ordering against `not progressed`.
+
+    Ordering inside the prune: the `_ledger_unfit_to_publish()` refusal sits BELOW
+    the three read arms, so this ledger still takes DW-182's arm (its own token,
+    its own carry, the "could not be decoded mid-sweep" headline rather than the
+    generic one) even though `_ledger_in_doubt` is armed here too. Move that
+    refusal above the read and the prune refuses on `ledger-in-doubt` instead."""
     engine, adapter = _sweep_with_ledger_fault_at_the_decision_prompt(
         project,
         lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
@@ -16561,7 +16569,10 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     assert [spec.role for spec in adapter.sessions] == ["triage"]  # cycle 2 never triaged
     assert project.deferred_work.read_bytes() == _UNDECODABLE_LEDGER  # the window really opened
     [refused] = _records(engine, "sweep-preanswer-prune-refused")
-    assert refused["reason"] == "ledger-unreadable"
+    assert refused["reason"] == "ledger-unreadable"  # DW-182 wins...
+    assert "not valid UTF-8" in refused["error"]
+    assert engine._ledger_in_doubt  # ...though the in-doubt refusal's precondition holds
+    assert engine._prune_ledger_unreadable  # the carry the in-doubt arm does not set
     # The scaffolding every row here rests on, pinned rather than assumed: the fault
     # lands inside `prompter.ask`, so DW-2's own `close` effect necessarily meets the
     # same corrupt bytes and takes DW-186's degrade. Were that arm to raise instead,
@@ -16573,6 +16584,7 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     assert done["reason"] == "ledger-unreadable"
     assert done["stop_cause"] == done["reason"]
     assert done["cycles"] == 1  # the cycle COMPLETED, unlike `legacy-appeared`'s cycle - 1
+    assert _records(engine, "sweep-bundles-withheld") == []  # no bundles, no withheld claim
     # cycle 1's close was published; the boundary commit was NOT taken, so the
     # bytes nobody can decode are absent from HEAD and still dirty on disk.
     assert len(_records(engine, "sweep-ledger-commit")) == 1
@@ -16585,6 +16597,7 @@ def test_an_undecodable_prune_refusal_ends_a_repeat_run_before_the_boundary_comm
     assert f"repair {project.deferred_work} by hand" in attention
     assert f"commit or stash any changes in {project.repo_root}" in attention
     assert attention.count("the deferred-work ledger could not be decoded mid-sweep:") == 1
+    assert "not fit to publish" not in attention
 
 
 def test_an_undecodable_prune_in_cycle_two_keeps_the_completed_bundle(project):
@@ -16706,7 +16719,16 @@ def test_a_faulted_decision_effect_withholds_the_same_cycles_bundles(project):
 
 
 def test_a_healthy_decision_phase_still_dispatches_the_cycles_bundles(project):
-    """A healthy phase dispatches every bundle.
+    """A healthy phase dispatches every bundle and arms nothing: neither the
+    cycle-scoped close latch nor the run-scoped mirror (DW-218/219), in memory
+    or on disk. The positive healthy row for the persisted flag: arming the
+    mirror unconditionally, or leaving `_record_ledger_doubt` ungated at
+    `_decisions_phase`'s `=` publish, would pass every withholding row while
+    withholding every resume.
+
+    The close latch's per-cycle RESET is defense-in-depth no row can grade:
+    `_loop` stops at the boundary of any cycle that armed it, so no later
+    `_close_resolved` re-enters with it set.
 
     Ablation: make `_cycle`'s ledger-in-doubt guard unconditional; dev/review
     sessions disappear and a withheld row appears."""
@@ -16721,28 +16743,12 @@ def test_a_healthy_decision_phase_still_dispatches_the_cycles_bundles(project):
     assert _records(engine, "sweep-bundles-withheld") == []
     assert engine.state.tasks["dw-ledger-fix"].phase == Phase.DONE
     assert "change for dw-ledger-fix" in git(project.project, "show", "HEAD:src.txt")
+    assert not engine._close_ledger_in_doubt and not engine._ledger_unfit_to_publish()
+    assert engine.state.sweep_ledger_in_doubt is False
+    assert load_state(engine.run_dir).sweep_ledger_in_doubt is False
     # Everything closed, so cycle 2 stops on `no-open` rather than on the gate.
     [done] = _records(engine, "sweep-repeat-done")
     assert done["reason"] == "no-open"
-
-
-def test_a_faulted_cycle_with_no_bundles_writes_no_withheld_row(project):
-    """An empty bundle list still stops, without claiming withheld work.
-
-    Ablation: remove `if bundles:` around the withheld row; a zero-count row appears."""
-    engine, _ = _sweep_with_ledger_fault_at_the_decision_prompt(
-        project,
-        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
-        policy=repeat_policy(),
-    )
-
-    summary = engine.run()
-
-    assert not summary.crashed and not summary.paused
-    assert _records(engine, "sweep-bundles-withheld") == []
-    [done] = _records(engine, "sweep-repeat-done")
-    assert done["reason"] == "ledger-unreadable"
-    assert done["stop_cause"] == done["reason"]
 
 
 def test_a_decodable_decision_fault_withholds_the_bundle_that_would_publish_it(
@@ -17020,54 +17026,6 @@ def test_a_faulted_close_phase_withholds_the_same_cycles_bundles(project, monkey
     assert attention.count("the deferred-work ledger is not fit to publish:") == 1
     assert "could not be decoded" not in attention
     assert f"repair {project.deferred_work} by hand" in attention
-
-
-def test_a_healthy_close_phase_dispatches_its_bundles(project):
-    """The close latch is CYCLE-scoped, so one bad cycle cannot withhold the rest of
-    the run. Nothing faults here, so nothing is ever armed.
-
-    The RESET itself is defense-in-depth, not a property this row can grade, and no
-    row can: `_loop` stops (or returns) at the boundary of any cycle that armed the
-    latch, so no later `_close_resolved` ever re-enters with it set and the
-    "cycle 1 faults, cycle 2 does not" run is unreachable. The latch is already
-    cycle-bound by that stop; the reset is what keeps it so if a future caller ever
-    continues past one. Kept for that reason, asserted for none.
-
-    Ablation: make `_cycle`'s dispatch gate unconditional and every assertion below
-    reds — which is the claim this row actually carries: a healthy close phase arms
-    nothing and withholds nothing."""
-    write_ledger(project, {"DW-1": "open", "DW-3": "open"})
-    plan = triage_result(
-        ["DW-1", "DW-3"],
-        already_resolved=[{"id": "DW-1", "evidence": "already guarded at src.txt:1"}],
-        bundles=[{"name": "ledger-fix", "dw_ids": ["DW-3"], "intent": "fix"}],
-    )
-    engine, adapter = make_sweep(
-        project,
-        [
-            triage_effect(plan),
-            bundle_dev_effect(project, "ledger-fix", ["DW-3"]),
-            bundle_review_effect(project, "ledger-fix"),
-        ],
-        policy=repeat_policy(),
-    )
-
-    summary = engine.run()
-
-    assert not summary.crashed and not summary.paused
-    assert not engine._close_ledger_in_doubt and not engine._ledger_unfit_to_publish()
-    # ...and the RUN-scoped mirror (DW-218/219) is False in memory AND on disk. The
-    # positive healthy row for the persisted flag: without it, arming the mirror
-    # unconditionally — or leaving `_record_ledger_doubt` ungated at
-    # `_decisions_phase`'s `=` publish, which runs on every cycle — would pass every
-    # withholding row in this file while withholding the whole archive of resumes.
-    assert engine.state.sweep_ledger_in_doubt is False
-    assert load_state(engine.run_dir).sweep_ledger_in_doubt is False
-    assert [spec.role for spec in adapter.sessions] == ["triage", "dev", "review"]
-    assert _records(engine, "sweep-bundles-withheld") == []
-    assert engine.state.tasks["dw-ledger-fix"].phase == Phase.DONE
-    [done] = _records(engine, "sweep-repeat-done")
-    assert done["reason"] == "no-open"  # everything closed, so cycle 2 stops cleanly
 
 
 # ------------------- DW-218/219: the cycle's verdict has to survive the process
@@ -18579,33 +18537,6 @@ def test_a_decodable_fault_keeps_the_pre_answer_it_would_have_pruned(project, mo
     assert _records(engine, "sweep-ledger-commit-clean") == []
 
 
-def test_an_undecodable_ledger_still_takes_the_dw182_prune_arm(project):
-    """Ordering, stated: the new refusal sits BELOW the three read arms, so a ledger
-    that will not decode still takes DW-182's arm — its own token, its own carry,
-    and the "could not be decoded mid-sweep" headline rather than the generic one —
-    even though `_ledger_in_doubt` is armed here too.
-
-    Ablation: move the `_ledger_unfit_to_publish()` refusal above the read and every
-    assertion below reds; the run would report a decodable ledger it never read."""
-    engine, _ = _sweep_with_ledger_fault_at_the_decision_prompt(
-        project,
-        lambda ledger: ledger.write_bytes(_UNDECODABLE_LEDGER),
-        policy=repeat_policy(),
-    )
-
-    summary = engine.run()
-
-    assert not summary.crashed and not summary.paused
-    assert engine._ledger_in_doubt  # the new arm's precondition holds...
-    [refused] = _records(engine, "sweep-preanswer-prune-refused")
-    assert refused["reason"] == "ledger-unreadable"  # ...and DW-182 still wins
-    assert "not valid UTF-8" in refused["error"]
-    assert engine._prune_ledger_unreadable  # the carry the new arm does not set
-    attention = (engine.run_dir / "ATTENTION").read_text(encoding="utf-8")
-    assert attention.count("the deferred-work ledger could not be decoded mid-sweep:") == 1
-    assert "not fit to publish" not in attention
-
-
 # ------------------- DW-201: every repeat stop keeps its token through a dump
 
 
@@ -18622,42 +18553,14 @@ _REPEAT_STOP_TOKENS = frozenset(
 )
 
 
-def test_a_repeat_stop_journals_a_stop_cause_beside_its_reason(project):
-    """DW-201, live. `sweep-repeat-done` says WHY the repeat loop stopped through
-    `reason`, and `reason` is in `diagnostics._JOURNAL_DROP_FIELDS` — so
-    `bmad-loop diagnose` rendered `reason_present: true` and every stop
-    collapsed into one indistinguishable row. `max-cycles` ("your budget ran out")
-    and `ledger-unreadable` ("a human has to repair the file") are opposite
-    findings, and a dump could tell them apart only by inferring from other rows.
-
-    `stop_cause` is added BESIDE `reason`, never in place of it: the raw journal
-    and the existing rows above all name `reason`, so both are
-    written and both carry the same token. Same closed-slug convention as
-    `regen_cause` (DW-164) and `drop_cause`.
-
-    One stop is driven for real here — a cycle whose triage skips everything, so
-    nothing is addressable and the loop stops on `no-progress` — which is what
-    grades that the field reaches the journal at all. The row below is the TOTAL
-    half, covering the four stops no single run can reach at once.
-
-    Ablation: drop `stop_cause` from the `not progressed` arm and this reds on the
-    missing key."""
-    write_ledger(project, {"DW-1": "open"})
-    plan = triage_result(["DW-1"], skip=[{"id": "DW-1", "reason": "not this cycle"}])
-    engine, _ = make_sweep(project, [triage_effect(plan)], policy=repeat_policy())
-
-    summary = engine.run()
-
-    assert not summary.crashed and not summary.paused
-    [done] = _records(engine, "sweep-repeat-done")
-    assert done["reason"] == "no-progress"  # unchanged, still written
-    assert done["stop_cause"] == "no-progress"  # ...and now a copy that survives a dump
-    assert done["stop_cause"] in _REPEAT_STOP_TOKENS
-
-
 def test_every_repeat_stop_pairs_its_reason_with_the_same_stop_cause():
     """The TOTAL half of DW-201: all nine `sweep-repeat-done` writes in `sweep.py`,
     graded at the source rather than by nine separate runs.
+
+    `reason` is in `diagnostics._JOURNAL_DROP_FIELDS`, so a dump collapses every
+    stop into one row; `stop_cause` is written BESIDE it, never in place of it.
+    The live half is `test_repeat_stops_on_no_progress`, a real stop whose
+    journal row carries both fields.
 
     Three claims a behavioral row cannot make together: every write passes BOTH
     fields, the two are the SAME literal on each write (a `stop_cause` that drifted
@@ -36235,18 +36138,6 @@ def _assert_escalation_held(project, engine, detail: str):
     return resumed
 
 
-def test_escalation_from_triage_verify_holds_over_a_non_legacy_ledger(project, monkeypatch):
-    """DW-426: a format-1 migration ESCALATED from TRIAGE_VERIFY, whose live
-    ledger is the accepted-but-uncommitted rewrite, stays paused on a plain
-    resume: no triage over text the migration never accepted.
-
-    Ablation, performed: drop the DW-426 `elif` in `_loop` and this reddens:
-    the cycle reader triages the migrated ledger with the task still ESCALATED."""
-    engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
-
-    _assert_escalation_held(project, engine, _dw426_non_legacy_detail(engine.run_dir))
-
-
 def test_escalation_holds_over_an_absent_ledger(project, monkeypatch):
     """DW-426: a vanished ledger is not the restored legacy text, so it refuses
     like a non-legacy one instead of reaching the cycle reader.
@@ -36294,22 +36185,6 @@ def test_escalation_from_triage_running_holds_over_an_unreadable_ledger(
     assert _records(resumed, "sweep-repeat-done") == []
 
 
-@needs_dir_fd_recovery
-def test_escalation_on_a_non_legacy_rival_holds_and_keeps_the_rival(project, monkeypatch):
-    """DW-426: a refused non-legacy rival (`migration_ledger_rival` latched) is
-    not the operator remedy; the next plain resume re-pauses and the rival bytes
-    and the latch survive.
-
-    Ablation, performed: drop the DW-426 `elif` and this reddens: the rival is
-    triaged as if it were an accepted DW ledger."""
-    engine = _escalate_on_a_non_legacy_rival(project, monkeypatch)
-
-    _assert_escalation_held(project, engine, _dw426_non_legacy_detail(engine.run_dir))
-
-    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
-    assert load_state(engine.run_dir).tasks["sweep-migrate"].migration_ledger_rival is True
-
-
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -36323,7 +36198,17 @@ def test_held_escalation_re_enters_the_migration_once_the_legacy_ledger_returns(
 ):
     """DW-426 operator remedy: after the re-pause, restoring the legacy ledger
     (and deleting the migrate-* records, as the remedy says) makes the arm
-    return, and the existing ESCALATED restart re-migrates to DONE."""
+    return, and the existing ESCALATED restart re-migrates to DONE.
+
+    The re-pause half is the DW-426 hold itself: no triage over text the
+    migration never accepted. `triage-verify` holds over the accepted-but-
+    uncommitted rewrite; `rival` holds over a refused non-legacy rival, whose
+    bytes and `migration_ledger_rival` latch survive (`_assert_escalation_held`
+    pins the live bytes and the whole task).
+
+    Ablation, performed: drop the DW-426 `elif` in `_loop` and every row reddens
+    at `_assert_escalation_held`: the cycle reader triages the migrated ledger
+    (or the rival) with the task still ESCALATED."""
     if scenario == "triage-verify":
         engine = _escalate_from_fallback_triage_verify(project, monkeypatch)
         detail = _dw426_non_legacy_detail(engine.run_dir)

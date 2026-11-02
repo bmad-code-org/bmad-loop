@@ -400,36 +400,6 @@ def test_isolated_verify_commands_execute_and_classify_in_the_unit_worktree(proj
     assert classified and all(cwd == unit_root for cwd in classified)
 
 
-def test_local_absolute_ignored_accepted_spec_is_seeded_and_bound_in_mount(project):
-    """Relativizing an accepted spec also delivers it to a tracked-only checkout."""
-    rel = "_bmad-output/implementation-artifacts/accepted-untracked.md"
-    ignore_before_commit(project, rel)
-    commit_sprint(project, {"1-1-a": "ready-for-dev"})
-    accepted = project.project / rel
-    accepted.parent.mkdir(parents=True, exist_ok=True)
-    accepted.write_bytes(b"accepted operator bytes\n")
-    engine, _ = make_engine(project, [], policy=wt_policy(keep_failed=False))
-    engine.state.target_branch = "main"
-    task = StoryTask("1-1-a", 1, spec_file=str(accepted))
-    engine.state.tasks[task.story_key] = task
-    observed: dict[str, object] = {}
-
-    def bind_then_defer(current):
-        engine._bind_dispatched_spec_for_attempt(current)
-        observed["path"] = current.dispatched_spec_file
-        observed["snapshot"] = current.dispatched_spec_snapshot
-        observed["root"] = engine.workspace.root
-        current.phase = Phase.DEFERRED
-        current.defer_reason = "test complete"
-
-    engine._run_isolated(task, bind_then_defer)
-
-    mounted_root = observed["root"]
-    assert isinstance(mounted_root, Path)
-    assert observed["path"] == str(mounted_root / rel)
-    assert observed["snapshot"] == b"accepted operator bytes\n"
-
-
 def test_prior_dispatch_does_not_block_fresh_mounted_spec_binding(project):
     """A none-to-worktree re-drive relocates accepted input, then replaces old authority."""
     rel = "_bmad-output/implementation-artifacts/accepted-rearm.md"

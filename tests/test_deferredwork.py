@@ -4582,27 +4582,6 @@ def test_mark_open_many_matches_serial_mark_open_bytes(tmp_path, monkeypatch):
     assert seed.read_text(encoding="utf-8") == twin.read_text(encoding="utf-8")
 
 
-def test_mark_open_many_writes_nothing_when_no_id_is_eligible(tmp_path, monkeypatch):
-    """A replayed rollback over already-open entries leaves the file untouched —
-    and, since #736, takes no lock to establish that.
-
-    Ablation: delete `mark_open_many`'s pre-lock probe block — the acquisition
-    assertion reds. NOT the `if not reopened: return []` guard, whose documented
-    ablation used to live here and now goes GREEN: the probe answers these exact
-    inputs above the lock, so the write spy never reaches that guard. Its
-    ablation moved to `test_a_failing_probe_read_falls_through_to_the_locked_path`,
-    which faults the probe read so the same inputs reach the hold."""
-    path = write_ledger(tmp_path)
-    writes, acquisitions = [], []
-    _counting_write(monkeypatch, writes)
-
-    with _counting_lock(monkeypatch, acquisitions):
-        assert mark_open_many(path, ["DW-1", "DW-99"], "by dw-a", OPERATION_ID) == []
-
-    assert writes == []
-    assert acquisitions == []
-
-
 def test_held_reopenable_closes_names_exactly_what_mark_open_many_would_reopen(tmp_path):
     """`held_reopenable_closes` is the read-only twin of `mark_open_many`'s decision:
     a close this operation wrote is held, while an entry that is still open, was
@@ -4810,29 +4789,6 @@ def test_record_decision_require_open_still_records_on_an_open_entry(tmp_path):
     assert entry is not None
     assert entry.status.startswith("done ")
     assert "decision: 2026-06-11 close — moot" in entry.body
-
-
-def test_record_decision_returns_false_for_a_missing_entry(tmp_path, monkeypatch):
-    """A missing id records nothing, writes nothing, and takes no lock (#736).
-
-    Ablation: delete `record_decision`'s pre-lock probe block — the acquisition
-    assertion reds. The ablation this docstring used to carry ("write
-    unconditionally after the appliers") now goes GREEN: the probe answers a
-    missing id above the lock, so the write spy never reaches the under-lock
-    `if updated is None` guard. That guard's ablation moved to
-    `test_a_failing_probe_read_falls_through_to_the_locked_path`, which faults
-    the probe read so this same call reaches the hold."""
-    path = write_ledger(tmp_path)
-    before = path.read_text(encoding="utf-8")
-    writes, acquisitions = [], []
-    _counting_write(monkeypatch, writes)
-
-    with _counting_lock(monkeypatch, acquisitions):
-        assert record_decision(path, "DW-99", "2026-06-11", "keep", "x", close_note="y") is False
-
-    assert writes == []
-    assert acquisitions == []
-    assert path.read_text(encoding="utf-8") == before
 
 
 def test_mark_done_many_per_id_notes(tmp_path, monkeypatch):
@@ -5420,12 +5376,14 @@ def test_a_read_dependent_noop_takes_no_lock(tmp_path, monkeypatch, name):
     path = _noop_seed_for(tmp_path, name)
     before = path.read_text(encoding="utf-8")
     call, expected = NOOP_MUTATORS[name]
-    acquisitions = []
+    acquisitions, writes = [], []
+    _counting_write(monkeypatch, writes)
 
     with _counting_lock(monkeypatch, acquisitions):
         assert call(path) == expected
 
     assert acquisitions == []
+    assert writes == []
     assert path.read_text(encoding="utf-8") == before
     assert not (path.parent / ARCHIVE_REL).exists()
 
@@ -5928,21 +5886,6 @@ def test_ledger_read_error_is_not_caught_by_an_existing_handler():
     assert not issubclass(deferredwork.LedgerReadError, ValueError)
 
 
-def test_read_for_write_wraps_oserror(tmp_path, monkeypatch):
-    """DW-279: refused repair reads preserve the original OS fault as cause.
-
-    Removing the corresponding OS wrap must fail this regression.
-    """
-    path = write_ledger(tmp_path)
-    fault_read_text(monkeypatch, path)
-
-    with pytest.raises(deferredwork.LedgerReadFault) as raised:
-        deferredwork.read_for_write(path)
-
-    assert isinstance(raised.value.__cause__, PermissionError)
-    assert str(path) in str(raised.value)
-
-
 @pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO, errno.ESTALE, errno.EBADF])
 def test_read_for_write_propagates_a_refused_metadata_probe(tmp_path, monkeypatch, error_number):
     """Refused metadata is a fault, never absence (DW-221/253/279).
@@ -6246,7 +6189,9 @@ def test_observe_ledger_attributes_a_fault_with_no_text(tmp_path, monkeypatch):
 def test_read_for_observation_degrades_on_undecodable_bytes(tmp_path):
     """The OBSERVATION arm never raises — it hands back an empty text plus an
     ATTRIBUTED fault, so a caller holding a journal records which fault it degraded
-    on rather than reporting an empty ledger.
+    on rather than reporting an empty ledger. An unreadable LOCATION degrades the same
+    way (`test_observe_ledger_attributes_a_fault_with_no_text`), attributed by class so
+    the two stay distinguishable downstream.
     Ablation: drop `UnicodeDecodeError` from the except tuple and this reddens with
     that exception escaping instead of a `("", fault)` pair."""
     path = tmp_path / "deferred-work.md"
@@ -6256,20 +6201,6 @@ def test_read_for_observation_degrades_on_undecodable_bytes(tmp_path):
 
     assert text == ""
     assert fault is not None and fault.startswith("UnicodeDecodeError: ")
-
-
-def test_read_for_observation_degrades_on_oserror(tmp_path, monkeypatch):
-    """The other half of the OBSERVATION arm's tuple, and the reason it is a tuple
-    rather than a bare `str`: an unreadable LOCATION degrades the same way as
-    unreadable bytes, attributed by class so the two are distinguishable downstream.
-    Ablation: drop `OSError` from the except tuple and this reddens."""
-    path = write_ledger(tmp_path)
-    fault_read_text(monkeypatch, path)
-
-    text, fault = deferredwork.read_for_observation(path)
-
-    assert text == ""
-    assert fault is not None and fault.startswith("PermissionError: ")
 
 
 def test_read_for_observation_degrades_on_a_metadata_fault(tmp_path, monkeypatch):
@@ -6361,7 +6292,8 @@ def test_mark_done_many_raises_on_an_undecodable_ledger_and_writes_nothing(tmp_p
 def test_read_for_write_wraps_text_read_faults_even_when_the_probe_would_absorb_them(
     tmp_path, monkeypatch, fault
 ):
-    """A successful regular-file probe never licenses synthesizing empty text.
+    """A successful regular-file probe never licenses synthesizing empty text, and a
+    refused repair read keeps the original OS fault as its cause (DW-279).
 
     Ablation: remove the text-read wrap; every row raises the original OSError.
     Reusing probe_absence here also fails the disappearance/type-change rows.

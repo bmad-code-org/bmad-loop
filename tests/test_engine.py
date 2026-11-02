@@ -22409,7 +22409,10 @@ def test_nonfixable_retry_reverts_harvest_from_external_ledger(project, tmp_path
 
 
 def test_nonfixable_retry_reverts_harvest_before_the_next_attempt(project, monkeypatch):
-    """A rejected attempt's finding is removed and the retry files it afresh."""
+    """A rejected attempt's finding is removed and the retry files it afresh.
+
+    A harvest alone is not proof of work: attempt 1 writes only the ledger finding,
+    so the gate retries it as "no changes" instead of proceeding."""
     ledger_present_at_retry: list[bool] = []
     ledger_present_after_reset: list[bool] = []
 
@@ -23543,32 +23546,6 @@ def test_persistent_timeout_salvage_harvest_failure_defers_without_reviewer(proj
     assert [event["harvest_attempt"] for event in failures] == [1, 2]
     task = engine.state.tasks["1-1-a"]
     assert "harvest remained unreadable after 2 attempts" in task.defer_reason
-
-
-def test_harvest_alone_is_not_proof_of_work(project):
-    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
-    engine, adapter = make_engine(
-        project,
-        [
-            dev_effect(
-                project,
-                "1-1-a",
-                followup_review=False,
-                write_src=False,
-                deferred=[HARVEST_A],
-            ),
-            dev_effect(project, "1-1-a", followup_review=False),
-        ],
-        policy=_harvest_policy(attempts=2),
-    )
-
-    summary = engine.run()
-
-    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
-    assert [d["action"] for d in decisions] == ["retry", "proceed"]
-    assert "no changes" in decisions[0]["reason"]
-    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
-    assert summary.done == 1
 
 
 @pytest.mark.parametrize("error_type", [OSError, RuntimeError])

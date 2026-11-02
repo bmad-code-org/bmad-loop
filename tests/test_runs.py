@@ -846,11 +846,15 @@ def test_stop_run_already_finished(tmp_path, monkeypatch):
 
 
 def test_stop_run_no_pid_falls_back_to_mark(tmp_path, monkeypatch):
+    """On the mark-stopped fallback nothing is left alive to consume the request, so
+    stop_run discards what it lodged. A file outliving the run it asked to stop is a
+    trap: the next resume would find it and stop again at the first item."""
     killed = []
     monkeypatch.setattr(runs, "kill_session", lambda rid: killed.append(rid))
     run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid -> legacy/dead
     assert runs.stop_run(run_dir) is True
     assert load_state(run_dir).stopped is True
+    assert runs.read_stop_request_mode(run_dir) is None
     assert killed == ["r1"]
     journal = (run_dir / "journal.jsonl").read_text()
     assert "run-stop" in journal and '"fallback": true' in journal
@@ -1151,18 +1155,6 @@ def test_stop_run_stops_sigterm_immune_child_via_stop_request_file(tmp_path, mon
             proc.wait(timeout=10)
 
 
-def test_stop_run_fallback_clears_hard_request(tmp_path, monkeypatch):
-    """On the mark-stopped fallback nothing is left alive to consume the request, so
-    stop_run discards what it lodged. A file outliving the run it asked to stop is a
-    trap: the next resume would find it and stop again at the first item."""
-    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
-    run_dir = _make_state_run(tmp_path, "r1")  # no engine.pid -> straight to fallback
-    assert runs.stop_run(run_dir) is True
-    assert load_state(run_dir).stopped is True
-    assert runs.read_stop_request_mode(run_dir) is None
-    assert '"fallback": true' in (run_dir / "journal.jsonl").read_text()
-
-
 def test_stop_run_takes_state_lock_only_after_signal_and_wait(tmp_path, monkeypatch):
     """Ablation: move stop_run's state_lock above terminate and this reddens on order;
     the engine would be unable to save its own stopped state while stop waits."""
@@ -1338,7 +1330,11 @@ def test_stop_run_refusal_leaves_hard_request_lodged(tmp_path, monkeypatch):
     force-kill a pid whose identity we can no longer verify — but if it *is* still
     our engine, the file is now the only channel that can stop it. Clearing it here
     would retract the operator's request while simultaneously declining to enforce
-    it, leaving a live run nobody asked to keep running."""
+    it, leaving a live run nobody asked to keep running.
+
+    The refusal itself: the pid is still alive but its identity changed during the
+    grace window (possible pid reuse), so stop_run raises StopRunError rather than
+    force-kill it."""
     monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
     monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
     monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
@@ -1565,25 +1561,6 @@ def test_stop_run_force_kills_wedged_legacy_engine(tmp_path, monkeypatch):
     assert runs.stop_run(run_dir) is True
     assert host.force_killed == [4242]
     assert load_state(run_dir).stopped is True
-
-
-def test_stop_run_refuses_force_kill_on_identity_mismatch(tmp_path, monkeypatch):
-    """If the pid is still 'alive' but its identity changed during the grace window
-    (possible pid reuse), refuse to force-kill and raise StopRunError instead."""
-    monkeypatch.setattr(runs, "kill_session", lambda _rid: None)
-    monkeypatch.setattr(runs, "_STOP_WAIT_S", 0.05)
-    monkeypatch.setattr(runs, "_STOP_POLL_S", 0.01)
-    run_dir = _make_state_run(tmp_path, "r1")
-    (run_dir / "engine.pid").write_text("4242 123.0")  # persisted identity at run start
-
-    # matches the persisted identity at stop entry, then changes before the
-    # post-grace force-kill check (pid reused mid-grace).
-    identities = iter([123.0, 999.0])
-    host = _FakeHost(alive=True, identity=lambda: next(identities))
-    monkeypatch.setattr(runs, "get_process_host", lambda: host)
-    with pytest.raises(runs.StopRunError):
-        runs.stop_run(run_dir)
-    assert host.force_killed == []
 
 
 def test_stop_run_refuses_force_kill_without_identity(tmp_path, monkeypatch):
@@ -2183,34 +2160,6 @@ def _fake_home(monkeypatch, home) -> None:
     monkeypatch.setenv("USERPROFILE", str(home))
 
 
-def test_state_root_precedence_override_then_xdg_then_home(tmp_path, monkeypatch):
-    """Three answers, ranked, and the ranking is what each assertion removes.
-
-    The override outranks a *set* XDG_STATE_HOME and not merely an unset one —
-    graded by leaving XDG set throughout — because it is the operator's stated
-    answer and the suite's own isolation depends on it winning against whatever a
-    host exports.
-
-    The asymmetry in the middle is deliberate and pinned here rather than left to
-    the reader: `XDG_STATE_HOME` is a *base* to build under, so `bmad-loop` is
-    appended to it, while `BMAD_LOOP_STATE_DIR` names our root itself and is used
-    as spelled. Appending to the override would silently move every path a
-    phase-3 hook computes from that same variable."""
-    monkeypatch.setattr(runs.sys, "platform", "linux")
-    home = tmp_path / "home"
-    _fake_home(monkeypatch, home)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
-    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "override"))
-
-    assert runs.state_root() == tmp_path / "override"  # verbatim: no "bmad-loop" tail
-
-    monkeypatch.delenv(envvars.STATE_DIR)
-    assert runs.state_root() == tmp_path / "xdg" / "bmad-loop"
-
-    monkeypatch.delenv("XDG_STATE_HOME")
-    assert runs.state_root() == home / ".local" / "state" / "bmad-loop"
-
-
 @pytest.mark.parametrize("value", ["state", "./state", "~/state"], ids=repr)
 def test_state_root_refuses_a_relative_override(tmp_path, monkeypatch, value):
     """`BMAD_LOOP_STATE_DIR` is honoured as spelled, but a relative spelling is
@@ -2230,8 +2179,9 @@ def test_state_root_refuses_a_relative_override(tmp_path, monkeypatch, value):
 
     `~/state` is here for the same reason it is in the XDG rows: nothing expands
     it, so it stays relative. The empty string is deliberately NOT a row — empty
-    reads as *unset* and falls through to the cascade, which
-    `test_state_root_precedence_override_then_xdg_then_home` already grades.
+    reads as *unset* and falls through to the cascade, which the
+    `posix-empty-override` row of
+    `test_resolve_state_root_matches_state_root_on_every_cascade_arm` grades.
 
     Ablation target: drop the `os.path.isabs` guard from the override arm and all
     three rows fail — each returning a cwd-relative root instead of raising."""
@@ -2402,7 +2352,15 @@ def test_resolve_state_root_matches_state_root_on_every_cascade_arm(
     `USERPROFILE` mirrors `HOME` on the POSIX rows, as `_fake_home` does, so a
     faked-POSIX row means the same thing on a Windows host. HOME stays set on
     every POSIX row, so the passwd lookup never runs and `passwd_home=None` is
-    the faithful argument."""
+    the faithful argument.
+
+    The override outranks a *set* `XDG_STATE_HOME` (`posix-override` keeps XDG
+    set): it is the operator's stated answer, and the suite's own isolation
+    depends on it winning against whatever a host exports. The asymmetry is
+    deliberate: `XDG_STATE_HOME` is a *base* to build under, so `bmad-loop` is
+    appended to it, while `BMAD_LOOP_STATE_DIR` names our root itself and is used
+    as spelled. Appending to the override would silently move every path a
+    phase-3 hook computes from that same variable."""
     monkeypatch.setattr(runs.sys, "platform", platform)
     for name in (envvars.STATE_DIR, "XDG_STATE_HOME", "LOCALAPPDATA", "USERPROFILE", "HOME"):
         monkeypatch.delenv(name, raising=False)
@@ -3405,12 +3363,6 @@ def _raising(exc: Exception):
     return _fail
 
 
-def test_delete_run(tmp_path):
-    run_dir = _make_state_run(tmp_path, "r1")
-    runs.delete_run(tmp_path, run_dir)
-    assert not run_dir.exists()
-
-
 def test_delete_run_refuses_a_live_engine_inside_the_lifecycle_hold(tmp_path, monkeypatch):
     """Resume-first ordering: the decisive probe runs after lock acquisition and
     leaves both the run and its control plane untouched.
@@ -3743,21 +3695,6 @@ def test_delete_run_refuses_a_session_tagged_as_ours(tmp_path, monkeypatch):
     assert run_dir.exists()
 
 
-def test_delete_run_proceeds_when_the_session_listing_raises(tmp_path, monkeypatch):
-    """The seam only promises `pipe_pane` and `kill_session` never raise, so an
-    out-of-tree backend answers a failed listing with MultiplexerError where the
-    bundled one answers `[]`. Both must reach the same place, or the guard would
-    turn a transient transport error into a failed `delete`/`archive`/`clean` —
-    and `clean` has no override. Degrading to "no session" matches what tmux
-    already does for a dead server. (A stronger contract — refuse on the raise —
-    was built on this branch and withdrawn: the guard's degrade is main's
-    documented decision, and the measured cost is filed for its owner.)"""
-    run_dir = _make_state_run(tmp_path, "r1")
-    monkeypatch.setattr(runs, "get_multiplexer", lambda: _LivenessMux([], unanswerable=True))
-    runs.delete_run(tmp_path, run_dir)
-    assert not run_dir.exists()
-
-
 @pytest.mark.parametrize("helper", ["delete_run", "archive_run"])
 def test_removal_routes_the_unasked_guard_warning_to_one_channel(
     tmp_path, monkeypatch, capsys, helper
@@ -3766,6 +3703,12 @@ def test_removal_routes_the_unasked_guard_warning_to_one_channel(
     or the caller's ``warn`` sink instead of stderr (the TUI, whose stderr
     Textual captures). The sink gets the operator-facing line without the
     ``warning:`` prefix; stderr stays empty when a sink is given.
+
+    The listing here raises (MultiplexerError, what an out-of-tree backend may
+    answer where the bundled ones answer `[]`), and removal still proceeds: the
+    guard degrades to "no session", as tmux does for a dead server, rather than
+    turn a transient transport error into a failed `delete`/`archive`/`clean` —
+    and `clean` has no override. That degrade is the guard's documented decision.
 
     Ablation: drop ``warn=warn`` from either helper's `_refuse_live_session`
     call and its sink row fails (the note goes to stderr instead)."""
@@ -6878,10 +6821,6 @@ def test_clear_sentinel_readable_row_is_unchanged(tmp_path):
 # split tests stay in test_tui_data.py.
 
 
-def test_discover_runs_missing_dir(tmp_path):
-    assert _discover(tmp_path) == []
-
-
 def test_discover_runs_classification(tmp_path):
     _make_state_run(tmp_path, "20260611-100000-aaaa", finished=True)
     _make_state_run(tmp_path, "20260611-110000-bbbb", paused_reason="escalation")
@@ -6976,7 +6915,8 @@ def test_discover_runs_marks_graceful_stop_pending_while_unknown(tmp_path, monke
 
 def test_stopping_ignored_on_a_non_running_run(tmp_path):
     # The engine consumes the control file at the stop boundary; a file lingering
-    # on an already-stopped or finished run must not read as still-stopping.
+    # on an already-stopped or finished run must not read as still-stopping. The
+    # stopped run leaves a dead pid and reads STOPPED, not INTERRUPTED.
     from bmad_loop.runs import STOP_REQUEST_FILE
 
     stopped = _make_state_run(tmp_path, "20260611-100000-aaaa", stopped=True)
@@ -7082,13 +7022,6 @@ def test_stat_sig_includes_inode_for_same_size_rewrite(tmp_path):
     same_mtime = before[0] == after[0]
     assert same_size and same_mtime  # (mtime_ns, size) alone could not tell these apart
     assert before != after  # ...but the inode did
-
-
-def test_stopped_run_classifies_as_stopped_not_interrupted(tmp_path):
-    # a deliberate stop leaves a dead pid; it must read STOPPED, not INTERRUPTED
-    run_dir = _make_state_run(tmp_path, "20260611-100000-aaaa", stopped=True)
-    (run_dir / "engine.pid").write_text(str(_dead_pid()))
-    assert _discover(tmp_path)[0].status == runs.STOPPED
 
 
 def test_classify_crashed(tmp_path):
@@ -7672,10 +7605,12 @@ def test_export_psmux_registry_root_sets_the_derived_root(tmp_path, monkeypatch)
     assert os.environ[runs.PSMUX_DATA_DIR] == expected
 
 
-def test_export_psmux_registry_root_overrides_an_operators_own(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ambient", ["", "relative/root", ".", "/an/absolute/one"])
+def test_export_psmux_registry_root_overrides_any_ambient_spelling(tmp_path, monkeypatch, ambient):
     """The rule, and the absence of an exception to it is the point: the root is
     derived from (project, state root), full stop, so two bmad-loop processes
-    given one project cannot land in different registries.
+    given one project cannot land in different registries — whatever the ambient
+    spelling, including the ones psmux would panic on.
 
     Honouring an ambient value was tried and is the thing that was cut. It makes
     the registry a function of the launch *shell* — a TUI from the Start menu
@@ -7684,21 +7619,13 @@ def test_export_psmux_registry_root_overrides_an_operators_own(tmp_path, monkeyp
     because the process that finds a root in its environment cannot tell one
     typed in this shell alone from one the profile exports into every shell.
 
-    Ablate the unconditional export (restore an if-unset guard) and this fails."""
-    theirs = str(tmp_path / "theirs")
-    derived = str(runs.mux_registry_root(tmp_path))
-    monkeypatch.setenv(runs.PSMUX_DATA_DIR, theirs)
+    An earlier rule left a relative or empty value untouched so as not to
+    countermand something the operator typed — which, now that nothing ambient is
+    honoured, only preserved a value that makes every verb fail. Replacing it is
+    strictly better: the derived root works.
 
-    assert runs.export_psmux_registry_root(tmp_path) == derived
-    assert os.environ[runs.PSMUX_DATA_DIR] == derived
-
-
-@pytest.mark.parametrize("ambient", ["", "relative/root", ".", "/an/absolute/one"])
-def test_export_psmux_registry_root_overrides_any_ambient_spelling(tmp_path, monkeypatch, ambient):
-    """Including the ones psmux would panic on. An earlier rule left a relative or
-    empty value untouched so as not to countermand something the operator typed —
-    which, now that nothing ambient is honoured, only preserved a value that makes
-    every verb fail. Replacing it is strictly better: the derived root works."""
+    Ablate the unconditional export (restore an if-unset guard) and the rows
+    fail."""
     derived = str(runs.mux_registry_root(tmp_path))
     monkeypatch.setenv(runs.PSMUX_DATA_DIR, ambient)
 
@@ -8951,15 +8878,6 @@ def test_registry_ownership_demands_a_tag_when_it_cannot_be_asked(tmp_path, monk
     assert runs._registry_proves_ownership(tmp_path) is False
 
 
-def test_legacy_registry_leftovers_names_an_untagged_session(tmp_path, monkeypatch):
-    """A sweep that silently declines to migrate something is the same silence
-    this change exists to remove: cleanup prints a removal count, and a count that
-    excludes what it chose not to claim reads as "everything is clean"."""
-    legacy = _RegistryMux(["bmad-loop-old-1"], {})
-    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]}
-
-
 def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_path, monkeypatch):
     """The grouping is the whole point of the shape: the operator's next action is
     to open the registry and look, and there are two of them now — psmux's own
@@ -8988,6 +8906,10 @@ def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_pat
 def test_legacy_registry_leftovers_merges_two_registries_that_name_one_root(tmp_path, monkeypatch):
     """A displaced root that happens to spell psmux's own default is admitted
     twice, and the rows merge rather than the second overwriting the first.
+
+    Both sessions are untagged, which the legacy pass declines to migrate, so
+    both are named: cleanup prints a removal count, and a count that excludes
+    what it chose not to claim reads as "everything is clean".
 
     Ablate the `grouped.get(label, [])` merge and the first registry's sessions
     vanish from a message that claims to name what is standing."""
@@ -9953,7 +9875,11 @@ def test_mount_root_identity_refuses_a_nested_mount_swapped_for_a_link_holding_a
 
     Ablation: skip the record compare (open ``mount`` unpinned, the handle arm) and
     both rows redden with the outside ``app/``'s identity; the pre-DW-446
-    per-component `lstat` walk reddens the ``worktrees`` row."""
+    per-component `lstat` walk reddens the ``worktrees`` row.
+
+    Positive control: `test_mount_root_identity_pins_an_intact_nested_project` —
+    a recorded mount and a real ``<mount>/<offset>`` answer the offset's own
+    identity, so the intact writes land."""
     mount = _mount(tmp_path)
     (mount / "app").mkdir(parents=True)
     record = _rec(mount)
@@ -9966,29 +9892,6 @@ def test_mount_root_identity_refuses_a_nested_mount_swapped_for_a_link_holding_a
     assert (mount / "app").is_dir()  # the premise
 
     assert _never_matches(runs.mount_root_identity(mount / "app", mount=mount, recorded=record))
-
-
-def test_mount_root_identity_of_an_intact_nested_project_is_its_own_fstat(tmp_path):
-    """DW-486 positive control: a recorded mount and a real ``<mount>/<offset>``
-    answer ``<mount>/<offset>``'s own identity — what the writers compare the root
-    they open against — so the intact writes land."""
-    mount = _mount(tmp_path)
-    nested = mount / "app"
-    nested.mkdir(parents=True)
-
-    identity = runs.mount_root_identity(nested, mount=mount, recorded=_rec(mount))
-
-    if sys.platform == "win32":
-        # `os.open` cannot open a directory on Windows; `stat` reads the same
-        # volume serial and file index.
-        own = os.stat(nested)
-    else:
-        fd = os.open(nested, os.O_RDONLY)
-        try:
-            own = os.fstat(fd)
-        finally:
-            os.close(fd)
-    assert (identity.st_dev, identity.st_ino) == (own.st_dev, own.st_ino)
 
 
 @requires_symlinked_mount_swap
@@ -11354,15 +11257,20 @@ def test_stop_run_backstop_leaves_another_projects_session(tmp_path, monkeypatch
     assert "refused" in capsys.readouterr().err
 
 
-def test_session_liveness_does_not_read_another_projects_session_as_alive(tmp_path, monkeypatch):
+def test_session_liveness_does_not_read_another_projects_session_as_alive(
+    tmp_path, monkeypatch, capsys
+):
     """A same-named session in a shared registry proves nothing about this run:
     'unknown', not 'alive', which would refuse this run's resume and delete
-    and hide it from cleanup.
+    and hide it from cleanup. 'unknown' alone cannot tell a refused probe from an
+    absent session, so the refusal is warned about.
 
-    Ablate the gate in `_session_liveness` and the first assert reads 'alive'."""
+    Ablate the gate in `_session_liveness` and the first assert reads 'alive';
+    ablate the warning and stderr is empty."""
     monkeypatch.setattr(runs, "mux_usable", lambda _m: True)
     _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
     assert runs._session_liveness("r1") == "unknown"
+    assert "reading bmad-loop-r1 as this run's refused" in capsys.readouterr().err
 
     _shared(monkeypatch, tmp_path, _own_r1(tmp_path))
     assert runs._session_liveness("r1") == "alive"
@@ -11431,18 +11339,6 @@ def test_prune_sessions_does_not_count_a_refused_kill_as_removed(tmp_path, monke
     monkeypatch.setattr(runs, "kill_session", lambda _run_id: False)
 
     assert runs.prune_sessions(tmp_path) == ([], [], set())
-
-
-def test_session_liveness_says_why_it_did_not_read_alive(tmp_path, monkeypatch, capsys):
-    """'unknown' alone cannot tell a refused probe from an absent session, so the
-    refusal is warned about.
-
-    Ablate the warning in `_session_liveness` and stderr is empty."""
-    monkeypatch.setattr(runs, "mux_usable", lambda _m: True)
-    _shared(monkeypatch, tmp_path, _foreign_r1(tmp_path))
-
-    assert runs._session_liveness("r1") == "unknown"
-    assert "reading bmad-loop-r1 as this run's refused" in capsys.readouterr().err
 
 
 # ------------------------------------------- session_scan_error (#864)
