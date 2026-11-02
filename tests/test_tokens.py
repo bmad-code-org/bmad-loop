@@ -316,13 +316,6 @@ def test_tally_no_usage_lines_is_untracked(tmp_path):
     assert read_usage("claude-jsonl", path) is None
 
 
-def test_tally_block_without_token_keys_is_untracked(tmp_path):
-    path = tmp_path / "t.jsonl"
-    entry = {"type": "assistant", "message": {"usage": {"service_tier": None}}}
-    path.write_text(json.dumps(entry) + "\n")
-    assert tally(path) is None
-
-
 def test_tally_all_zero_usage_is_tracked_zero(tmp_path):
     # An all-zero usage block still counts as seen: tracked zero spend (DW-364).
     path = tmp_path / "t.jsonl"

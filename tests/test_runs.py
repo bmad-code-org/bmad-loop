@@ -4517,39 +4517,52 @@ def test_rearm_plain_mode_sets_ready_for_dev_and_clears_stale_latch(tmp_path):
     assert entry["restore"] is False
 
 
-def test_rearm_clears_a_stale_adopt_latch(tmp_path):
-    """DW-386: an adoption that re-escalated before its latch was spent (e.g. the
-    kept worktree vanished on resume) must not fire an adopt leg on the re-drive.
+@pytest.mark.parametrize(
+    "field,seeded,cleared",
+    [
+        ("adopt_pending", True, False),
+        ("env_fault_site", "probe:decision:dev", None),
+        ("reverify_from", "deferred", ""),
+        ("reverify_replayed", "deferred", ""),
+    ],
+    ids=["dw386-adopt-latch", "dw523-env-fault-site", "reverify-latch", "dw527-post-replay-marker"],
+)
+def test_rearm_clears_a_stale_task_latch(tmp_path, field, seeded, cleared):
+    """A plain re-arm re-implements from the baseline, so every per-attempt latch the
+    escalated attempt left on its task is spent; each row seeds one and pins its clear.
 
-    Ablation, performed: drop the `adopt_pending = False` in
-    `_rearm_escalation_locked` and this reddens."""
-    from bmad_loop.model import Phase
+    [dw386-adopt-latch] DW-386: an adoption that re-escalated before its latch was
+    spent (e.g. the kept worktree vanished on resume) must not fire an adopt leg on
+    the re-drive. Ablation, performed: drop the `adopt_pending = False` in
+    `_rearm_escalation_locked` and this row reddens.
 
+    [dw523-env-fault-site] DW-523: a re-armed story starts with no environment fault
+    on record. Ablation, performed: drop the `env_fault_site = None` in
+    `_rearm_escalation_locked` and this row reddens.
+
+    [reverify-latch] A verify replay that escalated before its decision (a refused
+    board write) leaves `reverify_from` on the escalated task; left set, the fresh
+    attempt's next DEV_VERIFY pause would resume through the verify-replay arm.
+    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this row
+    reddens on the surviving latch.
+
+    [dw527-post-replay-marker] DW-527: a `--reverify` continuation that escalated in
+    review leaves `reverify_replayed` on the escalated task; left set, a mid-review
+    crash of the re-drive would re-latch a verify replay instead of taking
+    resume-restart. Ablation, performed: drop the clear in `_rearm_escalation_locked`
+    and this row reddens on the surviving marker."""
     run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
     state = load_state(run_dir)
-    state.tasks["1-1-a"].adopt_pending = True
+    setattr(state.tasks["1-1-a"], field, seeded)
     save_state(run_dir, state)
 
     runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
 
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.phase == Phase.PENDING
-    assert task.adopt_pending is False
-
-
-def test_rearm_clears_env_fault_site(tmp_path):
-    """DW-523: a re-armed story starts with no environment fault on record.
-
-    Ablation, performed: drop the `env_fault_site = None` in
-    `_rearm_escalation_locked` and this reddens."""
-    run_dir, _spec = _escalated_run(tmp_path, _SPEC_WITH_ARR)
-    state = load_state(run_dir)
-    state.tasks["1-1-a"].env_fault_site = "probe:decision:dev"
-    save_state(run_dir, state)
-
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
-
-    assert load_state(run_dir).tasks["1-1-a"].env_fault_site is None
+    assert getattr(task, field) == cleared
+    if cleared is None or isinstance(cleared, bool):
+        assert getattr(task, field) is cleared
 
 
 def test_adopt_clears_env_fault_site(tmp_path):
@@ -5118,42 +5131,6 @@ def test_rearm_resets_followup_reviews_spent(tmp_path):
     task = load_state(run_dir).tasks["1-1-a"]
     assert task.followup_reviews_spent == 0
     assert task.review_cycle == 0  # reset in lockstep with the counter
-
-
-def test_rearm_clears_a_stale_reverify_latch(tmp_path):
-    """A verify replay that escalated before its decision (a refused board write)
-    leaves `reverify_from` on the escalated task. A plain re-arm re-implements from
-    the baseline, so it spends the latch; left set, the fresh attempt's next
-    DEV_VERIFY pause would resume through the verify-replay arm.
-
-    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this
-    reddens on the surviving latch."""
-    run_dir, _ = _escalated_run(tmp_path, _SPEC_WITH_ARR)
-    state = load_state(run_dir)
-    state.tasks["1-1-a"].reverify_from = "deferred"
-    save_state(run_dir, state)
-
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
-
-    assert load_state(run_dir).tasks["1-1-a"].reverify_from == ""
-
-
-def test_rearm_clears_a_post_replay_marker(tmp_path):
-    """DW-527: a `--reverify` continuation that escalated in review leaves
-    `reverify_replayed` on the escalated task. A plain re-arm re-implements from the
-    baseline, so it clears the marker; left set, a mid-review crash of the re-drive
-    would re-latch a verify replay instead of taking resume-restart.
-
-    Ablation, performed: drop the clear in `_rearm_escalation_locked` and this
-    reddens on the surviving marker."""
-    run_dir, _ = _escalated_run(tmp_path, _SPEC_WITH_ARR)
-    state = load_state(run_dir)
-    state.tasks["1-1-a"].reverify_replayed = "deferred"
-    save_state(run_dir, state)
-
-    runs.rearm_escalation(run_dir, isolated_redrive=False, resolution_recorded=True)
-
-    assert load_state(run_dir).tasks["1-1-a"].reverify_replayed == ""
 
 
 # --------------------------------------------- #90: abandoned restore-latch residue

@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import operator
 import re
 import tomllib
 from importlib import resources
@@ -128,31 +129,42 @@ def test_builtin_profiles_load():
         assert profiles[name].hookless is False
 
 
-def test_usage_grace_and_nudges_default_when_unset(tmp_path):
-    # MINIMAL_PROFILE omits both -> 0.0 / None
+_MINIMAL_PROFILE_DEFAULTS = [
+    ("usage_grace_s", 0.0),
+    ("stop_without_result_nudges", None),
+    ("subagent_stop_without_transcript", False),
+    ("seed_files", ()),
+    # classification inert
+    ("env_fault_patterns", ()),
+    # parked-signal fields: both inert (DW-348/DW-350)
+    ("hooks.notification_types", {}),
+    ("hooks.stop_failure_types", {}),
+    ("parked_prompt_patterns", ()),
+    # usage fields: both inert (#610)
+    ("usage_limit_patterns", ()),
+    ("usage_wait_patterns", ()),
+    # the overlay parse-time default, separate from the dataclass default
+    ("skill_tree", ".claude/skills"),
+]
+
+
+@pytest.mark.parametrize(
+    "field,expected",
+    _MINIMAL_PROFILE_DEFAULTS,
+    ids=[field for field, _ in _MINIMAL_PROFILE_DEFAULTS],
+)
+def test_minimal_profile_field_defaults(tmp_path, field, expected):
+    """MINIMAL_PROFILE, loaded as a user overlay, declares none of these fields, so
+    each takes its default. One row per field, so one wrong default never hides
+    another."""
     profiles_dir = tmp_path / ".bmad-loop" / "profiles"
     profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
+    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE, encoding="utf-8")
     prof = load_profiles(tmp_path)["mycli"]
-    assert prof.usage_grace_s == 0.0
-    assert prof.stop_without_result_nudges is None
-    assert prof.subagent_stop_without_transcript is False
-
-
-def test_seed_files_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE omits seed_files -> defaults to ()
-    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
-    profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
-    assert load_profiles(tmp_path)["mycli"].seed_files == ()
-
-
-def test_env_fault_patterns_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE omits env_fault_patterns -> defaults to () (classification inert)
-    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
-    profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE)
-    assert load_profiles(tmp_path)["mycli"].env_fault_patterns == ()
+    got = operator.attrgetter(field)(prof)
+    assert got == expected
+    if expected is None or isinstance(expected, bool):
+        assert got is expected
 
 
 def test_env_fault_patterns_parse_from_overlay(tmp_path):
@@ -199,16 +211,6 @@ def test_deeply_nested_pattern_is_a_profile_error_not_a_bare_recursion_error(tmp
     # The RecursionError path specifically — not a plain `regex.error`, which the
     # pre-fix `except` already caught and would pass this test for another reason.
     assert isinstance(excinfo.value.__cause__, RecursionError)
-
-
-def test_parked_signal_fields_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE declares neither -> both inert (DW-348/DW-350)
-    (tmp_path / ".bmad-loop" / "profiles").mkdir(parents=True)
-    (tmp_path / ".bmad-loop" / "profiles" / "mycli.toml").write_text(MINIMAL_PROFILE)
-    prof = load_profiles(tmp_path)["mycli"]
-    assert prof.hooks.notification_types == {}
-    assert prof.hooks.stop_failure_types == {}
-    assert prof.parked_prompt_patterns == ()
 
 
 def test_parked_signal_fields_parse_from_overlay(tmp_path):
@@ -370,16 +372,6 @@ def _wrapped_hits(text: str, patterns) -> list[tuple[int, str]]:
 
 
 _USAGE_FIELDS = ("usage_limit_patterns", "usage_wait_patterns")
-
-
-def test_usage_fields_default_empty_when_unset(tmp_path):
-    # MINIMAL_PROFILE declares neither -> both inert (#610)
-    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
-    profiles_dir.mkdir(parents=True)
-    (profiles_dir / "mycli.toml").write_text(MINIMAL_PROFILE, encoding="utf-8", newline="")
-    prof = load_profiles(tmp_path)["mycli"]
-    assert prof.usage_limit_patterns == ()
-    assert prof.usage_wait_patterns == ()
 
 
 def test_usage_fields_parse_from_overlay(tmp_path):
@@ -808,11 +800,6 @@ def test_only_claude_and_opencode_seed_usage_patterns():
         elif name != "claude":
             assert prof.usage_limit_patterns == (), name
             assert prof.usage_wait_patterns == (), name
-
-
-def test_skill_tree_defaults_when_unset():
-    # MINIMAL_PROFILE omits skill_tree -> defaults to .claude/skills
-    assert get_profile("claude").skill_tree == ".claude/skills"
 
 
 def test_legacy_alias_resolves():

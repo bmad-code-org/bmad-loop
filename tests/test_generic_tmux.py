@@ -1574,29 +1574,10 @@ def test_stories_readback_ambiguous_returns_none_without_waiting(tmp_path):
     assert time.monotonic() - start < generic.RESULT_GRACE_S / 2
 
 
-def test_stories_readback_pending_returns_none(tmp_path):
-    adapter, _ = make_dev_adapter(tmp_path)
-    # no story spec on disk yet -> not terminal
-    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
-
-
 def test_stories_readback_non_terminal_returns_none(tmp_path):
     adapter, _ = make_dev_adapter(tmp_path)
     # a died-mid-flight ready-for-dev (no plan-halt) is not a terminal result
     _write_story_spec(tmp_path, "1", "foo", "---\nstatus: ready-for-dev\n---\n\nplanned only\n")
-    assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
-
-
-def test_stories_readback_non_utf8_spec_returns_none(tmp_path):
-    """synthesize_result re-reads the resolved spec as UTF-8; a binary/undecodable
-    spec (or a torn glimpse of one still being written) must degrade to a
-    result-less poll, never crash the read-back. resolve_story_spec classifies it
-    PRESENT with status "" — so without the guard the poll dies on the very state
-    the engine is designed to wedge-and-pause on at the next pick."""
-    adapter, _ = make_dev_adapter(tmp_path)
-    d = tmp_path / "epic" / "stories"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "1-slug.md").write_bytes(_BAD_UTF8)
     assert adapter._result_json(_dev_handle(), _stories_spec(tmp_path), wait=False) is None
 
 
@@ -1647,15 +1628,6 @@ def _breadcrumbs(adapter, task_id="3-1-dev-1"):
     if not path.is_file():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-
-
-def test_resultless_stop_breadcrumb_scan_no_artifact(tmp_path, monkeypatch):
-    adapter, impl = make_dev_adapter(tmp_path)
-    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
-    assert adapter._result_json(_dev_handle(), _dev_spec(tmp_path), wait=True) is None
-    (crumb,) = _breadcrumbs(adapter)
-    assert crumb["verdict"] == "no-artifact"
-    assert str(impl) in crumb["detail"]  # names the searched dirs
 
 
 def test_resultless_stop_breadcrumb_explains_non_recursive_artifact_scan(tmp_path, monkeypatch):
@@ -1859,6 +1831,12 @@ def test_stories_readback_undecodable_spec_is_not_not_terminal(tmp_path, monkeyp
     `spec-readback-failed` on the one-shot read. A genuinely non-terminal spec
     keeps `not-terminal` (`test_resultless_stop_breadcrumb_stories_not_terminal`)
     and writes no lifecycle crumb (the healthy row below).
+
+    synthesize_result re-reads the resolved spec as UTF-8, and resolve_story_spec
+    classifies an undecodable spec (or a torn glimpse of one still being written)
+    PRESENT with status "", so the read-back must degrade to a result-less poll and
+    never crash on the very state the engine is designed to wedge-and-pause on at
+    the next pick.
 
     Ablation: drop the `_spec_read_fault` re-read or the `_note_spec_read_fault`
     call and the fault rows fail."""
@@ -7684,26 +7662,6 @@ def test_frontmatter_fallback_refuses_unmodified_snapshot_dead_window(tmp_path):
     assert _breadcrumbs(adapter) == []
 
 
-def test_frontmatter_fallback_hash_mismatch_still_two_obs(tmp_path, monkeypatch):
-    """Content edited since the snapshot (the review actually wrote): the hash gate
-    is inert and today's fingerprint behavior stands — pending on the first stable
-    Stop, harvested on the second."""
-    adapter, impl = make_dev_adapter(tmp_path)
-    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
-    spec_file = impl / "spec-3-1-foo.md"
-    spec_file.write_text(
-        "---\nstatus: done\nbaseline_revision: abc123\n---\n\n# Story\n\nLaunch.\n"
-    )
-    spec = _snapshotted_spec(tmp_path, spec_file)
-    # the review rewrote the spec's body: bytes differ from the launch snapshot.
-    spec_file.write_text(_MARKERLESS_DONE)
-    assert adapter._result_json(_dev_handle(), spec, wait=True) is None
-    (crumb,) = _breadcrumbs(adapter)
-    assert crumb["verdict"] == "terminal-frontmatter-pending"
-    rj = adapter._result_json(_dev_handle(), spec, wait=True)
-    assert rj["synthesized_from_frontmatter"] is True
-
-
 def test_frontmatter_fallback_snapshot_other_path_inert(tmp_path, monkeypatch):
     """The gate only fires when the candidate IS the snapshotted spec. A snapshot
     for a different path leaves the fallback on its normal fingerprint path even
@@ -7887,7 +7845,8 @@ def test_frontmatter_fallback_missed_transition_stays_conservative(tmp_path, mon
     """Snapshot present, bytes differ, but NO transition was recorded (the flip
     happened between ticks): the fallback keeps the conservative 2-observation
     fingerprint — pending on the first stable Stop, harvested on the second with
-    transition=False."""
+    transition=False. Content edited since the snapshot (the review actually wrote)
+    leaves the M1 hash gate inert, so this is also the hash-mismatch row."""
     adapter, impl = make_dev_adapter(tmp_path)
     monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
     spec_file = impl / "spec-3-1-foo.md"

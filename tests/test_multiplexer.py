@@ -1368,6 +1368,9 @@ def test_version_folds_a_multi_line_probe_onto_one_line(monkeypatch):
     assert got is not None and "\n" not in got
     # Folded, not truncated: dropping the tail would hide which binary runs.
     assert got == "tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)"
+    # The bound must clear the probes that actually exist by a wide margin —
+    # otherwise it trades one unreadable cell for a useless one.
+    assert len(got) < multiplexer.VERSION_MAX_CHARS
     # Order is load-bearing — PsmuxMultiplexer.available() anchors its version
     # match at position 0, so the compat line must stay first.
     assert got.startswith("tmux 3.3.7")
@@ -1488,17 +1491,6 @@ def test_version_error_of_a_backend_that_keeps_no_record_is_none():
     instantiated to hold any)."""
     assert "version_error" not in multiplexer.TerminalMultiplexer.__abstractmethods__
     assert multiplexer.TerminalMultiplexer.version_error(object()) is None  # type: ignore[arg-type]
-
-
-def test_version_of_a_real_probe_is_never_truncated(monkeypatch):
-    # The bound must clear the probes that actually exist by a wide margin —
-    # otherwise it trades one unreadable cell for a useless one.
-    _version_stdout(monkeypatch, "tmux 3.3.7\npsmux 3.3.7 (05cc5d4 2026-07-20)\n")
-
-    got = TmuxMultiplexer().version()
-
-    assert got == "tmux 3.3.7; psmux 3.3.7 (05cc5d4 2026-07-20)"
-    assert len(got) < multiplexer.VERSION_MAX_CHARS
 
 
 # ---------------------------------------------- _run seam: encoding + env (#40)

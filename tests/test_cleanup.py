@@ -214,20 +214,15 @@ def test_reconcile_stale_worktrees_finished_only(project):
 # ------------------------------------------------------------- retention
 
 
-def test_runs_past_retention_by_count():
-    dirs = [project_dir(f"2026010{i}-000000-aa") for i in range(1, 8)]
-    past = runs.runs_past_retention(dirs, keep_n=3)
-    assert [p.name for p in past] == [d.name for d in dirs[:4]]
-
-
-def test_runs_past_retention_keep_all_within_count():
-    dirs = [project_dir(f"2026010{i}-000000-aa") for i in range(1, 4)]
-    assert runs.runs_past_retention(dirs, keep_n=10) == []
-
-
-def test_runs_past_retention_zero_keeps_none():
-    dirs = [project_dir(f"2026010{i}-000000-aa") for i in range(1, 4)]
-    assert len(runs.runs_past_retention(dirs, keep_n=0)) == 3
+@pytest.mark.parametrize(
+    "count,keep_n,n_past",
+    [(7, 3, 4), (3, 10, 0), (3, 0, 3)],
+    ids=["by-count", "keep-all-within-count", "zero-keeps-none"],
+)
+def test_runs_past_retention_by_count(count, keep_n, n_past):
+    dirs = [project_dir(f"2026010{i}-000000-aa") for i in range(1, count + 1)]
+    past = runs.runs_past_retention(dirs, keep_n=keep_n)
+    assert [p.name for p in past] == [d.name for d in dirs[:n_past]]
 
 
 def test_runs_past_retention_days_boundary():
