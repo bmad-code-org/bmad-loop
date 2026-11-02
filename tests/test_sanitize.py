@@ -236,6 +236,15 @@ def test_scrub_event_payload_is_scrub_json(home):
         "glpat-xxxxxxxxxxxxxxxxxxxx",  # gitlab pat
         "AIzaSyA0000000000000000000000000000000",  # google api key
         "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",  # 40-char high-entropy hex secret
+        # Shapes whose every alnum run is shorter than _SECRET_RUN_MIN, so only a
+        # prefix arm can catch them. Low-entropy canaries in the vendors' formats,
+        # not live keys.
+        "sk_live_CANARYxxxxxxxxxxxxxxxx",  # stripe secret, legacy 24-char tail
+        "sk_test_CANARYxxxxxxxxxxxxxxxx",  # stripe test secret
+        "rk_live_CANARYxxxxxxxxxxxxxxxx",  # stripe restricted key
+        "xapp-1-A0CANARY01-0000000000-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",  # slack app-level
+        "SG.CANARYxxxxxxxxxxxxxxx.CANARYxxxx-xxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxx",  # sendgrid
+        "pypi-AgEIcHlwaS5vcmcCANARY",  # pypi upload token
     ],
 )
 def test_looks_like_secret_catches_credentials(value):
@@ -252,6 +261,12 @@ def test_looks_like_secret_catches_credentials(value):
         "01234567-89ab-cdef-0123-456789abcdef",  # UUID: short runs at hyphens
         "DW-1",
         "1.2-add-logging",
+        # Near-misses for the vendor arms: each shares a prefix's first letters
+        # but not the format the arm is anchored on.
+        "sk_util",
+        "pypi-mirror",
+        "SG.1",
+        "xapp-name",
     ],
 )
 def test_looks_like_secret_passes_safe_slugs(value):
@@ -311,6 +326,12 @@ def test_assert_no_leak_clean_text():
     [
         ("contact me@example.com", "email"),
         ("see https://user:pass@host/x", "url-credentials"),
+        # Not only http(s): connection strings carry userinfo the same way.
+        ("dsn postgres://app:hunter2@localhost:5432/db", "url-credentials"),
+        ("REDIS_URL=redis://default:hunter2@cache:6379", "url-credentials"),
+        ("uri mongodb+srv://bob:hunter2@cluster0.example.net/x", "url-credentials"),
+        ("broker amqp://guest:guest@rabbit/vhost", "url-credentials"),
+        ("ssh://deploy:hunter2@host/repo.git", "url-credentials"),
         ("path /home/alice/x", "absolute-home-path"),
         # Every arm of _ABS_HOME_RE, not just the Linux one. The macOS and root
         # arms were correct but unpinned; so was the drive-letter-plus-FORWARD-
@@ -350,6 +371,18 @@ def test_assert_no_leak_clean_text():
 )
 def test_assert_no_leak_fires(text, rule):
     assert rule in sanitize.assert_no_leak(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ssh://git@github.com:22/org/repo.git",  # user, no password
+        "git@github.com:org/repo.git",  # scp-style, no scheme
+        "see https://host:8443/path",  # a port is not a password
+    ],
+)
+def test_assert_no_leak_url_rule_needs_a_password(text):
+    assert "url-credentials" not in sanitize.assert_no_leak(text)
 
 
 def test_assert_no_leak_sees_wsl_unc_through_the_json_render():

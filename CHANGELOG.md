@@ -237,6 +237,10 @@ breaking changes may land in a minor release.
 - Pin the run journal and `state.json` to the run dir's recorded identity: writes and
   re-reads refuse a run dir swapped for a link or another directory instead of acting
   outside the run, and Windows verify-stream logs refuse junctions.
+- Catch more credential shapes in the `diagnose` / `probe-adapter` egress guard: Stripe
+  `sk_`/`rk_` live and test keys, Slack app-level `xapp-` tokens, SendGrid `SG.` keys and
+  PyPI upload tokens are now redacted, and URL credentials are flagged for any scheme
+  (`postgres://`, `redis://`, `mongodb+srv://`, `amqp://`, `ssh://`), not only http(s).
 
 ## [0.13.2] — 2026-10-09
 

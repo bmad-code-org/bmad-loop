@@ -77,7 +77,16 @@ _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _SECRET_PREFIX_RE = re.compile(
     r"^(?:"
     r"sk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|gss_|"
-    r"xox[baprs]-|AKIA|ASIA|AIza|ya29\.|AGAPP|hf_|npm_|dop_v1_|sk-ant-"
+    r"xox[baprs]-|AKIA|ASIA|AIza|ya29\.|AGAPP|hf_|npm_|dop_v1_|sk-ant-|"
+    # Shapes the entropy arm below cannot see: each splits at `.`/`-`/`_` into
+    # runs shorter than `_SECRET_RUN_MIN`, so without a prefix they pass as plain
+    # identifiers. Stripe secret/restricted keys (legacy ones carry a 24-char
+    # tail), Slack app-level tokens (`xapp-<n>-…`, every segment short), SendGrid
+    # (`SG.<22>.<43>`, the 43 often split by `-`), and PyPI upload tokens, whose
+    # macaroon always opens `pypi-AgE`. Each arm is anchored on enough of the
+    # vendor format that an ordinary slug (`sk_util`, `pypi-mirror`, `SG.1`)
+    # does not trip it.
+    r"[sr]k_(?:live|test)_|xapp-\d+-|SG\.[A-Za-z0-9_-]{16,}\.|pypi-AgE"
     r")"
 )
 _JWT_RE = re.compile(r"^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+")
@@ -89,7 +98,10 @@ _SECRET_ENTROPY_MIN = 3.5  # bits/char; pure hex ~4.0, base64 ~6.0, prose/slug w
 
 # Token shape used by assert_no_leak to re-scan rendered output for secrets.
 _LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._/+-]{6,}")
-_URL_CRED_RE = re.compile(r"https?://[^/\s]*:[^/@\s]+@")
+# Any RFC 3986 scheme, not only http(s): connection strings (`postgres://`,
+# `redis://`, `mongodb+srv://`, `amqp://`, `ssh://`) carry `user:password@`
+# userinfo the same way and are as likely to reach a log tail or `--help` blob.
+_URL_CRED_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s]*:[^/@\s]+@")
 # The guard constructs whose match can straddle a truncation point AND whose
 # leading fragment would still be sensitive once the rest is clipped away.
 # `scrub_text`'s cut retracts out of these -- see `_truncate_line`. This sits
