@@ -4513,15 +4513,17 @@ class SweepEngine(Engine):
                 ledger=str(ledger),
                 refuse_cause="dirty",
             )
+        # Saved before the notify (DW-632), so a host loss inside a slow notify
+        # command cannot leave the stale baseline on disk.
+        task.baseline_commit = None
+        task.baseline_untracked = None
+        self._save()
         gates.notify(
             self.policy,
             self.run_dir,
             f"migration refused: {ledger.name}",
             f"{reason} — then `bmad-loop resume {self.state.run_id}`",
         )
-        task.baseline_commit = None
-        task.baseline_untracked = None
-        self._save()
         raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
 
     def _complete_empty_migration(self, task: StoryTask) -> None:
@@ -4783,15 +4785,17 @@ class SweepEngine(Engine):
                 "hand and COMMIT the fix, then resume"
             )
             self.journal.append("migrate-duplicate-ids", story_key=MIGRATE_KEY, dw_ids=list(dupes))
+            # Cleared and saved before the notify (DW-632): a host loss inside a
+            # slow notify command must not leave the stale baseline on disk.
+            task.baseline_commit = None
+            task.baseline_untracked = None
+            self._save()
             gates.notify(
                 self.policy,
                 self.run_dir,
                 f"migration refused: {ledger.name}",
                 f"{reason} — then `bmad-loop resume {self.state.run_id}`",
             )
-            task.baseline_commit = None
-            task.baseline_untracked = None
-            self._save()
             raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
 
         if not task.baseline_commit:
@@ -8385,7 +8389,7 @@ class SweepEngine(Engine):
         The save precedes the notify (DW-631) so a host loss inside a slow notify
         command cannot leave the stale baseline on disk. The arm's journal row is
         written by the arm, before this. The `_ensure_migration` duplicate-ids
-        pause is the template.
+        pause is the template, and it too saves before it notifies (DW-632).
 
         `gates.notify` directly, never `_notify_ledger_repair`: that helper steers
         to a fresh `bmad-loop sweep`, which is the wrong route for a run that is

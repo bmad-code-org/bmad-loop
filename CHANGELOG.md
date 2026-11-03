@@ -169,8 +169,8 @@ breaking changes may land in a minor release.
 - Save an escalation before running its notify command, so a host loss during a slow
   notify no longer resumes the escalated dev attempt into review and commit. Worktree
   unit escalations, plugin `pause`/`defer` vetoes, the unknown `--story` pause, the
-  worktree-open failure defer and the sweep's intent-regeneration pause now save first
-  too.
+  worktree-open failure defer, the sweep's intent-regeneration pause and the sweep's
+  dirty-ledger and duplicate-id migration pauses now save first too.
 - Commit the engine's own deferred-work ledger changes before review, repair and retry
   sessions and after an in-place defer, so a tracked ledger no longer pauses the run with
   `finalization left repository dirty`. The in-place defer notice now prints

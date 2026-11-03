@@ -23354,6 +23354,107 @@ def test_migration_duplicate_refusal_clears_a_baseline_it_arrived_holding(projec
     assert task.baseline_untracked is None
 
 
+def _host_loss_in_migration_pause_notify(project, monkeypatch, engine, guard: str):
+    """Drive `engine.run()` into a migration pause whose notify dies (DW-632).
+
+    The migrate task enters ESCALATED with a baseline at the real HEAD over a
+    clean tree, so the restart branch keeps it (a moved HEAD would read stale
+    and be cleared before the guards). `guard` names the engine method observed
+    on entry, to prove a baseline was held going in. The notify snapshots
+    `state.json` and raises a `BaseException`; the snapshot is written back,
+    because `run()`'s `finally` save would otherwise persist the cleared
+    in-memory pair and hide the boundary. Asserts the persisted task is PENDING
+    with no baseline pair."""
+    from bmad_loop import gates
+
+    class HostLoss(BaseException):
+        pass
+
+    engine.state.tasks[MIGRATE_KEY] = StoryTask(
+        story_key=MIGRATE_KEY,
+        epic=0,
+        phase=Phase.ESCALATED,
+        baseline_commit=rev_parse_head(project.project),
+        baseline_untracked=[],
+    )
+    state_file = engine.run_dir / "state.json"
+    durable: list[bytes] = []
+    entering: list[str | None] = []
+    real_guard = getattr(engine, guard)
+
+    def observe_guard(*args, **kwargs):
+        entering.append(engine.state.tasks[MIGRATE_KEY].baseline_commit)
+        return real_guard(*args, **kwargs)
+
+    monkeypatch.setattr(engine, guard, observe_guard)
+
+    def host_dies_in_notify(_policy, _run_dir, headline, *_args, **_kwargs):
+        if not durable and headline == "migration refused: deferred-work.md":
+            durable.append(state_file.read_bytes())
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        engine.run()
+    assert durable, "the migration refusal never reached its notify"
+    # premise: the guard starts with a baseline to clear, or the test is vacuous
+    assert entering and entering[0] is not None
+    state_file.write_bytes(durable[0])
+    task = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    assert task.baseline_commit is None
+    assert task.baseline_untracked is None
+    assert task.phase == Phase.PENDING
+
+
+def test_host_loss_in_migration_duplicate_ids_notify_leaves_the_baseline_cleared_on_disk(
+    project, monkeypatch
+):
+    """DW-632. The `migrate-duplicate-ids` pause clears the task's baseline pair
+    and saves before it notifies, as `_pause_on_intent_refusal` does (DW-631).
+    A host loss inside a slow notify command then leaves no stale pre-repair
+    baseline on disk for a later env-fault `_safe_reset` to rewind over the
+    operator's renumbering commit.
+
+    Ablation, performed: move the clearing and `self._save()` back below
+    `gates.notify` and the snapshot keeps the arrival baseline."""
+    write_legacy_ledger(
+        project,
+        "# Deferred Work\n\n" + _gated_dw1("gate: 3-2") + "\n" + _gated_dw1("gate: 3-3") + "\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n",
+    )
+    engine, adapter = make_sweep(project, [])
+
+    _host_loss_in_migration_pause_notify(project, monkeypatch, engine, "_migration_manifest")
+
+    assert adapter.sessions == []
+    assert _records(engine, "migrate-duplicate-ids")
+
+
+def test_host_loss_in_migration_ledger_dirty_notify_leaves_the_baseline_cleared_on_disk(
+    project, monkeypatch
+):
+    """DW-632. The `migrate-ledger-dirty` pause clears the task's baseline pair
+    and saves before it notifies, as `_pause_on_intent_refusal` does (DW-631).
+    Reached here by a `_ledger_rel` probe fault over a committed, clean ledger:
+    a really dirty one makes the restart branch's `worktree_clean` read dirty
+    and reset the ledger before the guard runs.
+
+    Ablation, performed: move the clearing and `self._save()` back below
+    `gates.notify` and the snapshot keeps the arrival baseline."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [])
+    monkeypatch.setattr(engine, "_ledger_rel", lambda: (None, OSError("scope probe boom")))
+
+    _host_loss_in_migration_pause_notify(
+        project, monkeypatch, engine, "_refuse_dirty_migration_input"
+    )
+
+    assert adapter.sessions == []
+    [row] = _records(engine, "migrate-ledger-dirty")
+    assert row["refuse_cause"] == "probe-fault"
+
+
 # ------------------------------------------ review-budget commit-instead-of-rollback
 
 
