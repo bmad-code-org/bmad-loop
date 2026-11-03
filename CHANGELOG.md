@@ -69,7 +69,8 @@ breaking changes may land in a minor release.
 - Support OpenCode 2.x (`@opencode/cli`) in the opencode-http adapter, picking the server
   API from `opencode --version` (`validate`: `adapter.opencode-version`). On 2.x `effort`
   is sent as the model variant, subagent tokens count toward usage and the budget, forms
-  show in the `[bmad]` transcript, and provider errors are logged to
+  show in the `[bmad]` transcript, a dev/review turn end waits (up to the dev stall grace)
+  for background subagents still running, and provider errors are logged to
   `logs/<task-id>.provider-errors.log`, where outages pause as environment faults and
   quota failures as usage limits (#847).
 - Add `bmad-loop resolve <replay-run> --abandon`: close a replay run that escalated

@@ -55,8 +55,12 @@ Transport shape (the settled design drivers):
   session's token aggregate plus every descendant (subagent) session's;
   stashed by session id, the raw messages (V2: every page, oldest first)
   dumped to ``tasks/<task_id>/messages.json`` as the transcript. V1 counts no
-  child-session tokens — its API scopes messages per session. A V2 child
-  still running at capture is journaled as ``usage-child-active``; V2's
+  child-session tokens — its API scopes messages per session. Under a stall
+  grace (the dev adapters) a turn end first waits, up to that grace, while a
+  V2 descendant (a ``background: true`` subagent) is still running
+  (``descendant-wait-*`` crumbs); a probe fault is never read as "none
+  active". A V2 child still running at capture is journaled as
+  ``usage-child-active``; V2's
   ``models`` add each descendant's model ref after the parent's, and a
   malformed ref is journaled as ``usage-models-partial``.
 - ``opencode serve`` survives parent death, so teardown is
@@ -157,6 +161,10 @@ KILL_WAIT_S = 5.0
 REAP_POLL_S = 0.1
 SPAWN_ATTEMPTS = 3
 POLL_TICK_S = 5.0  # max event-queue wait per loop tick (generic's cadence)
+# Re-probe cadence of `_await_descendants` while a turn end waits on a still-
+# running descendant (a V2 background subagent); also how often that wait
+# re-checks a hard stop, the session deadline and server death.
+DESCENDANT_POLL_S = 2.0
 # Structured SSE trace (``logs/<task_id>.sse.jsonl``). Tier-1 knob deliberately:
 # a module default plus the ``sse_trace`` instance attribute, NOT a policy field
 # in core.toml. It changes nothing about how a run behaves — it only decides
@@ -541,6 +549,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         self.reconnect_sleep_s = RECONNECT_SLEEP_S
         self.kill_wait_s = KILL_WAIT_S
         self.poll_tick_s = POLL_TICK_S
+        self.descendant_poll_s = DESCENDANT_POLL_S
         self.sse_trace = SSE_TRACE  # False = never open the .sse.jsonl sink
         self.result_grace_s: float | None = None  # None = the mixin default
         self.tasks_dir = run_dir / "tasks"
@@ -1320,6 +1329,36 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # it as of the previous sample (sampling follows the heartbeat write).
         usage_failures = 0
 
+        def beat() -> bool:
+            """Overwrite heartbeat.json and run `_observe_tick` when the
+            HEARTBEAT_INTERVAL_S cadence is due; True when it fired. Shared with
+            `_await_descendants`, so a turn end held on a running subagent keeps
+            the session's proof-of-life cadence."""
+            nonlocal last_heartbeat
+            now = time.monotonic()
+            if last_heartbeat is not None and now - last_heartbeat < HEARTBEAT_INTERVAL_S:
+                return False
+            last_heartbeat = now
+            self._write_heartbeat(
+                handle.task_id,
+                {
+                    "ts": time.time(),
+                    "remaining_s": round(deadline - now, 3),
+                    "stall_armed": stall_deadline is not None,
+                    "stall_nudges_sent": stall_nudges_sent,
+                    # the running budget usage-sample failure streak (DW-461)
+                    "usage_sample_failures": usage_failures,
+                    # SSE frames the parser could not decode (DW-462)
+                    "sse_frames_dropped": sess.sse_frames_dropped,
+                },
+            )
+            # Mid-session spec-status transition sampling (#276 M2) rides the
+            # same heartbeat cadence — a no-op on the plain HTTP adapter; the
+            # OpencodeDevAdapter shares _DevSynthesisMixin, so the hook records
+            # transitions there exactly as on the generic dev adapter.
+            self._observe_tick(handle, spec)
+            return True
+
         while True:
             remaining = deadline - time.monotonic()
             wall_expired = time.time() >= wall_deadline
@@ -1380,27 +1419,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path=transcript,
                     budget_weighted=budget_weighted,
                 )
-            now = time.monotonic()
-            if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-                last_heartbeat = now
-                self._write_heartbeat(
-                    handle.task_id,
-                    {
-                        "ts": time.time(),
-                        "remaining_s": round(remaining, 3),
-                        "stall_armed": stall_deadline is not None,
-                        "stall_nudges_sent": stall_nudges_sent,
-                        # the running budget usage-sample failure streak (DW-461)
-                        "usage_sample_failures": usage_failures,
-                        # SSE frames the parser could not decode (DW-462)
-                        "sse_frames_dropped": sess.sse_frames_dropped,
-                    },
-                )
-                # Mid-session spec-status transition sampling (#276 M2) rides the
-                # same heartbeat cadence — a no-op on the plain HTTP adapter; the
-                # OpencodeDevAdapter shares _DevSynthesisMixin, so the hook records
-                # transitions there exactly as on the generic dev adapter.
-                self._observe_tick(handle, spec)
+            if beat():
                 # Budget sampling rides the heartbeat cadence — no extra knob.
                 # Usage comes over HTTP (server state is sqlite, not a file).
                 if (
@@ -1683,6 +1702,18 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             if event == "idle":
                 # A turn end, from the stream or the probe, resolves any gap.
                 gap_activity = gap_recheck_at = None
+                # A V2 background subagent can outlive this turn end: hold it
+                # (bounded by the stall grace) until no descendant is running.
+                if not self._await_descendants(
+                    handle,
+                    sess,
+                    deadline=deadline,
+                    wall_deadline=wall_deadline,
+                    budget_deadline=budget_deadline,
+                    budget_wall_deadline=budget_wall_deadline,
+                    beat=beat,
+                ):
+                    continue  # stop / deadline / budget / death: the loop's arms decide
                 result_json = self._result_json(handle, spec, wait=True)
                 if result_json is not None:
                     transcript = self._capture_usage(handle, sess)
@@ -1719,6 +1750,121 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # wake-nudge budget (the monotonic cap still bounds the total).
                 stall_nudges_left = self._stall_nudges
                 continue
+
+    def _await_descendants(
+        self,
+        handle: SessionHandle,
+        sess: _ServerSession,
+        *,
+        deadline: float,
+        wall_deadline: float,
+        budget_deadline: float | None,
+        budget_wall_deadline: float | None,
+        beat: Callable[[], bool],
+    ) -> bool:
+        """Hold a turn end while a descendant session of this one is still
+        running. Under OpenCode 2.x a ``background: true`` subagent can work on
+        after its parent publishes ``session.execution.succeeded``; acting on
+        that turn end at once (reading the result, nudging, stalling) decides
+        the session before the child's work lands.
+
+        Polls the protocol's ``active_descendants`` every ``descendant_poll_s``
+        until none is active or ``_stall_grace_s`` passes; the bound is
+        ``min(grace, session deadline)``, each with its wall-clock co-bound
+        (#157). Returns True when the caller should act on the turn end now:
+        nothing was active (nothing journaled), the children finished
+        (``descendant-wait-ended`` with ``waited_s``, ``probe_failures``), or
+        the grace expired (``descendant-wait-timeout`` with the last known
+        active ``sessions`` — null when no probe ever read — ``waited_s``,
+        ``probe_failures``, plus ``error`` when the last probe faulted). A
+        wait that starts journals ``descendant-wait-started`` (``sessions``,
+        ``grace_s``; ``sessions: null`` + ``error`` when the first probe
+        faulted). Returns False only when the wait is cut short —
+        ``descendant-wait-cut`` with ``reason`` ``stop`` (a hard stop),
+        ``timeout`` (the session deadline), ``budget`` (an armed enforce-mode
+        budget grace — ``budget_deadline`` / ``budget_wall_deadline``, None
+        when unarmed — has expired) or ``server-exited`` — and the wait
+        loop's own arms then take the verdict (aborted / timeout /
+        over_budget / crashed).
+
+        A probe fault is never "none active": the first fault of each streak
+        is crumbed as ``descendant-probe-failed`` (``error``) and the wait runs
+        on to its bound. A grace of zero (the plain adapter) never probes; V1
+        answers ``([], None)`` without a request, so it never waits. The
+        heartbeat keeps its cadence through ``beat``; budget sampling and the
+        stall/gap machinery pause for the wait, which the grace bounds — but a
+        budget grace already armed still cuts the wait when it expires, so a
+        child spending on past the cap cannot carry the session to
+        ``completed``."""
+        grace = self._stall_grace_s
+        if grace <= 0:
+            return True
+        active, fault = sess.protocol.active_descendants(sess.client, sess.session_id)
+        if active is not None and not active:
+            return True
+        started = time.monotonic()
+        wait_end = min(started + grace, deadline)
+        wall_end = min(time.time() + grace, wall_deadline)
+        task_id = handle.task_id
+        failures = 0
+        known: list[str] | None = active
+        last_fault: str | None = fault
+        started_fields: dict[str, Any] = {"sessions": active, "grace_s": grace}
+        if fault is not None:
+            started_fields["error"] = fault
+        self._note_lifecycle(task_id, "descendant-wait-started", **started_fields)
+        if fault is not None:
+            failures = 1
+            self._note_lifecycle(task_id, "descendant-probe-failed", error=fault)
+
+        def waited() -> float:
+            return round(time.monotonic() - started, 3)
+
+        def cut(reason: str) -> bool:
+            self._note_lifecycle(
+                task_id, "descendant-wait-cut", reason=reason, sessions=known, waited_s=waited()
+            )
+            return False
+
+        while True:
+            if self._hard_stop_requested():
+                return cut("stop")
+            if sess.process.poll() is not None:
+                return cut("server-exited")
+            now = time.monotonic()
+            if now >= deadline or time.time() >= wall_deadline:
+                return cut("timeout")
+            if budget_deadline is not None and (
+                now >= budget_deadline
+                or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
+            ):
+                return cut("budget")
+            if now >= wait_end or time.time() >= wall_end:
+                timeout_fields: dict[str, Any] = {
+                    "sessions": known,
+                    "waited_s": waited(),
+                    "probe_failures": failures,
+                }
+                if last_fault is not None:
+                    timeout_fields["error"] = last_fault
+                self._note_lifecycle(task_id, "descendant-wait-timeout", **timeout_fields)
+                return True
+            beat()
+            time.sleep(max(0.0, min(self.descendant_poll_s, wait_end - time.monotonic())))
+            active, fault = sess.protocol.active_descendants(sess.client, sess.session_id)
+            if active is None:
+                failures += 1
+                if last_fault is None:
+                    self._note_lifecycle(task_id, "descendant-probe-failed", error=fault)
+                last_fault = fault
+                continue
+            last_fault = None
+            known = active
+            if not active:
+                self._note_lifecycle(
+                    task_id, "descendant-wait-ended", waited_s=waited(), probe_failures=failures
+                )
+                return True
 
     def _session_status(self, sess: _ServerSession) -> bool | None:
         """Tri-state busy probe — the protocol's ``session_busy``: True =

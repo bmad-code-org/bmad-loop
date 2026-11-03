@@ -117,6 +117,14 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #                      `session.execution.failed` is published
 #   provider-quota-after-work  provider-quota, but Session.Info reports the
 #                      tokens of work already done (the #764 veto's measurement)
+#   background-child   (V2) the first turn starts a `background: true` child
+#                      session and ends result-less while the child runs; ~1s
+#                      later the child writes the result and goes idle. While
+#                      a child exists `/api/session?parentID=<SESSION_ID>` lists
+#                      it; while it runs `/api/session/active` lists it too
+#   background-child-stuck  (V2) the parent writes the result and ends its turn;
+#                      its background child runs forever
+#   active-map-fault   (V2) completed, but `/api/session/active` answers 500
 # FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind;
 # FAKE_OPENCODE_START_FAILURE_LINE is printed to stdout just before each such exit.
 # FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
@@ -197,7 +205,8 @@ if START_FAILURES:
 SESSION_ID = "ses_fake0000000000000000000001"
 CHILD_SESSION_ID = "ses_fakechild00000000000000001"
 LOCK = threading.Lock()
-STATE = {"busy": False, "completed_ms": 0, "prompts": 0, "streams": 0}
+STATE = {"busy": False, "completed_ms": 0, "prompts": 0, "streams": 0,
+         "child": False, "child_busy": False}
 EVENTS = []
 EVENT_IDS = itertools.count(1)
 USER_MSGS = []  # V2 inbox items, oldest first
@@ -285,6 +294,21 @@ def finish_turn():
         STATE["busy"] = False
 
 
+def start_child():
+    # A `background: true` subagent: listed under the parent, running.
+    with LOCK:
+        STATE["child"] = True
+        STATE["child_busy"] = True
+
+
+def finish_child_later():
+    time.sleep(1.0)
+    write_result()
+    with LOCK:
+        STATE["child_busy"] = False
+    push(v2_frame("session.execution.succeeded", sessionID=CHILD_SESSION_ID))
+
+
 def run_turn():
     with LOCK:
         STATE["busy"] = True
@@ -301,8 +325,15 @@ def run_turn():
                 if STATE["streams"] >= 2:
                     break
             time.sleep(0.02)
-    if SCENARIO in ("completed", "sse-drop-once"):
+    if SCENARIO in ("completed", "sse-drop-once", "active-map-fault"):
         write_result(); write_spec(); finish_turn(); push_idle()
+    elif SCENARIO == "background-child":
+        if n == 1:
+            start_child()
+            threading.Thread(target=finish_child_later, daemon=True).start()
+        finish_turn(); push_idle()
+    elif SCENARIO == "background-child-stuck":
+        start_child(); write_result(); finish_turn(); push_idle()
     elif SCENARIO == "nudge-then-complete":
         if n >= 2:
             write_result()
@@ -437,15 +468,25 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/event":
             self._sse()
         elif path == "/api/session/active":
+            if SCENARIO == "active-map-fault":
+                self._json(500, {"_tag": "InternalError"})
+                return
             with LOCK:
-                busy = STATE["busy"]
-            self._json(200, {"data": {SESSION_ID: {"type": "running"}} if busy else {}})
+                busy, child_busy = STATE["busy"], STATE["child_busy"]
+            active = {SESSION_ID: {"type": "running"}} if busy else {}
+            if child_busy:
+                active[CHILD_SESSION_ID] = {"type": "running"}
+            self._json(200, {"data": active})
         elif path == f"/api/session/{SESSION_ID}/message":
             self._message_page(parse_qs(urlsplit(self.path).query))
         elif path == f"/api/session/{SESSION_ID}":
             self._json(200, {"data": session_info()})
         elif path == "/api/session":
-            self._json(200, {"data": [], "cursor": {"previous": None, "next": None}})
+            parent = (parse_qs(urlsplit(self.path).query).get("parentID") or [""])[0]
+            with LOCK:
+                child = STATE["child"]
+            children = [child_info()] if child and parent == SESSION_ID else []
+            self._json(200, {"data": children, "cursor": {"previous": None, "next": None}})
         elif path in ("/api/model", "/api/model/default"):
             query = parse_qs(urlsplit(self.path).query)
             directory = (query.get("location[directory]") or [""])[0]
@@ -597,6 +638,14 @@ def session_info(title=""):
     return {"id": SESSION_ID, "title": title, "cost": 0.01 if done else 0,
             "tokens": turn_tokens(), "outcome": "succeeded" if done else None,
             "time": {"created": now_ms(), "updated": now_ms(), "idle": done or None}}
+
+
+def child_info():
+    # The background child's `Session.Info`, listed under the parent.
+    return {"id": CHILD_SESSION_ID, "parentID": SESSION_ID, "title": "subagent", "cost": 0,
+            "tokens": {"input": 10, "output": 5, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}},
+            "time": {"created": now_ms(), "updated": now_ms()}}
 
 
 def v2_messages():
@@ -5267,6 +5316,243 @@ def test_v2_capture_crumbs_an_unread_active_map(tmp_path, active, error):
     )
     (crumb,) = _child_active_crumbs(adapter)
     assert crumb["event"] == "usage-child-active-failed" and crumb["error"] == error
+
+
+# ------------------------ OpenCode 2.x (V2) turn end held on a running subagent
+
+_FAKE_CHILD_ID = "ses_fakechild00000000000000001"
+
+
+def _descendant_crumbs(tmp_path: Path) -> list[dict]:
+    return [c for c in _lifecycle(tmp_path) if c["event"].startswith("descendant-")]
+
+
+def _descendant_adapter(tmp_path: Path, launcher, grace_s: float) -> OpencodeHttpAdapter:
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter._stall_grace_s = grace_s
+    adapter.descendant_poll_s = 0.1
+    return adapter
+
+
+def test_v2_turn_end_waits_for_a_background_child(tmp_path, v2_fake):
+    """The parent's turn ends result-less while its background child still
+    runs; the turn end is held until the child (which writes the result)
+    goes idle, so the session completes on its first prompt without a nudge.
+
+    ABLATION: drop the `_await_descendants` call in `_wait_loop`'s idle branch
+    and the result-less turn end is nudged — a second prompt is sent."""
+    launcher, rec = v2_fake
+    adapter = _descendant_adapter(tmp_path, launcher, grace_s=10.0)
+
+    result = adapter.run(make_spec(tmp_path, rec, "background-child"))
+
+    assert result.status == "completed"
+    assert result.result_json == {"ok": True, "workflow": "fake-triage"}
+    assert len(prompt_texts(rec)) == 1
+    started, ended = _descendant_crumbs(tmp_path)
+    assert started["event"] == "descendant-wait-started"
+    assert started["sessions"] == [_FAKE_CHILD_ID] and started["grace_s"] == 10.0
+    assert ended["event"] == "descendant-wait-ended"
+    assert ended["probe_failures"] == 0 and 0 < ended["waited_s"] < 10.0
+    assert_server_gone(rec)
+
+
+def test_v2_descendant_wait_times_out_naming_the_child(tmp_path, v2_fake):
+    """A background child that outlives the stall grace: the wait journals
+    `descendant-wait-timeout` naming it, then the turn end is handled as
+    before (the parent's result completes the session).
+
+    ABLATION: drop the `_await_descendants` call in `_wait_loop`'s idle branch
+    and no `descendant-*` crumb is written."""
+    launcher, rec = v2_fake
+    adapter = _descendant_adapter(tmp_path, launcher, grace_s=0.8)
+
+    result = adapter.run(make_spec(tmp_path, rec, "background-child-stuck"))
+
+    assert result.status == "completed"
+    assert result.result_json == {"ok": True, "workflow": "fake-triage"}
+    assert len(prompt_texts(rec)) == 1
+    started, timeout = _descendant_crumbs(tmp_path)
+    assert started["event"] == "descendant-wait-started"
+    assert started["sessions"] == [_FAKE_CHILD_ID]
+    assert timeout["event"] == "descendant-wait-timeout"
+    assert timeout["sessions"] == [_FAKE_CHILD_ID]
+    assert timeout["waited_s"] >= 0.7 and timeout["probe_failures"] == 0
+    assert "error" not in timeout
+    assert_server_gone(rec)
+
+
+def test_v2_descendant_probe_fault_waits_to_the_grace_bound(tmp_path, v2_fake):
+    """`/api/session/active` answering 500 is never "none active": the wait
+    starts with unknown `sessions` and the fault, crumbs
+    `descendant-probe-failed` once for the streak, and lasts to the grace
+    bound — never an early `descendant-wait-ended`.
+
+    ABLATION: return True from `_await_descendants` when the first probe
+    faults (read a fault as "none active") and no crumb is written."""
+    launcher, rec = v2_fake
+    adapter = _descendant_adapter(tmp_path, launcher, grace_s=0.8)
+
+    result = adapter.run(make_spec(tmp_path, rec, "active-map-fault"))
+
+    assert result.status == "completed"
+    crumbs = _descendant_crumbs(tmp_path)
+    assert [c["event"] for c in crumbs] == [
+        "descendant-wait-started",
+        "descendant-probe-failed",
+        "descendant-wait-timeout",
+    ]
+    started, failed, timeout = crumbs
+    assert started["sessions"] is None and started["error"] == "HTTP 500"
+    assert failed["error"] == "HTTP 500"
+    assert timeout["sessions"] is None and timeout["error"] == "HTTP 500"
+    assert timeout["waited_s"] >= 0.7 and timeout["probe_failures"] >= 2
+    assert_server_gone(rec)
+
+
+def test_v2_session_deadline_cuts_the_descendant_wait(tmp_path, v2_fake):
+    """A session deadline inside the wait cuts it (`descendant-wait-cut`,
+    reason `timeout`) and the loop's own timeout arm takes the verdict.
+
+    ABLATION: drop the deadline check in `_await_descendants` and the wait
+    (its `wait_end`/`wall_end` already clamped to the session deadline) ends
+    at the deadline as `descendant-wait-timeout` and returns True, so the
+    parent's result completes the session — `completed`, not `timeout`."""
+    launcher, rec = v2_fake
+    adapter = _descendant_adapter(tmp_path, launcher, grace_s=30.0)
+
+    result = adapter.run(make_spec(tmp_path, rec, "background-child-stuck", timeout_s=2.0))
+
+    assert result.status == "timeout"
+    events = [c["event"] for c in _lifecycle(tmp_path)]
+    assert events.index("descendant-wait-cut") < events.index("timeout-fired")
+    (cut,) = [c for c in _descendant_crumbs(tmp_path) if c["event"] == "descendant-wait-cut"]
+    assert cut["reason"] == "timeout" and cut["sessions"] == [_FAKE_CHILD_ID]
+    assert_server_gone(rec)
+
+
+class _ProbeSpy:
+    """A protocol stand-in answering `active_descendants` from a fixed reply,
+    counting the calls."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = 0
+
+    def active_descendants(self, _client, _session_id):
+        self.calls += 1
+        return self.reply
+
+
+class _Proc:
+    def __init__(self, code=None):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+
+def _await(adapter, sess, *, deadline_in: float = 60.0, budget_in: float | None = None) -> bool:
+    return adapter._await_descendants(
+        SessionHandle(task_id="t-d", native_id=sess.session_id),
+        sess,
+        deadline=time.monotonic() + deadline_in,
+        wall_deadline=time.time() + deadline_in,
+        budget_deadline=None if budget_in is None else time.monotonic() + budget_in,
+        budget_wall_deadline=None if budget_in is None else time.time() + budget_in,
+        beat=lambda: False,
+    )
+
+
+def test_descendant_wait_never_probes_without_grace_or_on_v1(tmp_path):
+    """A zero stall grace (the plain adapter) never probes; a V1 session
+    answers "none active" without a request — neither waits nor journals.
+
+    ABLATION: drop the `grace <= 0` early return and the grace-0 case
+    probes (and, the child being active, waits)."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    spy = _ProbeSpy((["ses_child"], None))
+    sess.protocol = spy  # type: ignore[assignment]
+    adapter._stall_grace_s = 0.0
+    assert _await(adapter, sess) is True
+    assert spy.calls == 0
+
+    adapter._stall_grace_s = 5.0
+    v1 = _v2_sess(_V2_SID)
+    v1.protocol = V1Protocol()
+    v1.client = _V2RouteClient()
+    assert _await(adapter, v1) is True
+    assert v1.client.gets == []
+    assert _lifecycle_lines(adapter, "t-d") == []
+
+
+@pytest.mark.parametrize("reason", ["stop", "server-exited", "timeout", "budget"])
+def test_descendant_wait_is_cut_by_stop_death_or_deadline(tmp_path, monkeypatch, reason):
+    """A hard stop, server death, the session deadline or an expired
+    enforce-mode budget grace cuts the wait short (False,
+    `descendant-wait-cut` naming the reason and the still-active sessions) so
+    the wait loop's own arms decide the verdict.
+
+    ABLATION: drop the matching check in `_await_descendants` and the wait
+    ends as `descendant-wait-timeout` and returns True instead — at its grace
+    bound for stop / server-exited / budget, and at once for timeout, whose
+    `wait_end`/`wall_end` are already clamped to the (past) session deadline."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 0.3
+    adapter.descendant_poll_s = 0.05
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _ProbeSpy((["ses_child"], None))  # type: ignore[assignment]
+    sess.process = _Proc(0 if reason == "server-exited" else None)  # type: ignore[assignment]
+    monkeypatch.setattr(adapter, "_hard_stop_requested", lambda: reason == "stop")
+
+    assert (
+        _await(
+            adapter,
+            sess,
+            deadline_in=0.0 if reason == "timeout" else 60.0,
+            budget_in=0.0 if reason == "budget" else None,
+        )
+        is False
+    )
+
+    started, cut = _lifecycle_lines(adapter, "t-d")
+    assert started["event"] == "descendant-wait-started"
+    assert cut["event"] == "descendant-wait-cut"
+    assert cut["reason"] == reason and cut["sessions"] == ["ses_child"]
+
+
+def test_descendant_probe_recovery_ends_a_faulted_wait(tmp_path):
+    """A fault streak is crumbed once; a later probe that reads "none
+    active" ends the wait (`descendant-wait-ended` counting the faults).
+
+    ABLATION: crumb `descendant-probe-failed` on every fault and the streak
+    writes two."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 5.0
+    adapter.descendant_poll_s = 0.01
+    replies = iter([(None, "HTTP 500"), (None, "HTTP 500"), (None, "HTTP 503"), ([], None)])
+
+    class _Seq:
+        def active_descendants(self, _client, _session_id):
+            return next(replies)
+
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _Seq()  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+
+    assert _await(adapter, sess) is True
+
+    events = [(c["event"], c.get("error")) for c in _lifecycle_lines(adapter, "t-d")]
+    assert events == [
+        ("descendant-wait-started", "HTTP 500"),
+        ("descendant-probe-failed", "HTTP 500"),
+        ("descendant-wait-ended", None),
+    ]
+    assert _lifecycle_lines(adapter, "t-d")[-1]["probe_failures"] == 3
 
 
 def _v2_modeled(session_id: str, parent_id: str, model, **tokens) -> dict:
