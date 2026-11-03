@@ -257,15 +257,16 @@ class _StopFailureLatch:
     recovered. `wait_hit` also clears when a quota wait admits or ends.
 
     `kind` classifies the latest StopFailure for a window that dies after it
-    (#959): ``"account"``, ``"blocked"`` or ``"wait"``, or ``"unmatched"`` for
-    a ``rate_limit`` that matched neither usage list, latched only in
-    usage-relaunch mode (None for an unmapped, transient or ignored error, and
-    for an unmatched one outside that mode). `evidence` is the label the live
-    exit would carry and `resets` its parsed reset (`UsageReset.value`), so the
-    funnel can relabel a result-less ``crashed`` exit as the same uncharged
-    pause. `baseline` is the transcript's (mtime_ns, size) stat'ed fresh at the
-    latch (None when none was named or the stat failed; the next heartbeat
-    sample then adopts one). A Stop clears all four, and so does a heartbeat
+    (#959): ``"account"`` (also for an ``account-fatal`` error), ``"blocked"``
+    or ``"wait"``, or ``"unmatched"`` for a ``rate_limit`` that matched neither
+    usage list, latched only in usage-relaunch mode (None for an unmapped,
+    transient or ignored error, and for an unmatched one outside that mode).
+    `evidence` is the label the live exit would carry and `resets` its parsed
+    reset (`UsageReset.value`), so the funnel can relabel a result-less
+    ``crashed`` exit as the same uncharged pause. `baseline` is the
+    transcript's (mtime_ns, size) stat'ed fresh at the latch (None when none
+    was named or the stat failed; the next heartbeat sample then adopts one).
+    A Stop clears all four, and so does a heartbeat
     sample whose key differs from `baseline`: a CLI that wrote its transcript
     after the failure recovered by itself."""
 
@@ -354,8 +355,9 @@ SPAWN_SCAN_SLACK_NS = 300 * 1_000_000_000
 # `StopFailure` (#865, Claude Code >= 2.1.78) never completes one either: it
 # fires INSTEAD of `Stop` when an API error ends the turn, and the profile's
 # `[hooks.stop_failure_types]` maps its `error` to an action the wait loop takes
-# at once — a stop nudge (transient), a parked exit (account), or the usage-limit
-# split by message (rate_limit). Every exit it takes goes through `stall_exit`.
+# at once — a stop nudge (transient), a parked exit (account, account-fatal), or
+# the usage-limit split by message (rate_limit). Every exit it takes goes
+# through `stall_exit`.
 EVENT_KINDS = {"SessionStart", "Stop", "SessionEnd", "Notification", "StopFailure"} | set(
     PARKED_EVENTS
 )
@@ -3038,8 +3040,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             handle.task_id, "stop-failure-nudge-exhausted", error=error
                         )
                     continue
-                if action == "account":
+                if action in ("account", "account-fatal"):
                     # Only an operator can fix it: an uncharged parked pause.
+                    # `account-fatal` differs only downstream — usage-relaunch
+                    # mode never relaunches it — so it latches the `account`
+                    # kind and a dead window after it relabels parked too; the
+                    # result's `stop_failure_action` keeps the mapped value.
                     if message:
                         said = _env_excerpt(message, 0)
                     elif event.stop_error_details:

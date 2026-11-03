@@ -15850,6 +15850,53 @@ def _decide_dev_relaunch(result, *, usage_relaunches=0):
     )
 
 
+@pytest.mark.parametrize("alive", [True, False])
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        ("model_not_found", "model claude-nope does not exist"),
+        ("cloud_credential_error", "could not load cloud credentials"),
+    ],
+)
+def test_account_fatal_stop_failure_exits_parked_and_never_relaunches(
+    tmp_path, monkeypatch, alive, error, message
+):
+    """DW-613: claude maps `model_not_found` and `cloud_credential_error` to
+    `account-fatal`. In relaunch mode with budget left the adapter ends the
+    session parked at the event exactly as for `account` (live `stalled`, or a
+    dead window relabeled `crashed` + parked), the result carries the mapped
+    `account-fatal`, nothing is typed, and the relaunch-mode decider pauses it
+    instead of relaunching.
+
+    Ablation: leave the wait loop's parked arm at `action == "account"` and the
+    live exit is never taken (the error is ignored, `parked is False`)."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event(error, message)],
+        alive=lambda handle: alive,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _relaunch_spec(_dev_spec(tmp_path)))
+    assert (result.status, result.parked) == ("stalled" if alive else "crashed", True)
+    assert result.parked_evidence == f"StopFailure({error}): {message}"
+    assert result.usage_limited is None
+    assert (result.stop_failure, result.stop_failure_action) == (error, "account-fatal")
+    assert result.stop_seen is False
+    assert mux.sent == []
+    relabeled = _lifecycle_events(adapter, "crash-relabeled")
+    if alive:
+        assert relabeled == []
+    else:
+        (crumb,) = relabeled
+        assert (crumb["kind"], crumb["error"]) == ("account", error)
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert decision.action == Action.PAUSE
+    assert decision.uncharged is False
+    assert decision.reason.startswith("parked: dev session ")
+
+
 def test_relaunch_mode_wait_stop_failure_exits_at_once(tmp_path, monkeypatch):
     """Relaunch budget left: a wait-class usage StopFailure ends the session at
     the event, stalled + usage-limited WAIT with the reset carried, instead of

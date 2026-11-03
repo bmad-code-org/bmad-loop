@@ -27080,37 +27080,117 @@ def test_fix_phase_relaunch_is_uncharged(project, monkeypatch):
     assert repaired["uncharged"] is False and repaired["ok"] is True
 
 
-def test_uncharged_relaunch_skips_environment_probes(project, tmp_path):
-    """#959: an uncharged relaunch charges nothing, so the decision seam never
-    re-probes the environment for it. The environment dies during the
-    usage-limited session, yet the relaunch still launches: a dev retry
-    dispatches inside `_dev_phase`, past the dispatch gate, so nothing probes
-    between the two sessions. ABLATION, performed: drop `not decision.uncharged`
-    from `_env_gate_decision` and the decision is reclassified at
-    `probe:decision:dev` (a PAUSE, one session)."""
+def test_dev_relaunch_into_a_dead_environment_pauses_at_dispatch(project, tmp_path):
+    """DW-616: the environment dies during a usage-limited dev session. The
+    uncharged relaunch decision still skips the decision-site probe (it charges
+    nothing), but before the relaunch dispatches the probes run once the
+    rollback has landed, fail, and the run takes the ordinary dispatch pause at
+    `probe:dispatch:dev`: one session, phase reset to PENDING, the refund kept
+    and persisted, no escalation. A `resume` with the environment back clears
+    the fault, dispatches the relaunch without a rollback and finishes the
+    story. ABLATION, performed: drop the `_gate_relaunch` call from the dev
+    RETRY branch and the relaunch is requested from the one-entry script (the
+    run crashes instead of pausing)."""
     write_sprint(project, {"1-1-a": "ready-for-dev"})
     rig = _env_rig(tmp_path)
     policy = dataclasses.replace(
         _relaunch_policy(), environment=EnvironmentPolicy(probes=(rig.probe,))
     )
     engine, adapter = make_engine(
+        project, [rig.dies_during(_usage_limited(env_fault=False))], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 0 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = _dispatch_paused(engine)
+    assert task.phase == Phase.PENDING
+    assert (task.attempt, task.dev_usage_relaunches, task.charged_attempts) == (1, 1, 0)
+    on_disk = load_state(engine.run_dir).tasks["1-1-a"]
+    assert on_disk.phase == Phase.PENDING and on_disk.dev_usage_relaunches == 1
+    (decision,) = _rows(engine, "dev-decision")
+    assert decision["action"] == "retry" and decision["uncharged"] is True
+    assert "env_fault_site" not in decision
+    assert not _reclassified(engine)
+    assert [e["site"] for e in _rows(engine, "env-probe-failed")] == ["probe:dispatch:dev"]
+    assert not _rows(engine, "story-escalated")
+
+    rig.up.write_text("up\n")
+    engine2, adapter2 = resume_engine(
+        project, engine, [dev_effect(project, "1-1-a", followup_review=False)]
+    )
+    summary2 = engine2.run()
+
+    assert summary2.done == 1 and not summary2.paused
+    assert [s.role for s in adapter2.sessions] == ["dev"]
+    (cleared,) = _rows(engine2, "env-fault-cleared")
+    assert cleared["site"] == "probe:dispatch:dev"
+    (dispatched,) = _rows(engine2, "resume-env-dispatch")
+    assert dispatched["role"] == "dev"
+    assert not _rows(engine2, "resume-restart")
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.env_fault_site is None
+    assert (task.attempt, task.dev_usage_relaunches, task.charged_attempts) == (2, 1, 1)
+
+
+def test_dev_relaunch_probes_a_healthy_environment_then_dispatches(project, tmp_path):
+    """DW-616: with the environment healthy, the probe before the relaunch
+    passes and the relaunch runs exactly as before — no pause, no
+    `env-probe-failed`. The counter shows the extra pass: the first dispatch
+    gate (1), the relaunch probe (2); the relaunch iteration dispatches inside
+    `_dev_phase`, so the top-of-phase gate never re-runs. ABLATION, performed:
+    drop the `_gate_relaunch` call and the counter reads 1."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    counter = tmp_path / "probe-count"
+    probe = _python_cmd(
+        tmp_path / "probe.py",
+        "import pathlib\n"
+        f"p = pathlib.Path(r'{counter}')\n"
+        "p.write_text(str(int(p.read_text()) + 1 if p.exists() else 1))\n",
+    )
+    policy = dataclasses.replace(_relaunch_policy(), environment=EnvironmentPolicy(probes=(probe,)))
+    engine, adapter = make_engine(
         project,
-        [
-            rig.dies_during(_usage_limited(env_fault=False)),
-            dev_effect(project, "1-1-a", followup_review=False),
-        ],
+        [_usage_limited(env_fault=False), dev_effect(project, "1-1-a", followup_review=False)],
         policy=policy,
     )
-    engine.run()
+    summary = engine.run()
 
+    assert summary.done == 1 and not summary.paused
     assert [s.role for s in adapter.sessions] == ["dev", "dev"]
-    first = _rows(engine, "dev-decision")[0]
-    assert first["action"] == "retry" and first["uncharged"] is True
-    assert "env_fault_site" not in first
-    assert not _reclassified(engine)
-    sites = [e["site"] for e in _rows(engine, "env-probe-failed")]
-    assert "probe:decision:dev" not in sites
+    assert counter.read_text(encoding="utf-8") == "2"
+    assert not _rows(engine, "env-probe-failed")
     assert engine.state.tasks["1-1-a"].dev_usage_relaunches == 1
+
+
+def test_account_fatal_stop_failure_pauses_in_relaunch_mode(project):
+    """DW-613: a dev session the adapter parked on an `account-fatal`
+    StopFailure (claude's `model_not_found`) is never relaunched: relaunch mode
+    with budget left still pauses parked after one session, refunding nothing.
+    ABLATION, performed: widen `usage_relaunch`'s qualifier to accept
+    `account-fatal` and a second session is requested from the one-entry script
+    (the run crashes instead of pausing)."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    evidence = "StopFailure(model_not_found): model claude-nope does not exist"
+    fatal = SessionResult(
+        status="stalled",
+        parked=True,
+        parked_evidence=evidence,
+        stop_failure="model_not_found",
+        stop_failure_action="account-fatal",
+    )
+    engine, adapter = make_engine(project, [fatal], policy=_relaunch_policy())
+    summary = engine.run()
+
+    assert summary.paused and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    assert engine.state.paused_reason is not None
+    assert engine.state.paused_reason.startswith("parked: dev session stalled (")
+    assert evidence in engine.state.paused_reason
+    task = engine.state.tasks["1-1-a"]
+    assert (task.attempt, task.dev_usage_relaunches) == (1, 0)
+    (decision,) = _rows(engine, "dev-decision")
+    assert decision["action"] == "pause" and decision["uncharged"] is False
 
 
 def test_usage_relaunch_env_var_only_after_a_relaunch(project):

@@ -219,8 +219,9 @@ elicitation_url_dialog = "PermissionPrompt"
 # `last_assistant_message` (the rendered API error, not the model's prose), and
 # this table maps the `error` value onto an adapter action: `transient` gets the
 # stop nudge at once, `account` ends the session parked (an uncharged pause),
-# `rate_limit` is split by its message, `ignore` does nothing. An unmapped value
-# is crumbed and otherwise ignored. StopFailure is never a completion event.
+# `account-fatal` ends it parked the same way, `rate_limit` is split by its
+# message, `ignore` does nothing. An unmapped value is crumbed and otherwise
+# ignored. StopFailure is never a completion event.
 #
 # Values verified 2026-10-30 against code.claude.com/docs/en/hooks.md (12
 # documented) and the Claude Code 2.1.316 build, which adds an undocumented
@@ -238,7 +239,11 @@ elicitation_url_dialog = "PermissionPrompt"
 # `invalid_request` mostly means a context-shape failure (prompt too long,
 # compaction thrashing, a mismatched tool history) that a fresh session fixes —
 # not an account error. `unknown` also covers model-output failures (a malformed
-# tool call, an empty completion).
+# tool call, an empty completion). `model_not_found` (a wrong model name) and
+# `cloud_credential_error` (a broken cloud-provider credential) map to
+# `account-fatal`, not `account`: under `usage_limit_action = "relaunch"` an
+# `account` error is relaunched, but no relaunch or account switch fixes these,
+# so they always pause for the operator.
 [hooks.stop_failure_types]
 overloaded = "transient"
 server_error = "transient"
@@ -251,8 +256,8 @@ authentication_failed = "account"
 oauth_org_not_allowed = "account"
 account_on_hold = "account"
 verification_required = "account"
-cloud_credential_error = "account"
-model_not_found = "account"
+cloud_credential_error = "account-fatal"
+model_not_found = "account-fatal"
 
 # Native events an older Claude Code does not know -> the first version that
 # does (see StopFailure signals above for why the gate exists).

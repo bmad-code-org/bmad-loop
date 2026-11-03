@@ -290,7 +290,7 @@ To wait out a session-window reset instead of watching the clock, run `bmad-loop
 
 A session-window limit the CLI waits out by itself does not pause at all at first. While the pane shows that wait and the transcript is idle, the session timeout stands still and no stall nudge is sent, so the session finishes after the CLI continues. `[limits] quota_wait_max_min` (default 300, one five-hour window; 0 = off) caps the minutes one session may spend waiting. Past the cap, or when the parsed reset already lies beyond what is left of it, the session pauses with the reason above. A heartbeat shows the wait as `quota_waiting` / `quota_wait_s` / `quota_resets_at`, and the TUI header as `quota wait`.
 
-**Relaunch instead of pausing.** With `[limits] usage_limit_action = "relaunch"` (default `"pause"`), a dev, fix or review session that ends usage-limited, or on a Claude Code account `StopFailure`, does not pause: the story is relaunched at once and the attempt or review cycle is not charged. Use it when something outside bmad-loop clears the limit between sessions, typically a wrapper that switches accounts (see [Account rotation](plugin-authoring-guide.md#account-rotation)). In this mode:
+**Relaunch instead of pausing.** With `[limits] usage_limit_action = "relaunch"` (default `"pause"`), a dev, fix or review session that ends usage-limited, or on a Claude Code account `StopFailure` (billing, authentication, an account hold), does not pause: the story is relaunched at once and the attempt or review cycle is not charged. Use it when something outside bmad-loop clears the limit between sessions, typically a wrapper that switches accounts (see [Account rotation](plugin-authoring-guide.md#account-rotation)). In this mode:
 
 - the session ends at the limit instead of waiting out a session-window reset, and a Claude Code `rate_limit` `StopFailure` whose message names no known usage limit counts as one;
 - a dev or fix relaunch rolls back like any retry (the preserve ref keeps the cut-off work), and a review relaunch re-runs the review;
@@ -298,7 +298,9 @@ A session-window limit the CLI waits out by itself does not pause at all at firs
 - the decision row reads `usage relaunch (<n>/<cap>): <evidence>` with `uncharged: true`, and the notification `dev relaunch: <story> (usage limit, relaunch <n>/<cap>)` (`review relaunch:` / `fix relaunch:` likewise);
 - `[limits] max_usage_relaunches` (default 3) caps the relaunches per story. At the cap the session waits out a session-window reset as above, and a limit that remains pauses uncharged as in pause mode, recovered the same way. A `resolve` re-arm resets the count.
 
-Relaunches skip the `[environment]` probes, and a relaunch cannot fix a Claude Code account error such as `model_not_found`: those fail again on the first turn until the cap stops them.
+A Claude Code `model_not_found` or `cloud_credential_error` is never relaunched, since no relaunch or account switch fixes a wrong model name or a broken cloud credential: it pauses with a `parked:` reason exactly as in pause mode.
+
+With `[environment] probes` configured, a dev relaunch runs them first, after its rollback. A failing probe pauses the run at the `environment` stage with a reason starting `environment fault before dev session dispatch`; the relaunch stays refunded and nothing else is charged. Fix the environment and run `bmad-loop resume <run-id>`: the probes re-run, then the relaunch dispatches. A review relaunch is probed by the review dispatch gate the same way. A fix relaunch skips the probes.
 
 ## Worktree merge-back failures
 

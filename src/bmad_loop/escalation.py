@@ -438,7 +438,10 @@ def usage_relaunch(task: StoryTask, result: SessionResult, policy: Policy) -> De
     "relaunch"``), while the story's uncharged relaunches stay under
     ``limits.max_usage_relaunches``, for a non-completed session the adapter saw
     behind a usage limit (``usage_limited``, any adapter) or a StopFailure mapped
-    to the account action. At the cap it returns None, so the caller falls
+    to the ``account`` action. A StopFailure mapped to ``account-fatal`` (a wrong
+    model name, a broken cloud credential) never qualifies: no relaunch or
+    account switch fixes it, so it takes the same parked pause it gets in pause
+    mode. At the cap it returns None, so the caller falls
     through to the usage-limit pause the same result gets in pause mode: a
     repeated or forged limit signal buys at most the cap, never a loop.
 

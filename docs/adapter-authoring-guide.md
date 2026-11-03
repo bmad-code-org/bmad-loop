@@ -362,14 +362,14 @@ stall grace, as pane growth does.
 
 ### `HookSpec` (the `[hooks]` table)
 
-| Field                | Required                     | Default | Meaning                                                                                                                                                            |
-| -------------------- | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `dialect`            | ✅                           | —       | Hook-config format: `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `antigravity-hooks-json`, or `none` (hookless).   |
-| `config_path`        | ✅ unless `dialect = "none"` | `""`    | Project-relative path the hook config is written to. Must stay inside the project; empty when hookless.                                                            |
-| `events`             | ✅ unless `dialect = "none"` | `{}`    | Native event → canonical event (`SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, `Notification`, `StopFailure`, or a parked kind). Empty when hookless.         |
-| `notification_types` |                              | `{}`    | `[hooks.notification_types]`: notification subtype → parked kind. Unmapped subtypes are ignored. Needs an event mapped to `Notification`.                          |
-| `stop_failure_types` |                              | `{}`    | `[hooks.stop_failure_types]`: `StopFailure` error value → `transient`, `rate_limit`, `account` or `ignore`. Needs an event mapped to `StopFailure`.                |
-| `event_min_versions` |                              | `{}`    | `[hooks.event_min_versions]`: native event → minimum CLI version (`X.Y.Z`). Registration leaves the event out below it. Keys must be mapped; never a Stop carrier. |
+| Field                | Required                     | Default | Meaning                                                                                                                                                              |
+| -------------------- | ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dialect`            | ✅                           | —       | Hook-config format: `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `antigravity-hooks-json`, or `none` (hookless).     |
+| `config_path`        | ✅ unless `dialect = "none"` | `""`    | Project-relative path the hook config is written to. Must stay inside the project; empty when hookless.                                                              |
+| `events`             | ✅ unless `dialect = "none"` | `{}`    | Native event → canonical event (`SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, `Notification`, `StopFailure`, or a parked kind). Empty when hookless.           |
+| `notification_types` |                              | `{}`    | `[hooks.notification_types]`: notification subtype → parked kind. Unmapped subtypes are ignored. Needs an event mapped to `Notification`.                            |
+| `stop_failure_types` |                              | `{}`    | `[hooks.stop_failure_types]`: `StopFailure` error value → `transient`, `rate_limit`, `account`, `account-fatal` or `ignore`. Needs an event mapped to `StopFailure`. |
+| `event_min_versions` |                              | `{}`    | `[hooks.event_min_versions]`: native event → minimum CLI version (`X.Y.Z`). Registration leaves the event out below it. Keys must be mapped; never a Stop carrier.   |
 
 ### Session identity and nested CLIs
 
@@ -531,6 +531,12 @@ The generic adapter acts on it when it arrives, by action:
   `StopFailure(<error>): <message, else details, else "no message">`. The log-tail
   env-fault scan is skipped, so the run pauses with a `parked:` reason naming the error,
   and the attempt is not charged.
+- **`account-fatal`**: the adapter treats it exactly like `account` (the same parked exit
+  and evidence, and a dead window after it is relabeled `parked` with
+  `crash-relabeled` `kind="account"`), and `stop_failure_action` reads `account-fatal`.
+  The difference is downstream: usage-relaunch mode relaunches an `account` error but
+  never an `account-fatal` one, so map an error here when no relaunch or account switch
+  can fix it.
 - **`rate_limit`**: an ordinary 429 and a subscription limit share this value, so the
   message is matched against the profile's usage lists (see
   [Usage-limit signals](#usage-limit-signals)). A `usage_limit_patterns` match ends the
@@ -551,9 +557,9 @@ uncleared error, as does the heartbeat and the `session-end` journal entry, and
 
 **A window that dies after the event.** An operator's own `StopFailure` hook may kill the
 window, for example to switch accounts. The session then ends `crashed`, but an `account`
-error, or a `rate_limit` that matched a usage list, keeps its classification: the result
-is labeled `parked` (account) or `usage_limited` (blocked or wait class), and the run gets
-the same uncharged pause as the live exit. The adapter leaves a `crash-relabeled`
+or `account-fatal` error, or a `rate_limit` that matched a usage list, keeps its
+classification: the result is labeled `parked` (account) or `usage_limited` (blocked or
+wait class), and the run gets the same uncharged pause as the live exit. The adapter leaves a `crash-relabeled`
 lifecycle crumb (`kind`, `error`). A `Stop` clears the classification, and so does a
 transcript write after the event, since the CLI recovered by itself. A crash whose result
 file exists is completed as before and never relabeled. An unmatched `rate_limit` stays an
@@ -581,8 +587,10 @@ The engine relaunches such a session without charging an attempt (see
 The shipped `claude` profile maps the documented values: `overloaded`, `server_error`,
 `unknown`, `max_output_tokens` and `invalid_request` (a context-shape failure that a fresh
 session fixes) are `transient`; `rate_limit` is `rate_limit`; `billing_error`,
-`authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`,
-`verification_required`, `cloud_credential_error` and `model_not_found` are `account`.
+`authentication_failed`, `oauth_org_not_allowed`, `account_on_hold` and
+`verification_required` are `account`; `cloud_credential_error` and `model_not_found` are
+`account-fatal`, since a relaunch on another account still hits the same wrong model or
+broken cloud credential.
 
 **Version gate.** Claude Code before 2.1.78 skips its whole settings file over an
 unknown hook event key, `Stop` relay included, so claude's

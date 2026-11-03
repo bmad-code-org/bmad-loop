@@ -90,6 +90,9 @@ PARKED_EVENTS = frozenset({"PermissionPrompt", "IdlePrompt", "QuotaPrompt"})
 # INSTEAD of `Stop`, so it is never a completion. It is not a parked kind — the
 # profile's `hooks.stop_failure_types` maps its native `error` value onto one of
 # STOP_FAILURE_ACTIONS, the closed set the generic adapter knows how to act on.
+# `account-fatal` is `account` for an error no relaunch or account switch can fix
+# (a wrong model name, a broken cloud credential): the adapter ends the session
+# parked exactly as for `account`, but usage-relaunch mode never relaunches it.
 CANONICAL_EVENTS = {
     "SessionStart",
     "Stop",
@@ -98,7 +101,7 @@ CANONICAL_EVENTS = {
     "Notification",
     "StopFailure",
 } | set(PARKED_EVENTS)
-STOP_FAILURE_ACTIONS = frozenset({"transient", "rate_limit", "account", "ignore"})
+STOP_FAILURE_ACTIONS = frozenset({"transient", "rate_limit", "account", "account-fatal", "ignore"})
 # A CLI version as `hooks.event_min_versions` spells it and `--version` prints
 # it: the first dotted MAJOR.MINOR.PATCH triple.
 _CLI_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")

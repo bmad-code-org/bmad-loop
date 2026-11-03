@@ -998,6 +998,59 @@ def test_dev_account_stop_failure_relaunches():
     assert escalation.usage_relaunch(_task(attempt=1), permission, RELAUNCH) is None
 
 
+_ACCOUNT_FATAL_EVIDENCE = "StopFailure(model_not_found): model claude-nope does not exist"
+
+
+def _account_fatal_stop_failure(status: str = "stalled") -> SessionResult:
+    """A session the adapter parked on an `account-fatal` StopFailure (DW-613):
+    the same parked shape as `account`, with the action the profile mapped."""
+    return SessionResult(
+        status=status,
+        parked=True,
+        parked_evidence=_ACCOUNT_FATAL_EVIDENCE,
+        stop_failure="model_not_found",
+        stop_failure_action="account-fatal",
+    )
+
+
+@pytest.mark.parametrize("status", ["stalled", "crashed"])
+def test_account_fatal_stop_failure_never_relaunches(status):
+    """DW-613: relaunch mode never relaunches an `account-fatal` StopFailure (a
+    wrong model, a broken cloud credential): dev and review both take the
+    parked PAUSE, charged nothing and not marked uncharged, with budget left.
+    ABLATION: widen `usage_relaunch`'s qualifier to
+    `stop_failure_action not in ("account", "account-fatal")` and the RETRY
+    comes back, failing every assertion below."""
+    result = _account_fatal_stop_failure(status)
+    task = _task(attempt=1, review_cycle=1)
+    assert task.usage_relaunches < RELAUNCH.limits.max_usage_relaunches
+    assert escalation.usage_relaunch(task, result, RELAUNCH) is None
+    decision = decide_dev(task, result, None, RELAUNCH)
+    assert decision.action == Action.PAUSE
+    assert decision.uncharged is False
+    assert decision.reason.startswith("parked: dev session ")
+    assert _ACCOUNT_FATAL_EVIDENCE in decision.reason
+    review = decide_review_session(task, result, RELAUNCH)
+    assert review.action == Action.PAUSE
+    assert review.uncharged is False
+    assert review.reason.startswith("parked: ")
+
+
+def test_account_fatal_pauses_exactly_like_account_in_pause_mode():
+    """DW-613: in pause mode an `account-fatal` result decides identically to
+    the same result mapped to `account` — the action only matters to the
+    relaunch qualifier."""
+    fatal = _account_fatal_stop_failure()
+    account = dataclasses.replace(fatal, stop_failure_action="account")
+    assert decide_dev(_task(attempt=1), fatal, None, POLICY) == decide_dev(
+        _task(attempt=1), account, None, POLICY
+    )
+    assert decide_review_session(_task(review_cycle=1), fatal, POLICY) == (
+        decide_review_session(_task(review_cycle=1), account, POLICY)
+    )
+    assert decide_dev(_task(attempt=1), fatal, None, POLICY).action == Action.PAUSE
+
+
 def test_relaunch_cap_falls_back_to_the_usage_pause():
     """At the per-story cap (dev and review refunds together) the result gets
     the same uncharged usage-limit PAUSE it gets in pause mode. ABLATION: skip

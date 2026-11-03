@@ -91,7 +91,10 @@ breaking changes may land in a minor release.
 - Add opt-in `[limits] usage_limit_action = "relaunch"`: a session that ends on a usage
   limit relaunches the story at once without charging an attempt, up to
   `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
-  session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers (#959).
+  session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers. A dev relaunch
+  runs the `[environment]` probes first and pauses at `environment` when they fail;
+  Claude's `model_not_found` and `cloud_credential_error` map to the new `account-fatal`
+  StopFailure action, which pauses like `account` but is never relaunched (#959).
 - Record the models a session actually ran on: session-end `models` (Claude, Codex,
   Gemini, Copilot, OpenCode — on 2.x its subagent sessions' models too; `models_unresolved`
   when none was found), `status --json` `adapters_used.<role>.models_used`, and the

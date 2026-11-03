@@ -2625,13 +2625,17 @@ class Engine:
                     self._release_orphaned_mount(task)
                     self._finalize_commit_phase(task)
             elif env_role == "dev" and task.phase == Phase.PENDING:
-                # DW-523: the run paused at the dev dispatch gate, before the
-                # attempt, the baseline, or anything else moved — so NO rollback:
-                # the tree (and any commit the operator made while paused) is the
-                # one the story starts from. The story gate was asked above, before
-                # the site cleared. A review-dispatch pause at DEV_VERIFY + spec_file
-                # (first cycle) or at REVIEW_VERIFY with the completed pass on record
-                # resumes through the spec-approval or completed-pass replay arms;
+                # DW-523: the run paused at a dev dispatch gate with nothing owed
+                # a rollback — at the top of the phase before the attempt, the
+                # baseline, or anything else moved, or (DW-616 `_gate_relaunch`)
+                # before a usage relaunch, after the usage-limited session's
+                # rollback already landed and the phase was reset to PENDING. So
+                # NO rollback: the tree (and any commit the operator made while
+                # paused) is the one the story starts from. The story gate was
+                # asked above, before the site cleared. A review-dispatch pause at
+                # DEV_VERIFY + spec_file (first cycle) or at REVIEW_VERIFY with the
+                # completed pass on record resumes through the spec-approval or
+                # completed-pass replay arms;
                 # the remaining REVIEW_VERIFY shape has its own arm below (DW-529).
                 self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
                 if mounted:
@@ -3855,6 +3859,13 @@ class Engine:
                             # Repair writes fail loud when there is no earlier
                             # exception whose identity must be preserved.
                             raise restore_error
+                if decision.uncharged:
+                    # DW-616: the relaunch dispatches below without passing the
+                    # top-of-phase gate, and `_env_gate_decision` skipped the
+                    # probes for this uncharged decision — probe now, after the
+                    # rollback, so a dead environment pauses instead of failing
+                    # the relaunched session.
+                    self._gate_relaunch(task)
                 continue
             # DEFER and escalation preserve their current tree/knowledge rather
             # than rejecting the attempt, so neither may later consume this arm.
@@ -6977,6 +6988,31 @@ class Engine:
         if not probe.ok:
             self._pause_environment(task, site=site, probe=probe)
 
+    def _gate_relaunch(self, task: StoryTask) -> None:
+        """Probe the environment before an uncharged dev usage relaunch (DW-616).
+
+        The relaunch is the next iteration of :meth:`_dev_phase`'s loop, so it
+        never reaches :meth:`_gate_dispatch` at the top of the phase, and
+        :meth:`_env_gate_decision` leaves uncharged decisions unprobed. Called
+        once the relaunch's rollback has run, so the tree is the attempt baseline
+        and the refund (``dev_usage_relaunches``) already stands. Skipped when no
+        probes are configured. Freshness is not consulted: the usage-limited
+        session's launch cleared it, and the rollback cleared it again.
+
+        On a failed pass the phase is reset to ``PENDING`` (deliberately, as the
+        resume arms do) and the run takes the ordinary dispatch pause at
+        ``probe:dispatch:dev``: a plain ``resume`` re-probes and lands on the
+        no-rollback dev-dispatch arm, which re-enters the phase from the top and
+        launches the relaunch. Left at ``DEV_VERIFY`` with a ``spec_file``,
+        resume would take the spec-approval arm and review unverified work."""
+        if not self.policy.environment.probes:
+            return
+        site = f"{ENV_FAULT_SITE_DISPATCH_PREFIX}dev"
+        probe = self._run_environment_probes(task, site=site)
+        if not probe.ok:
+            task.phase = Phase.PENDING  # deliberate reset, not a normal transition
+            self._pause_environment(task, site=site, probe=probe)
+
     def _pause_environment(
         self, task: StoryTask, *, site: str, probe: verify.ProbeOutcome
     ) -> NoReturn:
@@ -6984,11 +7020,12 @@ class Engine:
 
         Shaped like :meth:`_pause_for_ledger_repair`: notify, ``_save()``,
         ``RunPaused`` — and the task's phase, attempt and review cycle stay exactly
-        where they were. NOT :meth:`_escalate`: nothing ran, so there is nothing
-        for ``resolve`` to adjudicate. ``env_fault_site`` records the dispatch site
-        so a plain ``bmad-loop resume`` re-probes first
-        (:meth:`_take_env_dispatch_pause`) and then dispatches the same session
-        without a rollback."""
+        where the caller left them (:meth:`_gate_relaunch` resets the phase to
+        ``PENDING`` first; its usage-limited session already ran and was rolled
+        back). NOT :meth:`_escalate`: nothing is pending for ``resolve`` to
+        adjudicate. ``env_fault_site`` records the dispatch site so a plain
+        ``bmad-loop resume`` re-probes first (:meth:`_take_env_dispatch_pause`) and
+        then dispatches the withheld session without a rollback — none is owed."""
         failed = probe.failed
         assert failed is not None  # only a failed pass pauses
         role = site.removeprefix(ENV_FAULT_SITE_DISPATCH_PREFIX)
@@ -7066,7 +7103,8 @@ class Engine:
             return self._env_gate_claim(task, decision, claim, role=role)
         if not self.policy.environment.probes:
             return decision
-        # An uncharged usage relaunch (#959) charges nothing, so it never probes.
+        # An uncharged usage relaunch (#959) charges nothing, so it never probes
+        # here; a dev relaunch is probed at dispatch instead (`_gate_relaunch`).
         charges = (
             decision.action in (Action.RETRY, Action.DEFER) and not decision.uncharged
         ) or decision.budget_exhausted
