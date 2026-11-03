@@ -90,9 +90,13 @@ TRANSCRIPT_GLOBS = {
     "codex-rollout": "~/.codex/sessions/*/*/*/rollout-*.jsonl",
     "gemini-chat": "~/.gemini/tmp/*/chats/session-*.jsonl",
     "copilot-events": "~/.copilot/session-state/*/events.jsonl",
+    "antigravity-transcript": (
+        "~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl"
+    ),
 }
 # Fallback family glob keyed by the `cli` name, so a CLI whose usage_parser is
-# still "none" (e.g. antigravity, freshly added) still gets transcript discovery.
+# "none" (a freshly added profile, or an override that turns the parser off)
+# still gets transcript discovery.
 FAMILY_GLOBS = {
     "claude": "~/.claude/projects/*/*.jsonl",
     "codex": "~/.codex/sessions/*/*/*/rollout-*.jsonl",

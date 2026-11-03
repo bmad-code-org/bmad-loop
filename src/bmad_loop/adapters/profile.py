@@ -55,7 +55,14 @@ from ..policy import PERMISSION_MODES, PROFILE_ALIASES
 from .entrypoints import record_load_error
 from .multiplexer import ALLOWED_KEYS
 
-USAGE_PARSERS = {"claude-jsonl", "codex-rollout", "gemini-chat", "copilot-events", "none"}
+USAGE_PARSERS = {
+    "claude-jsonl",
+    "codex-rollout",
+    "gemini-chat",
+    "copilot-events",
+    "antigravity-transcript",
+    "none",
+}
 # The subagent transcript tree a usage parser's CLI writes beside its session
 # transcript, for profiles that leave `subagent_transcript_dir` unset. Mirrors
 # the subagent anchor tokens.tally already sums (`<stem>/subagents`, walked

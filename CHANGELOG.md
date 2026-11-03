@@ -97,6 +97,9 @@ breaking changes may land in a minor release.
   `adapters_used.<role>.models_used`, and the CLI-reported launch model (`session-model`
   journal row) on the TUI agent line. `session-start` `model` still records the configured
   model (#859).
+- Record antigravity token usage: the `antigravity-transcript` parser sums agy's per-step
+  transcript counts (checked against 1.4.9), subagent conversations included. Models stay
+  untracked.
 
 ### Changed
 

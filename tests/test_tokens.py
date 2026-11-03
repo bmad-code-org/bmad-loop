@@ -1,6 +1,8 @@
 import datetime
 import json
 import os
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +11,7 @@ from bmad_loop.model import TokenUsage
 from bmad_loop.tokens import (
     read_usage,
     tally,
+    tally_antigravity_transcript,
     tally_codex_rollout,
     tally_copilot_events,
     tally_gemini_chat,
@@ -1191,6 +1194,192 @@ def test_copilot_events_without_metrics_is_none(tmp_path):
     assert tally_copilot_events(tmp_path / "nope.jsonl") is None
 
 
+# --------------------------------------------------- antigravity-transcript
+
+# Sanitized from a real agy 1.4.9 parent + foreground-subagent capture: synthetic
+# conversation ids and placeholder text, token counts and key layout verbatim.
+AGY_BRAIN = Path(__file__).parent / "fixtures" / "antigravity-1.4.9" / "brain"
+AGY_PARENT = "d0000000-0000-4000-8000-000000000001"
+AGY_CHILD = "b0000000-0000-4000-8000-000000000002"
+# The parent's own steps: input 6899+2482+2313, cache 0+4845+5278, output 201+117+38.
+AGY_PARENT_USAGE = TokenUsage(input_tokens=11694, output_tokens=356, cache_read_tokens=10123)
+
+
+def _agy_transcript(brain, conversation):
+    return brain / conversation / ".system_generated" / "logs" / "transcript_full.jsonl"
+
+
+def _agy_marker(brain, parent, child):
+    marker = brain / parent / ".system_generated" / "subagents" / f"{child}.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"conversationId": child}), encoding="utf-8")
+    return marker
+
+
+def _agy_step(index, input_tokens=0, cache_read=0, output_tokens=0):
+    return {
+        "step_index": index,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "input_tokens": input_tokens,
+        "cache_read_tokens": cache_read,
+        "output_tokens": output_tokens,
+    }
+
+
+@pytest.fixture
+def agy_brain(tmp_path):
+    """A mutable copy of the 1.4.9 fixture brain store."""
+    return Path(shutil.copytree(AGY_BRAIN, tmp_path / "brain"))
+
+
+def test_antigravity_transcript_folds_spawned_subagent():
+    """Parent + child sums, read through the dispatcher as the adapter does at
+    session end; `models` stays None (no model source), so `session-end`
+    carries neither `models` nor `models_unresolved`."""
+    usage = read_usage("antigravity-transcript", _agy_transcript(AGY_BRAIN, AGY_PARENT))
+    assert usage == TokenUsage(input_tokens=25760, output_tokens=627, cache_read_tokens=26131)
+    assert usage.cache_creation_tokens == 0
+    assert usage.unread == ()
+    assert usage.models is None
+
+
+def test_antigravity_transcript_parent_only(agy_brain):
+    shutil.rmtree(agy_brain / AGY_PARENT / ".system_generated" / "subagents")
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == ()
+    assert usage.models is None
+
+
+def test_antigravity_transcript_outside_agy_layout_tallies_alone(agy_brain):
+    """The fold applies only to `<conv>/.system_generated/logs/<file>`: the same
+    transcript one folder over, in the same conversation, reads alone."""
+    elsewhere = agy_brain / AGY_PARENT / ".system_generated" / "other" / "transcript_full.jsonl"
+    elsewhere.parent.mkdir()
+    shutil.copy(_agy_transcript(agy_brain, AGY_PARENT), elsewhere)
+    assert tally_antigravity_transcript(elsewhere) == AGY_PARENT_USAGE
+
+
+def test_antigravity_transcript_pre_usage_shape_is_none(tmp_path):
+    """agy 1.1.3 wrote no counts: untracked, never zero."""
+    path = _agy_transcript(tmp_path, AGY_PARENT)
+    _write_jsonl(
+        path,
+        [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "x"},
+            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "OK"},
+        ],
+    )
+    assert tally_antigravity_transcript(path) is None
+    assert read_usage("antigravity-transcript", path) is None
+
+
+def test_antigravity_transcript_missing_file_is_none(tmp_path):
+    assert tally_antigravity_transcript(_agy_transcript(tmp_path, AGY_PARENT)) is None
+
+
+def test_antigravity_transcript_all_zero_step_is_tracked(tmp_path):
+    path = _agy_transcript(tmp_path, AGY_PARENT)
+    _write_jsonl(path, [_agy_step(1)])
+    assert tally_antigravity_transcript(path) == TokenUsage()
+
+
+def test_antigravity_transcript_skips_unreadable_child(agy_brain, monkeypatch):
+    child = _agy_transcript(agy_brain, AGY_CHILD)
+    real_open = Path.open
+
+    def guarded_open(self, *args, **kwargs):
+        if self == child:
+            raise PermissionError("denied")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == (f"{AGY_CHILD}/transcript_full.jsonl: PermissionError",)
+
+
+def test_antigravity_transcript_names_unlistable_marker_folder(agy_brain, monkeypatch):
+    subagents = agy_brain / AGY_PARENT / ".system_generated" / "subagents"
+    real_iterdir = Path.iterdir
+
+    def guarded_iterdir(self):
+        if self == subagents:
+            raise PermissionError("denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == ("subagents/: PermissionError",)
+
+
+def test_antigravity_transcript_child_only_usage_is_tracked(agy_brain):
+    parent = _agy_transcript(agy_brain, AGY_PARENT)
+    _write_jsonl(parent, [{"step_index": 0, "type": "USER_INPUT", "content": "x"}])
+    usage = tally_antigravity_transcript(parent)
+    assert usage == TokenUsage(input_tokens=14066, output_tokens=271, cache_read_tokens=16008)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "notauuid.json",
+        # a UUID, but not canonical: uppercase and unhyphenated spellings
+        f"{AGY_CHILD.upper()}.json",
+        f"{AGY_CHILD.replace('-', '')}.json",
+        # canonical stem, wrong suffix
+        f"{AGY_CHILD}.txt",
+    ],
+)
+def test_antigravity_transcript_ignores_non_canonical_marker(agy_brain, name):
+    """The child's conversation folder is renamed to the marker's stem, so only
+    the marker gate keeps it out of the tally."""
+    subagents = agy_brain / AGY_PARENT / ".system_generated" / "subagents"
+    (subagents / f"{AGY_CHILD}.json").rename(subagents / name)
+    stem = name.rpartition(".")[0]
+    if stem != AGY_CHILD:
+        (agy_brain / AGY_CHILD).rename(agy_brain / stem)
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+
+
+def test_antigravity_transcript_recurses_once_per_conversation(agy_brain):
+    """A grandchild folds in; a marker cycle back to the parent or a child the
+    tree already holds visits nothing twice."""
+    grandchild = "c0000000-0000-4000-8000-000000000003"
+    _write_jsonl(_agy_transcript(agy_brain, grandchild), [_agy_step(1, 1, 2, 3)])
+    _agy_marker(agy_brain, AGY_CHILD, grandchild)
+    _agy_marker(agy_brain, grandchild, AGY_PARENT)
+    _agy_marker(agy_brain, grandchild, AGY_CHILD)
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == TokenUsage(input_tokens=25761, output_tokens=630, cache_read_tokens=26133)
+
+
+def test_antigravity_transcript_duplicate_step_counts_once(tmp_path):
+    path = _agy_transcript(tmp_path, AGY_PARENT)
+    anon = _agy_step(None, 100, 0, 1)
+    del anon["step_index"]
+    _write_jsonl(
+        path,
+        [
+            _agy_step(1, 10, 20, 30),
+            _agy_step(1, 11, 21, 31),  # the same step re-emitted: last wins
+            _agy_step(2, 1, 0, 0),
+            anon,
+            anon,  # no int step_index: each counts
+            {**_agy_step(3, 1000), "step_index": "3"},
+            {**_agy_step(3, 1000), "step_index": True},
+        ],
+    )
+    usage = tally_antigravity_transcript(path)
+    assert usage == TokenUsage(
+        input_tokens=11 + 1 + 200 + 2000, output_tokens=33, cache_read_tokens=21
+    )
+
+
 def test_read_usage_dispatch(tmp_path):
     path = tmp_path / "t.jsonl"
     path.write_text(json.dumps({"usage": {"input_tokens": 1, "output_tokens": 2}}) + "\n")
@@ -1202,6 +1391,10 @@ def test_read_usage_dispatch(tmp_path):
         json.dumps({"data": {"modelMetrics": {"m": {"usage": {"inputTokens": 7}}}}}) + "\n"
     )
     assert read_usage("copilot-events", cop).input_tokens == 7
+
+    agy = tmp_path / "transcript_full.jsonl"
+    agy.write_text(json.dumps({"step_index": 1, "input_tokens": 5}) + "\n", encoding="utf-8")
+    assert read_usage("antigravity-transcript", agy).input_tokens == 5
 
 
 def test_read_usage_tracked_parsers_report_models(tmp_path):

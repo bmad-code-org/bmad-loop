@@ -42,6 +42,15 @@ transcript that yields nothing reads as None (untracked), not zero.
                  reasoningTokens} that is CUMULATIVE per model, so the last
                  entry bearing modelMetrics holds the session totals (summed
                  across models). reasoningTokens fold into output.
+- antigravity-transcript: ~/.gemini/antigravity-cli/brain/<conversation-id>/
+                 .system_generated/logs/transcript_full.jsonl (agy 1.4.9);
+                 each PLANNER_RESPONSE step (one API call) carries top-level
+                 input_tokens (exclusive of cache reads), cache_read_tokens and
+                 output_tokens, summed per step. A subagent is its own
+                 conversation: the parent's .system_generated/subagents/
+                 <child-id>.json spawn markers name the children, whose own
+                 transcripts are folded in recursively. No model id is
+                 written, so models stay untracked (None).
 """
 
 from __future__ import annotations
@@ -69,6 +78,8 @@ def read_usage(parser: str, transcript_path: Path) -> TokenUsage | None:
         return tally_gemini_chat(transcript_path)
     if parser == "copilot-events":
         return tally_copilot_events(transcript_path)
+    if parser == "antigravity-transcript":
+        return tally_antigravity_transcript(transcript_path)
     return None
 
 
@@ -571,6 +582,133 @@ def tally_copilot_events(transcript_path: Path) -> TokenUsage | None:
                 output_tokens=_int(usage.get("outputTokens")) + _int(usage.get("reasoningTokens")),
                 cache_read_tokens=_int(usage.get("cacheReadTokens")),
                 cache_creation_tokens=_int(usage.get("cacheWriteTokens")),
+            )
+        )
+    return total
+
+
+# ------------------------------------------------- antigravity-transcript
+
+_AGY_USAGE_KEYS = ("input_tokens", "cache_read_tokens", "output_tokens")
+# The file every conversation's usage lives in, under <conv>/AGY_LOGS_DIR.
+_AGY_TRANSCRIPT = "transcript_full.jsonl"
+_AGY_LOGS_DIR = (".system_generated", "logs")
+# Mirrors the antigravity profile's `subagent_spawn_marker`
+# (`.system_generated/subagents/{session_id}.json`): the folder, under a
+# conversation, that lists the children it spawned.
+_AGY_SUBAGENTS_DIR = (".system_generated", "subagents")
+
+
+def _agy_steps(transcript_path: Path) -> list[dict[str, int]] | None:
+    """The transcript's per-step usage counts, or None when no step carries one.
+
+    A step with an int `step_index` counts once, from its last usage-bearing
+    occurrence; one without each counts. OSError/ValueError propagate."""
+    by_step: dict[int, dict[str, int]] = {}
+    anon: list[dict[str, int]] = []
+    for entry in _jsonl_entries(transcript_path):
+        if not any(key in entry for key in _AGY_USAGE_KEYS):
+            continue
+        counts = {key: _int(entry.get(key)) for key in _AGY_USAGE_KEYS}
+        index = entry.get("step_index")
+        if isinstance(index, int) and not isinstance(index, bool):
+            by_step[index] = counts
+        else:
+            anon.append(counts)
+    if not by_step and not anon:
+        return None
+    return [*by_step.values(), *anon]
+
+
+def _agy_children(conversation: Path, label: str, unread: list[str]) -> list[str]:
+    """The child conversation ids `conversation`'s spawn markers name, sorted.
+
+    Only a `.json` marker whose stem is a canonical UUID names a child, so a
+    garbled name can never leave the brain store. A missing folder lists none;
+    one that cannot be listed is named in ``unread`` as ``<label>subagents/``."""
+    folder = conversation.joinpath(*_AGY_SUBAGENTS_DIR)
+    try:
+        names = sorted(each.name for each in folder.iterdir())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        unread.append(f"{label}subagents/: {type(e).__name__}")
+        return []
+    children: list[str] = []
+    for name in names:
+        stem, dot, suffix = name.rpartition(".")
+        if not dot or suffix != "json":
+            continue
+        try:
+            canonical = str(uuid.UUID(stem))
+        except ValueError:
+            continue
+        if canonical == stem:
+            children.append(stem)
+    return children
+
+
+def tally_antigravity_transcript(transcript_path: Path) -> TokenUsage | None:
+    """Sum the per-step usage of an agy conversation and its subagents, or None
+    when no step anywhere carries usage.
+
+    Verified against agy 1.4.9: each `PLANNER_RESPONSE` step (one API call)
+    carries top-level `input_tokens` (exclusive of cache reads),
+    `cache_read_tokens` and `output_tokens`; there are no running totals, so
+    steps are summed (see `_agy_steps` for duplicate steps). A step whose counts
+    are all zero still counts as tracked. Earlier agy (1.1.3) wrote no counts,
+    which reads as None.
+
+    A subagent is its own conversation, absent from the parent's transcript: at
+    spawn agy writes brain/<conv>/.system_generated/subagents/<childId>.json
+    (the profile's `subagent_spawn_marker`), and the child logs to
+    brain/<childId>/.system_generated/logs/transcript_full.jsonl. So when the
+    path has agy's `<conv>/.system_generated/logs/<file>` shape, each listed
+    child is folded in, recursively, every conversation at most once; any other
+    path tallies alone. A child's usage makes the session tracked even when the
+    parent reports none. An unreadable child transcript (OSError/ValueError) is
+    skipped and named in `TokenUsage.unread` as
+    `<childId>/transcript_full.jsonl: <ExcType>`, an unlistable marker folder as
+    `subagents/: <ExcType>` (prefixed `<childId>/` for a child's); the totals
+    are then a lower bound. Errors on the parent transcript itself propagate.
+
+    `models` is None: the transcript names no model."""
+    steps: list[dict[str, int]] = []
+    parent_steps = _agy_steps(transcript_path)
+    seen = parent_steps is not None
+    steps.extend(parent_steps or ())
+    unread: list[str] = []
+    logs = transcript_path.parent
+    if (logs.parent.name, logs.name) == _AGY_LOGS_DIR:
+        conversation = logs.parent.parent
+        brain = conversation.parent
+        visited = {conversation.name}
+        pending = [(conversation, "")]
+        while pending:
+            folder, label = pending.pop(0)
+            for child in _agy_children(folder, label, unread):
+                if child in visited:
+                    continue
+                visited.add(child)
+                child_folder = brain / child
+                try:
+                    child_steps = _agy_steps(child_folder.joinpath(*_AGY_LOGS_DIR, _AGY_TRANSCRIPT))
+                except (OSError, ValueError) as e:
+                    unread.append(f"{child}/{_AGY_TRANSCRIPT}: {type(e).__name__}")
+                else:
+                    if child_steps is not None:
+                        seen = True
+                        steps.extend(child_steps)
+                pending.append((child_folder, f"{child}/"))
+    if not seen:
+        return None
+    total = TokenUsage(unread=tuple(unread))
+    for counts in steps:
+        total.add(
+            TokenUsage(
+                input_tokens=counts["input_tokens"],
+                output_tokens=counts["output_tokens"],
+                cache_read_tokens=counts["cache_read_tokens"],
             )
         )
     return total

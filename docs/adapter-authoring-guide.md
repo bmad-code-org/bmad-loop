@@ -254,18 +254,20 @@ config or never fires a hook, the report says so, with a scrubbed log tail.
 
 Turn the report's `token_field_candidates` into a parser in
 [`src/bmad_loop/tokens.py`](../src/bmad_loop/tokens.py), following the existing ones
-(`tally` for claude, `tally_codex_rollout`, `tally_gemini_chat`), and register it in
-`read_usage`. Decide **per-call vs cumulative** yourself: a `token_count`-style event that
-carries running totals (codex) is read differently from per-message blocks that are summed
-(claude, gemini). Re-run the scan; the **parsed counts** self-check should now appear.
+(`tally` for claude, `tally_codex_rollout`, `tally_gemini_chat`, `tally_copilot_events`,
+`tally_antigravity_transcript`), and register it in `read_usage`. Decide **per-call vs
+cumulative** yourself: a `token_count`-style event that carries running totals (codex) is
+read differently from per-message blocks that are summed (claude, gemini, antigravity).
+Re-run the scan; the **parsed counts** self-check should now appear.
 At run time the parser reads the file named by the hook payload's `transcript_path`. For
 `codex-rollout`, a missing or unusable hook path is resolved from the session id under
-`$CODEX_HOME/sessions`.
+`$CODEX_HOME/sessions`. A CLI whose subagents write their own transcripts needs the parser
+to fold them in: `claude-jsonl`, `codex-rollout` and `antigravity-transcript` each do.
 
 **`none` is a legitimate final answer.** If the report has no `token_field_candidates`, the
-CLI may not expose usage anywhere a parser can reach. `antigravity` is the example: it
-writes token counts only into an internal SQLite blob, never into the transcript. Leave
-`usage_parser = "none"` and record why in the profile. Do not scrape a vendor's internal
+CLI may not expose usage anywhere a parser can reach, for example when it keeps token counts
+only in an internal database. Leave `usage_parser = "none"`, record why and the version you
+checked in the profile, and re-check on a newer release. Do not scrape a vendor's internal
 store outside the `(transcript_path) -> TokenUsage | None` contract.
 
 **Trust the payload over the docs.** A CLI that reports its transcript path in the hook
@@ -317,7 +319,7 @@ a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` reso
 | `bypass_args`                      |          | `[]`                                                                           | Permission-bypass flags for unattended runs, launched under `permission_mode = "bypass"`. A policy `extra_args` replaces them; `validate` warns (`policy.bypass-dropped`) when one is dropped.                                                                                                             |
 | `model_flag`                       |          | `--model`                                                                      | Flag passed with the model name when one is configured.                                                                                                                                                                                                                                                    |
 | `env`                              |          | `{}`                                                                           | `[env]` table of extra session environment variables. It cannot override the run's state-root pin.                                                                                                                                                                                                         |
-| `usage_parser`                     |          | `none`                                                                         | Transcript token parser: `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events` or `none`.                                                                                                                                                                                                       |
+| `usage_parser`                     |          | `none`                                                                         | Transcript token parser: `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `antigravity-transcript` or `none`.                                                                                                                                                                             |
 | `usage_grace_s`                    |          | `0.0`                                                                          | Seconds to keep polling the transcript for token totals after the session ends; `0` reads once. Must be ≥ 0.                                                                                                                                                                                               |
 | `stop_without_result_nudges`       |          | unset                                                                          | Per-profile default for Stop-without-result nudges. An `[adapter]` / `[adapter.<stage>]` value overrides it; unset inherits `[limits] stop_without_result_nudges`. Must be ≥ 0.                                                                                                                            |
 | `subagent_stop_without_transcript` |          | `false`                                                                        | When `true`, a `Stop` with no transcript path is a subagent turn-end and is ignored.                                                                                                                                                                                                                       |

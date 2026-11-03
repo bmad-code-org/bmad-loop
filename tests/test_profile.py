@@ -69,6 +69,8 @@ def test_builtin_profiles_load():
         "sessionEnd": "SessionEnd",
     }
     assert profiles["copilot"].usage_parser == "copilot-events"
+    # agy 1.4.9 writes per-step counts into its transcript
+    assert profiles["antigravity"].usage_parser == "antigravity-transcript"
     # copilot confirms tool calls, file paths and URL fetches separately; an
     # unattended session needs all three bypassed, or a URL fetch parks it
     assert profiles["copilot"].bypass_args == (

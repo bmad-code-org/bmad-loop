@@ -386,9 +386,12 @@ them to whoever owns the machine:
     **Known limitation:** entries are never removed when a worktree is torn down, so
     `trustedWorkspaces` accumulates one entry per unit — prune stale
     `.bmad-loop/runs/` paths by hand if the list grows.
-  - **Token usage is not recorded** (`usage_parser = "none"`) — and this is permanent,
-    not a gap: agy's transcript carries no usage data at all (it counts tokens only in
-    an internal SQLite/protobuf store). Runs work; the token columns stay empty.
+  - **Token usage is read from agy's transcript**
+    (`usage_parser = "antigravity-transcript"`, checked against agy 1.4.9): each model
+    step's input, cache-read and output counts are summed, and a subagent's usage is
+    folded into the parent session that spawned it. agy writes no model id, so the
+    observed model is not recorded. agy 1.1.3 wrote no counts, so its sessions read as
+    untracked.
 - **opencode** — install the HTTP client extra (`uv tool install "bmad-loop[tui,opencode] @ git+https://github.com/bmad-code-org/bmad-loop.git"`) and
   authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
   workspace-trust dialog to answer). Supports OpenCode 1.x ≥ 1.18 and 2.x ≥ 2.0.21; see
