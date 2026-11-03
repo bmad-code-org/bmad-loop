@@ -8380,16 +8380,18 @@ class SweepEngine(Engine):
         self, task: StoryTask, reason: str, headline: str, detail: str
     ) -> NoReturn:
         """The tail every regeneration-site refusal in `_ensure_bundle_intent`
-        ends in (DW-243/252): notify with the RESUME route, clear the task's
-        baseline pair, save, and raise `RunPaused` at the story gate on the task.
-        The arm's journal row is written by the arm, before this. The
-        `_ensure_migration` duplicate-ids pause is the template.
+        ends in (DW-243/252): clear the task's baseline triple, save, notify with
+        the RESUME route, and raise `RunPaused` at the story gate on the task.
+        The save precedes the notify (DW-631) so a host loss inside a slow notify
+        command cannot leave the stale baseline on disk. The arm's journal row is
+        written by the arm, before this. The `_ensure_migration` duplicate-ids
+        pause is the template.
 
         `gates.notify` directly, never `_notify_ledger_repair`: that helper steers
         to a fresh `bmad-loop sweep`, which is the wrong route for a run that is
         paused and resumable — following it abandons this run's in-flight task.
 
-        Clearing the baseline pair is safe and necessary: the recovery pass has
+        Clearing the baseline triple is safe and necessary: the recovery pass has
         already rolled the attempt back before regeneration ran (or the task never
         held one), so nothing of ours is outstanding, and a stale baseline left
         behind would name the PRE-repair tree — the next env-fault's `_safe_reset`
@@ -8400,16 +8402,16 @@ class SweepEngine(Engine):
         escalation action requires Phase.ESCALATED, so an escalation stage would
         offer only actions that must fail. The gate stage's single action is
         "resume", which is the whole remedy once the ledger is repaired."""
+        task.baseline_commit = None
+        task.baseline_untracked = None
+        task.baseline_artifacts = None
+        self._save()
         gates.notify(
             self.policy,
             self.run_dir,
             headline,
             f"{detail} — then `bmad-loop resume {self.state.run_id}`",
         )
-        task.baseline_commit = None
-        task.baseline_untracked = None
-        task.baseline_artifacts = None
-        self._save()
         raise RunPaused(reason, PAUSE_STORY_GATE, task.story_key)
 
     def _pause_for_bundle_close_repair(

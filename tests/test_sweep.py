@@ -24344,6 +24344,62 @@ def test_a_refused_ledger_pauses_the_resume_at_intent_regeneration(project, monk
         assert {field: getattr(survivor, field) for field in preserved} == preserved
 
 
+def test_host_loss_in_intent_refusal_notify_leaves_the_baseline_cleared_on_disk(
+    project, monkeypatch
+):
+    """DW-631. `_pause_on_intent_refusal` clears the task's baseline triple and
+    saves before it notifies. A host loss inside a slow notify command then
+    leaves no stale baseline on disk for a later env-fault `_safe_reset` to
+    rewind over the operator's repair commit.
+
+    The recipe's recovery re-stamps a baseline before regeneration runs, so the
+    in-memory task holds one when the tail starts. The test snapshots
+    `state.json` inside the notify, because `run()`'s `finally` save would
+    otherwise persist the cleared in-memory triple and hide the boundary.
+
+    Ablation, performed: move the clearing and `self._save()` back below
+    `gates.notify` and the snapshot keeps the re-stamped `baseline_commit`."""
+    from bmad_loop import gates
+
+    class HostLoss(BaseException):
+        pass
+
+    engine, _intent = _resume_with_lost_intent(project)
+    fault_read_text(monkeypatch, project.deferred_work)
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    state_file = resumed.run_dir / "state.json"
+    durable: list[bytes] = []
+    entering: list[str | None] = []
+    real_tail = resumed._pause_on_intent_refusal
+
+    def observe_tail(task, *args, **kwargs):
+        entering.append(task.baseline_commit)
+        return real_tail(task, *args, **kwargs)
+
+    monkeypatch.setattr(resumed, "_pause_on_intent_refusal", observe_tail)
+
+    def host_dies_in_notify(_policy, _run_dir, headline, *_args, **_kwargs):
+        if not durable and headline == "bundle dw-fix: intent document not regenerated":
+            durable.append(state_file.read_bytes())
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        resumed.run()
+    assert durable, "the intent refusal never reached its notify"
+    # premise: the tail starts with a baseline to clear, or the test is vacuous
+    assert entering and entering[0] is not None
+    state_file.write_bytes(durable[0])
+
+    assert adapter.sessions == []
+    assert _records(resumed, "sweep-intent-ledger-refused")
+    task = load_state(resumed.run_dir).tasks["dw-fix"]
+    assert task.phase == Phase.PENDING
+    assert task.baseline_commit is None
+    assert task.baseline_untracked is None
+    assert task.baseline_artifacts is None
+
+
 def _pending_bundle_with_lost_intent(project, key="fix", dw_ids=("DW-1",)):
     """The DW-252 shape: a bundle task persisted PENDING by `_run_bundle`'s save
     and lost before its dispatch stamped a baseline, so the resume's recovery has

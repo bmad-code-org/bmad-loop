@@ -2575,10 +2575,12 @@ class WorktreeFlow:
             task.defer_reason = f"could not open worktree: {e}"
             task.phase = Phase.DEFERRED  # deliberate: no legal move from PENDING
             self.journal.append("worktree-open-failed", story_key=task.story_key, error=str(e))
+            # Persist DEFERRED before the notify (DW-630): a host loss inside a
+            # slow notify command must not leave the unit PENDING on disk.
+            self._save()
             gates.notify(
                 self.policy, self.run_dir, f"worktree open failed: {task.story_key}", str(e)
             )
-            self._save()
             return
         task.worktree_path = str(unit.path)
         # The mount's mint-time identity (DW-446), taken before any session runs
