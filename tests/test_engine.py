@@ -27274,6 +27274,302 @@ def test_dev_relaunch_probes_a_healthy_environment_then_dispatches(project, tmp_
     assert engine.state.tasks["1-1-a"].dev_usage_relaunches == 1
 
 
+# DW-615: an uncharged dev usage relaunch keeps the cut-off attempt's tree
+
+
+def _kept_tree_story(project) -> tuple[Path, str]:
+    """A committed ready-for-dev spec for 1-1-a, as a re-armed story records it."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    repo = project.project
+    sp = spec_path(project, "1-1-a")
+    write_spec(sp, "ready-for-dev", rev_parse_head(repo))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "spec baseline")
+    return sp, rev_parse_head(repo)
+
+
+def _cut_off(project, sp: Path | None = None):
+    """A dev session a usage limit cuts off after it wrote partial work: a new
+    file, an edit to a tracked one and (with ``sp``) the spec's status flip."""
+
+    def run(_spec):
+        repo = project.project
+        (repo / "partial.txt").write_text("half done\n")
+        source = repo / "src.txt"
+        source.write_text(source.read_text() + "partial change\n")
+        if sp is not None:
+            sp.write_text(
+                sp.read_text().replace("status: 'ready-for-dev'", "status: 'in-progress'")
+            )
+        return _usage_limited(env_fault=False)
+
+    return run
+
+
+def _tree_rows(engine) -> list[tuple[bool, str]]:
+    return [(e["kept"], e["reason"]) for e in _rows(engine, "dev-relaunch-tree")]
+
+
+def _rollback_kinds(engine) -> list[str]:
+    return [e["kind"] for e in engine.journal.entries() if e["kind"].startswith("rollback")]
+
+
+def test_dev_relaunch_keeps_the_cut_off_tree_and_names_the_spec(project):
+    """DW-615: a usage-limited dev attempt whose recorded spec resolves is
+    relaunched on its own tree. No rollback runs, the relaunched session finds
+    the cut-off files on disk and is told to continue them through an explicit
+    spec pointer (which also pins the read-back), the spec status is not
+    rewritten, the phase baseline is unchanged and the relaunch stays uncharged.
+    ABLATION, performed: make `_usage_relaunch_tree` answer `kept=False` and the
+    second session starts on a rolled-back tree with the ready-for-dev prompt."""
+    sp, baseline = _kept_tree_story(project)
+    seen: list[tuple[bool, str, str]] = []
+    finish = dev_effect(project, "1-1-a", followup_review=False)
+
+    def resume(session):
+        repo = project.project
+        seen.append(
+            (
+                (repo / "partial.txt").exists(),
+                (repo / "src.txt").read_text(),
+                read_frontmatter(sp).get("status", ""),
+            )
+        )
+        return finish(session)
+
+    engine, adapter = make_engine(
+        project,
+        [_cut_off(project, sp), resume],
+        policy=_relaunch_policy(max_dev_attempts=1),
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task)
+
+    assert seen == [(True, "original\npartial change\n", "in-progress")]
+    relaunched = adapter.sessions[1]
+    assert relaunched.prompt.startswith(
+        f"/bmad-dev-auto Resume the autonomous dev session on the spec at `{sp}`. "
+        "A usage limit cut off the previous session before it finished; its partial "
+        "work is still in the working tree, so continue that work rather than "
+        "starting over. "
+    )
+    assert relaunched.prompt.endswith(engine._operator_park_instruction())
+    assert relaunched.expected_spec == str(sp)
+    assert _tree_rows(engine) == [(True, "spec-named")]
+    assert _rollback_kinds(engine) == []
+    assert task.baseline_commit == baseline
+    assert (task.attempt, task.dev_usage_relaunches, task.charged_attempts) == (2, 1, 1)
+
+
+def test_dev_relaunch_of_a_cut_off_repair_keeps_tree_and_feedback(project, monkeypatch):
+    """DW-615: a fixable repair session a usage limit cuts off is relaunched on
+    its kept tree with the same repair prompt and feedback file, as a relaunched
+    `_fix_phase` repair is. ABLATION, performed: make `_usage_relaunch_tree`
+    answer `kept=False` and the third session is a fresh-baseline attempt that
+    never sees the repair's partial file."""
+    sp, _ = _kept_tree_story(project)
+    marker = project.project / "verify-fixed.marker"
+    finish = dev_effect(project, "1-1-a", followup_review=False)
+    seen_partial: list[bool] = []
+
+    def repair_done(session):
+        seen_partial.append((project.project / "partial.txt").exists())
+        marker.write_text("fixed\n")
+        return finish(session)
+
+    policy = dataclasses.replace(
+        _relaunch_policy(max_dev_attempts=2),
+        review=ReviewPolicy(enabled=False),
+        verify=VerifyPolicy(commands=(_file_exists_cmd("verify-fixed.marker"),)),
+    )
+    engine, adapter = make_engine(project, [finish, _cut_off(project), repair_done], policy=policy)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task)
+
+    repair, relaunched = adapter.sessions[1].prompt, adapter.sessions[2].prompt
+    assert "failed deterministic verification" in repair
+    assert relaunched == repair
+    assert seen_partial == [True]
+    assert _tree_rows(engine) == [(True, "repair-feedback")]
+    assert _rollback_kinds(engine) == []
+    assert (task.attempt, task.dev_usage_relaunches, task.charged_attempts) == (3, 1, 2)
+
+
+def test_dev_relaunch_kept_tree_leaves_the_cut_off_sessions_ledger_edit_uncommitted(project):
+    """DW-615: the cut-off primary session never completed, so no harvest ran and
+    its ledger edit is its own work, not engine bookkeeping. The kept-tree
+    relaunch leaves it dirty for the resumed session instead of committing it as
+    a ledger-only bookkeeping commit, which a later rollback's preserve step
+    would drop. ABLATION, performed: launch with
+    `commit_engine_ledger=inherits_tree or rolled_back` and an
+    `engine-ledger-commit` row appears with the edit at HEAD."""
+    write_ledger(project, {"DW-1": "open"})
+    sp, baseline = _kept_tree_story(project)
+    cut_off = _cut_off(project, sp)
+    seen: list[str] = []
+    finish = dev_effect(project, "1-1-a", followup_review=False)
+
+    def cut_off_with_ledger(session):
+        with project.deferred_work.open("a", encoding="utf-8") as f:
+            f.write("\n### DW-2: session-authored\n\nstatus: open\n")
+        return cut_off(session)
+
+    def resume(session):
+        seen.append(git(project.project, "status", "--porcelain", "--", _LEDGER_REL))
+        return finish(session)
+
+    engine, _ = make_engine(
+        project,
+        [cut_off_with_ledger, resume],
+        policy=_relaunch_policy(max_dev_attempts=1),
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task)
+
+    assert _tree_rows(engine) == [(True, "spec-named")]
+    assert [e for e in _bookkeeping_rows(engine) if e["kind"] == "engine-ledger-commit"] == []
+    assert seen and seen[0] != ""
+    assert task.bookkeeping_for_baseline() is None
+    assert task.baseline_commit == baseline
+
+
+def test_dev_relaunch_without_a_spec_rolls_back_and_journals_why(project):
+    """DW-615: a bare-key attempt has no spec to name, so the relaunch takes the
+    rollback leg as before — the cut-off files are gone when it starts — and
+    the tree choice is journaled `kept=false` with its reason. ABLATION,
+    performed: drop the `dev-relaunch-tree` journal write and the row is
+    missing."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    seen: list[bool] = []
+    finish = dev_effect(project, "1-1-a", followup_review=False)
+
+    def relaunch(session):
+        seen.append((project.project / "partial.txt").exists())
+        return finish(session)
+
+    engine, adapter = make_engine(
+        project, [_cut_off(project), relaunch], policy=_relaunch_policy(max_dev_attempts=1)
+    )
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert seen == [False]
+    assert adapter.sessions[1].prompt.startswith("/bmad-dev-auto 1-1-a — ")
+    assert _tree_rows(engine) == [(False, "no-spec")]
+    assert _rollback_kinds(engine)
+
+
+def test_dev_relaunch_with_an_invalid_chain_snapshot_rolls_back(project, monkeypatch):
+    """DW-615: when the chain's dispatched-spec snapshot no longer validates, the
+    relaunch falls back to the rollback leg (journaled `snapshot-invalid`)
+    instead of keeping the tree and failing the pre-launch snapshot check.
+    ABLATION, performed: drop the snapshot gate from `_usage_relaunch_tree` and
+    the relaunch keeps the tree (`spec-named`)."""
+    sp, _ = _kept_tree_story(project)
+    seen: list[bool] = []
+    finish = dev_effect(project, "1-1-a", followup_review=False)
+
+    def relaunch(session):
+        seen.append((project.project / "partial.txt").exists())
+        return finish(session)
+
+    engine, adapter = make_engine(
+        project, [_cut_off(project), relaunch], policy=_relaunch_policy(max_dev_attempts=1)
+    )
+    # Only the relaunch's tree decision sees the invalid snapshot: the fresh
+    # attempt after the rollback rebinds and never validates a chain snapshot.
+    real = engine._validate_dispatched_spec_snapshot
+    calls: list[bool] = []
+
+    def invalid_once(t):
+        calls.append(True)
+        return False if len(calls) == 1 else real(t)
+
+    monkeypatch.setattr(engine, "_validate_dispatched_spec_snapshot", invalid_once)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task)
+
+    assert seen == [False]
+    assert _tree_rows(engine) == [(False, "snapshot-invalid")]
+    assert _rollback_kinds(engine)
+    assert len(adapter.sessions) == 2
+
+
+def test_usage_relaunch_tree_settles_the_snapshot_before_building_the_prompt(project, monkeypatch):
+    """DW-615: a spec that already failed the chain snapshot takes the journaled
+    `snapshot-invalid` rollback without the prompt seam reading it — tickets'
+    plan-halt probe escalates on an unreadable plan. ABLATION, performed: build
+    the prompt before the snapshot verdict and the seam's read fires."""
+    engine, _ = make_engine(project, [], policy=_relaunch_policy(max_dev_attempts=1))
+    task = StoryTask(story_key="1-1-a", epic=1)
+    monkeypatch.setattr(engine, "_preserves_dispatched_spec_snapshot_for_repair", lambda _t: True)
+    monkeypatch.setattr(engine, "_validate_dispatched_spec_snapshot", lambda _t: False)
+
+    def read_the_spec(_task):
+        raise AssertionError("prompt seam read the spec")
+
+    monkeypatch.setattr(engine, "_usage_relaunch_prompt", read_the_spec)
+
+    assert engine._usage_relaunch_tree(task, repair=False) == (False, "snapshot-invalid", None)
+
+
+def test_dev_relaunch_kept_tree_rolls_back_before_a_failed_probe_pauses(project, tmp_path):
+    """DW-615: keep-tree eligible, but the environment died with the session. The
+    relaunch probe fails, so the kept tree is rolled back to the phase baseline
+    first (resume re-captures the baseline and would absorb it), then the run
+    takes the ordinary dispatch pause at `probe:dispatch:dev` at PENDING. Resume
+    relaunches from the baseline. ABLATION, performed: drop the `rollback`
+    callback from `_gate_relaunch` and `partial.txt` survives the pause."""
+    sp, baseline = _kept_tree_story(project)
+    rig = _env_rig(tmp_path)
+    policy = dataclasses.replace(
+        _relaunch_policy(), environment=EnvironmentPolicy(probes=(rig.probe,))
+    )
+    engine, adapter = make_engine(project, [rig.dies_during(_cut_off(project, sp))], policy=policy)
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+    engine.state.tasks[task.story_key] = task
+
+    with pytest.raises(RunPaused) as paused:
+        engine._dev_phase(task)
+
+    assert paused.value.stage == PAUSE_ENVIRONMENT
+    repo = project.project
+    assert not (repo / "partial.txt").exists()
+    assert (repo / "src.txt").read_text() == "original\n"
+    assert read_frontmatter(sp).get("status") == "ready-for-dev"
+    assert rev_parse_head(repo) == baseline
+    assert task.phase == Phase.PENDING and task.env_fault_site == "probe:dispatch:dev"
+    assert _tree_rows(engine) == [(True, "spec-named")]
+    assert _rollback_kinds(engine)
+    assert [e["site"] for e in _rows(engine, "env-probe-failed")] == ["probe:dispatch:dev"]
+    assert len(adapter.sessions) == 1
+
+    rig.up.write_text("up\n")
+    seen: list[bool] = []
+    finish = dev_effect(project, "1-1-a", followup_review=False)
+
+    def relaunch(session):
+        seen.append((repo / "partial.txt").exists())
+        return finish(session)
+
+    engine2, adapter2 = resume_engine(project, engine, [relaunch])
+    summary = engine2.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert seen == [False]
+    assert [s.role for s in adapter2.sessions] == ["dev"]
+    (dispatched,) = _rows(engine2, "resume-env-dispatch")
+    assert dispatched["role"] == "dev"
+
+
 def test_account_fatal_stop_failure_pauses_in_relaunch_mode(project):
     """DW-613: a dev session the adapter parked on an `account-fatal`
     StopFailure (claude's `model_not_found`) is never relaunched: relaunch mode

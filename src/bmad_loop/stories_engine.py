@@ -49,7 +49,7 @@ from typing import Any, NoReturn
 from . import gates, stories, verify
 from .adapters.base import SessionResult
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
-from .engine import Engine, RunPaused
+from .engine import USAGE_RELAUNCH_RESUME, Engine, RunPaused
 from .model import (
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
@@ -350,6 +350,31 @@ class StoriesEngine(CheckpointFlowMixin, Engine):
             prompt += "\n" + entry.invoke_dev_with
         # A retry after a rolled-back attempt names its verified parked work (#777),
         # after the planner's verbatim text so that channel stays untouched.
+        preserved = self._retry_preserve_notice(task)
+        if preserved:
+            prompt += "\n\n" + preserved
+        return prompt
+
+    def _usage_relaunch_prompt(self, task: StoryTask) -> str | None:
+        """The kept-tree usage relaunch (DW-615): the base explicit-spec resume
+        line with this mode's clauses, the environment claim alone, then what the
+        fresh leg carries: ``Halt after planning.`` on a plan-halt leg (in
+        lock-step with ``BMAD_LOOP_PLAN_HALT``), the planner's ``invoke_dev_with``
+        verbatim and a retry's parked-work notice. None (roll back) unless the
+        id-keyed spec resolves as the attempt's file now."""
+        if not task.spec_file or self._dispatched_spec_for_attempt(task) is None:
+            return None
+        env_claim = self._environment_claim_instruction()
+        entry = self._entry_for(task)
+        prompt = (
+            f"/{self._dev_skill()} Resume the autonomous dev session on the spec at "
+            f"`{task.spec_file}`. {USAGE_RELAUNCH_RESUME}"
+        )
+        if self._plan_halt_leg(task, _checkpoint_flags(entry)):
+            prompt += " Halt after planning."
+        prompt += f" {env_claim}" if env_claim else ""
+        if entry is not None and entry.invoke_dev_with:
+            prompt += "\n" + entry.invoke_dev_with
         preserved = self._retry_preserve_notice(task)
         if preserved:
             prompt += "\n\n" + preserved

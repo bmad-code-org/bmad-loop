@@ -81,12 +81,15 @@ def retry_preserve_paragraph(repo: Path, task: StoryTask, run_id: str) -> str:
     never asks the session to.
 
     Shared by every dev-prompt builder (``Engine._generic_dev_prompt``,
-    ``StoriesEngine._stories_dev_prompt``, ``SweepEngine._generic_bundle_prompt``)
-    through ``Engine._retry_preserve_notice``; each appends it, as its own
-    paragraph, to its fresh-baseline legs only — a repair leg keeps the rejected
-    attempt's tree, and a patch-restore leg has already laid that attempt back
-    onto it. ``task.preserve_ref`` is set only by an auto-rollback of this task,
-    so a set ref already means this dispatch follows a rolled-back attempt.
+    ``StoriesEngine._stories_dev_prompt``, ``SweepEngine._generic_bundle_prompt``,
+    and the engines' ``_usage_relaunch_prompt`` seams) through
+    ``Engine._retry_preserve_notice``; each appends it, as its own paragraph, to
+    its fresh-baseline legs and to a kept-tree usage relaunch (DW-615), whose
+    tree holds the cut-off attempt's own work over the baseline, not a rejected
+    attempt's. A repair leg keeps the rejected attempt's tree, and a
+    patch-restore leg has already laid that attempt back onto it, so neither
+    carries it. ``task.preserve_ref`` is set only by an auto-rollback of this
+    task, so a set ref already means this dispatch follows a rolled-back attempt.
 
     Offered only when git confirms the claim, through the verify chokepoint:
 

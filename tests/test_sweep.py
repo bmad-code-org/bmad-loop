@@ -25053,6 +25053,22 @@ def test_bundle_dispatch_does_not_bind_accepted_spec_as_attempt_ownership(projec
     assert task.dispatched_spec_file is None
 
 
+def test_bundle_usage_relaunch_rolls_back_instead_of_keeping_the_tree(project):
+    """DW-615: a sweep bundle owns intent.md, never an accepted bundle spec, so
+    an uncharged dev usage relaunch cannot name a spec to resume and takes the
+    rollback leg (`no-spec`) even when an accepted spec is on disk. Ablation
+    (performed): delete the SweepEngine `_dispatched_spec_for_attempt` override
+    and the inherited seam keeps the tree, failing this."""
+    engine, _ = make_sweep(project, [])
+    accepted = project.implementation_artifacts / "spec-adopted-elsewhere.md"
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(accepted, "in-progress", "abc")
+    task = StoryTask(story_key="dw-fix", epic=0, spec_file=str(accepted))
+
+    assert engine._usage_relaunch_prompt(task) is None
+    assert engine._usage_relaunch_tree(task, repair=False) == (False, "no-spec", None)
+
+
 def test_bundle_explicit_spec_route_pins_readback_without_claiming_ownership(project):
     """Sweep's explicit restore route names output without owning it as input.
 

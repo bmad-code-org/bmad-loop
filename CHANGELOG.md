@@ -93,7 +93,9 @@ breaking changes may land in a minor release.
   limit relaunches the story at once without charging an attempt, up to
   `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
   session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers. A dev relaunch
-  runs the `[environment]` probes first and pauses at `environment` when they fail;
+  continues on the cut-off tree when it can name the spec or ticket plan, and rolls back
+  otherwise (`dev-relaunch-tree` journal row). It runs the `[environment]` probes first
+  and pauses at `environment` when they fail, rolling a kept tree back first;
   Claude's `model_not_found` and `cloud_credential_error` map to the new `account-fatal`
   StopFailure action, which pauses like `account` but is never relaunched. `status --json`
   tasks and `diagnose` report `dev_usage_relaunches` / `review_usage_relaunches`, and the

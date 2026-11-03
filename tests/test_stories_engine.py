@@ -24,7 +24,7 @@ from conftest import (
 from bmad_loop import stories, verify
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
-from bmad_loop.engine import Engine
+from bmad_loop.engine import USAGE_RELAUNCH_RESUME, Engine
 from bmad_loop.install import (
     DEV_PRIMITIVE_NEW,
     STORIES_PROBE_FILE,
@@ -886,6 +886,54 @@ def test_env_claim_clause_rides_stories_dev_prompts_only_with_probes(project, tm
     before = plain._dev_prompt(task, feedback)
     assert clause not in before
     assert probed._dev_prompt(task, feedback) == f"{before} {clause}"
+
+
+def test_usage_relaunch_prompt_keeps_the_fresh_legs_planner_channel(project, monkeypatch):
+    """DW-615 review: the kept-tree relaunch keeps what the fresh stories leg
+    carries — `Halt after planning.` on a plan-halt leg, the planner's
+    `invoke_dev_with` verbatim and the parked-work notice paragraph. Ablation
+    (performed): drop any of the three appends and this FAILS."""
+    setup_stories(project, [entry("1", invoke_dev_with="Use Redis.")])
+    engine, _ = make_engine(project, [])
+    spec = story_spec(project, "1")
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(spec, "draft", "abc")
+    task = StoryTask(story_key="1", epic=0, spec_file=str(spec))
+    monkeypatch.setattr(engine, "_plan_halt_leg", lambda _task, _flags: True)
+    monkeypatch.setattr(engine, "_retry_preserve_notice", lambda _task: "PARKED")
+
+    prompt = engine._usage_relaunch_prompt(task)
+
+    assert prompt == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the spec at `{spec}`. "
+        f"{USAGE_RELAUNCH_RESUME} Halt after planning.\nUse Redis.\n\nPARKED"
+    )
+
+
+def test_usage_relaunch_prompt_names_the_story_spec_with_stories_clauses(project, tmp_path):
+    """DW-615: the kept-tree usage relaunch names the id-keyed spec and the
+    resume sentence, followed by this mode's clauses only (the environment
+    claim) — no sprint-board or park clause. None (roll back) until the spec is
+    on disk. Green ablation: dropping the override leaves this green, since the
+    base seam's board and park clauses are empty in this mode too; the override
+    keeps the stories clause set explicit, as `_stories_dev_prompt` does.
+    Ablation (performed): drop the resume sentence and this FAILS."""
+    setup_stories(project, [entry("1")])
+    probed, _ = make_engine(
+        project, [], policy=Policy(environment=EnvironmentPolicy(probes=("exit 0",)))
+    )
+    clause = probed._environment_claim_instruction()
+    spec = story_spec(project, "1")
+    task = StoryTask(story_key="1", epic=0, spec_file=str(spec))
+    assert probed._usage_relaunch_prompt(task) is None
+
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(spec, "in-progress", "abc")
+    assert probed._usage_relaunch_prompt(task) == (
+        f"/bmad-dev-auto Resume the autonomous dev session on the spec at `{spec}`. "
+        f"{USAGE_RELAUNCH_RESUME} {clause}"
+    )
+    assert read_frontmatter(spec)["status"] == "in-progress"
 
 
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):

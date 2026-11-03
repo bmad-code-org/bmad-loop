@@ -1581,6 +1581,9 @@ JOURNAL_KINDS = frozenset(
         "deferred-close-skipped-out-of-tree",
         "deferred-close-unmatched",
         "dev-decision",
+        # DW-615. The tree choice of an uncharged dev usage relaunch, from
+        # `Engine._dev_phase`: `kept` and the `reason` it was kept or rolled back.
+        "dev-relaunch-tree",
         # DW-523. A failed `[environment]` probe pass, from
         # `Engine._observe_environment_probes` (dev/fix verify, and the review
         # gates through `_review_probe_sink`): `site` names the asking seam.
