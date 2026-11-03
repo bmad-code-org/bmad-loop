@@ -138,7 +138,9 @@ breaking changes may land in a minor release.
 
 - Remove the `[engine]` policy alias: a named `[engine]` block now fails to load with the
   `[plugins] enabled` + `[plugins.<name>]` migration, and an empty-name block is ignored
-  with a warning to delete it. 0.13.2 is the last release that folds it (#810).
+  with a warning to delete it. 0.13.2 is the last release that folds it (#810). Point
+  the Unity plugin's guidance at a granted project-local plugin copy instead of
+  `engine.*_cmd` overrides.
 - Remove the legacy `[review] on_status_contradiction = "retry"` mode: it now fails to load
   with a pointer to `escalate`, and a review that walks sprint-status or a ticket plan back
   from done always pauses. 0.13.2 is the last release that honours it (#813).
