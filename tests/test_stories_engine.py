@@ -2406,6 +2406,44 @@ def test_unknown_story_selector_pauses_not_crashes(project):
     assert _kinds(engine.journal, "stories-selector-unknown")
 
 
+def test_host_loss_in_unknown_selector_notify_leaves_the_pause_on_disk(project, monkeypatch):
+    """DW-629. An unknown `--story` id journals `stories-selector-unknown`, then
+    notifies. `_pause_unknown_selector` saves its ESCALATED selector task before
+    the notify, so a host loss inside a slow notify command leaves it on disk.
+
+    The test snapshots `state.json` inside the notify, because `run()`'s `finally`
+    save would otherwise persist the in-memory task and hide the boundary.
+
+    Ablation, performed: move `self._save()` back below `gates.notify` and no
+    `state.json` exists at the notify."""
+    from bmad_loop import gates
+
+    class HostLoss(BaseException):
+        pass
+
+    setup_stories(project, [entry("1"), entry("2")])
+    engine, adapter = make_engine(project, [], story_filter="99")
+    state_file = engine.run_dir / "state.json"
+    durable: list[bytes | None] = []
+
+    def host_dies_in_notify(*_args, **_kwargs):
+        if not durable and _kinds(engine.journal, "stories-selector-unknown"):
+            # The selector halts before anything else saves: without the early
+            # save there is no `state.json` at all.
+            durable.append(state_file.read_bytes() if state_file.exists() else None)
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        engine.run()
+    assert durable[0] is not None, "nothing was saved before the notify"
+    state_file.write_bytes(durable[0])
+
+    assert adapter.sessions == []
+    task = load_state(engine.run_dir).tasks.get("99")
+    assert task is not None and task.phase == Phase.ESCALATED
+
+
 def test_max_stories_survives_a_checkpoint_pause_resume(project):
     """A5: with --max-stories=2 and a done_checkpoint on story 1 (below the cap), the
     run pauses at story 1's checkpoint, then a resume dispatches ONLY story 2 — never

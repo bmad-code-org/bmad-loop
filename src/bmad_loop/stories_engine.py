@@ -180,8 +180,8 @@ class StoriesEngine(CheckpointFlowMixin, Engine):
             f"manifest, then `bmad-loop resume {self.state.run_id}`"
         )
         self.journal.append("stories-selector-unknown", story_key=selector)
+        self._save()  # before the notify: a host loss inside it keeps the pause
         gates.notify(self.policy, self.run_dir, f"unknown --story id: {selector}", reason)
-        self._save()
         raise RunPaused(reason, PAUSE_ESCALATION, selector)
 
     def _pause_wedged_story(self, sched: stories.Schedule) -> None:

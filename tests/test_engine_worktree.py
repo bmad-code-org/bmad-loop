@@ -5122,6 +5122,51 @@ def test_worktree_merge_conflict_escalates_and_keeps_branch(project):
     assert branch_exists(project.project, "bmad-loop/test-run/1-1-a")
 
 
+def test_host_loss_in_unit_escalation_notify_leaves_escalated_on_disk(project, monkeypatch):
+    """DW-629. A worktree provisioning refusal escalates through `escalate_unit`,
+    which journals `story-escalated`, then notifies. It saves ESCALATED before the
+    notify, so a host loss inside a slow notify command leaves it on disk.
+
+    The test snapshots `state.json` inside the notify, because `run()`'s `finally`
+    save would otherwise persist the in-memory phase and hide the boundary.
+
+    Ablation, performed: move `self._save()` back below `gates.notify` in
+    `escalate_unit` and the snapshot no longer records ESCALATED."""
+    from bmad_loop import gates
+
+    class HostLoss(BaseException):
+        pass
+
+    def refuse(*_args, **_kwargs):
+        raise verify.GitError("simulated provisioning refusal")
+
+    monkeypatch.setattr(worktree_flow, "provision_worktree", refuse)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=wt_policy(),
+    )
+    state_file = engine.run_dir / "state.json"
+    durable: list[bytes] = []
+
+    def host_dies_in_notify(*_args, **_kwargs):
+        if not durable and "story-escalated" in journal_kinds(engine):
+            durable.append(state_file.read_bytes())
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        engine.run()
+    state_file.write_bytes(durable[0])
+
+    assert adapter.sessions == []
+    assert "cannot safely provision the worktree for 1-1-a" in (
+        next(e for e in engine.journal.entries() if e["kind"] == "story-escalated")["reason"]
+    )
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == Phase.ESCALATED
+
+
 def test_worktree_merge_escalation_patch_carries_a_pinned_hook_config_edit(project, monkeypatch):
     """DW-501: a DONE unit whose merge-back fails is escalated through
     `keep_branch_and_escalate`, whose `changes.patch` must record a story edit to a

@@ -3039,22 +3039,25 @@ class Engine:
         if veto.action == "pause":
             task.phase = Phase.ESCALATED  # deliberate: veto stage may have no legal advance
             self.journal.append("story-escalated", story_key=task.story_key, reason=msg)
+            # Both notifying arms save before the notify, as `_escalate` does: a
+            # host loss inside a slow notify command must not leave the last save.
+            self._save()
             gates.notify(
                 self.policy,
                 self.run_dir,
                 f"CRITICAL escalation: {task.story_key}",
                 f"{msg} — resolve, then `bmad-loop resume {self.state.run_id}`",
             )
-            self._save()
             raise RunPaused(msg, PAUSE_ESCALATION, task.story_key)
         task.defer_reason = msg
         task.phase = Phase.DEFERRED  # deliberate set; the veto stage may have no legal advance
         if veto.action == "defer":
             self.journal.append("story-deferred", story_key=task.story_key, reason=msg)
+            self._save()
             gates.notify(self.policy, self.run_dir, f"story deferred: {task.story_key}", msg)
         else:  # skip: retire quietly, no human notification
             self.journal.append("story-skipped", story_key=task.story_key, reason=msg)
-        self._save()
+            self._save()
         return True
 
     def _emit_run_boundary(self, stage: str) -> None:

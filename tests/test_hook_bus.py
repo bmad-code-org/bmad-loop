@@ -782,6 +782,47 @@ def test_veto_pause_routes_to_escalation(project):
     assert summary.paused and summary.escalated == 1
 
 
+@pytest.mark.parametrize(
+    ("action", "row", "phase"),
+    [("pause", "story-escalated", Phase.ESCALATED), ("defer", "story-deferred", Phase.DEFERRED)],
+)
+def test_host_loss_in_veto_notify_leaves_the_veto_on_disk(project, monkeypatch, action, row, phase):
+    """DW-629. A pre-story `pause` or `defer` veto journals its row, then notifies.
+    `_vetoed` saves the terminal phase before the notify, so a host loss inside a
+    slow notify command leaves ESCALATED / DEFERRED on disk, not the last save.
+
+    The test snapshots `state.json` inside the notify, because `run()`'s `finally`
+    save would otherwise persist the in-memory phase and hide the boundary.
+
+    Ablation, performed: move the arm's `self._save()` back below `gates.notify`
+    and the snapshot no longer records the vetoed phase."""
+    from bmad_loop import gates
+
+    class HostLoss(BaseException):
+        pass
+
+    class P(Plugin):
+        def on_pre_story(self, c):
+            c.veto(action, "halt the line")
+
+    engine, adapter = make_engine(project, one_story(project), registry_of(py_plugin(P, "vh")))
+    state_file = engine.run_dir / "state.json"
+    durable: list[bytes] = []
+
+    def host_dies_in_notify(*_args, **_kwargs):
+        if not durable and any(e["kind"] == row for e in engine.journal.entries()):
+            durable.append(state_file.read_bytes())
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        engine.run()
+    state_file.write_bytes(durable[0])
+
+    assert adapter.sessions == []
+    assert load_state(engine.run_dir).tasks["1-1-a"].phase == phase
+
+
 def test_session_veto_retries_then_defers(project):
     # a vetoed dev session synthesizes status="vetoed"; decide_dev retries within
     # budget, then defers — never silently proceeds.

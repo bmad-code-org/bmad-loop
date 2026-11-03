@@ -5223,13 +5223,15 @@ class WorktreeFlow:
         task.phase = Phase.ESCALATED
         task.adopt_pending = False  # an escalation spends any adoption (DW-386)
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+        # Persist ESCALATED before the notify, as `Engine._escalate` does: a host
+        # loss inside a slow notify command must not leave the previous save.
+        self._save()
         gates.notify(
             self.policy,
             self.run_dir,
             pause_title(reason, task.story_key),
             f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
         )
-        self._save()
         self._pause(reason, task.story_key)
 
     def merge_message(self, task: StoryTask) -> str:
