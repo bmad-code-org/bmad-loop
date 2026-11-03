@@ -237,6 +237,9 @@ breaking changes may land in a minor release.
   (#906).
 - Pause a Claude session uncharged, instead of charging a dev attempt for a crash, when
   its window dies after a usage-limit or account StopFailure or during a quota wait (#959).
+- Classify a Claude session cut off mid-response as an environment fault on current Claude
+  Code (2.1.317 prints `Connection lost`, not `closed`, after the `API Error` prefix)
+  instead of charging a dev attempt.
 
 ### Security
 

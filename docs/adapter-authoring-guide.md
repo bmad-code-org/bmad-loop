@@ -451,7 +451,9 @@ is in [Environment faults](escalations-guide.md#environment-faults).
   file.
 - Patterns are a list of strings, compiled at load (an invalid regex is a profile error),
   and matched with the `regex` module under a per-pattern timeout.
-- Seeded for `claude` (connection loss and two captured provider 5xx errors) and
+- Seeded for `claude` (connection loss, a mid-response cut in both its older and its
+  current Claude Code wording, and two captured provider 5xx errors; the current lines
+  are pinned against `tests/fixtures/claude-stopfailure/`) and
   `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit`,
   `provider.transport`, `provider.internal`, `provider.auth` and `provider.no-route` events
   on 2.x, whose `provider.quota` is a usage limit instead).

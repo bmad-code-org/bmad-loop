@@ -1,0 +1,12 @@
+{
+  "session_id": "65e8df1d-94e6-4d2b-9a16-1a63d42cef06",
+  "transcript_path": "<capture-root>/cfg/projects/<capture-root>-proj/65e8df1d-94e6-4d2b-9a16-1a63d42cef06.jsonl",
+  "cwd": "<capture-root>/proj",
+  "prompt_id": "7d46d0c4-a038-4b4c-b6a1-af733d791f2c",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "StopFailure",
+  "error": "server_error",
+  "last_assistant_message": "API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:<port>)."
+}

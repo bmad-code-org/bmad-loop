@@ -15,7 +15,11 @@ and every negative assertion proven by ablation.**
 - Flat `tests/`: `test_*.py` files mirroring `src/bmad_loop` modules by name, no package
   nesting, one `tests/conftest.py`, and a small `tests/fixtures/` data dir (`stories.yaml`, the
   stories-mode contract, plus the captured claude trust-prompt pane log that
-  `test_generic_tmux.py` replays). `tests/fixtures/bmad_v7/` vendors upstream BMAD-METHOD's
+  `test_generic_tmux.py` replays). `tests/fixtures/claude-stopfailure/` holds Claude Code's
+  `StopFailure` payloads and pane logs for seven scripted API failures, captured zero-token by
+  `scripts/capture_claude_stopfailure.py` (the real `claude` against a local fake API);
+  `test_claude_stopfailure_capture.py` replays them through the relay and the claude adapter.
+  `tests/fixtures/bmad_v7/` vendors upstream BMAD-METHOD's
   `tickets.py`, `config_utils.py` and `LICENSE-BMAD-METHOD` byte for byte at the commit named in
   `PIN.toml`; `test_vendored_bmad_v7_matches_pin` checks them by sha256.
 - Configuration is four settings under `[tool.pytest.ini_options]` in `pyproject.toml`:
