@@ -166,6 +166,8 @@ breaking changes may land in a minor release.
 - Resume a dev attempt rejected for retry, after a manual-rollback pause or a host loss
   before the next attempt, by re-deciding or restarting it instead of reviewing and
   committing it.
+- Save an escalation before running its notify command, so a host loss during a slow
+  notify no longer resumes the escalated dev attempt into review and commit.
 - Commit the engine's own deferred-work ledger changes before review, repair and retry
   sessions and after an in-place defer, so a tracked ledger no longer pauses the run with
   `finalization left repository dirty`. The in-place defer notice now prints

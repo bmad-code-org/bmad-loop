@@ -11827,13 +11827,17 @@ class Engine:
             if env_fault_site_reverifiable(task)
             else ""
         )
+        # Persist ESCALATED before the notify (DW-628): a notify command can be
+        # slow, and a host loss inside it would otherwise leave the last save,
+        # e.g. a dev decision at DEV_VERIFY with `spec_file` set, which resume's
+        # spec-approval arm carries into review and commit.
+        self._save()
         gates.notify(
             self.policy,
             self.run_dir,
             pause_title(reason, task.story_key, env_fault_site=task.env_fault_site),
             f"{displayed} — resolve, then `bmad-loop resume {self.state.run_id}`{reverify}",
         )
-        self._save()
         raise RunPaused(reason, PAUSE_ESCALATION, task.story_key)
 
     def _escalate_env(self, task: StoryTask, reason: str, *, site: str) -> None:

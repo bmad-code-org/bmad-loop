@@ -15299,6 +15299,82 @@ def test_manual_rollback_pause_after_dev_retry_does_not_resume_into_review(proje
     assert not _rows(engine2, "resume-review")
 
 
+@pytest.mark.parametrize("decision", ["critical-pause", "exhausted-budget"])
+def test_host_loss_in_escalation_notify_does_not_resume_into_review(
+    project, tmp_path, monkeypatch, decision
+):
+    """DW-628. The dev session completes and its artifact gate records `spec_file`,
+    but `_dev_phase` escalates the attempt. In the first leg it is a CRITICAL
+    PAUSE. In the second it is a resolved re-drive whose red verify command spends
+    the dev budget, so the exhausted decision re-escalates instead of deferring.
+    The decision is saved at DEV_VERIFY with no acceptance or RETRY latch. The host
+    then dies inside the escalation notify. `_escalate` now saves ESCALATED before
+    the notify, so the state on disk at that moment is terminal, and the resume
+    reviews and commits nothing.
+
+    The test snapshots `state.json` inside the notify and writes it back after the
+    loss. Without that, `run()`'s `finally` save would persist the in-memory
+    ESCALATED and hide what was durable at the boundary.
+
+    Ablation, performed: move `self._save()` back below `gates.notify`. The
+    snapshot is then DEV_VERIFY, and in both legs the resume journals
+    `resume-review` and runs a review session on the rejected attempt. The CRITICAL
+    leg also commits it and marks the story DONE."""
+
+    class HostLoss(BaseException):
+        pass
+
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    critical = _critical(dev_effect(project, "1-1-a"))
+    if decision == "critical-pause":
+        engine, adapter = make_engine(project, [critical], policy=_env_policy(rig))
+    else:
+        policy = _env_policy(rig, rig.verify([1]), limits=LimitsPolicy(max_dev_attempts=1))
+        first, _ = make_engine(project, [critical], policy=policy)
+        assert first.run().paused
+        rearm_escalation(first.run_dir, isolated_redrive=False, resolution_recorded=True)
+        engine, adapter = resume_engine(project, first, [dev_effect(project, "1-1-a")])
+    state_file = engine.run_dir / "state.json"
+    escalations_before = len(_rows(engine, "story-escalated"))
+    durable: list[bytes] = []
+
+    def host_dies_in_notify(policy, run_dir, title, message, **kwargs):
+        # `_escalate` journals before it notifies, so the first notice after a
+        # new `story-escalated` row is the escalation's own.
+        if not durable and len(_rows(engine, "story-escalated")) > escalations_before:
+            durable.append(state_file.read_bytes())
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        engine.run()
+    # No `monkeypatch.undo()`: it would also revert the autouse isolation
+    # fixtures for the resume, and the patch is already inert after one loss.
+    state_file.write_bytes(durable[0])
+
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    escalated = _rows(engine, "story-escalated")[escalations_before:]
+    assert [e["story_key"] for e in escalated] == ["1-1-a"]
+    if decision == "exhausted-budget":
+        assert "re-escalating instead of deferring" in escalated[0]["reason"]
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED and task.spec_file
+    assert task.accepted_dev_session_index is None and not task.rejected_dev_task_id
+    head = git(project.project, "rev-parse", "HEAD")
+
+    engine2, adapter2 = resume_engine(
+        project, engine, [review_effect(project, "1-1-a", clean=True)]
+    )
+    summary = engine2.run()
+
+    assert summary.done == 0 and summary.escalated == 1
+    assert adapter2.sessions == []
+    assert engine2.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert not _rows(engine2, "resume-review")
+    assert git(project.project, "rev-parse", "HEAD") == head
+
+
 def test_review_loop_dispatch_pause_after_unrecommending_pass_replays_into_next_cycle(
     project, tmp_path
 ):
