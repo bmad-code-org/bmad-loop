@@ -335,7 +335,7 @@ a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` reso
 | `[parked_answers]`                 |          | unset                                                                          | The [`[parked_answers]`](#answer-keys-the-parked_answers-table) table. Unset: the TUI offers no answer keys.                                                                                                                                                                                               |
 | `[permission_modes.<mode>]`        |          | unset                                                                          | Launch args for a non-bypass `[adapter] permission_mode`. See [Permission modes](#permission-modes). Unset: the profile refuses that mode.                                                                                                                                                                 |
 | `session_id_flag`                  |          | `""`                                                                           | Launch flag for a caller-chosen session id (claude: `--session-id`). The generic adapter appends `[flag, uuid4]` and pins attribution to that id.                                                                                                                                                          |
-| `subagent_transcript_dir`          |          | derived from `usage_parser` (`{stem}/subagents` for `claude-jsonl`, else `""`) | Subagent transcript tree beside the transcript, walked recursively and stat-only; its writes count as idle-notice activity. Must contain `{stem}` (the transcript's filename stem) and stay relative; `""` = off.                                                                                          |
+| `subagent_transcript_dir`          |          | derived from `usage_parser` (`{stem}/subagents` for `claude-jsonl`, else `""`) | Subagent transcript tree beside the transcript, walked recursively and stat-only; its writes count as idle-notice activity and re-arm the dev stall grace. Must contain `{stem}` (the transcript's filename stem) and stay relative; `""` = off.                                                           |
 
 `session_id_flag` must be one `-`-prefixed token with no whitespace or `=`, and is refused
 on hookless profiles. Set it only when the CLI's `SessionStart` payload reports the id you
@@ -348,12 +348,16 @@ An overlay that changes `usage_parser` away from `claude-jsonl` must set
 session id; that folder's parent holds the conversation folders searched for the marker. A
 `Stop` it cannot judge (no id, no transcript path, no such folder) or a marker it cannot read
 is admitted and journaled once (`subagent-marker-unjudged`, `subagent-marker-unreadable`); a
-dropped child is journaled once per id (`subagent-stop-ignored`). The idle notice also walks
-each child the parent's folder lists (`<store root>/<childId>/`, its `*.jsonl` files only,
-stat-only) as it walks `subagent_transcript_dir`; when the parent's folder cannot be judged it
-watches no children, and a listing fault joins `subagent-scan-failed`. Like
-`subagent_transcript_dir`, it must contain its placeholder (here `{session_id}`), stay relative
-with no `..`, and is refused on hookless profiles.
+dropped child is journaled once per id (`subagent-stop-ignored`). The `Stop` check skips a
+store folder whose mtime predates the session's launch (less a 300 s slack): it stats each such
+folder once per session, then never again. Like `subagent_transcript_dir`, the marker must
+contain its placeholder (here `{session_id}`), stay relative with no `..`, and is refused on
+hookless profiles.
+
+The idle notice also walks each child the parent's folder lists (`<store root>/<childId>/`, its
+`*.jsonl` files only, stat-only) as it walks `subagent_transcript_dir`; when the parent's folder
+cannot be judged it watches no children, and a listing fault joins `subagent-scan-failed`. A
+listed child's writes also re-arm the dev stall grace, as pane growth does.
 
 ### `HookSpec` (the `[hooks]` table)
 

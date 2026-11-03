@@ -164,11 +164,14 @@ breaking changes may land in a minor release.
   roughly double), find a rollout by session id when the hook's transcript path is
   missing, and decode hook stdin as UTF-8 (#775).
 - Count Claude subagent and workflow-agent transcript writes as session activity, so a
-  session waiting on a foreground subagent no longer journals `session-idle`; the idle
-  notice names the tool it waits in (`subagent_transcript_dir` profile field) (#858).
+  session waiting on a foreground subagent no longer journals `session-idle` or is nudged
+  and stalled; the idle notice names the tool it waits in (`subagent_transcript_dir`
+  profile field) (#858).
 - Antigravity: ignore a `Stop` sent by a subagent or with `fullyIdle: false`, and count a
-  subagent's writes as its parent's activity, so a parent no longer completes early or
-  reads as idle while a subagent works (`subagent_spawn_marker` profile field).
+  subagent's writes as its parent's activity, so a parent no longer completes early, reads
+  as idle, or is nudged and stalled while a subagent works (`subagent_spawn_marker` profile
+  field). The `Stop` check skips conversations older than the session, so its cost no
+  longer grows with the whole agy history.
 - Pause a Claude session blocked by a usage limit with a `usage limit:` reason instead of
   charging a dev attempt (`usage_limit_patterns`, `usage_wait_patterns` profile fields);
   Windows installs now depend on tzdata so a named reset time zone resolves (#610).

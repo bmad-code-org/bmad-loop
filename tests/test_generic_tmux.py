@@ -2162,6 +2162,155 @@ def test_spawn_marker_verdict_propagates_a_store_read_fault(tmp_path, monkeypatc
         generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t)
 
 
+# DW-608: the bounded Stop scan. A store folder whose mtime predates the
+# session's launch (less `SPAWN_SCAN_SLACK_NS`) cannot be a parent the session
+# spawned, so it is remembered as settled and never stat'ed again.
+
+
+def _age_folder(folder: Path) -> None:
+    old = time.time() - 3600.0  # far below launch - SPAWN_SCAN_SLACK_NS (300 s)
+    os.utime(folder, (old, old))
+
+
+def _stat_counter(monkeypatch, target: Path) -> list[int]:
+    """Count `os.stat` calls on `target` exactly (the folder, not its marker)."""
+    real_stat = os.stat
+    calls = [0]
+
+    def counting(path, *args, **kwargs):
+        if os.fspath(path) == str(target):
+            calls[0] += 1
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(generic.os, "stat", counting)
+    return calls
+
+
+def test_bounded_spawn_marker_verdict_skips_a_folder_older_than_launch(tmp_path):
+    """A parent folder older than launch holding the child's marker is not a
+    parent this session spawned: settled and skipped, so the Stop reads "own".
+
+    Ablation, performed: drop the `mtime_ns < floor_ns` skip and this fails —
+    the old folder's marker reads "child"."""
+    _, child_t = _agy_brain(tmp_path)
+    _age_folder(tmp_path / "brain" / "agy-parent")
+    settled: set[str] = set()
+    verdict = generic._spawn_marker_verdict(
+        _AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns(), settled=settled
+    )
+    assert verdict == "own"
+    assert settled == {"agy-parent"}
+
+
+def test_bounded_spawn_marker_verdict_still_reads_a_fresh_folder(tmp_path):
+    """A folder created after launch (here: within the slack of it) is checked
+    as before, and never settled."""
+    _, child_t = _agy_brain(tmp_path)
+    settled: set[str] = set()
+    verdict = generic._spawn_marker_verdict(
+        _AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns(), settled=settled
+    )
+    assert verdict == "child"
+    assert settled == set()
+
+
+def test_bounded_spawn_marker_verdict_never_stats_a_settled_folder(tmp_path, monkeypatch):
+    """The settled index is what makes later Stops cheap: a name already in it
+    is skipped before any stat of the folder or its marker."""
+    _, child_t = _agy_brain(tmp_path)
+    parent = tmp_path / "brain" / "agy-parent"
+    _age_folder(parent)
+    folder_stats = _stat_counter(monkeypatch, parent)
+    since_ns = time.time_ns()
+    settled: set[str] = set()
+    generic._spawn_marker_verdict(
+        _AGY_MARKER, "agy-child", child_t, since_ns=since_ns, settled=settled
+    )
+    assert folder_stats == [1]
+    assert (
+        generic._spawn_marker_verdict(
+            _AGY_MARKER, "agy-child", child_t, since_ns=since_ns, settled=settled
+        )
+        == "own"
+    )
+    assert folder_stats == [1]  # the second call never stat'ed it
+
+
+def test_bounded_spawn_marker_verdict_propagates_a_folder_stat_fault(tmp_path, monkeypatch):
+    """A fault statting a candidate folder propagates for the caller to crumb —
+    never read as an old folder, nor as an absent marker; a vanished folder is
+    skipped like an absent marker."""
+    _, child_t = _agy_brain(tmp_path)
+    parent = tmp_path / "brain" / "agy-parent"
+    real_stat = os.stat
+    fault: list[OSError] = [PermissionError(13, "Permission denied", str(parent))]
+
+    def faulty(path, *args, **kwargs):
+        if os.fspath(path) == str(parent):
+            raise fault[0]
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(generic.os, "stat", faulty)
+    settled: set[str] = set()
+    with pytest.raises(PermissionError):
+        generic._spawn_marker_verdict(
+            _AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns(), settled=settled
+        )
+    assert settled == set()
+    fault[0] = FileNotFoundError(2, "No such file or directory", str(parent))
+    verdict = generic._spawn_marker_verdict(
+        _AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns(), settled=settled
+    )
+    assert verdict == "own"
+    assert settled == set()
+
+
+def test_unbounded_spawn_marker_verdict_still_reads_an_old_folder(tmp_path):
+    """Called without the index, the scan is unbounded, as before DW-608."""
+    _, child_t = _agy_brain(tmp_path)
+    _age_folder(tmp_path / "brain" / "agy-parent")
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-child", child_t) == "child"
+    assert (
+        generic._spawn_marker_verdict(_AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns())
+        == "child"
+    )
+
+
+def test_wait_loop_stats_an_old_store_folder_on_the_first_stop_only(tmp_path, monkeypatch):
+    """Two parent yields then the parent's final Stop, with an unrelated
+    conversation older than launch in brain/: the first Stop stats that folder
+    once and settles it; later Stops never stat it again, and the verdicts are
+    unchanged (the session completes on the parent's final Stop).
+
+    Ablation, performed: pass no `settled` set at the call site and this fails
+    — the old folder is stat'ed on every Stop (or not at all, unbounded)."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    parent_t, _ = _agy_brain(tmp_path)
+    old = tmp_path / "brain" / "old-conversation"
+    (old / ".system_generated").mkdir(parents=True)
+    _age_folder(old)
+    launched_ns = time.time_ns()  # before the spec: an older one reads as stale
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_stop("agy-parent", parent_t, False),
+            _agy_stop("agy-parent", parent_t, False),
+            _agy_stop("agy-parent", parent_t, True),
+        ]
+    )
+    folder_stats = _stat_counter(monkeypatch, old)
+
+    result = adapter.wait_for_completion(_dev_handle(launched_ns), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert adapter.watcher.calls == 3
+    assert folder_stats == [1]
+    assert _lifecycle_events(adapter, "subagent-marker-unreadable") == []
+
+
 def _agy_child_run(tmp_path, adapter, impl):
     """parent yield -> child yield -> child final -> parent final, with the
     terminal spec already on disk: whichever Stop is first read as a turn end
@@ -11645,6 +11794,197 @@ def test_spawned_child_appearing_mid_run_closes_the_stretch(tmp_path, monkeypatc
     assert [e["kind"] for e in entries] == ["session-idle", "session-active"]
     assert entries[0]["since_ts"] == 5000.0
     assert entries[1]["idle_s"] == 120.0
+
+
+def _agy_stall_run(tmp_path, monkeypatch, stops, on_call):
+    """An antigravity dev adapter with the stall armed (grace 60 s, no wake
+    nudges), a silent pane, and one heartbeat per tick: the clock advances one
+    `HEARTBEAT_INTERVAL_S` (30 s) on every call from call 2, before `on_call`.
+    Returns (adapter, parent transcript, child transcript)."""
+    adapter, _, _log, _t, clock, _ = _idle_adapter(
+        tmp_path, monkeypatch, grace=60.0, profile_name="antigravity"
+    )
+    parent_t, child_t = _agy_brain(tmp_path)
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        on_call(call_n, child_t)
+
+    adapter.watcher = _ScriptedWatcher(stops(parent_t), on_call=script)
+    return adapter, parent_t, child_t
+
+
+def test_listed_child_activity_keeps_the_dev_stall_grace_open(tmp_path, monkeypatch):
+    """DW-607: a silent agy parent blocked on its foreground child — pane and
+    parent transcript still — while the listed child writes past several graces.
+    The child's writes re-arm the stall grace like pane growth: no stall while
+    it grows, then a stall once it has been quiet for a full grace.
+
+    Timeline (grace 60 s, 30 s/tick): the child grows on calls 2-5; the sample
+    each heartbeat takes reflects the previous call's growth, so the grace
+    re-arms on calls 3-6, last at t=1150 -> due 1210 = call 8.
+
+    Ablation, performed: drop `sub_moved` from the stall re-arm and this
+    fails — the launch-armed grace stalls on call 3 (t=1060)."""
+
+    def grow(call_n, child_t):
+        if 2 <= call_n <= 5:
+            _grow(Path(child_t), b'{"step_index":1}\n')
+
+    adapter, _, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [_agy_stop("agy-parent", parent_t, False)],
+        grow,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 8
+    assert adapter.mux.sent == []  # silent re-arm: nothing typed
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "3-1-dev-1")]
+    assert not [c for c in crumbs if c.startswith("subagent-scan-")]
+
+
+def test_a_child_key_first_seen_does_not_rearm_the_dev_stall(tmp_path, monkeypatch):
+    """DW-607: the child key first appearing (None -> a value: the parent's
+    folder becomes judgeable once a Stop names its id) is a baseline, not
+    activity. The id-less yield leaves nothing to watch; the parent's yield on
+    call 2 names it; the next heartbeat's sample is the first child key, read
+    on call 3 exactly as the launch-armed grace (t=1060) falls due.
+
+    Ablation, performed: drop `last_sub_activity is not None` from `sub_moved`
+    and this fails — the first key re-arms the grace past call 3."""
+    adapter, _, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [
+            _agy_stop(None, parent_t, False),
+            _agy_stop("agy-parent", parent_t, False),
+        ],
+        lambda call_n, child_t: None,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 3
+
+
+def test_a_failing_child_scan_does_not_rearm_the_dev_stall(tmp_path, monkeypatch):
+    """DW-607: a marker listing that raises is no evidence of child activity.
+    The sampler keeps its last good key (here none), so the growing child
+    cannot re-arm the grace: the launch-armed grace stalls on call 3 as for a
+    parent with no children, and the fault is crumbed once.
+
+    ABLATION: read a failed scan as movement (re-arm whenever
+    `_sample_subagent_tree` returns None) and the stall slips past call 3."""
+
+    def denied(template, conversation):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(generic, "_spawned_children", denied)
+
+    def grow(call_n, child_t):
+        if call_n >= 2:
+            _grow(Path(child_t), b'{"step_index":1}\n')
+
+    adapter, _, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [_agy_stop("agy-parent", parent_t, False)],
+        grow,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 3
+    assert len(_lifecycle_events(adapter, "subagent-scan-failed")) == 1
+
+
+def test_a_store_folder_stat_fault_admits_the_stop_and_crumbs_once(tmp_path, monkeypatch):
+    """DW-608: under the bounded scan, a fault statting a candidate folder for
+    its mtime is never read as "old" or "absent": the Stop is admitted as
+    before and the fault is journaled once as `subagent-marker-unreadable`."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    _, child_t = _agy_child_run(tmp_path, adapter, impl)
+    parent = tmp_path / "brain" / "agy-parent"
+    real_stat = os.stat
+
+    def faulty(path, *args, **kwargs):
+        if os.fspath(path) == str(parent):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(generic.os, "stat", faulty)
+    # launched_ns=0 keeps the pre-written spec fresh; the bounded scan still
+    # stats each folder's mtime before comparing it with the (negative) floor.
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-child"  # admitted: the fault judged nothing
+    (crumb,) = _lifecycle_events(adapter, "subagent-marker-unreadable")
+    assert crumb["error"].startswith("PermissionError")
+    assert _lifecycle_events(adapter, "subagent-stop-ignored") == []
+
+
+def test_a_judged_children_flip_does_not_rearm_the_dev_stall(tmp_path, monkeypatch):
+    """DW-607: the sampler rebaselines the child key when what it covers
+    changes, and writes the new key in the same call, so the wait loop sees
+    one non-None key change straight to another. A tree+marker profile named
+    first by an id-less yield (tree only) and then, on call 3, by the parent's
+    yield (tree + the static child): the call-4 heartbeat's key covers more,
+    which is no activity, so the launch-armed grace (t=1060) stalls on call 4.
+
+    Ablation, performed: drop the `sub_judged == idle.sub_children_judged`
+    check and this fails — the flip re-arms the grace, stalling on call 6."""
+    adapter, parent_t, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [
+            _agy_stop(None, parent_t, False),
+            None,
+            _agy_stop("agy-parent", parent_t, False),
+        ],
+        lambda call_n, child_t: None,
+    )
+    adapter.profile = dataclasses.replace(
+        adapter.profile, subagent_transcript_dir="{stem}/subagents"
+    )
+    _subagent_file(Path(parent_t), "agent-a.jsonl")
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 4
+
+
+def test_claude_subagent_tree_activity_keeps_the_dev_stall_grace_open(tmp_path, monkeypatch):
+    """DW-607 on claude's derived `subagent_transcript_dir`: a parent whose pane
+    and transcript are still while a subagent transcript grows past several
+    graces. The tree's writes re-arm the grace (same timeline as the agy
+    child test: growth on calls 2-5, stall on call 8).
+
+    Ablation, performed: drop `sub_moved` from the stall re-arm and this
+    fails — the launch-armed grace stalls on call 3."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(
+        tmp_path, monkeypatch, grace=60.0, profile_name="claude"
+    )
+    agent = _subagent_file(transcript, "agent-a.jsonl")
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if 2 <= call_n <= 5:
+            _grow(agent, b'{"type":"assistant"}\n')
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 8
+    assert adapter.mux.sent == []
 
 
 def test_children_coming_into_view_rebaseline_the_subagent_key(tmp_path, monkeypatch):
