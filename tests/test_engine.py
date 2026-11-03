@@ -20927,7 +20927,6 @@ def test_restore_ledger_reset_owned_write_uses_the_blob_anchor(project):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
 def test_defer_restore_never_resurrects_a_deleted_symlink_target(project, tmp_path):
     """DIRECTION PIN (#735), the merge arm's twin of
     `test_restore_ledger_never_reads_a_symlink_deletion_as_reset_owned`.
@@ -20984,7 +20983,7 @@ def test_restore_ledger_never_reads_a_symlink_deletion_as_reset_owned(project, t
     `None` with the `None` a dangling link reads back would make the two compare
     equal and undo the deletion. Only a `BASELINE` anchor may spend a missing
     file as proof, because only there did the reset actually delete it — which is
-    exactly what `test_ledger_baseline_text_answers_determinate_absence` pins.
+    exactly what `test_ledger_baseline_text_reports_absence_at_baseline` pins.
 
     The digest anchor is deliberately NOT ours, so any write would be
     attributable to `reset_owned` alone.
@@ -23727,22 +23726,6 @@ def test_harvest_gate_resolve_fault_fails_proof_conservatively_without_crashing(
     assert "no changes" in decisions[0]["reason"]
     assert len(adapter.sessions) == 2
     assert summary.done == 1 and not summary.crashed and not summary.paused
-
-
-def test_real_work_plus_a_harvest_still_proceeds(project):
-    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
-    engine, adapter = make_engine(
-        project,
-        [dev_effect(project, "1-1-a", followup_review=False, deferred=[HARVEST_A])],
-        policy=_harvest_policy(),
-    )
-
-    summary = engine.run()
-
-    decisions = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
-    assert [d["action"] for d in decisions] == ["proceed"]
-    assert [s.role for s in adapter.sessions] == ["dev"]
-    assert summary.done == 1
 
 
 def _session_authored_ledger_effect(project, *, deferred=None):
@@ -26854,7 +26837,13 @@ def test_reverify_post_replay_re_run_that_fails_re_defers_and_clears_marker(proj
 def test_reverify_with_the_environment_still_down_re_defers_without_a_session(project, tmp_path):
     """DW-522: re-verifying before the environment is back fails the replay; a
     DEFERRED origin goes back to DEFERRED (no retry, no dev session), the latch is
-    spent, and the tree is still the operator's to recover."""
+    spent, and the tree is still the operator's to recover.
+
+    A re-armed task sits at DEV_VERIFY with a spec_file — the exact shape of a
+    spec-approval pause. The reverify arm must win, or `_resume_after_dev_verify`
+    reviews and COMMITS the kept work without replaying the (still failing) verify.
+    Ablation: move the `task.reverify_from` arm below the DEV_VERIFY + spec_file arm
+    in `_finish_inflight` and this story commits."""
     engine, _marker, baseline = _deferred_in_place(project, tmp_path)
     runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
     engine2, adapter2 = resume_engine(project, engine, [])
@@ -26862,8 +26851,10 @@ def test_reverify_with_the_environment_still_down_re_defers_without_a_session(pr
 
     assert adapter2.sessions == []
     assert summary.paused  # rollback OFF: the re-defer pauses for recovery again
+    assert "resume-review" not in [e["kind"] for e in Journal(engine2.run_dir).entries()]
     task = load_state(engine2.run_dir).tasks["1-1-a"]
     assert task.phase == Phase.DEFERRED
+    assert task.commit_sha is None
     assert task.reverify_from == ""
     [decision] = _rows(engine2, "reverify-decision")
     assert decision["action"] == "defer" and decision["env_fault"] is False
@@ -26927,24 +26918,6 @@ def test_reverify_of_an_env_fault_escalation_commits(project, tmp_path):
     [decision] = _rows(engine2, "reverify-decision")
     assert decision["origin"] == "escalated" and decision["action"] == "proceed"
     assert len(verify.commits_above(project.project, baseline)) == 1
-
-
-def test_reverify_arm_precedes_the_spec_approval_arm(project, tmp_path):
-    """DW-522: a re-armed task sits at DEV_VERIFY with a spec_file — the exact shape
-    of a spec-approval pause. The reverify arm must win, or `_resume_after_dev_verify`
-    reviews and COMMITS the kept work without replaying the (still failing) verify.
-    Ablation: move the `task.reverify_from` arm below the DEV_VERIFY + spec_file arm
-    in `_finish_inflight` and this story commits."""
-    engine, _marker, baseline = _deferred_in_place(project, tmp_path)
-    runs.rearm_for_reverify(engine.run_dir, project_root=project.project)
-    engine2, _ = resume_engine(project, engine, [])
-    engine2.run()
-
-    kinds = [e["kind"] for e in Journal(engine2.run_dir).entries()]
-    assert "resume-review" not in kinds
-    assert engine2.state.tasks["1-1-a"].phase == Phase.DEFERRED
-    assert engine2.state.tasks["1-1-a"].commit_sha is None
-    assert len(verify.commits_above(project.project, baseline)) == 2
 
 
 def test_reverify_honors_the_spec_approval_gate(project, tmp_path):

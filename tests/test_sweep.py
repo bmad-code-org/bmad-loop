@@ -26379,7 +26379,13 @@ def test_the_seeded_decisions_write_refuses_a_redirected_run_dir(project, tmp_pa
     Since DW-262 the refusal no longer crashes the run: `UnconfinedWriteError` is an
     `OSError`, so the seeded guard journals it as `sweep-decisions-store-write-failed`
     (the refusal's message in `error`) and the run carries on. The confinement is
-    what this row grades, and it is unchanged — nothing escapes either way."""
+    what this row grades, and it is unchanged — nothing escapes either way.
+
+    Positive control: `test_decisions_phase_keys_on_the_run_dir_project_not_workspace_root`
+    lands a seeded keep-open pre-answer for DW-1 in an ORDINARY run dir's
+    `decisions.json` and reads it back, so a seeded write wired to refuse everything
+    fails there — this refusal is the redirected run dir, not every reason the file
+    could be absent from `outside/`."""
     from bmad_loop import decisions
     from bmad_loop.sweep import DecisionOption
 
@@ -26429,7 +26435,12 @@ def test_the_interactive_decisions_write_refuses_a_redirected_run_dir(project, t
     rather than upstream of it.
 
     Ablation: revert this site and this fails — the run completes and
-    `decisions.json` appears in `outside/`."""
+    `decisions.json` appears in `outside/`.
+
+    Positive control: `test_interactive_decisions_build_and_close` runs the same
+    interactive write on an ORDINARY run dir and reads `decisions.json` back, so a
+    `_decisions_phase` wired to crash on anything fails there — this refusal is the
+    redirected run dir, not every reason the file could be absent from `outside/`."""
     outside = _redirect_the_run_dir(project, tmp_path)
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(  # close-only: no bundle, so no bundle-intent write
@@ -26454,34 +26465,6 @@ def test_the_interactive_decisions_write_refuses_a_redirected_run_dir(project, t
     assert '"decision-pending"' in journal  # PRECONDITION: the prompt was reached
     assert '"decision-answered"' not in journal  # the refusal landed AT the write
     assert not (outside / "decisions.json").exists()  # nothing escaped the project
-
-
-def test_the_decisions_writes_land_on_a_clean_tree(project):
-    """The positive control for both refusals above. Without it they pass for a
-    `_decisions_phase` wired to crash on anything, which is every reason
-    `decisions.json` could be absent from `outside/` — and the run dir under test
-    there is a symlink, so this row also pins that an ORDINARY run dir still gets
-    its file."""
-    write_ledger(project, {"DW-1": "open"})
-    plan = triage_result(
-        ["DW-1"],
-        decisions=[
-            _decision(
-                "DW-1",
-                [
-                    {"key": "1", "label": "Close it", "effect": "close", "resolution": "moot"},
-                    {"key": "2", "label": "Keep open", "effect": "keep-open"},
-                ],
-            )
-        ],
-    )
-    engine, _ = make_sweep(project, [triage_effect(plan)], answers=["1"], prompting=True)
-
-    summary = engine.run()
-
-    assert not summary.crashed
-    landed = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
-    assert landed["DW-1"]["effect"] == "close"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -31571,45 +31554,13 @@ def test_tampered_persisted_transition_never_overwrites_reflog_evidence(project,
     assert "unit-merged" not in journal_kinds(resumed)
 
 
-def test_malformed_persisted_strategy_never_records_integration(project, monkeypatch):
-    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
-    engine, original_adapter = make_sweep(
-        project,
-        [triage_effect(bundle_plan()), effect],
-        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
-    )
-
-    def host_loss_before_git(*_args, **_kwargs):
-        raise RuntimeError("host lost before git")
-
-    monkeypatch.setattr(verify, "merge_branch", host_loss_before_git)
-    assert engine.run().crashed
-    state = load_state(engine.run_dir)
-    task = state.tasks["dw-fix"]
-    assert task.integration_attempt is not None
-    task.integration_attempt["strategy"] = "bogus"
-    save_state(engine.run_dir, state)
-    resumed, adapter = resume_sweep(project, engine, [])
-
-    summary = resumed.run()
-
-    assert summary.paused and not summary.crashed
-    assert adapter.sessions == []
-    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
-    durable = resumed.state.tasks["dw-fix"]
-    assert durable.integration_attempt is not None
-    assert durable.integration_attempt["strategy"] == "bogus"
-    assert "unit-merged" not in journal_kinds(resumed)
-    assert Path(durable.worktree_path).is_dir()
-
-
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("outcome", "unknown"), ("version", 99)],
+    [("outcome", "unknown"), ("version", 99), ("strategy", "bogus")],
 )
 def test_malformed_persisted_receipt_shape_never_reaches_git(project, monkeypatch, field, value):
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
-    engine, _ = make_sweep(
+    engine, original_adapter = make_sweep(
         project,
         [triage_effect(bundle_plan()), effect],
         policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
@@ -31635,10 +31586,12 @@ def test_malformed_persisted_receipt_shape_never_reaches_git(project, monkeypatc
 
     assert summary.paused and not summary.crashed
     assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
     durable = resumed.state.tasks["dw-fix"]
     assert durable.integration_attempt is not None
     assert durable.integration_attempt[field] == value
     assert "unit-merged" not in journal_kinds(resumed)
+    assert Path(durable.worktree_path).is_dir()
 
 
 def test_no_ref_update_validation_refusal_keeps_ambiguous_receipt(project, monkeypatch):

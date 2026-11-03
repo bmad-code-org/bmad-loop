@@ -5493,20 +5493,6 @@ def test_safe_rollback_preserves_preexisting_untracked(project):
     assert not (repo / "junk.txt").exists()  # only run-created file removed
 
 
-def test_safe_rollback_keep_dir_protects_run_created(project):
-    repo = project.project
-    baseline = verify.rev_parse_head(repo)
-    snap = sorted(verify.untracked_files(repo))
-    out = repo / "_bmad-output"
-    out.mkdir(exist_ok=True)
-    (out / "fresh-artifact.md").write_text("generated this run\n")  # run-created
-
-    verify.safe_rollback(
-        repo, baseline, baseline_untracked=snap, keep=(".bmad-loop", "_bmad-output")
-    )
-    assert (out / "fresh-artifact.md").exists()  # protected by keep even though new
-
-
 # Names the pre-#783 line-based `untracked_files` did not answer verbatim: git
 # C-quotes a non-ASCII or newline-bearing name, and `.strip()` ate edge spaces.
 # Windows forbids a newline in a name and silently drops a trailing space.
@@ -5574,7 +5560,8 @@ def test_snapshot_worktree_parks_verbatim_named_untracked(project, name):
 @pytest.mark.parametrize("name", _VERBATIM_NAMES)
 def test_safe_rollback_removes_only_run_created_verbatim_names(project, name):
     """A run-created file of that name is deleted; the operator's pre-existing one
-    in the baseline and a keep-dir-protected one both survive."""
+    in the baseline and a keep-dir-protected one both survive: `keep` protects a
+    run-created file even though the snapshot never listed it."""
     repo = project.project
     _quote_path_default(repo)
     (repo / "pre").mkdir()
@@ -8850,7 +8837,8 @@ def test_commit_paths_run_hooks_false_skips_pre_commit_and_commit_msg_hooks(
 
     The default commit afterwards is the in-test proof that the installed hooks
     bite: without it, a hook that never runs for an unrelated reason passes the
-    marker assertions too.
+    marker assertions too. It also characterizes the default `run_hooks=True`: it
+    keeps every existing caller's hooks live and the commit still lands at HEAD.
 
     Ablation: make `commit_paths` ignore `run_hooks` (always pass `()`) and every
     marker appears after the first commit."""
@@ -8872,7 +8860,8 @@ def test_commit_paths_run_hooks_false_skips_pre_commit_and_commit_msg_hooks(
     assert [name for name in _HOOK_NAMES if (repo / f"hook-{name}").exists()] == []
 
     (repo / "src.txt").write_text("hooks live\n")
-    assert verify.commit_paths(repo, "chore: hooks", [repo / "src.txt"]) is not None
+    live = verify.commit_paths(repo, "chore: hooks", [repo / "src.txt"])
+    assert live is not None and live == verify.rev_parse_head(repo)
     assert [name for name in _HOOK_NAMES if (repo / f"hook-{name}").exists()] == list(_HOOK_NAMES)
 
 
@@ -8900,21 +8889,6 @@ def test_commit_paths_run_hooks_false_ignores_gpgsign(project, tmp_path):
     assert sha is not None and sha != base
     assert sha == verify.rev_parse_head(repo)
     assert git(repo, "log", "-1", "--format=%s") == "chore: unsigned"
-
-
-def test_commit_paths_default_still_runs_hooks(project):
-    """Characterization: the default `run_hooks=True` keeps every existing caller's
-    hooks live — a `.git/hooks/pre-commit` still runs and the commit still lands."""
-    repo = project.project
-    hook = repo / ".git" / "hooks" / "pre-commit"
-    hook.write_text("#!/bin/sh\nprintf ran > commit-hook-ran\n")
-    hook.chmod(0o755)
-    (repo / "src.txt").write_text("hooks live\n")
-
-    sha = verify.commit_paths(repo, "chore: hooks", [repo / "src.txt"])
-
-    assert sha is not None and sha == verify.rev_parse_head(repo)
-    assert (repo / "commit-hook-ran").exists()
 
 
 def test_apply_patch_replays_saved_diff(project):
@@ -8977,23 +8951,11 @@ def test_patch_new_files_names_created_files(project):
     assert verify.patch_new_files(_saved_patch(project)) == {"new_module.py", "pkg/deep.txt"}
 
 
-def test_patch_new_files_ignores_modifications(project):
-    repo = project.project
-    (repo / "src.txt").write_text("original\nedited\n")
-    assert verify.patch_new_files(_saved_patch(project)) == set()
-
-
-def test_patch_new_files_never_returns_deletions(project):
-    """A deleted file must not land in the exclusion set: the human may re-create
-    that path, and excluding it would make the next rollback delete their copy."""
-    repo = project.project
-    git(repo, "rm", "-q", "src.txt")
-    assert verify.patch_new_files(_saved_patch(project)) == set()
-
-
 def test_patch_new_files_multi_file_patch(project):
     """One patch carrying a creation, a modification and a deletion — only the
-    creation comes back."""
+    creation comes back. A deleted file must not land in the exclusion set: the
+    human may re-create that path, and excluding it would make the next rollback
+    delete their copy."""
     repo = project.project
     (repo / "created.txt").write_text("new\n")
     (repo / ".gitignore").write_text("*.log\n")
@@ -10558,6 +10520,10 @@ def test_commit_path_bound_preserves_tracked_executable_target_mode(project):
     assert git(repo, "ls-tree", published, "--", path.name).startswith("100755 blob ")
     assert git(repo, "ls-files", "-s", "--", path.name).startswith("100755 ")
     assert git(repo, "diff", "--cached", "--name-only") == ""
+    if os.name != "nt":
+        # The live-bit-matches-index half where core.fileMode is on: the worktree
+        # (exec bit included) reads clean against the published index.
+        assert git(repo, "status", "--porcelain", "--", path.name) == ""
 
 
 def test_commit_path_bound_keeps_executable_mode_when_a_hook_re_adds_the_target(project):
@@ -13694,30 +13660,6 @@ def test_commit_path_bound_ignores_live_mode_where_file_mode_is_off(project):
 
     assert published == verify.rev_parse_head(repo)
     assert git(repo, "ls-tree", published, "--", path.name).startswith("100644 blob ")
-
-
-@_POSIX_EXEC_BIT
-def test_commit_path_bound_publishes_executable_ledger_with_matching_live_bit(project):
-    repo = project.project
-    path = repo / "src.txt"
-    git(repo, "update-index", "--chmod=+x", "--", path.name)
-    git(repo, "commit", "-q", "-m", "track executable ledger")
-    path.chmod(path.stat().st_mode | 0o111)
-    baseline = path.read_text(encoding="utf-8")
-    accepted = "accepted executable migration ledger\n"
-    path.write_text(accepted, encoding="utf-8")
-
-    published = verify.commit_path_bound(
-        repo,
-        "chore: bound ledger",
-        path,
-        accepted_text=accepted,
-        baseline_text=baseline,
-    )
-
-    assert published == verify.rev_parse_head(repo)
-    assert git(repo, "ls-tree", published, "--", path.name).startswith("100755 blob ")
-    assert git(repo, "status", "--porcelain", "--", path.name) == ""
 
 
 @_POSIX_EXEC_BIT

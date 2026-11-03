@@ -2722,9 +2722,11 @@ def _two_session_dirs(tmp_path):
     directories. `task.sessions` is append-only and chronological, so `sessions[1]`
     is the NEWER attempt and `reversed(...)` must reach its directory first.
 
-    This shape exists because no single-directory row can see either of this
-    reader's cross-session contracts: rescope the content map per directory, or
-    drop `reversed`, and every one-directory row below stays green."""
+    This shape exists because no single-directory row can see this reader's
+    cross-session dedupe contract: rescope the content map per directory and every
+    one-directory row below stays green. (The other cross-session contract, the
+    `reversed` newest-first order, is pinned by
+    `test_gather_escalations_shows_the_whole_trail_at_watermark_zero`.)"""
     run_dir, state, task = _escalated_run(tmp_path)
     key = "6-4-cli-list-command"
     older = _session_task_id(key, "triage", 1, 0)
@@ -2754,22 +2756,6 @@ def test_gather_escalations_dedupes_one_entry_across_two_sessions(tmp_path):
 
     found, _ = resolve._gather_escalations(run_dir, state, key)
     assert [e["detail"] for e in found] == ["unresolved across attempts"]
-
-
-def test_gather_escalations_orders_distinct_sessions_newest_first(tmp_path):
-    """The documented "newest first" order is a CROSS-SESSION property: nothing
-    inside one directory can pin it, because `reversed(task.sessions)` is what
-    reaches the newer record's directory before the older one's. Drop `reversed`
-    and only this row notices."""
-    run_dir, state, key, older_dir, newer_dir = _two_session_dirs(tmp_path)
-    for d, detail in ((older_dir, "older"), (newer_dir, "newer")):
-        (d / "escalation.json").write_text(
-            json.dumps({"escalations": [{"severity": "CRITICAL", "detail": detail}]}),
-            encoding="utf-8",
-        )
-
-    found, _ = resolve._gather_escalations(run_dir, state, key)
-    assert [e["detail"] for e in found] == ["newer", "older"]
 
 
 def _task_dir(run_dir, task):
@@ -3201,7 +3187,12 @@ def _redrive_escalates(run_dir, key, detail, *, escalated=False):
 def test_gather_escalations_shows_the_whole_trail_at_watermark_zero(tmp_path):
     """The default is the PRE-DW-11 walk, byte-for-byte. 0 is what a task that was
     never resolved carries and what a pre-upgrade `state.json` deserializes to, so
-    this row is also the legacy-state contract at the reader."""
+    this row is also the legacy-state contract at the reader.
+
+    It also pins the documented "newest first" order, a CROSS-SESSION property:
+    nothing inside one directory can pin it, because `reversed(task.sessions)` is
+    what reaches the newer record's directory before the older one's. Drop
+    `reversed` and this row reds."""
     run_dir, state, task, key = _watermarked_trail(tmp_path, [["older"], ["newer"]])
     assert task.escalations_resolved_upto == 0
 
@@ -4046,18 +4037,10 @@ def test_build_context_keeps_recorded_sentinel_mode_after_its_file_disappears(tm
     assert ctx["spec_reaches_the_redrive"] is None
 
 
-def test_build_context_sprint_mode_has_no_stories_block(tmp_path):
-    """Sprint mode leaves the context contract unchanged — no stories block."""
-    run_dir, state, _ = _escalated_run(tmp_path, spec_file="/abs/spec.md")  # sprint source
-    ctx = json.loads(
-        _context(state, run_dir, "6-4-cli-list-command", isolation="").read_text(encoding="utf-8")
-    )
-    assert "stories" not in ctx
-
-
 def test_build_context_sprint_mode_does_not_resolve_a_stories_root(tmp_path, monkeypatch):
-    """A sprint context has no consumer for stories-root data, so it performs no
-    stories-only filesystem lookup.
+    """Sprint mode leaves the context contract unchanged — no stories block. A sprint
+    context has no consumer for stories-root data, so it performs no stories-only
+    filesystem lookup either.
 
     The seam is planted on `live_stories_root`, the module global
     `_context_stories_root` delegates to, so the row grades the delegation as well as
@@ -4257,39 +4240,16 @@ def test_build_context_stories_block_stays_on_the_mount_for_an_out_of_mount_spec
     assert "sentinel" not in ctx["stories"]  # task never recorded a sentinel verdict
 
 
-def test_build_context_reports_whether_the_spec_reaches_the_redrive(tmp_path):
-    """The agent is told when the file it is being sent to edit has no future.
+def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_path):
+    """The agent is told when the file it is being sent to edit has no future, and
+    where the correction has to land instead.
 
     Under isolation `engine._finish_inflight` discards the mount, so an edit to a
     worktree-local spec succeeds and then vanishes before the re-drive reads anything.
     `rearm_escalation` already journals `rearm-spec-write-unreachable` on this verdict;
     emitting it here is what lets the session act on it rather than discover it after.
 
-    Ablation: hardcode the field to `True` and the isolated leg reddens.
-    """
-    wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
-    run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
-    ctx = json.loads(
-        _context(state, run_dir, "6-4-cli-list-command", isolation="worktree").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert ctx["spec_reaches_the_redrive"] is False
-
-    plain_dir, plain_state, _ = _escalated_run(
-        tmp_path, "20260613-111429-6a15", spec_file=str(tmp_path / "specs" / "6-4.md")
-    )
-    plain = json.loads(
-        _context(plain_state, plain_dir, "6-4-cli-list-command", isolation="").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert plain["spec_reaches_the_redrive"] is True
-
-
-def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_path):
-    """`spec_reaches_the_redrive: false` on its own states a problem with no remedy.
-
+    `spec_reaches_the_redrive: false` on its own states a problem with no remedy.
     The session is told its edit is doomed, and both obvious repairs fail silently for
     an isolated unit: committing from the main checkout cannot include a file that
     lives in the linked unit worktree, and committing on the unit's own branch does
@@ -4300,6 +4260,8 @@ def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_pat
 
     Ablation: return `"HEAD"` unconditionally and the isolated leg reddens; drop the
     key and the skill-contract guard reddens too, since the schema documents it.
+    Hardcode `spec_reaches_the_redrive` to `True` and the isolated leg reddens; to
+    `False` and the in-place leg does.
     """
     wt = tmp_path / ".bmad-loop" / "runs" / "20260613-111429-6a14" / "worktrees" / "1"
     run_dir, state, _ = _escalated_run(tmp_path, spec_file="specs/6-4.md", worktree_path=str(wt))
@@ -4323,6 +4285,7 @@ def test_build_context_names_where_an_unreachable_correction_has_to_land(tmp_pat
             encoding="utf-8"
         )
     )
+    assert plain["spec_reaches_the_redrive"] is True
     assert plain["redrive_base_ref"] == "HEAD"
 
 
@@ -4347,10 +4310,21 @@ def test_rearm_warns_about_an_unreachable_spec_write_only_when_it_is_actionable(
     Both legs keep the WORKTREE spec at `blocked`, so the only thing separating them is
     what git has committed — which is the whole claim.
 
+    Neither leg pins `target_branch`, on purpose: that is the pre-upgrade state.json
+    shape (`ensure_target_branch` pins the field before any worktree can mount, so only
+    an older state reaches here with a `worktree_path` and no target), and an
+    unrecorded target is a MISSING value, not a divergent one. `_redrive_base_ref` must
+    degrade to `HEAD` rather than to `""`, which would make `_redrive_spec_status`
+    unprovable for every re-arm of such a run and hold the resume on a
+    per-configuration constant. The `ready-for-dev` leg is what separates the two:
+    only an anchor that actually resolves can suppress.
+
     Ablation: restore the gate to a bare `if task.worktree_path:` and the
     `committed_status="ready-for-dev"` row reddens on `assert True is False`, while the
     `"blocked"` row keeps passing. That asymmetry IS the narrowing; a gate that fires
-    for both is indistinguishable from no gate at all.
+    for both is indistinguishable from no gate at all. Make `_redrive_base_ref` return
+    `""` on the migrated shape and the `"ready-for-dev"` row reddens on the record
+    appearing.
     """
     rel = "_bmad-output/specs/6-4-cli-list-command.md"
     _resolve_repo(tmp_path)
@@ -4899,41 +4873,6 @@ def test_rearm_event_notice_reads_a_pre_discriminator_record_as_isolated():
     _, message, next_step = runs.rearm_event_notice(legacy)
     assert "Commit the corrected spec on `main`" in next_step
     assert "mount a fresh worktree" in message
-
-
-def test_rearm_base_ref_degrades_to_head_for_a_run_that_pinned_no_target(tmp_path, monkeypatch):
-    """An unrecorded `target_branch` is a MISSING value, not a divergent one.
-
-    `ensure_target_branch` pins the field before any worktree can mount, so only a
-    state.json predating it reaches here with a `worktree_path` and no target — and it
-    must degrade to the ref it read before the fix rather than to `""`. Answering `""`
-    would make `_redrive_spec_status` unprovable for every re-arm of such a run and
-    hold the resume on a per-configuration constant, the exact failure the record's
-    narrowing exists to avoid.
-
-    The committed spec here already carries the target status, so a degrade to `""`
-    is separable from the read succeeding: only an anchor that actually resolves can
-    suppress. Ablation: make `_redrive_base_ref` return `""` on the migrated shape and
-    this reddens on the record appearing.
-    """
-    rel = "_bmad-output/specs/6-4-cli-list-command.md"
-    _resolve_repo(tmp_path)
-    spec = tmp_path / rel
-    spec.parent.mkdir(parents=True, exist_ok=True)
-    spec.write_text("---\nstatus: ready-for-dev\n---\n\n## Intent\n\nx\n", encoding="utf-8")
-    git(tmp_path, "add", "-A")
-    git(tmp_path, "commit", "-q", "-m", "corrected spec")
-    wt_spec = tmp_path / "wt" / rel
-    wt_spec.parent.mkdir(parents=True, exist_ok=True)
-    wt_spec.write_text("---\nstatus: blocked\n---\n\n## Intent\n\nx\n", encoding="utf-8")
-
-    # no `target_branch=`: the pre-upgrade shape, worktree_path set all the same
-    run_dir, _, _ = _escalated_run(tmp_path, spec_file=rel, worktree_path=str(tmp_path / "wt"))
-    monkeypatch.chdir(tmp_path)
-
-    runs.rearm_escalation(run_dir, isolated_redrive=True, resolution_recorded=True)
-
-    assert [e for e in _kinds(run_dir) if e["kind"] == "rearm-spec-write-unreachable"] == []
 
 
 @pytest.mark.parametrize("committed_status", ["ready-for-dev", "blocked"])

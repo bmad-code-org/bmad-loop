@@ -4017,28 +4017,71 @@ def test_sweep_dry_run_only_refuses_non_open_or_unknown_projected_id(project, ca
     assert "triage:" not in captured.out
 
 
+_UNRESTRICTED_SWEEP_OPTIONS = json.dumps({"only": None, "min_severity": None})
+_SAME_AS_CONTENTS = object()
+
+
 @pytest.mark.parametrize(
-    "contents",
+    ("version_delta", "digest_bytes", "contents", "message"),
     [
-        "[]",
-        "{",
-        '{"only": "DW-1", "min_severity": null}',
-        '{"only": null, "min_severity": "urgent"}',
-        '{"only": ["DW-1"], "min_severity": "high"}',
+        pytest.param(0, _SAME_AS_CONTENTS, "[]", "cannot resume", id="non-object"),
+        pytest.param(0, _SAME_AS_CONTENTS, "{", "cannot resume", id="invalid-json"),
+        pytest.param(
+            0,
+            _SAME_AS_CONTENTS,
+            '{"only": "DW-1", "min_severity": null}',
+            "cannot resume",
+            id="only-shape",
+        ),
+        pytest.param(
+            0,
+            _SAME_AS_CONTENTS,
+            '{"only": null, "min_severity": "urgent"}',
+            "cannot resume",
+            id="severity-value",
+        ),
+        pytest.param(
+            0,
+            _SAME_AS_CONTENTS,
+            '{"only": ["DW-1"], "min_severity": "high"}',
+            "cannot resume",
+            id="both",
+        ),
+        # contents None: sweep.json is unlinked
+        pytest.param(
+            0, b"{}", None, "sweep.json is missing for this selector-capable run", id="missing"
+        ),
+        # digest None: no digest persisted (unread for a non-current version)
+        pytest.param(
+            1,
+            None,
+            _UNRESTRICTED_SWEEP_OPTIONS,
+            "unsupported sweep options version",
+            id="newer-version",
+        ),
+        pytest.param(0, b"{}", "{}", "missing current selector field", id="incomplete"),
+        pytest.param(
+            0,
+            json.dumps({"only": ["DW-1"], "min_severity": None}).encode("utf-8"),
+            _UNRESTRICTED_SWEEP_OPTIONS,
+            "bound at launch",
+            id="targeted-replaced-by-unrestricted",
+        ),
     ],
-    ids=["non-object", "invalid-json", "only-shape", "severity-value", "both"],
 )
 def test_public_resume_refuses_malformed_selectors_before_mutation(
-    project, monkeypatch, capsys, contents
+    project, monkeypatch, capsys, version_delta, digest_bytes, contents, message
 ):
-    run_dir = _paused_run_for_resume(
-        project,
-        monkeypatch,
-        run_type="sweep",
-        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
-        sweep_options_digest=hashlib.sha256(contents.encode("utf-8")).hexdigest(),
-    )
-    (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
+    state_kwargs = {"sweep_options_version": runsetup.SWEEP_OPTIONS_VERSION + version_delta}
+    if digest_bytes is _SAME_AS_CONTENTS:
+        digest_bytes = contents.encode("utf-8")
+    if digest_bytes is not None:
+        state_kwargs["sweep_options_digest"] = hashlib.sha256(digest_bytes).hexdigest()
+    run_dir = _paused_run_for_resume(project, monkeypatch, run_type="sweep", **state_kwargs)
+    if contents is None:
+        (run_dir / "sweep.json").unlink(missing_ok=True)
+    else:
+        (run_dir / "sweep.json").write_text(contents, encoding="utf-8")
     state_before = (run_dir / "state.json").read_bytes()
     journal_path = run_dir / "journal.jsonl"
     journal_before = journal_path.read_bytes() if journal_path.is_file() else None
@@ -4049,7 +4092,9 @@ def test_public_resume_refuses_malformed_selectors_before_mutation(
 
     assert cli._resume_paused_run(project.project, run_dir) == 1
 
-    assert "cannot resume" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "cannot resume" in err
+    assert message in err
     assert (run_dir / "state.json").read_bytes() == state_before
     assert (journal_path.read_bytes() if journal_path.is_file() else None) == journal_before
     pid_path = run_dir / runs.PID_FILE
@@ -10880,96 +10925,6 @@ def test_resume_tolerates_a_missing_legacy_sweep_json(project, monkeypatch):
     assert captured["max_bundles"] is None
 
 
-def test_public_resume_refuses_missing_current_sweep_options_before_mutation(
-    project, monkeypatch, capsys
-):
-    run_dir = _paused_run_for_resume(
-        project,
-        monkeypatch,
-        run_type="sweep",
-        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
-        sweep_options_digest=hashlib.sha256(b"{}").hexdigest(),
-    )
-    (run_dir / "sweep.json").unlink(missing_ok=True)
-    state_before = (run_dir / "state.json").read_bytes()
-    journal_path = run_dir / "journal.jsonl"
-    journal_before = journal_path.read_bytes() if journal_path.is_file() else None
-    pid_path = run_dir / runs.PID_FILE
-    pid_before = pid_path.read_bytes() if pid_path.is_file() else None
-    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
-
-    assert cli._resume_paused_run(project.project, run_dir) == 1
-
-    assert "missing" in capsys.readouterr().err
-    assert (run_dir / "state.json").read_bytes() == state_before
-    assert (journal_path.read_bytes() if journal_path.is_file() else None) == journal_before
-    assert (pid_path.read_bytes() if pid_path.is_file() else None) == pid_before
-
-
-def test_public_resume_refuses_a_newer_sweep_options_version_before_mutation(
-    project, monkeypatch, capsys
-):
-    run_dir = _paused_run_for_resume(
-        project,
-        monkeypatch,
-        run_type="sweep",
-        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION + 1,
-    )
-    (run_dir / "sweep.json").write_text(
-        json.dumps({"only": None, "min_severity": None}), encoding="utf-8"
-    )
-    state_before = (run_dir / "state.json").read_bytes()
-    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
-
-    assert cli._resume_paused_run(project.project, run_dir) == 1
-
-    assert "unsupported sweep options version" in capsys.readouterr().err
-    assert (run_dir / "state.json").read_bytes() == state_before
-
-
-def test_public_resume_refuses_incomplete_current_sweep_options_before_mutation(
-    project, monkeypatch, capsys
-):
-    run_dir = _paused_run_for_resume(
-        project,
-        monkeypatch,
-        run_type="sweep",
-        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
-        sweep_options_digest=hashlib.sha256(b"{}").hexdigest(),
-    )
-    (run_dir / "sweep.json").write_text("{}", encoding="utf-8")
-    state_before = (run_dir / "state.json").read_bytes()
-    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
-
-    assert cli._resume_paused_run(project.project, run_dir) == 1
-
-    assert "selector field" in capsys.readouterr().err
-    assert (run_dir / "state.json").read_bytes() == state_before
-
-
-def test_public_resume_refuses_replacing_targeted_options_with_unrestricted_json(
-    project, monkeypatch, capsys
-):
-    targeted = json.dumps({"only": ["DW-1"], "min_severity": None})
-    run_dir = _paused_run_for_resume(
-        project,
-        monkeypatch,
-        run_type="sweep",
-        sweep_options_version=runsetup.SWEEP_OPTIONS_VERSION,
-        sweep_options_digest=hashlib.sha256(targeted.encode("utf-8")).hexdigest(),
-    )
-    (run_dir / "sweep.json").write_text(
-        json.dumps({"only": None, "min_severity": None}), encoding="utf-8"
-    )
-    state_before = (run_dir / "state.json").read_bytes()
-    monkeypatch.setattr(cli, "SweepEngine", lambda **_kwargs: pytest.fail("engine constructed"))
-
-    assert cli._resume_paused_run(project.project, run_dir) == 1
-
-    assert "bound at launch" in capsys.readouterr().err
-    assert (run_dir / "state.json").read_bytes() == state_before
-
-
 @pytest.mark.parametrize(
     ("only", "expected"),
     [(["DW-9"], 1), (None, 0)],
@@ -16215,36 +16170,6 @@ def test_dry_run_tickets_parent_previews_the_chain(project, monkeypatch, capsys)
     )
 
 
-def test_dry_run_tickets_parent_predicts_the_pick_after_closing_a_drained_child(
-    project, monkeypatch, capsys
-):
-    """AUTH drained but its initiative not yet `done`: the real run closes it and
-    then builds BILLING. The dry run writes nothing, but re-judges the pick as the
-    tree reads once AUTH is closed: AUTH is tagged `drained (the run closes it
-    first)`, BILLING is `next` with no wait left, its tickets block is printed, and
-    the predicted line says the run closes AUTH first. Ablation (performed): pick
-    with `after_close=False` in `_dry_run_chain` and BILLING still waits, the chain
-    ends `waiting` — this FAILS."""
-    _chain_project(project, monkeypatch, capsys, [])
-    _drain_child(project.project, CHAIN_AUTH)
-
-    rc, out, err, written = _chain_dry_run(project, monkeypatch, capsys)
-
-    assert rc == 0, err
-    assert written == ""
-    lines = out.splitlines()
-    assert lines[1:3] == [
-        f"  1. {CHAIN_AUTH}  (open; 4 of 4 tickets closed)  [drained (the run closes it first)]",
-        f"  2. {CHAIN_BILLING}  (open; 0 of 4 tickets closed)  [next]",
-    ]
-    assert f"tickets mode: initiative {CHAIN_BILLING} — 1 ready of 4 tickets" in out
-    assert lines[-1] == (
-        f"predicted: chain starts with {CHAIN_BILLING}; later children are chosen as each "
-        f"finishes; the run closes drained {CHAIN_AUTH} before its first pick"
-    )
-    assert not _initiative_status(project, CHAIN_AUTH)
-
-
 def test_dry_run_tickets_parent_keeps_a_drained_child_with_work_left_open(
     project, monkeypatch, capsys
 ):
@@ -16303,9 +16228,13 @@ def test_dry_run_tickets_parent_tags_each_dependent_of_a_closed_child(
     builds BILLING, and REPORTS — no longer waiting — is tagged as the tree reads
     once AUTH is closed: `ready` with no waits, or `no folder` when it is declared
     but not sliced. AUTH's status column stays the tree as it reads now (`open`).
+    BILLING's tickets block is printed and the predicted line says the run closes
+    AUTH first; the dry run writes nothing.
 
     Ablation (performed): tag and print from `view.initiatives` (the unclosed
-    tree) in `_dry_run_chain` and REPORTS reads `waiting` — both rows FAIL."""
+    tree) in `_dry_run_chain` and REPORTS reads `waiting` — both rows FAIL.
+    Ablation (performed): pick with `after_close=False` in `_dry_run_chain` and
+    BILLING still waits, the chain ends `waiting` — both rows FAIL."""
     _chain_project(project, monkeypatch, capsys, [])
     _chain_second_dependent(project.project, folder=folder)
 
@@ -16320,6 +16249,7 @@ def test_dry_run_tickets_parent_tags_each_dependent_of_a_closed_child(
         f"  2. {CHAIN_BILLING}  (open; 0 of 4 tickets closed)  [next]",
         reports,
     ]
+    assert f"tickets mode: initiative {CHAIN_BILLING} — 1 ready of 4 tickets" in out
     assert lines[-1] == (
         f"predicted: chain starts with {CHAIN_BILLING}; later children are chosen as each "
         f"finishes; the run closes drained {CHAIN_AUTH} before its first pick"
@@ -17099,21 +17029,6 @@ def test_run_after_a_stopped_chain_closes_the_child_it_left_open(project, monkey
     assert [rows[0]["slug"], rows[2]["slug"]] == [CHAIN_AUTH, CHAIN_BILLING]
 
 
-def test_run_closes_a_sibling_drained_outside_the_chain(project, monkeypatch, capsys):
-    """AUTH was drained by hand and never built by the chain: `run` on the parent
-    closes it before the pick instead of passing it over `drained`, so BILLING is
-    built. Ablation (performed): drop the pre-pick close in `cmd_run` and the run
-    ends `waiting` launching nothing — this FAILS."""
-    built = _chain_project(project, monkeypatch, capsys, ["drain"])
-    _drain_child(project.project, CHAIN_AUTH)
-
-    assert cli.main(["run", "--project", str(project.project)]) == 0
-
-    assert [s.initiative for _, s, _ in built] == [CHAIN_BILLING]
-    assert _initiative_status(project, CHAIN_AUTH)
-    assert f"initiative chain {CHAIN_PARENT}: ends (all-done)" in capsys.readouterr().out
-
-
 def test_run_builds_a_drained_child_whose_epics_are_still_open(project, monkeypatch, capsys):
     """AUTH's tickets are all done but its epics are open: drained by its counts,
     yet its first pick halts at the epic closure, which a run of AUTH does. The
@@ -17312,7 +17227,10 @@ def test_chain_start_close_is_journaled_in_the_first_childs_run(project, monkeyp
     dir existed, land verbatim in BILLING's run journal after `run-start` and ahead
     of BILLING's own close and `initiative-chain-end`. Ablation (performed): drop
     the replay in `cmd_run` and BILLING's journal starts at its own close — this
-    FAILS."""
+    FAILS. AUTH was never built by the chain, so it is closed before the pick
+    instead of passed over `drained`, and BILLING is built. Ablation (performed):
+    drop the pre-pick close in `cmd_run` and the run ends `waiting` launching
+    nothing (`built == []`) — this FAILS."""
     from bmad_loop.journal import Journal
 
     built = _chain_project(project, monkeypatch, capsys, ["drain"])
@@ -17343,6 +17261,8 @@ def test_chain_start_close_is_journaled_in_the_first_childs_run(project, monkeyp
     }
     subject = f"chore(tickets): {CHAIN_AUTH} done [bmad-loop chain {CHAIN_PARENT}]"
     assert git(root, "log", "-1", "--format=%s", rows[1]["commit"]) == subject
+    assert _initiative_status(project, CHAIN_AUTH)
+    assert f"initiative chain {CHAIN_PARENT}: ends (all-done)" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("chained", [True, False], ids=["chained", "unchained"])
@@ -26208,31 +26128,16 @@ def test_relay_is_not_given_a_registry_root(tmp_path, monkeypatch):
     assert runs.PSMUX_DATA_DIR not in os.environ
 
 
-def test_mux_discloses_the_registry_root(mux_registry, tmp_path, capsys, monkeypatch):
-    """An operator's bare `psmux ls` reads psmux's default registry and answers
-    "no sessions" for this project — not an error, just a lie by omission. The
-    root and a paste-ready export are what make that actionable."""
-    import sys as _sys
-
-    root = str(tmp_path / "reg")
-    mux_registry.register_multiplexer(
-        "alpha", lambda p: p == _sys.platform, lambda: _MuxStub(registry=root)
-    )
-    monkeypatch.setenv(runs.PSMUX_DATA_DIR, root)
-
-    assert cli.main(["mux", "--project", str(tmp_path)]) == 0
-    out = capsys.readouterr().out
-    assert f"registry: {root}" in out
-    assert f"$env:{runs.PSMUX_DATA_DIR} = '{root}'" in out
-
-
 def test_mux_says_when_the_registry_is_not_the_derived_one(
     mux_registry, tmp_path, capsys, monkeypatch
 ):
     """bmad-loop always derives, so a root that is NOT the derived one means the
     export degraded — an underivable state root, where it leaves what it found
     rather than inventing one. Reporting that as "derived" would mislead about
-    the single case an operator most needs told."""
+    the single case an operator most needs told. An operator's bare `psmux ls`
+    reads psmux's default registry and answers "no sessions" for this project —
+    not an error, just a lie by omission. The root and a paste-ready export are
+    what make that actionable."""
     import sys as _sys
 
     theirs = str(tmp_path / "theirs")
@@ -26245,6 +26150,7 @@ def test_mux_says_when_the_registry_is_not_the_derived_one(
     out = capsys.readouterr().out
     assert f"registry: {theirs} (NOT bmad-loop's" in out
     assert "no state root could be derived" in out
+    assert f"$env:{runs.PSMUX_DATA_DIR} = '{theirs}'" in out
 
 
 def test_mux_says_when_the_registry_was_derived(mux_registry, tmp_path, capsys, monkeypatch):
@@ -26322,30 +26228,6 @@ def test_mux_export_line_escapes_a_single_quote(mux_registry, tmp_path, capsys, 
     assert literal[1:-1].replace("''", "'") == root
 
 
-def test_cleanup_names_what_the_migration_left_behind(project, capsys, monkeypatch):
-    """cleanup prints a removal count; a count that quietly excludes sessions the
-    migration pass declined to claim reads as "everything is clean". Ablate the
-    `_warn_legacy_leftovers` call and this fails."""
-    from bmad_loop.tui import launch
-
-    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(
-        runs,
-        "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: (
-            {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-1"]},
-            [],
-            [],
-        ),
-    )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
-
-    assert cli.main(["cleanup", "--project", str(project.project)]) == 0
-    err = capsys.readouterr().err
-    assert "not migrated" in err
-    assert "bmad-loop-ctl" in err and "bmad-loop-old-1" in err
-
-
 def test_cleanup_dry_run_previews_what_the_migration_would_leave_behind(
     project, capsys, monkeypatch
 ):
@@ -26403,30 +26285,6 @@ def test_cleanup_dry_run_hands_the_remainder_the_plan_it_printed(project, capsys
     assert seen == [[]]
 
 
-def test_cleanup_json_carries_the_remainder_and_leaves_stderr_empty(project, capsys, monkeypatch):
-    """The `unverifiable_pid` precedent: in --json mode the degradation travels in
-    the document, and stderr stays empty for a consumer reading both streams."""
-    from bmad_loop.tui import launch
-
-    monkeypatch.setattr(runs, "prune_sessions", lambda _p, dry_run=False: ([], [], set()))
-    monkeypatch.setattr(
-        runs,
-        "legacy_registry_leftovers",
-        lambda _p, announced=(), **_kw: (
-            {runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-old-1"]},
-            [],
-            [],
-        ),
-    )
-    monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
-
-    assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
-    captured = capsys.readouterr()
-    doc = json.loads(captured.out)
-    assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-old-1"]
-    assert captured.err == ""
-
-
 def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys, monkeypatch):
     """The reader's next action is to open the registry and look, so the message
     has to name the right one.
@@ -26441,7 +26299,12 @@ def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys
     naming an empty one is the same wrong errand in miniature.
 
     Ablate the per-registry loop in `_warn_legacy_leftovers` back to a single
-    line naming the default and the displaced root goes unnamed."""
+    line naming the default and the displaced root goes unnamed.
+
+    cleanup prints a removal count; a count that quietly excludes sessions the
+    migration pass declined to claim reads as "everything is clean", so every
+    name a registry holds is listed. Ablate the `_warn_legacy_leftovers` call and
+    this fails."""
     from bmad_loop.tui import launch
 
     theirs = r"D:\their-own-registry"
@@ -26451,7 +26314,7 @@ def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys
         "legacy_registry_leftovers",
         lambda _p, announced=(), **_kw: (
             {
-                runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+                runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl", "bmad-loop-old-2"],
                 theirs: ["bmad-loop-old-1"],
             },
             [],
@@ -26467,7 +26330,8 @@ def test_cleanup_names_the_registry_each_leftover_is_actually_in(project, capsys
     # each registry names its OWN sessions, and nobody else's
     default_line = next(ln for ln in lines if runs.DEFAULT_REGISTRY_LABEL in ln)
     theirs_line = next(ln for ln in lines if theirs in ln)
-    assert "bmad-loop-ctl" in default_line and "bmad-loop-old-1" not in default_line
+    assert "bmad-loop-ctl" in default_line and "bmad-loop-old-2" in default_line
+    assert "bmad-loop-old-1" not in default_line
     assert "bmad-loop-old-1" in theirs_line and "bmad-loop-ctl" not in theirs_line
 
 
@@ -26517,7 +26381,9 @@ def test_cleanup_says_a_derived_registry_of_another_project_path_is_not_a_remain
 def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, capsys, monkeypatch):
     """`sessions.legacy_leftovers` is a documented list of NAMES in a
     schema-versioned document, so the grouping serves the text mode only —
-    widening the field would be a contract change and a schema bump.
+    widening the field would be a contract change and a schema bump. The
+    `unverifiable_pid` precedent: in --json mode the degradation travels in the
+    document, and stderr stays empty for a consumer reading both streams.
 
     Ablate the flatten at the `cleanup_document` call and the field carries the
     grouping instead, which no consumer of this schema version can read."""
@@ -26539,8 +26405,10 @@ def test_cleanup_json_flattens_the_remainder_to_the_documented_list(project, cap
     monkeypatch.setattr(launch, "prune_ctl_windows", lambda _p: ([], [], [], []))
 
     assert cli.main(["cleanup", "--json", "--project", str(project.project)]) == 0
-    doc = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
     assert doc["sessions"]["legacy_leftovers"] == ["bmad-loop-ctl", "bmad-loop-old-1"]
+    assert captured.err == ""
 
 
 def test_cleanup_says_nothing_about_a_registry_with_no_remainder(project, capsys, monkeypatch):
