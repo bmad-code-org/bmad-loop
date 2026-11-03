@@ -3679,13 +3679,63 @@ def test_the_markdown_report_carries_the_split_root_and_the_generation(project):
     assert names[4] == "gen"
     assert names[5] == "esc-upto"
     # header, separator and row must agree on width or the table renders skewed
-    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 13
+    assert len(cells) == len(names) == len(rule.strip("|").split("|")) == 14
     assert cells[3] == "2"  # attempt, seeded by `_seed_run`
     assert cells[4] == "2"  # generation — NOT the review cycle, which is 1
     assert cells[5] == "3"  # the DW-11 watermark, in its own column
     assert cells[6] == "1"  # review cycle, still in its own column
     # still a flag and a counter: the path itself never renders
     assert "code-tree" not in md
+
+
+def test_diag_task_carries_the_usage_relaunch_refunds(project):
+    """DW-614: `attempt` / `review_cycle` count the #959 uncharged usage-limit
+    relaunches, so without the refund counters a dump shows `att` past
+    `max_dev_attempts` and reads as a broken cap. Both counters reach the
+    `--json` collector (`asdict(TaskDiag)`) and the markdown `relaunch` cell
+    (`dev/review`, beside `rev`).
+
+    Seeded to values that are neither the attempt (2), the review cycle (1) nor
+    each other, so a field reading a neighbour cannot pass.
+
+    Ablation: drop `dev_usage_relaunches=` from `_task_diag` and this reddens as a
+    TypeError at construction; drop the `relaunch` row cell (keeping its header) and
+    it reddens on the width comparison.
+    """
+    run_dir = _seed_run(project.project)
+    state = load_state(run_dir)
+    state.tasks[STORY_KEY].dev_usage_relaunches = 3
+    state.tasks[STORY_KEY].review_usage_relaunches = 4
+    save_state(run_dir, state)
+
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+    (run,) = diag.runs
+    assert run.tasks[0].dev_usage_relaunches == 3
+    assert run.tasks[0].review_usage_relaunches == 4
+
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+    cells = _md_task_row(md)
+    (header,) = [ln for ln in md.splitlines() if ln.startswith("| alias |")]
+    names = [c.strip() for c in header.strip("|").split("|")]
+    assert names[6] == "rev"
+    assert names[7] == "relaunch"
+    assert len(cells) == len(names)
+    assert cells[6] == "1"  # review cycle, unshifted
+    assert cells[7] == "3/4"
+
+
+def test_diag_task_usage_relaunches_default_to_zero(project):
+    """A run that never relaunched (or predates #959) dumps `0` / `0/0`, not a
+    missing field: a hardcoded nonzero would pass the sibling above."""
+    run_dir = _seed_run(project.project)
+    pseudo = sanitize.Pseudonymizer()
+    diag = diagnostics.collect([run_dir], pseudo=pseudo, project=ANY_PROJECT)
+    (run,) = diag.runs
+    assert run.tasks[0].dev_usage_relaunches == 0
+    assert run.tasks[0].review_usage_relaunches == 0
+    md = diagnostics.render_markdown(diag, pseudo=pseudo)
+    assert _md_task_row(md)[7] == "0/0"
 
 
 def test_the_markdown_report_says_no_for_the_ordinary_layout(project):

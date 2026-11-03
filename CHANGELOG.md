@@ -94,7 +94,9 @@ breaking changes may land in a minor release.
   session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers. A dev relaunch
   runs the `[environment]` probes first and pauses at `environment` when they fail;
   Claude's `model_not_found` and `cloud_credential_error` map to the new `account-fatal`
-  StopFailure action, which pauses like `account` but is never relaunched (#959).
+  StopFailure action, which pauses like `account` but is never relaunched. `status --json`
+  tasks and `diagnose` report `dev_usage_relaunches` / `review_usage_relaunches`, and the
+  TUI marks a relaunched counter `×N ↻M` (#959).
 - Record the models a session actually ran on: session-end `models` (Claude, Codex,
   Gemini, Copilot, OpenCode — on 2.x its subagent sessions' models too; `models_unresolved`
   when none was found), `status --json` `adapters_used.<role>.models_used`, and the

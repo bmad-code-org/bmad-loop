@@ -2721,6 +2721,31 @@ def test_status_json_carries_the_followup_recommendation(project, capsys):
     assert entry_done["followup_review_recommended"] is False
 
 
+def test_status_json_carries_the_usage_relaunch_refunds(project, capsys):
+    """DW-614: `attempt` / `review_cycle` include the #959 uncharged usage-limit
+    relaunches, so the document reports the refund counters beside them; a task
+    that never relaunched reports 0, not a missing key.
+    Ablation: drop the fields from the status task projection and this FAILS on
+    the missing key."""
+    from bmad_loop.model import Phase, StoryTask
+
+    relaunched = StoryTask(
+        story_key="1-1-login", epic=1, phase=Phase.DEV_RUNNING, attempt=5, review_cycle=2
+    )
+    relaunched.dev_usage_relaunches = 2
+    relaunched.review_usage_relaunches = 1
+    done = StoryTask(story_key="1-2-logout", epic=1, phase=Phase.DONE)
+    _make_run_with_tokens(project, {"1-1-login": relaunched, "1-2-logout": done}, weight=0.1)
+
+    doc = _status_json(project, capsys)
+    entry_relaunched, entry_done = doc["tasks"]
+    assert entry_relaunched["attempt"] == 5
+    assert entry_relaunched["dev_usage_relaunches"] == 2
+    assert entry_relaunched["review_usage_relaunches"] == 1
+    assert entry_done["dev_usage_relaunches"] == 0
+    assert entry_done["review_usage_relaunches"] == 0
+
+
 def test_status_text_names_the_preserve_ref_beside_the_reason(project, capsys):
     from bmad_loop.model import Phase, StoryTask
 

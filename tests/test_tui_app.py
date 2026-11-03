@@ -802,6 +802,37 @@ async def test_task_table_shows_weighted_and_raw_tokens(project_tree):
         assert "660 tokens (1,160 raw)" in header
 
 
+async def test_task_table_marks_usage_relaunch_refunds(project_tree):
+    """DW-614: a counter that includes uncharged usage-limit relaunches (#959)
+    carries a `↻M` marker, so `×5` past the attempt cap is explained; a counter
+    with none stays a bare `×N`."""
+    root = project_tree.project
+    relaunched = StoryTask(
+        story_key="1-1-login", epic=1, phase=Phase.DEV_RUNNING, attempt=5, review_cycle=2
+    )
+    relaunched.dev_usage_relaunches = 2
+    plain = StoryTask(story_key="1-2-logout", epic=1, phase=Phase.DONE, attempt=1)
+    plain.review_cycle = 3
+    plain.review_usage_relaunches = 1
+    make_run(
+        root,
+        "20260611-100000-aaaa",
+        finished=True,
+        tasks={"1-1-login": relaunched, "1-2-logout": plain},
+    )
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        tasks_table = screen.query_one("#tasks", DataTable)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        await until(pilot, lambda: tasks_table.row_count == 2)
+        assert tasks_table.get_cell("1-1-login", "dev") == "×5 ↻2"
+        assert tasks_table.get_cell("1-1-login", "review") == "×2"
+        assert tasks_table.get_cell("1-2-logout", "dev") == "×1"
+        assert tasks_table.get_cell("1-2-logout", "review") == "×3 ↻1"
+
+
 async def test_zero_weighted_tokens_shows_zero_not_dash(project_tree):
     """With cache_read_weight=0 a cache-read-only task has weighted==0 but nonzero raw.
     The tokens cell must render "0" (a real value), not "-" — which reads as missing

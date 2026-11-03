@@ -345,6 +345,10 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
     is 0, as a stories or sweep unit's is, and its epic is named by
     ``ticket.epic_slug``. A plan's live ``status`` is not projected — it is not
     in state.json; the text board reads it from the tree.
+
+    Per task ``dev_usage_relaunches`` / ``review_usage_relaunches`` (additive, no
+    schema bump) count the uncharged usage-limit relaunches inside ``attempt`` /
+    ``review_cycle``, so an attempt past ``max_dev_attempts`` is explained.
     """
     raw_total, weighted_total, weight = run_token_totals(state)
     adapter_policy = policy.adapter_policy_from_snapshot(state.policy_snapshot)
@@ -387,6 +391,10 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
                 "phase": str(task.phase),
                 "attempt": task.attempt,
                 "review_cycle": task.review_cycle,
+                # uncharged usage-limit relaunches (#959) refunded out of
+                # `attempt` / `review_cycle`; additive, no schema bump.
+                "dev_usage_relaunches": task.dev_usage_relaunches,
+                "review_usage_relaunches": task.review_usage_relaunches,
                 "tokens": tokens,
                 "commit_sha": task.commit_sha,
                 "defer_reason": task.defer_reason,
