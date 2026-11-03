@@ -558,6 +558,8 @@ Built from the run's `state.json`.
 
 Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `dev_usage_relaunches` and `review_usage_relaunches` (int: the uncharged usage-limit relaunches counted inside `attempt` and `review_cycle`, which is why either can exceed its cap), `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `followup_review_recommended` (bool: the build session recommended a follow-up review), `adapters_used` (`{role: {name, model}}`), `ticket` (object or null, below).
 
+`tokens_by_model` (object, present only when some session of the task recorded a per-model split) maps each model id, and `<unattributed>`, to `{input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens}` summed over the task's sessions (see the [run directory](run-state.md#run-directory)). It sums to `tokens` when every session was split; it never changes `tokens`.
+
 `adapters_used` reports each role's last session that stamped an adapter. Its `model` is the configured model (`""` for the CLI default). `models_used` lists the models that session was observed to run (see the [run directory](run-state.md#run-directory)) and is present only when some were observed, so a role whose latest session observed none shows no `models_used` even when an earlier one did.
 
 `epic` is always an integer. A unit of a source with no integer epics (stories, sweep, tickets) reports `0`; a ticket's epic is in its `ticket` object.

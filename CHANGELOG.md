@@ -105,6 +105,9 @@ breaking changes may land in a minor release.
   when none was found), `status --json` `adapters_used.<role>.models_used`, and the
   CLI-reported launch model (`session-model` journal row) on the TUI agent line.
   `session-start` `model` still records the configured model (#859).
+- Split each session's tokens per observed model: session-end `tokens_by_model` (summing
+  to `tokens`, `<unattributed>` for usage a parser cannot pin on a model), kept on the
+  state.json session record and summed per task in `status --json`.
 - Record Antigravity token usage from agy's per-step transcript counts (checked against
   1.4.9), subagent conversations included; models stay untracked.
 

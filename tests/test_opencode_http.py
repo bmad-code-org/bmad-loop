@@ -68,7 +68,7 @@ from bmad_loop.adapters.opencode_protocol import SUPPORTED, UsageFault, V1Protoc
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
-from bmad_loop.model import TokenUsage
+from bmad_loop.model import UNATTRIBUTED_MODEL, TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.process_host import ProcessHostError, get_process_host
 
@@ -5712,6 +5712,123 @@ def test_v2_usage_reads_child_models_off_the_one_token_walk():
         (_V2_LIST, {"parentID": "ses_a", "limit": 200}),
         (_V2_LIST, {"parentID": "ses_a1", "limit": 200}),
     ]
+
+
+def _assert_split(usage) -> None:
+    """The DW-618 invariants: `by_model` sums field-wise to the totals, and
+    every key is an observed model or the sentinel."""
+    assert usage is not None and usage.by_model is not None
+    summed = TokenUsage()
+    for each in usage.by_model.values():
+        summed.add(each)
+    assert summed == usage
+    assert set(usage.by_model) <= {*usage.models, UNATTRIBUTED_MODEL}
+
+
+def test_v1_usage_splits_tokens_per_message_model():
+    """DW-618: V1 bills each assistant message's tokens to its
+    `"<providerID>/<modelID>"`; a message missing either half is
+    unattributed.
+
+    ABLATION: bucket every message under the first model and the split
+    names one model."""
+    messages = [
+        _v1_assistant("anthropic", "claude-sonnet-4-5", output=2),
+        _v1_assistant("openai", "gpt-5", cache={"read": 4, "write": 1}),
+        _v1_assistant("anthropic", "claude-sonnet-4-5", reasoning=3),
+        _v1_assistant("openai", None),
+    ]
+    usage, fault = V1Protocol().usage(None, "ses_1", messages)
+    assert fault is None
+    _assert_split(usage)
+    assert usage.by_model == {
+        "anthropic/claude-sonnet-4-5": TokenUsage(input_tokens=2, output_tokens=5),
+        "openai/gpt-5": TokenUsage(input_tokens=1, cache_read_tokens=4, cache_creation_tokens=1),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=1),
+    }
+
+
+def test_v2_usage_splits_session_aggregates_per_model():
+    """DW-618: a single-model parent's own aggregate bills to that model, and
+    each descendant's aggregate to its `model` ref; a child without a ref
+    (server default) is unattributed.
+
+    ABLATION: bill the summed usage (parent + children) to the parent's model
+    and the split overshoots the totals."""
+    tree = {
+        _V2_SID: [
+            _v2_children(
+                _v2_modeled("ses_a", _V2_SID, _REF_BY, input=20),
+                _v2_child("ses_b", _V2_SID, input=5),
+            )
+        ],
+        "ses_a": [_v2_children(_v2_modeled("ses_a1", "ses_a", _REF_CZ, output=3))],
+    }
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert fault is None
+    _assert_split(usage)
+    assert usage.by_model == {
+        "a/x": TokenUsage(input_tokens=100),
+        "b/y": TokenUsage(input_tokens=20),
+        "c/z": TokenUsage(output_tokens=3),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=5),
+    }
+
+
+def test_v2_usage_multi_model_parent_is_unattributed():
+    """A parent whose transcript names two models (a mid-session switch) has
+    one aggregate and no per-step split: it bills to the sentinel, while a
+    child still bills to its own ref.
+
+    ABLATION: bill the parent to `parent_models[0]` and `a/x` holds it."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_CZ, input=20))]}
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree),
+        _V2_SID,
+        [_v2_assistant(1, model=_REF_AX), _v2_assistant(2, model=_REF_BY)],
+    )
+    assert fault is None
+    _assert_split(usage)
+    assert usage.by_model == {
+        "c/z": TokenUsage(input_tokens=20),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=100),
+    }
+
+
+def test_v2_usage_split_unknown_without_a_transcript():
+    """An unread transcript leaves `models` None, and `by_model` with it."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY, input=1))]}
+    usage, fault = V2Protocol().usage(_v2_models_client(tree), _V2_SID, None)
+    assert fault is None and usage is not None
+    assert usage.by_model is None
+
+
+def test_v2_usage_split_is_sentinel_only_when_the_transcript_names_none():
+    """`models == ()` consults no child ref, so every aggregate — the
+    parent's and a well-formed child's — bills to the sentinel."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY, input=7))]}
+    usage, fault = V2Protocol().usage(_v2_models_client(tree), _V2_SID, [_v2_assistant(1)])
+    assert fault is None
+    _assert_split(usage)
+    assert usage.by_model == {UNATTRIBUTED_MODEL: TokenUsage(input_tokens=107)}
+
+
+def test_v2_usage_split_bills_a_malformed_child_ref_to_the_sentinel():
+    """A malformed child ref bills that child to the sentinel; the ref stays
+    the one `models` fault, with no new one from the split."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, "b/y", input=7))]}
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert fault is not None and fault.stage == "models"
+    assert fault.error.startswith("child session ses_a model: TypeError")
+    _assert_split(usage)
+    assert usage.by_model == {
+        "a/x": TokenUsage(input_tokens=100),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=7),
+    }
 
 
 def test_v2_capture_stashes_child_models(tmp_path):

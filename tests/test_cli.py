@@ -2502,6 +2502,72 @@ def test_status_json_omits_models_used_when_unobserved(project, capsys):
     assert "models_used" not in entry["adapters_used"]["dev"]
 
 
+def test_status_json_task_carries_tokens_by_model(project, capsys):
+    """DW-618: per task, the sessions' `tokens_by_model` summed field-wise per
+    model (first-seen order) project as `tokens_by_model`, summing to the
+    task's `tokens` when every session was split; every pre-existing key is
+    unchanged and the schema version does not move.
+
+    ABLATION: drop the `tokens_by_model` projection in `status_document` and
+    the key is absent."""
+    from bmad_loop.model import UNATTRIBUTED_MODEL, Phase, SessionRecord, StoryTask, TokenUsage
+
+    task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    first = {
+        "m1": TokenUsage(input_tokens=6, output_tokens=2),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=1),
+    }
+    second = {
+        "m2": TokenUsage(cache_read_tokens=9),
+        "m1": TokenUsage(input_tokens=4, cache_creation_tokens=3),
+    }
+    for split in (first, second):
+        usage = TokenUsage()
+        for each in split.values():
+            usage.add(each)
+        task.record_session(
+            SessionRecord(task_id="t", role="dev", status="ok", usage=usage, tokens_by_model=split)
+        )
+    _make_run_with_tokens(project, {"1-1-login": task}, weight=0.1)
+    baseline = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    for record in task.sessions:
+        baseline.record_session(
+            SessionRecord(task_id="t", role="dev", status="ok", usage=record.usage)
+        )
+
+    doc = _status_json(project, capsys)
+    assert doc["schema_version"] == cli.STATUS_SCHEMA_VERSION == 1
+    (entry,) = doc["tasks"]
+    assert entry["tokens_by_model"] == {
+        "m1": TokenUsage(input_tokens=10, output_tokens=2, cache_creation_tokens=3).to_dict(),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=1).to_dict(),
+        "m2": TokenUsage(cache_read_tokens=9).to_dict(),
+    }
+    for name in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"):
+        assert sum(c[name] for c in entry["tokens_by_model"].values()) == entry["tokens"][name]
+    # every other key and value is what the same run without the split projects
+    _make_run_with_tokens(project, {"1-1-login": baseline}, weight=0.1)
+    (plain,) = _status_json(project, capsys)["tasks"]
+    assert {k: v for k, v in entry.items() if k != "tokens_by_model"} == plain
+
+
+def test_status_json_omits_tokens_by_model_without_a_split(project, capsys):
+    """Present-only: a task whose sessions carry no split (legacy state, an
+    untracked-model CLI) has no `tokens_by_model` key, never `{}`.
+
+    ABLATION: write the key unconditionally and it appears as `{}`."""
+    from bmad_loop.model import Phase, SessionRecord, StoryTask, TokenUsage
+
+    task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE)
+    task.record_session(
+        SessionRecord(task_id="t", role="dev", status="ok", usage=TokenUsage(input_tokens=10))
+    )
+    _make_run_with_tokens(project, {"1-1-login": task}, weight=0.1)
+
+    (entry,) = _status_json(project, capsys)["tasks"]
+    assert "tokens_by_model" not in entry
+
+
 def test_status_json_weight_from_snapshot_and_per_task_rounding(project, capsys):
     """The run-level weighted total must be the sum of per-task weighted totals
     (sum-of-rounds), never weighted_total of the summed counters: two tasks of

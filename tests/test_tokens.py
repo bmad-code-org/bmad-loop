@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from bmad_loop import tokens
-from bmad_loop.model import TokenUsage
+from bmad_loop.model import UNATTRIBUTED_MODEL, TokenUsage
 from bmad_loop.tokens import (
     read_usage,
     tally,
@@ -1243,6 +1243,7 @@ def test_antigravity_transcript_folds_spawned_subagent():
     assert usage.cache_creation_tokens == 0
     assert usage.unread == ()
     assert usage.models is None
+    assert usage.by_model is None  # DW-618: no model source, no split
 
 
 def test_antigravity_transcript_parent_only(agy_brain):
@@ -1443,3 +1444,297 @@ def test_read_usage_tracked_parsers_report_models(tmp_path):
         usage = read_usage(parser, path)
         assert usage is not None, parser
         assert usage.models == (model,), parser
+
+
+# ------------------------------------------------- per-model split (DW-618)
+
+
+def _assert_split(usage):
+    """The DW-618 invariants: `by_model` sums field-wise to the totals, and
+    every key is an observed model or the sentinel."""
+    assert usage is not None and usage.by_model is not None
+    summed = TokenUsage()
+    for each in usage.by_model.values():
+        summed.add(each)
+    assert summed == usage
+    assert set(usage.by_model) <= {*usage.models, UNATTRIBUTED_MODEL}
+
+
+def test_tally_splits_tokens_per_model(tmp_path):
+    """A deduped response bills to the first usable model its blocks name; an
+    id-less entry to its own; usage with no model (or only `<synthetic>`)
+    to the sentinel. Subagent usage lands on the subagent's model.
+
+    Ablation: key the claude buckets by the LAST block's model and `msg_late`
+    bills to sonnet; drop the anon model and the id-less sonnet entry is
+    unattributed."""
+    path = tmp_path / "sid.jsonl"
+    opus = _with_model(_assistant("msg_1", input_tokens=10, output_tokens=20), "claude-opus-5-5")
+    _write_jsonl(
+        path,
+        [
+            opus,
+            opus,  # a repeated content block: deduped
+            _with_model(_assistant("msg_err", input_tokens=0), "<synthetic>"),
+            _assistant("msg_3", input_tokens=7),  # no model at all
+            {"type": "message", "usage": {"input_tokens": 1}},  # top-level shape
+            _with_model(_assistant(None, input_tokens=4), "claude-sonnet-5-5"),
+            _assistant("msg_late", output_tokens=6),
+            _with_model(_assistant("msg_late", output_tokens=6), "claude-opus-5-5"),
+            _with_model(_assistant("msg_late", output_tokens=6), "claude-sonnet-5-5"),
+        ],
+    )
+    _write_jsonl(
+        tmp_path / "sid" / "subagents" / "agent-a.jsonl",
+        [_with_model(_assistant("msg_a", input_tokens=3, output_tokens=2), "claude-haiku-5-5")],
+    )
+
+    usage = tally(path)
+    _assert_split(usage)
+    assert usage.by_model == {
+        "claude-opus-5-5": TokenUsage(input_tokens=10, output_tokens=26),
+        "claude-sonnet-5-5": TokenUsage(input_tokens=4),
+        "claude-haiku-5-5": TokenUsage(input_tokens=3, output_tokens=2),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=8),
+    }
+    assert list(usage.by_model) == [*usage.models, UNATTRIBUTED_MODEL]
+
+
+def test_tally_split_omits_a_zero_sentinel(tmp_path):
+    """The sentinel bucket appears only when it holds usage: a zero-usage
+    `<synthetic>` entry leaves the split model-only.
+
+    Ablation: always add the stray bucket in `settle_by_model` and the
+    sentinel key appears with zeros."""
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _with_model(_assistant("msg_1", input_tokens=5), "claude-opus-5-5"),
+            _with_model(_assistant("msg_err", input_tokens=0), "<synthetic>"),
+        ],
+    )
+
+    usage = tally(path)
+    _assert_split(usage)
+    assert usage.by_model == {"claude-opus-5-5": TokenUsage(input_tokens=5)}
+
+
+def test_tally_split_is_sentinel_only_without_a_model(tmp_path):
+    """Tracked with no model (`models == ()`): everything is unattributed —
+    `by_model` is never None for a tracking parser."""
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(path, [_assistant("msg_1", input_tokens=5)])
+
+    usage = tally(path)
+    _assert_split(usage)
+    assert usage.models == ()
+    assert usage.by_model == {UNATTRIBUTED_MODEL: TokenUsage(input_tokens=5)}
+
+
+def _codex_reading(input_tokens, cached, output):
+    totals = {"input_tokens": input_tokens, "cached_input_tokens": cached, "output_tokens": output}
+    return {
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"total_token_usage": totals}},
+    }
+
+
+def _codex_turn(model):
+    return {"type": "turn_context", "payload": {"model": model}}
+
+
+def _append_codex(path, lines):
+    """Append lines to a `_codex_thread` rollout, keeping its pinned mtime."""
+    stamp = path.stat().st_mtime
+    with path.open("a", encoding="utf-8") as f:
+        f.write("".join(json.dumps(line) + "\n" for line in lines))
+    os.utime(path, (stamp, stamp))
+
+
+def test_codex_tally_splits_cumulative_readings_per_model(tmp_path):
+    """Cumulative token_count readings bill their deltas to the latest
+    `turn_context` model (a reading before any is unattributed); a switch
+    back resumes the first model's bucket, and a child's own deltas merge
+    into its model's. Each bucket splits cached input out as the totals do.
+
+    Ablation: bill each reading in full (no delta) and the split overshoots
+    the totals; bill every delta to the last model and A collapses into B."""
+    parent = _codex_thread(tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT)
+    _append_codex(
+        parent,
+        [
+            _codex_reading(10, 0, 1),  # before any turn_context
+            _codex_turn("gpt-a"),
+            _codex_reading(100, 40, 10),
+            _codex_turn("gpt-b"),
+            _codex_reading(160, 60, 15),
+            _codex_turn("gpt-a"),
+            _codex_reading(200, 70, 20),
+        ],
+    )
+    child = _codex_thread(tmp_path, "2026/10/01", "10-05-00", CHILD, session_id=ROOT, parent=ROOT)
+    _append_codex(child, [_codex_turn("gpt-b"), _codex_reading(50, 10, 5)])
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=130 + 40, output_tokens=25, cache_read_tokens=80)
+    _assert_split(usage)
+    assert usage.by_model == {
+        "gpt-a": TokenUsage(input_tokens=80, output_tokens=14, cache_read_tokens=50),
+        "gpt-b": TokenUsage(input_tokens=80, output_tokens=10, cache_read_tokens=30),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=10, output_tokens=1),
+    }
+
+
+def test_codex_tally_unreadable_child_adds_nothing_to_the_split(tmp_path):
+    """A child that faults mid-read after a reading contributes no bucket, so
+    the split still sums to the totals (which skip it too).
+
+    Ablation: tally the child straight into the shared buckets and its
+    reading leaks into the split, breaking the sum."""
+    parent = _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-00-00",
+        ROOT,
+        session_id=ROOT,
+        usage=(10, 0, 1),
+        models=("gpt-5.5",),
+    )
+    broken = _codex_thread(
+        tmp_path, "2026/10/01", "10-06-00", GRANDCHILD, session_id=ROOT, parent=ROOT
+    )
+    filler = json.dumps({"type": "event_msg", "payload": {"type": "noise", "pad": "x" * 200}})
+    stamp = broken.stat().st_mtime
+    with broken.open("ab") as f:
+        f.write((json.dumps(_codex_turn("gpt-5.5")) + "\n").encode("utf-8"))
+        f.write((json.dumps(_codex_reading(500, 0, 50)) + "\n").encode("utf-8"))
+        f.write((filler + "\n").encode("utf-8") * 200)
+        f.write(b'{"type": "event_msg", "payload": "\xff\xfe"}\n')
+    os.utime(broken, (stamp, stamp))
+
+    usage = tally_codex_rollout(parent)
+    assert usage is not None and usage.unread == (f"{broken.name}: UnicodeDecodeError",)
+    _assert_split(usage)
+    assert usage.by_model == {"gpt-5.5": TokenUsage(input_tokens=10, output_tokens=1)}
+
+
+def test_gemini_chat_splits_tokens_per_model(tmp_path):
+    """Each message id's winning (last) `tokens` bill to the last model any
+    `type == "gemini"` occurrence of that id named; an id no gemini occurrence
+    names a model for, or a non-gemini message carrying tokens, is
+    unattributed.
+
+    Ablation: bill by the first occurrence's model and `g1` stays on pro."""
+    lines = [
+        {"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 1}},
+        {
+            "$set": {
+                "messages": [
+                    {
+                        "id": "g1",
+                        "type": "gemini",
+                        "model": "gemini-3-flash",
+                        "tokens": {"input": 10, "cached": 4, "output": 2, "thoughts": 1},
+                    }
+                ]
+            }
+        },
+        {"id": "g2", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 5}},
+        {"id": "g3", "type": "gemini", "tokens": {"input": 3}},
+        {"id": "u1", "type": "user", "model": "user-side", "tokens": {"output": 2}},
+    ]
+    path = tmp_path / "session.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+    usage = tally_gemini_chat(path)
+    _assert_split(usage)
+    assert usage.by_model == {
+        "gemini-3-pro": TokenUsage(input_tokens=5),
+        "gemini-3-flash": TokenUsage(input_tokens=6, output_tokens=3, cache_read_tokens=4),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=3, output_tokens=2),
+    }
+
+
+def test_gemini_chat_split_keeps_the_model_across_a_model_less_reemission(tmp_path):
+    """A re-emission of a message id that omits `model` still bills its winning
+    `tokens` to the model an earlier occurrence of that id named.
+
+    Ablation: bill by the winning occurrence's own `model` and the tokens land
+    on the unattributed sentinel."""
+    lines = [
+        {"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 1}},
+        {"$set": {"messages": [{"id": "g1", "type": "gemini", "tokens": {"input": 7}}]}},
+    ]
+    path = tmp_path / "session.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+    usage = tally_gemini_chat(path)
+    _assert_split(usage)
+    assert usage.by_model == {"gemini-3-pro": TokenUsage(input_tokens=7)}
+
+
+def test_copilot_events_splits_tokens_per_metric_key(tmp_path):
+    """One bucket per named `modelMetrics` key of the last snapshot; an empty
+    key's usage is unattributed, and a key without a usage dict has none.
+
+    Ablation: sum every key into one bucket and the split names one model."""
+    metrics = {
+        "gpt-5": {
+            "usage": {
+                "inputTokens": 5,
+                "outputTokens": 1,
+                "reasoningTokens": 2,
+                "cacheReadTokens": 7,
+                "cacheWriteTokens": 3,
+            }
+        },
+        "gpt-5-mini": {"usage": {"inputTokens": 4}},
+        "": {"usage": {"inputTokens": 9}},
+        "claude-x": {"usage": "garbled"},
+    }
+    path = tmp_path / "events.jsonl"
+    path.write_text(json.dumps({"data": {"modelMetrics": metrics}}) + "\n", encoding="utf-8")
+
+    usage = tally_copilot_events(path)
+    _assert_split(usage)
+    assert usage.by_model == {
+        "gpt-5": TokenUsage(
+            input_tokens=5, output_tokens=3, cache_read_tokens=7, cache_creation_tokens=3
+        ),
+        "gpt-5-mini": TokenUsage(input_tokens=4),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=9),
+    }
+
+
+def test_read_usage_tracked_parsers_report_a_split(tmp_path):
+    """Each tracked parser, through the dispatcher, returns a `by_model`
+    naming its one model with the whole usage; antigravity returns None."""
+    claude = tmp_path / "claude.jsonl"
+    _write_jsonl(claude, [_with_model(_assistant("msg_1", input_tokens=1), "claude-opus-5-5")])
+    codex = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, usage=(1, 0, 1), models=("gpt-5.5",)
+    )
+    gemini = tmp_path / "gemini.jsonl"
+    gemini.write_text(
+        json.dumps({"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 2}})
+        + "\n",
+        encoding="utf-8",
+    )
+    copilot = tmp_path / "events.jsonl"
+    copilot.write_text(
+        json.dumps({"data": {"modelMetrics": {"gpt-5": {"usage": {"inputTokens": 1}}}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    for parser, path, model in [
+        ("claude-jsonl", claude, "claude-opus-5-5"),
+        ("codex-rollout", codex, "gpt-5.5"),
+        ("gemini-chat", gemini, "gemini-3-pro"),
+        ("copilot-events", copilot, "gpt-5"),
+    ]:
+        usage = read_usage(parser, path)
+        assert usage is not None, parser
+        assert usage.by_model == {model: usage}, parser
+    agy = read_usage("antigravity-transcript", _agy_transcript(AGY_BRAIN, AGY_PARENT))
+    assert agy is not None and agy.by_model is None

@@ -1095,6 +1095,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "threshold_s",
         "to",
         "tokens",
+        # `session-end` (DW-618): the session's usage split per observed model, a
+        # {model id: four int counts} map `diagnostics._scrub_tokens_by_model`
+        # keeps key-wise through `_scrub_model_id`, values cut to the counts.
+        "tokens_by_model",
         "tokens_weighted",
         "total",
         # `quota-wait-ended` (DW-396): the session's cumulative quota-wait
@@ -1317,6 +1321,7 @@ JOURNAL_SPLAT_FIELDS = {
             "usage_limit_class",
             "models",
             "models_unresolved",
+            "tokens_by_model",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys

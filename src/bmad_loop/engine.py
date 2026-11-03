@@ -8959,6 +8959,13 @@ class Engine:
                 extras["models"] = list(usage.models)
             else:
                 extras["models_unresolved"] = True
+        # per-model split (DW-618): `tokens` re-cut by observed model, values
+        # summing field-wise to it (`<unattributed>` holds what the parser could
+        # not pin). Present-only: absent for an untracked-model CLI or no usage.
+        if usage is not None and usage.by_model:
+            extras["tokens_by_model"] = {
+                model: each.to_dict() for model, each in usage.by_model.items()
+            }
         return extras
 
     @staticmethod

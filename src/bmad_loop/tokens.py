@@ -13,7 +13,8 @@ transcript that yields nothing reads as None (untracked), not zero.
                  per-field max (output_tokens grows while the response
                  streams; max is order-independent across files). The dedupe
                  is global because fork subagents copy their parent's message
-                 ids. Entries without an id each count.
+                 ids. Entries without an id each count. Per-model split: a
+                 deduped response bills to the first model its blocks name.
 - codex-rollout: $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
                  (CODEX_HOME defaults to ~/.codex; day dirs are LOCAL dates
                  while session_meta timestamps are UTC). The filename UUID is
@@ -29,19 +30,24 @@ transcript that yields nothing reads as None (untracked), not zero.
                  adds its own last cumulative totals. Siblings are sought in
                  the parent's day dir and later ones (a session can cross
                  midnight), from the parent's filename timestamp on.
+                 Per-model split: the deltas between consecutive token_count
+                 readings bill to the latest `turn_context` model.
 - gemini-chat:   ~/.gemini/tmp/<project>/chats/session-*.jsonl — a JSONL
                  patch stream: bare message entries (and messages inside
                  "$set" patches) carry a per-API-call `tokens` block
                  {input, output, cached, thoughts, tool, total}; the same
                  message id is re-emitted as it accretes content, so the
                  last occurrence per id wins, then unique messages are
-                 summed. `input` includes the cached portion.
+                 summed. `input` includes the cached portion. Per-model
+                 split: an id's winning `tokens` bill to the last model any
+                 `type == "gemini"` occurrence of that id named.
 - copilot-events: ~/.copilot/session-state/<session>/events.jsonl; some
                  entries carry `data.modelMetrics.<model>.usage`
                  {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
                  reasoningTokens} that is CUMULATIVE per model, so the last
                  entry bearing modelMetrics holds the session totals (summed
-                 across models). reasoningTokens fold into output.
+                 across models; the split keeps them per model).
+                 reasoningTokens fold into output.
 - antigravity-transcript: ~/.gemini/antigravity-cli/brain/<conversation-id>/
                  .system_generated/logs/transcript_full.jsonl (agy 1.4.9);
                  each PLANNER_RESPONSE step (one API call) carries top-level
@@ -50,7 +56,11 @@ transcript that yields nothing reads as None (untracked), not zero.
                  conversation: the parent's .system_generated/subagents/
                  <child-id>.json spawn markers name the children, whose own
                  transcripts are folded in recursively. No model id is
-                 written, so models stay untracked (None).
+                 written, so models (and the per-model split) stay
+                 untracked (None).
+
+A tracked parser's `TokenUsage.by_model` (DW-618) sums field-wise to its
+totals; usage it cannot pin on a model lands under `UNATTRIBUTED_MODEL`.
 """
 
 from __future__ import annotations
@@ -67,7 +77,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .model import TokenUsage
+from .model import TokenUsage, add_to_bucket, settle_by_model
 
 
 def read_usage(parser: str, transcript_path: Path) -> TokenUsage | None:
@@ -178,18 +188,30 @@ _CLAUDE_USAGE_KEYS = (
 _CLAUDE_SYNTHETIC_MODEL = "<synthetic>"
 
 
-def _note_claude_model(entry: dict[str, Any], models: dict[str, None]) -> None:
-    """Record the entry's `message.model` in `models` (insertion-ordered set).
+def _note_claude_model(entry: dict[str, Any], models: dict[str, None]) -> str | None:
+    """Record the entry's `message.model` in `models` (insertion-ordered set)
+    and return it, or None when the entry names no usable model.
 
     Independent of the usage dedupe: every block of a response repeats the
     same model, and the set keeps only distinct ids. Skips a non-str or empty
     value and the `<synthetic>` placeholder."""
     message = entry.get("message")
     if not isinstance(message, dict):
-        return
+        return None
     model = message.get("model")
     if isinstance(model, str) and model and model != _CLAUDE_SYNTHETIC_MODEL:
         models.setdefault(model, None)
+        return model
+    return None
+
+
+def _claude_usage(counts: dict[str, int]) -> TokenUsage:
+    return TokenUsage(
+        input_tokens=counts["input_tokens"],
+        output_tokens=counts["output_tokens"],
+        cache_read_tokens=counts["cache_read_input_tokens"],
+        cache_creation_tokens=counts["cache_creation_input_tokens"],
+    )
 
 
 def tally(transcript_path: Path) -> TokenUsage | None:
@@ -208,6 +230,9 @@ def tally(transcript_path: Path) -> TokenUsage | None:
 
     `models` holds the distinct assistant `message.model` ids in walk order
     (main transcript first, then subagents), `()` when none was found.
+    `by_model` bills each deduped response to the first usable model any of
+    its blocks named, and each id-less entry to its own; the rest (no model,
+    or only `<synthetic>`) is `UNATTRIBUTED_MODEL`.
 
     None (a missing file, or no usage-bearing line in any file) is "no usage
     signal" and must never read as free (DW-364): a zeroed TokenUsage is
@@ -219,12 +244,13 @@ def tally(transcript_path: Path) -> TokenUsage | None:
     if subagents_dir.is_dir():
         paths.extend(sorted(subagents_dir.rglob("*.jsonl")))
     by_id: dict[str, dict[str, int]] = {}
-    anon: list[dict[str, int]] = []
+    id_model: dict[str, str] = {}  # message id -> first usable model it named
+    anon: list[tuple[dict[str, int], str | None]] = []
     models: dict[str, None] = {}  # distinct, first-seen order
     seen = False
     for path in paths:
         for entry in _jsonl_entries(path):
-            _note_claude_model(entry, models)
+            model = _note_claude_model(entry, models)
             usage = _usage_block(entry)
             # Absent, empty `{}`, or no recognized token key: no usage signal here.
             if not usage or not any(key in usage for key in _CLAUDE_USAGE_KEYS):
@@ -240,36 +266,53 @@ def tally(transcript_path: Path) -> TokenUsage | None:
                 else None
             )
             if not isinstance(message_id, str):
-                anon.append(counts)
+                anon.append((counts, model))
                 continue
+            if model is not None:
+                id_model.setdefault(message_id, model)
             merged = by_id.setdefault(message_id, dict.fromkeys(_CLAUDE_USAGE_KEYS, 0))
             for key, value in counts.items():
                 merged[key] = max(merged[key], value)
     if not seen:
         return None
-    total = TokenUsage(models=tuple(models))
-    for counts in [*by_id.values(), *anon]:
-        total.add(
-            TokenUsage(
-                input_tokens=counts["input_tokens"],
-                output_tokens=counts["output_tokens"],
-                cache_read_tokens=counts["cache_read_input_tokens"],
-                cache_creation_tokens=counts["cache_creation_input_tokens"],
-            )
-        )
+    buckets: dict[str | None, TokenUsage] = {}
+    attributed = [(counts, id_model.get(message_id)) for message_id, counts in by_id.items()]
+    total = TokenUsage()
+    for counts, model in [*attributed, *anon]:
+        usage = _claude_usage(counts)
+        total.add(usage)
+        add_to_bucket(buckets, model, usage)
+    found = tuple(models)
+    total.models = found
+    total.by_model = settle_by_model(buckets, found)
     return total
 
 
 # ----------------------------------------------------------- codex-rollout
 
 
-def _codex_rollout_total(transcript_path: Path, models: dict[str, None]) -> dict[str, Any] | None:
+# The raw cumulative `token_count` fields a per-model delta is taken over.
+_CODEX_RAW_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens")
+
+
+def _codex_rollout_total(
+    transcript_path: Path,
+    models: dict[str, None],
+    buckets: dict[str | None, dict[str, int]],
+) -> dict[str, Any] | None:
     """The rollout's last cumulative `token_count` totals, or None when it has
     none. A subagent's rollout holds only its own turns, so this rule holds
     for children as well as for the parent. The same read records each
     `turn_context` line's `payload.model` (a non-empty str) in `models`, an
-    insertion-ordered set. OSError/ValueError propagate."""
+    insertion-ordered set, and adds each reading's raw delta over the previous
+    one (`_CODEX_RAW_KEYS`) to `buckets` under the latest `turn_context`'s
+    model (None before any, or when it names none): the deltas telescope, so
+    the buckets sum to the last reading. OSError/ValueError propagate, with
+    `buckets` partly filled — a caller that skips the file passes a scratch
+    dict."""
     last: dict[str, Any] | None = None
+    current: str | None = None
+    previous = dict.fromkeys(_CODEX_RAW_KEYS, 0)
     for entry in _jsonl_entries(transcript_path):
         payload = entry.get("payload")
         if not isinstance(payload, dict):
@@ -278,6 +321,9 @@ def _codex_rollout_total(transcript_path: Path, models: dict[str, None]) -> dict
             model = payload.get("model")
             if isinstance(model, str) and model:
                 models.setdefault(model, None)
+                current = model
+            else:
+                current = None
             continue
         if payload.get("type") != "token_count":
             continue
@@ -286,6 +332,11 @@ def _codex_rollout_total(transcript_path: Path, models: dict[str, None]) -> dict
             continue
         totals = info.get("total_token_usage")
         last = totals if isinstance(totals, dict) else info
+        reading = {key: _int(last.get(key)) for key in _CODEX_RAW_KEYS}
+        bucket = buckets.setdefault(current, dict.fromkeys(_CODEX_RAW_KEYS, 0))
+        for key in _CODEX_RAW_KEYS:
+            bucket[key] += reading[key] - previous[key]
+        previous = reading
     return last
 
 
@@ -452,9 +503,13 @@ def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
 
     `models` holds the distinct `turn_context` model ids, the parent's first,
     then each read child's, `()` when none was found; an unreadable child adds
-    none."""
+    none. `by_model` sums each rollout's per-model raw deltas (see
+    `_codex_rollout_total`) across the parent and the read children, then
+    splits each model's cached input out as for the totals; usage read before
+    any `turn_context` is `UNATTRIBUTED_MODEL`."""
     models: dict[str, None] = {}  # distinct, first-seen order
-    parent_totals = _codex_rollout_total(transcript_path, models)
+    raw: dict[str | None, dict[str, int]] = {}
+    parent_totals = _codex_rollout_total(transcript_path, models, raw)
     unread: list[str] = []
     try:
         parent_meta = _codex_meta(transcript_path)
@@ -487,20 +542,28 @@ def tally_codex_rollout(transcript_path: Path) -> TokenUsage | None:
         by_thread = {metas[path][0]: Path(path) for path in sorted(members)}
         for child in by_thread.values():
             child_models: dict[str, None] = {}
+            child_raw: dict[str | None, dict[str, int]] = {}
             try:
-                child_totals = _codex_rollout_total(child, child_models)
+                child_totals = _codex_rollout_total(child, child_models, child_raw)
             except (OSError, ValueError) as e:
                 unread.append(f"{child.name}: {type(e).__name__}")
                 continue
             for model in child_models:
                 models.setdefault(model, None)
+            for model, counts in child_raw.items():
+                merged = raw.setdefault(model, dict.fromkeys(_CODEX_RAW_KEYS, 0))
+                for key, value in counts.items():
+                    merged[key] += value
             if child_totals is not None:
                 totals.append(child_totals)
     if not totals:
         return None
-    usage = TokenUsage(unread=tuple(unread), models=tuple(models))
+    found = tuple(models)
+    usage = TokenUsage(unread=tuple(unread), models=found)
     for each in totals:
         usage.add(_codex_usage(each))
+    buckets = {model: _codex_usage(counts) for model, counts in raw.items()}
+    usage.by_model = settle_by_model(buckets, found)
     return usage
 
 
@@ -524,30 +587,40 @@ def tally_gemini_chat(transcript_path: Path) -> TokenUsage | None:
 
     `models` holds the distinct `model` ids of `type == "gemini"` messages in
     file order (a re-appended message repeats its id), `()` when none was
-    found."""
+    found. `by_model` bills each message's winning `tokens` to the last model
+    an occurrence of that id named (`type == "gemini"`), so a re-emission
+    without `model` keeps it; else `UNATTRIBUTED_MODEL`."""
     by_id: dict[str, dict[str, Any]] = {}
+    id_model: dict[str, str] = {}  # message id -> last model an occurrence named
     models: dict[str, None] = {}  # distinct, first-seen order
     for entry in _jsonl_entries(transcript_path):
         for message in _gemini_messages(entry):
             model = message.get("model")
+            message_id = message.get("id")
             if message.get("type") == "gemini" and isinstance(model, str) and model:
                 models.setdefault(model, None)
+                if isinstance(message_id, str):
+                    id_model[message_id] = model
             tokens = message.get("tokens")
-            message_id = message.get("id")
             if isinstance(tokens, dict) and isinstance(message_id, str):
                 by_id[message_id] = tokens
     if not by_id:
         return None
-    total = TokenUsage(models=tuple(models))
-    for tokens in by_id.values():
+    buckets: dict[str | None, TokenUsage] = {}
+    total = TokenUsage()
+    for message_id, tokens in by_id.items():
+        named = id_model.get(message_id)
         cached = _int(tokens.get("cached"))
-        total.add(
-            TokenUsage(
-                input_tokens=max(0, _int(tokens.get("input")) - cached),
-                output_tokens=_int(tokens.get("output")) + _int(tokens.get("thoughts")),
-                cache_read_tokens=cached,
-            )
+        usage = TokenUsage(
+            input_tokens=max(0, _int(tokens.get("input")) - cached),
+            output_tokens=_int(tokens.get("output")) + _int(tokens.get("thoughts")),
+            cache_read_tokens=cached,
         )
+        total.add(usage)
+        add_to_bucket(buckets, named, usage)
+    found = tuple(models)
+    total.models = found
+    total.by_model = settle_by_model(buckets, found)
     return total
 
 
@@ -569,22 +642,27 @@ def tally_copilot_events(transcript_path: Path) -> TokenUsage | None:
             last = metrics
     if last is None:
         return None
-    # The models are the last modelMetrics' keys, in insertion order.
-    total = TokenUsage(models=tuple(key for key in last if isinstance(key, str) and key))
-    for model_metrics in last.values():
+    # The models are the last modelMetrics' keys, in insertion order, and each
+    # key's usage is its own `by_model` bucket.
+    found = tuple(key for key in last if isinstance(key, str) and key)
+    buckets: dict[str | None, TokenUsage] = {}
+    total = TokenUsage()
+    for key, model_metrics in last.items():
         if not isinstance(model_metrics, dict):
             continue
         usage = model_metrics.get("usage")
         if not isinstance(usage, dict):
             continue
-        total.add(
-            TokenUsage(
-                input_tokens=_int(usage.get("inputTokens")),
-                output_tokens=_int(usage.get("outputTokens")) + _int(usage.get("reasoningTokens")),
-                cache_read_tokens=_int(usage.get("cacheReadTokens")),
-                cache_creation_tokens=_int(usage.get("cacheWriteTokens")),
-            )
+        each = TokenUsage(
+            input_tokens=_int(usage.get("inputTokens")),
+            output_tokens=_int(usage.get("outputTokens")) + _int(usage.get("reasoningTokens")),
+            cache_read_tokens=_int(usage.get("cacheReadTokens")),
+            cache_creation_tokens=_int(usage.get("cacheWriteTokens")),
         )
+        total.add(each)
+        add_to_bucket(buckets, key if isinstance(key, str) and key else None, each)
+    total.models = found
+    total.by_model = settle_by_model(buckets, found)
     return total
 
 

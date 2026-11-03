@@ -16263,6 +16263,66 @@ def test_session_record_persists_observed_models(project):
     assert all(r.models == ("m1", "m2") for r in load_state(engine.run_dir).tasks["1-1-a"].sessions)
 
 
+def _split_usage() -> TokenUsage:
+    """A usage split across two models plus the unattributed sentinel."""
+    return TokenUsage(
+        input_tokens=10,
+        output_tokens=5,
+        cache_read_tokens=7,
+        models=("m1", "m2"),
+        by_model={
+            "m1": TokenUsage(input_tokens=6, output_tokens=5),
+            "m2": TokenUsage(input_tokens=3, cache_read_tokens=7),
+            "<unattributed>": TokenUsage(input_tokens=1),
+        },
+    )
+
+
+def test_session_end_carries_tokens_by_model(project):
+    """DW-618: a parser's per-model split rides `session-end` as
+    `tokens_by_model`, each value a `TokenUsage.to_dict`, summing field-wise
+    to the row's usage; the split also persists on the SessionRecord.
+
+    ABLATION: delete the `tokens_by_model` block in `_session_end_extras` and
+    the journal assertion fails; drop the `by_model` copy in
+    `attach_session_usage` and the state.json one does."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    timeout = SessionResult(status="timeout")
+    engine, adapter = make_engine(project, [timeout, timeout])
+    adapter.usage_per_session = _split_usage()
+    expected = {model: u.to_dict() for model, u in _split_usage().by_model.items()}
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2
+    assert all(e["tokens_by_model"] == expected for e in ends)
+    assert all(e["tokens"] == 22 for e in ends)
+    assert all(
+        sum(sum(counts.values()) for counts in e["tokens_by_model"].values()) == e["tokens"]
+        for e in ends
+    )
+    doc = json.loads((engine.run_dir / "state.json").read_text(encoding="utf-8"))
+    sessions = doc["tasks"]["1-1-a"]["sessions"]
+    assert sessions and all(s["tokens_by_model"] == expected for s in sessions)
+
+
+@pytest.mark.parametrize("by_model", [None, {}], ids=["untracked", "empty"])
+def test_session_end_omits_tokens_by_model_without_a_split(project, by_model):
+    """Present-only: no split (an untracked-model CLI, or nothing to split)
+    leaves no `tokens_by_model` on `session-end` nor on the persisted record.
+
+    ABLATION: write the key whenever `usage` is set and it appears as `{}`."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    timeout = SessionResult(status="timeout")
+    engine, adapter = make_engine(project, [timeout, timeout])
+    adapter.usage_per_session = TokenUsage(input_tokens=10, by_model=by_model)
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2 and all("tokens_by_model" not in e for e in ends)
+    doc = json.loads((engine.run_dir / "state.json").read_text(encoding="utf-8"))
+    sessions = doc["tasks"]["1-1-a"]["sessions"]
+    assert sessions and all("tokens_by_model" not in s for s in sessions)
+
+
 def test_engine_attaches_its_journal_to_every_adapter(project):
     """The engine hands its `Journal` to the adapters it owns (#680), so an
     adapter-side `session-idle` lands in the same file with the same

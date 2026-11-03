@@ -1538,6 +1538,57 @@ def test_session_end_models_survive_scrub():
     assert diagnostics._scrub_model_id("claude-opus-5-5\n") == "<redacted:str>"
 
 
+def test_session_end_tokens_by_model_survive_scrub():
+    """DW-618: `session-end` `tokens_by_model` keeps a model-id-shaped key (and
+    the engine's `<unattributed>` sentinel) with its four int counts; a key
+    that redacts merges into `<redacted:str>` by summing, and a value keeps
+    only int counts of the four token fields.
+
+    Ablation: drop the `tokens_by_model` branch in `_scrub_entry` and
+    `scrub_json` blanks the `provider/model` key, failing the assertion."""
+    secret = "sk-ant-api03-" + "Zx8Qw3Rt7Yu1Io5Pa9Sd2Fg6Hj0Kl4ZxCvBn"
+    scrubbed = diagnostics._scrub_entry(
+        {
+            "kind": "session-end",
+            "tokens_by_model": {
+                "anthropic/claude-sonnet-4-5": {
+                    "input_tokens": 3,
+                    "output_tokens": 2,
+                    "cache_read_tokens": 1,
+                    "cache_creation_tokens": 0,
+                    "note": "/home/alice/x",
+                },
+                "<unattributed>": {"input_tokens": 4, "output_tokens": True},
+                secret: {"input_tokens": 5},
+                "/home/alice/.claude/model": {"input_tokens": 6, "output_tokens": "7"},
+                "claude-opus-5-5": "garbled",
+            },
+        },
+        sanitize.Pseudonymizer(salt=b"fixed"),
+        {},
+        None,
+    )
+    assert scrubbed["tokens_by_model"] == {
+        "anthropic/claude-sonnet-4-5": {
+            "input_tokens": 3,
+            "output_tokens": 2,
+            "cache_read_tokens": 1,
+            "cache_creation_tokens": 0,
+        },
+        "<unattributed>": {"input_tokens": 4},
+        "<redacted:str>": {"input_tokens": 11},
+        "claude-opus-5-5": {},
+    }
+    for value in ("claude-opus-5-5", ["m"], None):
+        not_a_map = diagnostics._scrub_entry(
+            {"kind": "session-end", "tokens_by_model": value},
+            sanitize.Pseudonymizer(salt=b"fixed"),
+            {},
+            None,
+        )
+        assert not_a_map["tokens_by_model"] == "<redacted:str>"
+
+
 def test_session_model_row_keeps_model_id():
     """`session-model` `model` (#859) keeps a model-id-shaped value — a claude
     `…[1m]` id included, which the `scrub_json` fallback would blank — and
