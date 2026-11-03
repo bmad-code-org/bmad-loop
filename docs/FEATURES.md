@@ -474,8 +474,8 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Stability:** stable
 - **Description:** Each session's journal records the models its CLI actually ran on, read from the transcript or usage file the CLI wrote, beside the configured model `session-start` records.
 - **Properties:**
-  - A `session-end` entry carries `models` (distinct ids, first-seen, main session first, subagent and fallback models included), or `models_unresolved: true` when a tracked CLI's usage names none; neither key appears for a CLI with no model source.
-  - Claude, Codex, Gemini, Copilot and OpenCode are tracked; antigravity is not.
+  - A `session-end` entry carries `models` (distinct ids, first-seen, main session first, subagent and fallback models included, with the OpenCode 1.x exception below), or `models_unresolved: true` when a tracked CLI's usage names none; neither key appears for a CLI with no model source.
+  - Claude, Codex, Gemini, Copilot and OpenCode are tracked; antigravity is not. On OpenCode 1.x, `models` lacks a subagent's model unless the session itself also ran it.
   - The configured `model` fields (`session-start`, the session record, `adapters_used.<role>.model`) are never overwritten by an observed one.
   - `status --json` reports a role's observed models as `adapters_used.<role>.models_used`, only when some were observed.
   - A tracked session's `session-end` entry carries `tokens_by_model`, its usage split per model (summing to the session's usage, with `<unattributed>` for usage the CLI's file does not tie to a model); `status --json` sums it per task as `tokens_by_model`. Neither appears when no split was read.
