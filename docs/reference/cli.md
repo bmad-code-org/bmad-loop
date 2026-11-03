@@ -310,6 +310,7 @@ bmad-loop status [--project PROJECT] [--json] [run_id]
 ```
 
 - The status line (`status: …`) is `finished`, `PAUSED (<stage>) — <reason>`, `in progress — graceful stop pending (will stop after the current item)`, or `in progress (or interrupted)`.
+- A story row's `dev×N review×N` is followed by `↻M` when M of those sessions were uncharged usage-limit relaunches (dev and review together), which is why either count can exceed its cap. Not shown when M is 0.
 - For an unfinished story run with no pause stage, each story still escalated adds `escalated: story '<key>' awaiting resolve — bmad-loop resolve <id>` below the status line. Not in `--json`.
 - For a tickets run, the footer is the tickets board, read live through the project's `tickets.py status` and pinned to the run's initiative. It shows the run's selectors, the ticket counts by state, then one block per epic in build order: done count, epic status and any recorded closure, and each ticket's state, plan status, flags and this run's phase. A tree that cannot be read prints `tickets board unavailable: <reason>`, and `status` still exits 0. Marks or store commits still owed after landing are listed last.
 - Exits 1 with `no runs found`, or on a bad or ambiguous ref (stdout stays empty under `--json`).

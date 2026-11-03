@@ -1964,6 +1964,42 @@ def test_status_sprint_prints_backlog_remaining(project, capsys):
     assert err == ""
 
 
+def test_status_task_line_omits_relaunch_count_when_zero(project, capsys):
+    """No uncharged usage-limit relaunch → the plain task line is unchanged:
+    no `↻` marker, `review×N` followed directly by the token cell."""
+    from bmad_loop.model import Phase, StoryTask
+
+    task = StoryTask(story_key="1-1-login", epic=1, phase=Phase.DONE, attempt=2, review_cycle=1)
+    _make_run_with_tokens(project, {"1-1-login": task}, weight=0.1)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    out = capsys.readouterr().out
+    assert "↻" not in out
+    assert _story_row(out)[2:5] == ["dev×2", "review×1", "-"]
+
+
+def test_status_task_line_appends_relaunch_count_when_nonzero(project, capsys):
+    """Uncharged usage-limit relaunches (#959) explain why dev×N / review×N
+    exceed their caps: the plain task line appends the story's combined count
+    (dev + review, `StoryTask.usage_relaunches`) as `↻N`, like the TUI cell."""
+    from bmad_loop.model import Phase, StoryTask
+
+    task = StoryTask(
+        story_key="1-1-login",
+        epic=1,
+        phase=Phase.DONE,
+        attempt=4,
+        review_cycle=2,
+        dev_usage_relaunches=2,
+        review_usage_relaunches=1,
+    )
+    _make_run_with_tokens(project, {"1-1-login": task}, weight=0.1)
+
+    assert cli.main(["status", "--project", str(project.project)]) == 0
+    out = capsys.readouterr().out
+    assert _story_row(out)[2:6] == ["dev×4", "review×2", "↻3", "-"]
+
+
 def test_status_stories_output_is_pinned(project, capsys):
     """Characterization pin for the WorkSource refactor: a stories run's `status`
     prints the stories board (done count, manifest path, one row per entry with
