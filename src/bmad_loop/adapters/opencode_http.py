@@ -56,7 +56,9 @@ Transport shape (the settled design drivers):
   stashed by session id, the raw messages (V2: every page, oldest first)
   dumped to ``tasks/<task_id>/messages.json`` as the transcript. V1 counts no
   child-session tokens — its API scopes messages per session. A V2 child
-  still running at capture is journaled as ``usage-child-active``.
+  still running at capture is journaled as ``usage-child-active``; V2's
+  ``models`` add each descendant's model ref after the parent's, and a
+  malformed ref is journaled as ``usage-models-partial``.
 - ``opencode serve`` survives parent death, so teardown is
   authoritative: kill in ``run()``'s finally plus an atexit sweep. On Windows
   the binary is an npm ``.cmd`` shim, so the kill goes straight to the
@@ -1775,7 +1777,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         session id for read_usage(). Best-effort in full — the crashed path
         runs this against a dead server and the verdict must not change.
 
-        A fault leaves nothing stashed, so read_usage() answers None (untracked)
+        A fault with no usage leaves nothing stashed, so read_usage() answers None (untracked)
         and never a zero; it is crumbed as `usage-capture-failed` with ``stage``
         (``fetch`` — a GET, its status or its body; ``payload`` — a body of the
         wrong shape: a malformed V1 message list or V2 session; ``dump`` — the
@@ -1789,7 +1791,12 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         A read usage counts each child session as far as it has landed; the
         children still running (a V2 background subagent) are crumbed as
         `usage-child-active` with their ``sessions`` ids, and a failure to
-        tell is crumbed as `usage-child-active-failed` with ``error``."""
+        tell is crumbed as `usage-child-active-failed` with ``error``.
+
+        A usage read WITH a fault (stage ``models``: a V2 child's malformed
+        model ref) is still stashed — its token figure is whole — and the fault
+        is crumbed as `usage-models-partial` with ``stage`` and ``error``, never
+        as `usage-capture-failed`."""
         if sess.client is None or not sess.session_id:
             return None
         messages, fault = sess.protocol.transcript(sess.client, sess.session_id)
@@ -1800,9 +1807,16 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         usage, usage_fault = sess.protocol.usage(sess.client, sess.session_id, messages)
         if usage is not None:
             self._stash_usage(sess.session_id, usage)
+            if usage_fault is not None:
+                self._note_lifecycle(
+                    handle.task_id,
+                    "usage-models-partial",
+                    stage=usage_fault.stage,
+                    error=usage_fault.error,
+                )
         elif usage_fault is not None:
             self._note_usage_capture_failed(handle, usage_fault.stage, usage_fault.error)
-        if usage_fault is None:
+        if usage is not None or usage_fault is None:
             self._note_active_children(handle, sess.protocol, sess.client, sess.session_id)
         if fault is not None:
             return None

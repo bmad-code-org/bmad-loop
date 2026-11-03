@@ -64,7 +64,7 @@ from bmad_loop.adapters.opencode_http import (
     _sum_args,
     _sum_usage,
 )
-from bmad_loop.adapters.opencode_protocol import SUPPORTED, V1Protocol, V2Protocol
+from bmad_loop.adapters.opencode_protocol import SUPPORTED, UsageFault, V1Protocol, V2Protocol
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
@@ -5267,6 +5267,225 @@ def test_v2_capture_crumbs_an_unread_active_map(tmp_path, active, error):
     )
     (crumb,) = _child_active_crumbs(adapter)
     assert crumb["event"] == "usage-child-active-failed" and crumb["error"] == error
+
+
+def _v2_modeled(session_id: str, parent_id: str, model, **tokens) -> dict:
+    """A listed child `Session.Info` carrying a `model` ref (any value)."""
+    return {**_v2_child(session_id, parent_id, **tokens), "model": model}
+
+
+_REF_AX = {"id": "x", "providerID": "a", "variant": "high"}
+_REF_BY = {"id": "y", "providerID": "b"}
+_REF_CZ = {"id": "z", "providerID": "c"}
+
+
+def _v2_models_client(tree: dict, **info_tokens) -> _V2RouteClient:
+    return _V2RouteClient(
+        **{_V2_INFO: [_v2_info(**(info_tokens or {"input": 100}))], _V2_LIST: [_v2_tree(tree)]}
+    )
+
+
+def test_v2_usage_models_fold_every_descendants_model_ref():
+    """DW-619: a subagent that ran on another model is in `models` — the
+    parent transcript's first, then each descendant's `Session.Info.model`
+    ref in walk order (child, then grandchild), variant ignored; the token
+    figure is the same sum as before.
+
+    ABLATION: return `_v2_models(transcript)` from `V2Protocol.usage` and
+    this reddens (`("a/x",)`)."""
+    tree = {
+        _V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY, input=20))],
+        "ses_a": [_v2_children(_v2_modeled("ses_a1", "ses_a", _REF_CZ, output=3))],
+    }
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert fault is None
+    assert usage == TokenUsage(input_tokens=120, output_tokens=3)
+    assert usage.models == ("a/x", "b/y", "c/z")
+
+
+@pytest.mark.parametrize(
+    "child",
+    [
+        pytest.param(_v2_modeled("ses_a", _V2_SID, {**_REF_AX, "variant": "low"}), id="duplicate"),
+        pytest.param(_v2_child("ses_a", _V2_SID), id="no-model-key"),
+        pytest.param(_v2_modeled("ses_a", _V2_SID, None), id="model-null"),
+    ],
+)
+def test_v2_usage_child_model_adds_nothing_new(child):
+    """A child on the parent's model is not repeated, and a child with no
+    `model` ref (it ran the server default, which the parent's transcript
+    already names) contributes nothing — neither is a fault."""
+    usage, fault = V2Protocol().usage(
+        _v2_models_client({_V2_SID: [_v2_children(child)]}),
+        _V2_SID,
+        [_v2_assistant(1, model=_REF_AX)],
+    )
+    assert fault is None and usage is not None
+    assert usage.models == ("a/x",)
+
+
+@pytest.mark.parametrize(
+    "ref, error",
+    [
+        pytest.param("b/y", "TypeError: model is str, not an object", id="string"),
+        pytest.param({"id": "y"}, "ValueError: providerID is None", id="no-provider"),
+        pytest.param({"providerID": "b", "id": ""}, "ValueError: id is ''", id="empty-id"),
+        pytest.param({"providerID": "b", "id": 5}, "ValueError: id is 5", id="id-not-str"),
+    ],
+)
+def test_v2_usage_malformed_child_model_is_a_models_fault(ref, error):
+    """A malformed child ref keeps the whole token figure and every readable
+    model (the parent's, a well-formed sibling's) and returns a `models`
+    fault naming the child beside the usage — never a None usage.
+
+    ABLATION: return `None` in place of the fold's fault and this reddens."""
+    tree = {
+        _V2_SID: [
+            _v2_children(
+                _v2_modeled("ses_bad", _V2_SID, ref, input=7),
+                _v2_modeled("ses_b", _V2_SID, _REF_BY, input=3),
+            )
+        ]
+    }
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert usage == TokenUsage(input_tokens=110)
+    assert usage.models == ("a/x", "b/y")
+    assert fault is not None and fault.stage == "models"
+    assert fault.error.startswith(f"child session ses_bad model: {error}")
+
+
+def test_v2_usage_several_malformed_child_models_join_in_one_fault():
+    tree = {
+        _V2_SID: [
+            _v2_children(
+                _v2_modeled("ses_a", _V2_SID, "a/x"),
+                _v2_modeled("ses_b", _V2_SID, {"id": "y"}),
+            )
+        ]
+    }
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert usage is not None and usage.models == ("a/x",)
+    assert fault == UsageFault(
+        "models",
+        "child session ses_a model: TypeError: model is str, not an object; "
+        "child session ses_b model: ValueError: providerID is None, not a non-empty string",
+    )
+
+
+@pytest.mark.parametrize("ref", [_REF_BY, "b/y"], ids=["well-formed", "malformed"])
+def test_v2_usage_child_models_unconsulted_without_a_transcript(ref):
+    """An unread transcript leaves `models` None — unknown — whatever the
+    children's refs say, and a malformed one is not a fault then."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, ref, input=1))]}
+    usage, fault = V2Protocol().usage(_v2_models_client(tree), _V2_SID, None)
+    assert fault is None and usage == TokenUsage(input_tokens=101)
+    assert usage.models is None
+
+
+@pytest.mark.parametrize("ref", [_REF_BY, "b/y"], ids=["well-formed", "malformed"])
+def test_v2_usage_child_models_unconsulted_when_the_transcript_names_none(ref):
+    """A transcript read but naming no model stays `()` (unresolved): a child
+    ref never becomes element 0, and a malformed one is not a fault then.
+
+    ABLATION: guard `_fold_child_models` on `models is None` only and both
+    cases redden (`("b/y",)`; a `models` fault)."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, ref, input=1))]}
+    usage, fault = V2Protocol().usage(_v2_models_client(tree), _V2_SID, [_v2_assistant(1)])
+    assert fault is None and usage == TokenUsage(input_tokens=101)
+    assert usage.models == ()
+
+
+def test_v2_usage_untracked_ignores_child_models():
+    """A zero total with no completed step is untracked `(None, None)` even
+    when a child's model ref is malformed."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, "b/y"))]}
+    client = _V2RouteClient(**{_V2_INFO: [_v2_info()], _V2_LIST: [_v2_tree(tree)]})
+    assert V2Protocol().usage(client, _V2_SID, [_v2_assistant(None)]) == (None, None)
+
+
+def test_v2_usage_reads_child_models_off_the_one_token_walk():
+    """The models fold costs no request: `usage` makes the session GET and ONE
+    descendant walk (a listing per session in the tree), and never fetches a
+    child's messages."""
+    tree = {
+        _V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY))],
+        "ses_a": [_v2_children(_v2_modeled("ses_a1", "ses_a", _REF_CZ))],
+    }
+    client = _v2_models_client(tree)
+    usage, fault = V2Protocol().usage(client, _V2_SID, [_v2_assistant(1, model=_REF_AX)])
+    assert fault is None and usage is not None and usage.models == ("a/x", "b/y", "c/z")
+    assert client.gets == [
+        (_V2_INFO, None),
+        (_V2_LIST, {"parentID": _V2_SID, "limit": 200}),
+        (_V2_LIST, {"parentID": "ses_a", "limit": 200}),
+        (_V2_LIST, {"parentID": "ses_a1", "limit": 200}),
+    ]
+
+
+def test_v2_capture_stashes_child_models(tmp_path):
+    """Through `_capture_usage`, the stashed usage's `models` lists the
+    parent's model first and the subagent's after it."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9, model=_REF_AX))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [_v2_tree({_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY))]})],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    got = adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID))
+    assert got is not None and got.models == ("a/x", "b/y")
+    assert _lifecycle_lines(adapter, "t-cap") == []
+
+
+def test_v2_capture_crumbs_partial_models_and_still_stashes(tmp_path):
+    """A malformed child model ref costs neither the usage nor the active-child
+    check: the full figure is stashed, one `usage-models-partial` row names
+    the child, no `usage-capture-failed` row is written, and a still-running
+    child is still journaled.
+
+    ABLATION: drop the `usage-models-partial` note in `_capture_usage` and
+    the crumb is gone; gate `_note_active_children` on `usage_fault is None`
+    again and the `usage-child-active` row is gone."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    running = {"type": "running"}
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9, model=_REF_AX))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [
+                _v2_tree({_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, "b/y", input=5))]})
+            ],
+            _V2_ACTIVE: [{"data": {_V2_SID: running, "ses_a": running}}],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    got = adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID))
+    assert got == TokenUsage(input_tokens=105) and got.models == ("a/x",)
+    assert _capture_crumbs(adapter) == []
+    lines = _lifecycle_lines(adapter, "t-cap")
+    (partial,) = [ln for ln in lines if ln["event"] == "usage-models-partial"]
+    assert partial["stage"] == "models"
+    assert partial["error"] == "child session ses_a model: TypeError: model is str, not an object"
+    (active,) = _child_active_crumbs(adapter)
+    assert active["event"] == "usage-child-active" and active["sessions"] == ["ses_a"]
 
 
 def test_v2_transcript_walks_all_pages(tmp_path, v2_fake, monkeypatch):

@@ -93,10 +93,10 @@ breaking changes may land in a minor release.
   `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
   session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers (#959).
 - Record the models a session actually ran on: session-end `models` (Claude, Codex,
-  Gemini, Copilot, OpenCode; `models_unresolved` when none was found), `status --json`
-  `adapters_used.<role>.models_used`, and the CLI-reported launch model (`session-model`
-  journal row) on the TUI agent line. `session-start` `model` still records the configured
-  model (#859).
+  Gemini, Copilot, OpenCode — on 2.x its subagent sessions' models too; `models_unresolved`
+  when none was found), `status --json` `adapters_used.<role>.models_used`, and the
+  CLI-reported launch model (`session-model` journal row) on the TUI agent line.
+  `session-start` `model` still records the configured model (#859).
 - Record antigravity token usage: the `antigravity-transcript` parser sums agy's per-step
   transcript counts (checked against 1.4.9), subagent conversations included. Models stay
   untracked.
