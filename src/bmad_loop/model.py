@@ -619,6 +619,13 @@ class StoryTask:
     # reused after a human re-arm, so the exact record occurrence is the acceptance
     # identity; None is legacy/unarmed.
     accepted_dev_session_index: int | None = None
+    # Session task_id (story, `dev`, attempt, generation) of the dev attempt a RETRY
+    # decision rejected, persisted in that decision's DEV_VERIFY save and cleared
+    # by the next attempt's DEV_RUNNING save (DW-617). DEV_VERIFY + spec_file is
+    # otherwise the spec-approval resume shape, so a host loss in the retry window
+    # would review the rejected attempt. Keyed on the attempt identity, not a
+    # flag: an attempt bump or a generation-bumping re-arm leaves it stale.
+    rejected_dev_task_id: str = ""
     harvest_carry_commit_pending: bool = False
     isolated_ledger_carried: bool = False
     # Publication evidence is independent of the artifact-only receipt. None
@@ -987,6 +994,7 @@ class StoryTask:
             "pinned_config_rewrites": deepcopy(self.pinned_config_rewrites),
             "board_advance_intended": self.board_advance_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
+            "rejected_dev_task_id": self.rejected_dev_task_id,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
             "isolated_ledger_carried": self.isolated_ledger_carried,
             "artifact_baseline": deepcopy(self.artifact_baseline),
@@ -1282,6 +1290,7 @@ class StoryTask:
                 if d.get("accepted_dev_session_index") is not None
                 else None
             ),
+            rejected_dev_task_id=str(d.get("rejected_dev_task_id", "") or ""),
             harvest_carry_commit_pending=bool(d.get("harvest_carry_commit_pending", False)),
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             artifact_baseline=deepcopy(d.get("artifact_baseline")),

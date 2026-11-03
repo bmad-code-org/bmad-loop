@@ -2538,10 +2538,17 @@ class Engine:
                 else:
                     self._release_orphaned_mount(task)
                     self._resume_reverify(task)
-            elif task.phase == Phase.DEV_VERIFY and task.spec_file:
+            elif (
+                task.phase == Phase.DEV_VERIFY
+                and task.spec_file
+                and not self._dev_retry_latched(task)
+            ):
                 # paused at the spec-approval gate (or, in stories mode, a
                 # plan-checkpoint awaiting implementation — _resume_after_dev_verify
-                # dispatches the right leg): dev verified on disk.
+                # dispatches the right leg): dev verified on disk. A latched dev
+                # RETRY (DW-617) shares this shape but rejected the attempt, so it
+                # falls through to the replay or restart arm below, as it would
+                # with no spec_file.
                 if mounted:
                     unit = self._reopen_unit(task)
                     prev = self.workspace
@@ -2820,10 +2827,13 @@ class Engine:
         restart used to discard a completed-``done`` attempt's commits).
 
         DEV_VERIFY reaches this matcher only when no persisted defer identifies
-        an interrupted decision and ``task.spec_file`` is empty (verify did not
-        fully pass before the death): _finish_inflight checks the defer-replay
-        and spec-approval-gate arms first, so a DEV_VERIFY task WITH a verified
-        spec keeps its _resume_after_dev_verify recovery."""
+        an interrupted decision and either ``task.spec_file`` is empty (verify did
+        not fully pass before the death) or a dev RETRY of the current attempt is
+        latched (DW-617, the death landed in the retry window): _finish_inflight
+        checks the defer-replay and spec-approval-gate arms first, so a DEV_VERIFY
+        task WITH a verified spec and no rejection keeps its
+        _resume_after_dev_verify recovery. A latched completed attempt replays
+        here and is re-decided; an incomplete one falls through to restart."""
         if task.phase in (Phase.DEV_RUNNING, Phase.DEV_VERIFY):
             role, seq = "dev", task.attempt
         elif task.phase in (Phase.REVIEW_RUNNING, Phase.REVIEW_VERIFY):
@@ -2843,6 +2853,13 @@ class Engine:
                 transcript_path=record.transcript_path,
             )
         return None
+
+    def _dev_retry_latched(self, task: StoryTask) -> bool:
+        """Whether a dev RETRY rejected the task's current attempt and the next
+        attempt has not started (DW-617, ``StoryTask.rejected_dev_task_id``)."""
+        return bool(task.rejected_dev_task_id) and task.rejected_dev_task_id == (
+            _session_task_id(task.story_key, "dev", task.attempt, task.generation)
+        )
 
     def _current_dev_session_index(self, task: StoryTask) -> int | None:
         """Index of the newest primary dev record for the current attempt."""
@@ -3545,6 +3562,10 @@ class Engine:
                 if not preserve_chain_snapshot:
                     self._bind_dispatched_spec_for_attempt(task)
             advance(task, Phase.DEV_RUNNING)
+            # The retry window a RETRY latch guards ends here: a fresh attempt
+            # bumped `attempt` above, and a crash replay re-decides from the
+            # recorded result below (DW-617).
+            task.rejected_dev_task_id = ""
             self._save()
             if (
                 resume_result is None
@@ -3748,6 +3769,15 @@ class Engine:
                 # explicit transaction latch so recovery may replay accepted-only
                 # bookkeeping without closing work from a PAUSE/RETRY/DEFER.
                 self._accept_current_dev_session(task)
+            elif decision.action == Action.RETRY:
+                # DW-617: the same DEV_VERIFY save carries a spec_file whenever the
+                # artifact gate passed (this attempt, ahead of a failing verify
+                # command, or an earlier verified one), which is the spec-approval
+                # resume shape. Persist the rejection so a host loss before the
+                # next attempt's save re-decides or restarts instead of reviewing.
+                task.rejected_dev_task_id = _session_task_id(
+                    task.story_key, "dev", task.attempt, task.generation
+                )
             self._save()
             if decision.action == Action.PROCEED:
                 self._finish_post_dev_accepted_sync(task, result.result_json)

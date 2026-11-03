@@ -1302,6 +1302,18 @@ def test_deferred_work_state_fields_default_for_one_old_state_dict():
     assert restored.pinned_config_rewrites == {}
 
 
+def test_rejected_dev_task_id_round_trips_and_defaults_for_old_state():
+    """The DW-617 dev RETRY latch survives the JSON state file, and a state.json
+    written before the field existed loads with it unarmed."""
+    task = StoryTask(story_key="1-1-a", epic=1, rejected_dev_task_id="1-1-a-dev-2-g1")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.rejected_dev_task_id == "1-1-a-dev-2-g1"
+
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["rejected_dev_task_id"]
+    assert StoryTask.from_dict(doc).rejected_dev_task_id == ""
+
+
 def test_pre_harvest_ledger_preserves_absent_empty_and_text_states():
     """Empty text means an existing empty ledger; None means no file. Collapsing
     them would turn the common empty-ledger restore into an unlink."""

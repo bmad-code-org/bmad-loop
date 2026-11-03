@@ -156,6 +156,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Resume a dev attempt rejected for retry by re-deciding or restarting it, not by reviewing
+  and committing it. This applies after a manual-rollback pause and after a host loss
+  before the next attempt starts.
 - Commit the engine's own deferred-work ledger changes before review, repair and retry
   sessions and after an in-place defer, so a tracked ledger no longer pauses the run with
   `finalization left repository dirty`. The in-place defer notice now prints

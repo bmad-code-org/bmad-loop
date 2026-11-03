@@ -15161,6 +15161,144 @@ def test_post_fix_crash_before_review_dispatch_resumes_into_review(project, tmp_
     assert not _rows(engine2, "resume-restart")
 
 
+def test_crash_after_fixable_dev_retry_save_redecides_instead_of_reviewing(project, tmp_path):
+    """DW-617, fixable leg. The dev session completes and its artifact gate passes,
+    which records `spec_file`. Its verify command then fails, so the decision is a
+    fixable RETRY saved at DEV_VERIFY. The host dies before the repair's DEV_RUNNING
+    save (here, inside `_write_feedback`). That state is the spec-approval resume
+    shape, so the resume used to review and commit the rejected tree. The latch now
+    routes it to the completed-session replay. The replay re-verifies (still red),
+    re-decides RETRY, and the repair session then turns it green before any review.
+
+    Ablation, performed: drop `and not self._dev_retry_latched(task)` from the
+    spec-approval arm. The resume then journals `resume-review` and runs two
+    review sessions, with no repair."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    engine, adapter = make_engine(
+        project, [dev_effect(project, "1-1-a")], policy=_env_policy(rig, rig.verify([1, 1, 0]))
+    )
+
+    def host_dies(task, reason):
+        raise RuntimeError("host died after the dev RETRY save")
+
+    engine._write_feedback = host_dies
+    assert engine.run().crashed
+
+    assert [s.role for s in adapter.sessions] == ["dev"]
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY and task.spec_file
+    assert task.accepted_dev_session_index is None and task.attempt == 1
+    assert task.rejected_dev_task_id
+
+    engine2, adapter2 = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["dev", "review"]
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.attempt == 2
+    assert task.rejected_dev_task_id == ""
+    assert _rows(engine2, "resume-verify")
+    assert not _rows(engine2, "resume-review")
+    # The run's journal spans both engines: the crashed RETRY, the replay's
+    # re-decided RETRY, then the repair's PROCEED.
+    decisions = [d["action"] for d in _rows(engine2, "dev-decision")]
+    assert decisions == ["retry", "retry", "proceed"]
+
+
+def test_crash_in_rollback_after_dev_retry_save_restarts_instead_of_reviewing(project, tmp_path):
+    """DW-617, the ledger's exact shape. Attempt 1 verified its spec, then failed its
+    verify command (a fixable RETRY). The repair session (attempt 2) fails, so the
+    decision is a non-fixable RETRY while the task still carries attempt 1's
+    `spec_file`. The host dies inside the rollback. The failed record cannot be
+    replayed, so the resume takes the restart arm and runs a fresh attempt instead
+    of reviewing the rejected one.
+
+    Ablation, performed: drop the RETRY stamp in `_dev_phase`. The resume then
+    journals `resume-review` and reviews the failed repair's tree."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(rig, rig.verify([1, 0]), limits=LimitsPolicy(max_dev_attempts=3))
+    policy = dataclasses.replace(policy, scm=ScmPolicy(rollback_on_failure=True))
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="failed", result_json=None)],
+        policy=policy,
+    )
+
+    def host_dies(task, **kwargs):
+        raise RuntimeError("host died during the dev RETRY rollback")
+
+    engine._rollback_or_pause = host_dies
+    assert engine.run().crashed
+
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY and task.spec_file
+    assert task.accepted_dev_session_index is None and task.attempt == 2
+    assert task.rejected_dev_task_id
+
+    engine2, adapter2 = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = engine2.run()
+
+    assert summary.done == 1
+    assert [s.role for s in adapter2.sessions] == ["dev", "review"]
+    task = engine2.state.tasks["1-1-a"]
+    assert task.phase == Phase.DONE and task.attempt == 3
+    assert _rows(engine2, "resume-restart")
+    assert not _rows(engine2, "resume-review")
+
+
+def test_manual_rollback_pause_after_dev_retry_does_not_resume_into_review(project, tmp_path):
+    """DW-617 without a host loss. Under the default `rollback_on_failure = false`, a
+    non-fixable RETRY pauses for manual rollback, and that pause's save carries
+    DEV_VERIFY, attempt 1's `spec_file` and the live latch. The operator resets
+    tracked files as the notice says and resumes. The resume takes the restart arm,
+    which pauses again on the attempt's untracked residue. It never reviews the
+    rejected attempt.
+
+    Ablation, performed: drop `and not self._dev_retry_latched(task)` from the
+    spec-approval arm. The resume then journals `resume-review`, runs two review
+    sessions, and marks the story DONE with no new dev attempt."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    rig = _env_rig(tmp_path)
+    policy = _env_policy(rig, rig.verify([1, 0]), limits=LimitsPolicy(max_dev_attempts=3))
+    policy = dataclasses.replace(policy, scm=ScmPolicy(rollback_on_failure=False))
+    engine, adapter = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), SessionResult(status="failed", result_json=None)],
+        policy=policy,
+    )
+    assert engine.run().paused
+
+    assert [s.role for s in adapter.sessions] == ["dev", "dev"]
+    task = load_state(engine.run_dir).tasks["1-1-a"]
+    assert task.phase == Phase.DEV_VERIFY and task.spec_file and task.rejected_dev_task_id
+    assert _rows(engine, "rollback-manual-required")
+    git(project.project, "reset", "-q", "--hard", task.baseline_commit)
+
+    engine2, adapter2 = resume_engine(
+        project,
+        engine,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+    )
+    summary = engine2.run()
+
+    assert summary.done == 0 and summary.paused
+    assert [s.role for s in adapter2.sessions] == []
+    assert _rows(engine2, "resume-restart")
+    assert not _rows(engine2, "resume-review")
+
+
 def test_review_loop_dispatch_pause_after_unrecommending_pass_replays_into_next_cycle(
     project, tmp_path
 ):
