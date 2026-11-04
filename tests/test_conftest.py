@@ -827,33 +827,6 @@ def test_opencode_gate_refuses_a_binary_that_cannot_be_launched(monkeypatch, err
     assert len(calls) == 1
 
 
-def test_opencode_gate_answers_win32_without_touching_the_host(monkeypatch):
-    """The win32 early-out, which nothing else in the suite grades.
-
-    opencode-on-Windows is unverified for this adapter (README adapter table),
-    so the answer there is False by policy — and it has to be reached before the
-    PATH lookup and before the probe, because Windows CI should pay for
-    neither. Poisoning both `shutil.which` and `subprocess.run` is how the
-    ordering is asserted rather than just the return value: either one being
-    reached is an `AssertionError`.
-
-    Ablation target: delete the `if sys.platform == "win32": return False` early
-    return and this test fails alone, on the `AssertionError` the poisoned
-    `shutil.which` raises. The other three rows all pin `platform` to "linux" to
-    stay host-independent, so they stay GREEN under that same mutation — which
-    is the whole reason this row exists: without it, deleting the early return
-    leaves this file, and the suite, entirely green."""
-
-    def refuse(*args, **kwargs):
-        raise AssertionError("win32 must answer before any PATH lookup or probe")
-
-    monkeypatch.setattr(conftest.sys, "platform", "win32")
-    monkeypatch.setattr(conftest.shutil, "which", refuse)
-    monkeypatch.setattr(conftest.subprocess, "run", refuse)
-
-    assert not conftest.opencode_runs()
-
-
 # --- DW-95: the real-tmux xdist grouping guard --------------------------------
 #
 # Real-tmux E2Es are the suite's only wall-clock-sensitive tests, and the fix for

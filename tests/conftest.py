@@ -442,9 +442,7 @@ def opencode_runs() -> bool:
 
     ``stdin=subprocess.DEVNULL`` because a shim that prompts rather than runs
     otherwise inherits the runner's tty and blocks until the timeout expires
-    (measured: 4.00s stall on an inherited tty, 0.00s with DEVNULL). win32
-    returns before either step: opencode-on-Windows is unverified for this
-    adapter (README adapter table), so there is nothing to probe for.
+    (measured: 4.00s stall on an inherited tty, 0.00s with DEVNULL).
 
     Deliberately a function and not a ``skipif`` constant beside
     ``needs_strict_codec``: a module-level constant here would spawn a
@@ -453,8 +451,6 @@ def opencode_runs() -> bool:
     own in-file ``HAVE_OPENCODE`` gate, which the ``*_live.py`` suffix
     convention requires anyway.
     """
-    if sys.platform == "win32":
-        return False
     if (binary := shutil.which("opencode")) is None:
         return False
     try:
