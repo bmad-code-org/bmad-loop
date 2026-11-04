@@ -97,9 +97,8 @@ breaking changes may land in a minor release.
   when none was found), `status --json` `adapters_used.<role>.models_used`, and the
   CLI-reported launch model (`session-model` journal row) on the TUI agent line.
   `session-start` `model` still records the configured model (#859).
-- Record antigravity token usage: the `antigravity-transcript` parser sums agy's per-step
-  transcript counts (checked against 1.4.9), subagent conversations included. Models stay
-  untracked.
+- Record Antigravity token usage from agy's per-step transcript counts (checked against
+  1.4.9), subagent conversations included; models stay untracked.
 
 ### Changed
 
@@ -141,8 +140,8 @@ breaking changes may land in a minor release.
 
 - Remove the `[engine]` policy alias: a named `[engine]` block now fails to load with the
   `[plugins] enabled` + `[plugins.<name>]` migration, and an empty-name block is ignored
-  with a warning to delete it. 0.13.2 is the last release that folds it (#810). Point
-  the Unity plugin's guidance at a granted project-local plugin copy instead of
+  with a warning to delete it. 0.13.2 is the last release that folds it (#810). The
+  Unity plugin's guidance now points at a granted project-local plugin copy, not
   `engine.*_cmd` overrides.
 - Remove the legacy `[review] on_status_contradiction = "retry"` mode: it now fails to load
   with a pointer to `escalate`, and a review that walks sprint-status or a ticket plan back
@@ -170,8 +169,7 @@ breaking changes may land in a minor release.
 - Antigravity: ignore a `Stop` sent by a subagent or with `fullyIdle: false`, and count a
   subagent's writes as its parent's activity, so a parent no longer completes early, reads
   as idle, or is nudged and stalled while a subagent works (`subagent_spawn_marker` profile
-  field). The `Stop` check skips conversations older than the session, so its cost no
-  longer grows with the whole agy history.
+  field). The `Stop` check skips conversations older than the session.
 - Pause a Claude session blocked by a usage limit with a `usage limit:` reason instead of
   charging a dev attempt (`usage_limit_patterns`, `usage_wait_patterns` profile fields);
   Windows installs now depend on tzdata so a named reset time zone resolves (#610).
