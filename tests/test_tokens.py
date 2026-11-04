@@ -1187,6 +1187,85 @@ def test_copilot_events_models_empty_without_named_model(tmp_path):
     assert usage.models == ()
 
 
+# Sanitized from real Copilot CLI 1.0.105 captures (Linux, 2026-11-04); see the
+# fixture README. Prompts, paths and ids are redacted; event order, key layout,
+# model ids and token counts are verbatim.
+COPILOT_STATE = Path(__file__).parent / "fixtures" / "copilot-1.0.105" / "session-state"
+# One turn launched with `--model claude-haiku-4.5`, which the plan rejected
+# (auto-routed to mai-code-1.1-flash); ended with /exit.
+COPILOT_REJECTED_MODEL = COPILOT_STATE / "c0000000-0000-4000-8000-000000000001" / "events.jsonl"
+# Two turns with no --model; ended with /exit.
+COPILOT_TWO_TURNS = COPILOT_STATE / "c0000000-0000-4000-8000-000000000002" / "events.jsonl"
+COPILOT_MODEL = "mai-code-1.1-flash"
+
+
+def _copilot_events_until(tmp_path, source, keep):
+    """A copy of `source` holding only the lines `keep(entry)` accepts."""
+    lines = source.read_text(encoding="utf-8").splitlines()
+    path = tmp_path / "events.jsonl"
+    path.write_text(
+        "".join(line + "\n" for line in lines if keep(json.loads(line))), encoding="utf-8"
+    )
+    return path
+
+
+def test_copilot_events_real_capture_totals():
+    """A real 1.0.105 session: the shutdown snapshot's bare model-id key names
+    the model, and input excludes the cache reads (`tokenDetails.input` is 570).
+
+    Ablation: drop the cache-read subtraction and input reads 35898."""
+    usage = tally_copilot_events(COPILOT_TWO_TURNS)
+    assert usage == TokenUsage(input_tokens=570, output_tokens=11, cache_read_tokens=35328)
+    assert usage.models == (COPILOT_MODEL,)
+    assert usage.by_model == {COPILOT_MODEL: usage}
+
+
+def test_copilot_events_ignore_the_rejected_model_flag():
+    """`session.start` `selectedModel` echoes the `--model` flag even when
+    Copilot rejects it, so the models come from the metrics, not from it."""
+    start = json.loads(COPILOT_REJECTED_MODEL.read_text(encoding="utf-8").splitlines()[0])
+    assert start["type"] == "session.start"
+    assert start["data"]["selectedModel"] == "claude-haiku-4.5"
+
+    usage = tally_copilot_events(COPILOT_REJECTED_MODEL)
+    assert usage == TokenUsage(input_tokens=16520, output_tokens=5, cache_read_tokens=1408)
+    assert usage.models == (COPILOT_MODEL,)
+
+
+def test_copilot_events_read_the_last_checkpoint_without_a_shutdown(tmp_path):
+    """A session with no `session.shutdown` line still reads its totals and
+    model from the last per-turn `session.usage_checkpoint`, whose metrics sit
+    under `accountingSnapshot`; the checkpoints are cumulative.
+
+    Ablation: read `modelMetrics` only at the top of `data` and both are None."""
+    no_shutdown = _copilot_events_until(
+        tmp_path, COPILOT_TWO_TURNS, lambda entry: entry["type"] != "session.shutdown"
+    )
+    usage = tally_copilot_events(no_shutdown)
+    assert usage == tally_copilot_events(COPILOT_TWO_TURNS)
+    assert usage is not None and usage.models == (COPILOT_MODEL,)
+
+    seen: list[str] = []
+
+    def first_turn(entry):
+        seen.append(entry["type"])
+        return seen.count("session.usage_checkpoint") <= 1 and entry["type"] != "session.shutdown"
+
+    usage = tally_copilot_events(_copilot_events_until(tmp_path, COPILOT_TWO_TURNS, first_turn))
+    assert usage == TokenUsage(input_tokens=518, output_tokens=5, cache_read_tokens=17408)
+    assert usage.models == (COPILOT_MODEL,)
+
+
+def test_copilot_events_without_a_snapshot_is_none(tmp_path):
+    """A real session cut before its first checkpoint carries no usage."""
+    cut = _copilot_events_until(
+        tmp_path,
+        COPILOT_TWO_TURNS,
+        lambda entry: entry["type"] not in ("session.usage_checkpoint", "session.shutdown"),
+    )
+    assert tally_copilot_events(cut) is None
+
+
 def test_copilot_events_without_metrics_is_none(tmp_path):
     path = tmp_path / "events.jsonl"
     path.write_text(json.dumps({"id": "e0", "type": "message", "data": {"content": "hi"}}) + "\n")
@@ -1430,17 +1509,11 @@ def test_read_usage_tracked_parsers_report_models(tmp_path):
         encoding="utf-8",
     )
 
-    copilot = tmp_path / "events.jsonl"
-    copilot.write_text(
-        json.dumps({"data": {"modelMetrics": {"gpt-5": {"usage": {"inputTokens": 1}}}}}) + "\n",
-        encoding="utf-8",
-    )
-
     for parser, path, model in [
         ("claude-jsonl", claude, "claude-opus-5-5"),
         ("codex-rollout", codex, "gpt-5.5"),
         ("gemini-chat", gemini, "gemini-3-pro"),
-        ("copilot-events", copilot, "gpt-5"),
+        ("copilot-events", COPILOT_TWO_TURNS, COPILOT_MODEL),
     ]:
         usage = read_usage(parser, path)
         assert usage is not None, parser
@@ -1738,17 +1811,11 @@ def test_read_usage_tracked_parsers_report_a_split(tmp_path):
         encoding="utf-8",
     )
 
-    copilot = tmp_path / "events.jsonl"
-    copilot.write_text(
-        json.dumps({"data": {"modelMetrics": {"gpt-5": {"usage": {"inputTokens": 1}}}}}) + "\n",
-        encoding="utf-8",
-    )
-
     for parser, path, model in [
         ("claude-jsonl", claude, "claude-opus-5-5"),
         ("codex-rollout", codex, "gpt-5.5"),
         ("gemini-chat", gemini, "gemini-3-pro"),
-        ("copilot-events", copilot, "gpt-5"),
+        ("copilot-events", COPILOT_TWO_TURNS, COPILOT_MODEL),
     ]:
         usage = read_usage(parser, path)
         assert usage is not None, parser
