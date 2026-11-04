@@ -156,9 +156,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
-- Resume a dev attempt rejected for retry by re-deciding or restarting it, not by reviewing
-  and committing it. This applies after a manual-rollback pause and after a host loss
-  before the next attempt starts.
+- Resume a dev attempt rejected for retry, after a manual-rollback pause or a host loss
+  before the next attempt, by re-deciding or restarting it instead of reviewing and
+  committing it.
 - Commit the engine's own deferred-work ledger changes before review, repair and retry
   sessions and after an in-place defer, so a tracked ledger no longer pauses the run with
   `finalization left repository dirty`. The in-place defer notice now prints
@@ -237,9 +237,9 @@ breaking changes may land in a minor release.
   (#906).
 - Pause a Claude session uncharged, instead of charging a dev attempt for a crash, when
   its window dies after a usage-limit or account StopFailure or during a quota wait (#959).
-- Classify a Claude session cut off mid-response as an environment fault on current Claude
-  Code (2.1.317 prints `Connection lost`, not `closed`, after the `API Error` prefix)
-  instead of charging a dev attempt.
+- Classify a Claude session cut off mid-response as an environment fault instead of
+  charging a dev attempt when Claude Code 2.1.317 prints `Connection lost`, not `closed`,
+  after `API Error`.
 
 ### Security
 
