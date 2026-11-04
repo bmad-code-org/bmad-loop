@@ -247,7 +247,8 @@ breaking changes may land in a minor release.
   `remain-on-exit on` (#950); turn `destroy-unattached` off on bmad-loop's sessions
   (#951); spawn tmux with `-u` so listings parse without a UTF-8 locale (#881).
 - Send nudges to the agent's own pane, pinned at launch, not the window's active pane
-  (#948), and record a nudge typed into a copy- or clock-mode pane as not delivered (#949).
+  (#948), and record a nudge typed into a pane in copy, clock or view mode as not
+  delivered, naming the mode and how to leave it (#949).
 - psmux: start a run's session at the project root, so a Windows worktree teardown no
   longer leaves `worktrees/1` behind (#902); reach a miscased run ref's session (#904);
   refuse option values psmux 3.4.0 mangles (#905); report an unreadable session listing

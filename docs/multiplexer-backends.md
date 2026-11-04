@@ -65,6 +65,25 @@ server per session, so the inherited environment is that session's own server's.
 registry is keyed on the state root, so a launcher normally reaches only servers started
 under its own root; the note covers the cases where it does not.
 
+### Your own tmux configuration
+
+bmad-loop runs on your default tmux server, so your `~/.tmux.conf` (or
+`~/.config/tmux/tmux.conf`) applies to its windows. It never changes a server-wide or
+global option. The only option it sets is session-local: `destroy-unattached off`.
+
+- **A config command that fails at server start.** When a `run` or `run-shell` in your config
+  fails or prints, tmux shows the output in view-mode on whichever pane is active when the
+  command finishes. If bmad-loop started the server, that pane is usually the first task
+  window. bmad-loop never types into a pane in a mode, because leaving the mode would yank
+  out an operator who is reading scrollback. So the session's wake nudges and the TUI's
+  answer keys are refused with `is in a pane mode (view-mode)`, and the refusal says to
+  press `q` in that window. To fix it, make the failing config command succeed (run it by
+  hand to see why it fails), or start tmux a few seconds before the run so the output lands
+  on a pane of your own. Pressing `q` in the window clears it for that session.
+- **Extended keys.** `extended-keys on` or `always`, in either `xterm` or `csi-u` format,
+  does not change the `Enter` and `Escape` that bmad-loop sends: Claude Code receives both
+  as plain keys (checked on tmux 3.8).
+
 ## psmux (native Windows, experimental)
 
 On a native-Windows host the bundled **psmux** backend is the platform default. psmux is a

@@ -328,6 +328,9 @@ RUN_STATE_TRANSACTIONS = {
 # refusals, and deliberately adds no runtime abstraction (no RefusalError, no
 # registry): the inventory is the test file's, not the product's.
 REFUSAL_HELPER_DEFS = {
+    # #949: no keys into a pane in a mode, naming the mode; test_generic_tmux.py
+    # test_send_text_refuses_a_pane_in_mode, test_a_pane_mode_refusal_names_the_mode_*
+    ("adapters/tmux_base.py", "_refuse_in_mode"),
     # DW-444: publish into a zero-inode artifacts root; test_artifact_publication.py
     ("artifact_publication.py", "_refuse_zero_inode_root"),
     ("cli.py", "_reject_bad_run_id"),

@@ -13985,6 +13985,57 @@ def test_send_keys_refuses_a_pane_in_mode(monkeypatch, force_tmux_backend):
     assert [c for c in calls if "send-keys" in c] == []
 
 
+def _sequenced_tmux(monkeypatch, *replies):
+    """Like `_scripted_tmux`, but the Nth call answers ``replies[N]`` (a
+    TmuxError-raising nonzero exit when the reply is None)."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        reply = replies[len(calls) - 1]
+        if reply is None:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no server")
+        return subprocess.CompletedProcess(argv, 0, stdout=reply, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
+    monkeypatch.setattr(tmux_base.time, "sleep", lambda _s: None)
+    return calls
+
+
+@pytest.mark.parametrize("send", ["text", "keys"])
+def test_a_pane_mode_refusal_names_the_mode_and_the_way_out(monkeypatch, force_tmux_backend, send):
+    """A user config whose `run` fails at server start leaves the first task
+    window in view-mode; the refusal is what the nudge crumb and the TUI answer
+    show, so it names the mode and how to leave it — read only once refused.
+    Ablation: raise the bare refusal and the mode and `press q` go missing."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _sequenced_tmux(monkeypatch, "1\n", "view-mode\n")
+    mux = get_multiplexer()
+    with pytest.raises(MultiplexerError) as caught:
+        mux.send_text("@7.%9", "go on") if send == "text" else mux.send_keys("@7.%9", "Enter")
+    assert "is in a pane mode (view-mode);" in str(caught.value)
+    assert "press q in that window to leave the mode" in str(caught.value)
+    assert calls == [
+        ["tmux", "-u", "display-message", "-p", "-t", "@7.%9", "#{pane_in_mode}"],
+        ["tmux", "-u", "display-message", "-p", "-t", "@7.%9", "#{pane_mode}"],
+    ]
+
+
+@pytest.mark.parametrize("mode_reply", [None, "\n", "#{pane_mode}\n", "1\n"])
+def test_a_pane_mode_refusal_stays_unnamed_without_a_mode_name(
+    monkeypatch, force_tmux_backend, mode_reply
+):
+    """An unreadable mode probe, or a reply that is no mode name (an unexpanded
+    format), still refuses — unnamed, never with the reply pasted in."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _sequenced_tmux(monkeypatch, "1\n", mode_reply)
+    with pytest.raises(MultiplexerError, match=r"is in a pane mode; not pressing keys in it"):
+        get_multiplexer().send_keys("@7.%9", "Escape")
+    assert [c for c in calls if "send-keys" in c] == []
+
+
 @pytest.mark.parametrize("keys", [("y",), ("C-c",), ("Enter", "q"), ("go on",)])
 def test_send_keys_refuses_a_key_outside_the_allowed_set(monkeypatch, force_tmux_backend, keys):
     """Only Enter and Escape: anything else is refused before tmux is asked
