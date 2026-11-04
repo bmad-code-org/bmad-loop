@@ -485,9 +485,10 @@ def main() -> int:
         text = _bounded_text(payload, payload_key)
         if text is not None:
             event[event_key] = text
-    # The model the CLI reports on its hook payload (#859): Claude's SessionStart,
-    # Codex on every hook. Only when it is a non-empty string, so every other
-    # event stays unchanged.
+    # The model the CLI reports on its hook payload (#859): Claude's SessionStart
+    # (startup and compact only, not resume, clear or -p; bmad-loop launches only
+    # interactive startups), Codex on every hook. Only when it is a non-empty
+    # string, so every other event stays unchanged.
     model = _bounded_text(payload, "model")
     if model:
         event["model"] = model

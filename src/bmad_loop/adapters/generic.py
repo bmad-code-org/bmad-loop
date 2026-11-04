@@ -3570,9 +3570,19 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         """Journal one `session-model` (`task_id`, `model`, `cli`): the model the
         CLI reported on the session's first admitted SessionStart hook (#859).
 
-        This is the CLI's own launch model (Claude sends its resolved full id,
-        and may omit it; Codex sends it on every hook), unlike `session-start`'s
-        configured `model`, where `""` means "CLI default". Only the first such
+        This is the CLI's own launch model (Codex sends it on every hook), unlike
+        `session-start`'s configured `model`, where `""` means "CLI default".
+        Claude sends it on `startup` and `compact` starts and omits it on
+        `resume` (`--resume`/`--continue`), `clear`, and every `-p` start
+        (captured on 2.1.318; the CHANGELOG records no version for the field and
+        the hooks reference calls it optional). bmad-loop's only Claude launch is
+        an interactive startup (prompt as argv, `--session-id`, either permission
+        mode, with or without `--model`), so the row is present for every Claude
+        session it runs and no transcript fallback is needed. The value is the
+        CLI's resolution of `--model`, not the API id: an alias resolves
+        (`haiku` -> `claude-haiku-5-5`), a `[1m]` suffix is kept, and an
+        undated id stays undated where the transcript's `message.model` is dated
+        (`claude-haiku-4-5` vs `claude-haiku-4-5-20251001`). Only the first such
         hook counts: Codex subagent hooks reuse the parent session id, so a later
         same-sid SessionStart is admitted too and could carry a child's model, and
         a `/clear` or `compact` rebind keeps the launch model. Observation only:
