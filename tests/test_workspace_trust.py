@@ -298,3 +298,48 @@ def test_trust_status_never_writes(home, repo):
     before = (path.read_bytes(), os.stat(path).st_mtime_ns)
     trust_status(SPEC, repo)
     assert (path.read_bytes(), os.stat(path).st_mtime_ns) == before
+
+
+# ------------------------------------------------- agy's honored spellings
+
+
+@pytest.mark.parametrize(
+    ("platform", "cwd", "entry", "honored"),
+    [
+        # Windows arm: the raw cwd, or Go's Clean + ToSlash of it — byte-exact.
+        ("win32", "C:\\Users\\A\\wt", "C:\\Users\\A\\wt", True),
+        ("win32", "C:\\Users\\A\\wt", "C:/Users/A/wt", True),
+        ("win32", "C:\\Users\\A\\wt\\", "C:/Users/A/wt", True),
+        ("win32", "C:\\Users\\A\\wt\\..\\wt", "C:/Users/A/wt", True),
+        ("win32", "C:\\Users\\A\\wt", "c:\\users\\a\\wt", False),
+        ("win32", "C:\\Users\\A\\wt", "c:/Users/A/wt", False),
+        ("win32", "C:\\Users\\A\\wt", "C:\\Users\\A\\wt\\", False),
+        ("win32", "C:\\Users\\A\\wt", "C:/Users/A/wt/", False),
+        ("win32", "C:\\Users\\A\\wt", "\\\\?\\C:\\Users\\A\\wt", False),
+        # POSIX arm: the raw cwd or its Clean form, case-sensitive.
+        ("linux", "/home/a/wt", "/home/a/wt", True),
+        ("linux", "/home/a/wt/", "/home/a/wt", True),
+        ("linux", "//home/a/wt", "/home/a/wt", True),
+        ("linux", "/home/a/wt", "/home/A/wt", False),
+        ("linux", "/home/a/wt", "/home/a/wt/", False),
+        ("darwin", "/Users/a/wt", "/users/a/wt", False),
+    ],
+)
+def test_honored_spellings_match_agys_rule(platform, cwd, entry, honored):
+    assert (entry in workspace_trust.honored_spellings(cwd, platform)) is honored
+
+
+def test_a_case_variant_entry_trusts_nothing(home, repo, worktree):
+    # agy compares bytes: a case-folded spelling of the same directory (one
+    # directory on Windows and macOS) is not a grant for bmad-loop's spelling.
+    write_settings(home, {"trustedWorkspaces": [str(repo).swapcase()]})
+    assert trust_status(SPEC, repo)[0] == "untrusted"
+    assert seed(SPEC, worktree, trusted_root=repo)[0] == "root-untrusted"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="forward-slash entries are a Windows spelling")
+def test_a_forward_slash_root_entry_is_honored(home, repo, worktree):
+    path = write_settings(home, {"trustedWorkspaces": [str(repo).replace("\\", "/")]})
+    assert trust_status(SPEC, repo)[0] == "trusted"
+    assert seed(SPEC, worktree, trusted_root=repo)[0] == "seeded"
+    assert read_doc(path)["trustedWorkspaces"][-1] == str(worktree.resolve())

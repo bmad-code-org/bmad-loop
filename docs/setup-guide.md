@@ -371,8 +371,8 @@ them to whoever owns the machine:
 - **antigravity** — run `agy` once in the project, authenticate, and answer
   **"Yes, I trust this folder"** before `bmad-loop run`; spawned sessions can't answer that
   dialog, and a pending one reads as a session timeout. Requires Antigravity CLI
-  (`agy` ≥ 1.1.3). Two limitations to know, both verified against 1.1.3:
-  - **Trust is exact-path.** `settings.json` `trustedWorkspaces` matches whole paths —
+  (`agy` ≥ 1.1.3). Things to know:
+  - **Trust is exact-path** (verified against 1.1.3). `settings.json` `trustedWorkspaces` matches whole paths —
     trusting a parent does _not_ cover its subdirectories, and
     `--dangerously-skip-permissions` does not bypass the dialog (it covers tool
     permissions only). `isolation = "none"` (the default) works once the project root
@@ -386,6 +386,11 @@ them to whoever owns the machine:
     **Known limitation:** entries are never removed when a worktree is torn down, so
     `trustedWorkspaces` accumulates one entry per unit — prune stale
     `.bmad-loop/runs/` paths by hand if the list grows.
+  - **Trust is case-sensitive, even on Windows** (agy 1.5.0). agy records the cwd as
+    your shell spelled it, so answer the dialog from the project's canonical-case path
+    (`C:\Users\...`). `cmd` keeps a typed `c:` drive letter, and that entry trusts
+    neither bmad-loop's sessions nor its worktrees. A forward-slash spelling of the same
+    path (`C:/Users/...`) also counts.
   - **Token usage is read from agy's transcript**
     (`usage_parser = "antigravity-transcript"`, checked against agy 1.4.9): each model
     step's input, cache-read and output counts are summed, and a subagent's usage is

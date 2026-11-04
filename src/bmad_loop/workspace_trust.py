@@ -1,4 +1,4 @@
-"""Seed and read a coding CLI's home-level workspace-trust allowlist (DW-390).
+r"""Seed and read a coding CLI's home-level workspace-trust allowlist (DW-390).
 
 agy (Antigravity CLI) gates every workspace on ``trustedWorkspaces`` in
 ``~/.gemini/antigravity-cli/settings.json`` with EXACT-path matching, and blocks
@@ -28,6 +28,19 @@ list of strings), a read fault other than absence, or a write fault raises
 into an explicit ``unverifiable`` status. Neither returns a raw path in a reason,
 so the probe can render reasons without leaking the workspace location.
 
+**Spellings.** agy (1.5.0 on Windows 11, 1.4.9 on Linux; read from the binaries'
+trust path, which compares with plain byte equality) honors an entry equal to
+the session's raw ``os.Getwd()`` string, or to that string through Go's
+``filepath.Clean`` — plus ``filepath.ToSlash`` on Windows. Nothing folds case,
+strips a ``\\?\`` prefix or normalizes the entries themselves, so a
+``c:\users\...`` entry does not trust a ``C:\Users\...`` session. Accepting
+the trust dialog appends the raw ``os.Getwd()`` string; on Windows that is the
+cwd as the launcher spelled it, after Windows itself turns ``/`` into ``\`` and
+drops a trailing separator (case kept: a lower-case cwd is recorded lower-case).
+:func:`honored_spellings` models that rule, and :func:`seed` writes the resolved
+spelling — the session cwd bmad-loop launches with, and so the entry agy itself
+would record.
+
 Read-modify-write is serialized in-process by a module lock and the entry is
 re-read after the write to confirm it landed, narrowing (not closing) the window
 for a concurrent agy write. Entries accumulate one per unit: removal on worktree
@@ -37,6 +50,9 @@ teardown is out of scope.
 from __future__ import annotations
 
 import json
+import ntpath
+import posixpath
+import sys
 import threading
 from pathlib import Path
 from typing import Literal
@@ -68,12 +84,28 @@ def settings_file(spec: WorkspaceTrustSpec) -> Path:
     return home / spec.settings_path[2:]
 
 
-def _spellings(path: Path) -> set[str]:
-    """The as-passed (absolutized) and resolved spellings of ``path``; a path the
-    OS cannot resolve contributes only its lexical form."""
-    out = {str(path.absolute())}
+def honored_spellings(cwd: str, platform: str) -> frozenset[str]:
+    r"""The entries agy honors for a session whose cwd is spelled ``cwd``: the raw
+    string, and its ``filepath.Clean`` form — forward-slashed on ``win32``
+    (``filepath.ToSlash``). Exact-string otherwise: no case folding and no
+    ``\\?\`` stripping (see the module docstring). Pure; ``platform`` is a
+    ``sys.platform`` value, passed in so either arm runs anywhere."""
+    if platform == "win32":
+        clean = ntpath.normpath(cwd).replace("\\", "/")
+    else:
+        clean = posixpath.normpath(cwd)
+        # Go's Clean folds a leading "//" that POSIX normpath keeps.
+        if clean.startswith("//") and not clean.startswith("///"):
+            clean = clean[1:]
+    return frozenset({cwd, clean})
+
+
+def _spellings(path: Path, platform: str = sys.platform) -> set[str]:
+    """Every entry agy honors for ``path`` as-passed (absolutized) or resolved; a
+    path the OS cannot resolve contributes only its lexical form."""
+    out = set(honored_spellings(str(path.absolute()), platform))
     try:
-        out.add(str(path.resolve()))
+        out |= honored_spellings(str(path.resolve()), platform)
     except (OSError, RuntimeError, ValueError):
         pass
     return out
@@ -129,7 +161,8 @@ def trust_status(spec: WorkspaceTrustSpec, workspace: Path) -> tuple[TrustStatus
 def seed(
     spec: WorkspaceTrustSpec, workspace: Path, *, trusted_root: Path
 ) -> tuple[SeedOutcome, str]:
-    """Append ``workspace`` (resolved spelling) to the declared list, only when
+    """Append ``workspace`` (resolved spelling — the session cwd, so the entry agy
+    itself would record) to the declared list, only when
     ``trusted_root`` is already in it. Idempotent: already present (either
     spelling) writes nothing.
 

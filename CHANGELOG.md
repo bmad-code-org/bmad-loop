@@ -162,6 +162,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Match agy's workspace-trust entries the way agy does: a forward-slash spelling of the
+  project (`C:/Users/...`) now counts as trusted on Windows when seeding a worktree and
+  in `probe-adapter --workspace`; case and trailing-separator variants still do not.
 - Read hook stdin as bytes in `probe-adapter --probe` captures, so a UTF-8 payload with a
   non-ASCII path no longer garbles or drops on a Windows code-page locale. The capture
   also keeps each payload's raw bytes beside it.
