@@ -2290,9 +2290,12 @@ def test_wait_loop_stats_an_old_store_folder_on_the_first_stop_only(tmp_path, mo
     (old / ".system_generated").mkdir(parents=True)
     _age_folder(old)
     launched_ns = time.time_ns()  # before the spec: an older one reads as stale
-    (impl / "spec-3-1-foo.md").write_text(
-        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
-    )
+    spec_path = impl / "spec-3-1-foo.md"
+    spec_path.write_text("---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n")
+    # A Windows mtime comes from a coarser clock than time.time_ns(), so the spec
+    # can read as older than the launch and be skipped as stale. Stamp it past it.
+    later = launched_ns + _MTIME_TICK_NS
+    os.utime(spec_path, ns=(later, later))
     adapter.watcher = _ScriptedWatcher(
         [
             _agy_stop("agy-parent", parent_t, False),
