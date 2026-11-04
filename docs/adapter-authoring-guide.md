@@ -292,7 +292,9 @@ It surfaced three corrections to the draft:
   relay (`bmad_loop_hook.py`) reads both casings.
 - **Token schema.** The probe found `~/.copilot/session-state/*/events.jsonl` and its token
   fields (`data.modelMetrics.<model>.usage.*`), which became the `copilot-events` parser in
-  `tokens.py`.
+  `tokens.py`. A later capture on 1.0.105 (now the fixture in `tests/fixtures/copilot-1.0.105/`)
+  showed two more things. Each turn's `session.usage_checkpoint` carries the same totals
+  under `data.accountingSnapshot`. And `inputTokens` includes the cache reads.
 
 Confirm the `mkdtemp` dir is gone afterward.
 

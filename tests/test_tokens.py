@@ -1096,8 +1096,8 @@ def test_gemini_chat_without_tokens_is_none(tmp_path):
 
 
 def test_copilot_events_last_cumulative_across_models(tmp_path):
-    # shape from ~/.copilot/session-state/<session>/events.jsonl: per line
-    # {id, type, data:{...}}; data.modelMetrics.<model>.usage is cumulative.
+    # Synthetic two-model session (the real capture below ran one model): per
+    # line {id, type, data:{...}}; data.modelMetrics.<model>.usage is cumulative.
     lines = [
         {"id": "e0", "type": "session_start", "data": {"sessionId": "s1"}},
         # an earlier, smaller cumulative snapshot — superseded by the last one
@@ -1137,7 +1137,7 @@ def test_copilot_events_last_cumulative_across_models(tmp_path):
     path.write_text("\n".join(json.dumps(line) for line in lines) + "\nnot json\n")
 
     usage = tally_copilot_events(path)
-    assert usage.input_tokens == 540  # 500 + 40
+    assert usage.input_tokens == 340  # (500 - 200 cache reads) + 40
     assert usage.output_tokens == 75  # (60 + 5) + (8 + 2), reasoning folded in
     assert usage.cache_read_tokens == 200
     assert usage.cache_creation_tokens == 30
@@ -1429,6 +1429,7 @@ def test_read_usage_tracked_parsers_report_models(tmp_path):
         json.dumps({"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {}}) + "\n",
         encoding="utf-8",
     )
+
     copilot = tmp_path / "events.jsonl"
     copilot.write_text(
         json.dumps({"data": {"modelMetrics": {"gpt-5": {"usage": {"inputTokens": 1}}}}}) + "\n",
@@ -1697,7 +1698,7 @@ def test_copilot_events_splits_tokens_per_metric_key(tmp_path):
     metrics = {
         "gpt-5": {
             "usage": {
-                "inputTokens": 5,
+                "inputTokens": 12,
                 "outputTokens": 1,
                 "reasoningTokens": 2,
                 "cacheReadTokens": 7,
@@ -1736,6 +1737,7 @@ def test_read_usage_tracked_parsers_report_a_split(tmp_path):
         + "\n",
         encoding="utf-8",
     )
+
     copilot = tmp_path / "events.jsonl"
     copilot.write_text(
         json.dumps({"data": {"modelMetrics": {"gpt-5": {"usage": {"inputTokens": 1}}}}}) + "\n",

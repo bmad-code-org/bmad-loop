@@ -41,13 +41,15 @@ transcript that yields nothing reads as None (untracked), not zero.
                  summed. `input` includes the cached portion. Per-model
                  split: an id's winning `tokens` bill to the last model any
                  `type == "gemini"` occurrence of that id named.
-- copilot-events: ~/.copilot/session-state/<session>/events.jsonl; some
-                 entries carry `data.modelMetrics.<model>.usage`
+- copilot-events: ~/.copilot/session-state/<session>/events.jsonl
+                 (Copilot CLI 1.0.105); each turn's `session.usage_checkpoint`
+                 (under `data.accountingSnapshot`) and the `session.shutdown`
+                 line carry `modelMetrics.<model-id>.usage`
                  {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
                  reasoningTokens} that is CUMULATIVE per model, so the last
-                 entry bearing modelMetrics holds the session totals (summed
-                 across models; the split keeps them per model).
-                 reasoningTokens fold into output.
+                 snapshot holds the session totals (summed across models; the
+                 split keeps them per model). inputTokens includes the cache
+                 reads, which are subtracted; reasoningTokens fold into output.
 - antigravity-transcript: ~/.gemini/antigravity-cli/brain/<conversation-id>/
                  .system_generated/logs/transcript_full.jsonl (agy 1.4.9);
                  each PLANNER_RESPONSE step (one API call) carries top-level
@@ -631,18 +633,44 @@ def tally_gemini_chat(transcript_path: Path) -> TokenUsage | None:
 # --------------------------------------------------------- copilot-events
 
 
+def _copilot_metrics(data: dict[str, Any]) -> dict[str, Any] | None:
+    """The non-empty `modelMetrics` snapshot an events.jsonl `data` block
+    carries, or None: `session.shutdown` has it at the top level, and every
+    `session.usage_checkpoint` (written after each turn) only under
+    `accountingSnapshot`."""
+    for holder in (data, data.get("accountingSnapshot")):
+        if isinstance(holder, dict):
+            metrics = holder.get("modelMetrics")
+            if isinstance(metrics, dict) and metrics:
+                return metrics
+    return None
+
+
 def tally_copilot_events(transcript_path: Path) -> TokenUsage | None:
-    # data.modelMetrics.<model>.usage is cumulative per model, so the LAST entry
-    # carrying modelMetrics holds the session totals; sum across its models.
-    # (Schema verified against a single Copilot CLI 1.0.63 events.jsonl — revisit
-    # the cumulative/multi-model assumption if a newer build disagrees.)
+    """Sum the last cumulative `modelMetrics` snapshot of a Copilot
+    events.jsonl, or None when no entry carries one.
+
+    Checked against Copilot CLI 1.0.105 on Linux (tests/fixtures/
+    copilot-1.0.105/): a `session.usage_checkpoint` after every turn and the
+    `session.shutdown` line (written on /exit and when the window is killed)
+    each carry the session's running totals per model, keyed by bare model id
+    (`mai-code-1.1-flash`). So the LAST snapshot holds the session totals, and
+    a session that ends without a shutdown line still reads its last
+    checkpoint. `inputTokens` includes the cache reads (its `tokenDetails`
+    split shows `input + cache_read`), so they are subtracted, as for codex and
+    gemini; whether it also includes cache writes is unverified (the capture
+    had none). reasoningTokens fold into output.
+
+    `session.start` `selectedModel` is NOT a model source: it echoes the
+    `--model` flag verbatim (absent without one), even when Copilot rejects
+    the model and routes to another, so it can name a model that never ran."""
     last: dict[str, Any] | None = None
     for entry in _jsonl_entries(transcript_path):
         data = entry.get("data")
         if not isinstance(data, dict):
             continue
-        metrics = data.get("modelMetrics")
-        if isinstance(metrics, dict) and metrics:
+        metrics = _copilot_metrics(data)
+        if metrics is not None:
             last = metrics
     if last is None:
         return None
@@ -657,10 +685,11 @@ def tally_copilot_events(transcript_path: Path) -> TokenUsage | None:
         usage = model_metrics.get("usage")
         if not isinstance(usage, dict):
             continue
+        cached = _int(usage.get("cacheReadTokens"))
         each = TokenUsage(
-            input_tokens=_int(usage.get("inputTokens")),
+            input_tokens=max(0, _int(usage.get("inputTokens")) - cached),
             output_tokens=_int(usage.get("outputTokens")) + _int(usage.get("reasoningTokens")),
-            cache_read_tokens=_int(usage.get("cacheReadTokens")),
+            cache_read_tokens=cached,
             cache_creation_tokens=_int(usage.get("cacheWriteTokens")),
         )
         total.add(each)

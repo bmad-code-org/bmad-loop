@@ -366,8 +366,11 @@ them to whoever owns the machine:
   ≥ 0.46.
 - **copilot** — run `copilot` once in the project and authenticate (`gh` / a Copilot
   subscription). Requires the Copilot **CLI** GA (≥ 2026-02) — _not_ the VS Code extension.
-  **Pin a capable model**: the free default (GPT-5 mini) silently skips steps in the
-  multi-step dev/review skills; set `[adapter] model = "claude-sonnet-4-6"` (→ `--model`).
+  **Pin a capable model**: a small model (GPT-5 mini was the old free default) silently
+  skips steps in the multi-step dev/review skills, so set
+  `[adapter] model = "claude-sonnet-4-6"` (→ `--model`). The Copilot Free plan ignores
+  `--model`: Copilot 1.0.105 auto-routes every session. The model that actually ran shows
+  in session-end `models`.
 - **antigravity** — run `agy` once in the project, authenticate, and answer
   **"Yes, I trust this folder"** before `bmad-loop run`; spawned sessions can't answer that
   dialog, and a pending one reads as a session timeout. Requires Antigravity CLI
