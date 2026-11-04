@@ -93,14 +93,13 @@ breaking changes may land in a minor release.
   limit relaunches the story at once without charging an attempt, up to
   `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
   session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers. A dev relaunch
-  continues on the cut-off tree when it can name the spec or ticket plan, and rolls back
-  otherwise (`dev-relaunch-tree` journal row). It runs the `[environment]` probes first
-  and pauses at `environment` when they fail, rolling a kept tree back first;
-  Claude's `model_not_found` and `cloud_credential_error` map to the new `account-fatal`
-  StopFailure action, which pauses like `account` but is never relaunched. `status --json`
-  tasks and `diagnose` report `dev_usage_relaunches` / `review_usage_relaunches`, the
-  TUI marks a relaunched counter `×N ↻M`, and the plain `status` task line appends the
-  story's total `↻M` (#959).
+  keeps the cut-off tree when it can name the spec or ticket plan, else rolls back
+  (`dev-relaunch-tree` journal row), and pauses at `environment`, tree rolled back, when
+  the `[environment]` probes it runs first fail. Claude's `model_not_found` and
+  `cloud_credential_error` map to the new `account-fatal` StopFailure action, which pauses
+  like `account` but is never relaunched. `status --json` tasks and `diagnose` report
+  `dev_usage_relaunches` / `review_usage_relaunches`, the TUI marks a relaunched counter
+  `×N ↻M`, and the plain `status` task line appends the story's total `↻M` (#959).
 - Record the models a session actually ran on: session-end `models` (Claude, Codex,
   Gemini, Copilot, OpenCode — on 2.x its subagent sessions' models too; `models_unresolved`
   when none was found), `status --json` `adapters_used.<role>.models_used`, and the
@@ -169,8 +168,7 @@ breaking changes may land in a minor release.
 - Save an escalation before running its notify command, so a host loss during a slow
   notify no longer resumes the escalated dev attempt into review and commit. Worktree
   unit escalations, plugin `pause`/`defer` vetoes, the unknown `--story` pause, the
-  worktree-open failure defer, the sweep's intent-regeneration pause and the sweep's
-  dirty-ledger and duplicate-id migration pauses now save first too.
+  worktree-open defer and the sweep's intent and migration pauses save first too.
 - Commit the engine's own deferred-work ledger changes before review, repair and retry
   sessions and after an in-place defer, so a tracked ledger no longer pauses the run with
   `finalization left repository dirty`. The in-place defer notice now prints
