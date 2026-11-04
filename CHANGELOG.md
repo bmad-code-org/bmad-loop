@@ -162,6 +162,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Read hook stdin as bytes in `probe-adapter --probe` captures, so a UTF-8 payload with a
+  non-ASCII path no longer garbles or drops on a Windows code-page locale. The capture
+  also keeps each payload's raw bytes beside it.
 - Resume a dev attempt rejected for retry, after a manual-rollback pause or a host loss
   before the next attempt, by re-deciding or restarting it instead of reviewing and
   committing it.

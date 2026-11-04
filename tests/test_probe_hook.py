@@ -88,3 +88,47 @@ def test_installed_copy_matches_source(tmp_path):
 
     packaged = resources.files("bmad_loop.data").joinpath("bmad_loop_probe_hook.py")
     assert packaged.read_text(encoding="utf-8") == SCRIPT.read_text(encoding="utf-8")
+
+
+def run_hook_bytes(event: str, env: dict, data: bytes) -> subprocess.CompletedProcess:
+    """Feed ``data`` as raw stdin bytes, the way a CLI on Windows pipes UTF-8."""
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), event],
+        input=data,
+        env={"PATH": "/usr/bin:/bin", **env},
+        capture_output=True,
+        timeout=10,
+    )
+
+
+def test_utf8_payload_decodes_under_a_cp1252_stdin_locale(tmp_path):
+    # PYTHONIOENCODING=cp1252 forces the Windows code-page decode on every
+    # platform: a text-mode read would turn "ü" (C3 BC) into "Ã¼".
+    capture = tmp_path / "capture"
+    env = {"BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture), "PYTHONIOENCODING": "cp1252"}
+    transcript = "C:\\Users\\u\\dwcap\\\u00fcn\u00ef545\\rollout.jsonl"
+    data = json.dumps(
+        {"session_id": "s-\u00fc", "transcript_path": transcript}, ensure_ascii=False
+    ).encode("utf-8")
+    proc = run_hook_bytes("Stop", env, data)
+    assert proc.returncode == 0
+
+    signal = json.loads(next(capture.glob("*.signal.json")).read_text(encoding="utf-8"))
+    assert signal["transcript_path"] == transcript
+    assert signal["session_id"] == "s-\u00fc"
+    captured = json.loads(next(capture.glob("*.payload.json")).read_text(encoding="utf-8"))
+    assert captured["transcript_path"] == transcript
+    assert next(capture.glob("*.stdin.raw")).read_bytes() == data
+
+
+def test_unparseable_stdin_keeps_its_bytes_verbatim(tmp_path):
+    # A truncated document parses to {}, but the raw sidecar keeps what arrived.
+    capture = tmp_path / "capture"
+    env = {"BMAD_LOOP_PROBE_CAPTURE_DIR": str(capture)}
+    data = b'{"session_id": "s1", "transcript_path": "/tmp/\xc3\xbc'
+    proc = run_hook_bytes("Stop", env, data)
+    assert proc.returncode == 0
+    captured = json.loads(next(capture.glob("*.payload.json")).read_text(encoding="utf-8"))
+    assert captured == {"argv_event": "Stop"}
+    assert next(capture.glob("*.stdin.raw")).read_bytes() == data
+    assert not list(capture.glob("*.tmp"))
