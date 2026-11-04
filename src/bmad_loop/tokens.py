@@ -58,8 +58,9 @@ transcript that yields nothing reads as None (untracked), not zero.
                  conversation: the parent's .system_generated/subagents/
                  <child-id>.json spawn markers name the children, whose own
                  transcripts are folded in recursively. No model id is
-                 written, so models (and the per-model split) stay
-                 untracked (None).
+                 written (checked through agy 1.5.0), so models (and the
+                 per-model split) stay untracked (None); agy names the model
+                 only on its Stop hook payload (`modelName`).
 
 A tracked parser's `TokenUsage.by_model` (DW-618) sums field-wise to its
 totals; usage it cannot pin on a model lands under `UNATTRIBUTED_MODEL`.
@@ -790,7 +791,9 @@ def tally_antigravity_transcript(transcript_path: Path) -> TokenUsage | None:
     `subagents/: <ExcType>` (prefixed `<childId>/` for a child's); the totals
     are then a lower bound. Errors on the parent transcript itself propagate.
 
-    `models` is None: the transcript names no model."""
+    The 1.5.0 transcript has the same step layout. `models` is None: the
+    transcript names no model through 1.5.0 (the Stop hook payload's
+    `modelName` is the only place agy reports one)."""
     steps: list[dict[str, int]] = []
     parent_steps = _agy_steps(transcript_path)
     seen = parent_steps is not None

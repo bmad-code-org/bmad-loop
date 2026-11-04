@@ -395,9 +395,9 @@ them to whoever owns the machine:
     neither bmad-loop's sessions nor its worktrees. A forward-slash spelling of the same
     path (`C:/Users/...`) also counts.
   - **Token usage is read from agy's transcript**
-    (`usage_parser = "antigravity-transcript"`, checked against agy 1.4.9): each model
-    step's input, cache-read and output counts are summed, and a subagent's usage is
-    folded into the parent session that spawned it. agy writes no model id, so the
+    (`usage_parser = "antigravity-transcript"`, checked against agy 1.4.9 and 1.5.0): each
+    model step's input, cache-read and output counts are summed, and a subagent's usage is
+    folded into the parent session that spawned it. The transcript has no model id, so the
     observed model is not recorded. agy 1.1.3 wrote no counts, so its sessions read as
     untracked.
 - **opencode** — install the HTTP client extra (`uv tool install "bmad-loop[tui,opencode] @ git+https://github.com/bmad-code-org/bmad-loop.git"`) and
