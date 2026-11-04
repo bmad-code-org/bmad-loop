@@ -416,6 +416,18 @@ def _read_payload(stdin):
     text-only stream (no ``buffer``) is read as text. ``UnicodeDecodeError`` and
     ``json.JSONDecodeError`` are both ``ValueError`` subclasses and ride the same
     arm; ``OSError`` covers a closed or unreadable descriptor.
+
+    Windows capture (codex 0.166.0, Windows 11, cp1252 locale, project at a
+    non-ASCII path, home ASCII): SessionStart and Stop both carry a non-null
+    ``transcript_path``, and Stop's stdin is complete JSON (no openai/codex#23784
+    truncation). Codex writes non-ASCII as raw UTF-8, not ``\\u`` escapes, so a
+    cp1252 text read garbles every non-ASCII character (UTF-8 C3 BC reads as two) and
+    rejects one whose UTF-8 bytes include a byte cp1252 leaves undefined (0x81,
+    0x8D, 0x8F, 0x90, 0x9D; U+00C1 is C3 81), which collapses the payload to ``{}``.
+    Of the three suspected causes of null codex tokens on Windows, only the code
+    page decode matches the capture: it bites when the transcript path is
+    non-ASCII (a non-ASCII user home or ``CODEX_HOME``). This byte read decodes
+    the captured payloads intact.
     """
     buffer = getattr(stdin, "buffer", None)
     try:
