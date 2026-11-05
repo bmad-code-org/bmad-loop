@@ -387,6 +387,33 @@ def test_assert_no_leak_url_rule_needs_a_password(text):
     assert "url-credentials" not in sanitize.assert_no_leak(text)
 
 
+def test_url_cred_scheme_is_bounded():
+    """The scheme is capped at 32 characters, one of the two properties that keep
+    the unanchored URL-credential scan linear on a long alphanumeric run. A longer
+    scheme still matches, starting later.
+
+    Ablation: restoring the unbounded ``*`` scheme makes the match start at 0.
+    """
+    text = "a" * 40 + "://u:p@h"
+    m = sanitize._URL_CRED_RE.search(text)
+    assert m is not None
+    assert m.start() == 8
+    assert "url-credentials" in sanitize.assert_no_leak(text)
+
+
+def test_url_cred_user_half_stops_at_first_colon():
+    """The user half stops at the first ``:`` (RFC 3986's user/password split),
+    the other property that keeps the scan linear. The whole userinfo is still
+    redacted.
+
+    Ablation: restoring ``[^/?#\\s]*`` for the user half yields ``"a:b"``.
+    """
+    m = sanitize._URL_CRED_RE.search("redis://a:b:c@h")
+    assert m is not None
+    assert m.group("user") == "a"
+    assert sanitize.scrub_text("redis://a:b:c@h") == "redis://<redacted:userinfo>h"
+
+
 @pytest.mark.parametrize(
     "text",
     [
