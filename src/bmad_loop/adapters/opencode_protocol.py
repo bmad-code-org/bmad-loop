@@ -1377,7 +1377,7 @@ class V2Protocol(OpencodeProtocol):
             return None, None
         parent_models = _v2_models(transcript)
         models, models_fault = _fold_child_models(parent_models, infos)
-        by_model = _v2_by_model(parent, parent_models, models, infos)
+        by_model = _v2_by_model(parent, _v2_sole_model(transcript), models, infos)
         return replace(usage, models=models, by_model=by_model), models_fault
 
     def sample_usage(self, client: Any, session_id: str) -> tuple[TokenUsage | None, str | None]:
@@ -1554,6 +1554,25 @@ def _v2_models(messages: Any) -> tuple[str, ...] | None:
     return tuple(seen)
 
 
+def _v2_sole_model(messages: Any) -> str | None:
+    """The one model every assistant message of a V2 transcript names, or
+    None: no assistant message, two models (a mid-session switch), or any
+    assistant message whose ``model`` ref :func:`_v2_models` skips as
+    missing or malformed — its tokens are in the parent's aggregate too, so
+    the aggregate is billed to no named model rather than to the others'."""
+    if not isinstance(messages, list):
+        return None
+    sole: str | None = None
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("type") != "assistant":
+            continue
+        named = _v2_models([msg])
+        if not named or (sole is not None and named[0] != sole):
+            return None
+        sole = named[0]
+    return sole
+
+
 def _info_model(info: Any) -> str | None:
     """One ``Session.Info``'s ``"<providerID>/<id>"`` model ref (``variant``
     ignored, as in :func:`_v2_models`), or None when it has none — the key is
@@ -1597,13 +1616,14 @@ def _fold_child_models(
 
 def _v2_by_model(
     parent: TokenUsage,
-    parent_models: tuple[str, ...] | None,
+    parent_model: str | None,
     models: tuple[str, ...] | None,
     infos: list[Any],
 ) -> dict[str, TokenUsage] | None:
     """The V2 ``by_model`` split over session aggregates: ``parent`` (the
-    session's own) bills to the one model its transcript names, else (none, or
-    a mid-session switch) to ``UNATTRIBUTED_MODEL``; each descendant's
+    session's own) bills to ``parent_model`` (:func:`_v2_sole_model`: the one
+    model every assistant message names), else (none, a mid-session switch, or
+    a message with an unreadable ref) to ``UNATTRIBUTED_MODEL``; each descendant's
     aggregate bills to its :func:`_info_model` ref when that id is among the
     folded ``models``, else (no ref, a malformed one, or children not
     consulted) to the sentinel. None when ``models`` is None (transcript
@@ -1613,8 +1633,7 @@ def _v2_by_model(
     if models is None:
         return None
     buckets: dict[str | None, TokenUsage] = {}
-    single = parent_models[0] if parent_models and len(parent_models) == 1 else None
-    add_to_bucket(buckets, single, parent)
+    add_to_bucket(buckets, parent_model, parent)
     for info in infos:
         try:
             model = _info_model(info)

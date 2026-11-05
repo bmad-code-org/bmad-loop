@@ -5452,15 +5452,22 @@ class _Proc:
         return self.code
 
 
-def _await(adapter, sess, *, deadline_in: float = 60.0, budget_in: float | None = None) -> bool:
+def _await(
+    adapter,
+    sess,
+    *,
+    deadline_in: float = 60.0,
+    budget_in: float | None = None,
+    tick=lambda: False,
+) -> bool:
+    budget_at = None if budget_in is None else time.monotonic() + budget_in
     return adapter._await_descendants(
         SessionHandle(task_id="t-d", native_id=sess.session_id),
         sess,
         deadline=time.monotonic() + deadline_in,
         wall_deadline=time.time() + deadline_in,
-        budget_deadline=None if budget_in is None else time.monotonic() + budget_in,
-        budget_wall_deadline=None if budget_in is None else time.time() + budget_in,
-        beat=lambda: False,
+        budget_due=lambda: budget_at is not None and time.monotonic() >= budget_at,
+        tick=tick,
     )
 
 
@@ -5522,6 +5529,159 @@ def test_descendant_wait_is_cut_by_stop_death_or_deadline(tmp_path, monkeypatch,
     assert started["event"] == "descendant-wait-started"
     assert cut["event"] == "descendant-wait-cut"
     assert cut["reason"] == reason and cut["sessions"] == ["ses_child"]
+
+
+@pytest.mark.parametrize("reason", ["stop", "timeout", "budget"])
+def test_descendant_wait_rechecks_cuts_after_an_empty_probe(tmp_path, monkeypatch, reason):
+    """A stop, the session deadline or a budget grace that expires while the
+    probe runs still cuts the wait when that probe reads "none active" — the
+    empty answer must not hand the loop a turn end to read as `completed`.
+
+    ABLATION: drop the `cut_reason()` recheck in the `not active` branch and
+    the wait ends `descendant-wait-ended` (True) instead."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 30.0
+    adapter.descendant_poll_s = 0.01
+    stopped = {"now": False}
+
+    class _SlowEmpty:
+        calls = 0
+
+        def active_descendants(self, _client, _session_id):
+            self.calls += 1
+            if self.calls == 1:
+                return ["ses_child"], None
+            time.sleep(0.3)  # the cutoff lands during this probe
+            stopped["now"] = True
+            return [], None
+
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _SlowEmpty()  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        adapter, "_hard_stop_requested", lambda: reason == "stop" and stopped["now"]
+    )
+
+    assert (
+        _await(
+            adapter,
+            sess,
+            deadline_in=0.2 if reason == "timeout" else 60.0,
+            budget_in=0.2 if reason == "budget" else None,
+        )
+        is False
+    )
+
+    started, cut = _lifecycle_lines(adapter, "t-d")
+    assert started["event"] == "descendant-wait-started"
+    assert cut["event"] == "descendant-wait-cut" and cut["reason"] == reason
+
+
+def test_descendant_wait_tick_settling_the_session_cuts_it_as_budget(tmp_path):
+    """`tick` answering True (a zero-grace enforce trip sampled mid-wait)
+    cuts the wait as `budget` at once.
+
+    ABLATION: ignore `tick`'s answer and the wait runs to its grace bound
+    (`descendant-wait-timeout`, True)."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 0.3
+    adapter.descendant_poll_s = 0.01
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _ProbeSpy((["ses_child"], None))  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+
+    assert _await(adapter, sess, tick=lambda: True) is False
+
+    _started, cut = _lifecycle_lines(adapter, "t-d")
+    assert cut["event"] == "descendant-wait-cut" and cut["reason"] == "budget"
+
+
+def test_descendant_wait_grace_counts_the_first_probe(tmp_path):
+    """The grace runs from before the first probe: a probe slower than the
+    grace leaves no fresh grace to wait out after it.
+
+    ABLATION: start the clock after the first probe and the wait polls on for
+    a full grace, so it waits well past the probe's own duration."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 0.5
+    adapter.descendant_poll_s = 0.01
+
+    class _SlowFirst:
+        calls = 0
+
+        def active_descendants(self, _client, _session_id):
+            self.calls += 1
+            if self.calls == 1:
+                time.sleep(0.6)
+            return ["ses_child"], None
+
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _SlowFirst()  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+
+    began = time.monotonic()
+    assert _await(adapter, sess) is True
+    elapsed = time.monotonic() - began
+
+    _started, timeout = _lifecycle_lines(adapter, "t-d")
+    assert timeout["event"] == "descendant-wait-timeout"
+    assert elapsed < 0.9  # the 0.6s probe, not the probe plus a fresh 0.5s grace
+
+
+@pytest.mark.parametrize("grace_s", [0.3, 0.0], ids=["grace", "zero-grace"])
+def test_v2_budget_is_sampled_while_a_turn_end_waits_on_a_child(
+    tmp_path, v2_fake, monkeypatch, grace_s
+):
+    """A background child spending past an enforce-mode cap while the parent's
+    turn end is held trips the budget there, and the session ends `over_budget`
+    rather than `completed` on the parent's result.
+
+    ABLATION: hand `_await_descendants` the bare `beat` (no budget sample) and
+    the `grace` case runs the wait to its grace bound, then the parent's result
+    completes it."""
+    monkeypatch.setattr(opencode_http, "HEARTBEAT_INTERVAL_S", 0.05)
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher), policy=_budget_policy())
+    adapter._stall_grace_s = 3.0
+    adapter.descendant_poll_s = 0.05
+    waiting = {"now": False}
+    real_wait = adapter._await_descendants
+
+    def flagged_wait(*args, **kwargs):
+        waiting["now"] = True
+        return real_wait(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_await_descendants", flagged_wait)
+    # Under the cap until the turn end is held, then the child's spend lands.
+    monkeypatch.setattr(
+        adapter,
+        "_sample_weighted_usage",
+        lambda _sess, _spec: (5_000_000 if waiting["now"] else 1, None),
+    )
+    spec = make_spec(
+        tmp_path,
+        rec,
+        "background-child-stuck",
+        token_budget=1_000_000,
+        token_budget_mode="enforce",
+        token_budget_grace_s=grace_s,
+    )
+
+    result = adapter.run(spec)
+
+    assert result.status == "over_budget"
+    assert result.budget_weighted == 5_000_000
+    lifecycle = _lifecycle(tmp_path)
+    (tripped,) = [c for c in lifecycle if c["event"] == "budget-tripped"]
+    assert tripped["weighted"] == 5_000_000
+    (cut,) = [c for c in lifecycle if c["event"] == "descendant-wait-cut"]
+    assert cut["reason"] == "budget"
+    (fired,) = [c for c in lifecycle if c["event"] == "over-budget-fired"]
+    assert fired["zero_grace"] is (grace_s == 0.0)
+    assert_server_gone(rec)
 
 
 def test_descendant_probe_recovery_ends_a_faulted_wait(tmp_path):
@@ -5795,6 +5955,25 @@ def test_v2_usage_multi_model_parent_is_unattributed():
         "c/z": TokenUsage(input_tokens=20),
         UNATTRIBUTED_MODEL: TokenUsage(input_tokens=100),
     }
+
+
+@pytest.mark.parametrize("bad", [None, "a/x", {"id": "x"}], ids=["absent", "string", "half"])
+def test_v2_usage_parent_with_an_unreadable_model_ref_is_unattributed(bad):
+    """An assistant message whose `model` ref is missing or malformed is still
+    in the parent's aggregate, so the one readable model does not own that
+    aggregate: it bills to the sentinel (the model list is unchanged).
+
+    ABLATION: bill the parent to the sole model `_v2_models` reads and `a/x`
+    holds the whole aggregate."""
+    tree = {_V2_SID: [_v2_children()]}
+    odd = _v2_assistant(2) if bad is None else _v2_assistant(2, model=bad)
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX), odd]
+    )
+    assert fault is None
+    _assert_split(usage)
+    assert usage.models == ("a/x",)
+    assert usage.by_model == {UNATTRIBUTED_MODEL: TokenUsage(input_tokens=100)}
 
 
 def test_v2_usage_split_unknown_without_a_transcript():

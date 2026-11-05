@@ -1359,6 +1359,127 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             self._observe_tick(handle, spec)
             return True
 
+        def sample_budget() -> SessionResult | None:
+            """One budget usage sample, taken when `beat` fired. Usage comes over
+            HTTP (server state is sqlite, not a file). Latches the first cap
+            crossing (journal + ATTENTION notify) and, in enforce mode, nudges
+            and arms the grace (`budget_deadline`); returns the session's
+            verdict only for a zero-grace enforce trip, else None. Shared with
+            `_await_descendants` (through `wait_tick`), so a turn end held on a
+            running subagent still samples the spend the subagent adds."""
+            nonlocal budget_tripped, budget_weighted, budget_deadline
+            nonlocal budget_wall_deadline, usage_failures
+            if (
+                not budget_tripped
+                and spec.token_budget is not None
+                and spec.token_budget_mode in ("warn", "enforce")
+            ):
+                weighted, usage_fault = self._sample_weighted_usage(sess, spec)
+                # A failed sample is still "no sample" this tick; its streak
+                # is crumbed at the transitions only (DW-461), the generic
+                # adapter's DW-452 model — a persistent fault leaves
+                # enforce mode off, which must not look like a quiet session.
+                if usage_fault is not None:
+                    usage_failures += 1
+                    if usage_failures == 1:
+                        self._note_lifecycle(
+                            handle.task_id, "usage-sample-failed", error=usage_fault
+                        )
+                else:
+                    if usage_failures:
+                        self._note_lifecycle(
+                            handle.task_id, "usage-sample-recovered", failures=usage_failures
+                        )
+                    usage_failures = 0
+                if weighted is not None and weighted > spec.token_budget:
+                    budget_tripped = True
+                    budget_weighted = weighted
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "budget-tripped",
+                        weighted=weighted,
+                        budget=spec.token_budget,
+                        mode=spec.token_budget_mode,
+                    )
+                    try:
+                        gates.notify(
+                            self.policy,
+                            self.run_dir,
+                            "bmad-loop session over token budget",
+                            f"{handle.task_id}: weighted spend {weighted} crossed the "
+                            f"{spec.token_budget} per-session cap "
+                            f"(mode={spec.token_budget_mode})",
+                        )
+                    except OSError:
+                        # observe-degrade: an unwritable ATTENTION file is
+                        # observability, never a reason to break the loop
+                        # (the _write_heartbeat doctrine).
+                        pass
+                    # nosec below: bandit B105 pattern-matches the "token"
+                    # in token_budget_mode as a hardcoded-password compare;
+                    # it is a mode enum, not a credential.
+                    if spec.token_budget_mode == "enforce":  # nosec B105
+                        if spec.token_budget_grace_s <= 0:
+                            # zero grace = terminate at trip, no nudge — but
+                            # server death still wins (artifact honored via
+                            # the crash path), exactly like grace expiry.
+                            if sess.process.poll() is not None:
+                                transcript = self._capture_usage(handle, sess)
+                                return self._final(
+                                    handle,
+                                    spec,
+                                    "crashed",
+                                    session_id,
+                                    transcript,
+                                    budget_weighted=weighted,
+                                )
+                            self._note_lifecycle(
+                                handle.task_id,
+                                "over-budget-fired",
+                                weighted=weighted,
+                                budget=spec.token_budget,
+                                grace_s=spec.token_budget_grace_s,
+                                zero_grace=True,
+                            )
+                            self._abort(sess)
+                            transcript = self._capture_usage(handle, sess)
+                            return SessionResult(
+                                status="over_budget",
+                                session_id=session_id,
+                                transcript_path=transcript,
+                                budget_weighted=weighted,
+                            )
+                        try:
+                            self.send_text(handle, BUDGET_NUDGE_TEXT)
+                        except MultiplexerError as e:
+                            # a dead/hung server can't take the nudge; the
+                            # grace still arms — the next tick's process
+                            # poll scores a dead server crashed.
+                            self._note_nudge_send_failed(handle, "budget", e)
+                        budget_deadline = time.monotonic() + spec.token_budget_grace_s
+                        budget_wall_deadline = time.time() + spec.token_budget_grace_s
+            return None
+
+        def budget_due() -> bool:
+            """Whether an armed enforce-mode budget grace has expired (the wall
+            clock may expire it, never extend it — #157)."""
+            return budget_deadline is not None and (
+                time.monotonic() >= budget_deadline
+                or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
+            )
+
+        # A zero-grace enforce verdict reached inside `_await_descendants`.
+        budget_verdict: SessionResult | None = None
+
+        def wait_tick() -> bool:
+            """`beat` plus the budget sample the loop takes when it fires, for
+            `_await_descendants`; True when the sample settled the session (a
+            zero-grace enforce trip: `budget_verdict`), which cuts the wait."""
+            nonlocal budget_verdict
+            if beat():
+                budget_verdict = sample_budget()
+            return budget_verdict is not None
+
         while True:
             remaining = deadline - time.monotonic()
             wall_expired = time.time() >= wall_deadline
@@ -1421,100 +1542,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 )
             if beat():
                 # Budget sampling rides the heartbeat cadence — no extra knob.
-                # Usage comes over HTTP (server state is sqlite, not a file).
-                if (
-                    not budget_tripped
-                    and spec.token_budget is not None
-                    and spec.token_budget_mode in ("warn", "enforce")
-                ):
-                    weighted, usage_fault = self._sample_weighted_usage(sess, spec)
-                    # A failed sample is still "no sample" this tick; its streak
-                    # is crumbed at the transitions only (DW-461), the generic
-                    # adapter's DW-452 model — a persistent fault leaves
-                    # enforce mode off, which must not look like a quiet session.
-                    if usage_fault is not None:
-                        usage_failures += 1
-                        if usage_failures == 1:
-                            self._note_lifecycle(
-                                handle.task_id, "usage-sample-failed", error=usage_fault
-                            )
-                    else:
-                        if usage_failures:
-                            self._note_lifecycle(
-                                handle.task_id, "usage-sample-recovered", failures=usage_failures
-                            )
-                        usage_failures = 0
-                    if weighted is not None and weighted > spec.token_budget:
-                        budget_tripped = True
-                        budget_weighted = weighted
-                        self._note_lifecycle(
-                            handle.task_id,
-                            "budget-tripped",
-                            weighted=weighted,
-                            budget=spec.token_budget,
-                            mode=spec.token_budget_mode,
-                        )
-                        try:
-                            gates.notify(
-                                self.policy,
-                                self.run_dir,
-                                "bmad-loop session over token budget",
-                                f"{handle.task_id}: weighted spend {weighted} crossed the "
-                                f"{spec.token_budget} per-session cap "
-                                f"(mode={spec.token_budget_mode})",
-                            )
-                        except OSError:
-                            # observe-degrade: an unwritable ATTENTION file is
-                            # observability, never a reason to break the loop
-                            # (the _write_heartbeat doctrine).
-                            pass
-                        # nosec below: bandit B105 pattern-matches the "token"
-                        # in token_budget_mode as a hardcoded-password compare;
-                        # it is a mode enum, not a credential.
-                        if spec.token_budget_mode == "enforce":  # nosec B105
-                            if spec.token_budget_grace_s <= 0:
-                                # zero grace = terminate at trip, no nudge — but
-                                # server death still wins (artifact honored via
-                                # the crash path), exactly like grace expiry.
-                                if sess.process.poll() is not None:
-                                    transcript = self._capture_usage(handle, sess)
-                                    return self._final(
-                                        handle,
-                                        spec,
-                                        "crashed",
-                                        session_id,
-                                        transcript,
-                                        budget_weighted=weighted,
-                                    )
-                                self._note_lifecycle(
-                                    handle.task_id,
-                                    "over-budget-fired",
-                                    weighted=weighted,
-                                    budget=spec.token_budget,
-                                    grace_s=spec.token_budget_grace_s,
-                                    zero_grace=True,
-                                )
-                                self._abort(sess)
-                                transcript = self._capture_usage(handle, sess)
-                                return SessionResult(
-                                    status="over_budget",
-                                    session_id=session_id,
-                                    transcript_path=transcript,
-                                    budget_weighted=weighted,
-                                )
-                            try:
-                                self.send_text(handle, BUDGET_NUDGE_TEXT)
-                            except MultiplexerError as e:
-                                # a dead/hung server can't take the nudge; the
-                                # grace still arms — the next tick's process
-                                # poll scores a dead server crashed.
-                                self._note_nudge_send_failed(handle, "budget", e)
-                            budget_deadline = time.monotonic() + spec.token_budget_grace_s
-                            budget_wall_deadline = time.time() + spec.token_budget_grace_s
-            if budget_deadline is not None and (
-                time.monotonic() >= budget_deadline
-                or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
-            ):
+                verdict = sample_budget()
+                if verdict is not None:
+                    return verdict
+            if budget_due():
                 # Grace expired with no completion (wall co-bound included: a
                 # suspend-frozen monotonic clock must not stretch the window,
                 # #157). Server death ≙ window death (the crash path honors a
@@ -1709,10 +1740,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     sess,
                     deadline=deadline,
                     wall_deadline=wall_deadline,
-                    budget_deadline=budget_deadline,
-                    budget_wall_deadline=budget_wall_deadline,
-                    beat=beat,
+                    budget_due=budget_due,
+                    tick=wait_tick,
                 ):
+                    if budget_verdict is not None:
+                        return budget_verdict  # a zero-grace enforce trip mid-wait
                     continue  # stop / deadline / budget / death: the loop's arms decide
                 result_json = self._result_json(handle, spec, wait=True)
                 if result_json is not None:
@@ -1758,9 +1790,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         *,
         deadline: float,
         wall_deadline: float,
-        budget_deadline: float | None,
-        budget_wall_deadline: float | None,
-        beat: Callable[[], bool],
+        budget_due: Callable[[], bool],
+        tick: Callable[[], bool],
     ) -> bool:
         """Hold a turn end while a descendant session of this one is still
         running. Under OpenCode 2.x a ``background: true`` subagent can work on
@@ -1771,40 +1802,44 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         Polls the protocol's ``active_descendants`` every ``descendant_poll_s``
         until none is active or ``_stall_grace_s`` passes; the bound is
         ``min(grace, session deadline)``, each with its wall-clock co-bound
-        (#157). Returns True when the caller should act on the turn end now:
-        nothing was active (nothing journaled), the children finished
-        (``descendant-wait-ended`` with ``waited_s``, ``probe_failures``), or
-        the grace expired (``descendant-wait-timeout`` with the last known
-        active ``sessions`` — null when no probe ever read — ``waited_s``,
-        ``probe_failures``, plus ``error`` when the last probe faulted). A
-        wait that starts journals ``descendant-wait-started`` (``sessions``,
-        ``grace_s``; ``sessions: null`` + ``error`` when the first probe
-        faulted). Returns False only when the wait is cut short —
-        ``descendant-wait-cut`` with ``reason`` ``stop`` (a hard stop),
-        ``timeout`` (the session deadline), ``budget`` (an armed enforce-mode
-        budget grace — ``budget_deadline`` / ``budget_wall_deadline``, None
-        when unarmed — has expired) or ``server-exited`` — and the wait
+        (#157), and the grace runs from before the first probe. Returns True
+        when the caller should act on the turn end now: nothing was active
+        (nothing journaled), the children finished (``descendant-wait-ended``
+        with ``waited_s``, ``probe_failures``), or the grace expired
+        (``descendant-wait-timeout`` with the last known active ``sessions`` —
+        null when no probe ever read — ``waited_s``, ``probe_failures``, plus
+        ``error`` when the last probe faulted). A wait that starts journals
+        ``descendant-wait-started`` (``sessions``, ``grace_s``; ``sessions:
+        null`` + ``error`` when the first probe faulted). Returns False only
+        when the wait is cut short — ``descendant-wait-cut`` with ``reason``
+        ``stop`` (a hard stop), ``timeout`` (the session deadline), ``budget``
+        (``budget_due``: an armed enforce-mode budget grace has expired, or
+        ``tick`` settled the session) or ``server-exited`` — and the wait
         loop's own arms then take the verdict (aborted / timeout /
-        over_budget / crashed).
+        over_budget / crashed). The cut conditions are checked again after a
+        probe that reads "none active", so a stop, deadline or budget expiry
+        that lands during the sleep or the probe still wins.
 
         A probe fault is never "none active": the first fault of each streak
         is crumbed as ``descendant-probe-failed`` (``error``) and the wait runs
         on to its bound. A grace of zero (the plain adapter) never probes; V1
-        answers ``([], None)`` without a request, so it never waits. The
-        heartbeat keeps its cadence through ``beat``; budget sampling and the
-        stall/gap machinery pause for the wait, which the grace bounds — but a
-        budget grace already armed still cuts the wait when it expires, so a
-        child spending on past the cap cannot carry the session to
-        ``completed``."""
+        answers ``([], None)`` without a request, so it never waits. ``tick``
+        keeps the heartbeat cadence and the budget sampling that rides it, so
+        a child spending past the cap trips the budget (and, in enforce mode,
+        arms its grace) as it would mid-turn; the True return of ``tick``
+        means the sample settled the session (a zero-grace enforce trip). The
+        stall/gap machinery pauses for the wait, which the grace bounds."""
         grace = self._stall_grace_s
         if grace <= 0:
             return True
-        active, fault = sess.protocol.active_descendants(sess.client, sess.session_id)
-        if active is not None and not active:
-            return True
+        # The grace runs from before the first probe, so a slow probe is not
+        # granted a fresh full grace on top.
         started = time.monotonic()
         wait_end = min(started + grace, deadline)
         wall_end = min(time.time() + grace, wall_deadline)
+        active, fault = sess.protocol.active_descendants(sess.client, sess.session_id)
+        if active is not None and not active:
+            return True
         task_id = handle.task_id
         failures = 0
         known: list[str] | None = active
@@ -1820,6 +1855,17 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         def waited() -> float:
             return round(time.monotonic() - started, 3)
 
+        def cut_reason() -> str | None:
+            if self._hard_stop_requested():
+                return "stop"
+            if sess.process.poll() is not None:
+                return "server-exited"
+            if time.monotonic() >= deadline or time.time() >= wall_deadline:
+                return "timeout"
+            if budget_due():
+                return "budget"
+            return None
+
         def cut(reason: str) -> bool:
             self._note_lifecycle(
                 task_id, "descendant-wait-cut", reason=reason, sessions=known, waited_s=waited()
@@ -1827,19 +1873,10 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             return False
 
         while True:
-            if self._hard_stop_requested():
-                return cut("stop")
-            if sess.process.poll() is not None:
-                return cut("server-exited")
-            now = time.monotonic()
-            if now >= deadline or time.time() >= wall_deadline:
-                return cut("timeout")
-            if budget_deadline is not None and (
-                now >= budget_deadline
-                or (budget_wall_deadline is not None and time.time() >= budget_wall_deadline)
-            ):
-                return cut("budget")
-            if now >= wait_end or time.time() >= wall_end:
+            reason = cut_reason()
+            if reason is not None:
+                return cut(reason)
+            if time.monotonic() >= wait_end or time.time() >= wall_end:
                 timeout_fields: dict[str, Any] = {
                     "sessions": known,
                     "waited_s": waited(),
@@ -1849,7 +1886,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     timeout_fields["error"] = last_fault
                 self._note_lifecycle(task_id, "descendant-wait-timeout", **timeout_fields)
                 return True
-            beat()
+            if tick():
+                return cut("budget")
             time.sleep(max(0.0, min(self.descendant_poll_s, wait_end - time.monotonic())))
             active, fault = sess.protocol.active_descendants(sess.client, sess.session_id)
             if active is None:
@@ -1861,6 +1899,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             last_fault = None
             known = active
             if not active:
+                # The sleep and the probe can outlast a stop, the deadline or
+                # the budget grace: an empty answer then must not read as done.
+                reason = cut_reason()
+                if reason is not None:
+                    return cut(reason)
                 self._note_lifecycle(
                     task_id, "descendant-wait-ended", waited_s=waited(), probe_failures=failures
                 )
