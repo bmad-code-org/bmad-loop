@@ -2575,10 +2575,12 @@ class WorktreeFlow:
             task.defer_reason = f"could not open worktree: {e}"
             task.phase = Phase.DEFERRED  # deliberate: no legal move from PENDING
             self.journal.append("worktree-open-failed", story_key=task.story_key, error=str(e))
+            # Persist DEFERRED before the notify (DW-630): a host loss inside a
+            # slow notify command must not leave the unit PENDING on disk.
+            self._save()
             gates.notify(
                 self.policy, self.run_dir, f"worktree open failed: {task.story_key}", str(e)
             )
-            self._save()
             return
         task.worktree_path = str(unit.path)
         # The mount's mint-time identity (DW-446), taken before any session runs
@@ -5223,13 +5225,15 @@ class WorktreeFlow:
         task.phase = Phase.ESCALATED
         task.adopt_pending = False  # an escalation spends any adoption (DW-386)
         self.journal.append("story-escalated", story_key=task.story_key, reason=reason)
+        # Persist ESCALATED before the notify, as `Engine._escalate` does: a host
+        # loss inside a slow notify command must not leave the previous save.
+        self._save()
         gates.notify(
             self.policy,
             self.run_dir,
             pause_title(reason, task.story_key),
             f"{reason} — resolve, then `bmad-loop resume {self.state.run_id}`",
         )
-        self._save()
         self._pause(reason, task.story_key)
 
     def merge_message(self, task: StoryTask) -> str:

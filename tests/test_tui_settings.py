@@ -741,6 +741,12 @@ def test_save_refuses_a_symlinked_bmad_loop(tmp_path):
     The second assertion is the load-bearing one — refusing loudly buys nothing if
     the document already landed outside the confine root.
 
+    Positive control: `test_save_creates_parent_and_leaves_no_tmp` saves to the same
+    target under the same confine root with no link planted and reads the value back
+    through `policy_mod.load`, so a `save` wired to refuse everything fails there —
+    this refusal is the planted link, not every reason a file could be absent from
+    `outside/`.
+
     Ablation: revert `save` to `atomic_write_text(path, self.dumps(),
     follow_symlinks=False)` and this fails `DID NOT RAISE`, with `policy.toml`
     sitting in `outside/`."""
@@ -754,34 +760,6 @@ def test_save_refuses_a_symlinked_bmad_loop(tmp_path):
         doc.save(tmp_path / ".bmad-loop" / "policy.toml", confine_root=tmp_path)
 
     assert list(outside.iterdir()) == []  # nothing escaped the confine root
-
-
-def test_save_lands_on_a_clean_tree_at_the_same_target(tmp_path):
-    """The positive control for the refusal above: the same target path, the same
-    confine root, the same `outside/` — differing only in whether `.bmad-loop/` is a
-    real directory. Without it that test passes for a `save` wired to refuse
-    everything, which is every reason a file could be absent from `outside/`.
-
-    Deliberately not `test_save_creates_parent_and_leaves_no_tmp` over again: that
-    one grades "the parent gets created and no temp is left behind" on a bare tree
-    with nowhere to escape TO. What this adds is the geometry — `outside/` exists
-    here as well and stays empty — so the pair isolates the planted link as the only
-    difference between landing and refusing, rather than leaving "the refusal test's
-    `outside/` was empty" open to an unrelated cause.
-
-    The value is read back through `policy_mod.load`, not off the document, because
-    what is being graded is the file the confined write published."""
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    path = tmp_path / ".bmad-loop" / "policy.toml"
-    path.parent.mkdir()  # a real directory where the refusal test plants a link
-    doc = fresh_doc(tmp_path)
-    doc.set("limits", "max_review_cycles", 7)  # distinctive: the template ships 3
-
-    doc.save(path, confine_root=tmp_path)
-
-    assert policy_mod.load(path).limits.max_review_cycles == 7
-    assert list(outside.iterdir()) == []  # the write stayed where it was aimed
 
 
 def test_save_refuses_a_readonly_policy_toml(tmp_path):

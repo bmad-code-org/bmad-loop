@@ -21,8 +21,8 @@ call that writes the task's ``result.json``, the next with a closing text
 reply, each with fixed usage — so the session's token aggregate is known
 exactly.
 
-V2-only (the opencode on PATH must report 2.x) and POSIX-only, like the no-prompt
-module: opencode-on-Windows is unverified for this adapter.
+V2-only (the opencode on PATH must report 2.x). Runs on native Windows as on
+POSIX, like the no-prompt module.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,7 +65,7 @@ def _path_opencode_is_v2() -> bool:
 HAVE_OPENCODE_V2 = _path_opencode_is_v2()
 pytestmark = pytest.mark.skipif(
     not HAVE_OPENCODE_V2,
-    reason="live turn needs a runnable OpenCode 2.x `opencode` on PATH (POSIX)",
+    reason="live turn needs a runnable OpenCode 2.x `opencode` on PATH",
 )
 
 httpx = pytest.importorskip("httpx")
@@ -168,16 +169,23 @@ class FakeLLM:
 
 @pytest.fixture
 def scrubbed_env(tmp_path, monkeypatch):
-    """os.environ reduced to PATH, LANG and a scratch HOME / XDG base — the
-    adapter spawns the server with this env, so nothing outside it (provider
-    keys, cloud credentials, the operator's opencode config) can reach it."""
+    """os.environ reduced to PATH, LANG (plus SYSTEMROOT on Windows) and a
+    scratch HOME / XDG base — the adapter spawns the server with this env, so
+    nothing outside it (provider keys, cloud credentials, the operator's
+    opencode config) can reach it."""
     home = tmp_path / "home"
     keep = {"PATH": os.environ["PATH"], "LANG": "C.UTF-8"}
+    if sys.platform == "win32":
+        # Without it the child cannot initialise Winsock, so the server fails
+        # every bind with "Failed to start server. Is port N in use?".
+        keep["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
     for key in list(os.environ):
         monkeypatch.delenv(key)
     for key, value in keep.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("HOME", str(home))
+    if sys.platform == "win32":
+        monkeypatch.setenv("USERPROFILE", str(home))  # the home directory there
     for var, rel in (
         ("XDG_CONFIG_HOME", ".config"),
         ("XDG_DATA_HOME", ".local/share"),

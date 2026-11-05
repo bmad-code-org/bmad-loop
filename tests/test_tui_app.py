@@ -802,6 +802,37 @@ async def test_task_table_shows_weighted_and_raw_tokens(project_tree):
         assert "660 tokens (1,160 raw)" in header
 
 
+async def test_task_table_marks_usage_relaunch_refunds(project_tree):
+    """DW-614: a counter that includes uncharged usage-limit relaunches (#959)
+    carries a `↻M` marker, so `×5` past the attempt cap is explained; a counter
+    with none stays a bare `×N`."""
+    root = project_tree.project
+    relaunched = StoryTask(
+        story_key="1-1-login", epic=1, phase=Phase.DEV_RUNNING, attempt=5, review_cycle=2
+    )
+    relaunched.dev_usage_relaunches = 2
+    plain = StoryTask(story_key="1-2-logout", epic=1, phase=Phase.DONE, attempt=1)
+    plain.review_cycle = 3
+    plain.review_usage_relaunches = 1
+    make_run(
+        root,
+        "20260611-100000-aaaa",
+        finished=True,
+        tasks={"1-1-login": relaunched, "1-2-logout": plain},
+    )
+    app = BmadLoopApp(root)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        screen = dashboard(app)
+        tasks_table = screen.query_one("#tasks", DataTable)
+        await until(pilot, lambda: screen.selected_run_id == "20260611-100000-aaaa")
+        await until(pilot, lambda: tasks_table.row_count == 2)
+        assert tasks_table.get_cell("1-1-login", "dev") == "×5 ↻2"
+        assert tasks_table.get_cell("1-1-login", "review") == "×2"
+        assert tasks_table.get_cell("1-2-logout", "dev") == "×1"
+        assert tasks_table.get_cell("1-2-logout", "review") == "×3 ↻1"
+
+
 async def test_zero_weighted_tokens_shows_zero_not_dash(project_tree):
     """With cache_read_weight=0 a cache-read-only task has weighted==0 but nonzero raw.
     The tokens cell must render "0" (a real value), not "-" — which reads as missing
@@ -9656,60 +9687,6 @@ def test_escalation_rearm_declines_a_run_whose_state_lock_is_held(project_tree, 
     assert "re-arm failed" not in notes[0][0]
 
 
-def test_rearm_contention_arm_precedes_the_generic_oserror_arm():
-    """`LockUnavailableError` SUBCLASSES `OSError`, so `_do_rearm`'s contention arm is
-    correct only in that ORDER: below the existing `except (RearmError, OSError,
-    runs.StateRootError)` it is unreachable and every contention is reported as a
-    fault, leaving the non-blocking acquire buying nothing.
-
-    The behavioral test above reddens on the same swap; this one names the property, so
-    the failure says what the invariant is instead of leaving the subclass relation to
-    be rediscovered from a toast.
-
-    Ablation: move the `except LockUnavailableError` arm after the OSError arm.
-    """
-    import ast
-    import inspect
-    import textwrap
-
-    from bmad_loop import platform_util
-    from bmad_loop.tui import app as app_mod
-
-    assert issubclass(platform_util.LockUnavailableError, OSError)  # the whole hazard
-
-    def caught(handler: ast.ExceptHandler) -> set[str]:
-        if handler.type is None:
-            return {"BaseException"}
-        names: set[str] = set()
-        for node in ast.walk(handler.type):
-            if isinstance(node, ast.Name):
-                names.add(node.id)
-            elif isinstance(node, ast.Attribute):
-                names.add(node.attr)
-        return names
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(app_mod.BmadLoopApp._do_rearm)))
-    paired = 0
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Try):
-            continue
-        arms = [caught(h) for h in node.handlers]
-        narrow = [i for i, names in enumerate(arms) if "LockUnavailableError" in names]
-        wide = [
-            i
-            for i, names in enumerate(arms)
-            if "LockUnavailableError" not in names and names & {"OSError", "BaseException"}
-        ]
-        if not narrow or not wide:
-            continue
-        paired += 1
-        assert max(narrow) < min(wide), (
-            "_do_rearm catches LockUnavailableError after a wider OSError arm — the "
-            "subclass makes the later arm unreachable, so contention is misreported"
-        )
-    assert paired == 1, "_do_rearm no longer pairs a LockUnavailableError arm with an OSError arm"
-
-
 def test_escalation_rearm_contention_does_not_echo_the_holders_journal_records(
     project_tree, monkeypatch
 ):
@@ -9954,44 +9931,18 @@ def test_escalation_rearm_judges_a_sweeps_store_under_the_configured_source(
     assert rearms == ([] if source == "tickets" else ["1"])
 
 
-def test_escalation_rearm_judges_a_v7_sweeps_store_as_a_tickets_run(project_v7, monkeypatch):
-    """The v7 leg of the sibling above: on v7 a sweep's ledger lives in the ticket
-    store whatever `[stories] source` says (`ticketstore.sweep_store_source`), so a
-    refused store is toasted before the re-arm under the sprint default too.
-    Ablation (performed): judge `live_policy.stories.source` and this FAILS (the
-    gesture re-arms)."""
-    from conftest import escalated_run
-
-    from bmad_loop import runs, ticketstore
-    from bmad_loop.journal import load_state
-
-    run_dir = escalated_run(project_v7.project, "r1", story_key="1", run_type="sweep").run_dir
-    state = load_state(run_dir)
-    state.initiative = project_v7.initiative  # pinned at launch, as `compose_sweep` does
-    save_state(run_dir, state)
-
-    def conflict(_project, store_source, _isolation, *, recorded=None):
-        return "the ticket store is not supported" if store_source == "tickets" else None
-
-    monkeypatch.setattr(ticketstore, "store_conflict", conflict)
-    monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)
-    monkeypatch.setattr(runs, "rearm_escalation", lambda *_a, **_k: pytest.fail("re-armed"))
-    notes: list[str] = []
-    app = BmadLoopApp(project_v7.project)
-    monkeypatch.setattr(app, "notify", lambda msg, **_k: notes.append(str(msg)))
-    monkeypatch.setattr(app, "_do_resume", lambda _run_id: None)
-
-    app._do_rearm(run_dir.name, run_dir, "1")
-
-    assert "the ticket store is not supported" in notes
-
-
 @pytest.mark.parametrize("chained", [True, False], ids=["chained", "unchained"])
 def test_escalation_rearm_judges_a_chained_childs_own_store(project_v7, monkeypatch, chained):
     """The re-arm's ticket-store refusal judges a chained child's sweep on the
     CHILD's store (`initiative=<child>`), as the resume it folds in does; an
     unchained sweep's call carries no `initiative`. Ablation (performed): drop the
-    `initiative` in `_do_rearm`'s store check and the chained row FAILS."""
+    `initiative` in `_do_rearm`'s store check and the chained row FAILS.
+
+    The stub refuses only a `"tickets"` source: on v7 a sweep's ledger lives in the
+    ticket store whatever `[stories] source` says (`ticketstore.sweep_store_source`),
+    so the refusal is toasted before the re-arm under the sprint default too.
+    Ablation: judge `live_policy.stories.source` and both rows FAIL (the gesture
+    re-arms)."""
     from conftest import escalated_run
 
     from bmad_loop import runs, ticketstore
@@ -10006,9 +9957,9 @@ def test_escalation_rearm_judges_a_chained_childs_own_store(project_v7, monkeypa
     save_state(run_dir, state)
     seen: list[dict] = []
 
-    def conflict(_project, _source, _isolation, **kw):
+    def conflict(_project, store_source, _isolation, **kw):
         seen.append(kw)
-        return "the ticket store is not supported"
+        return "the ticket store is not supported" if store_source == "tickets" else None
 
     monkeypatch.setattr(ticketstore, "store_conflict", conflict)
     monkeypatch.setattr(BmadLoopApp, "_resolve_blocked_by_liveness", lambda *_a: False)

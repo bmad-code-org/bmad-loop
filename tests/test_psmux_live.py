@@ -5,7 +5,8 @@ faked subprocess; what no unit layer can prove is the transport half — a real
 psmux server holding two projects' windows on one shared control session, a
 prune in one project, and the other project's window *and its option keys*
 surviving the kill. Same zero-token contract as test_opencode_live: parked
-windows run a plain `exit 0`, no coding CLI is ever launched.
+windows run a plain `exit 0` (or a sleep, or a pwsh key echo), no coding CLI is
+ever launched.
 
 The `test_premise_*` probes observe upstream psmux behavior *directly* — raw argv, no
 backend verb under test — so the assumptions the workarounds in psmux_backend
@@ -213,9 +214,11 @@ def _raw_new_session(mux: PsmuxMultiplexer, session: str, cwd: Path) -> None:
     ), "probe setup: probe session was not observable by plain name"
 
 
-def _mint_probe_window(mux: PsmuxMultiplexer, session: str, name: str, cwd: Path) -> str:
+def _mint_probe_window(
+    mux: PsmuxMultiplexer, session: str, name: str, cwd: Path, argv: list[str] = PARKED_ARGV
+) -> str:
     before = set(mux.list_window_ids(session))
-    mux.new_parked_window(session, name, cwd, PARKED_ARGV, "@r")
+    mux.new_parked_window(session, name, cwd, argv, "@r")
     deadline = time.monotonic() + 5
     created: set[str] = set()
     while time.monotonic() < deadline:
@@ -865,6 +868,54 @@ def test_adopted_pipe_pane_delivers_pane_bytes_through_the_flag_transport(probe,
         f"psmux/psmux#563), so the run log is silently empty. Captured: {text[:200]!r}"
     )
     assert not log.with_name(log.name + ".sink.ps1").exists()  # no sidecar, ever again
+
+
+# Zero tokens: a pwsh child that prints READY, then reads two keys straight off
+# the console input and echoes each one's char code and ConsoleKey name.
+KEY_ECHO_ARGV = [
+    "pwsh",
+    "-NoProfile",
+    "-Command",
+    "Write-Output READY; foreach ($n in 1..2) { $k = [Console]::ReadKey($true); "
+    "Write-Output ('KEY=' + [int]$k.KeyChar + ':' + $k.Key) }",
+]
+
+
+def test_adopted_send_keys_named_keys_reach_the_child(probe, tmp_path):
+    """The parked-prompt answer keys (#855) through the backend verb: a named
+    `Escape` must reach the ConPTY child as a real ESC (27) and `Enter` as a
+    carriage return (13), each read back from the child's own echo of the key.
+    A red here means psmux stopped mapping the name the backend sends, so the
+    dashboard's decline or confirm presses something else."""
+    mux, session, _windows = probe
+    screen = ""
+    for attempt in range(2):  # psmux/psmux#482's spawn race
+        window = _mint_probe_window(mux, session, f"keys-{attempt}", tmp_path, KEY_ECHO_ARGV)
+        screen = ""
+        deadline = time.monotonic() + 7.5
+        while "READY" not in screen and time.monotonic() < deadline:
+            time.sleep(0.25)
+            screen = mux.capture_pane(window)
+        if "READY" not in screen:
+            continue
+        mux.send_keys(window, "Escape")
+        deadline = time.monotonic() + 7.5
+        while "KEY=" not in screen and time.monotonic() < deadline:
+            time.sleep(0.25)
+            screen = mux.capture_pane(window)
+        mux.send_keys(window, "Enter")
+        deadline = time.monotonic() + 7.5
+        while screen.count("KEY=") < 2 and time.monotonic() < deadline:
+            time.sleep(0.25)
+            screen = mux.capture_pane(window)
+        break
+    assert "READY" in screen, f"probe setup: the key-echo child never started: {screen!r}"
+    keys = re.findall(r"KEY=(\d+):(\w+)", screen)
+    assert keys == [("27", "Escape"), ("13", "Enter")], (
+        "psmux delivered the named keys as something else — `send-keys Escape` / "
+        f"`Enter` no longer reach the child as ESC / CR. Read back: {keys!r}; "
+        f"screen: {screen[-400:]!r}"
+    )
 
 
 def test_a_pinned_pwsh_path_with_shell_syntax_launches_and_pipes(probe, tmp_path, monkeypatch):

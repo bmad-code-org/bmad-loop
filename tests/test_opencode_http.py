@@ -64,11 +64,11 @@ from bmad_loop.adapters.opencode_http import (
     _sum_args,
     _sum_usage,
 )
-from bmad_loop.adapters.opencode_protocol import SUPPORTED, V1Protocol, V2Protocol
+from bmad_loop.adapters.opencode_protocol import SUPPORTED, UsageFault, V1Protocol, V2Protocol
 from bmad_loop.adapters.profile import get_profile
 from bmad_loop.bmadconfig import ProjectPaths
 from bmad_loop.journal import TASK_CYCLE_ARTIFACTS
-from bmad_loop.model import TokenUsage
+from bmad_loop.model import UNATTRIBUTED_MODEL, TokenUsage
 from bmad_loop.policy import LimitsPolicy, NotifyPolicy, Policy
 from bmad_loop.process_host import ProcessHostError, get_process_host
 
@@ -117,6 +117,14 @@ PINNED_EPOCH_MS = 1_784_218_739_410
 #                      `session.execution.failed` is published
 #   provider-quota-after-work  provider-quota, but Session.Info reports the
 #                      tokens of work already done (the #764 veto's measurement)
+#   background-child   (V2) the first turn starts a `background: true` child
+#                      session and ends result-less while the child runs; ~1s
+#                      later the child writes the result and goes idle. While
+#                      a child exists `/api/session?parentID=<SESSION_ID>` lists
+#                      it; while it runs `/api/session/active` lists it too
+#   background-child-stuck  (V2) the parent writes the result and ends its turn;
+#                      its background child runs forever
+#   active-map-fault   (V2) completed, but `/api/session/active` answers 500
 # FAKE_OPENCODE_START_FAILURES=N makes the first N spawns exit(1) pre-bind;
 # FAKE_OPENCODE_START_FAILURE_LINE is printed to stdout just before each such exit.
 # FAKE_OPENCODE_LOG_LINE: written to the server's own stdout at the top of every
@@ -197,7 +205,8 @@ if START_FAILURES:
 SESSION_ID = "ses_fake0000000000000000000001"
 CHILD_SESSION_ID = "ses_fakechild00000000000000001"
 LOCK = threading.Lock()
-STATE = {"busy": False, "completed_ms": 0, "prompts": 0, "streams": 0}
+STATE = {"busy": False, "completed_ms": 0, "prompts": 0, "streams": 0,
+         "child": False, "child_busy": False}
 EVENTS = []
 EVENT_IDS = itertools.count(1)
 USER_MSGS = []  # V2 inbox items, oldest first
@@ -285,6 +294,21 @@ def finish_turn():
         STATE["busy"] = False
 
 
+def start_child():
+    # A `background: true` subagent: listed under the parent, running.
+    with LOCK:
+        STATE["child"] = True
+        STATE["child_busy"] = True
+
+
+def finish_child_later():
+    time.sleep(1.0)
+    write_result()
+    with LOCK:
+        STATE["child_busy"] = False
+    push(v2_frame("session.execution.succeeded", sessionID=CHILD_SESSION_ID))
+
+
 def run_turn():
     with LOCK:
         STATE["busy"] = True
@@ -301,8 +325,15 @@ def run_turn():
                 if STATE["streams"] >= 2:
                     break
             time.sleep(0.02)
-    if SCENARIO in ("completed", "sse-drop-once"):
+    if SCENARIO in ("completed", "sse-drop-once", "active-map-fault"):
         write_result(); write_spec(); finish_turn(); push_idle()
+    elif SCENARIO == "background-child":
+        if n == 1:
+            start_child()
+            threading.Thread(target=finish_child_later, daemon=True).start()
+        finish_turn(); push_idle()
+    elif SCENARIO == "background-child-stuck":
+        start_child(); write_result(); finish_turn(); push_idle()
     elif SCENARIO == "nudge-then-complete":
         if n >= 2:
             write_result()
@@ -437,15 +468,25 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/event":
             self._sse()
         elif path == "/api/session/active":
+            if SCENARIO == "active-map-fault":
+                self._json(500, {"_tag": "InternalError"})
+                return
             with LOCK:
-                busy = STATE["busy"]
-            self._json(200, {"data": {SESSION_ID: {"type": "running"}} if busy else {}})
+                busy, child_busy = STATE["busy"], STATE["child_busy"]
+            active = {SESSION_ID: {"type": "running"}} if busy else {}
+            if child_busy:
+                active[CHILD_SESSION_ID] = {"type": "running"}
+            self._json(200, {"data": active})
         elif path == f"/api/session/{SESSION_ID}/message":
             self._message_page(parse_qs(urlsplit(self.path).query))
         elif path == f"/api/session/{SESSION_ID}":
             self._json(200, {"data": session_info()})
         elif path == "/api/session":
-            self._json(200, {"data": [], "cursor": {"previous": None, "next": None}})
+            parent = (parse_qs(urlsplit(self.path).query).get("parentID") or [""])[0]
+            with LOCK:
+                child = STATE["child"]
+            children = [child_info()] if child and parent == SESSION_ID else []
+            self._json(200, {"data": children, "cursor": {"previous": None, "next": None}})
         elif path in ("/api/model", "/api/model/default"):
             query = parse_qs(urlsplit(self.path).query)
             directory = (query.get("location[directory]") or [""])[0]
@@ -597,6 +638,14 @@ def session_info(title=""):
     return {"id": SESSION_ID, "title": title, "cost": 0.01 if done else 0,
             "tokens": turn_tokens(), "outcome": "succeeded" if done else None,
             "time": {"created": now_ms(), "updated": now_ms(), "idle": done or None}}
+
+
+def child_info():
+    # The background child's `Session.Info`, listed under the parent.
+    return {"id": CHILD_SESSION_ID, "parentID": SESSION_ID, "title": "subagent", "cost": 0,
+            "tokens": {"input": 10, "output": 5, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}},
+            "time": {"created": now_ms(), "updated": now_ms()}}
 
 
 def v2_messages():
@@ -5267,6 +5316,801 @@ def test_v2_capture_crumbs_an_unread_active_map(tmp_path, active, error):
     )
     (crumb,) = _child_active_crumbs(adapter)
     assert crumb["event"] == "usage-child-active-failed" and crumb["error"] == error
+
+
+# ------------------------ OpenCode 2.x (V2) turn end held on a running subagent
+
+_FAKE_CHILD_ID = "ses_fakechild00000000000000001"
+
+
+def _descendant_crumbs(tmp_path: Path) -> list[dict]:
+    return [c for c in _lifecycle(tmp_path) if c["event"].startswith("descendant-")]
+
+
+def _descendant_adapter(tmp_path: Path, launcher, grace_s: float) -> OpencodeHttpAdapter:
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    adapter._stall_grace_s = grace_s
+    adapter.descendant_poll_s = 0.1
+    return adapter
+
+
+def test_v2_turn_end_waits_for_a_background_child(tmp_path, v2_fake):
+    """The parent's turn ends result-less while its background child still
+    runs; the turn end is held until the child (which writes the result)
+    goes idle, so the session completes on its first prompt without a nudge.
+
+    ABLATION: drop the `_await_descendants` call in `_wait_loop`'s idle branch
+    and the result-less turn end is nudged — a second prompt is sent."""
+    launcher, rec = v2_fake
+    adapter = _descendant_adapter(tmp_path, launcher, grace_s=10.0)
+
+    result = adapter.run(make_spec(tmp_path, rec, "background-child"))
+
+    assert result.status == "completed"
+    assert result.result_json == {"ok": True, "workflow": "fake-triage"}
+    assert len(prompt_texts(rec)) == 1
+    started, ended = _descendant_crumbs(tmp_path)
+    assert started["event"] == "descendant-wait-started"
+    assert started["sessions"] == [_FAKE_CHILD_ID] and started["grace_s"] == 10.0
+    assert ended["event"] == "descendant-wait-ended"
+    assert ended["probe_failures"] == 0 and 0 < ended["waited_s"] < 10.0
+    assert_server_gone(rec)
+
+
+def test_v2_descendant_wait_times_out_naming_the_child(tmp_path, v2_fake):
+    """A background child that outlives the stall grace: the wait journals
+    `descendant-wait-timeout` naming it, then the turn end is handled as
+    before (the parent's result completes the session).
+
+    ABLATION: drop the `_await_descendants` call in `_wait_loop`'s idle branch
+    and no `descendant-*` crumb is written."""
+    launcher, rec = v2_fake
+    adapter = _descendant_adapter(tmp_path, launcher, grace_s=0.8)
+
+    result = adapter.run(make_spec(tmp_path, rec, "background-child-stuck"))
+
+    assert result.status == "completed"
+    assert result.result_json == {"ok": True, "workflow": "fake-triage"}
+    assert len(prompt_texts(rec)) == 1
+    started, timeout = _descendant_crumbs(tmp_path)
+    assert started["event"] == "descendant-wait-started"
+    assert started["sessions"] == [_FAKE_CHILD_ID]
+    assert timeout["event"] == "descendant-wait-timeout"
+    assert timeout["sessions"] == [_FAKE_CHILD_ID]
+    assert timeout["waited_s"] >= 0.7 and timeout["probe_failures"] == 0
+    assert "error" not in timeout
+    assert_server_gone(rec)
+
+
+def test_v2_descendant_probe_fault_waits_to_the_grace_bound(tmp_path, v2_fake):
+    """`/api/session/active` answering 500 is never "none active": the wait
+    starts with unknown `sessions` and the fault, crumbs
+    `descendant-probe-failed` once for the streak, and lasts to the grace
+    bound — never an early `descendant-wait-ended`.
+
+    ABLATION: return True from `_await_descendants` when the first probe
+    faults (read a fault as "none active") and no crumb is written."""
+    launcher, rec = v2_fake
+    adapter = _descendant_adapter(tmp_path, launcher, grace_s=0.8)
+
+    result = adapter.run(make_spec(tmp_path, rec, "active-map-fault"))
+
+    assert result.status == "completed"
+    crumbs = _descendant_crumbs(tmp_path)
+    assert [c["event"] for c in crumbs] == [
+        "descendant-wait-started",
+        "descendant-probe-failed",
+        "descendant-wait-timeout",
+    ]
+    started, failed, timeout = crumbs
+    assert started["sessions"] is None and started["error"] == "HTTP 500"
+    assert failed["error"] == "HTTP 500"
+    assert timeout["sessions"] is None and timeout["error"] == "HTTP 500"
+    assert timeout["waited_s"] >= 0.7 and timeout["probe_failures"] >= 2
+    assert_server_gone(rec)
+
+
+def test_v2_session_deadline_cuts_the_descendant_wait(tmp_path, v2_fake):
+    """A session deadline inside the wait cuts it (`descendant-wait-cut`,
+    reason `timeout`) and the loop's own timeout arm takes the verdict.
+
+    ABLATION: drop the deadline check in `_await_descendants` and the wait
+    (its `wait_end`/`wall_end` already clamped to the session deadline) ends
+    at the deadline as `descendant-wait-timeout` and returns True, so the
+    parent's result completes the session — `completed`, not `timeout`."""
+    launcher, rec = v2_fake
+    adapter = _descendant_adapter(tmp_path, launcher, grace_s=30.0)
+
+    result = adapter.run(make_spec(tmp_path, rec, "background-child-stuck", timeout_s=2.0))
+
+    assert result.status == "timeout"
+    events = [c["event"] for c in _lifecycle(tmp_path)]
+    assert events.index("descendant-wait-cut") < events.index("timeout-fired")
+    (cut,) = [c for c in _descendant_crumbs(tmp_path) if c["event"] == "descendant-wait-cut"]
+    assert cut["reason"] == "timeout" and cut["sessions"] == [_FAKE_CHILD_ID]
+    assert_server_gone(rec)
+
+
+class _ProbeSpy:
+    """A protocol stand-in answering `active_descendants` from a fixed reply,
+    counting the calls."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = 0
+
+    def active_descendants(self, _client, _session_id):
+        self.calls += 1
+        return self.reply
+
+
+class _Proc:
+    def __init__(self, code=None):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+
+def _await(
+    adapter,
+    sess,
+    *,
+    deadline_in: float = 60.0,
+    budget_in: float | None = None,
+    tick=lambda: False,
+) -> bool:
+    budget_at = None if budget_in is None else time.monotonic() + budget_in
+    return adapter._await_descendants(
+        SessionHandle(task_id="t-d", native_id=sess.session_id),
+        sess,
+        deadline=time.monotonic() + deadline_in,
+        wall_deadline=time.time() + deadline_in,
+        budget_due=lambda: budget_at is not None and time.monotonic() >= budget_at,
+        tick=tick,
+    )
+
+
+def test_descendant_wait_never_probes_without_grace_or_on_v1(tmp_path):
+    """A zero stall grace (the plain adapter) never probes; a V1 session
+    answers "none active" without a request — neither waits nor journals.
+
+    ABLATION: drop the `grace <= 0` early return and the grace-0 case
+    probes (and, the child being active, waits)."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    spy = _ProbeSpy((["ses_child"], None))
+    sess.protocol = spy  # type: ignore[assignment]
+    adapter._stall_grace_s = 0.0
+    assert _await(adapter, sess) is True
+    assert spy.calls == 0
+
+    adapter._stall_grace_s = 5.0
+    v1 = _v2_sess(_V2_SID)
+    v1.protocol = V1Protocol()
+    v1.client = _V2RouteClient()
+    v1.process = _Proc()  # type: ignore[assignment]
+    assert _await(adapter, v1) is True
+    assert v1.client.gets == []
+    assert _lifecycle_lines(adapter, "t-d") == []
+
+
+@pytest.mark.parametrize("reason", ["stop", "server-exited", "timeout", "budget"])
+def test_descendant_wait_is_cut_by_stop_death_or_deadline(tmp_path, monkeypatch, reason):
+    """A hard stop, server death, the session deadline or an expired
+    enforce-mode budget grace cuts the wait short (False,
+    `descendant-wait-cut` naming the reason and the still-active sessions) so
+    the wait loop's own arms decide the verdict.
+
+    ABLATION: drop the matching check in `_await_descendants` and the wait
+    ends as `descendant-wait-timeout` and returns True instead — at its grace
+    bound for stop / server-exited / budget, and at once for timeout, whose
+    `wait_end`/`wall_end` are already clamped to the (past) session deadline."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 0.3
+    adapter.descendant_poll_s = 0.05
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _ProbeSpy((["ses_child"], None))  # type: ignore[assignment]
+    sess.process = _Proc(0 if reason == "server-exited" else None)  # type: ignore[assignment]
+    monkeypatch.setattr(adapter, "_hard_stop_requested", lambda: reason == "stop")
+
+    assert (
+        _await(
+            adapter,
+            sess,
+            deadline_in=0.0 if reason == "timeout" else 60.0,
+            budget_in=0.0 if reason == "budget" else None,
+        )
+        is False
+    )
+
+    started, cut = _lifecycle_lines(adapter, "t-d")
+    assert started["event"] == "descendant-wait-started"
+    assert cut["event"] == "descendant-wait-cut"
+    assert cut["reason"] == reason and cut["sessions"] == ["ses_child"]
+
+
+@pytest.mark.parametrize("reason", ["stop", "timeout", "budget"])
+def test_descendant_wait_rechecks_cuts_after_an_empty_probe(tmp_path, monkeypatch, reason):
+    """A stop, the session deadline or a budget grace that expires while the
+    probe runs still cuts the wait when that probe reads "none active" — the
+    empty answer must not hand the loop a turn end to read as `completed`.
+
+    ABLATION: drop the `cut_reason()` recheck in the `not active` branch and
+    the wait ends `descendant-wait-ended` (True) instead."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 30.0
+    adapter.descendant_poll_s = 0.01
+    stopped = {"now": False}
+
+    class _SlowEmpty:
+        calls = 0
+
+        def active_descendants(self, _client, _session_id):
+            self.calls += 1
+            if self.calls == 1:
+                return ["ses_child"], None
+            time.sleep(0.3)  # the cutoff lands during this probe
+            stopped["now"] = True
+            return [], None
+
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _SlowEmpty()  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        adapter, "_hard_stop_requested", lambda: reason == "stop" and stopped["now"]
+    )
+
+    assert (
+        _await(
+            adapter,
+            sess,
+            deadline_in=0.2 if reason == "timeout" else 60.0,
+            budget_in=0.2 if reason == "budget" else None,
+        )
+        is False
+    )
+
+    started, cut = _lifecycle_lines(adapter, "t-d")
+    assert started["event"] == "descendant-wait-started"
+    assert cut["event"] == "descendant-wait-cut" and cut["reason"] == reason
+
+
+@pytest.mark.parametrize("reason", ["stop", "timeout", "budget"])
+def test_descendant_wait_rechecks_cuts_after_an_empty_first_probe(tmp_path, monkeypatch, reason):
+    """The first probe gets the same recheck: a stop, the session deadline or
+    a budget grace that expires while it runs cuts the wait even when it reads
+    "none active". The cut is the only line journaled; no wait started.
+
+    ABLATION: return True on the first empty answer without `cut_reason()`
+    and the wait reads as "nothing active" (True, nothing journaled)."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 30.0
+    adapter.descendant_poll_s = 0.01
+    stopped = {"now": False}
+
+    class _SlowEmptyFirst:
+        def active_descendants(self, _client, _session_id):
+            time.sleep(0.3)  # the cutoff lands during this probe
+            stopped["now"] = True
+            return [], None
+
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _SlowEmptyFirst()  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        adapter, "_hard_stop_requested", lambda: reason == "stop" and stopped["now"]
+    )
+
+    assert (
+        _await(
+            adapter,
+            sess,
+            deadline_in=0.2 if reason == "timeout" else 60.0,
+            budget_in=0.2 if reason == "budget" else None,
+        )
+        is False
+    )
+
+    (cut,) = _lifecycle_lines(adapter, "t-d")
+    assert cut["event"] == "descendant-wait-cut"
+    assert cut["reason"] == reason and cut["sessions"] == []
+
+
+def test_descendant_wait_tick_settling_the_session_cuts_it_as_budget(tmp_path):
+    """`tick` answering True (a zero-grace enforce trip sampled mid-wait)
+    cuts the wait as `budget` at once.
+
+    ABLATION: ignore `tick`'s answer and the wait runs to its grace bound
+    (`descendant-wait-timeout`, True)."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 0.3
+    adapter.descendant_poll_s = 0.01
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _ProbeSpy((["ses_child"], None))  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+
+    assert _await(adapter, sess, tick=lambda: True) is False
+
+    _started, cut = _lifecycle_lines(adapter, "t-d")
+    assert cut["event"] == "descendant-wait-cut" and cut["reason"] == "budget"
+
+
+def test_descendant_wait_grace_counts_the_first_probe(tmp_path):
+    """The grace runs from before the first probe: a probe slower than the
+    grace leaves no fresh grace to wait out after it.
+
+    ABLATION: start the clock after the first probe and the wait polls on for
+    a full grace, so it waits well past the probe's own duration."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 0.5
+    adapter.descendant_poll_s = 0.01
+
+    class _SlowFirst:
+        calls = 0
+
+        def active_descendants(self, _client, _session_id):
+            self.calls += 1
+            if self.calls == 1:
+                time.sleep(0.6)
+            return ["ses_child"], None
+
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _SlowFirst()  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+
+    began = time.monotonic()
+    assert _await(adapter, sess) is True
+    elapsed = time.monotonic() - began
+
+    _started, timeout = _lifecycle_lines(adapter, "t-d")
+    assert timeout["event"] == "descendant-wait-timeout"
+    assert elapsed < 0.9  # the 0.6s probe, not the probe plus a fresh 0.5s grace
+
+
+@pytest.mark.parametrize("grace_s", [0.3, 0.0], ids=["grace", "zero-grace"])
+def test_v2_budget_is_sampled_while_a_turn_end_waits_on_a_child(
+    tmp_path, v2_fake, monkeypatch, grace_s
+):
+    """A background child spending past an enforce-mode cap while the parent's
+    turn end is held trips the budget there, and the session ends `over_budget`
+    rather than `completed` on the parent's result.
+
+    ABLATION: hand `_await_descendants` the bare `beat` (no budget sample) and
+    the `grace` case runs the wait to its grace bound, then the parent's result
+    completes it."""
+    monkeypatch.setattr(opencode_http, "HEARTBEAT_INTERVAL_S", 0.05)
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher), policy=_budget_policy())
+    adapter._stall_grace_s = 3.0
+    adapter.descendant_poll_s = 0.05
+    waiting = {"now": False}
+    real_wait = adapter._await_descendants
+
+    def flagged_wait(*args, **kwargs):
+        waiting["now"] = True
+        return real_wait(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_await_descendants", flagged_wait)
+    # Under the cap until the turn end is held, then the child's spend lands.
+    monkeypatch.setattr(
+        adapter,
+        "_sample_weighted_usage",
+        lambda _sess, _spec: (5_000_000 if waiting["now"] else 1, None),
+    )
+    spec = make_spec(
+        tmp_path,
+        rec,
+        "background-child-stuck",
+        token_budget=1_000_000,
+        token_budget_mode="enforce",
+        token_budget_grace_s=grace_s,
+    )
+
+    result = adapter.run(spec)
+
+    assert result.status == "over_budget"
+    assert result.budget_weighted == 5_000_000
+    lifecycle = _lifecycle(tmp_path)
+    (tripped,) = [c for c in lifecycle if c["event"] == "budget-tripped"]
+    assert tripped["weighted"] == 5_000_000
+    (cut,) = [c for c in lifecycle if c["event"] == "descendant-wait-cut"]
+    assert cut["reason"] == "budget"
+    (fired,) = [c for c in lifecycle if c["event"] == "over-budget-fired"]
+    assert fired["zero_grace"] is (grace_s == 0.0)
+    assert_server_gone(rec)
+
+
+def test_descendant_probe_recovery_ends_a_faulted_wait(tmp_path):
+    """A fault streak is crumbed once; a later probe that reads "none
+    active" ends the wait (`descendant-wait-ended` counting the faults).
+
+    ABLATION: crumb `descendant-probe-failed` on every fault and the streak
+    writes two."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 5.0
+    adapter.descendant_poll_s = 0.01
+    replies = iter([(None, "HTTP 500"), (None, "HTTP 500"), (None, "HTTP 503"), ([], None)])
+
+    class _Seq:
+        def active_descendants(self, _client, _session_id):
+            return next(replies)
+
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _Seq()  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+
+    assert _await(adapter, sess) is True
+
+    events = [(c["event"], c.get("error")) for c in _lifecycle_lines(adapter, "t-d")]
+    assert events == [
+        ("descendant-wait-started", "HTTP 500"),
+        ("descendant-probe-failed", "HTTP 500"),
+        ("descendant-wait-ended", None),
+    ]
+    assert _lifecycle_lines(adapter, "t-d")[-1]["probe_failures"] == 3
+
+
+def _v2_modeled(session_id: str, parent_id: str, model, **tokens) -> dict:
+    """A listed child `Session.Info` carrying a `model` ref (any value)."""
+    return {**_v2_child(session_id, parent_id, **tokens), "model": model}
+
+
+_REF_AX = {"id": "x", "providerID": "a", "variant": "high"}
+_REF_BY = {"id": "y", "providerID": "b"}
+_REF_CZ = {"id": "z", "providerID": "c"}
+
+
+def _v2_models_client(tree: dict, **info_tokens) -> _V2RouteClient:
+    return _V2RouteClient(
+        **{_V2_INFO: [_v2_info(**(info_tokens or {"input": 100}))], _V2_LIST: [_v2_tree(tree)]}
+    )
+
+
+def test_v2_usage_models_fold_every_descendants_model_ref():
+    """DW-619: a subagent that ran on another model is in `models` — the
+    parent transcript's first, then each descendant's `Session.Info.model`
+    ref in walk order (child, then grandchild), variant ignored; the token
+    figure is the same sum as before.
+
+    ABLATION: return `_v2_models(transcript)` from `V2Protocol.usage` and
+    this reddens (`("a/x",)`)."""
+    tree = {
+        _V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY, input=20))],
+        "ses_a": [_v2_children(_v2_modeled("ses_a1", "ses_a", _REF_CZ, output=3))],
+    }
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert fault is None
+    assert usage == TokenUsage(input_tokens=120, output_tokens=3)
+    assert usage.models == ("a/x", "b/y", "c/z")
+
+
+@pytest.mark.parametrize(
+    "child",
+    [
+        pytest.param(_v2_modeled("ses_a", _V2_SID, {**_REF_AX, "variant": "low"}), id="duplicate"),
+        pytest.param(_v2_child("ses_a", _V2_SID), id="no-model-key"),
+        pytest.param(_v2_modeled("ses_a", _V2_SID, None), id="model-null"),
+    ],
+)
+def test_v2_usage_child_model_adds_nothing_new(child):
+    """A child on the parent's model is not repeated, and a child with no
+    `model` ref (it ran the server default, which the parent's transcript
+    already names) contributes nothing — neither is a fault."""
+    usage, fault = V2Protocol().usage(
+        _v2_models_client({_V2_SID: [_v2_children(child)]}),
+        _V2_SID,
+        [_v2_assistant(1, model=_REF_AX)],
+    )
+    assert fault is None and usage is not None
+    assert usage.models == ("a/x",)
+
+
+@pytest.mark.parametrize(
+    "ref, error",
+    [
+        pytest.param("b/y", "TypeError: model is str, not an object", id="string"),
+        pytest.param({"id": "y"}, "ValueError: providerID is None", id="no-provider"),
+        pytest.param({"providerID": "b", "id": ""}, "ValueError: id is ''", id="empty-id"),
+        pytest.param({"providerID": "b", "id": 5}, "ValueError: id is 5", id="id-not-str"),
+    ],
+)
+def test_v2_usage_malformed_child_model_is_a_models_fault(ref, error):
+    """A malformed child ref keeps the whole token figure and every readable
+    model (the parent's, a well-formed sibling's) and returns a `models`
+    fault naming the child beside the usage — never a None usage.
+
+    ABLATION: return `None` in place of the fold's fault and this reddens."""
+    tree = {
+        _V2_SID: [
+            _v2_children(
+                _v2_modeled("ses_bad", _V2_SID, ref, input=7),
+                _v2_modeled("ses_b", _V2_SID, _REF_BY, input=3),
+            )
+        ]
+    }
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert usage == TokenUsage(input_tokens=110)
+    assert usage.models == ("a/x", "b/y")
+    assert fault is not None and fault.stage == "models"
+    assert fault.error.startswith(f"child session ses_bad model: {error}")
+
+
+def test_v2_usage_several_malformed_child_models_join_in_one_fault():
+    tree = {
+        _V2_SID: [
+            _v2_children(
+                _v2_modeled("ses_a", _V2_SID, "a/x"),
+                _v2_modeled("ses_b", _V2_SID, {"id": "y"}),
+            )
+        ]
+    }
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert usage is not None and usage.models == ("a/x",)
+    assert fault == UsageFault(
+        "models",
+        "child session ses_a model: TypeError: model is str, not an object; "
+        "child session ses_b model: ValueError: providerID is None, not a non-empty string",
+    )
+
+
+@pytest.mark.parametrize("ref", [_REF_BY, "b/y"], ids=["well-formed", "malformed"])
+def test_v2_usage_child_models_unconsulted_without_a_transcript(ref):
+    """An unread transcript leaves `models` None — unknown — whatever the
+    children's refs say, and a malformed one is not a fault then."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, ref, input=1))]}
+    usage, fault = V2Protocol().usage(_v2_models_client(tree), _V2_SID, None)
+    assert fault is None and usage == TokenUsage(input_tokens=101)
+    assert usage.models is None
+
+
+@pytest.mark.parametrize("ref", [_REF_BY, "b/y"], ids=["well-formed", "malformed"])
+def test_v2_usage_child_models_unconsulted_when_the_transcript_names_none(ref):
+    """A transcript read but naming no model stays `()` (unresolved): a child
+    ref never becomes element 0, and a malformed one is not a fault then.
+
+    ABLATION: guard `_fold_child_models` on `models is None` only and both
+    cases redden (`("b/y",)`; a `models` fault)."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, ref, input=1))]}
+    usage, fault = V2Protocol().usage(_v2_models_client(tree), _V2_SID, [_v2_assistant(1)])
+    assert fault is None and usage == TokenUsage(input_tokens=101)
+    assert usage.models == ()
+
+
+def test_v2_usage_untracked_ignores_child_models():
+    """A zero total with no completed step is untracked `(None, None)` even
+    when a child's model ref is malformed."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, "b/y"))]}
+    client = _V2RouteClient(**{_V2_INFO: [_v2_info()], _V2_LIST: [_v2_tree(tree)]})
+    assert V2Protocol().usage(client, _V2_SID, [_v2_assistant(None)]) == (None, None)
+
+
+def test_v2_usage_reads_child_models_off_the_one_token_walk():
+    """The models fold costs no request: `usage` makes the session GET and ONE
+    descendant walk (a listing per session in the tree), and never fetches a
+    child's messages."""
+    tree = {
+        _V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY))],
+        "ses_a": [_v2_children(_v2_modeled("ses_a1", "ses_a", _REF_CZ))],
+    }
+    client = _v2_models_client(tree)
+    usage, fault = V2Protocol().usage(client, _V2_SID, [_v2_assistant(1, model=_REF_AX)])
+    assert fault is None and usage is not None and usage.models == ("a/x", "b/y", "c/z")
+    assert client.gets == [
+        (_V2_INFO, None),
+        (_V2_LIST, {"parentID": _V2_SID, "limit": 200}),
+        (_V2_LIST, {"parentID": "ses_a", "limit": 200}),
+        (_V2_LIST, {"parentID": "ses_a1", "limit": 200}),
+    ]
+
+
+def _assert_split(usage) -> None:
+    """The DW-618 invariants: `by_model` sums field-wise to the totals, and
+    every key is an observed model or the sentinel."""
+    assert usage is not None and usage.by_model is not None
+    summed = TokenUsage()
+    for each in usage.by_model.values():
+        summed.add(each)
+    assert summed == usage
+    assert set(usage.by_model) <= {*usage.models, UNATTRIBUTED_MODEL}
+
+
+def test_v1_usage_splits_tokens_per_message_model():
+    """DW-618: V1 bills each assistant message's tokens to its
+    `"<providerID>/<modelID>"`; a message missing either half is
+    unattributed.
+
+    ABLATION: bucket every message under the first model and the split
+    names one model."""
+    messages = [
+        _v1_assistant("anthropic", "claude-sonnet-4-5", output=2),
+        _v1_assistant("openai", "gpt-5", cache={"read": 4, "write": 1}),
+        _v1_assistant("anthropic", "claude-sonnet-4-5", reasoning=3),
+        _v1_assistant("openai", None),
+    ]
+    usage, fault = V1Protocol().usage(None, "ses_1", messages)
+    assert fault is None
+    _assert_split(usage)
+    assert usage.by_model == {
+        "anthropic/claude-sonnet-4-5": TokenUsage(input_tokens=2, output_tokens=5),
+        "openai/gpt-5": TokenUsage(input_tokens=1, cache_read_tokens=4, cache_creation_tokens=1),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=1),
+    }
+
+
+def test_v2_usage_splits_session_aggregates_per_model():
+    """DW-618: a single-model parent's own aggregate bills to that model, and
+    each descendant's aggregate to its `model` ref; a child without a ref
+    (server default) is unattributed.
+
+    ABLATION: bill the summed usage (parent + children) to the parent's model
+    and the split overshoots the totals."""
+    tree = {
+        _V2_SID: [
+            _v2_children(
+                _v2_modeled("ses_a", _V2_SID, _REF_BY, input=20),
+                _v2_child("ses_b", _V2_SID, input=5),
+            )
+        ],
+        "ses_a": [_v2_children(_v2_modeled("ses_a1", "ses_a", _REF_CZ, output=3))],
+    }
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert fault is None
+    _assert_split(usage)
+    assert usage.by_model == {
+        "a/x": TokenUsage(input_tokens=100),
+        "b/y": TokenUsage(input_tokens=20),
+        "c/z": TokenUsage(output_tokens=3),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=5),
+    }
+
+
+def test_v2_usage_multi_model_parent_is_unattributed():
+    """A parent whose transcript names two models (a mid-session switch) has
+    one aggregate and no per-step split: it bills to the sentinel, while a
+    child still bills to its own ref.
+
+    ABLATION: bill the parent to `parent_models[0]` and `a/x` holds it."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_CZ, input=20))]}
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree),
+        _V2_SID,
+        [_v2_assistant(1, model=_REF_AX), _v2_assistant(2, model=_REF_BY)],
+    )
+    assert fault is None
+    _assert_split(usage)
+    assert usage.by_model == {
+        "c/z": TokenUsage(input_tokens=20),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=100),
+    }
+
+
+@pytest.mark.parametrize("bad", [None, "a/x", {"id": "x"}], ids=["absent", "string", "half"])
+def test_v2_usage_parent_with_an_unreadable_model_ref_is_unattributed(bad):
+    """An assistant message whose `model` ref is missing or malformed is still
+    in the parent's aggregate, so the one readable model does not own that
+    aggregate: it bills to the sentinel (the model list is unchanged).
+
+    ABLATION: bill the parent to the sole model `_v2_models` reads and `a/x`
+    holds the whole aggregate."""
+    tree = {_V2_SID: [_v2_children()]}
+    odd = _v2_assistant(2) if bad is None else _v2_assistant(2, model=bad)
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX), odd]
+    )
+    assert fault is None
+    _assert_split(usage)
+    assert usage.models == ("a/x",)
+    assert usage.by_model == {UNATTRIBUTED_MODEL: TokenUsage(input_tokens=100)}
+
+
+def test_v2_usage_split_unknown_without_a_transcript():
+    """An unread transcript leaves `models` None, and `by_model` with it."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY, input=1))]}
+    usage, fault = V2Protocol().usage(_v2_models_client(tree), _V2_SID, None)
+    assert fault is None and usage is not None
+    assert usage.by_model is None
+
+
+def test_v2_usage_split_is_sentinel_only_when_the_transcript_names_none():
+    """`models == ()` consults no child ref, so every aggregate — the
+    parent's and a well-formed child's — bills to the sentinel."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY, input=7))]}
+    usage, fault = V2Protocol().usage(_v2_models_client(tree), _V2_SID, [_v2_assistant(1)])
+    assert fault is None
+    _assert_split(usage)
+    assert usage.by_model == {UNATTRIBUTED_MODEL: TokenUsage(input_tokens=107)}
+
+
+def test_v2_usage_split_bills_a_malformed_child_ref_to_the_sentinel():
+    """A malformed child ref bills that child to the sentinel; the ref stays
+    the one `models` fault, with no new one from the split."""
+    tree = {_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, "b/y", input=7))]}
+    usage, fault = V2Protocol().usage(
+        _v2_models_client(tree), _V2_SID, [_v2_assistant(1, model=_REF_AX)]
+    )
+    assert fault is not None and fault.stage == "models"
+    assert fault.error.startswith("child session ses_a model: TypeError")
+    _assert_split(usage)
+    assert usage.by_model == {
+        "a/x": TokenUsage(input_tokens=100),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=7),
+    }
+
+
+def test_v2_capture_stashes_child_models(tmp_path):
+    """Through `_capture_usage`, the stashed usage's `models` lists the
+    parent's model first and the subagent's after it."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9, model=_REF_AX))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [_v2_tree({_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, _REF_BY))]})],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    got = adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID))
+    assert got is not None and got.models == ("a/x", "b/y")
+    assert _lifecycle_lines(adapter, "t-cap") == []
+
+
+def test_v2_capture_crumbs_partial_models_and_still_stashes(tmp_path):
+    """A malformed child model ref costs neither the usage nor the active-child
+    check: the full figure is stashed, one `usage-models-partial` row names
+    the child, no `usage-capture-failed` row is written, and a still-running
+    child is still journaled.
+
+    ABLATION: drop the `usage-models-partial` note in `_capture_usage` and
+    the crumb is gone; gate `_note_active_children` on `usage_fault is None`
+    again and the `usage-child-active` row is gone."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-cap").mkdir(parents=True)
+    sess = _v2_sess(_V2_SID)
+    running = {"type": "running"}
+    sess.client = _V2RouteClient(
+        **{
+            _V2_MESSAGES: [_v2_page(_v2_assistant(9, model=_REF_AX))],
+            _V2_INFO: [_v2_info(input=100)],
+            _V2_LIST: [
+                _v2_tree({_V2_SID: [_v2_children(_v2_modeled("ses_a", _V2_SID, "b/y", input=5))]})
+            ],
+            _V2_ACTIVE: [{"data": {_V2_SID: running, "ses_a": running}}],
+        }
+    )
+    handle = SessionHandle(task_id="t-cap", native_id=_V2_SID)
+
+    assert adapter._capture_usage(handle, sess) is not None
+
+    got = adapter.read_usage(SessionResult(status="completed", session_id=_V2_SID))
+    assert got == TokenUsage(input_tokens=105) and got.models == ("a/x",)
+    assert _capture_crumbs(adapter) == []
+    lines = _lifecycle_lines(adapter, "t-cap")
+    (partial,) = [ln for ln in lines if ln["event"] == "usage-models-partial"]
+    assert partial["stage"] == "models"
+    assert partial["error"] == "child session ses_a model: TypeError: model is str, not an object"
+    (active,) = _child_active_crumbs(adapter)
+    assert active["event"] == "usage-child-active" and active["sessions"] == ["ses_a"]
 
 
 def test_v2_transcript_walks_all_pages(tmp_path, v2_fake, monkeypatch):

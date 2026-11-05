@@ -23354,6 +23354,107 @@ def test_migration_duplicate_refusal_clears_a_baseline_it_arrived_holding(projec
     assert task.baseline_untracked is None
 
 
+def _host_loss_in_migration_pause_notify(project, monkeypatch, engine, guard: str):
+    """Drive `engine.run()` into a migration pause whose notify dies (DW-632).
+
+    The migrate task enters ESCALATED with a baseline at the real HEAD over a
+    clean tree, so the restart branch keeps it (a moved HEAD would read stale
+    and be cleared before the guards). `guard` names the engine method observed
+    on entry, to prove a baseline was held going in. The notify snapshots
+    `state.json` and raises a `BaseException`; the snapshot is written back,
+    because `run()`'s `finally` save would otherwise persist the cleared
+    in-memory pair and hide the boundary. Asserts the persisted task is PENDING
+    with no baseline pair."""
+    from bmad_loop import gates
+
+    class HostLoss(BaseException):
+        pass
+
+    engine.state.tasks[MIGRATE_KEY] = StoryTask(
+        story_key=MIGRATE_KEY,
+        epic=0,
+        phase=Phase.ESCALATED,
+        baseline_commit=rev_parse_head(project.project),
+        baseline_untracked=[],
+    )
+    state_file = engine.run_dir / "state.json"
+    durable: list[bytes] = []
+    entering: list[str | None] = []
+    real_guard = getattr(engine, guard)
+
+    def observe_guard(*args, **kwargs):
+        entering.append(engine.state.tasks[MIGRATE_KEY].baseline_commit)
+        return real_guard(*args, **kwargs)
+
+    monkeypatch.setattr(engine, guard, observe_guard)
+
+    def host_dies_in_notify(_policy, _run_dir, headline, *_args, **_kwargs):
+        if not durable and headline == "migration refused: deferred-work.md":
+            durable.append(state_file.read_bytes())
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        engine.run()
+    assert durable, "the migration refusal never reached its notify"
+    # premise: the guard starts with a baseline to clear, or the test is vacuous
+    assert entering and entering[0] is not None
+    state_file.write_bytes(durable[0])
+    task = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    assert task.baseline_commit is None
+    assert task.baseline_untracked is None
+    assert task.phase == Phase.PENDING
+
+
+def test_host_loss_in_migration_duplicate_ids_notify_leaves_the_baseline_cleared_on_disk(
+    project, monkeypatch
+):
+    """DW-632. The `migrate-duplicate-ids` pause clears the task's baseline pair
+    and saves before it notifies, as `_pause_on_intent_refusal` does (DW-631).
+    A host loss inside a slow notify command then leaves no stale pre-repair
+    baseline on disk for a later env-fault `_safe_reset` to rewind over the
+    operator's renumbering commit.
+
+    Ablation, performed: move the clearing and `self._save()` back below
+    `gates.notify` and the snapshot keeps the arrival baseline."""
+    write_legacy_ledger(
+        project,
+        "# Deferred Work\n\n" + _gated_dw1("gate: 3-2") + "\n" + _gated_dw1("gate: 3-3") + "\n"
+        "## Deferred from: epic 1 review (2026-04-06)\n\n"
+        "- **Open legacy thing here** — `src.txt` mishandles em-dashes\n",
+    )
+    engine, adapter = make_sweep(project, [])
+
+    _host_loss_in_migration_pause_notify(project, monkeypatch, engine, "_migration_manifest")
+
+    assert adapter.sessions == []
+    assert _records(engine, "migrate-duplicate-ids")
+
+
+def test_host_loss_in_migration_ledger_dirty_notify_leaves_the_baseline_cleared_on_disk(
+    project, monkeypatch
+):
+    """DW-632. The `migrate-ledger-dirty` pause clears the task's baseline pair
+    and saves before it notifies, as `_pause_on_intent_refusal` does (DW-631).
+    Reached here by a `_ledger_rel` probe fault over a committed, clean ledger:
+    a really dirty one makes the restart branch's `worktree_clean` read dirty
+    and reset the ledger before the guard runs.
+
+    Ablation, performed: move the clearing and `self._save()` back below
+    `gates.notify` and the snapshot keeps the arrival baseline."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [])
+    monkeypatch.setattr(engine, "_ledger_rel", lambda: (None, OSError("scope probe boom")))
+
+    _host_loss_in_migration_pause_notify(
+        project, monkeypatch, engine, "_refuse_dirty_migration_input"
+    )
+
+    assert adapter.sessions == []
+    [row] = _records(engine, "migrate-ledger-dirty")
+    assert row["refuse_cause"] == "probe-fault"
+
+
 # ------------------------------------------ review-budget commit-instead-of-rollback
 
 
@@ -24344,6 +24445,62 @@ def test_a_refused_ledger_pauses_the_resume_at_intent_regeneration(project, monk
         assert {field: getattr(survivor, field) for field in preserved} == preserved
 
 
+def test_host_loss_in_intent_refusal_notify_leaves_the_baseline_cleared_on_disk(
+    project, monkeypatch
+):
+    """DW-631. `_pause_on_intent_refusal` clears the task's baseline triple and
+    saves before it notifies. A host loss inside a slow notify command then
+    leaves no stale baseline on disk for a later env-fault `_safe_reset` to
+    rewind over the operator's repair commit.
+
+    The recipe's recovery re-stamps a baseline before regeneration runs, so the
+    in-memory task holds one when the tail starts. The test snapshots
+    `state.json` inside the notify, because `run()`'s `finally` save would
+    otherwise persist the cleared in-memory triple and hide the boundary.
+
+    Ablation, performed: move the clearing and `self._save()` back below
+    `gates.notify` and the snapshot keeps the re-stamped `baseline_commit`."""
+    from bmad_loop import gates
+
+    class HostLoss(BaseException):
+        pass
+
+    engine, _intent = _resume_with_lost_intent(project)
+    fault_read_text(monkeypatch, project.deferred_work)
+    resumed, adapter = resume_sweep(project, engine, _redrive_script(project))
+    state_file = resumed.run_dir / "state.json"
+    durable: list[bytes] = []
+    entering: list[str | None] = []
+    real_tail = resumed._pause_on_intent_refusal
+
+    def observe_tail(task, *args, **kwargs):
+        entering.append(task.baseline_commit)
+        return real_tail(task, *args, **kwargs)
+
+    monkeypatch.setattr(resumed, "_pause_on_intent_refusal", observe_tail)
+
+    def host_dies_in_notify(_policy, _run_dir, headline, *_args, **_kwargs):
+        if not durable and headline == "bundle dw-fix: intent document not regenerated":
+            durable.append(state_file.read_bytes())
+            raise HostLoss
+
+    monkeypatch.setattr(gates, "notify", host_dies_in_notify)
+    with pytest.raises(HostLoss):
+        resumed.run()
+    assert durable, "the intent refusal never reached its notify"
+    # premise: the tail starts with a baseline to clear, or the test is vacuous
+    assert entering and entering[0] is not None
+    state_file.write_bytes(durable[0])
+
+    assert adapter.sessions == []
+    assert _records(resumed, "sweep-intent-ledger-refused")
+    task = load_state(resumed.run_dir).tasks["dw-fix"]
+    assert task.phase == Phase.PENDING
+    assert task.baseline_commit is None
+    assert task.baseline_untracked is None
+    assert task.baseline_artifacts is None
+
+
 def _pending_bundle_with_lost_intent(project, key="fix", dw_ids=("DW-1",)):
     """The DW-252 shape: a bundle task persisted PENDING by `_run_bundle`'s save
     and lost before its dispatch stamped a baseline, so the resume's recovery has
@@ -25051,6 +25208,22 @@ def test_bundle_dispatch_does_not_bind_accepted_spec_as_attempt_ownership(projec
     task.dispatched_spec_file = engine._dispatched_spec_for_attempt(task)
 
     assert task.dispatched_spec_file is None
+
+
+def test_bundle_usage_relaunch_rolls_back_instead_of_keeping_the_tree(project):
+    """DW-615: a sweep bundle owns intent.md, never an accepted bundle spec, so
+    an uncharged dev usage relaunch cannot name a spec to resume and takes the
+    rollback leg (`no-spec`) even when an accepted spec is on disk. Ablation
+    (performed): delete the SweepEngine `_dispatched_spec_for_attempt` override
+    and the inherited seam keeps the tree, failing this."""
+    engine, _ = make_sweep(project, [])
+    accepted = project.implementation_artifacts / "spec-adopted-elsewhere.md"
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    write_spec(accepted, "in-progress", "abc")
+    task = StoryTask(story_key="dw-fix", epic=0, spec_file=str(accepted))
+
+    assert engine._usage_relaunch_prompt(task) is None
+    assert engine._usage_relaunch_tree(task, repair=False) == (False, "no-spec", None)
 
 
 def test_bundle_explicit_spec_route_pins_readback_without_claiming_ownership(project):
@@ -26379,7 +26552,13 @@ def test_the_seeded_decisions_write_refuses_a_redirected_run_dir(project, tmp_pa
     Since DW-262 the refusal no longer crashes the run: `UnconfinedWriteError` is an
     `OSError`, so the seeded guard journals it as `sweep-decisions-store-write-failed`
     (the refusal's message in `error`) and the run carries on. The confinement is
-    what this row grades, and it is unchanged — nothing escapes either way."""
+    what this row grades, and it is unchanged — nothing escapes either way.
+
+    Positive control: `test_decisions_phase_keys_on_the_run_dir_project_not_workspace_root`
+    lands a seeded keep-open pre-answer for DW-1 in an ORDINARY run dir's
+    `decisions.json` and reads it back, so a seeded write wired to refuse everything
+    fails there — this refusal is the redirected run dir, not every reason the file
+    could be absent from `outside/`."""
     from bmad_loop import decisions
     from bmad_loop.sweep import DecisionOption
 
@@ -26429,7 +26608,12 @@ def test_the_interactive_decisions_write_refuses_a_redirected_run_dir(project, t
     rather than upstream of it.
 
     Ablation: revert this site and this fails — the run completes and
-    `decisions.json` appears in `outside/`."""
+    `decisions.json` appears in `outside/`.
+
+    Positive control: `test_interactive_decisions_build_and_close` runs the same
+    interactive write on an ORDINARY run dir and reads `decisions.json` back, so a
+    `_decisions_phase` wired to crash on anything fails there — this refusal is the
+    redirected run dir, not every reason the file could be absent from `outside/`."""
     outside = _redirect_the_run_dir(project, tmp_path)
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(  # close-only: no bundle, so no bundle-intent write
@@ -26454,34 +26638,6 @@ def test_the_interactive_decisions_write_refuses_a_redirected_run_dir(project, t
     assert '"decision-pending"' in journal  # PRECONDITION: the prompt was reached
     assert '"decision-answered"' not in journal  # the refusal landed AT the write
     assert not (outside / "decisions.json").exists()  # nothing escaped the project
-
-
-def test_the_decisions_writes_land_on_a_clean_tree(project):
-    """The positive control for both refusals above. Without it they pass for a
-    `_decisions_phase` wired to crash on anything, which is every reason
-    `decisions.json` could be absent from `outside/` — and the run dir under test
-    there is a symlink, so this row also pins that an ORDINARY run dir still gets
-    its file."""
-    write_ledger(project, {"DW-1": "open"})
-    plan = triage_result(
-        ["DW-1"],
-        decisions=[
-            _decision(
-                "DW-1",
-                [
-                    {"key": "1", "label": "Close it", "effect": "close", "resolution": "moot"},
-                    {"key": "2", "label": "Keep open", "effect": "keep-open"},
-                ],
-            )
-        ],
-    )
-    engine, _ = make_sweep(project, [triage_effect(plan)], answers=["1"], prompting=True)
-
-    summary = engine.run()
-
-    assert not summary.crashed
-    landed = json.loads((engine.run_dir / "decisions.json").read_text(encoding="utf-8"))
-    assert landed["DW-1"]["effect"] == "close"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
@@ -31571,45 +31727,13 @@ def test_tampered_persisted_transition_never_overwrites_reflog_evidence(project,
     assert "unit-merged" not in journal_kinds(resumed)
 
 
-def test_malformed_persisted_strategy_never_records_integration(project, monkeypatch):
-    effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
-    engine, original_adapter = make_sweep(
-        project,
-        [triage_effect(bundle_plan()), effect],
-        policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
-    )
-
-    def host_loss_before_git(*_args, **_kwargs):
-        raise RuntimeError("host lost before git")
-
-    monkeypatch.setattr(verify, "merge_branch", host_loss_before_git)
-    assert engine.run().crashed
-    state = load_state(engine.run_dir)
-    task = state.tasks["dw-fix"]
-    assert task.integration_attempt is not None
-    task.integration_attempt["strategy"] = "bogus"
-    save_state(engine.run_dir, state)
-    resumed, adapter = resume_sweep(project, engine, [])
-
-    summary = resumed.run()
-
-    assert summary.paused and not summary.crashed
-    assert adapter.sessions == []
-    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
-    durable = resumed.state.tasks["dw-fix"]
-    assert durable.integration_attempt is not None
-    assert durable.integration_attempt["strategy"] == "bogus"
-    assert "unit-merged" not in journal_kinds(resumed)
-    assert Path(durable.worktree_path).is_dir()
-
-
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("outcome", "unknown"), ("version", 99)],
+    [("outcome", "unknown"), ("version", 99), ("strategy", "bogus")],
 )
 def test_malformed_persisted_receipt_shape_never_reaches_git(project, monkeypatch, field, value):
     effect, _destination, _accepted = _git_bound_publication_bundle(project, "tracked")
-    engine, _ = make_sweep(
+    engine, original_adapter = make_sweep(
         project,
         [triage_effect(bundle_plan()), effect],
         policy=isolated_policy(keep_failed=False, merge_strategy="merge"),
@@ -31635,10 +31759,12 @@ def test_malformed_persisted_receipt_shape_never_reaches_git(project, monkeypatc
 
     assert summary.paused and not summary.crashed
     assert adapter.sessions == []
+    assert [session.role for session in original_adapter.sessions] == ["triage", "dev"]
     durable = resumed.state.tasks["dw-fix"]
     assert durable.integration_attempt is not None
     assert durable.integration_attempt[field] == value
     assert "unit-merged" not in journal_kinds(resumed)
+    assert Path(durable.worktree_path).is_dir()
 
 
 def test_no_ref_update_validation_refusal_keeps_ambiguous_receipt(project, monkeypatch):

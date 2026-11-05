@@ -757,8 +757,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # rather than leave the mode — that would yank an operator reading
         # scrollback. On psmux the flag is server-wide (psmux/psmux#828), which
         # still matches what it swallows.
-        if self._tmux("display-message", "-p", "-t", window_id, "#{pane_in_mode}") == "1":
-            raise TmuxError(f"{window_id} is in a pane mode; not typing into it")
+        self._refuse_in_mode(window_id, "typing into it")
         self._tmux("send-keys", "-t", window_id, "-l", text)
         time.sleep(0.3)  # let the TUI ingest the paste before submitting
         self._tmux("send-keys", "-t", window_id, "Enter")
@@ -769,10 +768,33 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # first is pressed, and a pane in a mode refuses as send_text does.
         if bad := [key for key in keys if key not in ALLOWED_KEYS]:
             raise TmuxError(f"refusing to send keys {bad!r}; allowed: {sorted(ALLOWED_KEYS)}")
-        if self._tmux("display-message", "-p", "-t", target, "#{pane_in_mode}") == "1":
-            raise TmuxError(f"{target} is in a pane mode; not pressing keys in it")
+        self._refuse_in_mode(target, "pressing keys in it")
         for key in keys:
             self._tmux("send-keys", "-t", target, key)
+
+    def _refuse_in_mode(self, target: str, refused: str) -> None:
+        """Raise when ``target``'s pane is in a mode, naming the mode and the way
+        out: the refusal reaches the operator as a nudge's ``nudge-send-failed``
+        crumb or the TUI answer's "keys not sent", and only a human may leave it.
+
+        The mode a pane idles in is usually not one an operator chose: a user
+        config whose ``run``/``run-shell`` fails or prints when a server starts
+        shows that output in view-mode on whichever pane is active then, and on
+        a server bmad-loop itself started that is its first task window. The
+        mode is read only on the refusal path, so a send keeps one probe; a
+        reply that is not a mode name (an unread probe, or a backend that does
+        not expand ``#{pane_mode}``) leaves the refusal unnamed."""
+        if self._tmux("display-message", "-p", "-t", target, "#{pane_in_mode}") != "1":
+            return
+        try:
+            mode = self._tmux("display-message", "-p", "-t", target, "#{pane_mode}")
+        except TmuxError:
+            mode = ""
+        named = mode.endswith("-mode") and mode.replace("-", "").isalpha()
+        raise TmuxError(
+            f"{target} is in a pane mode{f' ({mode})' if named else ''}; not {refused}"
+            " - press q in that window to leave the mode"
+        )
 
     def kill_window(self, target: str) -> None:
         # Best-effort teardown: a hang / missing binary is no worse than the window

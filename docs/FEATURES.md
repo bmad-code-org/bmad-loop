@@ -105,10 +105,12 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
   - A session that did no work, or is still parked on a prompt only a human should answer when it stalls or times out, pauses the run instead of being charged; a non-blocking workflow's is journaled and the run continues.
   - A session approved past its permission prompt that then goes silent gets the stall nudge, not a parked pause.
-  - When a Claude Code turn ends on an API error (its `StopFailure` hook), the adapter acts at once and never counts it as a completion: a transient error gets the stall nudge right away and is charged if never recovered, and an account error (billing, authentication, an account hold) pauses the run uncharged with a reason naming the error.
+  - When a Claude Code turn ends on an API error (its `StopFailure` hook), the adapter acts at once and never counts it as a completion: a transient error gets the stall nudge right away and is charged if never recovered, and an account error (billing, authentication, an account hold, a wrong model, a broken cloud credential) pauses the run uncharged with a reason naming the error.
   - `validate --probes` launches each role's CLI once with no prompt and fails when its first screen shows a startup dialog that would park an unattended session.
   - While the pane shows the CLI waiting out a usage-limit reset, the session timeout and stall nudge are held for at most `[limits] quota_wait_max_min` (default 300; 0 = off) minutes; past that the session pauses with a usage-limit reason.
-  - With `[limits] usage_limit_action = "relaunch"`, a dev, fix or review session that ends on a usage limit or a Claude Code account error is relaunched at once without charging an attempt or review cycle, at most `[limits] max_usage_relaunches` (default 3) times per story; past that it pauses uncharged as in the default `"pause"` mode.
+  - With `[limits] usage_limit_action = "relaunch"`, a dev, fix or review session that ends on a usage limit or a Claude Code account error is relaunched at once without charging an attempt or review cycle, at most `[limits] max_usage_relaunches` (default 3) times per story; past that it pauses uncharged as in the default `"pause"` mode. A wrong model or a broken cloud credential is never relaunched: it pauses as in `"pause"` mode.
+  - A dev relaunch continues on the cut-off attempt's working tree when the spec or ticket plan it worked on can be named, pointing the session at it; otherwise it rolls back like any retry. The journal records the choice (`dev-relaunch-tree`).
+  - A dev relaunch runs the `[environment]` probes first; a failing probe rolls a kept tree back as any retry does, then pauses the run at the `environment` stage with the relaunch still uncharged, and `resume` re-probes before relaunching. In place with `[scm] rollback_on_failure = false`, a kept tree with uncommitted work and no attempt commits pauses for manual rollback instead.
   - In relaunch mode the session ends at the limit instead of waiting for its reset, a Claude Code `rate_limit` error naming no known limit counts as one, and the relaunched session gets `BMAD_LOOP_USAGE_RELAUNCH=<n>` so a wrapper can switch accounts.
   - Before an attempt is reset, its commits go to an `attempt-preserve/<run>-<tip8>` branch and uncommitted work to a `refs/attempt-preserve-dirty/*` snapshot.
 - **Config:** `[limits] max_dev_attempts`, `[limits] max_review_cycles`, `[limits] session_timeout_min`, `[limits] dev_stall_grace_s`, `[limits] dev_stall_nudges`, `[limits] dev_stall_nudges_cap`, `[limits] quota_wait_max_min`, `[limits] usage_limit_action`, `[limits] max_usage_relaunches`, `[scm] preserve_keep`
@@ -333,7 +335,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - opencode runs as a headless `opencode serve` over HTTP/SSE. It needs no tmux window and registers no hooks. It speaks the OpenCode 1.x and 2.x server APIs; `validate` reports an unsupported version as `adapter.opencode-version`.
   - codex runs with `--no-daemon` (Codex ≥ 0.156), so tools and hooks see the session's `BMAD_LOOP_*` environment; `validate` reports an older Codex or a profile that drops the flag as `adapter.codex-version`.
   - `bmad-loop probe-adapter <cli>` does a zero-launch scan by default. `--probe` opts in to one live, content-free turn. Every report is sanitized before it is printed.
-  - Antigravity (experimental) never reports token usage. Under worktree isolation, it trusts each unit worktree only when the project root is already trusted.
+  - Antigravity (experimental) reports token usage from its transcript (checked against agy 1.4.9; 1.1.3 writes none), subagents included, but not the model. Under worktree isolation, it trusts each unit worktree only when the project root is already trusted.
 - **Config:** `[adapter] name`; `[limits] session_start_grace_s`; `bmad-loop probe-adapter <cli> --probe`; `bmad-loop probe-adapter <cli> --workspace <path>`; `bmad-loop adapters`
 - **Tested by:** `tests/test_profile.py`, `tests/test_probe.py`, `tests/test_adapter_registry.py`, `tests/test_workspace_trust.py`, `tests/test_codex_trust.py`, `tests/test_generic_tmux.py`, `tests/test_cli.py`
 - **Docs:** [Choosing which CLIs to drive](setup-guide.md#choosing-which-clis-to-drive), [Codex shared app-server daemon](setup-guide.md#codex-shared-app-server-daemon), [Adapter authoring guide: finalizing a profile](adapter-authoring-guide.md#walkthrough-finalizing-a-profile), [CLI reference: probe-adapter](reference/cli.md#probe-adapter), [CLI reference: adapters](reference/cli.md#adapters)
@@ -462,7 +464,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A story's spend is checked at every session boundary. Crossing `max_tokens_per_story` warns once and journals `token-budget-exceeded`; the story keeps running.
   - With `session_budget_mode = "enforce"`, a session over `max_tokens_per_session` gets a wrap-up nudge, then ends `over_budget` once `session_budget_grace_s` has passed.
   - In `warn` mode (the default) the crossing is flagged once and the session finishes normally. In `off` mode usage is never sampled.
-  - The session guard stays inert for profiles that cannot report usage mid-session.
+  - The session guard stays inert for profiles that cannot report usage mid-session. On antigravity it starts at the first `Stop`, which is what reports the transcript path.
 - **Config:** `[limits] max_tokens_per_story`, `[limits] cache_read_weight`, `[limits] session_budget_mode`, `[limits] max_tokens_per_session`, `[limits] session_budget_grace_s`
 - **Tested by:** `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`, `tests/test_policy.py`
 - **Docs:** [[limits] settings](reference/configuration.md#limits), [CLI: status](reference/cli.md#status)
@@ -473,11 +475,12 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Description:** Each session's journal records the models its CLI actually ran on, read from the transcript or usage file the CLI wrote, beside the configured model `session-start` records.
 - **Properties:**
   - A `session-end` entry carries `models` (distinct ids, first-seen, main session first, subagent and fallback models included), or `models_unresolved: true` when a tracked CLI's usage names none; neither key appears for a CLI with no model source.
-  - Claude, Codex, Gemini, Copilot and OpenCode are tracked; antigravity is not.
+  - Claude, Codex, Gemini, Copilot and OpenCode are tracked; antigravity is not. On OpenCode 1.x, `models` lacks a subagent's model unless the session itself also ran it.
   - The configured `model` fields (`session-start`, the session record, `adapters_used.<role>.model`) are never overwritten by an observed one.
   - `status --json` reports a role's observed models as `adapters_used.<role>.models_used`, only when some were observed.
+  - A tracked session's `session-end` entry carries `tokens_by_model`, its usage split per model (summing to the session's usage, with `<unattributed>` for usage the CLI's file does not tie to a model); `status --json` sums it per task as `tokens_by_model`. Neither appears when no split was read.
   - The first SessionStart hook that names a model (Claude, Codex) journals one `session-model` row, and the TUI agent line shows that model in place of the configured one.
-  - `diagnose` keeps model ids and redacts any element that is not shaped like one.
+  - `diagnose` keeps model ids and redacts any element that is not shaped like one; `tokens_by_model` keeps only its integer counts.
 - **Config:** none
 - **Tested by:** `tests/test_tokens.py`, `tests/test_opencode_http.py`, `tests/test_engine.py`, `tests/test_model.py`, `tests/test_cli.py`, `tests/test_events.py`, `tests/test_generic_tmux.py`, `tests/test_diagnostics.py`, `tests/test_tui_data.py`, `tests/test_tui_app.py`
 - **Docs:** [Run directory](reference/run-state.md#run-directory), [CLI: status](reference/cli.md#status), [TUI: run header](tui-guide.md#run-header-top-right)

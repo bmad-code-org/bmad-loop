@@ -1,0 +1,120 @@
+{
+  "harness": "scripts/capture_claude_stopfailure.py",
+  "redactions": {
+    "<capture-root>": "the temporary capture root: its path, its `-` slug, its `/…/` elided form",
+    "<port>": "the fake server's port after 127.0.0.1:"
+  },
+  "scenarios": {
+    "auth-401": {
+      "claude_version": "2.1.317",
+      "tmux_version": "tmux 3.8",
+      "captured": "2026-11-02",
+      "response": "401 application/json authentication_error",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/v1/messages?beta=true",
+          "stream": true,
+          "served": true
+        }
+      ],
+      "stop_failure_error": "authentication_failed"
+    },
+    "billing-402": {
+      "claude_version": "2.1.317",
+      "tmux_version": "tmux 3.8",
+      "captured": "2026-11-02",
+      "response": "402 application/json billing_error",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/v1/messages?beta=true",
+          "stream": true,
+          "served": true
+        }
+      ],
+      "stop_failure_error": "billing_error"
+    },
+    "mid-response-cut": {
+      "claude_version": "2.1.317",
+      "tmux_version": "tmux 3.8",
+      "captured": "2026-11-02",
+      "response": "200 text/event-stream: message_start, text block 0 complete, block 1 started with one delta, then the TCP connection reset (SO_LINGER 0)",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/v1/messages?beta=true",
+          "stream": true,
+          "served": true
+        }
+      ],
+      "stop_failure_error": "server_error"
+    },
+    "overloaded-529": {
+      "claude_version": "2.1.317",
+      "tmux_version": "tmux 3.8",
+      "captured": "2026-11-02",
+      "response": "529 application/json overloaded_error",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/v1/messages?beta=true",
+          "stream": true,
+          "served": true
+        }
+      ],
+      "stop_failure_error": "server_error"
+    },
+    "rate-limit-429": {
+      "claude_version": "2.1.317",
+      "tmux_version": "tmux 3.8",
+      "captured": "2026-11-02",
+      "response": "429 application/json rate_limit_error",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/v1/messages?beta=true",
+          "stream": true,
+          "served": true
+        }
+      ],
+      "stop_failure_error": "rate_limit"
+    },
+    "server-error-500": {
+      "claude_version": "2.1.317",
+      "tmux_version": "tmux 3.8",
+      "captured": "2026-11-02",
+      "response": "500 application/json api_error",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/v1/messages?beta=true",
+          "stream": true,
+          "served": true
+        }
+      ],
+      "stop_failure_error": "server_error"
+    },
+    "truncated-stream": {
+      "claude_version": "2.1.317",
+      "tmux_version": "tmux 3.8",
+      "captured": "2026-11-02",
+      "response": "200 for every request, closed cleanly before any content block completes: a streaming request gets message_start, block 0 started with one delta, then EOF; a non-streaming request gets an empty body",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/v1/messages?beta=true",
+          "stream": true,
+          "served": true
+        },
+        {
+          "method": "POST",
+          "path": "/v1/messages?beta=true",
+          "stream": false,
+          "served": true
+        }
+      ],
+      "stop_failure_error": "unknown"
+    }
+  }
+}

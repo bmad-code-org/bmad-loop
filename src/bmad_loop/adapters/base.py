@@ -413,10 +413,11 @@ class SessionResult:
     # APPENDED.
     stop_failure: str | None = None
     # The `[hooks.stop_failure_types]` action the profile maps `stop_failure`'s
-    # error to (`account`, `rate_limit`, `transient`, `ignore`), None when the
-    # error is unmapped or there is no uncleared StopFailure. Stamped with
-    # `stop_failure` on every result `wait_for_completion` returns. Diagnostic,
-    # plus #959 usage-relaunch routing. APPENDED.
+    # error to (`account`, `account-fatal`, `rate_limit`, `transient`,
+    # `ignore`), None when the error is unmapped or there is no uncleared
+    # StopFailure. Stamped with `stop_failure` on every result
+    # `wait_for_completion` returns. Diagnostic, plus #959 usage-relaunch
+    # routing (`account` qualifies, `account-fatal` never does). APPENDED.
     stop_failure_action: str | None = None
 
 

@@ -328,6 +328,9 @@ RUN_STATE_TRANSACTIONS = {
 # refusals, and deliberately adds no runtime abstraction (no RefusalError, no
 # registry): the inventory is the test file's, not the product's.
 REFUSAL_HELPER_DEFS = {
+    # #949: no keys into a pane in a mode, naming the mode; test_generic_tmux.py
+    # test_send_text_refuses_a_pane_in_mode, test_a_pane_mode_refusal_names_the_mode_*
+    ("adapters/tmux_base.py", "_refuse_in_mode"),
     # DW-444: publish into a zero-inode artifacts root; test_artifact_publication.py
     ("artifact_publication.py", "_refuse_zero_inode_root"),
     ("cli.py", "_reject_bad_run_id"),
@@ -1095,6 +1098,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "threshold_s",
         "to",
         "tokens",
+        # `session-end` (DW-618): the session's usage split per observed model, a
+        # {model id: four int counts} map `diagnostics._scrub_tokens_by_model`
+        # keeps key-wise through `_scrub_model_id`, values cut to the counts.
+        "tokens_by_model",
         "tokens_weighted",
         "total",
         # `quota-wait-ended` (DW-396): the session's cumulative quota-wait
@@ -1317,6 +1324,7 @@ JOURNAL_SPLAT_FIELDS = {
             "usage_limit_class",
             "models",
             "models_unresolved",
+            "tokens_by_model",
         }
     ),
     # The plugin bus's `_log` forwards its OWN `**fields` parameter, so the keys
@@ -1581,6 +1589,9 @@ JOURNAL_KINDS = frozenset(
         "deferred-close-skipped-out-of-tree",
         "deferred-close-unmatched",
         "dev-decision",
+        # DW-615. The tree choice of an uncharged dev usage relaunch, from
+        # `Engine._dev_phase`: `kept` and the `reason` it was kept or rolled back.
+        "dev-relaunch-tree",
         # DW-523. A failed `[environment]` probe pass, from
         # `Engine._observe_environment_probes` (dev/fix verify, and the review
         # gates through `_review_probe_sink`): `site` names the asking seam.

@@ -23,8 +23,7 @@ both majors keep their sqlite store at the same
 ``$XDG_DATA_HOME/opencode/opencode.db``, and a 1.x server refuses to start on
 one a 2.x server created ("Database is not empty and has no session table").
 
-Windows is excluded: opencode-on-Windows is unverified for this adapter
-(README adapter table); the suite must skip cleanly there.
+Runs on native Windows as on POSIX; the binary resolves through PATHEXT.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ from conftest import opencode_runs
 HAVE_OPENCODE = opencode_runs()
 pytestmark = pytest.mark.skipif(
     not HAVE_OPENCODE,
-    reason="live smoke needs a runnable `opencode` binary (POSIX): not on PATH, or on "
+    reason="live smoke needs a runnable `opencode` binary: not on PATH, or on "
     "PATH but failing `--version` — e.g. a dead WSL/npm shim (#294)",
 )
 

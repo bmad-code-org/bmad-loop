@@ -1,0 +1,12 @@
+{
+  "session_id": "c095b6ff-6ebe-4b4c-93ae-ec578cc3be13",
+  "transcript_path": "<capture-root>/cfg/projects/<capture-root>-proj/c095b6ff-6ebe-4b4c-93ae-ec578cc3be13.jsonl",
+  "cwd": "<capture-root>/proj",
+  "prompt_id": "98567e83-dc53-4e0b-9497-37d3a0c6b0db",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "StopFailure",
+  "error": "server_error",
+  "last_assistant_message": "API Error: Connection lost mid-response. The response above may be incomplete."
+}

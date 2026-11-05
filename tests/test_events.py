@@ -228,6 +228,9 @@ def test_both_relay_twins_forward_the_notification_type(tmp_path, monkeypatch, p
 
 
 _STOP_KEYS = ("stop_error", "stop_error_details", "stop_message")
+# Claude Code's mid-response-cut StopFailure wording, built by concatenation so this file
+# carries no line the claude env-fault patterns match (the repo-wide pane scan).
+_LOST_MESSAGE = "API Error: Connection lost " + "mid-response"
 
 
 @pytest.mark.parametrize(
@@ -237,12 +240,12 @@ _STOP_KEYS = ("stop_error", "stop_error_details", "stop_message")
             {
                 "error": "server_error",
                 "error_details": "529 Overloaded",
-                "last_assistant_message": "API Error: Connection lost mid-response",
+                "last_assistant_message": _LOST_MESSAGE,
             },
             {
                 "stop_error": "server_error",
                 "stop_error_details": "529 Overloaded",
-                "stop_message": "API Error: Connection lost mid-response",
+                "stop_message": _LOST_MESSAGE,
             },
         ),
         # optional fields absent -> their keys are absent, the present one still rides

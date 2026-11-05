@@ -292,7 +292,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from ..model import TokenUsage
+from ..model import TokenUsage, add_to_bucket, settle_by_model
 from .base import SessionSpec
 
 # Earliest version probed live per supported major — `validate` warns below it.
@@ -576,7 +576,8 @@ class OpencodeProtocol:
         """The session's token usage at teardown, given the :meth:`transcript`
         already read. None is "untracked" when ``fault`` is None and "unknown"
         when it is not — never a zero standing in for a failed read (DW-461).
-        Never raises."""
+        A usage WITH a fault is a full token figure whose ``models`` is
+        incomplete (stage ``models``). Never raises."""
         raise NotImplementedError
 
     def sample_usage(self, client: Any, session_id: str) -> tuple[TokenUsage | None, str | None]:
@@ -600,7 +601,10 @@ class UsageFault:
     """Why a usage read failed, as the ``usage-capture-failed`` crumb reports it
     (DW-461): ``stage`` is ``fetch`` (the request, its status or an undecodable
     body), ``payload`` (a body of the wrong shape) or ``children`` (V2's
-    descendant-session walk, or a child's malformed ``Session.Info``)."""
+    descendant-session walk, or a child's malformed ``Session.Info``). Stage
+    ``models`` rides beside a read usage instead, crumbed as
+    ``usage-models-partial``: a V2 child's malformed ``model`` ref left the
+    usage's ``models`` incomplete, its token figure whole."""
 
     stage: str
     error: str
@@ -875,7 +879,9 @@ class V1Protocol(OpencodeProtocol):
         self, client: Any, session_id: str, transcript: Any
     ) -> tuple[TokenUsage | None, UsageFault | None]:
         """The assistant-message token sum over the transcript (:func:`_sum_usage`),
-        its ``models`` the ``"<providerID>/<modelID>"`` ids those messages ran."""
+        its ``models`` the ``"<providerID>/<modelID>"`` ids those messages ran.
+        1.x has no child-session enumeration, so a subagent's tokens and model
+        are not counted. ``by_model`` splits the sum per message model."""
         usage, fault = _tally_messages(transcript)
         return usage, None if fault is None else UsageFault("payload", fault)
 
@@ -1335,9 +1341,19 @@ class V2Protocol(OpencodeProtocol):
         alone.) Never raises.
 
         ``models`` is the ``"<providerID>/<id>"`` of each assistant message in
-        ``transcript`` (:func:`_v2_models`): None when the transcript was not
-        read. Descendant sessions' messages are not fetched, so a subagent's
-        model is missing unless the parent also ran it."""
+        ``transcript`` (:func:`_v2_models`), then each descendant's
+        ``Session.Info.model`` ref (:func:`_info_model`) in walk order, distinct
+        and first-seen — read off the one walk the tokens use, never the
+        children's messages. A ref is the child's current model (a switched
+        child reports its latest); a child without one ran the server default,
+        which the parent's transcript already names. None when the transcript
+        was not read, ``()`` when it names no model — children are not
+        consulted then, so element 0 is always the parent's. A malformed child ref
+        keeps the usage and the readable models but returns a ``models`` fault
+        beside it.
+
+        ``by_model`` (:func:`_v2_by_model`) splits per session aggregate, since
+        V2 reports no per-step tokens: None exactly when ``models`` is."""
         try:
             resp = client.get(f"/api/session/{session_id}")
             if resp.status_code != 200:
@@ -1349,13 +1365,20 @@ class V2Protocol(OpencodeProtocol):
             usage = _session_tokens(body)
         except (AttributeError, KeyError, TypeError, ValueError) as e:
             return None, UsageFault("payload", f"malformed session: {type(e).__name__}: {e}")
-        children, fault = self._children_tokens(client, session_id)
+        parent = replace(usage)  # `usage` is summed into below
+        infos, fault = self.descendants(client, session_id)
+        if infos is None:
+            return None, UsageFault("children", fault or "")
+        children, fault = _infos_tokens(infos)
         if children is None:
             return None, UsageFault("children", fault or "")
         usage.add(children)
         if usage.total == 0 and not _any_completed_assistant(transcript):
             return None, None
-        return replace(usage, models=_v2_models(transcript)), None
+        parent_models = _v2_models(transcript)
+        models, models_fault = _fold_child_models(parent_models, infos)
+        by_model = _v2_by_model(parent, _v2_sole_model(transcript), models, infos)
+        return replace(usage, models=models, by_model=by_model), models_fault
 
     def sample_usage(self, client: Any, session_id: str) -> tuple[TokenUsage | None, str | None]:
         """The budget guard's sample: the same parent-plus-descendants sum as
@@ -1431,13 +1454,7 @@ class V2Protocol(OpencodeProtocol):
         infos, fault = self.descendants(client, session_id)
         if infos is None:
             return None, fault
-        total = TokenUsage()
-        for info in infos:
-            try:
-                total.add(_info_tokens(info))
-            except (AttributeError, KeyError, TypeError, ValueError) as e:
-                return None, f"malformed child session {info.get('id')}: {type(e).__name__}: {e}"
-        return total, None
+        return _infos_tokens(infos)
 
     def active_descendants(
         self, client: Any, session_id: str
@@ -1471,6 +1488,19 @@ def _session_tokens(body: Any) -> TokenUsage:
     body of the wrong shape (no ``data`` / ``tokens`` object, a non-numeric
     count) — a fault, never a zero."""
     return _info_tokens(body["data"])
+
+
+def _infos_tokens(infos: list[Any]) -> tuple[TokenUsage | None, str | None]:
+    """``(usage, fault)``: the summed aggregate of the :meth:`V2Protocol.descendants`
+    ``infos`` (a zero usage when there are none), or None with ``fault`` naming
+    the malformed child. Never raises."""
+    total = TokenUsage()
+    for info in infos:
+        try:
+            total.add(_info_tokens(info))
+        except (AttributeError, KeyError, TypeError, ValueError) as e:
+            return None, f"malformed child session {info.get('id')}: {type(e).__name__}: {e}"
+    return total, None
 
 
 def _info_tokens(info: Any) -> TokenUsage:
@@ -1524,6 +1554,95 @@ def _v2_models(messages: Any) -> tuple[str, ...] | None:
     return tuple(seen)
 
 
+def _v2_sole_model(messages: Any) -> str | None:
+    """The one model every assistant message of a V2 transcript names, or
+    None: no assistant message, two models (a mid-session switch), or any
+    assistant message whose ``model`` ref :func:`_v2_models` skips as
+    missing or malformed — its tokens are in the parent's aggregate too, so
+    the aggregate is billed to no named model rather than to the others'."""
+    if not isinstance(messages, list):
+        return None
+    sole: str | None = None
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("type") != "assistant":
+            continue
+        named = _v2_models([msg])
+        if not named or (sole is not None and named[0] != sole):
+            return None
+        sole = named[0]
+    return sole
+
+
+def _info_model(info: Any) -> str | None:
+    """One ``Session.Info``'s ``"<providerID>/<id>"`` model ref (``variant``
+    ignored, as in :func:`_v2_models`), or None when it has none — the key is
+    optional: a session created without a model runs the server default.
+    Raises TypeError / ValueError on a ref of the wrong shape."""
+    ref = info.get("model")
+    if ref is None:
+        return None
+    if not isinstance(ref, dict):
+        raise TypeError(f"model is {type(ref).__name__}, not an object")
+    provider, model_id = ref.get("providerID"), ref.get("id")
+    for key, value in (("providerID", provider), ("id", model_id)):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{key} is {value!r}, not a non-empty string")
+    return f"{provider}/{model_id}"
+
+
+def _fold_child_models(
+    models: tuple[str, ...] | None, infos: list[Any]
+) -> tuple[tuple[str, ...] | None, UsageFault | None]:
+    """``models`` (the parent transcript's, :func:`_v2_models`) with each
+    descendant's :func:`_info_model` appended in walk order, distinct and
+    first-seen, plus a ``models`` fault naming every child whose ref was
+    malformed (its model skipped). A falsy ``models`` is returned unchanged,
+    with no fault: None (an unread transcript) stays unknown and ``()`` stays
+    unresolved — element 0 is the parent's model, never a child's."""
+    if not models:
+        return models, None
+    seen = dict.fromkeys(models)
+    faults: list[str] = []
+    for info in infos:
+        try:
+            model = _info_model(info)
+        except (TypeError, ValueError) as e:
+            faults.append(f"child session {info.get('id')} model: {type(e).__name__}: {e}")
+            continue
+        if model is not None:
+            seen.setdefault(model, None)
+    return tuple(seen), UsageFault("models", "; ".join(faults)) if faults else None
+
+
+def _v2_by_model(
+    parent: TokenUsage,
+    parent_model: str | None,
+    models: tuple[str, ...] | None,
+    infos: list[Any],
+) -> dict[str, TokenUsage] | None:
+    """The V2 ``by_model`` split over session aggregates: ``parent`` (the
+    session's own) bills to ``parent_model`` (:func:`_v2_sole_model`: the one
+    model every assistant message names), else (none, a mid-session switch, or
+    a message with an unreadable ref) to ``UNATTRIBUTED_MODEL``; each descendant's
+    aggregate bills to its :func:`_info_model` ref when that id is among the
+    folded ``models``, else (no ref, a malformed one, or children not
+    consulted) to the sentinel. None when ``models`` is None (transcript
+    unread). ``infos`` already passed :func:`_infos_tokens`, so their counts
+    read; a malformed ref is no new fault here — :func:`_fold_child_models`
+    reports it."""
+    if models is None:
+        return None
+    buckets: dict[str | None, TokenUsage] = {}
+    add_to_bucket(buckets, parent_model, parent)
+    for info in infos:
+        try:
+            model = _info_model(info)
+        except (TypeError, ValueError):
+            model = None
+        add_to_bucket(buckets, model if model in models else None, _info_tokens(info))
+    return settle_by_model(buckets, models)
+
+
 # The characters V2's permission-rule matcher reads as wildcards.
 _V2_RULE_WILDCARDS = frozenset("*?")
 
@@ -1564,7 +1683,9 @@ def _sum_usage(messages: Any) -> TokenUsage | None:
 
     A tracked usage's ``models`` holds the distinct ``"<providerID>/<modelID>"``
     of every assistant message naming both (required on a V1
-    ``AssistantMessage``), first-seen order; ``()`` when none does."""
+    ``AssistantMessage``), first-seen order; ``()`` when none does. Its
+    ``by_model`` bills each message's tokens to that id, else (an id missing)
+    to ``UNATTRIBUTED_MODEL``."""
     return _tally_messages(messages)[0]
 
 
@@ -1588,13 +1709,16 @@ def _sum_message_list(messages: list[Any]) -> TokenUsage | None:
     usage: TokenUsage | None = None
     any_completed = False
     models: dict[str, None] = {}
+    buckets: dict[str | None, TokenUsage] = {}
     for msg in messages:
         info = (msg or {}).get("info") or {}
         if info.get("role") != "assistant":
             continue
         provider, model_id = info.get("providerID"), info.get("modelID")
+        model: str | None = None
         if isinstance(provider, str) and provider and isinstance(model_id, str) and model_id:
-            models.setdefault(f"{provider}/{model_id}", None)
+            model = f"{provider}/{model_id}"
+            models.setdefault(model, None)
         error = info.get("error")
         aborted = isinstance(error, dict) and error.get("name") == "MessageAbortedError"
         if (info.get("time") or {}).get("completed") and not aborted:
@@ -1605,14 +1729,15 @@ def _sum_message_list(messages: list[Any]) -> TokenUsage | None:
         if usage is None:
             usage = TokenUsage()
         cache = tokens.get("cache") or {}
-        usage.add(
-            TokenUsage(
-                input_tokens=int(tokens.get("input") or 0),
-                output_tokens=int(tokens.get("output") or 0) + int(tokens.get("reasoning") or 0),
-                cache_read_tokens=int(cache.get("read") or 0),
-                cache_creation_tokens=int(cache.get("write") or 0),
-            )
+        each = TokenUsage(
+            input_tokens=int(tokens.get("input") or 0),
+            output_tokens=int(tokens.get("output") or 0) + int(tokens.get("reasoning") or 0),
+            cache_read_tokens=int(cache.get("read") or 0),
+            cache_creation_tokens=int(cache.get("write") or 0),
         )
+        usage.add(each)
+        add_to_bucket(buckets, model, each)
     if usage is None or (usage.total == 0 and not any_completed):
         return None
-    return replace(usage, models=tuple(models))
+    found = tuple(models)
+    return replace(usage, models=found, by_model=settle_by_model(buckets, found))

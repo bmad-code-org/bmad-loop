@@ -366,13 +366,17 @@ them to whoever owns the machine:
   ≥ 0.46.
 - **copilot** — run `copilot` once in the project and authenticate (`gh` / a Copilot
   subscription). Requires the Copilot **CLI** GA (≥ 2026-02) — _not_ the VS Code extension.
-  **Pin a capable model**: the free default (GPT-5 mini) silently skips steps in the
-  multi-step dev/review skills; set `[adapter] model = "claude-sonnet-4-6"` (→ `--model`).
+  **Pin a capable model**: a small model (GPT-5 mini was the old free default) silently
+  skips steps in the multi-step dev/review skills, so set
+  `[adapter] model = "claude-sonnet-4.6"` (→ `--model`; Copilot model ids use dotted
+  versions). The Copilot Free plan ignores `--model`: Copilot 1.0.105 auto-routes every
+  session. The model that actually ran shows in session-end `models` once a turn has
+  finished; a session that ends before its first turn completes records no model.
 - **antigravity** — run `agy` once in the project, authenticate, and answer
   **"Yes, I trust this folder"** before `bmad-loop run`; spawned sessions can't answer that
   dialog, and a pending one reads as a session timeout. Requires Antigravity CLI
-  (`agy` ≥ 1.1.3). Two limitations to know, both verified against 1.1.3:
-  - **Trust is exact-path.** `settings.json` `trustedWorkspaces` matches whole paths —
+  (`agy` ≥ 1.1.3). Things to know:
+  - **Trust is exact-path** (verified against 1.1.3). `settings.json` `trustedWorkspaces` matches whole paths —
     trusting a parent does _not_ cover its subdirectories, and
     `--dangerously-skip-permissions` does not bypass the dialog (it covers tool
     permissions only). `isolation = "none"` (the default) works once the project root
@@ -386,9 +390,17 @@ them to whoever owns the machine:
     **Known limitation:** entries are never removed when a worktree is torn down, so
     `trustedWorkspaces` accumulates one entry per unit — prune stale
     `.bmad-loop/runs/` paths by hand if the list grows.
-  - **Token usage is not recorded** (`usage_parser = "none"`) — and this is permanent,
-    not a gap: agy's transcript carries no usage data at all (it counts tokens only in
-    an internal SQLite/protobuf store). Runs work; the token columns stay empty.
+  - **Trust is case-sensitive, even on Windows** (agy 1.5.0). agy records the cwd as
+    your shell spelled it, so answer the dialog from the project's canonical-case path
+    (`C:\Users\...`). `cmd` keeps a typed `c:` drive letter, and that entry trusts
+    neither bmad-loop's sessions nor its worktrees. A forward-slash spelling of the same
+    path (`C:/Users/...`) also counts.
+  - **Token usage is read from agy's transcript**
+    (`usage_parser = "antigravity-transcript"`, checked against agy 1.4.9 and 1.5.0): each
+    model step's input, cache-read and output counts are summed, and a subagent's usage is
+    folded into the parent session that spawned it. The transcript has no model id, so the
+    observed model is not recorded. agy 1.1.3 wrote no counts, so its sessions read as
+    untracked.
 - **opencode** — install the HTTP client extra (`uv tool install "bmad-loop[tui,opencode] @ git+https://github.com/bmad-code-org/bmad-loop.git"`) and
   authenticate once, **globally**, with `opencode auth login` (not per-project — there is no
   workspace-trust dialog to answer). Supports OpenCode 1.x ≥ 1.18 and 2.x ≥ 2.0.21; see

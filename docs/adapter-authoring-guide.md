@@ -254,18 +254,20 @@ config or never fires a hook, the report says so, with a scrubbed log tail.
 
 Turn the report's `token_field_candidates` into a parser in
 [`src/bmad_loop/tokens.py`](../src/bmad_loop/tokens.py), following the existing ones
-(`tally` for claude, `tally_codex_rollout`, `tally_gemini_chat`), and register it in
-`read_usage`. Decide **per-call vs cumulative** yourself: a `token_count`-style event that
-carries running totals (codex) is read differently from per-message blocks that are summed
-(claude, gemini). Re-run the scan; the **parsed counts** self-check should now appear.
+(`tally` for claude, `tally_codex_rollout`, `tally_gemini_chat`, `tally_copilot_events`,
+`tally_antigravity_transcript`), and register it in `read_usage`. Decide **per-call vs
+cumulative** yourself: a `token_count`-style event that carries running totals (codex) is
+read differently from per-message blocks that are summed (claude, gemini, antigravity).
+Re-run the scan; the **parsed counts** self-check should now appear.
 At run time the parser reads the file named by the hook payload's `transcript_path`. For
 `codex-rollout`, a missing or unusable hook path is resolved from the session id under
-`$CODEX_HOME/sessions`.
+`$CODEX_HOME/sessions`. A CLI whose subagents write their own transcripts needs the parser
+to fold them in: `claude-jsonl`, `codex-rollout` and `antigravity-transcript` each do.
 
 **`none` is a legitimate final answer.** If the report has no `token_field_candidates`, the
-CLI may not expose usage anywhere a parser can reach. `antigravity` is the example: it
-writes token counts only into an internal SQLite blob, never into the transcript. Leave
-`usage_parser = "none"` and record why in the profile. Do not scrape a vendor's internal
+CLI may not expose usage anywhere a parser can reach, for example when it keeps token counts
+only in an internal database. Leave `usage_parser = "none"`, record why and the version you
+checked in the profile, and re-check on a newer release. Do not scrape a vendor's internal
 store outside the `(transcript_path) -> TokenUsage | None` contract.
 
 **Trust the payload over the docs.** A CLI that reports its transcript path in the hook
@@ -290,7 +292,10 @@ It surfaced three corrections to the draft:
   relay (`bmad_loop_hook.py`) reads both casings.
 - **Token schema.** The probe found `~/.copilot/session-state/*/events.jsonl` and its token
   fields (`data.modelMetrics.<model>.usage.*`), which became the `copilot-events` parser in
-  `tokens.py`.
+  `tokens.py`. A later capture on 1.0.105 (now the fixture in `tests/fixtures/copilot-1.0.105/`)
+  showed two more things. Each turn's `session.usage_checkpoint` carries the same totals
+  under `data.accountingSnapshot`. And `inputTokens` includes the cache reads (the Copilot
+  SDK docs add cache writes, and count `reasoningTokens` inside `outputTokens`).
 
 Confirm the `mkdtemp` dir is gone afterward.
 
@@ -317,7 +322,7 @@ a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` reso
 | `bypass_args`                      |          | `[]`                                                                           | Permission-bypass flags for unattended runs, launched under `permission_mode = "bypass"`. A policy `extra_args` replaces them; `validate` warns (`policy.bypass-dropped`) when one is dropped.                                                                                                             |
 | `model_flag`                       |          | `--model`                                                                      | Flag passed with the model name when one is configured.                                                                                                                                                                                                                                                    |
 | `env`                              |          | `{}`                                                                           | `[env]` table of extra session environment variables. It cannot override the run's state-root pin.                                                                                                                                                                                                         |
-| `usage_parser`                     |          | `none`                                                                         | Transcript token parser: `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events` or `none`.                                                                                                                                                                                                       |
+| `usage_parser`                     |          | `none`                                                                         | Transcript token parser: `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `antigravity-transcript` or `none`.                                                                                                                                                                             |
 | `usage_grace_s`                    |          | `0.0`                                                                          | Seconds to keep polling the transcript for token totals after the session ends; `0` reads once. Must be ≥ 0.                                                                                                                                                                                               |
 | `stop_without_result_nudges`       |          | unset                                                                          | Per-profile default for Stop-without-result nudges. An `[adapter]` / `[adapter.<stage>]` value overrides it; unset inherits `[limits] stop_without_result_nudges`. Must be ≥ 0.                                                                                                                            |
 | `subagent_stop_without_transcript` |          | `false`                                                                        | When `true`, a `Stop` with no transcript path is a subagent turn-end and is ignored.                                                                                                                                                                                                                       |
@@ -333,7 +338,7 @@ a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` reso
 | `[parked_answers]`                 |          | unset                                                                          | The [`[parked_answers]`](#answer-keys-the-parked_answers-table) table. Unset: the TUI offers no answer keys.                                                                                                                                                                                               |
 | `[permission_modes.<mode>]`        |          | unset                                                                          | Launch args for a non-bypass `[adapter] permission_mode`. See [Permission modes](#permission-modes). Unset: the profile refuses that mode.                                                                                                                                                                 |
 | `session_id_flag`                  |          | `""`                                                                           | Launch flag for a caller-chosen session id (claude: `--session-id`). The generic adapter appends `[flag, uuid4]` and pins attribution to that id.                                                                                                                                                          |
-| `subagent_transcript_dir`          |          | derived from `usage_parser` (`{stem}/subagents` for `claude-jsonl`, else `""`) | Subagent transcript tree beside the transcript, walked recursively and stat-only; its writes count as idle-notice activity. Must contain `{stem}` (the transcript's filename stem) and stay relative; `""` = off.                                                                                          |
+| `subagent_transcript_dir`          |          | derived from `usage_parser` (`{stem}/subagents` for `claude-jsonl`, else `""`) | Subagent transcript tree beside the transcript, walked recursively and stat-only; its writes count as idle-notice activity and re-arm the dev stall grace. Must contain `{stem}` (the transcript's filename stem) and stay relative; `""` = off.                                                           |
 
 `session_id_flag` must be one `-`-prefixed token with no whitespace or `=`, and is refused
 on hookless profiles. Set it only when the CLI's `SessionStart` payload reports the id you
@@ -346,23 +351,28 @@ An overlay that changes `usage_parser` away from `claude-jsonl` must set
 session id; that folder's parent holds the conversation folders searched for the marker. A
 `Stop` it cannot judge (no id, no transcript path, no such folder) or a marker it cannot read
 is admitted and journaled once (`subagent-marker-unjudged`, `subagent-marker-unreadable`); a
-dropped child is journaled once per id (`subagent-stop-ignored`). The idle notice also walks
-each child the parent's folder lists (`<store root>/<childId>/`, its `*.jsonl` files only,
-stat-only) as it walks `subagent_transcript_dir`; when the parent's folder cannot be judged it
-watches no children, and a listing fault joins `subagent-scan-failed`. Like
-`subagent_transcript_dir`, it must contain its placeholder (here `{session_id}`), stay relative
-with no `..`, and is refused on hookless profiles.
+dropped child is journaled once per id (`subagent-stop-ignored`). The `Stop` check skips a
+store folder whose mtime predates the session's launch (less a 300 s slack): it stats each such
+folder once per session, then never again. Like `subagent_transcript_dir`, the marker must
+contain its placeholder (here `{session_id}`), stay relative with no `..`, and is refused on
+hookless profiles.
+
+The idle notice also walks each child the parent's folder lists (`<store root>/<childId>/`, its
+`*.jsonl` files only, stat-only), and each child those children list in turn, as it walks
+`subagent_transcript_dir`; when the parent's folder cannot be judged it watches no children, and
+a listing fault joins `subagent-scan-failed`. A listed descendant's writes also re-arm the dev
+stall grace, as pane growth does.
 
 ### `HookSpec` (the `[hooks]` table)
 
-| Field                | Required                     | Default | Meaning                                                                                                                                                            |
-| -------------------- | ---------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `dialect`            | ✅                           | —       | Hook-config format: `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `antigravity-hooks-json`, or `none` (hookless).   |
-| `config_path`        | ✅ unless `dialect = "none"` | `""`    | Project-relative path the hook config is written to. Must stay inside the project; empty when hookless.                                                            |
-| `events`             | ✅ unless `dialect = "none"` | `{}`    | Native event → canonical event (`SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, `Notification`, `StopFailure`, or a parked kind). Empty when hookless.         |
-| `notification_types` |                              | `{}`    | `[hooks.notification_types]`: notification subtype → parked kind. Unmapped subtypes are ignored. Needs an event mapped to `Notification`.                          |
-| `stop_failure_types` |                              | `{}`    | `[hooks.stop_failure_types]`: `StopFailure` error value → `transient`, `rate_limit`, `account` or `ignore`. Needs an event mapped to `StopFailure`.                |
-| `event_min_versions` |                              | `{}`    | `[hooks.event_min_versions]`: native event → minimum CLI version (`X.Y.Z`). Registration leaves the event out below it. Keys must be mapped; never a Stop carrier. |
+| Field                | Required                     | Default | Meaning                                                                                                                                                              |
+| -------------------- | ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dialect`            | ✅                           | —       | Hook-config format: `claude-settings-json`, `codex-hooks-json`, `gemini-settings-json`, `copilot-settings-json`, `antigravity-hooks-json`, or `none` (hookless).     |
+| `config_path`        | ✅ unless `dialect = "none"` | `""`    | Project-relative path the hook config is written to. Must stay inside the project; empty when hookless.                                                              |
+| `events`             | ✅ unless `dialect = "none"` | `{}`    | Native event → canonical event (`SessionStart`, `Stop`, `SessionEnd`, `PreCompact`, `Notification`, `StopFailure`, or a parked kind). Empty when hookless.           |
+| `notification_types` |                              | `{}`    | `[hooks.notification_types]`: notification subtype → parked kind. Unmapped subtypes are ignored. Needs an event mapped to `Notification`.                            |
+| `stop_failure_types` |                              | `{}`    | `[hooks.stop_failure_types]`: `StopFailure` error value → `transient`, `rate_limit`, `account`, `account-fatal` or `ignore`. Needs an event mapped to `StopFailure`. |
+| `event_min_versions` |                              | `{}`    | `[hooks.event_min_versions]`: native event → minimum CLI version (`X.Y.Z`). Registration leaves the event out below it. Keys must be mapped; never a Stop carrier.   |
 
 ### Session identity and nested CLIs
 
@@ -444,7 +454,9 @@ is in [Environment faults](escalations-guide.md#environment-faults).
   file.
 - Patterns are a list of strings, compiled at load (an invalid regex is a profile error),
   and matched with the `regex` module under a per-pattern timeout.
-- Seeded for `claude` (connection loss and two captured provider 5xx errors) and
+- Seeded for `claude` (connection loss, a mid-response cut in both its older and its
+  current Claude Code wording, and two captured provider 5xx errors; the current lines
+  are pinned against `tests/fixtures/claude-stopfailure/`) and
   `opencode` (provider quota/rate-limit and connection on 1.x; `provider.rate-limit`,
   `provider.transport`, `provider.internal`, `provider.auth` and `provider.no-route` events
   on 2.x, whose `provider.quota` is a usage limit instead).
@@ -524,6 +536,12 @@ The generic adapter acts on it when it arrives, by action:
   `StopFailure(<error>): <message, else details, else "no message">`. The log-tail
   env-fault scan is skipped, so the run pauses with a `parked:` reason naming the error,
   and the attempt is not charged.
+- **`account-fatal`**: the adapter treats it exactly like `account` (the same parked exit
+  and evidence, and a dead window after it is relabeled `parked` with
+  `crash-relabeled` `kind="account"`), and `stop_failure_action` reads `account-fatal`.
+  The difference is downstream: usage-relaunch mode relaunches an `account` error but
+  never an `account-fatal` one, so map an error here when no relaunch or account switch
+  can fix it.
 - **`rate_limit`**: an ordinary 429 and a subscription limit share this value, so the
   message is matched against the profile's usage lists (see
   [Usage-limit signals](#usage-limit-signals)). A `usage_limit_patterns` match ends the
@@ -544,9 +562,9 @@ uncleared error, as does the heartbeat and the `session-end` journal entry, and
 
 **A window that dies after the event.** An operator's own `StopFailure` hook may kill the
 window, for example to switch accounts. The session then ends `crashed`, but an `account`
-error, or a `rate_limit` that matched a usage list, keeps its classification: the result
-is labeled `parked` (account) or `usage_limited` (blocked or wait class), and the run gets
-the same uncharged pause as the live exit. The adapter leaves a `crash-relabeled`
+or `account-fatal` error, or a `rate_limit` that matched a usage list, keeps its
+classification: the result is labeled `parked` (account) or `usage_limited` (blocked or
+wait class), and the run gets the same uncharged pause as the live exit. The adapter leaves a `crash-relabeled`
 lifecycle crumb (`kind`, `error`). A `Stop` clears the classification, and so does a
 transcript write after the event, since the CLI recovered by itself. A crash whose result
 file exists is completed as before and never relabeled. An unmatched `rate_limit` stays an
@@ -574,8 +592,10 @@ The engine relaunches such a session without charging an attempt (see
 The shipped `claude` profile maps the documented values: `overloaded`, `server_error`,
 `unknown`, `max_output_tokens` and `invalid_request` (a context-shape failure that a fresh
 session fixes) are `transient`; `rate_limit` is `rate_limit`; `billing_error`,
-`authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`,
-`verification_required`, `cloud_credential_error` and `model_not_found` are `account`.
+`authentication_failed`, `oauth_org_not_allowed`, `account_on_hold` and
+`verification_required` are `account`; `cloud_credential_error` and `model_not_found` are
+`account-fatal`, since a relaunch on another account still hits the same wrong model or
+broken cloud credential.
 
 **Version gate.** Claude Code before 2.1.78 skips its whole settings file over an
 unknown hook event key, `Stop` relay included, so claude's

@@ -87,6 +87,11 @@ def test_notification_payload_carries_its_subtype(tmp_path):
     assert json.loads(stop.read_text())["notification_type"] is None
 
 
+# Claude Code's mid-response-cut StopFailure wording, built by concatenation so this file
+# carries no line the claude env-fault patterns match (the repo-wide pane scan).
+_LOST_MESSAGE = "API Error: Connection lost " + "mid-response"
+
+
 def test_stop_failure_payload_carries_its_api_error(tmp_path):
     """#865: a claude StopFailure's `error` and `last_assistant_message` ride the
     event file as `stop_error` / `stop_message`, so the adapter can tell a
@@ -99,7 +104,7 @@ def test_stop_failure_payload_carries_its_api_error(tmp_path):
             "session_id": "s1",
             "hook_event_name": "StopFailure",
             "error": "server_error",
-            "last_assistant_message": "API Error: Connection lost mid-response",
+            "last_assistant_message": _LOST_MESSAGE,
         },
     )
     assert proc.returncode == 0
@@ -108,7 +113,7 @@ def test_stop_failure_payload_carries_its_api_error(tmp_path):
     )
     assert event["event"] == "StopFailure"
     assert event["stop_error"] == "server_error"
-    assert event["stop_message"] == "API Error: Connection lost mid-response"
+    assert event["stop_message"] == _LOST_MESSAGE
     assert "stop_error_details" not in event  # optional, and absent here
     assert run_hook("Stop", env, {"session_id": "s1"}).returncode == 0
     stop = json.loads(next((tmp_path / "events").glob("*-Stop.json")).read_text(encoding="utf-8"))

@@ -2162,6 +2162,158 @@ def test_spawn_marker_verdict_propagates_a_store_read_fault(tmp_path, monkeypatc
         generic._spawn_marker_verdict(_AGY_MARKER, "agy-parent", parent_t)
 
 
+# DW-608: the bounded Stop scan. A store folder whose mtime predates the
+# session's launch (less `SPAWN_SCAN_SLACK_NS`) cannot be a parent the session
+# spawned, so it is remembered as settled and never stat'ed again.
+
+
+def _age_folder(folder: Path) -> None:
+    old = time.time() - 3600.0  # far below launch - SPAWN_SCAN_SLACK_NS (300 s)
+    os.utime(folder, (old, old))
+
+
+def _stat_counter(monkeypatch, target: Path) -> list[int]:
+    """Count `os.stat` calls on `target` exactly (the folder, not its marker)."""
+    real_stat = os.stat
+    calls = [0]
+
+    def counting(path, *args, **kwargs):
+        if os.fspath(path) == str(target):
+            calls[0] += 1
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(generic.os, "stat", counting)
+    return calls
+
+
+def test_bounded_spawn_marker_verdict_skips_a_folder_older_than_launch(tmp_path):
+    """A parent folder older than launch holding the child's marker is not a
+    parent this session spawned: settled and skipped, so the Stop reads "own".
+
+    Ablation, performed: drop the `mtime_ns < floor_ns` skip and this fails —
+    the old folder's marker reads "child"."""
+    _, child_t = _agy_brain(tmp_path)
+    _age_folder(tmp_path / "brain" / "agy-parent")
+    settled: set[str] = set()
+    verdict = generic._spawn_marker_verdict(
+        _AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns(), settled=settled
+    )
+    assert verdict == "own"
+    assert settled == {"agy-parent"}
+
+
+def test_bounded_spawn_marker_verdict_still_reads_a_fresh_folder(tmp_path):
+    """A folder created after launch (here: within the slack of it) is checked
+    as before, and never settled."""
+    _, child_t = _agy_brain(tmp_path)
+    settled: set[str] = set()
+    verdict = generic._spawn_marker_verdict(
+        _AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns(), settled=settled
+    )
+    assert verdict == "child"
+    assert settled == set()
+
+
+def test_bounded_spawn_marker_verdict_never_stats_a_settled_folder(tmp_path, monkeypatch):
+    """The settled index is what makes later Stops cheap: a name already in it
+    is skipped before any stat of the folder or its marker."""
+    _, child_t = _agy_brain(tmp_path)
+    parent = tmp_path / "brain" / "agy-parent"
+    _age_folder(parent)
+    folder_stats = _stat_counter(monkeypatch, parent)
+    since_ns = time.time_ns()
+    settled: set[str] = set()
+    generic._spawn_marker_verdict(
+        _AGY_MARKER, "agy-child", child_t, since_ns=since_ns, settled=settled
+    )
+    assert folder_stats == [1]
+    assert (
+        generic._spawn_marker_verdict(
+            _AGY_MARKER, "agy-child", child_t, since_ns=since_ns, settled=settled
+        )
+        == "own"
+    )
+    assert folder_stats == [1]  # the second call never stat'ed it
+
+
+def test_bounded_spawn_marker_verdict_propagates_a_folder_stat_fault(tmp_path, monkeypatch):
+    """A fault statting a candidate folder propagates for the caller to crumb —
+    never read as an old folder, nor as an absent marker; a vanished folder is
+    skipped like an absent marker."""
+    _, child_t = _agy_brain(tmp_path)
+    parent = tmp_path / "brain" / "agy-parent"
+    real_stat = os.stat
+    fault: list[OSError] = [PermissionError(13, "Permission denied", str(parent))]
+
+    def faulty(path, *args, **kwargs):
+        if os.fspath(path) == str(parent):
+            raise fault[0]
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(generic.os, "stat", faulty)
+    settled: set[str] = set()
+    with pytest.raises(PermissionError):
+        generic._spawn_marker_verdict(
+            _AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns(), settled=settled
+        )
+    assert settled == set()
+    fault[0] = FileNotFoundError(2, "No such file or directory", str(parent))
+    verdict = generic._spawn_marker_verdict(
+        _AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns(), settled=settled
+    )
+    assert verdict == "own"
+    assert settled == set()
+
+
+def test_unbounded_spawn_marker_verdict_still_reads_an_old_folder(tmp_path):
+    """Called without the index, the scan is unbounded, as before DW-608."""
+    _, child_t = _agy_brain(tmp_path)
+    _age_folder(tmp_path / "brain" / "agy-parent")
+    assert generic._spawn_marker_verdict(_AGY_MARKER, "agy-child", child_t) == "child"
+    assert (
+        generic._spawn_marker_verdict(_AGY_MARKER, "agy-child", child_t, since_ns=time.time_ns())
+        == "child"
+    )
+
+
+def test_wait_loop_stats_an_old_store_folder_on_the_first_stop_only(tmp_path, monkeypatch):
+    """Two parent yields then the parent's final Stop, with an unrelated
+    conversation older than launch in brain/: the first Stop stats that folder
+    once and settles it; later Stops never stat it again, and the verdicts are
+    unchanged (the session completes on the parent's final Stop).
+
+    Ablation, performed: pass no `settled` set at the call site and this fails
+    — the old folder is stat'ed on every Stop (or not at all, unbounded)."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    parent_t, _ = _agy_brain(tmp_path)
+    old = tmp_path / "brain" / "old-conversation"
+    (old / ".system_generated").mkdir(parents=True)
+    _age_folder(old)
+    launched_ns = time.time_ns()  # before the spec: an older one reads as stale
+    spec_path = impl / "spec-3-1-foo.md"
+    spec_path.write_text("---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n")
+    # A Windows mtime comes from a coarser clock than time.time_ns(), so the spec
+    # can read as older than the launch and be skipped as stale. Stamp it past it.
+    later = launched_ns + _MTIME_TICK_NS
+    os.utime(spec_path, ns=(later, later))
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_stop("agy-parent", parent_t, False),
+            _agy_stop("agy-parent", parent_t, False),
+            _agy_stop("agy-parent", parent_t, True),
+        ]
+    )
+    folder_stats = _stat_counter(monkeypatch, old)
+
+    result = adapter.wait_for_completion(_dev_handle(launched_ns), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert adapter.watcher.calls == 3
+    assert folder_stats == [1]
+    assert _lifecycle_events(adapter, "subagent-marker-unreadable") == []
+
+
 def _agy_child_run(tmp_path, adapter, impl):
     """parent yield -> child yield -> child final -> parent final, with the
     terminal spec already on disk: whichever Stop is first read as a turn end
@@ -6905,9 +7057,9 @@ def test_read_usage_polls_for_late_metrics(tmp_path, monkeypatch):
 
     def fake_tally(parser, path):
         calls.append(parser)
-        return None if len(calls) < 3 else usage
+        return (None, False) if len(calls) < 3 else (usage, True)
 
-    monkeypatch.setattr(generic, "tally_usage", fake_tally)
+    monkeypatch.setattr(generic, "read_usage_settled", fake_tally)
     monkeypatch.setattr(generic.time, "sleep", lambda *_: None)
     result = SessionResult(status="completed", transcript_path=str(tmp_path / "events.jsonl"))
     assert adapter.read_usage(result) is usage
@@ -6921,16 +7073,74 @@ def test_read_usage_single_read_when_no_grace(tmp_path, monkeypatch):
 
     def fake_tally(parser, path):
         calls.append(parser)
-        return None
+        return None, True
 
     def no_sleep(*_):
         raise AssertionError("read_usage must not sleep when the grace is 0")
 
-    monkeypatch.setattr(generic, "tally_usage", fake_tally)
+    monkeypatch.setattr(generic, "read_usage_settled", fake_tally)
     monkeypatch.setattr(generic.time, "sleep", no_sleep)
     result = SessionResult(status="completed", transcript_path=str(tmp_path / "x.jsonl"))
     assert adapter.read_usage(result) is None
     assert len(calls) == 1
+
+
+COPILOT_TWO_TURNS = (
+    Path(__file__).parent
+    / "fixtures"
+    / "copilot-1.0.105"
+    / "session-state"
+    / "c0000000-0000-4000-8000-000000000002"
+    / "events.jsonl"
+)
+
+
+def _copilot_cut_after_first_checkpoint(tmp_path):
+    """``(path, rest)``: the real two-turn capture cut right after the second
+    turn's agentStop `hook.end`, before its checkpoint (the transcript the
+    post-session read can meet), and the lines still to come."""
+    lines = COPILOT_TWO_TURNS.read_text(encoding="utf-8").splitlines(keepends=True)
+    checkpoints = [i for i, line in enumerate(lines) if '"session.usage_checkpoint"' in line]
+    cut = checkpoints[1]  # the second turn's checkpoint, which follows its hook.end
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(lines[:cut]), encoding="utf-8")
+    return path, "".join(lines[cut:])
+
+
+def test_read_usage_waits_past_an_earlier_turn_checkpoint(tmp_path, monkeypatch):
+    """An earlier turn's checkpoint already reads usage, so the grace poll
+    keeps going until `session.shutdown` lands with the session totals.
+
+    Ablation: return the first non-None read and this reads the first turn's
+    518 input / 5 output / 17408 cached."""
+    adapter = _usage_adapter(tmp_path, "copilot")
+    path, rest = _copilot_cut_after_first_checkpoint(tmp_path)
+    sleeps: list[float] = []
+
+    def land_the_rest(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(rest)
+
+    monkeypatch.setattr(generic.time, "sleep", land_the_rest)
+    usage = adapter.read_usage(SessionResult(status="completed", transcript_path=str(path)))
+    assert usage == TokenUsage(input_tokens=570, output_tokens=11, cache_read_tokens=35328)
+    assert len(sleeps) == 2
+
+
+def test_read_usage_keeps_an_unsettled_checkpoint_at_the_deadline(tmp_path, monkeypatch):
+    """No shutdown line by the deadline: the latest checkpoint stands rather
+    than None (an undercount beats untracked)."""
+    adapter = _usage_adapter(tmp_path, "copilot", usage_grace_s=0.0)
+    path, _ = _copilot_cut_after_first_checkpoint(tmp_path)
+
+    def no_sleep(*_):
+        raise AssertionError("grace 0 reads once")
+
+    monkeypatch.setattr(generic.time, "sleep", no_sleep)
+    usage = adapter.read_usage(SessionResult(status="completed", transcript_path=str(path)))
+    assert usage == TokenUsage(input_tokens=518, output_tokens=5, cache_read_tokens=17408)
 
 
 def test_read_usage_none_without_transcript(tmp_path):
@@ -11647,6 +11857,292 @@ def test_spawned_child_appearing_mid_run_closes_the_stretch(tmp_path, monkeypatc
     assert entries[1]["idle_s"] == 120.0
 
 
+def _agy_stall_run(tmp_path, monkeypatch, stops, on_call):
+    """An antigravity dev adapter with the stall armed (grace 60 s, no wake
+    nudges), a silent pane, and one heartbeat per tick: the clock advances one
+    `HEARTBEAT_INTERVAL_S` (30 s) on every call from call 2, before `on_call`.
+    Returns (adapter, parent transcript, child transcript)."""
+    adapter, _, _log, _t, clock, _ = _idle_adapter(
+        tmp_path, monkeypatch, grace=60.0, profile_name="antigravity"
+    )
+    parent_t, child_t = _agy_brain(tmp_path)
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        on_call(call_n, child_t)
+
+    adapter.watcher = _ScriptedWatcher(stops(parent_t), on_call=script)
+    return adapter, parent_t, child_t
+
+
+def test_listed_child_activity_keeps_the_dev_stall_grace_open(tmp_path, monkeypatch):
+    """DW-607: a silent agy parent blocked on its foreground child — pane and
+    parent transcript still — while the listed child writes past several graces.
+    The child's writes re-arm the stall grace like pane growth: no stall while
+    it grows, then a stall once it has been quiet for a full grace.
+
+    Timeline (grace 60 s, 30 s/tick): the child grows on calls 2-5; the sample
+    each heartbeat takes reflects the previous call's growth, so the grace
+    re-arms on calls 3-6, last at t=1150 -> due 1210 = call 8.
+
+    Ablation, performed: drop `sub_moved` from the stall re-arm and this
+    fails — the launch-armed grace stalls on call 3 (t=1060)."""
+
+    def grow(call_n, child_t):
+        if 2 <= call_n <= 5:
+            _grow(Path(child_t), b'{"step_index":1}\n')
+
+    adapter, _, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [_agy_stop("agy-parent", parent_t, False)],
+        grow,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 8
+    assert adapter.mux.sent == []  # silent re-arm: nothing typed
+    crumbs = [ln["event"] for ln in _lifecycle_lines(adapter, "3-1-dev-1")]
+    assert not [c for c in crumbs if c.startswith("subagent-scan-")]
+
+
+def _agy_grandchild(tmp_path, child="agy-child", grandchild="agy-grandchild"):
+    """A conversation ``child`` spawned: its folder beside the others, listed
+    by the marker ``child`` wrote. Returns its transcript path."""
+    brain = tmp_path / "brain"
+    logs = brain / grandchild / ".system_generated" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "transcript_full.jsonl").write_text("")
+    marker = brain / child / _AGY_MARKER.format(session_id=grandchild)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}")
+    return logs / "transcript_full.jsonl"
+
+
+def test_spawned_descendants_walks_the_marker_tree_once_per_folder(tmp_path):
+    """Children, then theirs; a marker cycle back to the parent or to a folder
+    already listed is not walked again."""
+    _agy_brain(tmp_path)
+    _agy_grandchild(tmp_path)
+    brain = tmp_path / "brain"
+    for back in ("agy-parent", "agy-child"):
+        (brain / "agy-grandchild" / _AGY_MARKER.format(session_id=back)).parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        (brain / "agy-grandchild" / _AGY_MARKER.format(session_id=back)).write_text("{}")
+    found = generic._spawned_descendants(_AGY_MARKER, brain / "agy-parent")
+    assert found == [brain / "agy-child", brain / "agy-grandchild"]
+
+
+def test_grandchild_activity_keeps_the_dev_stall_grace_open(tmp_path, monkeypatch):
+    """A silent agy parent waits on its child, which waits on its own
+    foreground subagent: only the grandchild writes. Its writes re-arm the
+    grace as a child's do (same timeline as the child test: growth on calls
+    2-5, stall on call 8).
+
+    Ablation, performed: walk only the parent's own markers
+    (`_spawned_children` in `_sample_subagent_tree`) and this fails — the
+    launch-armed grace stalls on call 3."""
+    grandchild_t = _agy_grandchild(tmp_path)
+
+    def grow(call_n, child_t):
+        if 2 <= call_n <= 5:
+            _grow(grandchild_t, b'{"step_index":1}\n')
+
+    adapter, _, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [_agy_stop("agy-parent", parent_t, False)],
+        grow,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 8
+    assert adapter.mux.sent == []
+
+
+def test_a_child_key_first_seen_does_not_rearm_the_dev_stall(tmp_path, monkeypatch):
+    """DW-607: the child key first appearing (None -> a value: the parent's
+    folder becomes judgeable once a Stop names its id) is a baseline, not
+    activity. The id-less yield leaves nothing to watch; the parent's yield on
+    call 2 names it; the next heartbeat's sample is the first child key, read
+    on call 3 exactly as the launch-armed grace (t=1060) falls due.
+
+    Ablation, performed: drop `last_sub_activity is not None` from `sub_moved`
+    and this fails — the first key re-arms the grace past call 3."""
+    adapter, _, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [
+            _agy_stop(None, parent_t, False),
+            _agy_stop("agy-parent", parent_t, False),
+        ],
+        lambda call_n, child_t: None,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 3
+
+
+def test_a_failing_child_scan_does_not_rearm_the_dev_stall(tmp_path, monkeypatch):
+    """DW-607: a marker listing that raises is no evidence of child activity.
+    The sampler keeps its last good key (here none), so the growing child
+    cannot re-arm the grace: the launch-armed grace stalls on call 3 as for a
+    parent with no children, and the fault is crumbed once.
+
+    ABLATION: read a failed scan as movement (re-arm whenever
+    `_sample_subagent_tree` returns None) and the stall slips past call 3."""
+
+    def denied(template, conversation):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(generic, "_spawned_children", denied)
+
+    def grow(call_n, child_t):
+        if call_n >= 2:
+            _grow(Path(child_t), b'{"step_index":1}\n')
+
+    adapter, _, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [_agy_stop("agy-parent", parent_t, False)],
+        grow,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 3
+    assert len(_lifecycle_events(adapter, "subagent-scan-failed")) == 1
+
+
+def test_a_store_folder_stat_fault_admits_the_stop_and_crumbs_once(tmp_path, monkeypatch):
+    """DW-608: under the bounded scan, a fault statting a candidate folder for
+    its mtime is never read as "old" or "absent": the Stop is admitted as
+    before and the fault is journaled once as `subagent-marker-unreadable`."""
+    adapter, impl = make_dev_adapter(tmp_path, profile_name="antigravity")
+    _, child_t = _agy_child_run(tmp_path, adapter, impl)
+    parent = tmp_path / "brain" / "agy-parent"
+    real_stat = os.stat
+
+    def faulty(path, *args, **kwargs):
+        if os.fspath(path) == str(parent):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(generic.os, "stat", faulty)
+    # launched_ns=0 keeps the pre-written spec fresh; the bounded scan still
+    # stats each folder's mtime before comparing it with the (negative) floor.
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+
+    assert result.status == "completed"
+    assert result.session_id == "agy-child"  # admitted: the fault judged nothing
+    (crumb,) = _lifecycle_events(adapter, "subagent-marker-unreadable")
+    assert crumb["error"].startswith("PermissionError")
+    assert _lifecycle_events(adapter, "subagent-stop-ignored") == []
+
+
+def test_a_judged_children_flip_does_not_rearm_the_dev_stall(tmp_path, monkeypatch):
+    """DW-607: the sampler rebaselines the child key when what it covers
+    changes, and writes the new key in the same call, so the wait loop sees
+    one non-None key change straight to another. A tree+marker profile named
+    first by an id-less yield (tree only) and then, on call 3, by the parent's
+    yield (tree + the static child): the call-4 heartbeat's key covers more,
+    which is no activity, so the launch-armed grace (t=1060) stalls on call 4.
+
+    Ablation, performed: drop the `sub_judged == idle.sub_children_judged`
+    check and this fails — the flip re-arms the grace, stalling on call 6."""
+    adapter, parent_t, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [
+            _agy_stop(None, parent_t, False),
+            None,
+            _agy_stop("agy-parent", parent_t, False),
+        ],
+        lambda call_n, child_t: None,
+    )
+    adapter.profile = dataclasses.replace(
+        adapter.profile, subagent_transcript_dir="{stem}/subagents"
+    )
+    _subagent_file(Path(parent_t), "agent-a.jsonl")
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 4
+
+
+def test_claude_subagent_tree_activity_keeps_the_dev_stall_grace_open(tmp_path, monkeypatch):
+    """DW-607 on claude's derived `subagent_transcript_dir`: a parent whose pane
+    and transcript are still while a subagent transcript grows past several
+    graces. The tree's writes re-arm the grace (same timeline as the agy
+    child test: growth on calls 2-5, stall on call 8).
+
+    Ablation, performed: drop `sub_moved` from the stall re-arm and this
+    fails — the launch-armed grace stalls on call 3."""
+    adapter, _, _log, transcript, clock, _ = _idle_adapter(
+        tmp_path, monkeypatch, grace=60.0, profile_name="claude"
+    )
+    agent = _subagent_file(transcript, "agent-a.jsonl")
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if 2 <= call_n <= 5:
+            _grow(agent, b'{"type":"assistant"}\n')
+
+    adapter.watcher = _ScriptedWatcher(
+        [_session_start("3-1-dev-1", str(transcript))], on_call=script
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 8
+    assert adapter.mux.sent == []
+
+
+def test_a_repoint_to_another_subagent_tree_does_not_rearm_the_dev_stall(tmp_path, monkeypatch):
+    """The stall re-arm records the old tree's child key when pane growth
+    re-arms the grace on call 3 (t=1060, due 1120); a hook event then re-points
+    the transcript, on call 4, to one whose static subagent tree walks cleanly
+    to a different key. That key was sampled on another path, so the change is
+    the sampler's rebaseline, not activity: the grace stalls on call 5.
+
+    Ablation, performed: drop the `sub_path == idle.path` check from
+    `sub_moved` and this fails — the repoint re-arms the grace, stalling on
+    call 7."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(
+        tmp_path, monkeypatch, grace=60.0, profile_name="claude"
+    )
+    _subagent_file(transcript, "agent-a.jsonl")
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user","other":true}\n')
+    _subagent_file(other, "agent-x.jsonl", b'{"type":"user","a":"longer payload"}\n')
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 3:
+            _grow(log, b"repaint\n")
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _session_start("3-1-dev-1", str(transcript)),
+            None,
+            None,
+            _session_start("3-1-dev-1", str(other)),
+        ],
+        on_call=script,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 5
+
+
 def test_children_coming_into_view_rebaseline_the_subagent_key(tmp_path, monkeypatch):
     """A profile declaring both a tree and a spawn marker, named first by an
     id-less Stop (the parent's folder cannot be judged: the tree alone is
@@ -13486,6 +13982,57 @@ def test_send_keys_refuses_a_pane_in_mode(monkeypatch, force_tmux_backend):
     calls = _scripted_tmux(monkeypatch, "1\n")
     with pytest.raises(MultiplexerError, match="pane mode"):
         get_multiplexer().send_keys("@7.%9", "Enter")
+    assert [c for c in calls if "send-keys" in c] == []
+
+
+def _sequenced_tmux(monkeypatch, *replies):
+    """Like `_scripted_tmux`, but the Nth call answers ``replies[N]`` (a
+    TmuxError-raising nonzero exit when the reply is None)."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        reply = replies[len(calls) - 1]
+        if reply is None:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no server")
+        return subprocess.CompletedProcess(argv, 0, stdout=reply, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake_run)
+    monkeypatch.setattr(tmux_base.time, "sleep", lambda _s: None)
+    return calls
+
+
+@pytest.mark.parametrize("send", ["text", "keys"])
+def test_a_pane_mode_refusal_names_the_mode_and_the_way_out(monkeypatch, force_tmux_backend, send):
+    """A user config whose `run` fails at server start leaves the first task
+    window in view-mode; the refusal is what the nudge crumb and the TUI answer
+    show, so it names the mode and how to leave it — read only once refused.
+    Ablation: raise the bare refusal and the mode and `press q` go missing."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _sequenced_tmux(monkeypatch, "1\n", "view-mode\n")
+    mux = get_multiplexer()
+    with pytest.raises(MultiplexerError) as caught:
+        mux.send_text("@7.%9", "go on") if send == "text" else mux.send_keys("@7.%9", "Enter")
+    assert "is in a pane mode (view-mode);" in str(caught.value)
+    assert "press q in that window to leave the mode" in str(caught.value)
+    assert calls == [
+        ["tmux", "-u", "display-message", "-p", "-t", "@7.%9", "#{pane_in_mode}"],
+        ["tmux", "-u", "display-message", "-p", "-t", "@7.%9", "#{pane_mode}"],
+    ]
+
+
+@pytest.mark.parametrize("mode_reply", [None, "\n", "#{pane_mode}\n", "1\n"])
+def test_a_pane_mode_refusal_stays_unnamed_without_a_mode_name(
+    monkeypatch, force_tmux_backend, mode_reply
+):
+    """An unreadable mode probe, or a reply that is no mode name (an unexpanded
+    format), still refuses — unnamed, never with the reply pasted in."""
+    from bmad_loop.adapters.multiplexer import get_multiplexer
+
+    calls = _sequenced_tmux(monkeypatch, "1\n", mode_reply)
+    with pytest.raises(MultiplexerError, match=r"is in a pane mode; not pressing keys in it"):
+        get_multiplexer().send_keys("@7.%9", "Escape")
     assert [c for c in calls if "send-keys" in c] == []
 
 
@@ -15410,6 +15957,53 @@ def _decide_dev_relaunch(result, *, usage_relaunches=0):
     return decide_dev(
         task, result, None, Policy(limits=LimitsPolicy(usage_limit_action="relaunch"))
     )
+
+
+@pytest.mark.parametrize("alive", [True, False])
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        ("model_not_found", "model claude-nope does not exist"),
+        ("cloud_credential_error", "could not load cloud credentials"),
+    ],
+)
+def test_account_fatal_stop_failure_exits_parked_and_never_relaunches(
+    tmp_path, monkeypatch, alive, error, message
+):
+    """DW-613: claude maps `model_not_found` and `cloud_credential_error` to
+    `account-fatal`. In relaunch mode with budget left the adapter ends the
+    session parked at the event exactly as for `account` (live `stalled`, or a
+    dead window relabeled `crashed` + parked), the result carries the mapped
+    `account-fatal`, nothing is typed, and the relaunch-mode decider pauses it
+    instead of relaunching.
+
+    Ablation: leave the wait loop's parked arm at `action == "account"` and the
+    live exit is never taken (the error is ignored, `parked is False`)."""
+    adapter, mux = _parked_adapter(
+        tmp_path,
+        monkeypatch,
+        [_stop_failure_event(error, message)],
+        alive=lambda handle: alive,
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _relaunch_spec(_dev_spec(tmp_path)))
+    assert (result.status, result.parked) == ("stalled" if alive else "crashed", True)
+    assert result.parked_evidence == f"StopFailure({error}): {message}"
+    assert result.usage_limited is None
+    assert (result.stop_failure, result.stop_failure_action) == (error, "account-fatal")
+    assert result.stop_seen is False
+    assert mux.sent == []
+    relabeled = _lifecycle_events(adapter, "crash-relabeled")
+    if alive:
+        assert relabeled == []
+    else:
+        (crumb,) = relabeled
+        assert (crumb["kind"], crumb["error"]) == ("account", error)
+    from bmad_loop.escalation import Action
+
+    decision = _decide_dev_relaunch(result)
+    assert decision.action == Action.PAUSE
+    assert decision.uncharged is False
+    assert decision.reason.startswith("parked: dev session ")
 
 
 def test_relaunch_mode_wait_stop_failure_exits_at_once(tmp_path, monkeypatch):

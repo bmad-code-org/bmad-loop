@@ -23,19 +23,22 @@
 # whose id has that marker in a sibling folder (DW-548). The same markers list
 # the parent's children for the idle notice: while a foreground subagent runs agy
 # writes nothing to brain/<parentId>/, only to brain/<childId>/, so each listed
-# child's *.jsonl writes count as the parent's activity.
+# child's *.jsonl writes count as the parent's activity — recursively, as a child
+# blocked on its own subagent writes only to the grandchild's folder.
 #
-# usage_parser is "none" DELIBERATELY AND PERMANENTLY — not a deferral. agy's
+# usage_parser = "antigravity-transcript" (verified against agy 1.4.9). agy's
 # transcript (~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/
 # logs/transcript_full.jsonl, the path its Stop hook reports as `transcriptPath`)
-# carries only step_index/source/type/status/created_at/content/thinking. There is
-# no usage block anywhere in it — verified by capturing a live turn and scanning
-# every key recursively. agy does count tokens (the TUI shows them), but only
-# inside conversations/<conversationId>.db, a SQLite store whose gen_metadata is
-# an undocumented protobuf blob — unreadable through the JSONL-shaped
-# `(transcript_path) -> TokenUsage` parser contract, and fragile against an
-# internal schema. Runs work; the token columns stay empty. Revisit only if agy
-# starts emitting usage in the transcript.
+# carries top-level input_tokens / cache_read_tokens / output_tokens on every
+# PLANNER_RESPONSE step: one API call each, no running totals, input exclusive of
+# cache reads. The parser sums the steps. A subagent's steps live only in its own
+# brain/<childId>/ transcript, so the parser folds in every child the parent's
+# spawn markers (see above) list, recursively. The transcript names no model
+# (checked through 1.5.0, same step layout), so the observed model stays
+# untracked; agy reports it only as the Stop payload's `modelName` (1.5.0), which
+# the relay does not read. agy 1.1.3 wrote no counts; its sessions
+# read as untracked. Never read conversations/<conversationId>.db, agy's internal
+# SQLite/protobuf store.
 #
 # Hook payloads are protojson: keys are camelCase (conversationId, transcriptPath,
 # workspacePaths) — NOT the snake_case claude/codex use. agy sends no `cwd`; the
@@ -63,7 +66,7 @@ prompt_template = "{prompt}"
 launch_args = ["-i"]
 bypass_args = ["--dangerously-skip-permissions"]
 model_flag = "--model"
-usage_parser = "none"
+usage_parser = "antigravity-transcript"
 first_run_note = "run `agy` once in the project and authenticate + answer 'Yes, I trust this folder' before `bmad-loop run` — spawned sessions can't answer first-run dialogs, and a pending one reads as a session timeout. Requires Antigravity CLI (agy >= 1.1.3). Trust is exact-path (settings.json trustedWorkspaces) and --dangerously-skip-permissions does not bypass it. isolation = \"worktree\" works once the project root is trusted: each unit worktree is appended to trustedWorkspaces before its sessions launch. Verify with `bmad-loop probe-adapter antigravity --workspace <path>`."
 skill_tree = ".agents/skills"
 # .agents/hooks.json is agy's lifecycle-hook config. Seeded first, then the Stop

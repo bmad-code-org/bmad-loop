@@ -69,6 +69,8 @@ def test_builtin_profiles_load():
         "sessionEnd": "SessionEnd",
     }
     assert profiles["copilot"].usage_parser == "copilot-events"
+    # agy 1.4.9 writes per-step counts into its transcript
+    assert profiles["antigravity"].usage_parser == "antigravity-transcript"
     # copilot confirms tool calls, file paths and URL fetches separately; an
     # unattended session needs all three bypassed, or a URL fetch parks it
     assert profiles["copilot"].bypass_args == (
@@ -259,8 +261,10 @@ def test_claude_maps_its_stop_failure_types():
     """#865: the claude profile relays `StopFailure` and maps every `error` value
     the hooks reference documents, plus the 2.1.316 build's undocumented
     `verification_required`, onto an action. `invalid_request` is context-shape (a
-    fresh session fixes it), so it is transient, not an account error. Every
-    other built-in stays `{}`: none has a StopFailure event."""
+    fresh session fixes it), so it is transient, not an account error.
+    `model_not_found` and `cloud_credential_error` are `account-fatal` (DW-613):
+    no usage relaunch fixes them, so the profile validator must accept the
+    action. Every other built-in stays `{}`: none has a StopFailure event."""
     claude = get_profile("claude")
     assert claude.hooks.events["StopFailure"] == "StopFailure"
     assert claude.hooks.stop_failure_types == {
@@ -275,8 +279,8 @@ def test_claude_maps_its_stop_failure_types():
         "oauth_org_not_allowed": "account",
         "account_on_hold": "account",
         "verification_required": "account",
-        "cloud_credential_error": "account",
-        "model_not_found": "account",
+        "cloud_credential_error": "account-fatal",
+        "model_not_found": "account-fatal",
     }
     # Claude Code before 2.1.78 skips the WHOLE settings file over an unknown hook
     # key, so registration gates the event on the installed version.

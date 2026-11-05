@@ -1,0 +1,12 @@
+{
+  "session_id": "aca592ac-ec39-445e-8a51-7945a70b06ec",
+  "transcript_path": "<capture-root>/cfg/projects/<capture-root>-proj/aca592ac-ec39-445e-8a51-7945a70b06ec.jsonl",
+  "cwd": "<capture-root>/proj",
+  "prompt_id": "56439468-c2c2-4b70-aff8-44ad04e28bc5",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "StopFailure",
+  "error": "authentication_failed",
+  "last_assistant_message": "Invalid API key · Fix external API key"
+}

@@ -38,15 +38,21 @@ the same branch-on-`BMAD_LOOP_ENGINE_MCP` pattern to support several.
 operator's already-open Editor + MCP are up. **`per_worktree` is IvanMurzak-only in
 the bundled plugin**, because its per-path port derivation gives each worktree's
 Editor its own server with no manual wiring. For CoplayDev's single-shared-server
-model, point `worktree_setup_cmd` / `worktree_teardown_cmd` at your own scripts
+model, replace `unity_setup.py` / `unity_teardown.py` (run by the plugin's
+`pre_worktree_setup` / `pre_worktree_teardown` hooks) with your own scripts
 (override the plugin under `.bmad-loop/plugins/unity/` and grant the copy with
 `bmad-loop plugins enable unity` — `[plugins] enabled` does not cover a project
 override), or use `shared` mode.
 
 ## Writing an MCP-agnostic readiness probe
 
-The contract is simple: **`ready_cmd` exits `0` when a session can safely start,
-non-zero otherwise** (which defers the unit). Within that, a few things matter:
+The contract is simple: **a plugin's `pre_ready_gate` readiness probe (Unity's:
+`unity_ready.py`) passes when a session can safely start and vetoes otherwise**
+(which defers the unit; Unity's hook vetoes when its script exits non-zero). The
+bundled `coplaydev` probe falls short of that: it passes once the MCP HTTP server
+accepts a connection, open Editor or not. Use `ivanmurzak`, or your own stricter
+probe, where a session must not start before the Editor is up. Within that, a few
+things matter:
 
 - **Respect the budget.** Poll until `BMAD_LOOP_ENGINE_READY_TIMEOUT` seconds elapse,
   then fail. The CLI's own default timeout is often far shorter (IvanMurzak's
@@ -65,7 +71,7 @@ non-zero otherwise** (which defers the unit). Within that, a few things matter:
 
 > CLI subcommand names and MCP endpoints move between releases. Keep the
 > version-specific bits in the plugin (and document the version you verified
-> against), so an operator can override `ready_cmd` under `.bmad-loop/plugins/<name>/`
+> against), so an operator can override the readiness script under `.bmad-loop/plugins/<name>/`
 > when their installed version differs. The override is a project plugin: grant it
 > with `bmad-loop plugins enable <name>`, and re-run `bmad-loop plugins accept <name>`
 > after each edit, or the next launch fails.

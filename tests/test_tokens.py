@@ -1,14 +1,18 @@
 import datetime
 import json
 import os
+import shutil
+from pathlib import Path
 
 import pytest
 
 from bmad_loop import tokens
-from bmad_loop.model import TokenUsage
+from bmad_loop.model import UNATTRIBUTED_MODEL, TokenUsage
 from bmad_loop.tokens import (
     read_usage,
+    read_usage_settled,
     tally,
+    tally_antigravity_transcript,
     tally_codex_rollout,
     tally_copilot_events,
     tally_gemini_chat,
@@ -1093,8 +1097,8 @@ def test_gemini_chat_without_tokens_is_none(tmp_path):
 
 
 def test_copilot_events_last_cumulative_across_models(tmp_path):
-    # shape from ~/.copilot/session-state/<session>/events.jsonl: per line
-    # {id, type, data:{...}}; data.modelMetrics.<model>.usage is cumulative.
+    # Synthetic two-model session (the real capture below ran one model): per
+    # line {id, type, data:{...}}; data.modelMetrics.<model>.usage is cumulative.
     lines = [
         {"id": "e0", "type": "session_start", "data": {"sessionId": "s1"}},
         # an earlier, smaller cumulative snapshot — superseded by the last one
@@ -1134,8 +1138,8 @@ def test_copilot_events_last_cumulative_across_models(tmp_path):
     path.write_text("\n".join(json.dumps(line) for line in lines) + "\nnot json\n")
 
     usage = tally_copilot_events(path)
-    assert usage.input_tokens == 540  # 500 + 40
-    assert usage.output_tokens == 75  # (60 + 5) + (8 + 2), reasoning folded in
+    assert usage.input_tokens == 310  # (500 - 200 cache reads - 30 cache writes) + 40
+    assert usage.output_tokens == 68  # 60 + 8: reasoningTokens are part of outputTokens
     assert usage.cache_read_tokens == 200
     assert usage.cache_creation_tokens == 30
 
@@ -1184,11 +1188,329 @@ def test_copilot_events_models_empty_without_named_model(tmp_path):
     assert usage.models == ()
 
 
+# Sanitized from real Copilot CLI 1.0.105 captures (Linux, 2026-11-04); see the
+# fixture README. Prompts, paths and ids are redacted; event order, key layout,
+# model ids and token counts are verbatim.
+COPILOT_STATE = Path(__file__).parent / "fixtures" / "copilot-1.0.105" / "session-state"
+# One turn launched with `--model claude-haiku-4.5`, which the plan rejected
+# (auto-routed to mai-code-1.1-flash); ended with /exit.
+COPILOT_REJECTED_MODEL = COPILOT_STATE / "c0000000-0000-4000-8000-000000000001" / "events.jsonl"
+# Two turns with no --model; ended with /exit.
+COPILOT_TWO_TURNS = COPILOT_STATE / "c0000000-0000-4000-8000-000000000002" / "events.jsonl"
+COPILOT_MODEL = "mai-code-1.1-flash"
+
+
+def _copilot_events_until(tmp_path, source, keep):
+    """A copy of `source` holding only the lines `keep(entry)` accepts."""
+    lines = source.read_text(encoding="utf-8").splitlines()
+    path = tmp_path / "events.jsonl"
+    path.write_text(
+        "".join(line + "\n" for line in lines if keep(json.loads(line))), encoding="utf-8"
+    )
+    return path
+
+
+def test_copilot_events_real_capture_totals():
+    """A real 1.0.105 session: the shutdown snapshot's bare model-id key names
+    the model, and input excludes the cache reads (`tokenDetails.input` is 570).
+
+    Ablation: drop the cache-read subtraction and input reads 35898."""
+    usage = tally_copilot_events(COPILOT_TWO_TURNS)
+    assert usage == TokenUsage(input_tokens=570, output_tokens=11, cache_read_tokens=35328)
+    assert usage.models == (COPILOT_MODEL,)
+    assert usage.by_model == {COPILOT_MODEL: usage}
+
+
+def test_copilot_events_ignore_the_rejected_model_flag():
+    """`session.start` `selectedModel` echoes the `--model` flag even when
+    Copilot rejects it, so the models come from the metrics, not from it."""
+    start = json.loads(COPILOT_REJECTED_MODEL.read_text(encoding="utf-8").splitlines()[0])
+    assert start["type"] == "session.start"
+    assert start["data"]["selectedModel"] == "claude-haiku-4.5"
+
+    usage = tally_copilot_events(COPILOT_REJECTED_MODEL)
+    assert usage == TokenUsage(input_tokens=16520, output_tokens=5, cache_read_tokens=1408)
+    assert usage.models == (COPILOT_MODEL,)
+
+
+def test_copilot_events_read_the_last_checkpoint_without_a_shutdown(tmp_path):
+    """A session with no `session.shutdown` line still reads its totals and
+    model from the last per-turn `session.usage_checkpoint`, whose metrics sit
+    under `accountingSnapshot`; the checkpoints are cumulative.
+
+    Ablation: read `modelMetrics` only at the top of `data` and both are None."""
+    no_shutdown = _copilot_events_until(
+        tmp_path, COPILOT_TWO_TURNS, lambda entry: entry["type"] != "session.shutdown"
+    )
+    usage = tally_copilot_events(no_shutdown)
+    assert usage == tally_copilot_events(COPILOT_TWO_TURNS)
+    assert usage is not None and usage.models == (COPILOT_MODEL,)
+    assert usage.by_model == {
+        COPILOT_MODEL: TokenUsage(input_tokens=570, output_tokens=11, cache_read_tokens=35328)
+    }
+
+    seen: list[str] = []
+
+    def first_turn(entry):
+        seen.append(entry["type"])
+        return seen.count("session.usage_checkpoint") <= 1 and entry["type"] != "session.shutdown"
+
+    usage = tally_copilot_events(_copilot_events_until(tmp_path, COPILOT_TWO_TURNS, first_turn))
+    assert usage == TokenUsage(input_tokens=518, output_tokens=5, cache_read_tokens=17408)
+    assert usage.models == (COPILOT_MODEL,)
+
+
+def test_copilot_events_settle_only_on_the_shutdown_line(tmp_path):
+    """A checkpoint reads usage but is not final: only `session.shutdown`
+    settles a copilot read, so a post-session poll waits for it. A
+    shutdown with no prior snapshot settles a None read.
+
+    Ablation: report every copilot read settled and the checkpoint-only read
+    flips to True."""
+    usage, settled = read_usage_settled("copilot-events", COPILOT_TWO_TURNS)
+    assert settled is True
+    assert usage == TokenUsage(input_tokens=570, output_tokens=11, cache_read_tokens=35328)
+
+    no_shutdown = _copilot_events_until(
+        tmp_path, COPILOT_TWO_TURNS, lambda entry: entry["type"] != "session.shutdown"
+    )
+    usage, settled = read_usage_settled("copilot-events", no_shutdown)
+    assert settled is False
+    assert usage is not None
+
+    bare = tmp_path / "bare.jsonl"
+    bare.write_text(json.dumps({"type": "session.shutdown", "data": {}}) + "\n", encoding="utf-8")
+    assert read_usage_settled("copilot-events", bare) == (None, True)
+
+
+def test_read_usage_settled_other_parsers_read_settled(tmp_path):
+    path = tmp_path / "t.jsonl"
+    path.write_text(json.dumps({"usage": {"input_tokens": 1, "output_tokens": 2}}) + "\n")
+    usage, settled = read_usage_settled("claude-jsonl", path)
+    assert settled is True and usage is not None and usage.total == 3
+    assert read_usage_settled("none", path) == (None, True)
+
+
+def test_copilot_events_without_a_snapshot_is_none(tmp_path):
+    """A real session cut before its first checkpoint carries no usage."""
+    cut = _copilot_events_until(
+        tmp_path,
+        COPILOT_TWO_TURNS,
+        lambda entry: entry["type"] not in ("session.usage_checkpoint", "session.shutdown"),
+    )
+    assert tally_copilot_events(cut) is None
+
+
 def test_copilot_events_without_metrics_is_none(tmp_path):
     path = tmp_path / "events.jsonl"
     path.write_text(json.dumps({"id": "e0", "type": "message", "data": {"content": "hi"}}) + "\n")
     assert tally_copilot_events(path) is None
     assert tally_copilot_events(tmp_path / "nope.jsonl") is None
+
+
+# --------------------------------------------------- antigravity-transcript
+
+# Sanitized from a real agy 1.4.9 parent + foreground-subagent capture: synthetic
+# conversation ids and placeholder text, token counts and key layout verbatim.
+AGY_BRAIN = Path(__file__).parent / "fixtures" / "antigravity-1.4.9" / "brain"
+AGY_PARENT = "d0000000-0000-4000-8000-000000000001"
+AGY_CHILD = "b0000000-0000-4000-8000-000000000002"
+# The parent's own steps: input 6899+2482+2313, cache 0+4845+5278, output 201+117+38.
+AGY_PARENT_USAGE = TokenUsage(input_tokens=11694, output_tokens=356, cache_read_tokens=10123)
+
+
+def _agy_transcript(brain, conversation):
+    return brain / conversation / ".system_generated" / "logs" / "transcript_full.jsonl"
+
+
+def _agy_marker(brain, parent, child):
+    marker = brain / parent / ".system_generated" / "subagents" / f"{child}.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"conversationId": child}), encoding="utf-8")
+    return marker
+
+
+def _agy_step(index, input_tokens=0, cache_read=0, output_tokens=0):
+    return {
+        "step_index": index,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "input_tokens": input_tokens,
+        "cache_read_tokens": cache_read,
+        "output_tokens": output_tokens,
+    }
+
+
+@pytest.fixture
+def agy_brain(tmp_path):
+    """A mutable copy of the 1.4.9 fixture brain store."""
+    return Path(shutil.copytree(AGY_BRAIN, tmp_path / "brain"))
+
+
+def test_antigravity_transcript_folds_spawned_subagent():
+    """Parent + child sums, read through the dispatcher as the adapter does at
+    session end; `models` stays None (no model source), so `session-end`
+    carries neither `models` nor `models_unresolved`."""
+    usage = read_usage("antigravity-transcript", _agy_transcript(AGY_BRAIN, AGY_PARENT))
+    assert usage == TokenUsage(input_tokens=25760, output_tokens=627, cache_read_tokens=26131)
+    assert usage.cache_creation_tokens == 0
+    assert usage.unread == ()
+    assert usage.models is None
+    assert usage.by_model is None  # DW-618: no model source, no split
+
+
+def test_antigravity_transcript_parent_only(agy_brain):
+    shutil.rmtree(agy_brain / AGY_PARENT / ".system_generated" / "subagents")
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == ()
+    assert usage.models is None
+
+
+def test_antigravity_transcript_outside_agy_layout_tallies_alone(agy_brain):
+    """The fold applies only to `<conv>/.system_generated/logs/<file>`: the same
+    transcript one folder over, in the same conversation, reads alone."""
+    elsewhere = agy_brain / AGY_PARENT / ".system_generated" / "other" / "transcript_full.jsonl"
+    elsewhere.parent.mkdir()
+    shutil.copy(_agy_transcript(agy_brain, AGY_PARENT), elsewhere)
+    assert tally_antigravity_transcript(elsewhere) == AGY_PARENT_USAGE
+
+
+def test_antigravity_transcript_pre_usage_shape_is_none(tmp_path):
+    """agy 1.1.3 wrote no counts: untracked, never zero."""
+    path = _agy_transcript(tmp_path, AGY_PARENT)
+    _write_jsonl(
+        path,
+        [
+            {"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "x"},
+            {"step_index": 2, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "OK"},
+        ],
+    )
+    assert tally_antigravity_transcript(path) is None
+    assert read_usage("antigravity-transcript", path) is None
+
+
+def test_antigravity_transcript_missing_file_is_none(tmp_path):
+    assert tally_antigravity_transcript(_agy_transcript(tmp_path, AGY_PARENT)) is None
+
+
+def test_antigravity_transcript_all_zero_step_is_tracked(tmp_path):
+    path = _agy_transcript(tmp_path, AGY_PARENT)
+    _write_jsonl(path, [_agy_step(1)])
+    assert tally_antigravity_transcript(path) == TokenUsage()
+
+
+def test_antigravity_transcript_skips_unreadable_child(agy_brain, monkeypatch):
+    child = _agy_transcript(agy_brain, AGY_CHILD)
+    real_open = Path.open
+
+    def guarded_open(self, *args, **kwargs):
+        if self == child:
+            raise PermissionError("denied")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == (f"{AGY_CHILD}/transcript_full.jsonl: PermissionError",)
+
+
+def test_antigravity_transcript_names_a_listed_child_without_a_transcript(agy_brain):
+    """A marker names the child, so its missing transcript is a lower bound the
+    engine journals (`usage_unread`), never a silent parent-only total."""
+    _agy_transcript(agy_brain, AGY_CHILD).unlink()
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == (f"{AGY_CHILD}/transcript_full.jsonl: FileNotFoundError",)
+
+
+def test_antigravity_transcript_names_a_listed_child_transcript_not_a_file(agy_brain):
+    child = _agy_transcript(agy_brain, AGY_CHILD)
+    child.unlink()
+    child.mkdir()
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == (f"{AGY_CHILD}/transcript_full.jsonl: ValueError",)
+
+
+def test_antigravity_transcript_names_unlistable_marker_folder(agy_brain, monkeypatch):
+    subagents = agy_brain / AGY_PARENT / ".system_generated" / "subagents"
+    real_iterdir = Path.iterdir
+
+    def guarded_iterdir(self):
+        if self == subagents:
+            raise PermissionError("denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == ("subagents/: PermissionError",)
+
+
+def test_antigravity_transcript_child_only_usage_is_tracked(agy_brain):
+    parent = _agy_transcript(agy_brain, AGY_PARENT)
+    _write_jsonl(parent, [{"step_index": 0, "type": "USER_INPUT", "content": "x"}])
+    usage = tally_antigravity_transcript(parent)
+    assert usage == TokenUsage(input_tokens=14066, output_tokens=271, cache_read_tokens=16008)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "notauuid.json",
+        # a UUID, but not canonical: uppercase and unhyphenated spellings
+        f"{AGY_CHILD.upper()}.json",
+        f"{AGY_CHILD.replace('-', '')}.json",
+        # canonical stem, wrong suffix
+        f"{AGY_CHILD}.txt",
+    ],
+)
+def test_antigravity_transcript_ignores_non_canonical_marker(agy_brain, name):
+    """The child's conversation folder is renamed to the marker's stem, so only
+    the marker gate keeps it out of the tally."""
+    subagents = agy_brain / AGY_PARENT / ".system_generated" / "subagents"
+    (subagents / f"{AGY_CHILD}.json").rename(subagents / name)
+    stem = name.rpartition(".")[0]
+    if stem != AGY_CHILD:
+        (agy_brain / AGY_CHILD).rename(agy_brain / stem)
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+
+
+def test_antigravity_transcript_recurses_once_per_conversation(agy_brain):
+    """A grandchild folds in; a marker cycle back to the parent or a child the
+    tree already holds visits nothing twice."""
+    grandchild = "c0000000-0000-4000-8000-000000000003"
+    _write_jsonl(_agy_transcript(agy_brain, grandchild), [_agy_step(1, 1, 2, 3)])
+    _agy_marker(agy_brain, AGY_CHILD, grandchild)
+    _agy_marker(agy_brain, grandchild, AGY_PARENT)
+    _agy_marker(agy_brain, grandchild, AGY_CHILD)
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == TokenUsage(input_tokens=25761, output_tokens=630, cache_read_tokens=26133)
+
+
+def test_antigravity_transcript_duplicate_step_counts_once(tmp_path):
+    path = _agy_transcript(tmp_path, AGY_PARENT)
+    anon = _agy_step(None, 100, 0, 1)
+    del anon["step_index"]
+    _write_jsonl(
+        path,
+        [
+            _agy_step(1, 10, 20, 30),
+            _agy_step(1, 11, 21, 31),  # the same step re-emitted: last wins
+            _agy_step(2, 1, 0, 0),
+            anon,
+            anon,  # no int step_index: each counts
+            {**_agy_step(3, 1000), "step_index": "3"},
+            {**_agy_step(3, 1000), "step_index": True},
+        ],
+    )
+    usage = tally_antigravity_transcript(path)
+    assert usage == TokenUsage(
+        input_tokens=11 + 1 + 200 + 2000, output_tokens=33, cache_read_tokens=21
+    )
 
 
 def test_read_usage_dispatch(tmp_path):
@@ -1202,6 +1524,10 @@ def test_read_usage_dispatch(tmp_path):
         json.dumps({"data": {"modelMetrics": {"m": {"usage": {"inputTokens": 7}}}}}) + "\n"
     )
     assert read_usage("copilot-events", cop).input_tokens == 7
+
+    agy = tmp_path / "transcript_full.jsonl"
+    agy.write_text(json.dumps({"step_index": 1, "input_tokens": 5}) + "\n", encoding="utf-8")
+    assert read_usage("antigravity-transcript", agy).input_tokens == 5
 
 
 def test_read_usage_tracked_parsers_report_models(tmp_path):
@@ -1217,9 +1543,306 @@ def test_read_usage_tracked_parsers_report_models(tmp_path):
         json.dumps({"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {}}) + "\n",
         encoding="utf-8",
     )
-    copilot = tmp_path / "events.jsonl"
-    copilot.write_text(
-        json.dumps({"data": {"modelMetrics": {"gpt-5": {"usage": {"inputTokens": 1}}}}}) + "\n",
+
+    for parser, path, model in [
+        ("claude-jsonl", claude, "claude-opus-5-5"),
+        ("codex-rollout", codex, "gpt-5.5"),
+        ("gemini-chat", gemini, "gemini-3-pro"),
+        ("copilot-events", COPILOT_TWO_TURNS, COPILOT_MODEL),
+    ]:
+        usage = read_usage(parser, path)
+        assert usage is not None, parser
+        assert usage.models == (model,), parser
+
+
+# ------------------------------------------------- per-model split (DW-618)
+
+
+def _assert_split(usage):
+    """The DW-618 invariants: `by_model` sums field-wise to the totals, and
+    every key is an observed model or the sentinel."""
+    assert usage is not None and usage.by_model is not None
+    summed = TokenUsage()
+    for each in usage.by_model.values():
+        summed.add(each)
+    assert summed == usage
+    assert set(usage.by_model) <= {*usage.models, UNATTRIBUTED_MODEL}
+
+
+def test_tally_splits_tokens_per_model(tmp_path):
+    """A deduped response bills to the first usable model its blocks name; an
+    id-less entry to its own; usage with no model (or only `<synthetic>`)
+    to the sentinel. Subagent usage lands on the subagent's model.
+
+    Ablation: key the claude buckets by the LAST block's model and `msg_late`
+    bills to sonnet; drop the anon model and the id-less sonnet entry is
+    unattributed."""
+    path = tmp_path / "sid.jsonl"
+    opus = _with_model(_assistant("msg_1", input_tokens=10, output_tokens=20), "claude-opus-5-5")
+    _write_jsonl(
+        path,
+        [
+            opus,
+            opus,  # a repeated content block: deduped
+            _with_model(_assistant("msg_err", input_tokens=0), "<synthetic>"),
+            _assistant("msg_3", input_tokens=7),  # no model at all
+            {"type": "message", "usage": {"input_tokens": 1}},  # top-level shape
+            _with_model(_assistant(None, input_tokens=4), "claude-sonnet-5-5"),
+            _assistant("msg_late", output_tokens=6),
+            _with_model(_assistant("msg_late", output_tokens=6), "claude-opus-5-5"),
+            _with_model(_assistant("msg_late", output_tokens=6), "claude-sonnet-5-5"),
+        ],
+    )
+    _write_jsonl(
+        tmp_path / "sid" / "subagents" / "agent-a.jsonl",
+        [_with_model(_assistant("msg_a", input_tokens=3, output_tokens=2), "claude-haiku-5-5")],
+    )
+
+    usage = tally(path)
+    _assert_split(usage)
+    assert usage.by_model == {
+        "claude-opus-5-5": TokenUsage(input_tokens=10, output_tokens=26),
+        "claude-sonnet-5-5": TokenUsage(input_tokens=4),
+        "claude-haiku-5-5": TokenUsage(input_tokens=3, output_tokens=2),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=8),
+    }
+    assert list(usage.by_model) == [*usage.models, UNATTRIBUTED_MODEL]
+
+
+def test_tally_split_takes_the_model_from_a_usage_less_block(tmp_path):
+    """A block that names the response's model but carries no usage still
+    attributes the response: its usage block, without a model, bills there.
+
+    Ablation: associate a message id's model only on usage-bearing blocks
+    and the response is unattributed."""
+    path = tmp_path / "sid.jsonl"
+    named = {"type": "assistant", "message": {"id": "msg_1", "model": "claude-opus-5-5"}}
+    _write_jsonl(path, [named, _assistant("msg_1", input_tokens=5)])
+
+    usage = tally(path)
+    _assert_split(usage)
+    assert usage.by_model == {"claude-opus-5-5": TokenUsage(input_tokens=5)}
+
+
+def test_tally_split_omits_a_zero_sentinel(tmp_path):
+    """The sentinel bucket appears only when it holds usage: a zero-usage
+    `<synthetic>` entry leaves the split model-only.
+
+    Ablation: always add the stray bucket in `settle_by_model` and the
+    sentinel key appears with zeros."""
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _with_model(_assistant("msg_1", input_tokens=5), "claude-opus-5-5"),
+            _with_model(_assistant("msg_err", input_tokens=0), "<synthetic>"),
+        ],
+    )
+
+    usage = tally(path)
+    _assert_split(usage)
+    assert usage.by_model == {"claude-opus-5-5": TokenUsage(input_tokens=5)}
+
+
+def test_tally_split_is_sentinel_only_without_a_model(tmp_path):
+    """Tracked with no model (`models == ()`): everything is unattributed —
+    `by_model` is never None for a tracking parser."""
+    path = tmp_path / "sid.jsonl"
+    _write_jsonl(path, [_assistant("msg_1", input_tokens=5)])
+
+    usage = tally(path)
+    _assert_split(usage)
+    assert usage.models == ()
+    assert usage.by_model == {UNATTRIBUTED_MODEL: TokenUsage(input_tokens=5)}
+
+
+def _codex_reading(input_tokens, cached, output):
+    totals = {"input_tokens": input_tokens, "cached_input_tokens": cached, "output_tokens": output}
+    return {
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"total_token_usage": totals}},
+    }
+
+
+def _codex_turn(model):
+    return {"type": "turn_context", "payload": {"model": model}}
+
+
+def _append_codex(path, lines):
+    """Append lines to a `_codex_thread` rollout, keeping its pinned mtime."""
+    stamp = path.stat().st_mtime
+    with path.open("a", encoding="utf-8") as f:
+        f.write("".join(json.dumps(line) + "\n" for line in lines))
+    os.utime(path, (stamp, stamp))
+
+
+def test_codex_tally_splits_cumulative_readings_per_model(tmp_path):
+    """Cumulative token_count readings bill their deltas to the latest
+    `turn_context` model (a reading before any is unattributed); a switch
+    back resumes the first model's bucket, and a child's own deltas merge
+    into its model's. Each bucket splits cached input out as the totals do.
+
+    Ablation: bill each reading in full (no delta) and the split overshoots
+    the totals; bill every delta to the last model and A collapses into B."""
+    parent = _codex_thread(tmp_path, "2026/10/01", "10-00-00", ROOT, session_id=ROOT)
+    _append_codex(
+        parent,
+        [
+            _codex_reading(10, 0, 1),  # before any turn_context
+            _codex_turn("gpt-a"),
+            _codex_reading(100, 40, 10),
+            _codex_turn("gpt-b"),
+            _codex_reading(160, 60, 15),
+            _codex_turn("gpt-a"),
+            _codex_reading(200, 70, 20),
+        ],
+    )
+    child = _codex_thread(tmp_path, "2026/10/01", "10-05-00", CHILD, session_id=ROOT, parent=ROOT)
+    _append_codex(child, [_codex_turn("gpt-b"), _codex_reading(50, 10, 5)])
+
+    usage = tally_codex_rollout(parent)
+    assert usage == TokenUsage(input_tokens=130 + 40, output_tokens=25, cache_read_tokens=80)
+    _assert_split(usage)
+    assert usage.by_model == {
+        "gpt-a": TokenUsage(input_tokens=80, output_tokens=14, cache_read_tokens=50),
+        "gpt-b": TokenUsage(input_tokens=80, output_tokens=10, cache_read_tokens=30),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=10, output_tokens=1),
+    }
+
+
+def test_codex_tally_unreadable_child_adds_nothing_to_the_split(tmp_path):
+    """A child that faults mid-read after a reading contributes no bucket, so
+    the split still sums to the totals (which skip it too).
+
+    Ablation: tally the child straight into the shared buckets and its
+    reading leaks into the split, breaking the sum."""
+    parent = _codex_thread(
+        tmp_path,
+        "2026/10/01",
+        "10-00-00",
+        ROOT,
+        session_id=ROOT,
+        usage=(10, 0, 1),
+        models=("gpt-5.5",),
+    )
+    broken = _codex_thread(
+        tmp_path, "2026/10/01", "10-06-00", GRANDCHILD, session_id=ROOT, parent=ROOT
+    )
+    filler = json.dumps({"type": "event_msg", "payload": {"type": "noise", "pad": "x" * 200}})
+    stamp = broken.stat().st_mtime
+    with broken.open("ab") as f:
+        f.write((json.dumps(_codex_turn("gpt-5.5")) + "\n").encode("utf-8"))
+        f.write((json.dumps(_codex_reading(500, 0, 50)) + "\n").encode("utf-8"))
+        f.write((filler + "\n").encode("utf-8") * 200)
+        f.write(b'{"type": "event_msg", "payload": "\xff\xfe"}\n')
+    os.utime(broken, (stamp, stamp))
+
+    usage = tally_codex_rollout(parent)
+    assert usage is not None and usage.unread == (f"{broken.name}: UnicodeDecodeError",)
+    _assert_split(usage)
+    assert usage.by_model == {"gpt-5.5": TokenUsage(input_tokens=10, output_tokens=1)}
+
+
+def test_gemini_chat_splits_tokens_per_model(tmp_path):
+    """Each message id's winning (last) `tokens` bill to the last model any
+    `type == "gemini"` occurrence of that id named; an id no gemini occurrence
+    names a model for, or a non-gemini message carrying tokens, is
+    unattributed.
+
+    Ablation: bill by the first occurrence's model and `g1` stays on pro."""
+    lines = [
+        {"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 1}},
+        {
+            "$set": {
+                "messages": [
+                    {
+                        "id": "g1",
+                        "type": "gemini",
+                        "model": "gemini-3-flash",
+                        "tokens": {"input": 10, "cached": 4, "output": 2, "thoughts": 1},
+                    }
+                ]
+            }
+        },
+        {"id": "g2", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 5}},
+        {"id": "g3", "type": "gemini", "tokens": {"input": 3}},
+        {"id": "u1", "type": "user", "model": "user-side", "tokens": {"output": 2}},
+    ]
+    path = tmp_path / "session.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+    usage = tally_gemini_chat(path)
+    _assert_split(usage)
+    assert usage.by_model == {
+        "gemini-3-pro": TokenUsage(input_tokens=5),
+        "gemini-3-flash": TokenUsage(input_tokens=6, output_tokens=3, cache_read_tokens=4),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=3, output_tokens=2),
+    }
+
+
+def test_gemini_chat_split_keeps_the_model_across_a_model_less_reemission(tmp_path):
+    """A re-emission of a message id that omits `model` still bills its winning
+    `tokens` to the model an earlier occurrence of that id named.
+
+    Ablation: bill by the winning occurrence's own `model` and the tokens land
+    on the unattributed sentinel."""
+    lines = [
+        {"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 1}},
+        {"$set": {"messages": [{"id": "g1", "type": "gemini", "tokens": {"input": 7}}]}},
+    ]
+    path = tmp_path / "session.jsonl"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+    usage = tally_gemini_chat(path)
+    _assert_split(usage)
+    assert usage.by_model == {"gemini-3-pro": TokenUsage(input_tokens=7)}
+
+
+def test_copilot_events_splits_tokens_per_metric_key(tmp_path):
+    """One bucket per named `modelMetrics` key of the last snapshot; an empty
+    key's usage is unattributed, and a key without a usage dict has none.
+
+    Ablation: sum every key into one bucket and the split names one model."""
+    metrics = {
+        "gpt-5": {
+            "usage": {
+                "inputTokens": 12,
+                "outputTokens": 1,
+                "reasoningTokens": 2,
+                "cacheReadTokens": 7,
+                "cacheWriteTokens": 3,
+            }
+        },
+        "gpt-5-mini": {"usage": {"inputTokens": 4}},
+        "": {"usage": {"inputTokens": 9}},
+        "claude-x": {"usage": "garbled"},
+    }
+    path = tmp_path / "events.jsonl"
+    path.write_text(json.dumps({"data": {"modelMetrics": metrics}}) + "\n", encoding="utf-8")
+
+    usage = tally_copilot_events(path)
+    _assert_split(usage)
+    assert usage.by_model == {
+        "gpt-5": TokenUsage(
+            input_tokens=2, output_tokens=1, cache_read_tokens=7, cache_creation_tokens=3
+        ),
+        "gpt-5-mini": TokenUsage(input_tokens=4),
+        UNATTRIBUTED_MODEL: TokenUsage(input_tokens=9),
+    }
+
+
+def test_read_usage_tracked_parsers_report_a_split(tmp_path):
+    """Each tracked parser, through the dispatcher, returns a `by_model`
+    naming its one model with the whole usage; antigravity returns None."""
+    claude = tmp_path / "claude.jsonl"
+    _write_jsonl(claude, [_with_model(_assistant("msg_1", input_tokens=1), "claude-opus-5-5")])
+    codex = _codex_thread(
+        tmp_path, "2026/10/01", "10-00-00", ROOT, usage=(1, 0, 1), models=("gpt-5.5",)
+    )
+    gemini = tmp_path / "gemini.jsonl"
+    gemini.write_text(
+        json.dumps({"id": "g1", "type": "gemini", "model": "gemini-3-pro", "tokens": {"input": 2}})
+        + "\n",
         encoding="utf-8",
     )
 
@@ -1227,8 +1850,10 @@ def test_read_usage_tracked_parsers_report_models(tmp_path):
         ("claude-jsonl", claude, "claude-opus-5-5"),
         ("codex-rollout", codex, "gpt-5.5"),
         ("gemini-chat", gemini, "gemini-3-pro"),
-        ("copilot-events", copilot, "gpt-5"),
+        ("copilot-events", COPILOT_TWO_TURNS, COPILOT_MODEL),
     ]:
         usage = read_usage(parser, path)
         assert usage is not None, parser
-        assert usage.models == (model,), parser
+        assert usage.by_model == {model: usage}, parser
+    agy = read_usage("antigravity-transcript", _agy_transcript(AGY_BRAIN, AGY_PARENT))
+    assert agy is not None and agy.by_model is None

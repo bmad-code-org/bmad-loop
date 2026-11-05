@@ -337,6 +337,11 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
       policy edited mid-run, or a role that never ran, diverge.
       ``models_used`` (additive, no schema bump) lists the models that record was
       observed to run, present only when non-empty; ``model`` stays configured.
+    - Per-task ``tokens_by_model`` (additive, no schema bump) re-cuts the task's
+      session usage by observed model: each session record's ``tokens_by_model``
+      summed field-wise per model (first-seen order; ``<unattributed>`` holds
+      usage a parser could not pin), present only when non-empty. Diagnostic —
+      it never feeds ``tokens``, and sums to it only when every session was split.
 
     Tickets mode adds two keys, additive with no schema bump: per task
     ``ticket`` (:func:`_ticket_projection`, null for a task with no ticket) and
@@ -345,6 +350,10 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
     is 0, as a stories or sweep unit's is, and its epic is named by
     ``ticket.epic_slug``. A plan's live ``status`` is not projected — it is not
     in state.json; the text board reads it from the tree.
+
+    Per task ``dev_usage_relaunches`` / ``review_usage_relaunches`` (additive, no
+    schema bump) count the uncharged usage-limit relaunches inside ``attempt`` /
+    ``review_cycle``, so an attempt past ``max_dev_attempts`` is explained.
     """
     raw_total, weighted_total, weight = run_token_totals(state)
     adapter_policy = policy.adapter_policy_from_snapshot(state.policy_snapshot)
@@ -380,27 +389,39 @@ def status_document(state: RunState, *, graceful_stop_pending: bool = False) -> 
                 if record.models:
                     used["models_used"] = list(record.models)
                 adapters_used[record.role] = used
-        tasks.append(
-            {
-                "story_key": key,
-                "epic": task.epic,
-                "phase": str(task.phase),
-                "attempt": task.attempt,
-                "review_cycle": task.review_cycle,
-                "tokens": tokens,
-                "commit_sha": task.commit_sha,
-                "defer_reason": task.defer_reason,
-                # the recovery ref a rolled-back attempt's work was parked on, or
-                # null. Reported verbatim from state.json — never re-validated
-                # against git here (retention may since have pruned it).
-                "preserve_ref": task.preserve_ref,
-                # the build session's follow-up review recommendation; a park
-                # skips that pass, so a parked story still owes it after confirm.
-                "followup_review_recommended": task.followup_review_recommended,
-                "adapters_used": adapters_used,
-                "ticket": _ticket_projection(task),
-            }
-        )
+        by_model: dict[str, dict[str, int]] = {}
+        for record in task.sessions:
+            for model, usage in record.tokens_by_model.items():
+                counts = by_model.setdefault(model, {})
+                for name, value in usage.to_dict().items():
+                    counts[name] = counts.get(name, 0) + value
+        task_doc: dict[str, object] = {
+            "story_key": key,
+            "epic": task.epic,
+            "phase": str(task.phase),
+            "attempt": task.attempt,
+            "review_cycle": task.review_cycle,
+            # uncharged usage-limit relaunches (#959) refunded out of
+            # `attempt` / `review_cycle`; additive, no schema bump.
+            "dev_usage_relaunches": task.dev_usage_relaunches,
+            "review_usage_relaunches": task.review_usage_relaunches,
+            "tokens": tokens,
+            "commit_sha": task.commit_sha,
+            "defer_reason": task.defer_reason,
+            # the recovery ref a rolled-back attempt's work was parked on, or
+            # null. Reported verbatim from state.json — never re-validated
+            # against git here (retention may since have pruned it).
+            "preserve_ref": task.preserve_ref,
+            # the build session's follow-up review recommendation; a park
+            # skips that pass, so a parked story still owes it after confirm.
+            "followup_review_recommended": task.followup_review_recommended,
+            "adapters_used": adapters_used,
+            "ticket": _ticket_projection(task),
+        }
+        # per observed model (DW-618): present only when a session was split
+        if by_model:
+            task_doc["tokens_by_model"] = by_model
+        tasks.append(task_doc)
     return {
         "schema_version": STATUS_SCHEMA_VERSION,
         "run_id": state.run_id,

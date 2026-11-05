@@ -233,7 +233,7 @@ kind = "select"
 options_ref = "USAGE_LIMIT_ACTIONS"
 default_ref = "LimitsPolicy.usage_limit_action"
 label = "usage limit action"
-description = "what a session that ends on a usage limit or an account StopFailure does · pause: the uncharged usage-limit pause `resolve` clears · relaunch: relaunch it at once as an uncharged retry (BMAD_LOOP_USAGE_RELAUNCH=<n> in the session env, for account rotation), capped by max_usage_relaunches"
+description = "what a session that ends on a usage limit or an account StopFailure does · pause: the uncharged usage-limit pause `resolve` clears · relaunch: relaunch it at once as an uncharged retry (BMAD_LOOP_USAGE_RELAUNCH=<n> in the session env, for account rotation), capped by max_usage_relaunches; an account-fatal StopFailure is never relaunched and always pauses"
 [[section.field]]
 key = "max_usage_relaunches"
 kind = "int"

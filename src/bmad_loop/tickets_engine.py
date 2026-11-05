@@ -111,6 +111,7 @@ from .engine import (
     RETRO_SKILL,
     RETRO_VERDICT_UNKNOWN,
     RETRO_VERDICTS,
+    USAGE_RELAUNCH_RESUME,
     Engine,
     RunPaused,
     RunStopped,
@@ -1355,6 +1356,52 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         )
         if tail:
             line += (" " if line.endswith(".") else " — ") + tail
+        preserved = self._retry_preserve_notice(task)
+        if preserved:
+            line += f"\n\n{preserved}"
+        return line
+
+    def _usage_relaunch_prompt(self, task: StoryTask) -> str | None:
+        """The kept-tree usage relaunch (DW-615): ``ticket <ref>`` routes the
+        existing plan by its status before build-auto's clean-tree check, and the
+        plan pointer plus the resume sentence tell the session to continue the
+        kept partial work. The head is the fresh leg's
+        :func:`~bmad_loop.tickets_source.dispatch_invocation` line, so the
+        ``thorough`` selection and a plan checkpoint's ``Halt after planning.``
+        stay in lock-step with ``BMAD_LOOP_PLAN_HALT``; a retry's parked-work
+        notice follows in its own paragraph. None (roll back) unless the bound
+        plan resolves as the trusted regular file the next attempt binds
+        (:meth:`_dispatched_spec_for_attempt`). Neither re-opens nor marks the
+        plan: a ``draft`` plan must still route to planning, and the plan is not
+        re-armed (no rollback ran)."""
+        plan = self._bound_plan(task)
+        if plan is None or self._dispatched_spec_for_attempt(task) is None:
+            return None
+        clauses = [
+            c
+            for c in (
+                self._sprint_board_instruction(),
+                self._environment_claim_instruction(),
+                self._operator_park_instruction(),
+            )
+            if c
+        ]
+        tail = " ".join(clauses)
+        ticket = task.ticket
+        ref = ticket.ref if ticket is not None else task.story_key
+        head = dispatch_invocation(
+            self._dev_skill(),
+            ref,
+            thorough=self._dev_thorough(task),
+            plan_halt=self._plan_halt_now(task),
+        )
+        # After a full stop (``Halt after planning.``) the clause is its own
+        # sentence; otherwise it hangs off the dispatch line by an em dash.
+        lead = " Resume" if head.endswith(".") else " — resume"
+        line = (
+            f"{head}{lead} the autonomous dev session on its plan at `{plan}`. "
+            f"{USAGE_RELAUNCH_RESUME}"
+        ) + (f" {tail}" if tail else "")
         preserved = self._retry_preserve_notice(task)
         if preserved:
             line += f"\n\n{preserved}"

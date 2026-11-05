@@ -29,7 +29,9 @@ stands (it does not re-defer a done/paused unit just because Editor-quit failed)
 
 Verified against unity-mcp-cli v0.81.1 (`close <path>` keys off the project path).
 Only the IvanMurzak MCP launches a managed per-worktree Editor, so only it is quit
-here; for CoplayDev (shared :8080 server) override engine.worktree_teardown_cmd.
+here; for CoplayDev (shared :8080 server) supply your own ``unity_teardown.py`` in a
+project-local copy of the plugin (``.bmad-loop/plugins/unity/``, granted with
+``bmad-loop plugins enable unity``).
 
 Env (injected by the engine):
   BMAD_LOOP_WORKTREE     the worktree whose Editor to quit
@@ -328,7 +330,9 @@ def main() -> int:
     elif mcp == "coplaydev":
         print(
             "unity_teardown: CoplayDev per_worktree teardown is not wired; override "
-            "engine.worktree_teardown_cmd if you launched a managed Editor for it.",
+            "unity_teardown.py in a project-local plugin copy (.bmad-loop/plugins/unity/, "
+            "granted with `bmad-loop plugins enable unity`) if you launched a managed "
+            "Editor for it.",
             file=sys.stderr,
         )
     else:
