@@ -238,12 +238,9 @@ breaking changes may land in a minor release.
   re-reads refuse a run dir swapped for a link or another directory instead of acting
   outside the run, and Windows verify-stream logs refuse junctions.
 - Catch more credential shapes in the `diagnose` / `probe-adapter` egress guard: Stripe
-  `sk_`/`rk_` live and test keys, Slack app-level `xapp-` tokens, SendGrid `SG.` keys and
-  PyPI upload tokens are now redacted, and URL credentials are flagged for any scheme
-  (`postgres://`, `redis://`, `mongodb+srv://`, `amqp://`, `ssh://`), not only http(s).
-  `scrub_text` now redacts a URL's whole `user:password@` before emails, so an
-  email-shaped tail can no longer leave part of the password behind, and an `@` after a
-  port's `?`/`#` is no longer mistaken for credentials.
+  `sk_`/`rk_` keys, Slack `xapp-`, SendGrid `SG.` and PyPI tokens, including inside URL
+  paths, and `user:password@` URL credentials under any scheme, not only http(s).
+  `scrub_text` now redacts a URL's whole userinfo, before emails.
 
 ## [0.13.2] — 2026-10-09
 
