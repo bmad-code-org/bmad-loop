@@ -1821,8 +1821,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         saw_session_start = False
         session_start_noted = False
         # The first admitted SessionStart carrying a hook `model` (on Codex, the
-        # first admitted SessionStart) was seen and its one `session-model` row
-        # attempted (#859); see `_note_session_model`.
+        # first admitted SessionStart) — or, with none, the first fully-idle
+        # top-level Stop carrying one (agy, DW-634) — was seen and its one
+        # `session-model` row attempted (#859); see `_note_session_model`.
         session_model_noted = False
 
         # A transcript can grow for an initial user prompt or the loop's own
@@ -3143,6 +3144,15 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # Latched after the subagent filter above, which rejects a stop that
                 # is not the main session's turn-end. Never cleared.
                 stop_seen = True
+                if not session_model_noted and event.fully_idle is True and event.model:
+                    # agy fires no SessionStart and names its model only on Stop
+                    # (`modelName`, DW-634). Only a fully-idle Stop that got past
+                    # the spawn-marker child filter above, so never an identified
+                    # child's; an unjudged Stop, or a child's that beats its
+                    # marker, is admitted there and can still label the session.
+                    # `fully_idle` is agy-only, so no other CLI's Stop does.
+                    session_model_noted = True
+                    self._note_session_model(handle, event.model)
                 if resolvable and not unresolved_crumbed and not _is_regular_file(transcript_path):
                     # Not gated on session_id: a Stop whose payloads all came
                     # through as `{}` has none, and that miss must show too.
@@ -3568,7 +3578,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def _note_session_model(self, handle: SessionHandle, model: str) -> None:
         """Journal one `session-model` (`task_id`, `model`, `cli`): the model the
-        CLI reported on the session's first admitted SessionStart hook (#859).
+        CLI reported on the session's first admitted SessionStart hook (#859),
+        or — for agy, which fires no SessionStart — on its first fully-idle
+        top-level Stop (the payload's `modelName`, agy 1.5.0; DW-634). That row
+        is the only place an agy model lands: session-end `models` stays
+        transcript-only, and agy's transcript names none.
 
         This is the CLI's own launch model (Codex sends it on every hook), unlike
         `session-start`'s configured `model`, where `""` means "CLI default".

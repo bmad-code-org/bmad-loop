@@ -479,7 +479,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - The configured `model` fields (`session-start`, the session record, `adapters_used.<role>.model`) are never overwritten by an observed one.
   - `status --json` reports a role's observed models as `adapters_used.<role>.models_used`, only when some were observed.
   - A tracked session's `session-end` entry carries `tokens_by_model`, its usage split per model (summing to the session's usage, with `<unattributed>` for usage the CLI's file does not tie to a model); `status --json` sums it per task as `tokens_by_model`. Neither appears when no split was read.
-  - The first SessionStart hook that names a model (Claude, Codex) journals one `session-model` row, and the TUI agent line shows that model in place of the configured one.
+  - The first SessionStart hook that names a model (Claude, Codex) journals one `session-model` row, and the TUI agent line shows that model in place of the configured one. Antigravity fires no SessionStart: its first fully-idle Stop that names a model (`modelName`) journals the row instead; its `models` stays untracked.
   - `diagnose` keeps model ids and redacts any element that is not shaped like one; `tokens_by_model` keeps only its integer counts.
 - **Config:** none
 - **Tested by:** `tests/test_tokens.py`, `tests/test_opencode_http.py`, `tests/test_engine.py`, `tests/test_model.py`, `tests/test_cli.py`, `tests/test_events.py`, `tests/test_generic_tmux.py`, `tests/test_diagnostics.py`, `tests/test_tui_data.py`, `tests/test_tui_app.py`

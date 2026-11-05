@@ -418,7 +418,8 @@ def shape_event(
     ``stop_error_details`` / ``stop_message`` (#865) only when a StopFailure
     payload carries ``error`` / ``error_details`` / ``last_assistant_message`` as
     a string, each cut to ``RELAY_TEXT_MAX`` characters; ``model`` (#859) only
-    when the payload carries a non-empty string ``model``, cut the same way."""
+    when the payload carries a non-empty string ``model`` — or, failing that,
+    agy's ``modelName`` (DW-634) — cut the same way."""
     event = {
         "ts": ts,
         "event": event_name,
@@ -458,9 +459,10 @@ def shape_event(
             event[event_key] = text
     # The model the CLI reports on its hook payload (#859): Claude's SessionStart
     # (startup and compact only, not resume, clear or -p; bmad-loop launches only
-    # interactive startups, see `_note_session_model`), Codex on every hook. Only
+    # interactive startups, see `_note_session_model`), Codex on every hook, and
+    # agy's Stop as `modelName` (DW-634; `model` wins when both are set). Only
     # when it is a non-empty string, so every other event stays unchanged.
-    model = _bounded_text(payload, "model")
+    model = _bounded_text(payload, "model") or _bounded_text(payload, "modelName")
     if model:
         event["model"] = model
     if payload_error:

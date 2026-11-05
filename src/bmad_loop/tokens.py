@@ -62,7 +62,8 @@ transcript that yields nothing reads as None (untracked), not zero.
                  transcripts are folded in recursively. No model id is
                  written (checked through agy 1.5.0), so models (and the
                  per-model split) stay untracked (None); agy names the model
-                 only on its Stop hook payload (`modelName`).
+                 only on its Stop hook payload (`modelName`), which feeds
+                 the `session-model` journal row, not `models`.
 
 A tracked parser's `TokenUsage.by_model` (DW-618) sums field-wise to its
 totals; usage it cannot pin on a model lands under `UNATTRIBUTED_MODEL`.
@@ -820,7 +821,8 @@ def tally_antigravity_transcript(transcript_path: Path) -> TokenUsage | None:
 
     The 1.5.0 transcript has the same step layout. `models` is None: the
     transcript names no model through 1.5.0 (the Stop hook payload's
-    `modelName` is the only place agy reports one)."""
+    `modelName` is the only place agy reports one; it feeds the adapter's
+    `session-model` row, never `models`)."""
     steps: list[dict[str, int]] = []
     parent_steps = _agy_steps(transcript_path)
     seen = parent_steps is not None

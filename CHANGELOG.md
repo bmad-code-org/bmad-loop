@@ -110,6 +110,9 @@ breaking changes may land in a minor release.
   state.json session record and summed per task in `status --json`.
 - Record Antigravity token usage from agy's per-step transcript counts (checked against
   1.4.9), subagent conversations included; models stay untracked.
+- Show Antigravity's model on the TUI agent line: the relay reads agy's Stop-payload
+  `modelName`, and the first fully-idle Stop journals the `session-model` row; session-end
+  `models` stays untracked.
 
 ### Changed
 

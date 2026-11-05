@@ -15393,6 +15393,108 @@ def test_session_model_journal_failure_is_crumbed(tmp_path, monkeypatch):
     assert (crumb["model"], crumb["error"]) == ("claude-opus-5-5", "OSError: disk full")
 
 
+# agy fires no SessionStart and names its model only on Stop (`modelName`,
+# DW-634): the first fully-idle top-level Stop carrying one journals the row.
+
+
+def _agy_model_stop(fully_idle, model, session_id="agy-parent", transcript="/final.jsonl"):
+    return HookEvent(
+        ts=1,
+        event="Stop",
+        task_id="3-1-dev-1",
+        session_id=session_id,
+        transcript_path=transcript,
+        path=Path("x"),
+        fully_idle=fully_idle,
+        model=model,
+    )
+
+
+def _model_stop_adapter(tmp_path, profile_name="antigravity"):
+    adapter, impl = make_dev_adapter(tmp_path, profile_name=profile_name)
+    adapter.journal = _FakeJournal()
+    (impl / "spec-3-1-foo.md").write_text(
+        "---\nstatus: done\n---\n\n## Auto Run Result\n\nStatus: done\n"
+    )
+    return adapter
+
+
+def test_agy_fully_idle_stop_journals_the_session_model(tmp_path):
+    """The yield Stop's model is never the row's; the final fully-idle Stop's is.
+
+    ABLATION: drop the note in the Stop branch and no row is written; drop its
+    `fully_idle is True` test and move it above the `fully_idle is False` branch,
+    and the yield's model lands."""
+    adapter = _model_stop_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_model_stop(False, "gemini-yield"),
+            _agy_model_stop(True, "gemini-4-argon-medium"),
+        ]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert _session_model_entries(adapter) == [
+        {
+            "kind": "session-model",
+            "task_id": "3-1-dev-1",
+            "model": "gemini-4-argon-medium",
+            "cli": "antigravity",
+        }
+    ]
+
+
+def test_agy_child_stop_model_is_not_the_session_model(tmp_path):
+    """A subagent's fully-idle Stop (spawn marker in a sibling folder) is dropped
+    before the note, so only the parent's own final Stop names the model.
+
+    ABLATION: move the note above the spawn-marker filter and the child's model
+    lands as the row."""
+    parent_t, child_t = _agy_brain(tmp_path)
+    adapter = _model_stop_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _agy_model_stop(True, "gemini-child", session_id="agy-child", transcript=child_t),
+            _agy_model_stop(True, "gemini-parent", transcript=parent_t),
+        ]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert result.session_id == "agy-parent"
+    assert [e["model"] for e in _session_model_entries(adapter)] == ["gemini-parent"]
+
+
+def test_stop_model_without_fully_idle_is_not_journaled(tmp_path):
+    """Only agy sends `fully_idle`: another CLI's Stop carrying a model (a Codex
+    subagent's reuses the parent id) never labels the session.
+
+    ABLATION: drop the `fully_idle is True` test and the Stop journals a row."""
+    adapter = _model_stop_adapter(tmp_path, profile_name="claude")
+    adapter.watcher = _ScriptedWatcher([_agy_model_stop(None, "gpt-5.5-mini")])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert _session_model_entries(adapter) == []
+
+
+def test_session_start_model_wins_over_a_stop_model(tmp_path):
+    """A SessionStart that noted the model latches: a later fully-idle Stop
+    carrying one adds no second row.
+
+    ABLATION: drop the `not session_model_noted` test from the Stop note and the
+    Stop's model lands as a second row."""
+    adapter = _model_stop_adapter(tmp_path)
+    start = dataclasses.replace(_session_start("3-1-dev-1", None), session_id="agy-parent")
+    adapter.watcher = _ScriptedWatcher(
+        [
+            dataclasses.replace(start, model="gemini-start"),
+            _agy_model_stop(True, "gemini-stop"),
+        ]
+    )
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert [e["model"] for e in _session_model_entries(adapter)] == ["gemini-start"]
+
+
 # --------------------------------------------- Claude Code StopFailure (#865)
 #
 # Claude Code fires `StopFailure` INSTEAD of `Stop` when an API error ends a

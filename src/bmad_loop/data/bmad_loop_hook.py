@@ -14,8 +14,10 @@ carries the API error that ended the turn: its `error`, `error_details` and
 `last_assistant_message` are forwarded as `stop_error`, `stop_error_details` and
 `stop_message`, each only when it is a string and cut to RELAY_TEXT_MAX
 characters. A payload's `model` (Claude's SessionStart, Codex on every hook) is
-forwarded the same way, only when it is a non-empty string. Reads the hook payload from stdin and writes one event file
-into the orchestrator's events directory. No-ops (exit 0) unless the session was
+forwarded the same way, only when it is a non-empty string; agy's Stop names it
+`modelName`, forwarded as `model` when there is no `model`. Reads the hook
+payload from stdin and writes one event file into the orchestrator's events
+directory. No-ops (exit 0) unless the session was
 spawned by bmad-loop (detected via env vars set on the tmux window), so
 normal interactive sessions are unaffected.
 
@@ -487,9 +489,10 @@ def main() -> int:
             event[event_key] = text
     # The model the CLI reports on its hook payload (#859): Claude's SessionStart
     # (startup and compact only, not resume, clear or -p; bmad-loop launches only
-    # interactive startups), Codex on every hook. Only when it is a non-empty
+    # interactive startups), Codex on every hook, and agy's Stop as `modelName`
+    # (DW-634; `model` wins when both are set). Only when it is a non-empty
     # string, so every other event stays unchanged.
-    model = _bounded_text(payload, "model")
+    model = _bounded_text(payload, "model") or _bounded_text(payload, "modelName")
     if model:
         event["model"] = model
     # Only when set, so a readable payload's event is unchanged.

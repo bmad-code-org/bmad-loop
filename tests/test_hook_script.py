@@ -138,6 +138,7 @@ def test_antigravity_payload(tmp_path):
         "workspacePaths": ["/ws"],
         "terminationReason": "model_stop",
         "fullyIdle": True,
+        "modelName": "gemini-4-argon-medium",
     }
     proc = run_hook("Stop", env, payload)
     assert proc.returncode == 0
@@ -146,6 +147,7 @@ def test_antigravity_payload(tmp_path):
     assert event["transcript_path"].endswith("transcript.jsonl")
     assert event["cwd"] == "/ws"
     assert event["fully_idle"] is True  # DW-548: forwarded as a boolean
+    assert event["model"] == "gemini-4-argon-medium"  # DW-634: `modelName` aliased
 
 
 def test_workspace_paths_ignored_when_unusable(tmp_path):

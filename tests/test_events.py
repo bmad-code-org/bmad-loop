@@ -343,12 +343,22 @@ def test_both_relay_twins_forward_the_session_start_source(
         ({"model": ["gpt-5.5"]}, None),
         ({"model": ""}, None),
         ({}, None),
+        # agy's Stop names it `modelName` (DW-634): aliased, `model` wins
+        ({"modelName": "gemini-4-argon-medium"}, "gemini-4-argon-medium"),
+        ({"model": "gpt-5.5-codex", "modelName": "gemini-x"}, "gpt-5.5-codex"),
+        ({"model": "", "modelName": "gemini-x"}, "gemini-x"),
+        ({"model": 7, "modelName": "gemini-x"}, "gemini-x"),
+        ({"modelName": 7}, None),
+        ({"modelName": ""}, None),
+        # bounded like `model`: cut to RELAY_TEXT_MAX, never dropped
+        ({"modelName": "m" * (events.RELAY_TEXT_MAX + 5)}, "m" * events.RELAY_TEXT_MAX),
     ],
 )
 def test_both_relay_twins_forward_the_hook_model(tmp_path, monkeypatch, payload, expected):
-    """#859: a hook payload's `model` reaches the event file from BOTH writers,
-    and only when it is a non-empty string — otherwise the key is absent, so an
-    event without one is unchanged (`test_relay_and_the_hook_shape_the_same_event`).
+    """#859: a hook payload's `model` (or, failing that, agy's `modelName`,
+    DW-634) reaches the event file from BOTH writers, and only when it is a
+    non-empty string — otherwise the key is absent, so an event without one is
+    unchanged (`test_relay_and_the_hook_shape_the_same_event`).
 
     Ablation: drop the `model` write from either writer and the string cases fail
     on that side; write it unconditionally and the absent cases fail."""
