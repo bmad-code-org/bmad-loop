@@ -251,13 +251,19 @@ def tally(transcript_path: Path) -> TokenUsage | None:
     for path in paths:
         for entry in _jsonl_entries(path):
             model = _note_claude_model(entry, models)
+            message = entry.get("message")
+            # Any block of a response may name its model, usage-bearing or
+            # not: associate it before the usage guard below.
+            if model is not None and isinstance(message, dict):
+                block_id = message.get("id")
+                if isinstance(block_id, str):
+                    id_model.setdefault(block_id, model)
             usage = _usage_block(entry)
             # Absent, empty `{}`, or no recognized token key: no usage signal here.
             if not usage or not any(key in usage for key in _CLAUDE_USAGE_KEYS):
                 continue
             seen = True
             counts = {key: _int(usage.get(key)) for key in _CLAUDE_USAGE_KEYS}
-            message = entry.get("message")
             # Only a message-level usage block is keyed by its message's id; a
             # top-level `usage` counts on its own even beside a `message.id`.
             message_id = (
@@ -268,8 +274,6 @@ def tally(transcript_path: Path) -> TokenUsage | None:
             if not isinstance(message_id, str):
                 anon.append((counts, model))
                 continue
-            if model is not None:
-                id_model.setdefault(message_id, model)
             merged = by_id.setdefault(message_id, dict.fromkeys(_CLAUDE_USAGE_KEYS, 0))
             for key, value in counts.items():
                 merged[key] = max(merged[key], value)

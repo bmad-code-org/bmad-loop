@@ -1500,6 +1500,21 @@ def test_tally_splits_tokens_per_model(tmp_path):
     assert list(usage.by_model) == [*usage.models, UNATTRIBUTED_MODEL]
 
 
+def test_tally_split_takes_the_model_from_a_usage_less_block(tmp_path):
+    """A block that names the response's model but carries no usage still
+    attributes the response: its usage block, without a model, bills there.
+
+    Ablation: associate a message id's model only on usage-bearing blocks
+    and the response is unattributed."""
+    path = tmp_path / "sid.jsonl"
+    named = {"type": "assistant", "message": {"id": "msg_1", "model": "claude-opus-5-5"}}
+    _write_jsonl(path, [named, _assistant("msg_1", input_tokens=5)])
+
+    usage = tally(path)
+    _assert_split(usage)
+    assert usage.by_model == {"claude-opus-5-5": TokenUsage(input_tokens=5)}
+
+
 def test_tally_split_omits_a_zero_sentinel(tmp_path):
     """The sentinel bucket appears only when it holds usage: a zero-usage
     `<synthetic>` entry leaves the split model-only.

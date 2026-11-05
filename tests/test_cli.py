@@ -2579,6 +2579,7 @@ def test_status_json_task_carries_tokens_by_model(project, capsys):
         UNATTRIBUTED_MODEL: TokenUsage(input_tokens=1).to_dict(),
         "m2": TokenUsage(cache_read_tokens=9).to_dict(),
     }
+    assert list(entry["tokens_by_model"]) == ["m1", UNATTRIBUTED_MODEL, "m2"]  # first-seen
     for name in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"):
         assert sum(c[name] for c in entry["tokens_by_model"].values()) == entry["tokens"][name]
     # every other key and value is what the same run without the split projects
