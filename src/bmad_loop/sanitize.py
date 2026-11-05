@@ -97,7 +97,9 @@ _SECRET_RUN_MIN = 32  # length of contiguous alnum run that triggers the entropy
 _SECRET_ENTROPY_MIN = 3.5  # bits/char; pure hex ~4.0, base64 ~6.0, prose/slug well below
 
 # Token shape used by assert_no_leak to re-scan rendered output for secrets.
-_LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._/+-]{6,}")
+# `/` separates tokens, so an anchored prefix arm sees a key that follows a path
+# segment; the entropy arm already splits on `/` via _ALNUM_RUN_RE.
+_LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._+-]{6,}")
 # Any RFC 3986 scheme, not only http(s): connection strings (`postgres://`,
 # `redis://`, `mongodb+srv://`, `amqp://`, `ssh://`) carry `user:password@`
 # userinfo the same way and are as likely to reach a log tail or `--help` blob.

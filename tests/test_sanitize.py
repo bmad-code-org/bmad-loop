@@ -387,6 +387,23 @@ def test_assert_no_leak_url_rule_needs_a_password(text):
     assert "url-credentials" not in sanitize.assert_no_leak(text)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Each key follows a `/`. The prefix arms are `^`-anchored, so they see
+        # the key only when `/` ends the token before it. Low-entropy canaries in
+        # the vendors' formats, not live keys.
+        "https://host.test/sk_live_123456789012345678901234",  # stripe secret in a URL path
+        "path/rk_live_abcdefABCDEF0123456789",  # stripe restricted key
+        "./SG.CANARYxxxxxxxxxxxxxxx.CANARYxxxx-xxxx",  # sendgrid
+        "a/sk-ant-xxxxxxxxxxxxxxxxxxxxx",  # anthropic
+    ],
+)
+def test_assert_no_leak_finds_prefixed_keys_in_url_paths(text):
+    """Ablation: restoring `/` in ``_LEAK_TOKEN_RE`` fails every row."""
+    assert "secret" in sanitize.assert_no_leak(text)
+
+
 def test_url_cred_scheme_is_bounded():
     """The scheme is capped at 32 characters, one of the two properties that keep
     the unanchored URL-credential scan linear on a long alphanumeric run. A longer
