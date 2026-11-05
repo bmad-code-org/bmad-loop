@@ -1301,6 +1301,24 @@ def test_antigravity_transcript_skips_unreadable_child(agy_brain, monkeypatch):
     assert usage.unread == (f"{AGY_CHILD}/transcript_full.jsonl: PermissionError",)
 
 
+def test_antigravity_transcript_names_a_listed_child_without_a_transcript(agy_brain):
+    """A marker names the child, so its missing transcript is a lower bound the
+    engine journals (`usage_unread`), never a silent parent-only total."""
+    _agy_transcript(agy_brain, AGY_CHILD).unlink()
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == (f"{AGY_CHILD}/transcript_full.jsonl: FileNotFoundError",)
+
+
+def test_antigravity_transcript_names_a_listed_child_transcript_not_a_file(agy_brain):
+    child = _agy_transcript(agy_brain, AGY_CHILD)
+    child.unlink()
+    child.mkdir()
+    usage = tally_antigravity_transcript(_agy_transcript(agy_brain, AGY_PARENT))
+    assert usage == AGY_PARENT_USAGE
+    assert usage.unread == (f"{AGY_CHILD}/transcript_full.jsonl: ValueError",)
+
+
 def test_antigravity_transcript_names_unlistable_marker_folder(agy_brain, monkeypatch):
     subagents = agy_brain / AGY_PARENT / ".system_generated" / "subagents"
     real_iterdir = Path.iterdir

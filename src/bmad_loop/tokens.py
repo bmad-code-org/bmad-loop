@@ -60,6 +60,7 @@ import fnmatch
 import json
 import os
 import re
+import stat
 import threading
 import uuid
 from collections.abc import Mapping
@@ -599,11 +600,16 @@ _AGY_LOGS_DIR = (".system_generated", "logs")
 _AGY_SUBAGENTS_DIR = (".system_generated", "subagents")
 
 
-def _agy_steps(transcript_path: Path) -> list[dict[str, int]] | None:
+def _agy_steps(transcript_path: Path, *, required: bool = False) -> list[dict[str, int]] | None:
     """The transcript's per-step usage counts, or None when no step carries one.
 
     A step with an int `step_index` counts once, from its last usage-bearing
-    occurrence; one without each counts. OSError/ValueError propagate."""
+    occurrence; one without each counts. OSError/ValueError propagate. A
+    missing or non-regular file reads as None, unless ``required`` (a child a
+    spawn marker names): then a missing file raises FileNotFoundError and a
+    non-regular one ValueError, so the absence is reported, never a zero."""
+    if required and not stat.S_ISREG(transcript_path.stat().st_mode):
+        raise ValueError(f"{transcript_path} is not a regular file")
     by_step: dict[int, dict[str, int]] = {}
     anon: list[dict[str, int]] = []
     for entry in _jsonl_entries(transcript_path):
@@ -666,7 +672,8 @@ def tally_antigravity_transcript(transcript_path: Path) -> TokenUsage | None:
     path has agy's `<conv>/.system_generated/logs/<file>` shape, each listed
     child is folded in, recursively, every conversation at most once; any other
     path tallies alone. A child's usage makes the session tracked even when the
-    parent reports none. An unreadable child transcript (OSError/ValueError) is
+    parent reports none. An unreadable child transcript (OSError/ValueError) —
+    one a marker names but that is missing or not a regular file included — is
     skipped and named in `TokenUsage.unread` as
     `<childId>/transcript_full.jsonl: <ExcType>`, an unlistable marker folder as
     `subagents/: <ExcType>` (prefixed `<childId>/` for a child's); the totals
@@ -692,7 +699,9 @@ def tally_antigravity_transcript(transcript_path: Path) -> TokenUsage | None:
                 visited.add(child)
                 child_folder = brain / child
                 try:
-                    child_steps = _agy_steps(child_folder.joinpath(*_AGY_LOGS_DIR, _AGY_TRANSCRIPT))
+                    child_steps = _agy_steps(
+                        child_folder.joinpath(*_AGY_LOGS_DIR, _AGY_TRANSCRIPT), required=True
+                    )
                 except (OSError, ValueError) as e:
                     unread.append(f"{child}/{_AGY_TRANSCRIPT}: {type(e).__name__}")
                 else:
