@@ -162,6 +162,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Keep email redaction and leak detection in `diagnose` and `probe-adapter` linear on a
+  long line: an 80k-character alphanumeric run with no `@` took seconds to scan, and now
+  takes milliseconds. What counts as an email is unchanged.
 - Match agy's workspace-trust entries the way agy does: a forward-slash spelling of the
   project (`C:/Users/...`) now counts as trusted on Windows when seeding a worktree and
   in `probe-adapter --workspace`; case and trailing-separator variants still do not.
