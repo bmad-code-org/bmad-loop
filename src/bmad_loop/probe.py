@@ -52,7 +52,9 @@ to shape instead of trying to enumerate what might be sensitive.
 
 from __future__ import annotations
 
+import errno
 import glob
+import hashlib
 import os
 import re
 import shlex
@@ -69,7 +71,7 @@ from typing import Literal
 
 import regex
 
-from . import childrun, runs, sanitize
+from . import childrun, platform_util, runs, sanitize
 from .adapters.generic import PARKED_PROMPT_MATCH_TIMEOUT_S
 from .adapters.multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
 from .adapters.panematch import Hit, MatchTimeout, match_rows, screen_rows
@@ -577,7 +579,7 @@ def _check_hook_trust(
                 f"(cd there and run `{finding.binary}` under the profile's `[env]`, if "
                 "it sets any), accept its folder trust and "
                 "hooks trust prompts, then re-run "
-                f"`bmad-loop probe-adapter {finding.cli} --probe`"
+                f"`bmad-loop probe-adapter {finding.cli} --probe` from your project checkout"
             )
         elif live:
             # unverifiable: a trust grant cannot fix a failed or unreadable query
@@ -834,33 +836,59 @@ def probe_workspace(profile: CLIProfile) -> Path:
     """The stable live-probe workspace for a ``codex-hooks-json`` profile:
     ``<state root>/probe-workspaces/<profile name>``. Codex keys hook trust by
     the config's path and hash, so only a path that survives between runs can
-    hold a trust grant. The name is made path-safe (anything outside
-    ``[A-Za-z0-9._-]`` becomes ``_``; an empty or all-dot name becomes
-    ``profile``). Raises :class:`runs.StateRootError` when no state root exists."""
-    name = _UNSAFE_NAME_CHAR_RE.sub("_", profile.name)
-    if not name.strip("."):
-        name = "profile"
+    hold a trust grant. The name is made path-safe: anything outside
+    ``[A-Za-z0-9._-]`` becomes ``_``, leading and trailing dots go (an empty
+    result becomes ``profile``), and a Windows device name (``nul``, ``CON``)
+    gets a ``_`` prefix. A changed name also gets ``-<hex8>`` of the raw name,
+    so two profiles that coerce alike (``my codex`` and ``my_codex``) never
+    share — and keep resetting — one workspace and its trust grant. Raises
+    :class:`runs.StateRootError` when no state root exists."""
+    name = _UNSAFE_NAME_CHAR_RE.sub("_", profile.name).strip(".") or "profile"
+    if platform_util.names_win32_alias(name):
+        name = "_" + name
+    if name != profile.name:
+        raw = profile.name.encode("utf-8", "surrogatepass")
+        name += "-" + hashlib.sha256(raw).hexdigest()[:8]
     return runs.state_root() / PROBE_WORKSPACES_DIR / name
 
 
 def _workspace_label(path: Path) -> str:
     """Paste-safe spelling of the stable probe workspace: home -> ``~``, and the
     per-component :func:`_redact_location` form when that still names the user
-    (a state root under ``/tmp/pytest-of-<user>``, say) — the egress guard's
-    username rule would otherwise refuse the whole report."""
+    (a state root under ``/tmp/pytest-of-<user>``, say) or trips any other
+    egress-guard rule (an email-shaped component of ``BMAD_LOOP_STATE_DIR``) —
+    the guard would otherwise refuse the whole report."""
     label = sanitize.redact_home(str(path))
-    if sanitize.embeds_current_username(label):
+    if sanitize.embeds_current_username(label) or sanitize.assert_no_leak(label):
         label = _redact_location(path)
     return label
 
 
 def _reset_probe_workspace(workspace: Path) -> None:
-    """Remove and recreate ``workspace`` so its contents are exactly what this
-    run writes. ``rmtree`` refuses a symlink and a plain file, which is the
-    point: both fail loud as :class:`OSError` rather than being followed."""
-    if os.path.lexists(workspace):
-        shutil.rmtree(workspace)
-    workspace.mkdir(parents=True)
+    """Empty ``workspace`` so its contents are exactly what this run writes.
+
+    The directory itself is kept: the untrusted next step sends the operator to
+    ``cd`` into it, and removing a shell's cwd strands that shell (``Path.cwd()``
+    raises) even after the same path is recreated. It and its
+    ``probe-workspaces`` parent are made owner-only (``0o700``; a no-op beyond
+    the read-only bit on Windows): Codex trusts the hook config's hash, not the
+    script it runs, so a script others can rewrite would run in every later
+    trusted session. A link (or junction) or a plain file at either of those two
+    paths fails loud as :class:`OSError` rather than being followed; links at
+    the state root or above are the operator's layout and are followed. A link
+    inside the workspace is removed, never followed."""
+    parent = workspace.parent
+    parent.parent.mkdir(parents=True, exist_ok=True)
+    for directory in (parent, workspace):
+        if platform_util.is_link_like(directory):
+            raise OSError(errno.ELOOP, "a symlink or junction, not a directory", str(directory))
+        directory.mkdir(mode=0o700, exist_ok=True)  # a plain file: FileExistsError
+        os.chmod(directory, 0o700)  # tighten one made by an older run or a looser umask
+    for child in workspace.iterdir():
+        if child.is_dir() and not platform_util.is_link_like(child):
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 def probe(
@@ -938,9 +966,10 @@ def probe(
                 else:
                     finding.next_steps.append(
                         "Close any Codex session running in the probe workspace and "
-                        f"make sure `{workspace_label}` can be recreated as a fresh directory "
-                        "(remove a file or symlink at that path; check its parent directory "
-                        f"is writable), then re-run `bmad-loop probe-adapter {cli} --probe`"
+                        f"make sure `{workspace_label}` is a directory you own that can be "
+                        "emptied (remove a file or symlink at that path or its parent; check "
+                        "its parent directory is writable), then re-run "
+                        f"`bmad-loop probe-adapter {cli} --probe`"
                     )
                 return finding
 

@@ -27,7 +27,7 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 ```text
 <state root>/
 ├── locks/                      advisory-lock files, shared across this user's projects
-├── probe-workspaces/<profile>/ Codex `probe-adapter --probe` hook script + config (reset each run)
+├── probe-workspaces/<profile>/ Codex `probe-adapter --probe` hook script + config (owner-only, emptied each run)
 └── <project key>/
     ├── <run-id>/               the run's control plane
     │   ├── events/             hook-event files written by `bmad-loop relay` (BMAD_LOOP_EVENTS_DIR)

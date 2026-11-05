@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -11,7 +13,7 @@ from pathlib import Path
 import pytest
 from conftest import install_bmad_config, windows_relay_builder, write_script_launcher
 
-from bmad_loop import cli, codex_trust, probe, runs
+from bmad_loop import cli, codex_trust, envvars, probe, runs, sanitize
 from bmad_loop.adapters.profile import ProfileError, get_profile
 from bmad_loop.install import _hook_command, merge_hooks
 
@@ -569,6 +571,8 @@ class _LiveProbeHarness:
         self.trust_paths: list[Path] = []
         self.starts: list[Path] = []
         self.raw_dirs: list[Path] = []
+        self.launch_envs: list[dict[str, str]] = []
+        self.log_files: list[Path] = []
         harness = self
         real_mkdtemp = probe.tempfile.mkdtemp
 
@@ -589,8 +593,10 @@ class _LiveProbeHarness:
             def __init__(self, **_kwargs):
                 pass
 
-            def start(self, _argv, _env, cwd, _log_file):
+            def start(self, _argv, env, cwd, log_file):
                 harness.starts.append(Path(cwd))
+                harness.launch_envs.append(dict(env))
+                harness.log_files.append(Path(log_file))
                 return "fake-window"
 
             def kill(self):
@@ -641,7 +647,7 @@ def test_untrusted_live_probe_names_stable_workspace_and_keeps_only_hook_and_con
     assert f"`{label}`" in step
     assert "Open Codex once in the stable probe workspace" in step
     assert "folder trust and hooks trust prompts" in step
-    assert "bmad-loop probe-adapter codex --probe" in step
+    assert "bmad-loop probe-adapter codex --probe` from your project checkout" in step
     assert sorted(p.relative_to(workspace).as_posix() for p in workspace.rglob("*")) == sorted(
         [
             probe.PROBE_HOOK_NAME,
@@ -689,6 +695,63 @@ def test_live_probe_workspace_reset_drops_strays_and_keeps_config_bytes(tmp_path
     assert harness.trust_paths == [workspace, workspace]
 
 
+def test_live_probe_workspace_reset_keeps_the_directory_an_operator_cd_into(tmp_path, monkeypatch):
+    # The untrusted next step sends the operator to cd into the workspace; a
+    # re-run from there must not unlink its own (and its shell's) cwd.
+    harness = _LiveProbeHarness(monkeypatch)
+    workspace = probe.probe_workspace(get_profile("codex"))
+    harness.run(tmp_path)
+    before = os.stat(workspace)
+    (workspace / "stray-dir" / "nested").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("not ours", encoding="utf-8")
+    monkeypatch.chdir(workspace)
+    if sys.platform != "win32":
+        (workspace / "stray-link").symlink_to(outside, target_is_directory=True)
+
+    harness.run(tmp_path)
+
+    assert Path.cwd() == workspace  # cwd still resolves
+    after = os.stat(workspace)
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert not (workspace / "stray-dir").exists()
+    assert not os.path.lexists(workspace / "stray-link")
+    assert (outside / "keep.txt").is_file()  # the link was removed, not followed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+def test_live_probe_workspace_is_owner_only(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch)
+    workspace = probe.probe_workspace(get_profile("codex"))
+    workspace.mkdir(parents=True)
+    workspace.chmod(0o775)  # an older run under a group-writable umask
+    workspace.parent.chmod(0o775)
+
+    harness.run(tmp_path)
+
+    assert workspace.stat().st_mode & 0o777 == 0o700
+    assert workspace.parent.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink")
+def test_live_probe_refuses_a_linked_probe_workspaces_dir(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch, trust_status="trusted")
+    workspace = probe.probe_workspace(get_profile("codex"))
+    target = tmp_path / "elsewhere"
+    (target / workspace.name).mkdir(parents=True)
+    keep = target / workspace.name / "keep.txt"
+    keep.write_text("not ours", encoding="utf-8")
+    workspace.parent.parent.mkdir(parents=True, exist_ok=True)
+    workspace.parent.symlink_to(target, target_is_directory=True)
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "unverifiable" and harness.starts == []
+    assert "symlink or junction" in finding.warnings[-1]
+    assert keep.is_file()
+
+
 def test_trusted_live_probe_launches_in_stable_workspace_and_removes_raw_dir(tmp_path, monkeypatch):
     harness = _LiveProbeHarness(monkeypatch, trust_status="trusted")
     workspace = probe.probe_workspace(get_profile("codex"))
@@ -698,6 +761,11 @@ def test_trusted_live_probe_launches_in_stable_workspace_and_removes_raw_dir(tmp
     assert finding.hook_trust == "trusted"
     assert harness.starts == [workspace]
     assert len(harness.raw_dirs) == 1 and not harness.raw_dirs[0].exists()
+    raw = harness.raw_dirs[0]
+    # captures and the launch log stay in the ephemeral raw dir, never the workspace
+    assert harness.log_files == [raw / "probe.log"]
+    assert harness.launch_envs[0]["BMAD_LOOP_PROBE_CAPTURE_DIR"] == str(raw / "capture")
+    assert harness.launch_envs[0]["BMAD_LOOP_RUN_DIR"] == str(raw)
     assert (workspace / probe.PROBE_HOOK_NAME).is_file()
 
 
@@ -711,7 +779,7 @@ def test_live_probe_workspace_fault_is_unverifiable_without_launch(tmp_path, mon
 
         monkeypatch.setattr(probe.runs, "state_root", no_root)
     else:
-        # a plain file where the workspace dir belongs: rmtree refuses it
+        # a plain file where the workspace dir belongs: mkdir refuses it
         workspace = probe.probe_workspace(get_profile("codex"))
         workspace.parent.mkdir(parents=True)
         workspace.write_text("not a dir", encoding="utf-8")
@@ -746,15 +814,56 @@ def test_non_codex_live_probe_keeps_the_ephemeral_workspace(tmp_path, monkeypatc
     assert not (runs.state_root() / probe.PROBE_WORKSPACES_DIR).exists()
 
 
+def _digest(name: str) -> str:
+    return "-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+
+
 @pytest.mark.parametrize(
     ("name", "expected"),
-    [("codex", "codex"), ("my codex/2", "my_codex_2"), ("..", "profile"), ("", "profile")],
+    [
+        ("codex", "codex"),
+        ("my codex/2", "my_codex_2" + _digest("my codex/2")),
+        ("..", "profile" + _digest("..")),
+        ("", "profile" + _digest("")),
+        ("nul", "_nul" + _digest("nul")),
+        ("CON.x", "_CON.x" + _digest("CON.x")),
+        ("codex.", "codex" + _digest("codex.")),
+    ],
 )
 def test_probe_workspace_name_is_path_safe(name, expected):
     profile = replace(get_profile("codex"), name=name)
     assert probe.probe_workspace(profile) == (
         runs.state_root() / probe.PROBE_WORKSPACES_DIR / expected
     )
+
+
+def test_probe_workspace_names_that_coerce_alike_stay_distinct():
+    base = get_profile("codex")
+    names = ["my codex/2", "my_codex_2", "my:codex:2"]
+    workspaces = {probe.probe_workspace(replace(base, name=n)) for n in names}
+    assert len(workspaces) == len(names)
+
+
+def test_workspace_label_redacts_an_email_shaped_component_without_the_username():
+    # Off the username branch (a tmp state root embeds the user): only the
+    # egress-guard fallback can catch the email here.
+    path = Path("/mnt/accounts/bob@example.net/state") / probe.PROBE_WORKSPACES_DIR / "codex"
+    assert not sanitize.embeds_current_username(str(path))
+    label = probe._workspace_label(path)
+    assert "bob@example.net" not in label and sanitize.assert_no_leak(label) == []
+    assert label.endswith(f"{probe.PROBE_WORKSPACES_DIR}/codex")
+
+
+def test_workspace_label_redacts_an_email_shaped_state_root(tmp_path, monkeypatch):
+    monkeypatch.setenv(envvars.STATE_DIR, str(tmp_path / "bob@example.net" / "state"))
+    harness = _LiveProbeHarness(monkeypatch)
+    label = probe._workspace_label(probe.probe_workspace(get_profile("codex")))
+    assert "bob@example.net" not in label and sanitize.assert_no_leak(label) == []
+
+    finding = harness.run(tmp_path)
+
+    assert f"`{label}`" in finding.next_steps[-1]
+    probe.render_markdown(finding)  # passes the egress guard
 
 
 def test_probe_json_exits_nonzero_and_names_hook_trust(tmp_path, monkeypatch, capsys):

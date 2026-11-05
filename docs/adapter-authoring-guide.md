@@ -161,12 +161,13 @@ the hook dialect your profile declares.
 Codex (`codex-hooks-json`) keys hook trust by the config's path and hash, so a fresh temp
 dir would never be trusted. For Codex the hook script and config go into a stable per-user
 workspace instead, `<state root>/probe-workspaces/<profile>` (see
-[state root](reference/run-state.md#state-root)). Each run resets it and
-writes the same bytes, and Codex launches there. The first `--probe` reports the hook trust
+[state root](reference/run-state.md#state-root)). The directory is owner-only. Each run
+empties it and writes the same bytes, and Codex launches there. The first `--probe` reports the hook trust
 as untrusted and exits 1 before any turn, with a next step naming the workspace: open Codex
 there once (under the profile's `[env]`), accept its folder trust and hooks trust
-prompts, and re-run. Trust holds until
-the config bytes or the workspace path change: a different hook interpreter, a moved
+prompts, and re-run from the project checkout.
+
+Trust holds until the config bytes or the workspace path change: a different hook interpreter, a moved
 bmad-loop install, a Codex version that changes the registered events, or a different state
 root (`BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME`) needs that one-time step again. If the state
 root cannot be resolved or the workspace cannot be reset, hook trust reads `unverifiable`
