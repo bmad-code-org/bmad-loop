@@ -10,6 +10,7 @@ from bmad_loop import tokens
 from bmad_loop.model import UNATTRIBUTED_MODEL, TokenUsage
 from bmad_loop.tokens import (
     read_usage,
+    read_usage_settled,
     tally,
     tally_antigravity_transcript,
     tally_codex_rollout,
@@ -1137,8 +1138,8 @@ def test_copilot_events_last_cumulative_across_models(tmp_path):
     path.write_text("\n".join(json.dumps(line) for line in lines) + "\nnot json\n")
 
     usage = tally_copilot_events(path)
-    assert usage.input_tokens == 340  # (500 - 200 cache reads) + 40
-    assert usage.output_tokens == 75  # (60 + 5) + (8 + 2), reasoning folded in
+    assert usage.input_tokens == 310  # (500 - 200 cache reads - 30 cache writes) + 40
+    assert usage.output_tokens == 68  # 60 + 8: reasoningTokens are part of outputTokens
     assert usage.cache_read_tokens == 200
     assert usage.cache_creation_tokens == 30
 
@@ -1244,6 +1245,9 @@ def test_copilot_events_read_the_last_checkpoint_without_a_shutdown(tmp_path):
     usage = tally_copilot_events(no_shutdown)
     assert usage == tally_copilot_events(COPILOT_TWO_TURNS)
     assert usage is not None and usage.models == (COPILOT_MODEL,)
+    assert usage.by_model == {
+        COPILOT_MODEL: TokenUsage(input_tokens=570, output_tokens=11, cache_read_tokens=35328)
+    }
 
     seen: list[str] = []
 
@@ -1254,6 +1258,37 @@ def test_copilot_events_read_the_last_checkpoint_without_a_shutdown(tmp_path):
     usage = tally_copilot_events(_copilot_events_until(tmp_path, COPILOT_TWO_TURNS, first_turn))
     assert usage == TokenUsage(input_tokens=518, output_tokens=5, cache_read_tokens=17408)
     assert usage.models == (COPILOT_MODEL,)
+
+
+def test_copilot_events_settle_only_on_the_shutdown_line(tmp_path):
+    """A checkpoint reads usage but is not final: only `session.shutdown`
+    settles a copilot read, so a post-session poll waits for it. A
+    shutdown with no prior snapshot settles a None read.
+
+    Ablation: report every copilot read settled and the checkpoint-only read
+    flips to True."""
+    usage, settled = read_usage_settled("copilot-events", COPILOT_TWO_TURNS)
+    assert settled is True
+    assert usage == TokenUsage(input_tokens=570, output_tokens=11, cache_read_tokens=35328)
+
+    no_shutdown = _copilot_events_until(
+        tmp_path, COPILOT_TWO_TURNS, lambda entry: entry["type"] != "session.shutdown"
+    )
+    usage, settled = read_usage_settled("copilot-events", no_shutdown)
+    assert settled is False
+    assert usage is not None
+
+    bare = tmp_path / "bare.jsonl"
+    bare.write_text(json.dumps({"type": "session.shutdown", "data": {}}) + "\n", encoding="utf-8")
+    assert read_usage_settled("copilot-events", bare) == (None, True)
+
+
+def test_read_usage_settled_other_parsers_read_settled(tmp_path):
+    path = tmp_path / "t.jsonl"
+    path.write_text(json.dumps({"usage": {"input_tokens": 1, "output_tokens": 2}}) + "\n")
+    usage, settled = read_usage_settled("claude-jsonl", path)
+    assert settled is True and usage is not None and usage.total == 3
+    assert read_usage_settled("none", path) == (None, True)
 
 
 def test_copilot_events_without_a_snapshot_is_none(tmp_path):
@@ -1789,7 +1824,7 @@ def test_copilot_events_splits_tokens_per_metric_key(tmp_path):
     _assert_split(usage)
     assert usage.by_model == {
         "gpt-5": TokenUsage(
-            input_tokens=5, output_tokens=3, cache_read_tokens=7, cache_creation_tokens=3
+            input_tokens=2, output_tokens=1, cache_read_tokens=7, cache_creation_tokens=3
         ),
         "gpt-5-mini": TokenUsage(input_tokens=4),
         UNATTRIBUTED_MODEL: TokenUsage(input_tokens=9),

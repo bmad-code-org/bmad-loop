@@ -49,7 +49,9 @@ transcript that yields nothing reads as None (untracked), not zero.
                  reasoningTokens} that is CUMULATIVE per model, so the last
                  snapshot holds the session totals (summed across models; the
                  split keeps them per model). inputTokens includes the cache
-                 reads, which are subtracted; reasoningTokens fold into output.
+                 reads and writes, which are subtracted; reasoningTokens are
+                 part of outputTokens. Only the shutdown line is final
+                 (`read_usage_settled`).
 - antigravity-transcript: ~/.gemini/antigravity-cli/brain/<conversation-id>/
                  .system_generated/logs/transcript_full.jsonl (agy 1.4.9);
                  each PLANNER_RESPONSE step (one API call) carries top-level
@@ -95,6 +97,20 @@ def read_usage(parser: str, transcript_path: Path) -> TokenUsage | None:
     if parser == "antigravity-transcript":
         return tally_antigravity_transcript(transcript_path)
     return None
+
+
+def read_usage_settled(parser: str, transcript_path: Path) -> tuple[TokenUsage | None, bool]:
+    """``(usage, settled)``: `read_usage`, plus whether the transcript holds its
+    final totals. A post-session read polls until ``settled`` (or its grace
+    runs out), because a read that is not final can already be non-None.
+
+    Only copilot-events reads early: each turn's checkpoint lands before the
+    next turn runs, so a read is settled only once `session.shutdown` is
+    written (on /exit and when the window is killed). Every other parser
+    reads settled."""
+    if parser == "copilot-events":
+        return _copilot_tally(transcript_path)
+    return read_usage(parser, transcript_path), True
 
 
 def codex_home(env: Mapping[str, str]) -> Path | None:
@@ -658,15 +674,25 @@ def tally_copilot_events(transcript_path: Path) -> TokenUsage | None:
     (`mai-code-1.1-flash`). So the LAST snapshot holds the session totals, and
     a session that ends without a shutdown line still reads its last
     checkpoint. `inputTokens` includes the cache reads (its `tokenDetails`
-    split shows `input + cache_read`), so they are subtracted, as for codex and
-    gemini; whether it also includes cache writes is unverified (the capture
-    had none). reasoningTokens fold into output.
+    split shows `input + cache_read`) and, per the Copilot SDK's usage-event
+    docs, the cache writes, so both are subtracted (the 1.0.105 capture wrote
+    none). `reasoningTokens` is a subset of `outputTokens` (same docs), so it
+    is not added again.
 
     `session.start` `selectedModel` is NOT a model source: it echoes the
     `--model` flag verbatim (absent without one), even when Copilot rejects
     the model and routes to another, so it can name a model that never ran."""
+    return _copilot_tally(transcript_path)[0]
+
+
+def _copilot_tally(transcript_path: Path) -> tuple[TokenUsage | None, bool]:
+    """`tally_copilot_events`, plus whether a `session.shutdown` line was read
+    (the final totals; see `read_usage_settled`)."""
     last: dict[str, Any] | None = None
+    shut_down = False
     for entry in _jsonl_entries(transcript_path):
+        if entry.get("type") == "session.shutdown":
+            shut_down = True
         data = entry.get("data")
         if not isinstance(data, dict):
             continue
@@ -674,7 +700,7 @@ def tally_copilot_events(transcript_path: Path) -> TokenUsage | None:
         if metrics is not None:
             last = metrics
     if last is None:
-        return None
+        return None, shut_down
     # The models are the last modelMetrics' keys, in insertion order, and each
     # key's usage is its own `by_model` bucket.
     found = tuple(key for key in last if isinstance(key, str) and key)
@@ -687,17 +713,18 @@ def tally_copilot_events(transcript_path: Path) -> TokenUsage | None:
         if not isinstance(usage, dict):
             continue
         cached = _int(usage.get("cacheReadTokens"))
+        written = _int(usage.get("cacheWriteTokens"))
         each = TokenUsage(
-            input_tokens=max(0, _int(usage.get("inputTokens")) - cached),
-            output_tokens=_int(usage.get("outputTokens")) + _int(usage.get("reasoningTokens")),
+            input_tokens=max(0, _int(usage.get("inputTokens")) - cached - written),
+            output_tokens=_int(usage.get("outputTokens")),
             cache_read_tokens=cached,
-            cache_creation_tokens=_int(usage.get("cacheWriteTokens")),
+            cache_creation_tokens=written,
         )
         total.add(each)
         add_to_bucket(buckets, key if isinstance(key, str) and key else None, each)
     total.models = found
     total.by_model = settle_by_model(buckets, found)
-    return total
+    return total, shut_down
 
 
 # ------------------------------------------------- antigravity-transcript

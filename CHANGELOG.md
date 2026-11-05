@@ -168,10 +168,11 @@ breaking changes may land in a minor release.
 - Read hook stdin as bytes in `probe-adapter --probe` captures, so a UTF-8 payload with a
   non-ASCII path no longer garbles or drops on a Windows code-page locale. The capture
   also keeps each payload's raw bytes beside it.
-- Stop counting Copilot cache reads twice: Copilot's `inputTokens` already includes them,
-  so input tokens now exclude them, as for Codex and Gemini.
+- Stop counting Copilot cache reads, cache writes and reasoning tokens twice: Copilot's
+  `inputTokens` already includes the cache tokens and `outputTokens` the reasoning tokens.
 - Read Copilot usage from each turn's `session.usage_checkpoint` (Copilot 1.0.105), so a
   session that ends without a `session.shutdown` line still reports its tokens and models.
+  The post-session read still waits its grace for the shutdown totals.
 - Resume a dev attempt rejected for retry, after a manual-rollback pause or a host loss
   before the next attempt, by re-deciding or restarting it instead of reviewing and
   committing it.

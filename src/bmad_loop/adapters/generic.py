@@ -52,6 +52,7 @@ from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from ..signals import REBIND_SOURCES, SessionAttribution, SignalWatcher
 from ..tokens import read_usage as tally_usage
+from ..tokens import read_usage_settled
 from ..usagereset import UsageReset, parse_reset
 from ..verify import GitError, git_bytes, read_frontmatter, status_of
 from .base import (
@@ -4236,14 +4237,16 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         if not result.transcript_path:
             return None
         path = Path(result.transcript_path)
-        # Some CLIs flush their token totals only on shutdown (Copilot writes
-        # modelMetrics in the trailing session.shutdown line, ~1s after the
-        # turn-end hook). Poll up to the effective grace so we don't sample the
-        # transcript before the totals land. grace 0 = read once (today's path).
+        # Some CLIs write their token totals only after the turn-end hook
+        # (Copilot: each turn's usage_checkpoint, then the session.shutdown
+        # line the window kill writes). Poll up to the effective grace until
+        # the read is settled: an earlier turn's checkpoint already reads
+        # non-None, and returning it would undercount the session. At the
+        # deadline the latest read stands, settled or not. grace 0 = read once.
         deadline = time.monotonic() + self._usage_grace_s
         while True:
-            usage = tally_usage(self.profile.usage_parser, path)
-            if usage is not None or time.monotonic() >= deadline:
+            usage, settled = read_usage_settled(self.profile.usage_parser, path)
+            if (usage is not None and settled) or time.monotonic() >= deadline:
                 return usage
             time.sleep(RESULT_POLL_S)
 

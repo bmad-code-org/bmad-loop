@@ -294,7 +294,8 @@ It surfaced three corrections to the draft:
   fields (`data.modelMetrics.<model>.usage.*`), which became the `copilot-events` parser in
   `tokens.py`. A later capture on 1.0.105 (now the fixture in `tests/fixtures/copilot-1.0.105/`)
   showed two more things. Each turn's `session.usage_checkpoint` carries the same totals
-  under `data.accountingSnapshot`. And `inputTokens` includes the cache reads.
+  under `data.accountingSnapshot`. And `inputTokens` includes the cache reads (the Copilot
+  SDK docs add cache writes, and count `reasoningTokens` inside `outputTokens`).
 
 Confirm the `mkdtemp` dir is gone afterward.
 

@@ -7057,9 +7057,9 @@ def test_read_usage_polls_for_late_metrics(tmp_path, monkeypatch):
 
     def fake_tally(parser, path):
         calls.append(parser)
-        return None if len(calls) < 3 else usage
+        return (None, False) if len(calls) < 3 else (usage, True)
 
-    monkeypatch.setattr(generic, "tally_usage", fake_tally)
+    monkeypatch.setattr(generic, "read_usage_settled", fake_tally)
     monkeypatch.setattr(generic.time, "sleep", lambda *_: None)
     result = SessionResult(status="completed", transcript_path=str(tmp_path / "events.jsonl"))
     assert adapter.read_usage(result) is usage
@@ -7073,16 +7073,74 @@ def test_read_usage_single_read_when_no_grace(tmp_path, monkeypatch):
 
     def fake_tally(parser, path):
         calls.append(parser)
-        return None
+        return None, True
 
     def no_sleep(*_):
         raise AssertionError("read_usage must not sleep when the grace is 0")
 
-    monkeypatch.setattr(generic, "tally_usage", fake_tally)
+    monkeypatch.setattr(generic, "read_usage_settled", fake_tally)
     monkeypatch.setattr(generic.time, "sleep", no_sleep)
     result = SessionResult(status="completed", transcript_path=str(tmp_path / "x.jsonl"))
     assert adapter.read_usage(result) is None
     assert len(calls) == 1
+
+
+COPILOT_TWO_TURNS = (
+    Path(__file__).parent
+    / "fixtures"
+    / "copilot-1.0.105"
+    / "session-state"
+    / "c0000000-0000-4000-8000-000000000002"
+    / "events.jsonl"
+)
+
+
+def _copilot_cut_after_first_checkpoint(tmp_path):
+    """``(path, rest)``: the real two-turn capture cut right after the second
+    turn's agentStop `hook.end`, before its checkpoint (the transcript the
+    post-session read can meet), and the lines still to come."""
+    lines = COPILOT_TWO_TURNS.read_text(encoding="utf-8").splitlines(keepends=True)
+    checkpoints = [i for i, line in enumerate(lines) if '"session.usage_checkpoint"' in line]
+    cut = checkpoints[1]  # the second turn's checkpoint, which follows its hook.end
+    path = tmp_path / "events.jsonl"
+    path.write_text("".join(lines[:cut]), encoding="utf-8")
+    return path, "".join(lines[cut:])
+
+
+def test_read_usage_waits_past_an_earlier_turn_checkpoint(tmp_path, monkeypatch):
+    """An earlier turn's checkpoint already reads usage, so the grace poll
+    keeps going until `session.shutdown` lands with the session totals.
+
+    Ablation: return the first non-None read and this reads the first turn's
+    518 input / 5 output / 17408 cached."""
+    adapter = _usage_adapter(tmp_path, "copilot")
+    path, rest = _copilot_cut_after_first_checkpoint(tmp_path)
+    sleeps: list[float] = []
+
+    def land_the_rest(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(rest)
+
+    monkeypatch.setattr(generic.time, "sleep", land_the_rest)
+    usage = adapter.read_usage(SessionResult(status="completed", transcript_path=str(path)))
+    assert usage == TokenUsage(input_tokens=570, output_tokens=11, cache_read_tokens=35328)
+    assert len(sleeps) == 2
+
+
+def test_read_usage_keeps_an_unsettled_checkpoint_at_the_deadline(tmp_path, monkeypatch):
+    """No shutdown line by the deadline: the latest checkpoint stands rather
+    than None (an undercount beats untracked)."""
+    adapter = _usage_adapter(tmp_path, "copilot", usage_grace_s=0.0)
+    path, _ = _copilot_cut_after_first_checkpoint(tmp_path)
+
+    def no_sleep(*_):
+        raise AssertionError("grace 0 reads once")
+
+    monkeypatch.setattr(generic.time, "sleep", no_sleep)
+    usage = adapter.read_usage(SessionResult(status="completed", transcript_path=str(path)))
+    assert usage == TokenUsage(input_tokens=518, output_tokens=5, cache_read_tokens=17408)
 
 
 def test_read_usage_none_without_transcript(tmp_path):
