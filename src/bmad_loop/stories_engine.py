@@ -361,14 +361,18 @@ class StoriesEngine(CheckpointFlowMixin, Engine):
         fresh leg carries: ``Halt after planning.`` on a plan-halt leg (in
         lock-step with ``BMAD_LOOP_PLAN_HALT``), the planner's ``invoke_dev_with``
         verbatim and a retry's parked-work notice. None (roll back) unless the
-        id-keyed spec resolves as the attempt's file now."""
-        if not task.spec_file or self._dispatched_spec_for_attempt(task) is None:
+        id-keyed spec resolves as the attempt's file now — resolved by id, not
+        read off ``spec_file``, which a stories dispatch leaves unset until a
+        session completes: the cut-off first attempt that wrote the spec is the
+        case this keeps."""
+        spec = self._dispatched_spec_for_attempt(task)
+        if spec is None:
             return None
         env_claim = self._environment_claim_instruction()
         entry = self._entry_for(task)
         prompt = (
             f"/{self._dev_skill()} Resume the autonomous dev session on the spec at "
-            f"`{task.spec_file}`. {USAGE_RELAUNCH_RESUME}"
+            f"`{spec}`. {USAGE_RELAUNCH_RESUME}"
         )
         if self._plan_halt_leg(task, _checkpoint_flags(entry)):
             prompt += " Halt after planning."

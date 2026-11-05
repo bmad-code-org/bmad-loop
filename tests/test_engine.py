@@ -27575,6 +27575,50 @@ def test_dev_relaunch_kept_tree_leaves_the_cut_off_sessions_ledger_edit_uncommit
     assert task.baseline_commit == baseline
 
 
+def test_dev_relaunch_of_a_cut_off_repair_leaves_its_ledger_edit_uncommitted(project):
+    """DW-615: a cut-off repair's own launch already committed the harvest it
+    inherited, and the cut-off session never completed, so a ledger edit it
+    made is its own work. The kept repair relaunch leaves it dirty for the
+    relaunched repair instead of committing it as engine bookkeeping, which a
+    later non-fixable rollback's preserve step would drop. ABLATION, performed:
+    launch with `commit_engine_ledger=(inherits_tree or rolled_back) and not
+    (kept_tree and feedback is None)` and the relaunch commits the edit."""
+    write_ledger(project, {"DW-1": "open"})
+    sp, _ = _kept_tree_story(project)
+    marker = project.project / "verify-fixed.marker"
+    finish = dev_effect(project, "1-1-a", followup_review=False)
+    cut_off = _cut_off(project)
+    seen: list[str] = []
+
+    def repair_cut_off_with_ledger(session):
+        with project.deferred_work.open("a", encoding="utf-8") as f:
+            f.write("\n### DW-2: repair-authored\n\nstatus: open\n")
+        return cut_off(session)
+
+    def repair_done(session):
+        seen.append(git(project.project, "status", "--porcelain", "--", _LEDGER_REL))
+        marker.write_text("fixed\n")
+        return finish(session)
+
+    policy = dataclasses.replace(
+        _relaunch_policy(max_dev_attempts=2),
+        review=ReviewPolicy(enabled=False),
+        verify=VerifyPolicy(commands=(_file_exists_cmd("verify-fixed.marker"),)),
+    )
+    engine, _ = make_engine(
+        project, [finish, repair_cut_off_with_ledger, repair_done], policy=policy
+    )
+    task = StoryTask(story_key="1-1-a", epic=1, spec_file=str(sp))
+    engine.state.tasks[task.story_key] = task
+
+    assert engine._dev_phase(task)
+
+    assert _tree_rows(engine) == [(True, "repair-feedback")]
+    assert seen and seen[0] != ""
+    head_ledger = git(project.project, "show", f"HEAD:{_LEDGER_REL}")
+    assert "repair-authored" not in head_ledger
+
+
 def test_dev_relaunch_without_a_spec_rolls_back_and_journals_why(project):
     """DW-615: a bare-key attempt has no spec to name, so the relaunch takes the
     rollback leg as before — the cut-off files are gone when it starts — and

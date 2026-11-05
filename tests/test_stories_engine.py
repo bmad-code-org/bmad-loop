@@ -22,7 +22,7 @@ from conftest import (
 )
 
 from bmad_loop import stories, verify
-from bmad_loop.adapters.base import SessionResult
+from bmad_loop.adapters.base import USAGE_LIMIT_WAIT, SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import USAGE_RELAUNCH_RESUME, Engine
 from bmad_loop.install import (
@@ -49,6 +49,7 @@ from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
 from bmad_loop.policy import (
     EnvironmentPolicy,
     GatesPolicy,
+    LimitsPolicy,
     NotifyPolicy,
     OperatorPolicy,
     Policy,
@@ -898,7 +899,7 @@ def test_usage_relaunch_prompt_keeps_the_fresh_legs_planner_channel(project, mon
     spec = story_spec(project, "1")
     spec.parent.mkdir(parents=True, exist_ok=True)
     write_spec(spec, "draft", "abc")
-    task = StoryTask(story_key="1", epic=0, spec_file=str(spec))
+    task = StoryTask(story_key="1", epic=0)
     monkeypatch.setattr(engine, "_plan_halt_leg", lambda _task, _flags: True)
     monkeypatch.setattr(engine, "_retry_preserve_notice", lambda _task: "PARKED")
 
@@ -914,17 +915,17 @@ def test_usage_relaunch_prompt_names_the_story_spec_with_stories_clauses(project
     """DW-615: the kept-tree usage relaunch names the id-keyed spec and the
     resume sentence, followed by this mode's clauses only (the environment
     claim) — no sprint-board or park clause. None (roll back) until the spec is
-    on disk. Green ablation: dropping the override leaves this green, since the
-    base seam's board and park clauses are empty in this mode too; the override
-    keeps the stories clause set explicit, as `_stories_dev_prompt` does.
-    Ablation (performed): drop the resume sentence and this FAILS."""
+    on disk. The task carries no `spec_file`, as a stories dispatch leaves it
+    until a session completes: the spec is resolved by id. Ablation
+    (performed): drop the resume sentence, or require `task.spec_file`, and
+    this FAILS."""
     setup_stories(project, [entry("1")])
     probed, _ = make_engine(
         project, [], policy=Policy(environment=EnvironmentPolicy(probes=("exit 0",)))
     )
     clause = probed._environment_claim_instruction()
     spec = story_spec(project, "1")
-    task = StoryTask(story_key="1", epic=0, spec_file=str(spec))
+    task = StoryTask(story_key="1", epic=0)
     assert probed._usage_relaunch_prompt(task) is None
 
     spec.parent.mkdir(parents=True, exist_ok=True)
@@ -934,6 +935,51 @@ def test_usage_relaunch_prompt_names_the_story_spec_with_stories_clauses(project
         f"{USAGE_RELAUNCH_RESUME} {clause}"
     )
     assert read_frontmatter(spec)["status"] == "in-progress"
+
+
+def test_usage_relaunch_keeps_a_first_attempts_tree_and_names_the_spec_it_wrote(project):
+    """DW-615: a first stories attempt dispatched folder+id has no `spec_file`;
+    when a usage limit cuts it off after it wrote the id-keyed spec, the
+    relaunch keeps its tree and names that spec, and the story then lands.
+    ABLATION, performed: require `task.spec_file` in `_usage_relaunch_prompt`
+    and the relaunch rolls back (`no-spec`) onto a tree without the partial
+    file."""
+    setup_stories(project, [entry("1")])
+    evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
+    seen: list[bool] = []
+    finish = stories_dev_effect()
+
+    def cut_off(spec) -> SessionResult:
+        cwd = Path(spec.cwd)
+        stories_dir = cwd / spec.env["BMAD_LOOP_SPEC_FOLDER"] / "stories"
+        stories_dir.mkdir(parents=True, exist_ok=True)
+        write_spec(stories_dir / "1-slug.md", "in-progress", rev_parse_head(cwd))
+        (cwd / "partial.txt").write_text("half done\n")
+        return SessionResult(
+            status="stalled",
+            parked=True,
+            parked_evidence=evidence,
+            usage_limited=evidence,
+            usage_limit_class=USAGE_LIMIT_WAIT,
+        )
+
+    def relaunched(spec) -> SessionResult:
+        seen.append((Path(spec.cwd) / "partial.txt").exists())
+        return finish(spec)
+
+    policy = _stories_policy(limits=LimitsPolicy(usage_limit_action="relaunch", max_dev_attempts=1))
+    engine, adapter = make_engine(project, [cut_off, relaunched], policy=policy)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused
+    assert seen == [True]
+    spec = story_spec(project, "1")
+    assert adapter.sessions[1].prompt.startswith(
+        f"/bmad-dev-auto Resume the autonomous dev session on the spec at `{spec}`. "
+    )
+    rows = [e for e in engine.journal.entries() if e["kind"] == "dev-relaunch-tree"]
+    assert [(e["kept"], e["reason"]) for e in rows] == [(True, "spec-named")]
 
 
 def test_dev_prompt_repair_leg_is_explicit_spec_resume(project, tmp_path):

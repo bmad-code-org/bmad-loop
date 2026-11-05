@@ -3656,13 +3656,14 @@ class Engine:
                     # #772: a repair keeps the harvested ledger, and a retry
                     # after rollback starts on the restored one — both dirty, both
                     # the engine's. A first-pass launch has no engine ledger dirt.
-                    # Neither has a kept-tree relaunch of a primary attempt
-                    # (DW-615): its cut-off session never completed, so no harvest
-                    # ran and any ledger dirt is that session's own work. It stays
-                    # in the tree for the resumed session, never committed as
-                    # bookkeeping that a later rollback's preserve step would drop.
-                    commit_engine_ledger=(inherits_tree or rolled_back)
-                    and not (kept_tree and feedback is None),
+                    # Neither has a kept-tree relaunch (DW-615), of a primary
+                    # attempt or of a repair: its cut-off session never completed,
+                    # so no harvest ran, and a cut-off repair's own launch already
+                    # committed the harvest it inherited. Any ledger dirt is that
+                    # session's own work. It stays in the tree for the resumed
+                    # session, never committed as bookkeeping that a later
+                    # rollback's preserve step would drop.
+                    commit_engine_ledger=(inherits_tree or rolled_back) and not kept_tree,
                 )
             advance(task, Phase.DEV_VERIFY)
             outcome = None
