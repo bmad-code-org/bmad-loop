@@ -396,6 +396,9 @@ class BaseTmuxBackend(TerminalMultiplexer):
     ) -> None:
         # Window 0 is a plain shell so the session survives task windows closing,
         # named like every other window bmad-loop creates (see _INITIAL_WINDOW_NAME).
+        # It is also where server-start config output lands: task windows open
+        # detached (new_window), so window 0 stays current and a failing config
+        # `run` puts its view-mode here, not on a task pane (DW-635).
         # Geometry is pinned only when both dimensions are given (detached agent
         # sessions); the control session omits it and takes tmux's default size.
         geometry = ["-x", str(cols), "-y", str(lines)] if cols and lines else []
@@ -607,8 +610,15 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # The launched pane's id comes back in the same create, so pane_target
         # pins exactly the pane this window started with, whatever splits or
         # swaps an operator or a hook makes before it is read (#948).
+        # -d: the window opens detached, so window 0 stays current. A config
+        # `run`/`run-shell` job still in flight from the server start reports
+        # (view-mode) on the pane active when it ends; that must be the shell
+        # window, never the agent's pane, whose wake nudges and answers a pane
+        # mode would refuse (DW-635). Never select the window here for the
+        # same reason; an attach selects it (tui.launch.select_agent_window).
         window_id, _, pane_id = self._tmux(
             "new-window",
+            "-d",
             "-t",
             f"={session}:",
             "-n",
@@ -779,11 +789,13 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
         The mode a pane idles in is usually not one an operator chose: a user
         config whose ``run``/``run-shell`` fails or prints when a server starts
-        shows that output in view-mode on whichever pane is active then, and on
-        a server bmad-loop itself started that is its first task window. The
-        mode is read only on the refusal path, so a send keeps one probe; a
-        reply that is not a mode name (an unread probe, or a backend that does
-        not expand ``#{pane_mode}``) leaves the refusal unnamed."""
+        shows that output in view-mode on whichever pane is active then. On a
+        server bmad-loop itself started that is the session's ``shell`` window
+        0 (task windows open detached), and a task window only when an attach
+        selected it while the job was still running. The mode is read only on
+        the refusal path, so a send keeps one probe; a reply that is not a mode
+        name (an unread probe, or a backend that does not expand
+        ``#{pane_mode}``) leaves the refusal unnamed."""
         if self._tmux("display-message", "-p", "-t", target, "#{pane_in_mode}") != "1":
             return
         try:

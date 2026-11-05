@@ -163,6 +163,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Open agent task windows detached, so a tmux config `run` or `run-shell` that fails or
+  prints when bmad-loop starts the server lands in view-mode on the session's `shell`
+  window instead of the agent's pane, where it refused every wake nudge and TUI answer
+  until someone pressed `q`. `bmad-loop attach` and the TUI's `a` select the task window
+  before attaching.
 - Make `probe-adapter codex --probe` able to capture: Codex keys hook trust by config path,
   so a fresh temp dir always read untrusted and the probe never launched. Its hook config
   now lives in a stable per-user workspace under the state root; the untrusted report says

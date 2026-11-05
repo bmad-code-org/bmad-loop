@@ -1738,6 +1738,9 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
         "tmux",
         "-u",
         "new-window",
+        # DW-635: detached, so window 0 stays current and catches server-start
+        # config output instead of the agent's pane
+        "-d",
         "-t",
         "=s:",
         "-n",
@@ -1774,10 +1777,11 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
     command = shlex.join(["echo", "a b", "&&", "reboot"])
     TmuxMultiplexer().new_window("s", "n", tmp_path, {}, command)
 
-    assert rec.argv[:12] == [
+    assert rec.argv[:13] == [
         "tmux",
         "-u",
         "new-window",
+        "-d",
         "-t",
         "=s:",
         "-n",
@@ -1789,7 +1793,7 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
         "#{window_id} #{pane_id}",
     ]
     assert rec.argv[-5:] == ["/bin/sh", "-c", tmux_base.LAUNCH_PRELUDE, "sh", command]
-    assert len(rec.argv) == 17
+    assert len(rec.argv) == 18
 
 
 _PID_PROBE = (
@@ -1885,7 +1889,7 @@ def test_base_window_launch_stays_dialect_neutral(monkeypatch, tmp_path):
 
     _ShellWrapOnlyLeaf().new_window("s", "n", tmp_path, {"K": "v"}, "claude --x")
 
-    assert rec.argv[11:] == ["-e", "K=v", "claude --x"]
+    assert rec.argv[12:] == ["-e", "K=v", "claude --x"]
 
 
 class _FakeDialect(TmuxMultiplexer):
@@ -1953,6 +1957,7 @@ def test_dialect_leaf_new_window_routes_launch_through_hook(monkeypatch, tmp_pat
         "tmux",
         "-u",
         "new-window",
+        "-d",
         "-t",
         "=s:",
         "-n",

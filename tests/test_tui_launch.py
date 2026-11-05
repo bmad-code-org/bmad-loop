@@ -715,6 +715,7 @@ def test_attach_plan_carries_on_past_an_unavailable_backend(monkeypatch):
     monkeypatch.setattr(launch, "mux_available", lambda: False)
     monkeypatch.setattr(launch, "agent_session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
+    monkeypatch.setattr(launch, "select_agent_window", lambda s: None)
     faults: list[str] = []
     plan, unproven = launch.attach_plan(Path("/proj"), "RID", on_fault=faults.append)
     assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)
@@ -2554,6 +2555,56 @@ def test_select_ctl_window_id_argv(fake_run):
     assert fake_run.calls == [["tmux", "-u", "select-window", "-t", "@7"]]
 
 
+class _WindowListingMux:
+    """Answers list_windows with fixed rows and records select_window."""
+
+    def __init__(self, rows: list[tuple[str, ...]]):
+        self.rows = rows
+        self.listed: list[tuple[str, list[str]]] = []
+        self.selected: list[str] = []
+
+    def list_windows(self, session, fields):
+        self.listed.append((session, fields))
+        return self.rows
+
+    def select_window(self, target):
+        self.selected.append(target)
+
+
+@pytest.mark.parametrize(
+    ("rows", "selected"),
+    [
+        # shell window 0 first, the task window last (index order)
+        ([("@1",), ("@5",)], ["@5"]),
+        # only window 0: selecting it is harmless, the attach proceeds
+        ([("@1",)], ["@1"]),
+        # psmux's qualified id is replayed verbatim, never re-composed
+        ([("bmad-loop-RID:@1",), ("bmad-loop-RID:@5",)], ["bmad-loop-RID:@5"]),
+        # an unanswerable listing selects nothing (the backend warned already)
+        ([], []),
+    ],
+    ids=["task-window", "shell-only", "psmux-qualified", "listing-failed"],
+)
+def test_select_agent_window_selects_the_last_listed_window(monkeypatch, rows, selected):
+    # DW-635: task windows open detached, so an agent attach selects the
+    # newest (highest-index) window first. Ablate the select and every
+    # non-empty case reads [].
+    mux = _WindowListingMux(rows)
+    monkeypatch.setattr(launch, "get_multiplexer", lambda: mux)
+    launch.select_agent_window("bmad-loop-RID")
+    assert mux.listed == [("bmad-loop-RID", ["window_id"])]
+    assert mux.selected == selected
+
+
+def test_select_agent_window_argv(fake_run):
+    fake_run.windows = "@1\n@5"
+    launch.select_agent_window("bmad-loop-RID")
+    assert fake_run.calls == [
+        ["tmux", "-u", "list-windows", "-t", "=bmad-loop-RID", "-F", "#{window_id}"],
+        ["tmux", "-u", "select-window", "-t", "@5"],
+    ]
+
+
 def test_in_ctl_session(monkeypatch):
     # in_ctl_session is backend-honest: it trusts current_session(), which is
     # None whenever this process is not inside the selected multiplexer (the
@@ -2816,10 +2867,13 @@ def test_attach_plan_prefers_ctl_when_decision_pending(monkeypatch):
     monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
     selected: list[str] = []
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
+    agent_selected: list[str] = []
+    monkeypatch.setattr(launch, "select_agent_window", agent_selected.append)
     plan, unproven = launch.attach_plan(Path("/proj"), "RID")
     assert plan == (["tmux", "attach", "-t", "=bmad-loop-ctl"], "@2")
     assert unproven == 0
     assert selected == ["@2"]
+    assert agent_selected == []  # the ctl attach leaves the agent session alone
 
 
 def test_attach_plan_prefers_ctl_when_no_agent_session(monkeypatch):
@@ -2828,19 +2882,54 @@ def test_attach_plan_prefers_ctl_when_no_agent_session(monkeypatch):
     monkeypatch.setattr(launch, "session_exists", lambda s: False)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: None)
+    agent_selected: list[str] = []
+    monkeypatch.setattr(launch, "select_agent_window", agent_selected.append)
     plan, _unproven = launch.attach_plan(Path("/proj"), "RID")
     assert plan == (["tmux", "attach", "-t", "=bmad-loop-ctl"], "@2")
+    assert agent_selected == []
 
 
 def test_attach_plan_agent_session_when_no_decision(monkeypatch):
+    # DW-635: task windows open detached, so the agent session's current
+    # window is its shell; the plan selects the task window before handing
+    # back the attach. Ablate the call in attach_plan and `selected` is empty.
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 0))
     monkeypatch.setattr(launch, "session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
+    selected: list[str] = []
+    monkeypatch.setattr(launch, "select_agent_window", selected.append)
     assert launch.attach_plan(Path("/proj"), "RID") == (
         (["tmux", "attach", "-t", "=bmad-loop-RID"], None),
         0,
     )
+    assert selected == ["bmad-loop-RID"]
+
+
+def test_attach_plan_reports_a_raising_agent_select_and_still_attaches(monkeypatch, capsys):
+    # The select is best-effort (DW-635): a MultiplexerError from it is warned
+    # on stderr under its own name — never through on_fault, which cmd_attach
+    # prints as a control-window fault — and the plan still attaches to the
+    # agent session; with no sink it propagates, like the ctl-lookup fault.
+    # Ablation: drop the except and the first call raises instead.
+    def boom(_session):
+        raise MultiplexerError("select lost the server")
+
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 0))
+    monkeypatch.setattr(launch, "session_exists", lambda s: True)
+    monkeypatch.setattr(launch, "decision_pending", lambda rd: False)
+    monkeypatch.setattr(launch, "select_agent_window", boom)
+    faults: list[str] = []
+    plan, unproven = launch.attach_plan(Path("/proj"), "RID", on_fault=faults.append)
+    assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)
+    assert unproven == 0
+    assert faults == []
+    err = capsys.readouterr().err
+    assert "could not select the run's task window" in err
+    assert "select lost the server" in err
+    with pytest.raises(MultiplexerError):
+        launch.attach_plan(Path("/proj"), "RID")
 
 
 def test_attach_plan_none_when_nothing_to_attach(monkeypatch):
@@ -2860,6 +2949,7 @@ def test_attach_plan_carries_the_unproven_count(monkeypatch, agent_live: bool):
     monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, rid: (None, 1))
     monkeypatch.setattr(launch, "session_exists", lambda s: agent_live)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
+    monkeypatch.setattr(launch, "select_agent_window", lambda s: None)
     plan, unproven = launch.attach_plan(Path("/proj"), "RID")
     assert unproven == 1
     if agent_live:
@@ -3260,6 +3350,7 @@ def test_attach_plan_reports_a_ctl_lookup_fault_and_reaches_the_agent(monkeypatc
     monkeypatch.setattr(launch, "ctl_window_lookup", boom)
     monkeypatch.setattr(launch, "agent_session_exists", lambda s: True)
     monkeypatch.setattr(launch, "decision_pending", lambda rd: True)
+    monkeypatch.setattr(launch, "select_agent_window", lambda s: None)
     faults: list[str] = []
     plan, unproven = launch.attach_plan(Path("/proj"), "RID", on_fault=faults.append)
     assert plan == (["tmux", "attach", "-t", "=bmad-loop-RID"], None)

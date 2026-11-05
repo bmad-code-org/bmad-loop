@@ -345,7 +345,7 @@ Attaches the terminal to a run through the selected multiplexer backend.
 bmad-loop attach [--project PROJECT] [run_id]
 ```
 
-- Attaches to the run's control window when a sweep is waiting on a decision or no agent session is live; otherwise to the live agent session.
+- Attaches to the run's control window when a sweep is waiting on a decision or no agent session is live; otherwise to the live agent session, selecting the session's last (highest-index) window first, which is the task window in bmad-loop's own sessions (task windows open detached).
 - Exits 1 with `nothing to attach for run <id>` when there is no target; otherwise exits with the multiplexer client's exit code.
 
 ### `stop`

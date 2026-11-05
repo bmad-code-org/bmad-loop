@@ -802,6 +802,27 @@ def select_ctl_window_id(window_id: str) -> None:
     get_multiplexer().select_window(window_id)
 
 
+def select_agent_window(session: str) -> None:
+    """Make the agent session's task window its current window, so a plain
+    attach to the session lands on the agent rather than on the ``shell``
+    window 0. Task windows open detached (DW-635: window 0 stays current to
+    catch server-start config output), so without this an attach would land
+    on the shell.
+
+    list-windows is index-ordered, so the last row is the session's
+    highest-index window: the task window in bmad-loop's own sessions (window
+    0 is the shell). new-window reuses the lowest free index, so a window an
+    operator opened in the session can outrank it. Best-effort,
+    like both seam calls it makes: an unanswerable listing (``[]``, which the
+    backend already reports on stderr) selects nothing and the attach goes to
+    the session as before. The id is replayed verbatim, so a backend that
+    qualifies it (psmux's ``session:@N``) is handed back its own form."""
+    mux = get_multiplexer()
+    rows = mux.list_windows(session, ["window_id"])
+    if rows and rows[-1] and rows[-1][0]:
+        mux.select_window(rows[-1][0])
+
+
 # Per-window tmux user option recording what an interactive attach should do
 # with the client once the window's command exits (consumed by the multiplexer's
 # parked-window return trailer; see start_detached and the tmux backend). Set by
@@ -979,7 +1000,11 @@ def attach_plan(
     A ctl lookup that raises (its listing could not be read) is handed to
     `on_fault` and the plan carries on as if there were no ctl window: the
     agent session may still be reachable, and an attach must not be refused
-    for a window it could not check. With no `on_fault` the raise propagates."""
+    for a window it could not check. A raising select of the agent's task window
+    (select_agent_window) does not block the attach either: with `on_fault`
+    given it is warned on stderr under its own name — `on_fault` carries ctl
+    lookup faults only, which a caller reports as such — and the attach lands on
+    the session's current window. With no `on_fault` either raise propagates."""
     session = runs.session_name(run_id)
     try:
         win_id, unproven = ctl_window_lookup(project, run_id)
@@ -995,6 +1020,19 @@ def attach_plan(
         select_ctl_window_id(win_id)
         return (runs.attach_target_argv(ctl_target(project)), win_id), unproven
     if agent_live:
+        # A select that raises must not block the attach: the client lands on
+        # the current window. Warned under its own name, not via on_fault,
+        # which callers report as a control-window fault.
+        try:
+            select_agent_window(session)
+        except MultiplexerError as e:
+            if on_fault is None:
+                raise
+            print(
+                f"warning: could not select the run's task window, attaching to {session} "
+                f"as is: {e}",
+                file=sys.stderr,
+            )
         return (runs.attach_target_argv(runs.session_target(run_id)), None), unproven
     return None, unproven
 
