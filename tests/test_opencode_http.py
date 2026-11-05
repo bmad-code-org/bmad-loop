@@ -5490,6 +5490,7 @@ def test_descendant_wait_never_probes_without_grace_or_on_v1(tmp_path):
     v1 = _v2_sess(_V2_SID)
     v1.protocol = V1Protocol()
     v1.client = _V2RouteClient()
+    v1.process = _Proc()  # type: ignore[assignment]
     assert _await(adapter, v1) is True
     assert v1.client.gets == []
     assert _lifecycle_lines(adapter, "t-d") == []
@@ -5576,6 +5577,48 @@ def test_descendant_wait_rechecks_cuts_after_an_empty_probe(tmp_path, monkeypatc
     started, cut = _lifecycle_lines(adapter, "t-d")
     assert started["event"] == "descendant-wait-started"
     assert cut["event"] == "descendant-wait-cut" and cut["reason"] == reason
+
+
+@pytest.mark.parametrize("reason", ["stop", "timeout", "budget"])
+def test_descendant_wait_rechecks_cuts_after_an_empty_first_probe(tmp_path, monkeypatch, reason):
+    """The first probe gets the same recheck: a stop, the session deadline or
+    a budget grace that expires while it runs cuts the wait even when it reads
+    "none active". The cut is the only line journaled; no wait started.
+
+    ABLATION: return True on the first empty answer without `cut_reason()`
+    and the wait reads as "nothing active" (True, nothing journaled)."""
+    adapter = make_adapter(tmp_path)
+    (adapter.tasks_dir / "t-d").mkdir(parents=True)
+    adapter._stall_grace_s = 30.0
+    adapter.descendant_poll_s = 0.01
+    stopped = {"now": False}
+
+    class _SlowEmptyFirst:
+        def active_descendants(self, _client, _session_id):
+            time.sleep(0.3)  # the cutoff lands during this probe
+            stopped["now"] = True
+            return [], None
+
+    sess = _v2_sess(_V2_SID)
+    sess.protocol = _SlowEmptyFirst()  # type: ignore[assignment]
+    sess.process = _Proc()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        adapter, "_hard_stop_requested", lambda: reason == "stop" and stopped["now"]
+    )
+
+    assert (
+        _await(
+            adapter,
+            sess,
+            deadline_in=0.2 if reason == "timeout" else 60.0,
+            budget_in=0.2 if reason == "budget" else None,
+        )
+        is False
+    )
+
+    (cut,) = _lifecycle_lines(adapter, "t-d")
+    assert cut["event"] == "descendant-wait-cut"
+    assert cut["reason"] == reason and cut["sessions"] == []
 
 
 def test_descendant_wait_tick_settling_the_session_cuts_it_as_budget(tmp_path):

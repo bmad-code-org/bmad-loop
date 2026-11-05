@@ -1816,9 +1816,11 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         (``budget_due``: an armed enforce-mode budget grace has expired, or
         ``tick`` settled the session) or ``server-exited`` — and the wait
         loop's own arms then take the verdict (aborted / timeout /
-        over_budget / crashed). The cut conditions are checked again after a
-        probe that reads "none active", so a stop, deadline or budget expiry
-        that lands during the sleep or the probe still wins.
+        over_budget / crashed). The cut conditions are checked again after
+        every probe that reads "none active", the first one included, so a
+        stop, deadline or budget expiry that lands during a sleep or a probe
+        still wins; a cut on the first probe journals only
+        ``descendant-wait-cut`` (``sessions: []``).
 
         A probe fault is never "none active": the first fault of each streak
         is crumbed as ``descendant-probe-failed`` (``error``) and the wait runs
@@ -1837,20 +1839,8 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         started = time.monotonic()
         wait_end = min(started + grace, deadline)
         wall_end = min(time.time() + grace, wall_deadline)
-        active, fault = sess.protocol.active_descendants(sess.client, sess.session_id)
-        if active is not None and not active:
-            return True
         task_id = handle.task_id
-        failures = 0
-        known: list[str] | None = active
-        last_fault: str | None = fault
-        started_fields: dict[str, Any] = {"sessions": active, "grace_s": grace}
-        if fault is not None:
-            started_fields["error"] = fault
-        self._note_lifecycle(task_id, "descendant-wait-started", **started_fields)
-        if fault is not None:
-            failures = 1
-            self._note_lifecycle(task_id, "descendant-probe-failed", error=fault)
+        known: list[str] | None = None
 
         def waited() -> float:
             return round(time.monotonic() - started, 3)
@@ -1871,6 +1861,23 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 task_id, "descendant-wait-cut", reason=reason, sessions=known, waited_s=waited()
             )
             return False
+
+        active, fault = sess.protocol.active_descendants(sess.client, sess.session_id)
+        known = active
+        if active is not None and not active:
+            # The first probe can outlast a stop, the deadline or the budget
+            # grace too: recheck before the empty answer reads as a turn end.
+            reason = cut_reason()
+            return True if reason is None else cut(reason)
+        failures = 0
+        last_fault: str | None = fault
+        started_fields: dict[str, Any] = {"sessions": active, "grace_s": grace}
+        if fault is not None:
+            started_fields["error"] = fault
+        self._note_lifecycle(task_id, "descendant-wait-started", **started_fields)
+        if fault is not None:
+            failures = 1
+            self._note_lifecycle(task_id, "descendant-probe-failed", error=fault)
 
         while True:
             reason = cut_reason()
