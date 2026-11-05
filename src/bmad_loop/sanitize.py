@@ -114,7 +114,9 @@ _LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._+-]{6,}")
 # That is quadratic on a base64 blob or a minified line, and scrub_text,
 # _truncate_line and assert_no_leak all scan such lines. A longer scheme still
 # matches, starting later; scrub_text keeps the scheme group either way.
-_URL_CRED_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]{0,31}://)(?P<user>[^/?#\s:]*):[^/?#\s]+@")
+_URL_CRED_RE = re.compile(
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]{0,31}://)(?P<user>[^/?#\s:]*):[^/?#\s]+@"
+)
 # The guard constructs whose match can straddle a truncation point AND whose
 # leading fragment would still be sensitive once the rest is clipped away.
 # `scrub_text`'s cut retracts out of these -- see `_truncate_line`. This sits
