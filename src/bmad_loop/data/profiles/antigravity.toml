@@ -23,7 +23,8 @@
 # whose id has that marker in a sibling folder (DW-548). The same markers list
 # the parent's children for the idle notice: while a foreground subagent runs agy
 # writes nothing to brain/<parentId>/, only to brain/<childId>/, so each listed
-# child's *.jsonl writes count as the parent's activity.
+# child's *.jsonl writes count as the parent's activity — recursively, as a child
+# blocked on its own subagent writes only to the grandchild's folder.
 #
 # usage_parser = "antigravity-transcript" (verified against agy 1.4.9). agy's
 # transcript (~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/

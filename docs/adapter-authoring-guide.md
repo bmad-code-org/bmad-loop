@@ -355,9 +355,10 @@ contain its placeholder (here `{session_id}`), stay relative with no `..`, and i
 hookless profiles.
 
 The idle notice also walks each child the parent's folder lists (`<store root>/<childId>/`, its
-`*.jsonl` files only, stat-only) as it walks `subagent_transcript_dir`; when the parent's folder
-cannot be judged it watches no children, and a listing fault joins `subagent-scan-failed`. A
-listed child's writes also re-arm the dev stall grace, as pane growth does.
+`*.jsonl` files only, stat-only), and each child those children list in turn, as it walks
+`subagent_transcript_dir`; when the parent's folder cannot be judged it watches no children, and
+a listing fault joins `subagent-scan-failed`. A listed descendant's writes also re-arm the dev
+stall grace, as pane growth does.
 
 ### `HookSpec` (the `[hooks]` table)
 

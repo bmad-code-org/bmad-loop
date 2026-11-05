@@ -533,6 +533,26 @@ def _spawned_children(template: str, conversation: Path) -> list[Path]:
     return children
 
 
+def _spawned_descendants(template: str, conversation: Path) -> list[Path]:
+    """Every conversation folder below ``conversation`` in its spawn-marker
+    tree: the children :func:`_spawned_children` lists, then theirs,
+    breadth-first, each folder at most once (``conversation`` itself never), so
+    a marker cycle ends. Stat-only, as :func:`_spawned_children` is; a listing
+    fault on any folder propagates, never a partial tree."""
+    found: list[Path] = []
+    seen = {conversation.name}
+    queue = [conversation]
+    while queue:
+        folder = queue.pop(0)
+        for child in _spawned_children(template, folder):
+            if child.name in seen:
+                continue
+            seen.add(child.name)
+            found.append(child)
+            queue.append(child)
+    return found
+
+
 def _spawn_marker_verdict(
     template: str,
     session_id: str | None,
@@ -2611,9 +2631,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     # productive turn building a diff, a streaming subagent) is
                     # working, not stalled. Re-arm on any pane growth so only
                     # genuine silence for the full grace trips the stall below.
-                    # A listed child's writes re-arm it too (DW-607): an agy
-                    # parent blocked on a foreground child writes nothing to
-                    # its pane or transcript while the child works. The child
+                    # A listed descendant's writes re-arm it too (DW-607): an
+                    # agy parent blocked on a foreground child writes nothing
+                    # to its pane or transcript while the child works. The child
                     # key is the one the idle sampler keeps (`idle.sub_key`); a
                     # key that first appears, or one sampled on another path or
                     # judged-children state (the sampler rebaselined it), is a
@@ -3285,10 +3305,12 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         there is nothing to watch or a walk raised.
 
         The roots are the declared tree (`_subagent_root`) plus, when the
-        profile sets `subagent_spawn_marker`, every child conversation folder the
-        parent's own folder lists through it (`_spawned_children`, DW-548): agy
-        writes nothing to the parent while a foreground subagent runs, only to
-        the child's sibling folder. The parent's folder is the transcript's
+        profile sets `subagent_spawn_marker`, every descendant conversation
+        folder the parent's own folder lists through it, recursively
+        (`_spawned_descendants`, DW-548): agy writes nothing to the parent while
+        a foreground subagent runs, only to the child's sibling folder — and a
+        child blocked on its own foreground subagent writes only to the
+        grandchild's. The parent's folder is the transcript's
         ancestor named by `session_id` (`_conversation_folder`); when it cannot
         be judged, no children are watched this tick — never guessed. A child
         folder is walked with the same `*.jsonl` rule as the tree, so its
@@ -3316,7 +3338,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         try:
             if marker and conversation is not None:
                 where = conversation
-                roots.extend(_spawned_children(marker, conversation))
+                roots.extend(_spawned_descendants(marker, conversation))
             keys: list[tuple[int, int, int]] = []
             for where in roots:
                 keys.append(_subagent_tree_key(where))

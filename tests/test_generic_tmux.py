@@ -11850,6 +11850,62 @@ def test_listed_child_activity_keeps_the_dev_stall_grace_open(tmp_path, monkeypa
     assert not [c for c in crumbs if c.startswith("subagent-scan-")]
 
 
+def _agy_grandchild(tmp_path, child="agy-child", grandchild="agy-grandchild"):
+    """A conversation ``child`` spawned: its folder beside the others, listed
+    by the marker ``child`` wrote. Returns its transcript path."""
+    brain = tmp_path / "brain"
+    logs = brain / grandchild / ".system_generated" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "transcript_full.jsonl").write_text("")
+    marker = brain / child / _AGY_MARKER.format(session_id=grandchild)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}")
+    return logs / "transcript_full.jsonl"
+
+
+def test_spawned_descendants_walks_the_marker_tree_once_per_folder(tmp_path):
+    """Children, then theirs; a marker cycle back to the parent or to a folder
+    already listed is not walked again."""
+    _agy_brain(tmp_path)
+    _agy_grandchild(tmp_path)
+    brain = tmp_path / "brain"
+    for back in ("agy-parent", "agy-child"):
+        (brain / "agy-grandchild" / _AGY_MARKER.format(session_id=back)).parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        (brain / "agy-grandchild" / _AGY_MARKER.format(session_id=back)).write_text("{}")
+    found = generic._spawned_descendants(_AGY_MARKER, brain / "agy-parent")
+    assert found == [brain / "agy-child", brain / "agy-grandchild"]
+
+
+def test_grandchild_activity_keeps_the_dev_stall_grace_open(tmp_path, monkeypatch):
+    """A silent agy parent waits on its child, which waits on its own
+    foreground subagent: only the grandchild writes. Its writes re-arm the
+    grace as a child's do (same timeline as the child test: growth on calls
+    2-5, stall on call 8).
+
+    Ablation, performed: walk only the parent's own markers
+    (`_spawned_children` in `_sample_subagent_tree`) and this fails — the
+    launch-armed grace stalls on call 3."""
+    grandchild_t = _agy_grandchild(tmp_path)
+
+    def grow(call_n, child_t):
+        if 2 <= call_n <= 5:
+            _grow(grandchild_t, b'{"step_index":1}\n')
+
+    adapter, _, _ = _agy_stall_run(
+        tmp_path,
+        monkeypatch,
+        lambda parent_t: [_agy_stop("agy-parent", parent_t, False)],
+        grow,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 8
+    assert adapter.mux.sent == []
+
+
 def test_a_child_key_first_seen_does_not_rearm_the_dev_stall(tmp_path, monkeypatch):
     """DW-607: the child key first appearing (None -> a value: the parent's
     folder becomes judgeable once a Stop names its id) is a baseline, not
@@ -11988,6 +12044,45 @@ def test_claude_subagent_tree_activity_keeps_the_dev_stall_grace_open(tmp_path, 
     assert result.status == "stalled"
     assert adapter.watcher.calls == 8
     assert adapter.mux.sent == []
+
+
+def test_a_repoint_to_another_subagent_tree_does_not_rearm_the_dev_stall(tmp_path, monkeypatch):
+    """The stall re-arm records the old tree's child key when pane growth
+    re-arms the grace on call 3 (t=1060, due 1120); a hook event then re-points
+    the transcript, on call 4, to one whose static subagent tree walks cleanly
+    to a different key. That key was sampled on another path, so the change is
+    the sampler's rebaseline, not activity: the grace stalls on call 5.
+
+    Ablation, performed: drop the `sub_path == idle.path` check from
+    `sub_moved` and this fails — the repoint re-arms the grace, stalling on
+    call 7."""
+    adapter, _, log, transcript, clock, _ = _idle_adapter(
+        tmp_path, monkeypatch, grace=60.0, profile_name="claude"
+    )
+    _subagent_file(transcript, "agent-a.jsonl")
+    other = tmp_path / "other.jsonl"
+    other.write_bytes(b'{"type":"user","other":true}\n')
+    _subagent_file(other, "agent-x.jsonl", b'{"type":"user","a":"longer payload"}\n')
+
+    def script(call_n):
+        if call_n >= 2:
+            clock["t"] += generic.HEARTBEAT_INTERVAL_S
+        if call_n == 3:
+            _grow(log, b"repaint\n")
+
+    adapter.watcher = _ScriptedWatcher(
+        [
+            _session_start("3-1-dev-1", str(transcript)),
+            None,
+            None,
+            _session_start("3-1-dev-1", str(other)),
+        ],
+        on_call=script,
+    )
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert result.status == "stalled"
+    assert adapter.watcher.calls == 5
 
 
 def test_children_coming_into_view_rebaseline_the_subagent_key(tmp_path, monkeypatch):

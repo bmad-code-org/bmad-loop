@@ -48,8 +48,11 @@ override), or use `shared` mode.
 
 The contract is simple: **a plugin's `pre_ready_gate` readiness probe (Unity's:
 `unity_ready.py`) passes when a session can safely start and vetoes otherwise**
-(which defers the unit; Unity's hook vetoes when its script exits non-zero). Within
-that, a few things matter:
+(which defers the unit; Unity's hook vetoes when its script exits non-zero). The
+bundled `coplaydev` probe falls short of that: it passes once the MCP HTTP server
+accepts a connection, open Editor or not. Use `ivanmurzak`, or your own stricter
+probe, where a session must not start before the Editor is up. Within that, a few
+things matter:
 
 - **Respect the budget.** Poll until `BMAD_LOOP_ENGINE_READY_TIMEOUT` seconds elapse,
   then fail. The CLI's own default timeout is often far shorter (IvanMurzak's

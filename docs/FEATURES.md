@@ -462,7 +462,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A story's spend is checked at every session boundary. Crossing `max_tokens_per_story` warns once and journals `token-budget-exceeded`; the story keeps running.
   - With `session_budget_mode = "enforce"`, a session over `max_tokens_per_session` gets a wrap-up nudge, then ends `over_budget` once `session_budget_grace_s` has passed.
   - In `warn` mode (the default) the crossing is flagged once and the session finishes normally. In `off` mode usage is never sampled.
-  - The session guard stays inert for profiles that cannot report usage mid-session.
+  - The session guard stays inert for profiles that cannot report usage mid-session. On antigravity it starts at the first `Stop`, which is what reports the transcript path.
 - **Config:** `[limits] max_tokens_per_story`, `[limits] cache_read_weight`, `[limits] session_budget_mode`, `[limits] max_tokens_per_session`, `[limits] session_budget_grace_s`
 - **Tested by:** `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_opencode_http.py`, `tests/test_policy.py`
 - **Docs:** [[limits] settings](reference/configuration.md#limits), [CLI: status](reference/cli.md#status)
