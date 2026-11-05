@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from conftest import install_bmad_config, windows_relay_builder, write_script_launcher
 
-from bmad_loop import cli, codex_trust, probe
+from bmad_loop import cli, codex_trust, probe, runs
 from bmad_loop.adapters.profile import ProfileError, get_profile
 from bmad_loop.install import _hook_command, merge_hooks
 
@@ -491,7 +491,7 @@ def test_scan_and_live_probe_refuse_trust_at_their_own_directories(tmp_path, mon
             pass
 
         def start(self, *_args):
-            pytest.fail("untrusted temporary hook config must stop before launch")
+            pytest.fail("untrusted probe hook config must stop before launch")
 
         def kill(self):
             pass
@@ -503,11 +503,12 @@ def test_scan_and_live_probe_refuse_trust_at_their_own_directories(tmp_path, mon
         cli="codex", profile=profile, project=tmp_path, hints=probe.Hints(binary="chosen")
     )
     assert live.hook_trust == "untrusted"
-    assert calls[-1][0] != tmp_path and calls[-1][1:] == ("chosen", probe.PROBE_HOOK_NAME)
-    assert "temporary probe workspace" in live.warnings[0]
+    assert calls[-1][0] == probe.probe_workspace(profile)
+    assert calls[-1][1:] == ("chosen", probe.PROBE_HOOK_NAME)
+    assert "stable probe workspace" in live.warnings[0]
 
 
-def test_trusted_live_probe_checks_temp_config_then_starts_zero_token_launcher(
+def test_trusted_live_probe_checks_stable_config_then_starts_zero_token_launcher(
     tmp_path, monkeypatch
 ):
     profile = get_profile("codex")
@@ -553,10 +554,207 @@ def test_trusted_live_probe_checks_temp_config_then_starts_zero_token_launcher(
         cli="codex", profile=profile, project=tmp_path, hints=probe.Hints(binary="chosen")
     )
     assert finding.hook_trust == "trusted"
-    assert events[0][0] == "trust" and events[0][1] != tmp_path
+    assert events[0][0] == "trust" and events[0][1] == probe.probe_workspace(profile)
     assert events[0][2:] == ("chosen", probe.PROBE_HOOK_NAME)
     assert events[1] == ("start", events[0][1], "/bin/true")
     assert events[-1] == ("kill",)
+
+
+class _LiveProbeHarness:
+    """Fakes the mux, launcher, watcher and mkdtemp around ``probe.probe`` so a
+    live probe runs with zero tokens and records where it queried trust, where
+    it launched, and which ephemeral raw dirs it made."""
+
+    def __init__(self, monkeypatch, trust_status: str = "untrusted"):
+        self.trust_paths: list[Path] = []
+        self.starts: list[Path] = []
+        self.raw_dirs: list[Path] = []
+        harness = self
+        real_mkdtemp = probe.tempfile.mkdtemp
+
+        def mkdtemp(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            harness.raw_dirs.append(Path(path))
+            return path
+
+        def trust(path, _profile, *, binary=None, marker=None):
+            harness.trust_paths.append(path)
+            return codex_trust.TrustResult(trust_status, f"hook trust {trust_status}")
+
+        class Mux:
+            def available(self):
+                return True
+
+        class Launcher:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self, _argv, _env, cwd, _log_file):
+                harness.starts.append(Path(cwd))
+                return "fake-window"
+
+            def kill(self):
+                pass
+
+        class Watcher:
+            def __init__(self, _capture_dir):
+                pass
+
+            def wait_for(self, *_args, **_kwargs):
+                return object()  # scripted Stop; no model turn
+
+        monkeypatch.setattr(probe.tempfile, "mkdtemp", mkdtemp)
+        monkeypatch.setattr(codex_trust, "project_hook_trust", trust)
+        monkeypatch.setattr(probe, "get_multiplexer", Mux)
+        monkeypatch.setattr(probe, "_ProbeLauncher", Launcher)
+        monkeypatch.setattr(probe, "SignalWatcher", Watcher)
+        monkeypatch.setattr(probe.shutil, "which", lambda _binary, **_kwargs: "/bin/true")
+        monkeypatch.setattr(
+            probe, "run_version_help", lambda binary: probe.FlagFinding(binary, True)
+        )
+        monkeypatch.setattr(probe, "discover_transcript", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(probe.time, "sleep", lambda _seconds: None)
+
+    def run(self, project: Path, cli_name: str = "codex") -> probe.ProfileFinding:
+        return probe.probe(
+            cli=cli_name,
+            profile=get_profile(cli_name),
+            project=project,
+            hints=probe.Hints(binary="chosen"),
+        )
+
+
+def test_untrusted_live_probe_names_stable_workspace_and_keeps_only_hook_and_config(
+    tmp_path, monkeypatch
+):
+    harness = _LiveProbeHarness(monkeypatch)
+    profile = get_profile("codex")
+    workspace = probe.probe_workspace(profile)
+    assert workspace.parent == runs.state_root() / probe.PROBE_WORKSPACES_DIR
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "untrusted" and harness.starts == []
+    assert harness.trust_paths == [workspace]
+    label = probe._workspace_label(workspace)
+    step = finding.next_steps[-1]
+    assert f"`{label}`" in step
+    assert "Open Codex once in the stable probe workspace" in step
+    assert "folder trust and hooks trust prompts" in step
+    assert "bmad-loop probe-adapter codex --probe" in step
+    assert sorted(p.relative_to(workspace).as_posix() for p in workspace.rglob("*")) == sorted(
+        [
+            probe.PROBE_HOOK_NAME,
+            Path(profile.hooks.config_path).parent.as_posix(),
+            Path(profile.hooks.config_path).as_posix(),
+        ]
+    )
+    assert len(harness.raw_dirs) == 1 and not harness.raw_dirs[0].exists()
+    raw = harness.raw_dirs[0]
+    assert raw != workspace and workspace not in raw.parents and raw not in workspace.parents
+
+    # the rendered report carries the workspace label past the egress guard
+    report = probe.render_markdown(finding)
+    assert label in report
+
+
+def test_unverifiable_live_probe_gets_the_diagnostic_step_not_the_trust_step(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch, trust_status="unverifiable")
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "unverifiable" and harness.starts == []
+    assert finding.next_steps[-1] == (
+        "Resolve the Codex hook trust diagnostic and re-run "
+        "`bmad-loop probe-adapter codex --probe`"
+    )
+    assert not any("Open Codex once" in step for step in finding.next_steps)
+
+
+def test_live_probe_workspace_reset_drops_strays_and_keeps_config_bytes(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch)
+    profile = get_profile("codex")
+    workspace = probe.probe_workspace(profile)
+    config = workspace / profile.hooks.config_path
+
+    harness.run(tmp_path)
+    first = config.read_bytes()
+    stray = workspace / "stray.txt"
+    stray.write_text("left behind", encoding="utf-8")
+
+    harness.run(tmp_path)
+
+    assert not stray.exists()
+    assert config.read_bytes() == first
+    assert harness.trust_paths == [workspace, workspace]
+
+
+def test_trusted_live_probe_launches_in_stable_workspace_and_removes_raw_dir(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch, trust_status="trusted")
+    workspace = probe.probe_workspace(get_profile("codex"))
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "trusted"
+    assert harness.starts == [workspace]
+    assert len(harness.raw_dirs) == 1 and not harness.raw_dirs[0].exists()
+    assert (workspace / probe.PROBE_HOOK_NAME).is_file()
+
+
+@pytest.mark.parametrize("fault", ["state-root", "reset"])
+def test_live_probe_workspace_fault_is_unverifiable_without_launch(tmp_path, monkeypatch, fault):
+    harness = _LiveProbeHarness(monkeypatch, trust_status="trusted")
+    if fault == "state-root":
+
+        def no_root():
+            raise runs.StateRootError("cannot locate a state directory")
+
+        monkeypatch.setattr(probe.runs, "state_root", no_root)
+    else:
+        # a plain file where the workspace dir belongs: rmtree refuses it
+        workspace = probe.probe_workspace(get_profile("codex"))
+        workspace.parent.mkdir(parents=True)
+        workspace.write_text("not a dir", encoding="utf-8")
+
+    finding = harness.run(tmp_path)
+
+    assert finding.hook_trust == "unverifiable"
+    assert harness.trust_paths == [] and harness.starts == []
+    assert "could not prepare the stable probe workspace" in finding.warnings[-1]
+    step = finding.next_steps[-1]
+    assert "re-run `bmad-loop probe-adapter codex --probe`" in step
+    if fault == "state-root":
+        assert "BMAD_LOOP_STATE_DIR" in step and "Close any Codex session" not in step
+    else:
+        assert "Close any Codex session running in the probe workspace" in step
+        assert "check its parent directory is writable" in step
+        assert "BMAD_LOOP_STATE_DIR" not in step
+        assert f"`{probe._workspace_label(probe.probe_workspace(get_profile('codex')))}`" in step
+    assert len(harness.raw_dirs) == 1 and not harness.raw_dirs[0].exists()
+    probe.render_markdown(finding)  # passes the egress guard
+
+
+def test_non_codex_live_probe_keeps_the_ephemeral_workspace(tmp_path, monkeypatch):
+    harness = _LiveProbeHarness(monkeypatch)
+
+    finding = harness.run(tmp_path, cli_name="claude")
+
+    assert finding.hook_trust is None
+    assert harness.trust_paths == []
+    assert harness.starts == harness.raw_dirs and len(harness.raw_dirs) == 1
+    assert not harness.raw_dirs[0].exists()
+    assert not (runs.state_root() / probe.PROBE_WORKSPACES_DIR).exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("codex", "codex"), ("my codex/2", "my_codex_2"), ("..", "profile"), ("", "profile")],
+)
+def test_probe_workspace_name_is_path_safe(name, expected):
+    profile = replace(get_profile("codex"), name=name)
+    assert probe.probe_workspace(profile) == (
+        runs.state_root() / probe.PROBE_WORKSPACES_DIR / expected
+    )
 
 
 def test_probe_json_exits_nonzero_and_names_hook_trust(tmp_path, monkeypatch, capsys):

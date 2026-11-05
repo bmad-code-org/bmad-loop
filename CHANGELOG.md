@@ -162,6 +162,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Make `probe-adapter codex --probe` able to capture: Codex keys hook trust by config path,
+  so a fresh temp dir always read untrusted and the probe never launched. Its hook config
+  now lives in a stable per-user workspace under the state root; the untrusted report says
+  to open Codex there once and accept the trust prompts. Captures stay in the temp dir.
 - Keep email redaction and leak detection in `diagnose` and `probe-adapter` linear on a
   long line: an 80k-character alphanumeric run with no `@` took seconds to scan, and now
   takes milliseconds. What counts as an email is unchanged.
