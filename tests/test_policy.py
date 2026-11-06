@@ -1587,6 +1587,20 @@ def test_verify_env_fault_rc_bounds(bad, match):
         policy.loads(f"[verify]\nenv_fault_rc = {bad}\n")
 
 
+def test_verify_reuse_unchanged_defaults_off_and_parses():
+    """Opt-in (#1002): off unless the operator sets it, and the template agrees."""
+    assert policy.loads("").verify.reuse_unchanged is False
+    assert policy.loads("[verify]\nreuse_unchanged = true\n").verify.reuse_unchanged is True
+    assert policy.loads(policy.POLICY_TEMPLATE).verify.reuse_unchanged is False
+
+
+@pytest.mark.parametrize("bad", ['"true"', "1", "0"])
+def test_verify_reuse_unchanged_rejects_non_bool(bad):
+    """Ablation: parse the key with a bare `bool(...)`; every row is accepted."""
+    with pytest.raises(policy.PolicyError, match=r"verify\.reuse_unchanged must be a boolean"):
+        policy.loads(f"[verify]\nreuse_unchanged = {bad}\n")
+
+
 def test_scm_invalid_values(tmp_path):
     p = tmp_path / "policy.toml"
     p.write_text('[scm]\nisolation = "vm"\n')
