@@ -167,7 +167,8 @@ breaking changes may land in a minor release.
   prints when bmad-loop starts the server lands in view-mode on the session's `shell`
   window instead of the agent's pane, where it refused every wake nudge and TUI answer
   until someone pressed `q`. `bmad-loop attach` and the TUI's `a` select the task window
-  before attaching.
+  before attaching, and a client already attached to the session still follows each new
+  task window.
 - Make `probe-adapter codex --probe` able to capture: Codex keys hook trust by config path,
   so a fresh temp dir always read untrusted and the probe never launched. Its hook config
   now lives in a stable per-user workspace under the state root; the untrusted report says

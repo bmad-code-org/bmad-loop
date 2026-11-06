@@ -748,7 +748,7 @@ class BmadLoopApp(App[None]):
             # window is the shell; select the agent's before attaching. A
             # failed select is toasted and the attach goes ahead regardless.
             try:
-                launch.select_agent_window(session)
+                launch.select_agent_window(self.project, run_id)
             except MultiplexerError as e:
                 self.notify(
                     f"could not select the run's task window, attaching anyway: {e}",

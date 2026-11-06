@@ -1765,6 +1765,49 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    ("clients", "selected"),
+    [
+        (subprocess.CompletedProcess([], 0, stdout="1\n", stderr=""), True),
+        (subprocess.CompletedProcess([], 0, stdout="2\n", stderr=""), True),
+        (subprocess.CompletedProcess([], 0, stdout="0\n", stderr=""), False),
+        # the count cannot be read: the window stays detached
+        (subprocess.CompletedProcess([], 1, stdout="", stderr="no server"), False),
+        (subprocess.CompletedProcess([], 0, stdout="\n", stderr=""), False),
+        (OSError("tmux vanished"), False),
+    ],
+    ids=["one-client", "two-clients", "unwatched", "probe-rc", "probe-empty", "probe-raised"],
+)
+def test_new_window_follows_a_watched_session(monkeypatch, tmp_path, capsys, clients, selected):
+    """Task windows open detached (DW-635), but a client already attached to
+    the session follows each new one, as a non-detached new-window had it:
+    the count is read before the create and the window is selected after.
+    Ablate the select and the watched cases list no select-window; ablate the
+    count gate and the unwatched ones list one."""
+    seen: list[list[str]] = []
+
+    def fake(argv, **_k):
+        seen.append(argv)
+        if argv[2] == "display-message":
+            if isinstance(clients, BaseException):
+                raise clients
+            return clients
+        out = "@7 %9\n" if argv[2] == "new-window" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    assert TmuxMultiplexer().new_window("s", "n", tmp_path, {}, "cmd") == "@7"
+    verbs = [argv[2] for argv in seen]
+    assert seen[0][2:] == ["display-message", "-p", "-t", "=s:", "#{session_attached}"]
+    if selected:
+        assert verbs == ["display-message", "new-window", "select-window"]
+        assert seen[-1][2:] == ["select-window", "-t", "=s:@7"]
+    else:
+        assert verbs == ["display-message", "new-window"]
+    err = capsys.readouterr().err
+    assert ("tmux vanished" in err) is isinstance(clients, BaseException)
+
+
 def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
     # The contract says `command` is a shlex-joined argv, not a shell line.
     # The POSIX leaf must not parse or re-quote it: whatever the caller built

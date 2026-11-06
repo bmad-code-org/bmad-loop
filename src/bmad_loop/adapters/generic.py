@@ -1490,7 +1490,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         pinned_session_id = str(uuid.uuid4()) if self.profile.session_id_flag else None
         window_id = self.mux.new_window(
             self.session_name,
-            spec.task_id[-40:],
+            runs.task_window_name(spec.task_id),
             spec.cwd,
             # Same merge as interactive_env, same pin chokepoint: the profile's
             # [env] table must not move the window off this process's state root.

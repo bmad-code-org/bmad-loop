@@ -33,6 +33,7 @@ from ..adapters.multiplexer import (
     parked_screen,
 )
 from ..journal import Journal
+from ..parked import open_session_start_indexed
 from ..platform_util import (
     DIR_FD_ANCHORED_WRITES,
     atomic_write_text,
@@ -802,25 +803,38 @@ def select_ctl_window_id(window_id: str) -> None:
     get_multiplexer().select_window(window_id)
 
 
-def select_agent_window(session: str) -> None:
-    """Make the agent session's task window its current window, so a plain
-    attach to the session lands on the agent rather than on the ``shell``
+def select_agent_window(project: Path, run_id: str) -> None:
+    """Make the run's task window its agent session's current window, so a
+    plain attach to the session lands on the agent rather than on the ``shell``
     window 0. Task windows open detached (DW-635: window 0 stays current to
     catch server-start config output), so without this an attach would land
     on the shell.
 
-    list-windows is index-ordered, so the last row is the session's
-    highest-index window: the task window in bmad-loop's own sessions (window
-    0 is the shell). new-window reuses the lowest free index, so a window an
-    operator opened in the session can outrank it. Best-effort,
-    like both seam calls it makes: an unanswerable listing (``[]``, which the
+    The task window is the one named for the journal's open session
+    (runs.task_window_name), so a window an operator opened in the session is
+    never picked over it. With no open session in the journal, an unreadable
+    journal, or no window under that name (a config with ``allow-rename``
+    lets the CLI retitle it), the session's highest-index window is selected:
+    list-windows is index-ordered and window 0 is the shell. Best-effort, like
+    both seam calls it makes: an unanswerable listing (``[]``, which the
     backend already reports on stderr) selects nothing and the attach goes to
     the session as before. The id is replayed verbatim, so a backend that
     qualifies it (psmux's ``session:@N``) is handed back its own form."""
+    entries = runs.journal_entries_or_none(runs.run_dir_for(project, run_id))
+    start, _ = open_session_start_indexed(entries or [])
+    task_id = start.get("task_id") if start is not None else None
+    want = runs.task_window_name(str(task_id)) if task_id is not None else None
     mux = get_multiplexer()
-    rows = mux.list_windows(session, ["window_id"])
-    if rows and rows[-1] and rows[-1][0]:
-        mux.select_window(rows[-1][0])
+    # window_name last: list_windows' bounded split keeps a free-text field whole.
+    rows = [
+        row
+        for row in mux.list_windows(runs.session_name(run_id), ["window_id", "window_name"])
+        if row and row[0]
+    ]
+    named = [row for row in rows if want is not None and row[1:2] == (want,)]
+    pick = named or rows
+    if pick:
+        mux.select_window(pick[-1][0])
 
 
 # Per-window tmux user option recording what an interactive attach should do
@@ -1024,7 +1038,7 @@ def attach_plan(
         # the current window. Warned under its own name, not via on_fault,
         # which callers report as a control-window fault.
         try:
-            select_agent_window(session)
+            select_agent_window(project, run_id)
         except MultiplexerError as e:
             if on_fault is None:
                 raise

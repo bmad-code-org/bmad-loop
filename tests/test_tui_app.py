@@ -4830,7 +4830,7 @@ async def test_attach_multiplexer_error_notifies(project, monkeypatch):
         raise MultiplexerError("backend server not reachable")
 
     monkeypatch.setattr("bmad_loop.tui.app.runs.attach_target_argv", boom)
-    monkeypatch.setattr(launch, "select_agent_window", lambda s: None)
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: None)
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -4968,7 +4968,7 @@ async def test_attach_warns_then_falls_back_to_the_agent_past_an_unproven_window
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
     monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 1))
-    monkeypatch.setattr(launch, "select_agent_window", lambda s: None)
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: None)
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
@@ -5078,7 +5078,7 @@ async def test_attach_prefers_agent_session_without_decision(project_tree, monke
     monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: ("@5", 0))
     calls, stamps = _patch_attach_exec(monkeypatch)
     order: list[object] = []
-    monkeypatch.setattr(launch, "select_agent_window", lambda s: order.append(("select", s)))
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: order.append(("select", r)))
     monkeypatch.setattr(
         "bmad_loop.tui.app.subprocess.call",
         lambda argv: calls.append(list(argv)) or order.append("attach") or 0,
@@ -5090,7 +5090,7 @@ async def test_attach_prefers_agent_session_without_decision(project_tree, monke
         await pilot.press("a")
         await until(pilot, lambda: bool(calls))
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-20260611-100000-aaaa"]]
-    assert order == [("select", "bmad-loop-20260611-100000-aaaa"), "attach"]
+    assert order == [("select", "20260611-100000-aaaa"), "attach"]
     # attaching to a live agent session is not our parked window — nothing stamped
     assert stamps == []
 
@@ -5105,7 +5105,7 @@ async def test_attach_goes_ahead_when_the_agent_window_select_raises(project_tre
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
     monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 0))
 
-    def boom(_session):
+    def boom(_project, _run_id):
         raise MultiplexerError("select lost the server")
 
     monkeypatch.setattr(launch, "select_agent_window", boom)
@@ -5132,7 +5132,7 @@ async def test_attach_falls_back_to_ctl_window(project_tree, monkeypatch):
     monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: ("@5", 0))
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
     agent_selected: list[str] = []
-    monkeypatch.setattr(launch, "select_agent_window", agent_selected.append)
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: agent_selected.append(r))
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
@@ -7946,7 +7946,7 @@ async def test_attach_reaches_the_agent_past_a_ctl_lookup_fault(project, monkeyp
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "agent_session_exists", lambda session: True)
     monkeypatch.setattr(launch, "ctl_window_lookup", boom)
-    monkeypatch.setattr(launch, "select_agent_window", lambda s: None)
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: None)
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     monkeypatch.setattr(app, "_attach_to_target", lambda target, **_k: attached.append(target))

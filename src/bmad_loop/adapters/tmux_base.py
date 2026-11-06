@@ -614,8 +614,13 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # `run`/`run-shell` job still in flight from the server start reports
         # (view-mode) on the pane active when it ends; that must be the shell
         # window, never the agent's pane, whose wake nudges and answers a pane
-        # mode would refuse (DW-635). Never select the window here for the
-        # same reason; an attach selects it (tui.launch.select_agent_window).
+        # mode would refuse (DW-635). In an unwatched session the window is
+        # never selected here; an attach selects it (tui.launch.select_agent_window).
+        # In a session a client was already watching, read before the create
+        # (and after the launch argv is built, so a refused one spawns nothing),
+        # it is selected below.
+        launch = self._window_launch(env, command)
+        watched = (self._session_clients(session) or 0) > 0
         window_id, _, pane_id = self._tmux(
             "new-window",
             "-d",
@@ -628,7 +633,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
             "-P",
             "-F",
             "#{window_id} #{pane_id}",
-            *self._window_launch(env, command),
+            *launch,
         ).partition(" ")
         panes = self._launched_panes()
         if pane_id.startswith("%"):
@@ -636,7 +641,33 @@ class BaseTmuxBackend(TerminalMultiplexer):
         else:
             # A restarted server can reuse the id: no stale pane may answer for it.
             panes.pop(window_id, None)
+        if watched:
+            # As a non-detached new-window would: an operator watching the run
+            # follows each task instead of staying on the ``shell`` window the
+            # previous task's exit dropped them on. A session with a client is
+            # long past its server start, so no config job is left to land on
+            # the task pane.
+            self.select_window(self.target(session, window_id))
         return window_id
+
+    def _session_clients(self, session: str) -> int | None:
+        """Clients attached to ``session``, or None when the backend cannot say
+        (new_window then reads the session as unwatched and leaves its window
+        detached). A probe that could not run says so on stderr."""
+        try:
+            proc = self._run(
+                ["display-message", "-p", "-t", f"{self.target(session)}:", "#{session_attached}"],
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
+            print(
+                f"warning: {self._BINARY} display-message #{{session_attached}} on {session} "
+                f"failed: {type(exc).__name__}: {exc}; leaving its new window detached",
+                file=sys.stderr,
+            )
+            return None
+        text = proc.stdout.strip() if proc.returncode == 0 else ""
+        return int(text) if text.isdigit() else None
 
     def new_parked_window(
         self, session: str, name: str, cwd: Path, argv: list[str], return_opt: str
@@ -792,10 +823,11 @@ class BaseTmuxBackend(TerminalMultiplexer):
         shows that output in view-mode on whichever pane is active then. On a
         server bmad-loop itself started that is the session's ``shell`` window
         0 (task windows open detached), and a task window only when an attach
-        selected it while the job was still running. The mode is read only on
-        the refusal path, so a send keeps one probe; a reply that is not a mode
-        name (an unread probe, or a backend that does not expand
-        ``#{pane_mode}``) leaves the refusal unnamed."""
+        selected it, or a task opened under an attached client, while the job
+        was still running. The mode is read only on the refusal path, so a send
+        keeps one probe; a reply that is not a mode name (an unread probe, or a
+        backend that does not expand ``#{pane_mode}``) leaves the refusal
+        unnamed."""
         if self._tmux("display-message", "-p", "-t", target, "#{pane_in_mode}") != "1":
             return
         try:

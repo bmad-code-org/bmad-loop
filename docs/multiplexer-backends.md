@@ -75,12 +75,12 @@ global option. The only option it sets is session-local: `destroy-unattached off
   fails or prints, tmux shows the output in view-mode on whichever pane is active when the
   command finishes. If bmad-loop started the server, that is the session's first window,
   `shell`: task windows open detached, so the agent's pane keeps taking wake nudges and the
-  TUI's answer keys. `bmad-loop attach` and the TUI's `a` select the task window before
-  attaching. An attach in the moment after the server starts can still make the task window
-  catch the output. bmad-loop never types into a pane in a mode, since leaving it would yank
-  out an operator reading scrollback, so nudges and answers are then refused with
-  `is in a pane mode (view-mode)`, and the refusal says to press `q` in that window. To stop
-  the output, make the failing config command succeed (run it by hand to see why it fails).
+  TUI's answer keys. `bmad-loop attach` and the TUI's `a` select the task window, and an
+  attached client follows each new one. An attach right after the server starts can still
+  put the output on the task window. bmad-loop never types into a pane in a mode, since
+  leaving it would yank out an operator reading scrollback, so nudges and answers are then
+  refused with `is in a pane mode (view-mode)`, and the refusal says to press `q` in that
+  window. To stop the output, make the failing config command succeed (run it by hand).
 - **Extended keys.** `extended-keys on` or `always`, in either `xterm` or `csi-u` format,
   does not change the `Enter` and `Escape` that bmad-loop sends: Claude Code receives both
   as plain keys (checked on tmux 3.8).

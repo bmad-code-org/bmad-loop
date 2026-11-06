@@ -1416,6 +1416,11 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # there; a verdict-gated fallback keeps that drag alive for every rc-0
     # switch the gate merely cannot vouch for.
 
+    def _session_clients(self, session: str) -> int | None:
+        # The base's `-t =session:` read can answer for another server's
+        # session here; _attached_clients refuses that answer (see it).
+        return self._attached_clients(session)
+
     def _attached_clients(self, session: str) -> int | None:
         """Clients attached to ``session``, or None when psmux cannot say.
 
