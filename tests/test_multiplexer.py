@@ -1766,19 +1766,25 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("clients", "selected"),
+    ("clients", "selected", "reason"),
     [
-        (subprocess.CompletedProcess([], 0, stdout="1\n", stderr=""), True),
-        (subprocess.CompletedProcess([], 0, stdout="2\n", stderr=""), True),
-        (subprocess.CompletedProcess([], 0, stdout="0\n", stderr=""), False),
-        # the count cannot be read: the window stays detached
-        (subprocess.CompletedProcess([], 1, stdout="", stderr="no server"), False),
-        (subprocess.CompletedProcess([], 0, stdout="\n", stderr=""), False),
-        (OSError("tmux vanished"), False),
+        (subprocess.CompletedProcess([], 0, stdout="1\n", stderr=""), True, None),
+        (subprocess.CompletedProcess([], 0, stdout="2\n", stderr=""), True, None),
+        (subprocess.CompletedProcess([], 0, stdout="0\n", stderr=""), False, None),
+        # the count cannot be read: the window stays detached, and stderr says why
+        (
+            subprocess.CompletedProcess([], 1, stdout="", stderr="no server"),
+            False,
+            "exited 1: no server",
+        ),
+        (subprocess.CompletedProcess([], 0, stdout="\n", stderr=""), False, "answered ''"),
+        (OSError("tmux vanished"), False, "OSError: tmux vanished"),
     ],
     ids=["one-client", "two-clients", "unwatched", "probe-rc", "probe-empty", "probe-raised"],
 )
-def test_new_window_follows_a_watched_session(monkeypatch, tmp_path, capsys, clients, selected):
+def test_new_window_follows_a_watched_session(
+    monkeypatch, tmp_path, capsys, clients, selected, reason
+):
     """Task windows open detached (DW-635), but a client already attached to
     the session follows each new one, as a non-detached new-window had it:
     the count is read before the create and the window is selected after.
@@ -1804,8 +1810,11 @@ def test_new_window_follows_a_watched_session(monkeypatch, tmp_path, capsys, cli
         assert seen[-1][2:] == ["select-window", "-t", "=s:@7"]
     else:
         assert verbs == ["display-message", "new-window"]
+    # every unreadable count says why; a read count says nothing
     err = capsys.readouterr().err
-    assert ("tmux vanished" in err) is isinstance(clients, BaseException)
+    assert ("leaving its new window detached" in err) is (reason is not None)
+    if reason is not None:
+        assert reason in err
 
 
 def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):

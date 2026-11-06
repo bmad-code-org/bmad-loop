@@ -653,21 +653,30 @@ class BaseTmuxBackend(TerminalMultiplexer):
     def _session_clients(self, session: str) -> int | None:
         """Clients attached to ``session``, or None when the backend cannot say
         (new_window then reads the session as unwatched and leaves its window
-        detached). A probe that could not run says so on stderr."""
+        detached). Every None says why on stderr: an operator watching the run
+        would otherwise stop following tasks with nothing to explain it."""
+        probe = f"{self._BINARY} display-message #{{session_attached}} on {session}"
         try:
             proc = self._run(
                 ["display-message", "-p", "-t", f"{self.target(session)}:", "#{session_attached}"],
                 check=False,
             )
         except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
-            print(
-                f"warning: {self._BINARY} display-message #{{session_attached}} on {session} "
-                f"failed: {type(exc).__name__}: {exc}; leaving its new window detached",
-                file=sys.stderr,
-            )
+            self._warn_detached(f"{probe} failed: {type(exc).__name__}: {exc}")
             return None
-        text = proc.stdout.strip() if proc.returncode == 0 else ""
-        return int(text) if text.isdigit() else None
+        text = proc.stdout.strip()
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or "no stderr"
+            self._warn_detached(f"{probe} exited {proc.returncode}: {detail}")
+            return None
+        if not text.isdigit():
+            self._warn_detached(f"{probe} answered {text!r}, not a client count")
+            return None
+        return int(text)
+
+    @staticmethod
+    def _warn_detached(reason: str) -> None:
+        print(f"warning: {reason}; leaving its new window detached", file=sys.stderr)
 
     def new_parked_window(
         self, session: str, name: str, cwd: Path, argv: list[str], return_opt: str

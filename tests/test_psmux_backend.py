@@ -1008,15 +1008,17 @@ def test_launch_probes_and_runs_the_same_resolved_pwsh(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     ("answer", "selected"),
-    [("1|s\n", True), ("0|s\n", False), ("1|other\n", False)],
-    ids=["watched", "unwatched", "another-servers-session"],
+    [("1|s\n", True), ("0|s\n", False), ("1|other\n", False), ("\n", False)],
+    ids=["watched", "unwatched", "another-servers-session", "unreadable"],
 )
 def test_new_window_follows_a_watched_session_by_its_own_count(
-    monkeypatch, tmp_path, answer, selected
+    monkeypatch, tmp_path, capsys, answer, selected
 ):
     """psmux reads the attached count through _attached_clients, which refuses
     an answer naming another server's session: a duplicated registry entry
-    must not select a window here for a client attached over there."""
+    must not select a window here for a client attached over there. A count
+    that cannot be read (refused or malformed) is warned on stderr, unlike the
+    switch_client verdict's silent None."""
     monkeypatch.setattr(PsmuxMultiplexer, "_pwsh_path", _REAL_PWSH_PATH)
     monkeypatch.setattr(
         psmux_backend.shutil, "which", lambda name: "pwsh.exe" if name == "pwsh" else None
@@ -1038,6 +1040,8 @@ def test_new_window_follows_a_watched_session_by_its_own_count(
     assert PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog") == "s:@2"
     selects = [argv for argv in calls if argv[:2] == ["psmux", "select-window"]]
     assert selects == ([["psmux", "select-window", "-t", "=s:@2"]] if selected else [])
+    warned = "could not read the attached-client count of s" in capsys.readouterr().err
+    assert warned is answer.startswith(("1|other", "\n"))
 
 
 def test_every_launch_refuses_a_pwsh_that_does_not_resolve(monkeypatch, tmp_path):
