@@ -119,8 +119,8 @@ def test_infer_with_parser_none_still_finds_candidates(tmp_path):
 
 
 # Captured from a live agy 1.1.3 turn (probe-adapter antigravity --probe). Shape
-# pinned deliberately: agy's transcript carries NO usage block, which is why the
-# profile's usage_parser is "none" permanently rather than pending a parser.
+# pinned deliberately: agy 1.1.3's transcript carries no usage, so a 1.1.3
+# session reads as untracked under the antigravity-transcript parser.
 ANTIGRAVITY_ROWS = [
     {
         "step_index": 0,
@@ -140,19 +140,52 @@ ANTIGRAVITY_ROWS = [
         "thinking": "**Processing User Request**",
     },
 ]
+# The sanitized agy 1.4.9 parent transcript (tests/test_tokens.py pins the
+# parser on the whole tree, subagent included).
+ANTIGRAVITY_149_PARENT = (
+    Path(__file__).parent
+    / "fixtures"
+    / "antigravity-1.4.9"
+    / "brain"
+    / "d0000000-0000-4000-8000-000000000001"
+    / ".system_generated"
+    / "logs"
+    / "transcript_full.jsonl"
+)
 
 
 def test_infer_antigravity_transcript_has_no_token_fields(tmp_path):
-    """agy exposes no usage in its transcript — the evidence for usage_parser="none".
-
-    If this ever starts finding candidates, agy began emitting usage and the
-    profile should be revisited (see antigravity.toml).
-    """
+    """agy 1.1.3 exposes no usage in its transcript: no candidates, and the
+    profile's parser reads it as untracked."""
     path = _write_jsonl(tmp_path / "transcript_full.jsonl", ANTIGRAVITY_ROWS)
-    schema = probe.infer_token_schema("none", path)
+    schema = probe.infer_token_schema(get_profile("antigravity").usage_parser, path)
     assert schema.entries_scanned == 2
     assert schema.token_field_candidates == []
+    assert schema.parsed_usage is None
     assert "step_index:int" in schema.key_paths
+
+
+def test_infer_antigravity_149_transcript_self_check():
+    """agy 1.4.9 writes per-step counts, and the packaged profile's parser reads
+    them back as the probe's self-check."""
+    parser = get_profile("antigravity").usage_parser
+    assert parser == "antigravity-transcript"
+    schema = probe.infer_token_schema(parser, ANTIGRAVITY_149_PARENT)
+    assert schema.parser == "antigravity-transcript"
+    assert schema.entries_scanned == 6
+    for key in ("input_tokens:int", "cache_read_tokens:int", "output_tokens:int"):
+        assert key in schema.token_field_candidates
+    # the parent's own steps plus its fixture subagent's
+    assert schema.parsed_usage == {
+        "input_tokens": 25760,
+        "output_tokens": 627,
+        "cache_read_tokens": 26131,
+        "cache_creation_tokens": 0,
+    }
+
+
+def test_antigravity_convention_glob_names_the_transcript():
+    assert probe.TRANSCRIPT_GLOBS["antigravity-transcript"] == probe.FAMILY_GLOBS["antigravity"]
 
 
 # ----------------------------------------------------------- discovery

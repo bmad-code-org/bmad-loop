@@ -9875,12 +9875,17 @@ def cmd_status(args: argparse.Namespace) -> int:
         extra = task.defer_reason or task.commit_sha or ""
         if task.preserve_ref:
             extra = f"{extra} [{task.preserve_ref}]".lstrip()
+        # The story's uncharged usage-limit relaunches (#959), only when nonzero
+        # — why dev×N / review×N can exceed their caps. Same `↻N` glyph and
+        # nonzero gate as the TUI counter cell (tui/screens/dashboard.py
+        # _counter_cell, not importable here: the TUI is an optional extra).
+        relaunched = f" ↻{task.usage_relaunches}" if task.usage_relaunches > 0 else ""
         # 17 = len("awaiting-operator"), the longest Phase token; a narrower
         # field does not truncate, it shifts every following column on that one
         # row, which reads as corrupt output rather than as a long status.
         print(
-            f"  {key:40s} {task.phase:17s} dev×{task.attempt} review×{task.review_cycle} "
-            f"{tokens} {extra}"
+            f"  {key:40s} {task.phase:17s} dev×{task.attempt} review×{task.review_cycle}"
+            f"{relaunched} {tokens} {extra}"
         )
     _STATUS_PRINTERS[worksource.resumed_traits_for(state.source).name](state, project)
     try:
@@ -11347,7 +11352,8 @@ def main(argv: list[str] | None = None) -> int:
         "--probe",
         action="store_true",
         help="opt-in LIVE capture: launch one trivial content-free turn in a temp "
-        "workspace and capture real hook payloads (default: zero-launch scan)",
+        "workspace (codex: a stable per-user probe workspace you trust once) and "
+        "capture real hook payloads (default: zero-launch scan)",
     )
     probe_p.add_argument(
         "--transcript", help="exact transcript file to inspect (overrides discovery)"

@@ -33,7 +33,7 @@ from bmad_loop import runs, tickets_engine, tickets_source, verify
 from bmad_loop.adapters.base import SessionResult, SessionSpec
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import load_paths
-from bmad_loop.engine import Engine, RunPaused, SpecStatusWriteRefused
+from bmad_loop.engine import USAGE_RELAUNCH_RESUME, Engine, RunPaused, SpecStatusWriteRefused
 from bmad_loop.frontmatter import parse_frontmatter, status_of
 from bmad_loop.journal import Journal, load_state, save_state
 from bmad_loop.model import (
@@ -51,6 +51,7 @@ from bmad_loop.model import (
 )
 from bmad_loop.policy import (
     GatesPolicy,
+    LimitsPolicy,
     NotifyPolicy,
     OperatorPolicy,
     Policy,
@@ -956,6 +957,123 @@ def test_dev_prompt_uses_ticket_ref(project_v7):
     assert repair.startswith(f"/{skill} ticket 1.1 — resume the autonomous dev session")
     assert repair.split("`")[-2] == str(feedback)
     assert [(m.target, m.reason) for m in tree.marks] == [("in-progress", "repair")]
+
+
+def test_usage_relaunch_prompt_resumes_the_bound_plan(project_v7):
+    """DW-615: the kept-tree usage relaunch dispatches `ticket <ref>` with the
+    bound plan named and the resume sentence, then the tickets clauses (park
+    last). None (roll back) while the plan is not on disk. It neither re-opens
+    nor marks the plan, so a draft plan still routes to planning. Ablation
+    (performed): drop the override and the base names `task.spec_file` with a
+    bare `Resume …` line instead of `ticket 1.1`, and this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    skill = engine._dev_skill()
+    assert engine._usage_relaunch_prompt(task) is None
+
+    plan = engine._bound_plan(task)
+    assert plan is not None
+    _write_plan(plan, "draft")
+    task.spec_file = str(plan)
+    before = plan.read_bytes()
+
+    prompt = engine._usage_relaunch_prompt(task)
+
+    assert prompt == (
+        f"/{skill} ticket 1.1 — resume the autonomous dev session on its plan at "
+        f"`{plan}`. {USAGE_RELAUNCH_RESUME} {engine._sprint_board_instruction()} "
+        f"{engine._operator_park_instruction()}"
+    )
+    assert plan.read_bytes() == before
+    assert tree.marks == []
+
+
+def test_usage_relaunch_prompt_keeps_the_dispatch_line_and_parked_notice(project_v7, monkeypatch):
+    """DW-615 review: the kept-tree relaunch heads with the fresh leg's
+    `dispatch_invocation` line, so `thorough` and a plan checkpoint's
+    `Halt after planning.` survive, and appends the parked-work notice. A
+    symlinked plan is refused (roll back) like the next attempt's binding would.
+    Ablation (performed): head with a bare `ticket <ref>` and this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    engine, _ = make_engine(project_v7, tree)
+    task = _bound(engine, tree)
+    plan = engine._bound_plan(task)
+    assert plan is not None
+    _write_plan(plan, "draft")
+    task.spec_file = str(plan)
+    monkeypatch.setattr(engine, "_dev_thorough", lambda _task: True)
+    monkeypatch.setattr(engine, "_plan_halt_now", lambda _task: True)
+    monkeypatch.setattr(engine, "_retry_preserve_notice", lambda _task: "PARKED")
+
+    prompt = engine._usage_relaunch_prompt(task)
+
+    assert prompt is not None
+    assert prompt.startswith(
+        f"/{engine._dev_skill()} ticket 1.1 thorough Halt after planning. Resume the "
+        f"autonomous dev session on its plan at `{plan}`. {USAGE_RELAUNCH_RESUME} "
+    )
+    assert prompt.endswith("\n\nPARKED")
+
+    real = plan.with_name("real-plan.md")
+    plan.rename(real)
+    try:
+        plan.symlink_to(real)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    assert engine._usage_relaunch_prompt(task) is None
+
+
+def test_dev_usage_relaunch_keeps_the_ticket_tree_without_rearming_the_plan(project_v7):
+    """DW-615: in tickets mode a usage-limited dev attempt with its plan on disk
+    relaunches on the kept tree. The relaunched session finds the cut-off file
+    and the plan still at the status the session left (no `_after_code_rollback`
+    re-arm, no mark), and its prompt names the plan. ABLATION, performed: make
+    `_usage_relaunch_tree` answer `kept=False` and the rollback removes the
+    partial file and re-arms the plan, and this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    policy = dataclasses.replace(
+        _policy(),
+        scm=ScmPolicy(rollback_on_failure=True),
+        limits=LimitsPolicy(usage_limit_action="relaunch", max_usage_relaunches=1),
+    )
+    evidence = "pane matched 'usage-pattern': session limi" + "t · resets 7:20pm"
+    cut = SessionResult(
+        status="stalled", parked=True, parked_evidence=evidence, usage_limited=evidence
+    )
+    repo = project_v7.project
+    seen: list[tuple[bool, str | None]] = []
+
+    def cut_off(_spec):
+        (repo / "partial.txt").write_text("half done\n")
+        _write_plan(plan, "in-progress")
+        return cut
+
+    def relaunched(_spec):
+        seen.append(
+            ((repo / "partial.txt").exists(), status_of(parse_frontmatter(plan.read_text())))
+        )
+        return cut  # past the cap: the usage-limit pause ends the phase
+
+    engine, adapter = make_engine(project_v7, tree, policy=policy, script=[cut_off, relaunched])
+    task = _bound(engine, tree)
+    plan = engine._bound_plan(task)
+    assert plan is not None
+    _write_plan(plan, "ready-for-dev")
+    task.spec_file = str(plan)
+
+    with pytest.raises(RunPaused):
+        engine._dev_phase(task)
+
+    assert seen == [(True, "in-progress")]
+    assert adapter.sessions[1].prompt.startswith(
+        f"/{engine._dev_skill()} ticket 1.1 — resume the autonomous dev session on its "
+        f"plan at `{plan}`. {USAGE_RELAUNCH_RESUME}"
+    )
+    rows = [(e["kept"], e["reason"]) for e in _kinds(engine, "dev-relaunch-tree")]
+    assert rows == [(True, "spec-named")]
+    assert not [e for e in engine.journal.entries() if e["kind"].startswith("rollback")]
+    assert tree.marks == []
 
 
 @pytest.mark.parametrize(

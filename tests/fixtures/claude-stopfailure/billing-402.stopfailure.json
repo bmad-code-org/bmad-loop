@@ -1,0 +1,12 @@
+{
+  "session_id": "3292a3c4-5d49-418b-9201-7d11125efbd6",
+  "transcript_path": "<capture-root>/cfg/projects/<capture-root>-proj/3292a3c4-5d49-418b-9201-7d11125efbd6.jsonl",
+  "cwd": "<capture-root>/proj",
+  "prompt_id": "b86fd79a-ea5c-46ac-a3c0-8467cd456bf1",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "StopFailure",
+  "error": "billing_error",
+  "last_assistant_message": "Credit balance is too low"
+}

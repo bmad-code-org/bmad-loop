@@ -127,18 +127,18 @@ bmad-loop probe-adapter [--project PROJECT] [--probe] [--transcript TRANSCRIPT] 
                         [--binary BINARY] [--model MODEL] [--workspace PATH] [--timeout TIMEOUT] [--out OUT] [--json] cli
 ```
 
-| Option                      | Description                                                                                                                               |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `cli`                       | Profile name. Hookless (HTTP) profiles are refused.                                                                                       |
-| `--probe`                   | Live capture: one trivial turn in a temp workspace, recording only the shape of each hook payload. Default: a scan that launches nothing. |
-| `--transcript TRANSCRIPT`   | Transcript file to inspect; skips discovery.                                                                                              |
-| `--session-dir SESSION_DIR` | Directory searched for the newest transcript.                                                                                             |
-| `--binary BINARY`           | Binary for a CLI with no profile; produces a reduced report.                                                                              |
-| `--model MODEL`             | Model for the probe turn (`--probe` only).                                                                                                |
-| `--workspace PATH`          | Also report whether PATH is in the profile's `[workspace_trust]` list; exit 1 unless trusted or when the profile declares no such list.   |
-| `--timeout TIMEOUT`         | Probe turn timeout in seconds. Default: 90.                                                                                               |
-| `--out OUT`                 | Write the report (or JSON document) to this file instead of stdout.                                                                       |
-| `--json`                    | Emit a JSON document instead of the Markdown report.                                                                                      |
+| Option                      | Description                                                                                                                                                                                                                                              |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cli`                       | Profile name. Hookless (HTTP) profiles are refused.                                                                                                                                                                                                      |
+| `--probe`                   | Live capture: one trivial turn in a temp workspace (Codex: a stable per-user probe workspace under the state root; the first run exits 1 until you trust it once), recording only the shape of each hook payload. Default: a scan that launches nothing. |
+| `--transcript TRANSCRIPT`   | Transcript file to inspect; skips discovery.                                                                                                                                                                                                             |
+| `--session-dir SESSION_DIR` | Directory searched for the newest transcript.                                                                                                                                                                                                            |
+| `--binary BINARY`           | Binary for a CLI with no profile; produces a reduced report.                                                                                                                                                                                             |
+| `--model MODEL`             | Model for the probe turn (`--probe` only).                                                                                                                                                                                                               |
+| `--workspace PATH`          | Also report whether PATH is in the profile's `[workspace_trust]` list; exit 1 unless trusted or when the profile declares no such list.                                                                                                                  |
+| `--timeout TIMEOUT`         | Probe turn timeout in seconds. Default: 90.                                                                                                                                                                                                              |
+| `--out OUT`                 | Write the report (or JSON document) to this file instead of stdout.                                                                                                                                                                                      |
+| `--json`                    | Emit a JSON document instead of the Markdown report.                                                                                                                                                                                                     |
 
 - Exits 1 when the profile is unknown (without `--binary`), the leak self-check fires (nothing is written), or hook or workspace trust is not `trusted` (the report is still written).
 
@@ -310,6 +310,7 @@ bmad-loop status [--project PROJECT] [--json] [run_id]
 ```
 
 - The status line (`status: …`) is `finished`, `PAUSED (<stage>) — <reason>`, `in progress — graceful stop pending (will stop after the current item)`, or `in progress (or interrupted)`.
+- A story row's `dev×N review×N` is followed by `↻M` when M of those sessions were uncharged usage-limit relaunches (dev and review together), which is why either count can exceed its cap. Not shown when M is 0.
 - For an unfinished story run with no pause stage, each story still escalated adds `escalated: story '<key>' awaiting resolve — bmad-loop resolve <id>` below the status line. Not in `--json`.
 - For a tickets run, the footer is the tickets board, read live through the project's `tickets.py status` and pinned to the run's initiative. It shows the run's selectors, the ticket counts by state, then one block per epic in build order: done count, epic status and any recorded closure, and each ticket's state, plan status, flags and this run's phase. A tree that cannot be read prints `tickets board unavailable: <reason>`, and `status` still exits 0. Marks or store commits still owed after landing are listed last.
 - Exits 1 with `no runs found`, or on a bad or ambiguous ref (stdout stays empty under `--json`).
@@ -344,7 +345,7 @@ Attaches the terminal to a run through the selected multiplexer backend.
 bmad-loop attach [--project PROJECT] [run_id]
 ```
 
-- Attaches to the run's control window when a sweep is waiting on a decision or no agent session is live; otherwise to the live agent session.
+- Attaches to the run's control window when a sweep is waiting on a decision or no agent session is live; otherwise to the live agent session, selecting its task window first (task windows open detached): the window named for the journal's open session, else the session's highest-index window.
 - Exits 1 with `nothing to attach for run <id>` when there is no target; otherwise exits with the multiplexer client's exit code.
 
 ### `stop`
@@ -556,7 +557,9 @@ Built from the run's `state.json`.
 | `tickets`                                           | object \| null | tickets runs only, below; null for every other source                  |
 | `tasks`                                             | array          | one entry per story                                                    |
 
-Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `followup_review_recommended` (bool: the build session recommended a follow-up review), `adapters_used` (`{role: {name, model}}`), `ticket` (object or null, below).
+Each task: `story_key`, `epic`, `phase`, `attempt`, `review_cycle`, `dev_usage_relaunches` and `review_usage_relaunches` (int: the uncharged usage-limit relaunches counted inside `attempt` and `review_cycle`, which is why either can exceed its cap), `tokens` (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `raw`, `weighted`), `commit_sha`, `defer_reason`, `preserve_ref`, `followup_review_recommended` (bool: the build session recommended a follow-up review), `adapters_used` (`{role: {name, model}}`), `ticket` (object or null, below).
+
+`tokens_by_model` (object, present only when some session of the task recorded a per-model split) maps each model id, and `<unattributed>`, to `{input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens}` summed over the task's sessions (see the [run directory](run-state.md#run-directory)). It sums to `tokens` when every session was split; it never changes `tokens`.
 
 `adapters_used` reports each role's last session that stamped an adapter. Its `model` is the configured model (`""` for the CLI default). `models_used` lists the models that session was observed to run (see the [run directory](run-state.md#run-directory)) and is present only when some were observed, so a role whose latest session observed none shows no `models_used` even when an earlier one did.
 

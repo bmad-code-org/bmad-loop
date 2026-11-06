@@ -87,9 +87,10 @@ def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
 
     # the tmux-family scaffolding is the base's, spawned via the psmux binary,
     # with no -e flags — the env rides the encoded source's prelude instead
-    assert rec.argv[:11] == [
+    assert rec.argv[:12] == [
         "psmux",
         "new-window",
+        "-d",
         "-t",
         "=s:",
         "-n",
@@ -100,7 +101,7 @@ def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
         "-F",
         "#{window_id} #{pane_id}",
     ]
-    assert len(rec.argv) == 12
+    assert len(rec.argv) == 13
     assert "-e" not in rec.argv
 
     source = _pwsh_payload(rec.argv)
@@ -994,14 +995,53 @@ def test_launch_probes_and_runs_the_same_resolved_pwsh(monkeypatch, tmp_path):
         pinned = os.path.abspath(found)
         del calls[:]
         mux.new_window("s", "n", tmp_path, {}, "prog")
-        probe, launch = calls
+        probe, clients, launch = calls
         assert probe[0] == pinned
+        assert clients[:2] == ["psmux", "display-message"]  # the watched-session read
         assert launch[:2] == ["psmux", "new-window"]
         _pwsh_payload(launch, pinned)
     assert set(psmux_backend._PWSH_VERSIONS) == {
         os.path.abspath("first-pwsh.exe"),
         os.path.abspath("second-pwsh.exe"),
     }
+
+
+@pytest.mark.parametrize(
+    ("answer", "selected"),
+    [("1|s\n", True), ("0|s\n", False), ("1|other\n", False), ("\n", False)],
+    ids=["watched", "unwatched", "another-servers-session", "unreadable"],
+)
+def test_new_window_follows_a_watched_session_by_its_own_count(
+    monkeypatch, tmp_path, capsys, answer, selected
+):
+    """psmux reads the attached count through _attached_clients, which refuses
+    an answer naming another server's session: a duplicated registry entry
+    must not select a window here for a client attached over there. A count
+    that cannot be read (refused or malformed) is warned on stderr, unlike the
+    switch_client verdict's silent None."""
+    monkeypatch.setattr(PsmuxMultiplexer, "_pwsh_path", _REAL_PWSH_PATH)
+    monkeypatch.setattr(
+        psmux_backend.shutil, "which", lambda name: "pwsh.exe" if name == "pwsh" else None
+    )
+    monkeypatch.setattr(psmux_backend, "_PWSH_VERSIONS", {})
+    calls: list[list[str]] = []
+
+    def fake(argv, **kwargs):
+        calls.append(argv)
+        if argv[0] != "psmux":
+            out = "7.6.6\n"
+        elif argv[1] == "display-message":
+            out = answer
+        else:
+            out = "@2 %4\n" if argv[1] == "new-window" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    assert PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog") == "s:@2"
+    selects = [argv for argv in calls if argv[:2] == ["psmux", "select-window"]]
+    assert selects == ([["psmux", "select-window", "-t", "=s:@2"]] if selected else [])
+    warned = "could not read the attached-client count of s" in capsys.readouterr().err
+    assert warned is answer.startswith(("1|other", "\n"))
 
 
 def test_every_launch_refuses_a_pwsh_that_does_not_resolve(monkeypatch, tmp_path):

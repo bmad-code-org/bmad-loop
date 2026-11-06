@@ -3373,8 +3373,10 @@ class SweepEngine(Engine):
         `_take_env_dispatch_pause` consumes first: nothing ran after the pause, so
         a review-dispatch pause at REVIEW_VERIFY replays its completed pass
         (returns True), and a dev-dispatch pause at PENDING returns False WITHOUT
-        the rollback — an isolated unit is untouched and is discarded for the
-        fresh mount, an in-place tree is the one the bundle starts from. The
+        the rollback — none is owed: the pause came either before anything ran or
+        (`_gate_relaunch`) after a usage-limited session whose rollback already
+        restored the baseline. An isolated unit is discarded for the fresh mount,
+        an in-place tree is the one the bundle starts from. The
         COMMITTING window IS recovered, though — same as the base engine's
         resume-commit arm (#115). The base's `_pending_salvage_session` replay
         (DW-278) is not mirrored either: a bundle whose review-timeout salvage
@@ -3426,10 +3428,12 @@ class SweepEngine(Engine):
                     self._review_and_commit(task, resume_result=resumable[1])
                 return True
         if env_role == "dev" and task.phase == Phase.PENDING:
-            # Paused at the dev dispatch gate: no session ran, nothing to roll back.
+            # Paused at a dev dispatch gate: nothing to roll back (no session ran,
+            # or a relaunch's usage-limited session was already rolled back).
             self.journal.append("resume-env-dispatch", story_key=task.story_key, role=env_role)
             if restart_isolated:
-                # the untouched unit; _run_story mounts a fresh one
+                # the unit (untouched, or a relaunch's rolled back to baseline);
+                # _run_story mounts a fresh one
                 self._discard_unit_for_restart(task)
             elif mounted:
                 self._release_orphaned_mount(task)
@@ -4509,15 +4513,17 @@ class SweepEngine(Engine):
                 ledger=str(ledger),
                 refuse_cause="dirty",
             )
+        # Saved before the notify (DW-632), so a host loss inside a slow notify
+        # command cannot leave the stale baseline on disk.
+        task.baseline_commit = None
+        task.baseline_untracked = None
+        self._save()
         gates.notify(
             self.policy,
             self.run_dir,
             f"migration refused: {ledger.name}",
             f"{reason} — then `bmad-loop resume {self.state.run_id}`",
         )
-        task.baseline_commit = None
-        task.baseline_untracked = None
-        self._save()
         raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
 
     def _complete_empty_migration(self, task: StoryTask) -> None:
@@ -4779,15 +4785,17 @@ class SweepEngine(Engine):
                 "hand and COMMIT the fix, then resume"
             )
             self.journal.append("migrate-duplicate-ids", story_key=MIGRATE_KEY, dw_ids=list(dupes))
+            # Cleared and saved before the notify (DW-632): a host loss inside a
+            # slow notify command must not leave the stale baseline on disk.
+            task.baseline_commit = None
+            task.baseline_untracked = None
+            self._save()
             gates.notify(
                 self.policy,
                 self.run_dir,
                 f"migration refused: {ledger.name}",
                 f"{reason} — then `bmad-loop resume {self.state.run_id}`",
             )
-            task.baseline_commit = None
-            task.baseline_untracked = None
-            self._save()
             raise RunPaused(reason, PAUSE_STORY_GATE, MIGRATE_KEY)
 
         if not task.baseline_commit:
@@ -8376,16 +8384,18 @@ class SweepEngine(Engine):
         self, task: StoryTask, reason: str, headline: str, detail: str
     ) -> NoReturn:
         """The tail every regeneration-site refusal in `_ensure_bundle_intent`
-        ends in (DW-243/252): notify with the RESUME route, clear the task's
-        baseline pair, save, and raise `RunPaused` at the story gate on the task.
-        The arm's journal row is written by the arm, before this. The
-        `_ensure_migration` duplicate-ids pause is the template.
+        ends in (DW-243/252): clear the task's baseline triple, save, notify with
+        the RESUME route, and raise `RunPaused` at the story gate on the task.
+        The save precedes the notify (DW-631) so a host loss inside a slow notify
+        command cannot leave the stale baseline on disk. The arm's journal row is
+        written by the arm, before this. The `_ensure_migration` duplicate-ids
+        pause is the template, and it too saves before it notifies (DW-632).
 
         `gates.notify` directly, never `_notify_ledger_repair`: that helper steers
         to a fresh `bmad-loop sweep`, which is the wrong route for a run that is
         paused and resumable — following it abandons this run's in-flight task.
 
-        Clearing the baseline pair is safe and necessary: the recovery pass has
+        Clearing the baseline triple is safe and necessary: the recovery pass has
         already rolled the attempt back before regeneration ran (or the task never
         held one), so nothing of ours is outstanding, and a stale baseline left
         behind would name the PRE-repair tree — the next env-fault's `_safe_reset`
@@ -8396,16 +8406,16 @@ class SweepEngine(Engine):
         escalation action requires Phase.ESCALATED, so an escalation stage would
         offer only actions that must fail. The gate stage's single action is
         "resume", which is the whole remedy once the ledger is repaired."""
+        task.baseline_commit = None
+        task.baseline_untracked = None
+        task.baseline_artifacts = None
+        self._save()
         gates.notify(
             self.policy,
             self.run_dir,
             headline,
             f"{detail} — then `bmad-loop resume {self.state.run_id}`",
         )
-        task.baseline_commit = None
-        task.baseline_untracked = None
-        task.baseline_artifacts = None
-        self._save()
         raise RunPaused(reason, PAUSE_STORY_GATE, task.story_key)
 
     def _pause_for_bundle_close_repair(

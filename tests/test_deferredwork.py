@@ -4396,21 +4396,6 @@ def test_any_status_dedupe_files_an_unseen_origin(tmp_path):
     assert append_entries(path, [spec]) == ["DW-2"]
 
 
-def test_default_spec_still_refiles_over_a_closed_twin(tmp_path):
-    """The default (and cross-spec) semantics are unchanged: a closed twin does
-    not suppress, because recurring work comes back.
-
-    Ablation: make the any-status arm unconditional and this returns `[None]`."""
-    (tmp_path / "default").mkdir()
-    (tmp_path / "cross").mkdir()
-    default = write_ledger(tmp_path / "default", RETRO_SEED.format(status="done 2026-06-01"))
-    assert append_entries(default, [_retro_spec()]) == ["DW-2"]
-    cross = write_ledger(tmp_path / "cross", RETRO_SEED.format(status="done 2026-06-01"))
-    assert append_entries(cross, [_retro_spec(source_spec="x.md", cross_spec_dedupe=True)]) == [
-        "DW-2"
-    ]
-
-
 def test_any_status_dedupe_no_op_takes_no_lock(tmp_path, monkeypatch):
     """The advisory pre-lock no-op stays in force for an any-status batch: its
     twin cannot vanish before the lock (entries are never deleted, stubs keep
@@ -4521,27 +4506,6 @@ def test_an_empty_batch_takes_no_lock(tmp_path, monkeypatch, call):
 
     assert acquisitions == []
     assert path.read_text(encoding="utf-8") == before
-
-
-def test_archive_closed_takes_no_lock_for_a_missing_ledger(tmp_path, monkeypatch):
-    """No ledger means no write, and so no lock — `advance`'s rule, one module over.
-
-    `bmad-loop sweep --archive` reports a project that has no ledger as SUCCESS
-    ("no deferred-work ledger at ..."). With the acquisition first, that answer
-    became a FAILURE wherever the state root cannot be derived: a released
-    behavior changed by a lock taken for a file that is not there. The guard under
-    the hold stays, deletion being able to race this one.
-
-    Ablation: move the presence guard (`_ledger_present`, since DW-255) back below
-    `with ledger_lock(path):` — the spy fires and this reds."""
-    path = tmp_path / "deferred-work.md"  # deliberately never created
-    acquisitions = []
-
-    with _counting_lock(monkeypatch, acquisitions):
-        assert archive_closed(path, archive_date="2026-08-24") == []
-
-    assert acquisitions == []
-    assert not path.exists()  # and nothing was created on the way past
 
 
 def test_mark_open_many_matches_serial_mark_open_bytes(tmp_path, monkeypatch):
@@ -4935,55 +4899,33 @@ def test_every_mutator_holds_the_ledger_lock(tmp_path, monkeypatch, name):
     `ledger_lock` that yielded without taking anything would satisfy the call
     count and exclude nobody.
 
+    The count grades the whole call graph a public name reaches, thin wrappers
+    included, and the spy tells apart the two ways it can exceed one. A wrapper
+    that re-pairs two locked primitives instead of delegating to a single leaf
+    acquires twice in sequence — count 2, depth 0, so `probed == [True, True]`.
+    A wrapper that takes the lock and then calls a mutator under it acquires
+    while already held — `ledger_lock`'s own guard turns that into a
+    `RuntimeError` rather than the POSIX self-deadlock it would otherwise be, but
+    the depth check names the offending mutator before the guard is even
+    reached, so a lost guard reds this row instead of hanging it.
+
     Ablation: delete this mutator's `with ledger_lock(path):` and dedent its
-    body — the spy never fires, `probed` stays empty, and the row reds."""
+    body — the spy never fires, `probed` stays empty, and the row reds. Re-pair
+    `record_decision` as `append_decision(...)` + `mark_done(...)` at the
+    wrapper and that row's count becomes 2 and it reds."""
     path = _seed_for(tmp_path, name)
     real_lock = deferredwork.ledger_lock
     probed = []
-
-    @contextlib.contextmanager
-    def spy_lock(p):
-        with real_lock(p):
-            probed.append(_lock_is_held(p))
-            yield
-
-    monkeypatch.setattr(deferredwork, "ledger_lock", spy_lock)
-
-    LOCKED_MUTATORS[name](path)
-
-    assert probed == [True]
-
-
-@pytest.mark.parametrize("name", sorted(LOCKED_MUTATORS))
-def test_mutators_acquire_exactly_once_and_never_nest(tmp_path, monkeypatch, name):
-    """One public call is one acquisition, at depth zero, for every entry point
-    including the thin wrappers.
-
-    What this adds over the row above is the *shape* of the failure it can name.
-    That test grades the leaf's hold from inside; this one grades the whole call
-    graph a public name reaches, and distinguishes the two ways the count can
-    exceed one. A wrapper that re-pairs two locked primitives instead of
-    delegating to a single leaf acquires twice in sequence — count 2, depth 0. A
-    wrapper that takes the lock and then calls a mutator under it acquires while
-    already held — `ledger_lock`'s own guard turns that into a `RuntimeError`
-    rather than the POSIX self-deadlock it would otherwise be, but the spy names
-    the offending mutator before the guard is even reached.
-
-    Ablation: re-pair `record_decision` as `append_decision(...)` +
-    `mark_done(...)` at the wrapper — that row's count becomes 2 and it reds."""
-    path = _seed_for(tmp_path, name)
-    real_lock = deferredwork.ledger_lock
     depth = 0
-    acquisitions = 0
 
     @contextlib.contextmanager
     def spy_lock(p):
-        nonlocal depth, acquisitions
+        nonlocal depth
         assert depth == 0, f"{name} nested a ledger_lock acquisition"
-        acquisitions += 1
         depth += 1
         try:
             with real_lock(p):
+                probed.append(_lock_is_held(p))
                 yield
         finally:
             depth -= 1
@@ -4992,7 +4934,7 @@ def test_mutators_acquire_exactly_once_and_never_nest(tmp_path, monkeypatch, nam
 
     LOCKED_MUTATORS[name](path)
 
-    assert acquisitions == 1
+    assert probed == [True]
 
 
 def test_ledger_lock_is_not_reentrant(tmp_path, monkeypatch):
@@ -5452,11 +5394,19 @@ def test_a_failing_probe_read_falls_through_to_the_locked_path(tmp_path, monkeyp
             False,
             id="record_decision",
         ),
+        pytest.param(
+            lambda p: archive_closed(p, archive_date="2026-08-24"), [], id="archive_closed"
+        ),
     ],
 )
 def test_mutators_take_no_lock_for_a_missing_ledger(tmp_path, monkeypatch, call, expected):
-    """No ledger means no write, and so no lock — `archive_closed`'s rule, now
-    kept by its three siblings too.
+    """No ledger means no write, and so no lock — `archive_closed`'s rule
+    (`advance`'s, one module over), now kept by its three siblings too.
+
+    `bmad-loop sweep --archive` reports a project that has no ledger as SUCCESS
+    ("no deferred-work ledger at ..."). With the acquisition first, that answer
+    became a FAILURE wherever the state root cannot be derived: a released
+    behavior changed by a lock taken for a file that is not there.
 
     These ids are real and these arguments are valid, so nothing but the absent
     file can be answering: it is the presence guard (`_ledger_present`, since

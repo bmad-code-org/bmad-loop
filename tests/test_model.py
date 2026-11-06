@@ -17,6 +17,7 @@ from bmad_loop.model import (
     PAUSE_TICKET_TREE,
     SWEEP_REFUSED_DIRTY,
     SWEEP_REFUSED_NOT_STARTED,
+    UNATTRIBUTED_MODEL,
     Phase,
     RunState,
     SessionRecord,
@@ -26,6 +27,7 @@ from bmad_loop.model import (
     VerifyOutcome,
     env_fault_site_reverifiable,
     result_mapping,
+    settle_by_model,
 )
 
 
@@ -545,6 +547,59 @@ def test_attach_session_usage_leaves_models_empty_when_unobserved(models):
     assert task.sessions[0].models == ()
 
 
+def test_attach_session_usage_copies_the_per_model_split():
+    """DW-618: a non-empty `by_model` lands on the record's `tokens_by_model`
+    and never on the task total, which counts the usage once.
+
+    Ablation: drop the `by_model` copy and the record's map stays empty."""
+    task = _task_with_session()
+    split = {"m1": TokenUsage(input_tokens=3), UNATTRIBUTED_MODEL: TokenUsage(input_tokens=1)}
+    task.attach_session_usage(
+        "1-1-a-dev-1", TokenUsage(input_tokens=4, models=("m1",), by_model=split)
+    )
+    assert task.sessions[0].tokens_by_model == split
+    assert task.tokens == TokenUsage(input_tokens=4)
+
+
+@pytest.mark.parametrize("by_model", [None, {}])
+def test_attach_session_usage_leaves_the_split_empty_when_absent(by_model):
+    task = _task_with_session()
+    task.attach_session_usage("1-1-a-dev-1", TokenUsage(input_tokens=1, by_model=by_model))
+    assert task.sessions[0].tokens_by_model == {}
+
+
+def test_token_usage_by_model_is_diagnostic_only():
+    """`by_model` re-cuts a figure without changing it: equality, `add` and the
+    persisted dict ignore it, and a hand-built TokenUsage defaults to None.
+
+    Ablation: drop `compare=False` and the equality assertion fails."""
+    usage = TokenUsage(input_tokens=10, by_model={"m": TokenUsage(input_tokens=10)})
+    assert usage == TokenUsage(input_tokens=10)
+    assert TokenUsage().by_model is None
+    assert "by_model" not in usage.to_dict()
+    total = TokenUsage()
+    total.add(usage)
+    assert total.by_model is None
+    assert TokenUsage.from_dict(usage.to_dict()).by_model is None
+
+
+def test_settle_by_model_orders_by_models_and_folds_strays():
+    """Model buckets follow `models` order; a None bucket and any key outside
+    `models` fold into the sentinel, which is dropped when zero.
+
+    Ablation: keep a stray key as-is and the key invariant breaks."""
+    buckets = {
+        None: TokenUsage(input_tokens=1),
+        "b": TokenUsage(output_tokens=2),
+        "stray": TokenUsage(input_tokens=4),
+        "a": TokenUsage(input_tokens=8),
+    }
+    settled = settle_by_model(buckets, ("a", "b", "unused"))
+    assert list(settled) == ["a", "b", UNATTRIBUTED_MODEL]
+    assert settled[UNATTRIBUTED_MODEL] == TokenUsage(input_tokens=5)
+    assert settle_by_model({None: TokenUsage(), "a": TokenUsage()}, ("a",)) == {"a": TokenUsage()}
+
+
 def test_token_usage_unread_is_diagnostic_only():
     """`unread` qualifies a figure without changing it: equality, `add` and the
     persisted dict ignore it, so a skip never alters stored totals or `--json`.
@@ -637,6 +692,39 @@ def test_session_record_models_round_trip_and_default():
     for bad in ("claude-opus-5-5", ["claude-opus-5-5", 3], {"m": 1}, None):
         doc["models"] = bad
         assert SessionRecord.from_dict(doc).models == ()
+
+
+def test_session_record_tokens_by_model_round_trip_and_default():
+    """DW-618: written only when non-empty, so a legacy-shaped record's dict
+    is unchanged; read back tolerantly, skipping a malformed entry.
+
+    Ablation: write the key unconditionally and the legacy doc gains it."""
+    record = SessionRecord(task_id="1-1-a-dev-1", role="dev", status="completed")
+    legacy = record.to_dict()
+    assert "tokens_by_model" not in legacy  # empty is not written
+    assert SessionRecord.from_dict(legacy).tokens_by_model == {}  # absent key
+    assert SessionRecord.from_dict(legacy).to_dict() == legacy  # byte-stable
+    record.tokens_by_model = {
+        "claude-opus-5-5": TokenUsage(input_tokens=3, cache_read_tokens=9),
+        UNATTRIBUTED_MODEL: TokenUsage(output_tokens=1),
+    }
+    doc = record.to_dict()
+    assert doc["tokens_by_model"] == {
+        "claude-opus-5-5": TokenUsage(input_tokens=3, cache_read_tokens=9).to_dict(),
+        UNATTRIBUTED_MODEL: TokenUsage(output_tokens=1).to_dict(),
+    }
+    back = SessionRecord.from_dict(json.loads(json.dumps(doc)))
+    assert back.tokens_by_model == record.tokens_by_model
+    assert back.to_dict() == doc
+    for bad in ("x", ["m"], None, 3):
+        doc["tokens_by_model"] = bad
+        assert SessionRecord.from_dict(doc).tokens_by_model == {}
+    doc["tokens_by_model"] = {
+        "ok": {"input_tokens": 2},
+        "not-a-dict": 5,
+        "bad-count": {"input_tokens": "lots"},
+    }
+    assert SessionRecord.from_dict(doc).tokens_by_model == {"ok": TokenUsage(input_tokens=2)}
 
 
 @pytest.mark.parametrize(
@@ -1300,6 +1388,18 @@ def test_deferred_work_state_fields_default_for_one_old_state_dict():
     assert restored.isolated_ledger_carried is False
     assert restored.ledger_seed_text is None
     assert restored.pinned_config_rewrites == {}
+
+
+def test_rejected_dev_task_id_round_trips_and_defaults_for_old_state():
+    """The DW-617 dev RETRY latch survives the JSON state file, and a state.json
+    written before the field existed loads with it unarmed."""
+    task = StoryTask(story_key="1-1-a", epic=1, rejected_dev_task_id="1-1-a-dev-2-g1")
+    restored = StoryTask.from_dict(json.loads(json.dumps(task.to_dict())))
+    assert restored.rejected_dev_task_id == "1-1-a-dev-2-g1"
+
+    doc = StoryTask(story_key="1-1-a", epic=1).to_dict()
+    del doc["rejected_dev_task_id"]
+    assert StoryTask.from_dict(doc).rejected_dev_task_id == ""
 
 
 def test_pre_harvest_ledger_preserves_absent_empty_and_text_states():

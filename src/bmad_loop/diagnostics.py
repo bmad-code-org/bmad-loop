@@ -52,7 +52,7 @@ from typing import Any
 
 from . import __version__, sanitize
 from .journal import SELF_MINTED_FIELDS, VERIFY_DIR, Journal, load_state
-from .model import RunState, StoryTask
+from .model import UNATTRIBUTED_MODEL, RunState, StoryTask
 from .platform_util import walk_files_unlinked
 
 # The guard machinery (fail-closed egress self-check + alias-substitution
@@ -725,6 +725,11 @@ class TaskDiag:
     # `context.json` — a story whose older escalations are filtered out dumps
     # identically to one that only ever raised the entries shown. A counter too.
     escalations_resolved_upto: int
+    # #959 refunds: the uncharged usage-limit relaunches counted inside `attempt` /
+    # `review_cycle`. Without them an `attempt` past `max_dev_attempts` reads as a
+    # broken cap. Counters, no customer content; additive — no SCHEMA_VERSION bump.
+    dev_usage_relaunches: int
+    review_usage_relaunches: int
     dw_count: int
     n_sessions: int
     sessions: SessionTally
@@ -1007,6 +1012,8 @@ def _task_diag(task: StoryTask, pseudo: sanitize.Pseudonymizer, weight: float) -
         worktree_isolated=bool(task.worktree_path),
         generation=task.generation,
         escalations_resolved_upto=task.escalations_resolved_upto,
+        dev_usage_relaunches=task.dev_usage_relaunches,
+        review_usage_relaunches=task.review_usage_relaunches,
         dw_count=len(task.dw_ids),
         n_sessions=len(task.sessions),
         sessions=_session_tally([task]),
@@ -1139,6 +1146,35 @@ def _scrub_model_id(value: object) -> str:
     return _REDACTED_STR
 
 
+_TOKEN_COUNT_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+)
+
+
+def _scrub_tokens_by_model(value: object) -> dict[str, dict[str, int]] | str:
+    """A `session-end` `tokens_by_model` map, safe to ship: each key through
+    `_scrub_model_id` (the `UNATTRIBUTED_MODEL` sentinel verbatim — engine
+    authored, never input), each value cut to its int counts of the four token
+    fields (a non-dict value keeps none). Keys that scrub to the same string
+    merge by summing; a non-dict map is `<redacted:str>`."""
+    if not isinstance(value, dict):
+        return _REDACTED_STR
+    out: dict[str, dict[str, int]] = {}
+    for model, counts in value.items():
+        key = model if model == UNATTRIBUTED_MODEL else _scrub_model_id(model)
+        merged = out.setdefault(key, {})
+        if not isinstance(counts, dict):
+            continue
+        for name in _TOKEN_COUNT_FIELDS:
+            count = counts.get(name)
+            if type(count) is int:
+                merged[name] = merged.get(name, 0) + count
+    return out
+
+
 def _scrub_entry(
     entry: dict,
     pseudo: sanitize.Pseudonymizer,
@@ -1234,6 +1270,12 @@ def _scrub_entry(
             # and brackets fail `looks_like_identifier`; keep each element that
             # is model-id shaped, redact the rest one by one.
             out[k] = [_scrub_model_id(each) for each in v] if isinstance(v, list) else _REDACTED_STR
+        elif kind == "session-end" and k == "tokens_by_model":
+            # DW-618: the per-model token split. Keys are model ids, so they go
+            # through `_scrub_model_id` like `models` (the engine's own
+            # `<unattributed>` sentinel is kept); values keep only the four int
+            # counts. Keys that redact to the same string merge by summing.
+            out[k] = _scrub_tokens_by_model(v)
         elif kind == "session-model" and k == "model":
             # #859: the hook-reported launch model, one id of the same shapes.
             out[k] = _scrub_model_id(v)
@@ -1567,17 +1609,20 @@ def render_markdown(
             # `gen` on that same rule: DW-11's watermark is the only field separating
             # "this story raised one escalation" from "its earlier ones are filtered
             # out as already answered", and a short `context.json` is read off exactly
-            # this report.
+            # this report. `relaunch` (`dev/review`, #959) rides beside `rev`: the
+            # uncharged usage relaunches are why `att` / `rev` can exceed their caps.
             out.append(
-                "| alias | epic | phase | att | gen | esc-upto | rev | committed | spec | dw "
-                "| sessions | weighted | raw |"
+                "| alias | epic | phase | att | gen | esc-upto | rev | relaunch | committed "
+                "| spec | dw | sessions | weighted | raw |"
             )
-            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+            out.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
             for t in r.tasks:
                 out.append(
                     f"| `{t.alias}` | {t.epic} | {t.phase} | {t.attempt} | {t.generation} "
                     f"| {t.escalations_resolved_upto} "
-                    f"| {t.review_cycle} | {t.committed} | {t.spec_present} | {t.dw_count} "
+                    f"| {t.review_cycle} "
+                    f"| {t.dev_usage_relaunches}/{t.review_usage_relaunches} "
+                    f"| {t.committed} | {t.spec_present} | {t.dw_count} "
                     f"| {t.n_sessions} | {t.tokens.get('weighted', 0)} "
                     f"| {t.tokens.get('total', 0)} |"
                 )

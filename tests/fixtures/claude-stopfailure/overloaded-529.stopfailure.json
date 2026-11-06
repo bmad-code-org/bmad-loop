@@ -1,0 +1,12 @@
+{
+  "session_id": "dfae325d-05da-40b7-a30a-25ac64fd8565",
+  "transcript_path": "<capture-root>/cfg/projects/<capture-root>-proj/dfae325d-05da-40b7-a30a-25ac64fd8565.jsonl",
+  "cwd": "<capture-root>/proj",
+  "prompt_id": "d6f96980-dcc5-4b59-b886-3e3ba12b45d8",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "StopFailure",
+  "error": "server_error",
+  "last_assistant_message": "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:<port>)."
+}

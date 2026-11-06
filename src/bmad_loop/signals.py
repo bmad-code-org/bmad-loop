@@ -72,7 +72,8 @@ class HookEvent:
     stop_message: str | None = None
     # The model the CLI reports on its hook payload (#859), forwarded by the
     # relay only as a non-empty string: Claude's SessionStart (resolved full id,
-    # may be omitted) and Codex on every hook. None for every other CLI, on an
+    # may be omitted), Codex on every hook, and agy's Stop (its `modelName`,
+    # DW-634). None for every other CLI, on an
     # older vendored relay that predates the field, and for a non-string value.
     # APPENDED with a default, like the fields above.
     model: str | None = None

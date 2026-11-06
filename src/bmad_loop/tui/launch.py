@@ -33,6 +33,7 @@ from ..adapters.multiplexer import (
     parked_screen,
 )
 from ..journal import Journal
+from ..parked import open_session_start_indexed
 from ..platform_util import (
     DIR_FD_ANCHORED_WRITES,
     atomic_write_text,
@@ -802,6 +803,40 @@ def select_ctl_window_id(window_id: str) -> None:
     get_multiplexer().select_window(window_id)
 
 
+def select_agent_window(project: Path, run_id: str) -> None:
+    """Make the run's task window its agent session's current window, so a
+    plain attach to the session lands on the agent rather than on the ``shell``
+    window 0. Task windows open detached (DW-635: window 0 stays current to
+    catch server-start config output), so without this an attach would land
+    on the shell.
+
+    The task window is the one named for the journal's open session
+    (runs.task_window_name), so a window an operator opened in the session is
+    never picked over it. With no open session in the journal, an unreadable
+    journal, or no window under that name (a config with ``allow-rename``
+    lets the CLI retitle it), the session's highest-index window is selected:
+    list-windows is index-ordered and window 0 is the shell. Best-effort, like
+    both seam calls it makes: an unanswerable listing (``[]``, which the
+    backend already reports on stderr) selects nothing and the attach goes to
+    the session as before. The id is replayed verbatim, so a backend that
+    qualifies it (psmux's ``session:@N``) is handed back its own form."""
+    entries = runs.journal_entries_or_none(runs.run_dir_for(project, run_id))
+    start, _ = open_session_start_indexed(entries or [])
+    task_id = start.get("task_id") if start is not None else None
+    want = runs.task_window_name(str(task_id)) if task_id is not None else None
+    mux = get_multiplexer()
+    # window_name last: list_windows' bounded split keeps a free-text field whole.
+    rows = [
+        row
+        for row in mux.list_windows(runs.session_name(run_id), ["window_id", "window_name"])
+        if row and row[0]
+    ]
+    named = [row for row in rows if want is not None and row[1:2] == (want,)]
+    pick = named or rows
+    if pick:
+        mux.select_window(pick[-1][0])
+
+
 # Per-window tmux user option recording what an interactive attach should do
 # with the client once the window's command exits (consumed by the multiplexer's
 # parked-window return trailer; see start_detached and the tmux backend). Set by
@@ -979,7 +1014,11 @@ def attach_plan(
     A ctl lookup that raises (its listing could not be read) is handed to
     `on_fault` and the plan carries on as if there were no ctl window: the
     agent session may still be reachable, and an attach must not be refused
-    for a window it could not check. With no `on_fault` the raise propagates."""
+    for a window it could not check. A raising select of the agent's task window
+    (select_agent_window) does not block the attach either: with `on_fault`
+    given it is warned on stderr under its own name — `on_fault` carries ctl
+    lookup faults only, which a caller reports as such — and the attach lands on
+    the session's current window. With no `on_fault` either raise propagates."""
     session = runs.session_name(run_id)
     try:
         win_id, unproven = ctl_window_lookup(project, run_id)
@@ -995,6 +1034,19 @@ def attach_plan(
         select_ctl_window_id(win_id)
         return (runs.attach_target_argv(ctl_target(project)), win_id), unproven
     if agent_live:
+        # A select that raises must not block the attach: the client lands on
+        # the current window. Warned under its own name, not via on_fault,
+        # which callers report as a control-window fault.
+        try:
+            select_agent_window(project, run_id)
+        except MultiplexerError as e:
+            if on_fault is None:
+                raise
+            print(
+                f"warning: could not select the run's task window, attaching to {session} "
+                f"as is: {e}",
+                file=sys.stderr,
+            )
         return (runs.attach_target_argv(runs.session_target(run_id)), None), unproven
     return None, unproven
 

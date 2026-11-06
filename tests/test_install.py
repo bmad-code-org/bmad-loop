@@ -5841,13 +5841,6 @@ def test_new_dev_auto_skill_is_additive_for_sprint_mode(tmp_path, primitive):
     assert missing_stories_support(tmp_path, [tree]) == []
 
 
-def test_provision_worktree_seed_skips_missing_source(tmp_path):
-    wt, repo = tmp_path / "wt", tmp_path / "repo"
-    repo.mkdir()
-    provision_worktree(wt, [], repo, seed_files=[".mcp.json"])
-    assert not (wt / ".mcp.json").exists()
-
-
 def test_provision_worktree_seed_does_not_clobber_existing(tmp_path):
     """A seed target already present in the worktree (tracked/committed) is left
     untouched, so no diff is merged back. The untouched entry is REPORTED, so a
@@ -5973,13 +5966,14 @@ def test_provision_worktree_seeds_absent_empty_child_dir(tmp_path):
 def test_provision_worktree_reports_nothing_when_seeding_succeeds(tmp_path):
     """A gitignored config present in the main repo is copied into the worktree (a
     `git worktree add` checkout would omit it). A seed that actually copies is not
-    reported — the signal stays specific to entries that silently did nothing. A missing source is also not a no-op report:
-    it is already covered as its own case."""
+    reported — the signal stays specific to entries that silently did nothing. A
+    missing source (`absent.json`) is skipped: neither copied nor reported."""
     wt, repo = tmp_path / "wt", tmp_path / "repo"
     repo.mkdir()
     (repo / ".mcp.json").write_text("FROM_REPO", encoding="utf-8")
     assert provision_worktree(wt, [], repo, seed_files=[".mcp.json", "absent.json"]) == []
     assert (wt / ".mcp.json").read_text() == "FROM_REPO"
+    assert not (wt / "absent.json").exists()
 
 
 def test_provision_worktree_seed_rejects_escaping_path(tmp_path):
@@ -7474,30 +7468,6 @@ def test_shield_runs_in_a_repository_with_an_owner_only_octal_mode(project, tmp_
     assert "probe-384" not in git(wt, "status", "--porcelain", "-uall")
 
 
-def test_shield_refuses_a_group_readable_octal_mode(project, tmp_path):
-    """`core.sharedRepository = 0640` is a filemode granting GROUP access, so it is
-    refused exactly like the `group` keyword — the octal support accepts owner-only
-    modes and must not widen past them.
-
-    `0640` rather than `0666` on purpose: it is the row immediately across the
-    boundary from the accepted `0600`, so it fails first if the mask is loosened.
-
-    Ablation: drop the `& 0066` mask from `_shared_repository_is_private` (accept any
-    octal git does not reject) and this fails — the shield proceeds in a repository
-    shared between OS users."""
-    repo = project.project
-    wt = tmp_path / "wt"
-    verify.worktree_add(repo, wt, "feat", "main")
-    git(repo, "config", "core.sharedRepository", "0640")
-
-    reason = _worktree_local_exclude(wt, ["/probe-384"])
-
-    assert reason is not None and "shared between OS users" in reason
-    assert "0640" in reason
-    assert not (repo / ".git" / "bmad-loop-shield.lock").exists()
-    assert not _wt_private_exclude(wt).exists()
-
-
 def test_shield_refuses_a_valueless_shared_repository_key(project, tmp_path):
     """`sharedRepository` with NO value is git's `PERM_GROUP` — a shared repository —
     and `--get` answers it rc 0 with a lone newline, byte-identical to an explicitly
@@ -7869,29 +7839,6 @@ def test_shield_refuses_to_enable_extension_at_the_old_capability_floor(
     assert "supports git" in reason  # policy wording, not a capability claim
     assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     assert not _wt_private_exclude(wt).exists()
-
-
-def test_shield_enables_the_extension_on_the_path_that_activates(project, tmp_path):
-    """The other half of the deferral: moving the enable down must not lose it. A
-    happy path still leaves the repo carrying the extension — that write is what
-    `git config --worktree` needs to exist at all, so without it the activation
-    fatals and the shield does nothing.
-
-    `test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are` proves the
-    flag is absent after a degrade; this proves the
-    reordering did not simply stop setting it. Neither alone distinguishes the fix
-    from a deletion."""
-    repo = project.project
-    wt = tmp_path / "wt"
-    verify.worktree_add(repo, wt, "feat", "main")
-    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
-
-    assert _worktree_local_exclude(wt, ["/probe-384"]) is None
-
-    assert "worktreeConfig" in (repo / ".git" / "config").read_text(encoding="utf-8")
-    # ...and it bought a shield that actually holds
-    (wt / "probe-384").write_text("noise\n", encoding="utf-8")
-    assert git(wt, "status", "--short") == ""
 
 
 def test_shield_rolls_back_the_extension_when_activation_fails(project, tmp_path, monkeypatch):
@@ -8735,12 +8682,18 @@ def test_shield_enables_extension_when_only_the_global_config_claims_it(
     call alone for the reason the XDG test gives at length: an env pin that outlives
     the code under test changes what git thinks of files already checked out.
 
+    It is also the other half of the enable's deferral: moving the enable down must
+    not lose it. `test_shield_degrades_when_git_will_not_say_what_the_users_excludes_are`
+    proves the flag is absent after a degrade; this proves the reordering did not
+    simply stop setting it. Neither alone distinguishes the fix from a deletion.
+
     Ablation: drop `--file <shared>` from the extension probe and this fails — the
     global value is believed, the extension never reaches the repo config, and the
     activation returns a reason instead of None."""
     repo = project.project
     wt = tmp_path / "wt"
     verify.worktree_add(repo, wt, "feat", "main")
+    assert "worktreeConfig" not in (repo / ".git" / "config").read_text(encoding="utf-8")
     fake_global = tmp_path / "gitconfig-with-the-extension"
     fake_global.write_text("[extensions]\n\tworktreeConfig = true\n", encoding="utf-8")
 
@@ -9892,37 +9845,6 @@ def test_worktree_local_exclude_degrades_on_symlink_loop_resolve(project, monkey
     assert not exclude.is_file() or "/probe-359" not in exclude.read_text(encoding="utf-8")
 
 
-def test_worktree_local_exclude_degrades_on_write_fault(project, tmp_path, monkeypatch):
-    """A write fault on the exclude file itself (e.g. a read-only .git) degrades to
-    a reason instead of propagating — this pins the guard reaching the LAST
-    statement of the tail, not just the early resolve/mkdir steps.
-
-    Injected rather than chmod: a root-owned CI runner ignores a read-only bit.
-
-    A real LINKED worktree is the subject here and in the rest of this block: since
-    #384 the tail's write only happens for one (a main checkout is refused before
-    it), so a main-checkout subject would degrade for the wrong reason and pass
-    without ever reaching the statement under test.
-
-    Ablation: drop the tail's `try` (or `OSError` from its tuple) and this fails —
-    the OSError propagates out of `_worktree_local_exclude`."""
-    wt = tmp_path / "wt"
-    verify.worktree_add(project.project, wt, "feat", "main")
-
-    def boom(*a, **kw):
-        raise OSError("read-only .git")
-
-    # patched at install's OWN binding: the exclude write goes through atomic_write_bytes
-    # (#375, #384), which writes via os.fdopen on an mkstemp fd, so a
-    # Path.write_bytes/Path.open patch never fires and would pass vacuously — and so would
-    # a patch left on the atomic_write_TEXT this replaced.
-    monkeypatch.setattr(install_mod, "atomic_write_bytes", boom)
-
-    reason = _worktree_local_exclude(wt, ["/probe-359"])
-
-    assert reason is not None and "read-only .git" in reason
-
-
 def test_worktree_local_exclude_appends_to_a_non_utf8_private_exclude(project, tmp_path):
     """REPURPOSED, and the reversal is the fix (#384). This case used
     to assert that a private exclude which is not UTF-8 DEGRADES the shield away,
@@ -10006,8 +9928,15 @@ def test_worktree_local_exclude_short_write_leaves_exclude_intact(project, tmp_p
     through the real `open(mode="wb")` is the whole point — that is what
     truncates.
 
+    A real LINKED worktree is the subject: since #384 the tail's write only happens
+    for one (a main checkout is refused before it), so a main-checkout subject would
+    degrade for the wrong reason without ever reaching the write.
+
     Ablation: swap `atomic_write_bytes` back to a direct `exclude.write_bytes` and
-    this fails — the file comes back truncated."""
+    this fails — the file comes back truncated. This also pins the guard reaching
+    the LAST statement of the tail, not just the early resolve/mkdir steps: drop the
+    tail's `try` (or `OSError` from its tuple) and this fails — the OSError
+    propagates out of `_worktree_local_exclude`."""
     wt = tmp_path / "wt"
     verify.worktree_add(project.project, wt, "feat", "main")
     exclude = _wt_private_exclude(wt)

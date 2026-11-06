@@ -14,8 +14,9 @@
 # camelCase (sessionId, transcriptPath, cwd) regardless of event-name casing, and
 # the `agentStop` payload carries `transcriptPath` + `stopReason: end_turn` — the
 # shared relay reads both camelCase and snake_case, so the usage_parser gets the
-# transcript. CAVEAT: single build/OS (1.0.63, macOS); a future build may alias
-# `Stop`. NOTE: an enterprise policy permissions.disableBypassPermissionsMode =
+# transcript. Re-checked on 1.0.105 (Linux): same events and keys; the
+# `sessionStart` payload carries `sessionId` but no `transcriptPath`, so the
+# events file is known only from `agentStop`. A future build may alias `Stop`. NOTE: an enterprise policy permissions.disableBypassPermissionsMode =
 # 'disable' suppresses the --allow-all-* flags and will block unattended runs.
 name = "copilot"
 binary = "copilot"
@@ -30,10 +31,12 @@ launch_args = ["-i"]
 bypass_args = ["--allow-all-tools", "--allow-all-paths", "--allow-all-urls"]
 model_flag = "--model"
 usage_parser = "copilot-events"
-# Copilot writes its token totals (modelMetrics) only in the trailing
-# `session.shutdown` events.jsonl line, ~1s AFTER the agentStop hook fires — so
-# read usage on a short grace poll, not the instant the turn ends, or it samples
-# the transcript before the totals land (reads as 0/None).
+# Copilot writes its token totals (modelMetrics) only AFTER the agentStop hook
+# returns: in the turn's `session.usage_checkpoint` events.jsonl line (1.0.105)
+# and in the trailing `session.shutdown` line (~1s after the hook on 1.0.63) —
+# so read usage on a short grace poll, not the instant the turn ends, or it
+# samples the transcript before the totals land (reads as 0/None). The poll waits
+# for the shutdown line, since an earlier turn's checkpoint already reads non-None.
 usage_grace_s = 8.0
 # agentStop fires PER response turn, so a parallel-subagent review (e.g. the
 # bmad-dev-auto step-04 hunter layers) ends several turns; the global default of

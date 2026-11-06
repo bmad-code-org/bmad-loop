@@ -49,7 +49,7 @@ from typing import Any, NoReturn
 from . import gates, stories, verify
 from .adapters.base import SessionResult
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
-from .engine import Engine, RunPaused
+from .engine import USAGE_RELAUNCH_RESUME, Engine, RunPaused
 from .model import (
     PAUSE_ESCALATION,
     PAUSE_SPEC_APPROVAL,
@@ -180,8 +180,8 @@ class StoriesEngine(CheckpointFlowMixin, Engine):
             f"manifest, then `bmad-loop resume {self.state.run_id}`"
         )
         self.journal.append("stories-selector-unknown", story_key=selector)
+        self._save()  # before the notify: a host loss inside it keeps the pause
         gates.notify(self.policy, self.run_dir, f"unknown --story id: {selector}", reason)
-        self._save()
         raise RunPaused(reason, PAUSE_ESCALATION, selector)
 
     def _pause_wedged_story(self, sched: stories.Schedule) -> None:
@@ -350,6 +350,35 @@ class StoriesEngine(CheckpointFlowMixin, Engine):
             prompt += "\n" + entry.invoke_dev_with
         # A retry after a rolled-back attempt names its verified parked work (#777),
         # after the planner's verbatim text so that channel stays untouched.
+        preserved = self._retry_preserve_notice(task)
+        if preserved:
+            prompt += "\n\n" + preserved
+        return prompt
+
+    def _usage_relaunch_prompt(self, task: StoryTask) -> str | None:
+        """The kept-tree usage relaunch (DW-615): the base explicit-spec resume
+        line with this mode's clauses, the environment claim alone, then what the
+        fresh leg carries: ``Halt after planning.`` on a plan-halt leg (in
+        lock-step with ``BMAD_LOOP_PLAN_HALT``), the planner's ``invoke_dev_with``
+        verbatim and a retry's parked-work notice. None (roll back) unless the
+        id-keyed spec resolves as the attempt's file now — resolved by id, not
+        read off ``spec_file``, which a stories dispatch leaves unset until a
+        session completes: the cut-off first attempt that wrote the spec is the
+        case this keeps."""
+        spec = self._dispatched_spec_for_attempt(task)
+        if spec is None:
+            return None
+        env_claim = self._environment_claim_instruction()
+        entry = self._entry_for(task)
+        prompt = (
+            f"/{self._dev_skill()} Resume the autonomous dev session on the spec at "
+            f"`{spec}`. {USAGE_RELAUNCH_RESUME}"
+        )
+        if self._plan_halt_leg(task, _checkpoint_flags(entry)):
+            prompt += " Halt after planning."
+        prompt += f" {env_claim}" if env_claim else ""
+        if entry is not None and entry.invoke_dev_with:
+            prompt += "\n" + entry.invoke_dev_with
         preserved = self._retry_preserve_notice(task)
         if preserved:
             prompt += "\n\n" + preserved

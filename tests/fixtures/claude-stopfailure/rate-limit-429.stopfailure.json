@@ -1,0 +1,12 @@
+{
+  "session_id": "a9ebf689-8776-4458-93ee-7d7e1714614e",
+  "transcript_path": "<capture-root>/cfg/projects/<capture-root>-proj/a9ebf689-8776-4458-93ee-7d7e1714614e.jsonl",
+  "cwd": "<capture-root>/proj",
+  "prompt_id": "9fba52d3-bba9-4797-b291-93d3e5c8f9fd",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "StopFailure",
+  "error": "rate_limit",
+  "last_assistant_message": "API Error: Request rejected (429) · Number of request tokens has exceeded your per-minute rate limit"
+}

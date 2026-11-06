@@ -2,8 +2,8 @@
 """Readiness gate for the bmad-loop Unity engine plugin.
 
 Blocks until the Unity Editor + MCP bridge are ready to accept commands, so a
-dev/sweep session never starts against a half-open Editor. The engine runs this
-as the plugin's ``ready_cmd`` and injects its configuration via the environment.
+dev/sweep session never starts against a half-open Editor. The plugin's
+``pre_ready_gate`` hook runs this and injects its configuration via the environment.
 
 Supported MCP servers (BMAD_LOOP_ENGINE_MCP):
   - ivanmurzak : shells out to the Unity-MCP CLI's ``wait-for-ready`` (passing an
@@ -21,7 +21,8 @@ Supported MCP servers (BMAD_LOOP_ENGINE_MCP):
                  tool-list``) and some return null/non-zero even when healthy, so the
                  round-trip is opt-in for operators who've picked a tool that works.
   - coplaydev  : connectivity check against the MCP HTTP server (best effort —
-                 see note below; override engine.ready_cmd for a stricter probe).
+                 see note below; for a stricter probe, edit this script in a
+                 project-local copy of the plugin — see the NOTE).
 
 Cold-launch grace: a per_worktree Editor is launched fresh per unit and needs
 time to start (and import) before it can answer at all. The gate waits
@@ -43,8 +44,11 @@ Env knobs (all optional):
   UNITY_MCP_URL                  CoplayDev MCP server URL         (default http://localhost:8080)
 
 NOTE: the exact IvanMurzak CLI name/subcommand and CoplayDev readiness endpoint
-move between releases — verify against the version installed in your project and
-override ``engine.ready_cmd`` in a project-local plugin if they differ.
+move between releases — verify against the version installed in your project and,
+if they differ, edit this script in a project-local copy of the plugin
+(``.bmad-loop/plugins/unity/``). Grant the copy with ``bmad-loop plugins enable
+unity`` and re-run ``bmad-loop plugins accept unity`` after each edit, or startup
+fails; the hook then runs the copy's verified snapshot.
 """
 
 from __future__ import annotations
@@ -148,7 +152,8 @@ def _ready_ivanmurzak(deadline: float) -> int:
     if shutil.which(cli) is None:
         print(
             f"unity_ready: {cli!r} not found on PATH; install the Unity-MCP CLI, set "
-            "UNITY_MCP_CLI, or override engine.ready_cmd",
+            "UNITY_MCP_CLI, or override unity_ready.py in a project-local plugin copy "
+            "(.bmad-loop/plugins/unity/, granted with `bmad-loop plugins enable unity`)",
             file=sys.stderr,
         )
         return 2

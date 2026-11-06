@@ -228,6 +228,9 @@ def test_both_relay_twins_forward_the_notification_type(tmp_path, monkeypatch, p
 
 
 _STOP_KEYS = ("stop_error", "stop_error_details", "stop_message")
+# Claude Code's mid-response-cut StopFailure wording, built by concatenation so this file
+# carries no line the claude env-fault patterns match (the repo-wide pane scan).
+_LOST_MESSAGE = "API Error: Connection lost " + "mid-response"
 
 
 @pytest.mark.parametrize(
@@ -237,12 +240,12 @@ _STOP_KEYS = ("stop_error", "stop_error_details", "stop_message")
             {
                 "error": "server_error",
                 "error_details": "529 Overloaded",
-                "last_assistant_message": "API Error: Connection lost mid-response",
+                "last_assistant_message": _LOST_MESSAGE,
             },
             {
                 "stop_error": "server_error",
                 "stop_error_details": "529 Overloaded",
-                "stop_message": "API Error: Connection lost mid-response",
+                "stop_message": _LOST_MESSAGE,
             },
         ),
         # optional fields absent -> their keys are absent, the present one still rides
@@ -330,6 +333,7 @@ def test_both_relay_twins_forward_the_session_start_source(
     assert from_relay["source"] == expected
 
 
+@pytest.mark.parametrize("event_name", ["SessionStart", "Stop"])
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -340,18 +344,31 @@ def test_both_relay_twins_forward_the_session_start_source(
         ({"model": ["gpt-5.5"]}, None),
         ({"model": ""}, None),
         ({}, None),
+        # agy's Stop names it `modelName` (DW-634): aliased, `model` wins
+        ({"modelName": "gemini-4-argon-medium"}, "gemini-4-argon-medium"),
+        ({"model": "gpt-5.5-codex", "modelName": "gemini-x"}, "gpt-5.5-codex"),
+        ({"model": "", "modelName": "gemini-x"}, "gemini-x"),
+        ({"model": 7, "modelName": "gemini-x"}, "gemini-x"),
+        ({"modelName": 7}, None),
+        ({"modelName": ""}, None),
+        # bounded like `model`: cut to RELAY_TEXT_MAX, never dropped
+        ({"modelName": "m" * (events.RELAY_TEXT_MAX + 5)}, "m" * events.RELAY_TEXT_MAX),
     ],
 )
-def test_both_relay_twins_forward_the_hook_model(tmp_path, monkeypatch, payload, expected):
-    """#859: a hook payload's `model` reaches the event file from BOTH writers,
-    and only when it is a non-empty string — otherwise the key is absent, so an
-    event without one is unchanged (`test_relay_and_the_hook_shape_the_same_event`).
+def test_both_relay_twins_forward_the_hook_model(
+    tmp_path, monkeypatch, payload, expected, event_name
+):
+    """#859: a hook payload's `model` (or, failing that, agy's `modelName`,
+    DW-634) reaches the event file from BOTH writers, on SessionStart and on
+    Stop (where agy sends it), and only when it is a
+    non-empty string — otherwise the key is absent, so an event without one is
+    unchanged (`test_relay_and_the_hook_shape_the_same_event`).
 
     Ablation: drop the `model` write from either writer and the string cases fail
     on that side; write it unconditionally and the absent cases fail."""
     hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
     proc = subprocess.run(
-        [sys.executable, str(HOOK), "SessionStart"],
+        [sys.executable, str(HOOK), event_name],
         input=json.dumps(payload),
         env={
             "PATH": os.environ.get("PATH", ""),
@@ -364,7 +381,7 @@ def test_both_relay_twins_forward_the_hook_model(tmp_path, monkeypatch, payload,
         timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
-    assert _relay("SessionStart", payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
+    assert _relay(event_name, payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
     from_hook = json.loads(next((hook_run / "events").glob("*.json")).read_text(encoding="utf-8"))
     from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text(encoding="utf-8"))
     if expected is None:

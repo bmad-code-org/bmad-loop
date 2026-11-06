@@ -459,8 +459,13 @@ OPENCODE_V2_UNSEEDED_REAL = [
 #
 # Provenance, since a pattern here may only be seeded from a captured line: the
 # first two were captured in issue #194, run `20260718-191419-44e7`, on the
-# `claude` adapter. The last three come from Claude Code's own JSONL transcripts,
-# from entries structurally tagged `"isApiErrorMessage": true`.
+# `claude` adapter. The next three come from Claude Code's own JSONL transcripts,
+# from entries structurally tagged `"isApiErrorMessage": true`; their `closed`
+# mid-response sentence is an older build's. The last three are Claude Code
+# 2.1.317's current wording, captured 2026-11-02 by
+# scripts/capture_claude_stopfailure.py (tests/fixtures/claude-stopfailure/,
+# the mid-response-cut, overloaded-529 and server-error-500 StopFailure
+# payloads; the 5xx lines name the fake server's gateway, port redacted).
 #
 # The quota class is still ABSENT from env_fault_patterns, and deliberately so:
 # no captured Claude Code provider-side quota line exists — not in this repo, not
@@ -478,6 +483,11 @@ CLAUDE_REAL = [
     "in a moment. If it persists, check https://status.claude.com.",
     "API Error: 500 Internal server error. This is a server-side issue, usually temporary — "
     "try again in a moment. If it persists, check https://status.claude.com.",
+    "API Error: Connection lost mid-response. The response above may be incomplete.",
+    "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again "
+    "in a moment. If it persists, check your inference gateway (127.0.0.1:<port>).",
+    "API Error: 500 Internal server error. This is a server-side issue, usually temporary — "
+    "try again in a moment. If it persists, check your inference gateway (127.0.0.1:<port>).",
 ]
 
 # Claude Code's subscription usage-limit lines (#610), as its pane prints them —
@@ -1135,11 +1145,24 @@ def test_shipped_patterns_do_not_match_their_own_profile_line(name: str) -> None
 #   false-negative half has to assert against the real thing.
 # * test_generic_tmux.py drives the REAL classifier end to end, so its fixture
 #   logs must be lines the shipped patterns actually match.
+# * tests/fixtures/claude-stopfailure/ holds verbatim Claude Code captures
+#   (scripts/capture_claude_stopfailure.py): the StopFailure payload and the
+#   pipe-pane bytes of the three scenarios whose error is an env fault carry the
+#   CLI's own error line, which is the evidence the patterns are seeded from.
 #
-# Both are pinned as non-vacuous below: an entry only stays legitimate while the
+# All are pinned as non-vacuous below: an entry only stays legitimate while the
 # file really does carry a matching line, so the list cannot be padded to silence
 # a genuine regression.
-DELIBERATE_CORPUS_FILES = ("tests/test_env_fault_patterns.py", "tests/test_generic_tmux.py")
+_STOPFAILURE_FIXTURES = "tests/fixtures/claude-stopfailure"
+DELIBERATE_CORPUS_FILES = (
+    "tests/test_env_fault_patterns.py",
+    "tests/test_generic_tmux.py",
+    *(
+        f"{_STOPFAILURE_FIXTURES}/{scenario}.{kind}"
+        for scenario in ("mid-response-cut", "overloaded-529", "server-error-500")
+        for kind in ("stopfailure.json", "pipe-pane.log")
+    ),
+)
 
 
 def test_pane_capture_patterns_do_not_match_this_repo() -> None:

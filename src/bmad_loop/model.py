@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -124,6 +125,12 @@ SWEEP_REFUSED_NOT_STARTED = "not-started"  # the launch raised before a child ex
 SWEEP_REFUSED_FAILED = "failed"  # a child started, then failed
 SWEEP_REFUSED_DIRTY = "dirty"  # the worktree was unclean, or `git status` faulted
 
+# The `TokenUsage.by_model` key for usage a parser read but cannot pin on a
+# model (no model on the line, a codex token_count before any turn_context, a
+# multi-model opencode V2 parent). Angle-bracketed so it can never collide with
+# a real model id; present only when its total is nonzero.
+UNATTRIBUTED_MODEL = "<unattributed>"
+
 
 @dataclass
 class TokenUsage:
@@ -145,6 +152,15 @@ class TokenUsage:
     # out of equality, `add` and `to_dict` like `unread`. The engine journals it
     # on `session-end` as `models` / `models_unresolved`. APPENDED.
     models: tuple[str, ...] | None = field(default=None, compare=False)
+    # The same usage split per observed model (DW-618): each value's four
+    # counts, summed field-wise over the map, equal the totals above. Keys are
+    # elements of `models` (in `models` order) plus `UNATTRIBUTED_MODEL` for
+    # usage the parser could not attribute. None exactly when `models` is None;
+    # a value's own `models`/`by_model` stay None. Built by `settle_by_model`.
+    # Diagnostic only, and left out of equality, `add` and `to_dict` like
+    # `models`. The engine journals it on `session-end` as `tokens_by_model`.
+    # APPENDED.
+    by_model: dict[str, "TokenUsage"] | None = field(default=None, compare=False)
 
     def add(self, other: "TokenUsage") -> None:
         self.input_tokens += other.input_tokens
@@ -190,6 +206,39 @@ class TokenUsage:
         )
 
 
+def settle_by_model(
+    buckets: Mapping[str | None, TokenUsage], models: tuple[str, ...]
+) -> dict[str, TokenUsage]:
+    """A parser's per-model buckets as a `TokenUsage.by_model` map: the keys
+    that are in `models`, in `models` order, then `UNATTRIBUTED_MODEL` holding
+    every other bucket (None = no model known) when its total is nonzero. So
+    the key invariant (keys within `models` plus the sentinel) holds by
+    construction, and so does the sum invariant: nothing is dropped but a zero
+    sentinel."""
+    settled: dict[str, TokenUsage] = {}
+    for model in models:
+        bucket = buckets.get(model)
+        if bucket is not None and model not in settled:
+            settled[model] = bucket
+    stray = TokenUsage()
+    for key, bucket in buckets.items():
+        if key is None or key not in settled:
+            stray.add(bucket)
+    if any(stray.to_dict().values()):
+        settled[UNATTRIBUTED_MODEL] = stray
+    return settled
+
+
+def add_to_bucket(
+    buckets: dict[str | None, TokenUsage], model: str | None, usage: TokenUsage
+) -> None:
+    """Add `usage`'s four counts to `buckets[model]` (created on first use)."""
+    bucket = buckets.get(model)
+    if bucket is None:
+        bucket = buckets[model] = TokenUsage()
+    bucket.add(usage)
+
+
 @dataclass
 class SessionRecord:
     task_id: str
@@ -218,6 +267,11 @@ class SessionRecord:
     # (`models` / `models_unresolved`) carries that distinction. Never the
     # configured `model` above, which keeps its meaning. APPENDED.
     models: tuple[str, ...] = ()
+    # the session's usage split per observed model (TokenUsage.by_model, DW-618),
+    # copied by attach_session_usage when non-empty; {} when not split. A key may
+    # be UNATTRIBUTED_MODEL. Diagnostic: never folded into StoryTask.tokens.
+    # APPENDED.
+    tokens_by_model: dict[str, TokenUsage] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -235,6 +289,10 @@ class SessionRecord:
         # written only when observed, so legacy-shaped state stays byte-stable
         if self.models:
             d["models"] = list(self.models)
+        if self.tokens_by_model:
+            d["tokens_by_model"] = {
+                model: usage.to_dict() for model, usage in self.tokens_by_model.items()
+            }
         return d
 
     @classmethod
@@ -258,7 +316,27 @@ class SessionRecord:
             result_json=d.get("result_json"),
             label=str(d.get("label", "") or ""),
             models=models,
+            tokens_by_model=_tokens_by_model_from(d.get("tokens_by_model")),
         )
+
+
+def _tokens_by_model_from(raw: object) -> dict[str, TokenUsage]:
+    """Rehydrate `SessionRecord.tokens_by_model`: a mapping of model id to a
+    `TokenUsage.to_dict` shape. Tolerant like `models`: a non-dict reads as {}
+    and an entry whose key is not a str, whose value is not a dict, or whose
+    counts do not parse is skipped — the split is diagnostic, never a load
+    fault."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, TokenUsage] = {}
+    for model, value in cast(dict[object, object], raw).items():
+        if not isinstance(model, str) or not isinstance(value, dict):
+            continue
+        try:
+            out[model] = TokenUsage.from_dict(cast(dict[str, Any], value))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return out
 
 
 def result_mapping(result_json: dict[str, Any] | None) -> dict[str, Any]:
@@ -619,6 +697,13 @@ class StoryTask:
     # reused after a human re-arm, so the exact record occurrence is the acceptance
     # identity; None is legacy/unarmed.
     accepted_dev_session_index: int | None = None
+    # Session task_id (story, `dev`, attempt, generation) of the dev attempt a RETRY
+    # decision rejected, persisted in that decision's DEV_VERIFY save and cleared
+    # by the next attempt's DEV_RUNNING save (DW-617). DEV_VERIFY + spec_file is
+    # otherwise the spec-approval resume shape, so a host loss in the retry window
+    # would review the rejected attempt. Keyed on the attempt identity, not a
+    # flag: an attempt bump or a generation-bumping re-arm leaves it stale.
+    rejected_dev_task_id: str = ""
     harvest_carry_commit_pending: bool = False
     isolated_ledger_carried: bool = False
     # Publication evidence is independent of the artifact-only receipt. None
@@ -916,7 +1001,9 @@ class StoryTask:
         """Fold usage into the most recent session for `task_id`. Usage is
         best-effort metadata attached after the session itself is saved, so a
         failed usage read never costs the recorded session. Observed
-        ``usage.models`` also land on the record's ``models`` when non-empty."""
+        ``usage.models`` also land on the record's ``models`` when non-empty,
+        and ``usage.by_model`` on its ``tokens_by_model`` likewise (never on
+        ``self.tokens``)."""
         if usage is None:
             return
         for record in reversed(self.sessions):
@@ -927,6 +1014,8 @@ class StoryTask:
                 self.tokens.add(usage)
             if usage.models:
                 record.models = tuple(usage.models)
+            if usage.by_model:
+                record.tokens_by_model = dict(usage.by_model)
             return
         raise KeyError(task_id)
 
@@ -987,6 +1076,7 @@ class StoryTask:
             "pinned_config_rewrites": deepcopy(self.pinned_config_rewrites),
             "board_advance_intended": self.board_advance_intended,
             "accepted_dev_session_index": self.accepted_dev_session_index,
+            "rejected_dev_task_id": self.rejected_dev_task_id,
             "harvest_carry_commit_pending": self.harvest_carry_commit_pending,
             "isolated_ledger_carried": self.isolated_ledger_carried,
             "artifact_baseline": deepcopy(self.artifact_baseline),
@@ -1282,6 +1372,7 @@ class StoryTask:
                 if d.get("accepted_dev_session_index") is not None
                 else None
             ),
+            rejected_dev_task_id=str(d.get("rejected_dev_task_id", "") or ""),
             harvest_carry_commit_pending=bool(d.get("harvest_carry_commit_pending", False)),
             isolated_ledger_carried=bool(d.get("isolated_ledger_carried", False)),
             artifact_baseline=deepcopy(d.get("artifact_baseline")),

@@ -65,6 +65,26 @@ server per session, so the inherited environment is that session's own server's.
 registry is keyed on the state root, so a launcher normally reaches only servers started
 under its own root; the note covers the cases where it does not.
 
+### Your own tmux configuration
+
+bmad-loop runs on your default tmux server, so your `~/.tmux.conf` (or
+`~/.config/tmux/tmux.conf`) applies to its windows. It never changes a server-wide or
+global option. The only option it sets is session-local: `destroy-unattached off`.
+
+- **A config command that fails at server start.** When a `run` or `run-shell` in your config
+  fails or prints, tmux shows the output in view-mode on whichever pane is active when the
+  command finishes. If bmad-loop started the server, that is the session's first window,
+  `shell`: task windows open detached, so the agent's pane keeps taking wake nudges and the
+  TUI's answer keys. `bmad-loop attach` and the TUI's `a` select the task window, and an
+  attached client follows each new one. An attach right after the server starts can still
+  put the output on the task window. bmad-loop never types into a pane in a mode, since
+  leaving it would yank out an operator reading scrollback, so nudges and answers are then
+  refused with `is in a pane mode (view-mode)`, and the refusal says to press `q` in that
+  window. To stop the output, make the failing config command succeed (run it by hand).
+- **Extended keys.** `extended-keys on` or `always`, in either `xterm` or `csi-u` format,
+  does not change the `Enter` and `Escape` that bmad-loop sends: Claude Code receives both
+  as plain keys (checked on tmux 3.8).
+
 ## psmux (native Windows, experimental)
 
 On a native-Windows host the bundled **psmux** backend is the platform default. psmux is a
@@ -286,7 +306,7 @@ A removal can still strand a session when the session listing misses it, because
 
 1. Put the multiplexer back on `PATH`.
 2. Run `bmad-loop cleanup`. It prunes a session tagged to this project even when its run directory is gone.
-3. For an untagged session, inspect it by hand. `bmad-loop attach` cannot reach it, because it needs the run directory. On psmux, paste the `$env:PSMUX_DATA_DIR = …` line `bmad-loop mux` prints first ([why](#where-psmux-sessions-live-the-per-project-registry)). Then attach with `psmux attach -t bmad-loop-<run-id>` (`tmux attach -t …` on tmux).
+3. For an untagged session, inspect it by hand. `bmad-loop attach` cannot reach it, because it needs the run directory. On psmux, paste the `$env:PSMUX_DATA_DIR = …` line `bmad-loop mux` prints first ([why](#where-psmux-sessions-live-the-per-project-registry)). Then attach with `psmux attach -t bmad-loop-<run-id>` (`tmux attach -t …` on tmux). It opens on the session's `shell` window; the agent is in the next window (prefix, then `n`).
 4. Once you have confirmed from its contents that it is yours (the name does not carry the project), kill it: `psmux kill-session -t bmad-loop-<run-id>` (or `tmux kill-session -t …`).
 
 Never kill a `bmad-loop-ctl…` control session this way: its windows can be live runs.

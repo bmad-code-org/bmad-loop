@@ -437,6 +437,13 @@ def session_name(run_id: str) -> str:
     return f"bmad-loop-{run_id}"
 
 
+def task_window_name(task_id: str) -> str:
+    """Name of the window a task's agent session runs in, inside the run's
+    :func:`session_name` session: the task id's last 40 characters. The adapter
+    names the window with it, and an attach finds the task window by it."""
+    return task_id[-40:]
+
+
 def attach_target_argv(target: str) -> list[str]:
     """Multiplexer command to reach a target session/window (see
     :meth:`TerminalMultiplexer.attach_target_argv`)."""

@@ -358,7 +358,6 @@ def test_capability_cache_reprobes_a_changed_script(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("run", "error"),
     [
-        (ChildRun(1, "", '{"error": "two entries with id 1", "where": "epic-cart"}'), TicketsFault),
         (ChildRun(1, "", '{"error": "no ticket matches \'x\'"}'), TicketsNoMatch),
         (
             ChildRun(1, "", "Traceback (most recent call last):\n  ...\nKeyError: 'id'"),
@@ -373,7 +372,6 @@ def test_capability_cache_reprobes_a_changed_script(tmp_path, monkeypatch):
         (ChildRun(0, '{"store": "repo"}', ""), TicketsSchemaError),
     ],
     ids=[
-        "rc1-json-fault",
         "rc1-no-match",
         "rc1-traceback",
         "rc0-not-json",

@@ -69,7 +69,8 @@ breaking changes may land in a minor release.
 - Support OpenCode 2.x (`@opencode/cli`) in the opencode-http adapter, picking the server
   API from `opencode --version` (`validate`: `adapter.opencode-version`). On 2.x `effort`
   is sent as the model variant, subagent tokens count toward usage and the budget, forms
-  show in the `[bmad]` transcript, and provider errors are logged to
+  show in the `[bmad]` transcript, a dev/review turn end waits (up to the dev stall grace)
+  for background subagents still running, and provider errors are logged to
   `logs/<task-id>.provider-errors.log`, where outages pause as environment faults and
   quota failures as usage limits (#847).
 - Add `bmad-loop resolve <replay-run> --abandon`: close a replay run that escalated
@@ -91,12 +92,25 @@ breaking changes may land in a minor release.
 - Add opt-in `[limits] usage_limit_action = "relaunch"`: a session that ends on a usage
   limit relaunches the story at once without charging an attempt, up to
   `max_usage_relaunches` per story (default 3), then pauses as before. The relaunched
-  session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers (#959).
+  session gets `BMAD_LOOP_USAGE_RELAUNCH` for account-rotation wrappers. A dev relaunch
+  keeps the cut-off tree when it can name the spec or ticket plan, else rolls back
+  (`dev-relaunch-tree` journal row), and pauses at `environment`, tree rolled back, when
+  the `[environment]` probes it runs first fail. Claude's `model_not_found` and
+  `cloud_credential_error` map to the new `account-fatal` StopFailure action, which pauses
+  like `account` but is never relaunched. `status --json` tasks and `diagnose` report
+  `dev_usage_relaunches` / `review_usage_relaunches`, the TUI marks a relaunched counter
+  `×N ↻M`, and the plain `status` task line appends the story's total `↻M` (#959).
 - Record the models a session actually ran on: session-end `models` (Claude, Codex,
-  Gemini, Copilot, OpenCode; `models_unresolved` when none was found), `status --json`
-  `adapters_used.<role>.models_used`, and the CLI-reported launch model (`session-model`
-  journal row) on the TUI agent line. `session-start` `model` still records the configured
-  model (#859).
+  Gemini, Copilot, OpenCode — on 2.x its subagent sessions' models too; `models_unresolved`
+  when none was found), `status --json` `adapters_used.<role>.models_used`, and the
+  CLI-reported launch model (`session-model` journal row) on the TUI agent line.
+  `session-start` `model` still records the configured model (#859).
+- Split each session's tokens per observed model: session-end `tokens_by_model` (summing
+  to `tokens`, `<unattributed>` for usage a parser cannot pin on a model), kept on the
+  state.json session record and summed per task in `status --json`.
+- Record Antigravity token usage from agy's per-step transcript counts (checked against
+  1.4.9), subagent conversations included, and show its model on the TUI agent line from
+  the first fully-idle Stop's `modelName`; session-end `models` stays untracked.
 
 ### Changed
 
@@ -138,7 +152,9 @@ breaking changes may land in a minor release.
 
 - Remove the `[engine]` policy alias: a named `[engine]` block now fails to load with the
   `[plugins] enabled` + `[plugins.<name>]` migration, and an empty-name block is ignored
-  with a warning to delete it. 0.13.2 is the last release that folds it (#810).
+  with a warning to delete it. 0.13.2 is the last release that folds it (#810). The
+  Unity plugin's guidance now points at a granted project-local plugin copy, not
+  `engine.*_cmd` overrides.
 - Remove the legacy `[review] on_status_contradiction = "retry"` mode: it now fails to load
   with a pointer to `escalate`, and a review that walks sprint-status or a ticket plan back
   from done always pauses. 0.13.2 is the last release that honours it (#813).
@@ -147,6 +163,37 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Open agent task windows detached, so a tmux config `run` or `run-shell` that fails or
+  prints when bmad-loop starts the server lands in view-mode on the session's `shell`
+  window instead of the agent's pane, where it refused every wake nudge and TUI answer
+  until someone pressed `q`. `bmad-loop attach` and the TUI's `a` select the task window
+  before attaching, and a client already attached to the session still follows each new
+  task window.
+- Make `probe-adapter codex --probe` able to capture: Codex keys hook trust by config path,
+  so a fresh temp dir always read untrusted and the probe never launched. Its hook config
+  now lives in a stable per-user workspace under the state root; the untrusted report says
+  to open Codex there once and accept the trust prompts. Captures stay in the temp dir.
+- Keep email redaction and leak detection in `diagnose` and `probe-adapter` linear on a
+  long line: an 80k-character alphanumeric run with no `@` took seconds to scan, and now
+  takes milliseconds. What counts as an email is unchanged.
+- Match agy's workspace-trust entries the way agy does: a forward-slash spelling of the
+  project (`C:/Users/...`) now counts as trusted on Windows when seeding a worktree and
+  in `probe-adapter --workspace`; case and trailing-separator variants still do not.
+- Read hook stdin as bytes in `probe-adapter --probe` captures, so a UTF-8 payload with a
+  non-ASCII path no longer garbles or drops on a Windows code-page locale. The capture
+  also keeps each payload's raw bytes beside it.
+- Stop counting Copilot cache reads, cache writes and reasoning tokens twice: Copilot's
+  `inputTokens` already includes the cache tokens and `outputTokens` the reasoning tokens.
+- Read Copilot usage from each turn's `session.usage_checkpoint` (Copilot 1.0.105), so a
+  session that ends without a `session.shutdown` line still reports its tokens and models.
+  The post-session read still waits its grace for the shutdown totals.
+- Resume a dev attempt rejected for retry, after a manual-rollback pause or a host loss
+  before the next attempt, by re-deciding or restarting it instead of reviewing and
+  committing it.
+- Save an escalation before running its notify command, so a host loss during a slow
+  notify no longer resumes the escalated dev attempt into review and commit. Worktree
+  unit escalations, plugin `pause`/`defer` vetoes, the unknown `--story` pause, the
+  worktree-open defer and the sweep's intent and migration pauses save first too.
 - Commit the engine's own deferred-work ledger changes before review, repair and retry
   sessions and after an in-place defer, so a tracked ledger no longer pauses the run with
   `finalization left repository dirty`. The in-place defer notice now prints
@@ -159,11 +206,13 @@ breaking changes may land in a minor release.
   roughly double), find a rollout by session id when the hook's transcript path is
   missing, and decode hook stdin as UTF-8 (#775).
 - Count Claude subagent and workflow-agent transcript writes as session activity, so a
-  session waiting on a foreground subagent no longer journals `session-idle`; the idle
-  notice names the tool it waits in (`subagent_transcript_dir` profile field) (#858).
+  session waiting on a foreground subagent no longer journals `session-idle` or is nudged
+  and stalled; the idle notice names the tool it waits in (`subagent_transcript_dir`
+  profile field) (#858).
 - Antigravity: ignore a `Stop` sent by a subagent or with `fullyIdle: false`, and count a
-  subagent's writes as its parent's activity, so a parent no longer completes early or
-  reads as idle while a subagent works (`subagent_spawn_marker` profile field).
+  subagent's writes as its parent's activity, so a parent no longer completes early, reads
+  as idle, or is nudged and stalled while a subagent works (`subagent_spawn_marker` profile
+  field). The `Stop` check skips conversations older than the session.
 - Pause a Claude session blocked by a usage limit with a `usage limit:` reason instead of
   charging a dev attempt (`usage_limit_patterns`, `usage_wait_patterns` profile fields);
   Windows installs now depend on tzdata so a named reset time zone resolves (#610).
@@ -212,7 +261,8 @@ breaking changes may land in a minor release.
   `remain-on-exit on` (#950); turn `destroy-unattached` off on bmad-loop's sessions
   (#951); spawn tmux with `-u` so listings parse without a UTF-8 locale (#881).
 - Send nudges to the agent's own pane, pinned at launch, not the window's active pane
-  (#948), and record a nudge typed into a copy- or clock-mode pane as not delivered (#949).
+  (#948), and record a nudge typed into a pane in copy, clock or view mode as not
+  delivered, naming the mode and how to leave it (#949).
 - psmux: start a run's session at the project root, so a Windows worktree teardown no
   longer leaves `worktrees/1` behind (#902); reach a miscased run ref's session (#904);
   refuse option values psmux 3.4.0 mangles (#905); report an unreadable session listing
@@ -223,6 +273,9 @@ breaking changes may land in a minor release.
   (#906).
 - Pause a Claude session uncharged, instead of charging a dev attempt for a crash, when
   its window dies after a usage-limit or account StopFailure or during a quota wait (#959).
+- Classify a Claude session cut off mid-response as an environment fault instead of
+  charging a dev attempt when Claude Code 2.1.317 prints `Connection lost`, not `closed`,
+  after `API Error`.
 
 ### Security
 

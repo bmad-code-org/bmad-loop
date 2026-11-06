@@ -1,0 +1,12 @@
+{
+  "session_id": "99dbe428-5b33-40db-9441-8bf228cfd7f9",
+  "transcript_path": "<capture-root>/cfg/projects/<capture-root>-proj/99dbe428-5b33-40db-9441-8bf228cfd7f9.jsonl",
+  "cwd": "<capture-root>/proj",
+  "prompt_id": "95547320-cae9-48a0-8f37-d82ee1971d17",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "StopFailure",
+  "error": "unknown",
+  "last_assistant_message": "API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request. Response: content-type json, empty body, 0 bytes, request-id absent, server other. This was the non-streaming retry of streaming request (no Anthropic request-id), which failed with: stream_truncated, StreamTruncatedError, StreamTruncated; 3 stream events received, first after 16 ms, none in the final 1 ms."
+}

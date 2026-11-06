@@ -18,6 +18,14 @@ For every event it writes two files atomically into the capture dir:
                              the CLI's exact field names and casing. The probe
                              command sanitizes this before it is ever shown;
                              nothing written here is displayed raw.
+  <ts>-<event>.stdin.raw     the stdin bytes verbatim, kept so a payload that
+                             does not parse (empty, truncated, undecodable) can
+                             still be read with --keep-temp. Never displayed.
+
+Stdin is read as bytes and parsed with ``json.loads``, which detects
+UTF-8/16/32 itself, exactly as the relay's ``_read_payload`` does: a text-mode
+read would decode with the locale code page (cp1252 on Windows) and garble or
+reject a non-ASCII path.
 
 Tolerant of empty/garbage stdin and of write errors — it must never crash the
 CLI window it is hooked into.
@@ -43,15 +51,39 @@ def _atomic_write(path: str, obj) -> None:
     os.replace(tmp, path)
 
 
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _read_stdin() -> bytes:
+    """The raw stdin bytes; a text-only stream (no ``buffer``) is re-encoded as
+    UTF-8, and an absent or unreadable stdin reads as empty."""
+    stdin = sys.stdin
+    buffer = getattr(stdin, "buffer", None)
+    try:
+        if buffer is not None:
+            return buffer.read()
+        if stdin is not None:
+            return stdin.read().encode("utf-8", "surrogateescape")
+    except (OSError, ValueError):
+        pass
+    return b""
+
+
 def main() -> int:
     capture_dir = os.environ.get("BMAD_LOOP_PROBE_CAPTURE_DIR")
     if not capture_dir:
         return 0
     task_id = os.environ.get("BMAD_LOOP_TASK_ID", "probe")
     event_name = sys.argv[1] if len(sys.argv) > 1 else "Unknown"
+    raw = _read_stdin()
     try:
-        payload = json.load(sys.stdin)
-    except (json.JSONDecodeError, ValueError):
+        payload = json.loads(raw)
+    # UnicodeDecodeError and JSONDecodeError are both ValueError subclasses.
+    except (ValueError, RecursionError):
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
@@ -79,6 +111,7 @@ def main() -> int:
         captured = dict(payload)
         captured["argv_event"] = event_name
         _atomic_write(os.path.join(capture_dir, f"{ts}-{event_name}.payload.json"), captured)
+        _atomic_write_bytes(os.path.join(capture_dir, f"{ts}-{event_name}.stdin.raw"), raw)
     except OSError:
         return 0
     return 0

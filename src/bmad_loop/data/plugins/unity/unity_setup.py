@@ -29,8 +29,9 @@ its own managed Editor:
   3. Launch a Unity Editor on the worktree path (detached) **with local-connection
      env** so it connects to that per-path local server and *hosts the server
      itself* (``--start-server true``) rather than the cloud. The plugin's
-     ``ready_cmd`` (the engine's readiness gate) then blocks until that Editor +
-     server are up, so this script only needs to start it, not wait for it.
+     ``pre_ready_gate`` hook (the readiness gate, ``unity_ready.py``) then blocks
+     until that Editor + server are up, so this script only needs to start it, not
+     wait for it.
 
 Why custom/local mode matters: a bare ``open`` passes no MCP connection env, so the
 Editor falls back to its persisted config (cloud by default) — the worktree Editor
@@ -48,12 +49,15 @@ in from the main repo by the plugin's ``seed_globs`` (``.claude/skills/*``).
 Verified against unity-mcp-cli v0.81.1 (`setup-mcp` writes ``.mcp.json`` with the
 deterministic local URL; `bootstrap-local --url --token` pins Custom mode; `open`
 injects UNITY_MCP_* env only when connection options are passed). The exact flags
-move between releases — override engine.worktree_setup_cmd in a project-local
-plugin if yours differ.
+move between releases — if yours differ, edit this script in a project-local copy
+of the plugin (``.bmad-loop/plugins/unity/``). Grant the copy with ``bmad-loop
+plugins enable unity`` and re-run ``bmad-loop plugins accept unity`` after each
+edit, or startup fails; the hook then runs the copy's verified snapshot.
 
 Only the IvanMurzak MCP is wired for a managed per-worktree launch. CoplayDev runs
 one shared :8080 server multiplexing Editors by instance id, so its per-worktree
-story differs — point engine.worktree_setup_cmd at your own script for it.
+story differs — supply your own ``unity_setup.py`` in a granted project-local copy
+of the plugin (as above) for it.
 
 Env (injected by the engine, all optional except the worktree):
   BMAD_LOOP_WORKTREE         the unit's worktree (the Unity project to manage)
@@ -459,7 +463,8 @@ def _setup_ivanmurzak(worktree: Path) -> int:
     if shutil.which(cli) is None:
         print(
             f"unity_setup: {cli!r} not found on PATH; install the Unity-MCP CLI, set "
-            "UNITY_MCP_CLI, or override engine.worktree_setup_cmd",
+            "UNITY_MCP_CLI, or override unity_setup.py in a project-local plugin copy "
+            "(.bmad-loop/plugins/unity/, granted with `bmad-loop plugins enable unity`)",
             file=sys.stderr,
         )
         return 2
@@ -544,9 +549,10 @@ def main() -> int:
     if mcp == "coplaydev":
         print(
             "unity_setup: per_worktree managed-launch is not wired for the CoplayDev "
-            "MCP (one shared :8080 server multiplexes Editors). Override "
-            "engine.worktree_setup_cmd with a CoplayDev launcher, or use editor_mode "
-            "= 'shared'.",
+            "MCP (one shared :8080 server multiplexes Editors). Supply a CoplayDev "
+            "launcher as unity_setup.py in a project-local plugin copy "
+            "(.bmad-loop/plugins/unity/, granted with `bmad-loop plugins enable unity`), "
+            "or set [plugins.unity] editor_mode = 'shared'.",
             file=sys.stderr,
         )
         return 2

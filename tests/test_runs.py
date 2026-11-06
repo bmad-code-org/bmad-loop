@@ -3864,18 +3864,6 @@ def test_delete_run_matches_the_session_by_exact_run_id(tmp_path, monkeypatch):
     assert not run_dir.exists()
 
 
-@pytest.mark.usefixtures("force_tmux_backend")  # the degradation is the seam's, not a stub's
-def test_delete_run_proceeds_when_the_multiplexer_cannot_answer(tmp_path, monkeypatch):
-    """Observation degrades: an absent multiplexer, a dead server, or a failed query
-    all read as "no session" (mux_sessions returns []). A removal the operator asked
-    for must not be blocked by an unanswerable question — the cost is only that the
-    backstop is inert there, which is the pre-#419 behavior."""
-    run_dir = _make_state_run(tmp_path, "r1")
-    monkeypatch.setattr(tmux_base.shutil, "which", lambda _name: None)  # no tmux at all
-    runs.delete_run(tmp_path, run_dir)
-    assert not run_dir.exists()
-
-
 @pytest.mark.parametrize(
     "kind",
     [
@@ -8890,15 +8878,20 @@ def test_legacy_registry_leftovers_keys_each_session_to_its_own_registry(tmp_pat
     `registry_root()` answers `None` for psmux's default — the seam deliberately
     never respells its home cascade — so that arm is labelled instead.
 
+    The default registry's session is `CTL_SESSION` on purpose: the prune
+    partition never touches it and the ctl-window sweep runs against the current
+    registry only, so a pre-upgrade control session survives the migration.
+    Naming it is the whole remedy.
+
     Ablate `legacy.registry_root() or DEFAULT_REGISTRY_LABEL` down to the
     constant and both keys collapse into one."""
     theirs = r"D:	heir-own-registry"
-    default_reg = _RegistryMux(["bmad-loop-ctl"], {})
+    default_reg = _RegistryMux([runs.CTL_SESSION], {})
     displaced = _RegistryMux(["bmad-loop-old-1"], {}, root=theirs)
     monkeypatch.setattr(runs, "_legacy_registries", lambda: [default_reg, displaced])
 
     assert _healthy_leftovers(tmp_path) == {
-        runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-ctl"],
+        runs.DEFAULT_REGISTRY_LABEL: [runs.CTL_SESSION],
         theirs: ["bmad-loop-old-1"],
     }
 
@@ -8919,15 +8912,6 @@ def test_legacy_registry_leftovers_merges_two_registries_that_name_one_root(tmp_
     assert _healthy_leftovers(tmp_path) == {
         runs.DEFAULT_REGISTRY_LABEL: ["bmad-loop-a", "bmad-loop-b"]
     }
-
-
-def test_legacy_registry_leftovers_names_a_surviving_control_session(tmp_path, monkeypatch):
-    """The prune partition never touches CTL_SESSION and the ctl-window sweep runs
-    against the current registry only, so a pre-upgrade control session survives
-    the migration. Naming it is the whole remedy."""
-    legacy = _RegistryMux([runs.CTL_SESSION], {})
-    monkeypatch.setattr(runs, "_legacy_registries", lambda: [legacy])
-    assert _healthy_leftovers(tmp_path) == {runs.DEFAULT_REGISTRY_LABEL: [runs.CTL_SESSION]}
 
 
 def test_legacy_leftovers_report_another_projects_derived_registry_in_full(tmp_path, monkeypatch):

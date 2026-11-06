@@ -40,7 +40,13 @@ seed_files = [
 #     20260718-191419-44e7 on this adapter.
 #   * `API Error` … `Connection closed mid-response`, and the 5xx pair
 #     (`529 Overloaded` / `500 Internal server error`) — Claude Code transcript
-#     entries structurally tagged "isApiErrorMessage": true.
+#     entries structurally tagged "isApiErrorMessage": true. The `closed`
+#     sentence is what older Claude Code builds wrote; it stays for them.
+#   * `API Error` … `Connection lost mid-response` — what Claude Code 2.1.317
+#     prints for a transport drop mid-stream (its binary carries only this
+#     wording), captured 2026-11-02 by scripts/capture_claude_stopfailure.py:
+#     tests/fixtures/claude-stopfailure/mid-response-cut.pipe-pane.log. The same
+#     capture re-confirms the 5xx pair's first sentences.
 #
 # The 5xx statuses are ENUMERATED, not ranged. A `5[0-9][0-9]` range admits 100
 # codes against either reason phrase when exactly two pairings were ever
@@ -67,6 +73,7 @@ seed_files = [
 env_fault_patterns = [
   "API Error: Unable to connect t[o] API",
   "API Error: Connection closed mid-respons[e]",
+  "API Error: Connection lost mid-respons[e]",
   "API Error: (5[2]9 Overloaded|5[0]0 Internal server error)",
 ]
 
@@ -219,12 +226,18 @@ elicitation_url_dialog = "PermissionPrompt"
 # `last_assistant_message` (the rendered API error, not the model's prose), and
 # this table maps the `error` value onto an adapter action: `transient` gets the
 # stop nudge at once, `account` ends the session parked (an uncharged pause),
-# `rate_limit` is split by its message, `ignore` does nothing. An unmapped value
-# is crumbed and otherwise ignored. StopFailure is never a completion event.
+# `account-fatal` ends it parked the same way, `rate_limit` is split by its
+# message, `ignore` does nothing. An unmapped value is crumbed and otherwise
+# ignored. StopFailure is never a completion event.
 #
 # Values verified 2026-10-30 against code.claude.com/docs/en/hooks.md (12
 # documented) and the Claude Code 2.1.316 build, which adds an undocumented
-# `verification_required`; a missing `error` reads as `unknown`. The event needs
+# `verification_required`; a missing `error` reads as `unknown`. Payloads
+# captured 2026-11-02 on 2.1.317 (scripts/capture_claude_stopfailure.py, zero
+# tokens; tests/fixtures/claude-stopfailure/): 529/500/mid-response cut report
+# `server_error` (a 529 is NOT `overloaded`), a truncated stream `unknown`, a 429
+# `rate_limit`, a 401 `authentication_failed`, a 402 `billing_error`;
+# `error_details` was absent from every payload. The event needs
 # Claude Code 2.1.78 or newer, and an older CLI must never see it: 2.1.77 checks
 # `hooks` keys against a fixed event list and skips the WHOLE settings file on
 # an unknown one, Stop relay included (npm bundle, checked 2026-10-31). Hence
@@ -238,7 +251,11 @@ elicitation_url_dialog = "PermissionPrompt"
 # `invalid_request` mostly means a context-shape failure (prompt too long,
 # compaction thrashing, a mismatched tool history) that a fresh session fixes —
 # not an account error. `unknown` also covers model-output failures (a malformed
-# tool call, an empty completion).
+# tool call, an empty completion). `model_not_found` (a wrong model name) and
+# `cloud_credential_error` (a broken cloud-provider credential) map to
+# `account-fatal`, not `account`: under `usage_limit_action = "relaunch"` an
+# `account` error is relaunched, but no relaunch or account switch fixes these,
+# so they always pause for the operator.
 [hooks.stop_failure_types]
 overloaded = "transient"
 server_error = "transient"
@@ -251,8 +268,8 @@ authentication_failed = "account"
 oauth_org_not_allowed = "account"
 account_on_hold = "account"
 verification_required = "account"
-cloud_credential_error = "account"
-model_not_found = "account"
+cloud_credential_error = "account-fatal"
+model_not_found = "account-fatal"
 
 # Native events an older Claude Code does not know -> the first version that
 # does (see StopFailure signals above for why the gate exists).

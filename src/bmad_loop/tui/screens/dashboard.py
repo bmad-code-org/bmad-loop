@@ -131,6 +131,14 @@ def _transcript_for_task(state: RunState, task_id: str) -> str | None:
     return found
 
 
+def _counter_cell(count: int, usage_relaunches: int) -> str:
+    """A task row's `dev` / `review` cell: `×N`, plus `↻M` when M of those N
+    sessions were uncharged usage-limit relaunches (#959) — why N can exceed its
+    cap. No `/cap`: `limits.max_usage_relaunches` is shared by both roles."""
+    cell = f"×{count}"
+    return f"{cell} ↻{usage_relaunches}" if usage_relaunches > 0 else cell
+
+
 class _PollContext:
     """Mutable state for polling one selected run. Constructed on the UI
     thread (constructors do no I/O), then mutated only inside the poll worker.
@@ -353,7 +361,7 @@ class DashboardScreen(Screen[None]):
         tasks.add_column("story", key="story", width=30)
         tasks.add_column("phase", key="phase", width=16)
         tasks.add_column("agent", key="agent", width=13)
-        tasks.add_column("dev", key="dev", width=5)
+        tasks.add_column("dev", key="dev", width=6)  # room for `×NN ↻M`
         tasks.add_column("review", key="review", width=6)
         tasks.add_column("tokens", key="tokens", width=12)
         tasks.add_column("info", key="info")
@@ -1199,8 +1207,8 @@ class DashboardScreen(Screen[None]):
             cells = {
                 "phase": str(task.phase),
                 "agent": self._agent_cell(task, key, agent),
-                "dev": f"×{task.attempt}",
-                "review": f"×{task.review_cycle}",
+                "dev": _counter_cell(task.attempt, task.dev_usage_relaunches),
+                "review": _counter_cell(task.review_cycle, task.review_usage_relaunches),
                 "tokens": tokens,
                 "info": info,
                 "raw": raw,  # must be last — matches add_column order
