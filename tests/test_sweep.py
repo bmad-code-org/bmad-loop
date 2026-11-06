@@ -4575,6 +4575,73 @@ def test_bundle_review_gate_journals_its_verify_commands(project):
     assert entry["command"] == _OK and entry["story_key"] == "dw-fix"
 
 
+def test_bundle_skip_review_gate_declines_verify_reuse_as_mode_unsupported(project, monkeypatch):
+    """Sweeps never reuse a green verify pass under `[verify] reuse_unchanged`
+    (#1002): the engine closes the bundle's ledger entries after the dev pass
+    and re-closes them before the gate, so no fingerprint would ever match.
+    With the flag on, the dev pass reads no fingerprint (mints no token), the
+    skip-review gate journals exactly one `mode-unsupported` decline, and both
+    passes run their commands.
+
+    Ablation: remove the `SweepEngine._verify_reuse_supported` override and the
+    dev pass fingerprints — the raising stub fires and the run crashes — and,
+    with a real fingerprint, the gate reuses the dev pass instead of declining."""
+    write_ledger(project, {"DW-1": "open"})
+    plan = triage_result(
+        ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
+    )
+    pol = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        review=ReviewPolicy(enabled=False),
+        dev=DevPolicy(skill="bmad-dev-auto"),
+        scm=ScmPolicy(rollback_on_failure=True),
+        verify=VerifyPolicy(commands=(_OK,), reuse_unchanged=True),
+        limits=LimitsPolicy(max_dev_attempts=1),
+    )
+    engine, _ = make_sweep(
+        project,
+        [
+            triage_effect(plan),
+            bundle_dev_effect(project, "fix", ["DW-1"], mark_ledger=False, followup_review=False),
+        ],
+        policy=pol,
+    )
+    real_run = verify.run_verify_commands
+    ran = []
+
+    def counting_run(policy, cwd):
+        ran.append(cwd)
+        return real_run(policy, cwd)
+
+    def refuse(_repo):
+        raise AssertionError("sweep fingerprinted the worktree for verify reuse")
+
+    monkeypatch.setattr(verify, "run_verify_commands", counting_run)
+    monkeypatch.setattr(verify, "worktree_fingerprint", refuse)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    entries = engine.journal.entries()
+    assert "review-skipped" in {e["kind"] for e in entries}
+    assert len(ran) == 2
+    passes = sorted(
+        {
+            (e["verification_stage"], e["verification_sequence"])
+            for e in entries
+            if e["kind"] == "verify-command-result"
+        },
+        key=lambda p: p[1],
+    )
+    assert passes == [("dev", 1), ("review", 2)]
+    declines = [e for e in entries if e["kind"] == "verify-reuse-declined"]
+    assert [e["decline"] for e in declines] == ["mode-unsupported"]
+    assert declines[0]["story_key"] == "dw-fix"
+    assert not [e for e in entries if e["kind"] == "verify-pass-reused"]
+
+
 def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):
     """The bundle counterpart of the sprint-board sync: an unreadable bundle spec
     must not close any dw id (the ledger write is a repair — it must never fire off

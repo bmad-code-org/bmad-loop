@@ -112,6 +112,21 @@ def test_command_results_are_readonly_observation_data():
         c.command_results = ()
 
 
+def test_verification_reused_is_readonly_and_defaults_to_false():
+    assert ctx().verification_reused is False
+    assert ctx("post_review_verify").verification_reused is False
+    c = ctx(
+        "post_review_verify",
+        verification_stage="dev",
+        verification_sequence=1,
+        verification_reused=True,
+    )
+    assert c.verification_reused is True
+    assert (c.verification_stage, c.verification_sequence) == ("dev", 1)
+    with pytest.raises(AttributeError):
+        c.verification_reused = False  # type: ignore[misc]
+
+
 def test_delivery_id_is_readonly_and_defaults_to_none():
     assert ctx().delivery_id is None
     c = ctx("post_migrate", delivery_id="abc123")

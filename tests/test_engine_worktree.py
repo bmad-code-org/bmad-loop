@@ -400,6 +400,78 @@ def test_isolated_verify_commands_execute_and_classify_in_the_unit_worktree(proj
     assert classified and all(cwd == unit_root for cwd in classified)
 
 
+def test_verify_reuse_skip_gate_reuses_the_dev_pass_inside_the_unit_worktree(project, monkeypatch):
+    """`[verify] reuse_unchanged` (#1002) under worktree isolation: the green dev
+    pass stands in for the skip-review gate's own run, exactly as in the base
+    engine (`test_verify_reuse_skip_gate_reuses_the_dev_pass` in test_engine.py).
+
+    The two halves of a token are read from different seams — the mint keys on
+    `Engine.workspace.root`, the gate recomputes from the verifier's
+    `paths.repo_root` — so isolation is where they could disagree. One command
+    pass, one `verify-pass-reused` row joining back to dev pass 1, and NO
+    `verify-reuse-declined` row: in particular no `policy-mismatch`, which pins
+    that the cwd half of the key resolves to the same root on both sides inside
+    the unit worktree, and no `tree-mismatch`, which pins that nothing the engine
+    writes between the dev pass and the gate (board mirror, run state) moves the
+    fingerprint. Every fingerprint read is taken inside the unit worktree, never
+    the main checkout; the story still merges back.
+
+    Ablation: key the mint on `self.paths.repo_root` (the main checkout) in
+    `Engine._mint_verify_reuse` and the gate declines `policy-mismatch`, running
+    the commands a second time."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    mounted: dict[str, Path] = {}
+    base_effect = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def dev(spec):
+        mounted["root"] = session_checkout_root(project, spec.cwd).resolve()
+        return base_effect(spec)
+
+    ran: list[Path] = []
+    real_run = verify.run_verify_commands
+
+    def counting_run(policy, cwd):
+        ran.append(Path(cwd).resolve())
+        return real_run(policy, cwd)
+
+    fingerprinted: list[Path] = []
+    real_fingerprint = verify.worktree_fingerprint
+
+    def spy_fingerprint(repo):
+        fingerprinted.append(Path(repo).resolve())
+        return real_fingerprint(repo)
+
+    monkeypatch.setattr(verify, "run_verify_commands", counting_run)
+    monkeypatch.setattr(verify, "worktree_fingerprint", spy_fingerprint)
+    policy = replace(wt_policy(), verify=VerifyPolicy(commands=(_OK,), reuse_unchanged=True))
+    engine, _ = make_engine(project, [dev], policy=policy)
+    head_before = rev_parse_head(project.project)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    unit_root = mounted["root"]
+    assert unit_root != project.repo_root.resolve()
+    assert ran == [unit_root]  # one command pass, run in the unit worktree
+    passes = {
+        (e["verification_stage"], e["verification_sequence"])
+        for e in engine.journal.entries()
+        if e["kind"] == "verify-command-result"
+    }
+    assert passes == {("dev", 1)}
+    declines = [e for e in engine.journal.entries() if e["kind"] == "verify-reuse-declined"]
+    assert not declines, [d.get("decline") for d in declines]
+    (row,) = [e for e in engine.journal.entries() if e["kind"] == "verify-pass-reused"]
+    assert (row["story_key"], row["reused_stage"], row["reused_sequence"]) == ("1-1-a", "dev", 1)
+    # mint before + after the dev pass, then the gate's own read: all in the unit
+    assert len(fingerprinted) == 3
+    assert all(path == unit_root for path in fingerprinted)
+    # the reused gate let the unit commit and merge back onto the target branch
+    assert rev_parse_head(project.project) != head_before
+    assert "change for 1-1-a" in (project.project / "src.txt").read_text()
+    assert "unit-merged" in journal_kinds(engine)
+
+
 def test_prior_dispatch_does_not_block_fresh_mounted_spec_binding(project):
     """A none-to-worktree re-drive relocates accepted input, then replaces old authority."""
     rel = "_bmad-output/implementation-artifacts/accepted-rearm.md"

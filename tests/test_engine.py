@@ -1295,6 +1295,8 @@ def test_verify_reuse_off_never_fingerprints(project, monkeypatch):
     Ablation: drop `self.policy.verify.reuse_unchanged` from
     `_verify_reuse_mintable` and the raising fingerprint crashes the run."""
     engine, _ = make_engine(project, _skip_story(project), policy=_reuse_policy(reuse=False))
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
     ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
 
     def refuse(_repo):
@@ -1309,6 +1311,9 @@ def test_verify_reuse_off_never_fingerprints(project, monkeypatch):
     assert _verify_passes(engine) == [("dev", 1), ("review", 2)]
     assert not _entries(engine, "verify-pass-reused")
     assert not _entries(engine, "verify-reuse-declined")
+    (ctx,) = capture.of("post_review_verify")
+    assert (ctx.verification_stage, ctx.verification_sequence) == ("review", 2)
+    assert ctx.verification_reused is False
 
 
 @pytest.mark.parametrize(
@@ -1340,6 +1345,7 @@ def test_verify_reuse_skip_gate_reuses_the_dev_pass(project, monkeypatch, review
     (ctx,) = capture.of("post_review_verify")
     assert (ctx.verification_stage, ctx.verification_sequence) == ("dev", 1)
     assert [r.stdout for r in ctx.command_results] == ["dev-out"]
+    assert ctx.verification_reused is True
     assert not ctx.verify_reason
     assert verify.rev_parse_head(project.project) != head_before  # the commit landed
 
@@ -1422,6 +1428,8 @@ def test_verify_reuse_fix_gate_reuses_the_fix_pass(project, monkeypatch):
     assert (first.verification_stage, first.verification_sequence) == ("review", 2)
     assert (second.verification_stage, second.verification_sequence) == ("fix", 3)
     assert [r.stdout for r in second.command_results] == ["fixed"]
+    # the declined gate ran its own commands; only the reused one is flagged
+    assert (first.verification_reused, second.verification_reused) == (False, True)
 
 
 def test_verify_reuse_post_fix_gate_never_reuses_the_dev_pass(project, monkeypatch):

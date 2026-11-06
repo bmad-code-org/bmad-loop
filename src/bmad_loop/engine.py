@@ -8872,6 +8872,7 @@ class Engine:
             command_results=records.results,
             verification_stage=records.stage,
             verification_sequence=records.sequence,
+            verification_reused=self._review_verify_reused,
         )
         return outcome
 

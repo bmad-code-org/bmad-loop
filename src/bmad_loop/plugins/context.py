@@ -93,6 +93,7 @@ class HookContext:
         command_results: tuple[CommandResult, ...] = (),
         verification_stage: str | None = None,
         verification_sequence: int | None = None,
+        verification_reused: bool = False,
         decision_action: str | None = None,
         delivery_id: str | None = None,
         rollback_outcome: str | None = None,
@@ -140,9 +141,14 @@ class HookContext:
         # neither `stage` (both legs emit `post_dev_verify`) nor `phase` (both
         # are DEV_VERIFY) nor `attempt` (one counter, shared) can supply. The
         # review gate publishes the same pair on `post_review_verify`, always
-        # under `"review"` when its command pass ran.
+        # under `"review"` when its command pass ran — or, on a reused skip-review
+        # gate, under the reused pass's own pair (see `verification_reused`).
         self._verification_stage = verification_stage
         self._verification_sequence = verification_sequence
+        # True only on a `post_review_verify` whose skip-review gate stood an
+        # unchanged green dev/fix pass in for its commands ([verify]
+        # reuse_unchanged); the stage/sequence pair then names that pass.
+        self._verification_reused = bool(verification_reused)
         self._decision_action = decision_action
         self._delivery_id = delivery_id
         self._rollback_outcome = rollback_outcome
@@ -283,9 +289,14 @@ class HookContext:
         (``post_dev_verify`` from ``Phase.DEV_VERIFY``), and ``attempt`` is one
         per-story counter the repair leg CONTINUES rather than restarts — so its
         value orders the two but never names either, and a human re-arm reuses
-        the numbers outright. ``post_review_verify`` only ever carries
-        ``"review"`` or ``None``; which of its gate visits fired is told by the
-        neighbouring journal entries, not by this field.
+        the numbers outright. ``post_review_verify`` carries ``"review"`` or
+        ``None``, with one exception: with ``[verify] reuse_unchanged`` on, a
+        skip-review gate that reused an unchanged green pass carries that pass's
+        stage (``"dev"`` or ``"fix"``) and sequence with
+        :attr:`verification_reused` True, so the ``story_key`` + stage + sequence
+        join still resolves to the journal records of the pass that ran. Which of
+        its gate visits fired is told by the neighbouring journal entries, not by
+        this field.
         """
         return self._verification_stage
 
@@ -302,6 +313,21 @@ class HookContext:
         re-arm can reuse.
         """
         return self._verification_sequence
+
+    @property
+    def verification_reused(self) -> bool:
+        """True when this ``post_review_verify`` gate ran no commands of its own
+        and instead reused the story's unchanged green dev/fix verify pass
+        (``[verify] reuse_unchanged``, skip-review gates only).
+
+        :attr:`command_results`, :attr:`verification_stage` and
+        :attr:`verification_sequence` then republish that earlier pass — the
+        journal holds one ``verify-pass-reused`` entry for the gate and no new
+        ``verify-command-result`` entries, so a census that counts distinct
+        sequences still counts passes that ran. False on every other stage and
+        on every gate that ran (or declined to reuse) its own commands.
+        """
+        return self._verification_reused
 
     @property
     def decision_action(self) -> str | None:
