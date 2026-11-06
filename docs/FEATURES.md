@@ -74,8 +74,9 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - With probes configured, a failing, timed-out or unstartable probe stops verification before any `[verify]` command runs.
   - `bmad-loop validate --probes` runs every probe, not stopping at the first failure, and fails validate if any probe fails.
   - A `repo_root` key in `_bmad/bmm/config.yaml` moves verify commands and git checks to a monorepo's code root.
-- **Config:** `[verify] commands`, `[verify] command_timeout_min`, `[verify] env_fault_rc`, `[environment] probes`, `[environment] probe_timeout_s`; `bmad-loop validate --probes`
-- **Tested by:** `tests/test_verify.py`, `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_bmadconfig.py`
+  - With `[verify] reuse_unchanged`, a skip-review gate reuses an unchanged green dev/fix pass instead of re-running the commands (in-memory token + git fingerprint; never across a session, pause or restart; not sweeps). Status checks and probes still run at the gate.
+- **Config:** `[verify] commands`, `[verify] command_timeout_min`, `[verify] env_fault_rc`, `[verify] reuse_unchanged`, `[environment] probes`, `[environment] probe_timeout_s`; `bmad-loop validate --probes`
+- **Tested by:** `tests/test_verify.py`, `tests/test_engine.py`, `tests/test_stories_engine.py`, `tests/test_tickets_engine.py`, `tests/test_cli.py`, `tests/test_bmadconfig.py`
 - **Docs:** [Configuration: [verify]](reference/configuration.md#verify), [Configuration: [environment]](reference/configuration.md#environment), [Environment faults](escalations-guide.md#environment-faults), [Re-verify kept work](escalations-guide.md#resolve-reverify)
 
 ### Fresh-context review

@@ -111,6 +111,9 @@ breaking changes may land in a minor release.
 - Record Antigravity token usage from agy's per-step transcript counts (checked against
   1.4.9), subagent conversations included, and show its model on the TUI agent line from
   the first fully-idle Stop's `modelName`; session-end `models` stays untracked.
+- Add opt-in `[verify] reuse_unchanged`: a skip-review gate reuses an unchanged green
+  dev/fix verify pass instead of re-running `[verify] commands`; journalled as
+  `verify-pass-reused` / `verify-reuse-declined` (#1002).
 
 ### Changed
 
@@ -147,6 +150,8 @@ breaking changes may land in a minor release.
   the TUI settings screen (#496, #497).
 - Restructure the docs: FEATURES.md is a feature catalog, and configuration, CLI and
   run-state references live in `docs/reference/`.
+- With `[verify] reuse_unchanged` on, `post_review_verify` may carry the reused pass's
+  `dev`/`fix` stage and sequence, flagged by the new `verification_reused` (#1002).
 
 ### Removed
 

@@ -590,8 +590,8 @@ repair legs but names neither:
 | `ctx.verification_stage`    | `"dev"` for the initial dev verification, `"fix"` for a repair one, `None` if none ran |
 | `ctx.verification_sequence` | the story's 1-based ordinal for that pass, or `None` if it recorded nothing            |
 
-The review gate publishes the same pair on [`post_review_verify`](#review), always as
-`"review"` (or `None`). The sequence is monotonic per story across pause/resume (unlike
+The review gate publishes the same pair on [`post_review_verify`](#review), as
+`"review"` (or `None`), except on a [reused skip-review gate](#reused-skip-review-gates). The sequence is monotonic per story across pause/resume (unlike
 `attempt`, which a human re-arm reuses), so it is safe to persist as a correlation id.
 
 Read `ctx.command_results == ()` together with `verification_stage`:
@@ -646,6 +646,8 @@ Two consequences for handlers:
   gate visit or of the project's. A hard-stopped pass records its full configured command
   count; a pass with no commands records nothing; `confirm --reverify` records nothing.
   Count distinct `verification_sequence` values to derive recorded passes.
+  The `verify-pass-reused` and `verify-reuse-declined` entries allocate no sequence: a
+  reuse entry is not a pass, and it adds no `verify-command-result` records.
 - **One command record is not a pass verdict**, and an earlier red pass does not mean the
   commit was blocked. Group records by `verification_sequence`, then read the surrounding
   decision event: `dev-decision` / `fix-decision` for the dev and fix legs; `review-result`,
@@ -691,10 +693,25 @@ The context carries the same payload as `post_dev_verify`:
 | `ctx.command_results`       | the `CommandResult` records the gate's command pass ran, in order                                                                                                                                                                                                                                                                                               |
 | `ctx.verification_stage`    | `"review"` whenever the gate reached its command pass (including zero commands); `None` when one of the gate's artifact checks refused first — the spec, the operator-action list, the sprint board, or a sweep's ledger (stories mode checks the spec only) — or a failed `[environment]` probe stopped the gate before its commands; `verify_reason` names it |
 | `ctx.verification_sequence` | the story's ordinal for that pass (joins the `verify-command-result` entries), or `None` if it recorded nothing (no `[verify] commands`, or no pass)                                                                                                                                                                                                            |
+| `ctx.verification_reused`   | `True` when the gate reused an earlier pass instead of running its commands (below); `False` on every other gate visit and on every other stage                                                                                                                                                                                                                 |
 
 Read `command_results == ()` with `verification_stage` exactly as for
 `post_dev_verify`. A review pass cut short by a hard `bmad-loop stop` stops the run
 before the gate is classified, so it is never published.
+
+#### Reused skip-review gates
+
+With `[verify] reuse_unchanged` on, the two skip-review commit gates can reuse the
+story's green dev or fix pass when nothing git-visible changed since it. On such a
+gate, `post_review_verify` carries the reused pass's `command_results`, its stage
+(`"dev"` or `"fix"`, not `"review"`) and its sequence, with `ctx.verification_reused`
+`True`. The `story_key` + stage + sequence join still resolves to the
+`verify-command-result` records of the pass that ran, so a handler keyed on the
+sequence sees it a second time. The journal holds one `verify-pass-reused` entry for
+the gate (`reused_stage`, `reused_sequence`, `command_count`, `head`, `tree`), and a
+gate that could not reuse journals `verify-reuse-declined` with a `decline` reason and
+runs its commands as usual. `verification_reused` is a Python-plugin context property;
+declarative hooks get no environment variable for it.
 
 ### Commit
 
