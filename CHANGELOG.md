@@ -290,6 +290,10 @@ breaking changes may land in a minor release.
 - Pin the run journal and `state.json` to the run dir's recorded identity: writes and
   re-reads refuse a run dir swapped for a link or another directory instead of acting
   outside the run, and Windows verify-stream logs refuse junctions.
+- Catch more credential shapes in the `diagnose` / `probe-adapter` egress guard: Stripe
+  `sk_`/`rk_` keys, Slack `xapp-`, SendGrid `SG.` and PyPI tokens, including inside URL
+  paths, and `user:password@` URL credentials under any scheme, not only http(s).
+  `scrub_text` now redacts a URL's whole userinfo, before emails.
 
 ## [0.13.2] — 2026-10-09
 

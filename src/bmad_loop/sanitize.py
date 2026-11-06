@@ -86,7 +86,16 @@ _EMAIL_DOMAIN_RE = re.compile(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _SECRET_PREFIX_RE = re.compile(
     r"^(?:"
     r"sk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|glpat-|gss_|"
-    r"xox[baprs]-|AKIA|ASIA|AIza|ya29\.|AGAPP|hf_|npm_|dop_v1_|sk-ant-"
+    r"xox[baprs]-|AKIA|ASIA|AIza|ya29\.|AGAPP|hf_|npm_|dop_v1_|sk-ant-|"
+    # Shapes the entropy arm below cannot see: each splits at `.`/`-`/`_` into
+    # runs shorter than `_SECRET_RUN_MIN`, so without a prefix they pass as plain
+    # identifiers. Stripe secret/restricted keys (legacy ones carry a 24-char
+    # tail), Slack app-level tokens (`xapp-<n>-…`, every segment short), SendGrid
+    # (`SG.<22>.<43>`, the 43 often split by `-`), and PyPI upload tokens, whose
+    # macaroon always opens `pypi-AgE`. Each arm is anchored on enough of the
+    # vendor format that an ordinary slug (`sk_util`, `pypi-mirror`, `SG.1`)
+    # does not trip it.
+    r"[sr]k_(?:live|test)_|xapp-\d+-|SG\.[A-Za-z0-9_-]{16,}\.|pypi-AgE"
     r")"
 )
 _JWT_RE = re.compile(r"^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+")
@@ -97,8 +106,26 @@ _SECRET_RUN_MIN = 32  # length of contiguous alnum run that triggers the entropy
 _SECRET_ENTROPY_MIN = 3.5  # bits/char; pure hex ~4.0, base64 ~6.0, prose/slug well below
 
 # Token shape used by assert_no_leak to re-scan rendered output for secrets.
-_LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._/+-]{6,}")
-_URL_CRED_RE = re.compile(r"https?://[^/\s]*:[^/@\s]+@")
+# `/` separates tokens, so an anchored prefix arm sees a key that follows a path
+# segment; the entropy arm already splits on `/` via _ALNUM_RUN_RE.
+_LEAK_TOKEN_RE = re.compile(r"[A-Za-z0-9._+-]{6,}")
+# Any RFC 3986 scheme, not only http(s): connection strings (`postgres://`,
+# `redis://`, `mongodb+srv://`, `amqp://`, `ssh://`) carry `user:password@`
+# userinfo the same way and are as likely to reach a log tail or `--help` blob.
+# Neither half crosses an authority delimiter (`/`, `?`, `#`), so a port plus a
+# query that happens to hold an `@` (`redis://cache:6379?client=user@cluster`) is
+# not mistaken for a password. The password half may hold `@` and runs to the
+# LAST one in the authority, as URL parsers split it, so `user:p@ss@host` is
+# matched — and redacted by scrub_text — whole rather than up to its first `@`.
+# The scheme is capped at 32 characters and the user half stops at the first `:`
+# (RFC 3986's user/password split). The pattern has no literal anchor, so an
+# unbounded scheme restarts a scan at every position of a long alphanumeric run.
+# That is quadratic on a base64 blob or a minified line, and scrub_text,
+# _truncate_line and assert_no_leak all scan such lines. A longer scheme still
+# matches, starting later; scrub_text keeps the scheme group either way.
+_URL_CRED_RE = re.compile(
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]{0,31}://)(?P<user>[^/?#\s:]*):[^/?#\s]+@"
+)
 # The guard constructs whose match can straddle a truncation point AND whose
 # leading fragment would still be sensitive once the rest is clipped away.
 # `scrub_text`'s cut retracts out of these -- see `_truncate_line`. This sits
@@ -145,6 +172,10 @@ _ABS_HOME_RE = re.compile(
 _REDACTED_STR = "<redacted:str>"
 _REDACTED_SECRET = "<redacted:secret>"  # nosec B105 - redaction marker, not a credential
 _REDACTED_EMAIL = "<redacted:email>"
+# Replaces a URL's whole `user:password@`, the `@` included: a marker followed by
+# `@` would itself read as `<user>:<password>@` to `_URL_CRED_RE` and make the
+# guard refuse the very output that was just made safe.
+_REDACTED_USERINFO = "<redacted:userinfo>"
 _REDACTED_DEPTH = "<redacted:depth>"
 
 
@@ -293,8 +324,8 @@ def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = 
     """Sanitize free text (a CLI's ``--help`` / ``--version`` / a log tail).
 
     Less aggressive than :func:`scrub_json` — help text is the CLI's own and
-    flag lines must survive — so we only redact the home dir and any emails,
-    then optionally cap the line count and each line's length.
+    flag lines must survive — so we only redact the home dir, URL credentials
+    and any emails, then optionally cap the line count and each line's length.
 
     ``max_chars`` bounds each line's **content** at ``max_chars``; a truncated
     line is emitted as at most ``max_chars`` characters plus the
@@ -314,6 +345,10 @@ def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = 
     of the redaction step.
     """
     s = redact_home(s)
+    # URL credentials go BEFORE emails: the email rule would otherwise take the
+    # `x@example.com` tail of `redis://bob:hunter2!x@example.com`, leaving
+    # `hunter2!` behind with the `@` gone, so the guard's URL rule no longer sees it.
+    s = _URL_CRED_RE.sub(lambda m: m.group("scheme") + _REDACTED_USERINFO, s)
     s = _redact_emails(s)
     if max_lines is None and max_chars is None:
         return s
