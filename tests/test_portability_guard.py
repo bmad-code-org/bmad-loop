@@ -725,6 +725,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "choice",
         "checkpoint",
         "code_root_changed",
+        # `verify-pass-reused` (#1002): how many command records the reused pass
+        # republished — an engine-computed count.
+        "command_count",
         "command_index",
         # `accepted-spec-write-unreachable`'s discriminator: whether the byte
         # comparison COMPLETED, not what it found. A bare boolean deliberately —
@@ -743,6 +746,13 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "cycles",
         "decision",
         "decisions",
+        # `verify-reuse-declined` (#1002): why a skip-review gate ran its commands
+        # instead of reusing a green pass. A closed engine-minted vocabulary
+        # (no-token, superseded, session-launched, rollback, worktree-discard,
+        # reset, paused, pass-mutated-tree, gitlinks, fingerprint-fault,
+        # policy-mismatch, tree-mismatch, mode-unsupported), never authored text;
+        # a fault's text rides the separately-dropped `detail`.
+        "decline",
         "deduped",
         # `sweep-migrated`'s completion identity (DW-317): a fresh `uuid4().hex`
         # minted per migration completion, and the dedup key a `post_migrate` hook
@@ -1038,6 +1048,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "reset_from",
         "restore",
         "returncode",
+        # `verify-pass-reused` (#1002): the reused pass's `verification_stage`
+        # (closed: dev/fix) and its `verification_sequence` ordinal.
+        "reused_sequence",
+        "reused_stage",
         "role",
         # The outcome of an aborted re-arm's spec rollback (`rearm-aborted`), one of
         # FOUR literal enum strings the producer chooses (`restored`, `unchanged`,
@@ -1791,6 +1805,15 @@ JOURNAL_KINDS = frozenset(
         "sweep-auto-trigger",
         "token-budget-exceeded",
         "verify-command-result",
+        # #1002. A skip-review gate standing the story's unchanged green dev/fix
+        # pass in for its `[verify] commands`, from `Engine._review_reuse_request`'s
+        # decision callback: `reused_stage`/`reused_sequence` join back to that
+        # pass's `verify-command-result` rows; `head`/`tree` are the gate-time
+        # fingerprint. Allocates no sequence — a reuse is not a pass.
+        "verify-pass-reused",
+        # #1002. The same gate running its commands instead: `decline` names why,
+        # `detail` carries a fingerprint fault's text.
+        "verify-reuse-declined",
         "workflow-end",
         "workflow-start",
         # engine.py + runs.py (runs.py's writer is the constructor-inline spelling)
