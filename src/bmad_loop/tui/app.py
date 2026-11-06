@@ -744,6 +744,17 @@ class BmadLoopApp(App[None]):
             self._attach_to_target(launch.ctl_target(self.project), return_window=win_id)
             return
         if agent_live:
+            # Task windows open detached (DW-635), so the session's current
+            # window is the shell; select the agent's before attaching. A
+            # failed select is toasted and the attach goes ahead regardless.
+            try:
+                launch.select_agent_window(self.project, run_id)
+            except MultiplexerError as e:
+                self.notify(
+                    f"could not select the run's task window, attaching anyway: {e}",
+                    severity="warning",
+                    timeout=15,
+                )
             target = runs.session_target(run_id)
         else:
             # Textual captures stderr, so agent_session_exists' warning about a

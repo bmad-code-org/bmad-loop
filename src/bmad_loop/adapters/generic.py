@@ -1490,7 +1490,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         pinned_session_id = str(uuid.uuid4()) if self.profile.session_id_flag else None
         window_id = self.mux.new_window(
             self.session_name,
-            spec.task_id[-40:],
+            runs.task_window_name(spec.task_id),
             spec.cwd,
             # Same merge as interactive_env, same pin chokepoint: the profile's
             # [env] table must not move the window off this process's state root.
@@ -1821,8 +1821,9 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         saw_session_start = False
         session_start_noted = False
         # The first admitted SessionStart carrying a hook `model` (on Codex, the
-        # first admitted SessionStart) was seen and its one `session-model` row
-        # attempted (#859); see `_note_session_model`.
+        # first admitted SessionStart) — or, with none, the first fully-idle
+        # top-level Stop carrying one (agy, DW-634) — was seen and its one
+        # `session-model` row attempted (#859); see `_note_session_model`.
         session_model_noted = False
 
         # A transcript can grow for an initial user prompt or the loop's own
@@ -2836,6 +2837,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # real transcript is preserved for usage tallying.
                 continue
             spawn_marker = self.profile.subagent_spawn_marker
+            # Set when the filter below admits a Stop it could not judge as the
+            # session's own (a marker fault or an unjudgeable Stop): failing open
+            # lets it complete the session, but it never names the session's
+            # model (DW-634) — a missing row beats a child's model on it.
+            stop_owner_unjudged = False
             if event.event == "Stop" and spawn_marker:
                 # agy runs a subagent as a sibling conversation whose Stops reach
                 # this stream unannounced, so attribution admits them; its final
@@ -2861,6 +2867,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         settled=settled,
                     )
                 except OSError as e:
+                    stop_owner_unjudged = True
                     if not marker_unreadable_crumbed:
                         marker_unreadable_crumbed = True
                         self._note_lifecycle(
@@ -2879,6 +2886,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             fully_idle=event.fully_idle,
                         )
                         continue
+                    stop_owner_unjudged = verdict == "unjudged"
                     if verdict == "unjudged" and not marker_unjudged_crumbed:
                         marker_unjudged_crumbed = True
                         self._note_lifecycle(
@@ -3143,6 +3151,20 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # Latched after the subagent filter above, which rejects a stop that
                 # is not the main session's turn-end. Never cleared.
                 stop_seen = True
+                if (
+                    not session_model_noted
+                    and event.fully_idle is True
+                    and event.model
+                    and not stop_owner_unjudged
+                ):
+                    # agy fires no SessionStart and names its model only on Stop
+                    # (`modelName`, DW-634). Only a fully-idle Stop the spawn-marker
+                    # filter above judged the session's own, so never an identified
+                    # child's nor one it admitted unjudged (crumbed there); a
+                    # child's Stop that beats its marker still reads as own.
+                    # `fully_idle` is agy-only, so no other CLI's Stop does.
+                    session_model_noted = True
+                    self._note_session_model(handle, event.model)
                 if resolvable and not unresolved_crumbed and not _is_regular_file(transcript_path):
                     # Not gated on session_id: a Stop whose payloads all came
                     # through as `{}` has none, and that miss must show too.
@@ -3568,7 +3590,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
 
     def _note_session_model(self, handle: SessionHandle, model: str) -> None:
         """Journal one `session-model` (`task_id`, `model`, `cli`): the model the
-        CLI reported on the session's first admitted SessionStart hook (#859).
+        CLI reported on the session's first admitted SessionStart hook (#859),
+        or — for agy, which fires no SessionStart — on its first fully-idle
+        top-level Stop (the payload's `modelName`, agy 1.5.0; DW-634). That row
+        is the only place an agy model lands: session-end `models` stays
+        transcript-only, and agy's transcript names none.
 
         This is the CLI's own launch model (Codex sends it on every hook), unlike
         `session-start`'s configured `model`, where `""` means "CLI default".

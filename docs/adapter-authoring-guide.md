@@ -151,11 +151,27 @@ hand.
 
 #### PROBE (`--probe`, opt-in live capture)
 
-In an ephemeral `mkdtemp` workspace, `probe` registers a full-payload capture hook for every
-native event in the profile, launches **one trivial content-free turn**
-(`Reply with exactly: OK`) in a window of the selected multiplexer, captures each hook
-event's payload, finds the transcript, and tears everything down. Use it to confirm the
-exact hook payload shape and that the CLI accepts the hook dialect your profile declares.
+In an ephemeral `mkdtemp` workspace (Codex: the stable workspace described below), `probe`
+registers a full-payload capture hook for every native event in the profile, launches
+**one trivial content-free turn** (`Reply with exactly: OK`) in a window of the selected
+multiplexer, captures each hook event's payload, finds the transcript, and tears
+everything down. Use it to confirm the exact hook payload shape and that the CLI accepts
+the hook dialect your profile declares.
+
+Codex (`codex-hooks-json`) keys hook trust by the config's path and hash, so a fresh temp
+dir would never be trusted. For Codex the hook script and config go into a stable per-user
+workspace instead, `<state root>/probe-workspaces/<profile>` (see
+[state root](reference/run-state.md#state-root)). The directory is owner-only. Each run
+empties it and writes the same bytes, and Codex launches there. The first `--probe` reports the hook trust
+as untrusted and exits 1 before any turn, with a next step naming the workspace: open Codex
+there once (under the profile's `[env]`), accept its folder trust and hooks trust
+prompts, and re-run from the project checkout.
+
+Trust holds until the config bytes or the workspace path change: a different hook interpreter, a moved
+bmad-loop install, a Codex version that changes the registered events, or a different state
+root (`BMAD_LOOP_STATE_DIR`, `XDG_STATE_HOME`) needs that one-time step again. If the state
+root cannot be resolved or the workspace cannot be reset, hook trust reads `unverifiable`
+and nothing launches.
 
 `--probe` needs a known profile. If the multiplexer backend is unavailable or the binary is
 missing, it falls back to a scan with a warning.
@@ -179,11 +195,13 @@ The report is built to be safe to paste into an issue or PR. One audited sanitiz
   home path or username in the final bytes makes the command refuse to emit: a message on
   stderr, empty stdout, nonzero exit, no `--out` file.
 
-In PROBE mode the raw capture exists only inside the temp dir, which is removed in a
-`finally` (even on an exception or Ctrl-C). The CLI's own transcript stays in its home dir;
-the command reads its structure and never copies it. The hidden `--keep-temp` flag keeps
-the raw temp dir for debugging and adds a `RAW probe data retained at … — DO NOT SHARE` warning to the report. Never
-paste a `--keep-temp` run.
+In PROBE mode the raw capture and the launch log exist only inside the temp dir, which is
+removed in a `finally` (even on an exception or Ctrl-C). The Codex probe workspace holds
+only the hook script and its config, never captured data, and stays in place for the trust
+step. The CLI's own transcript stays in its home dir; the command reads its structure and
+never copies it. The hidden `--keep-temp` flag keeps the raw temp dir for debugging and
+adds a `RAW probe data retained at … — DO NOT SHARE` warning to the report. Never paste a
+`--keep-temp` run.
 
 ### Flags reference
 
@@ -297,7 +315,8 @@ It surfaced three corrections to the draft:
   under `data.accountingSnapshot`. And `inputTokens` includes the cache reads (the Copilot
   SDK docs add cache writes, and count `reasoningTokens` inside `outputTokens`).
 
-Confirm the `mkdtemp` dir is gone afterward.
+Confirm the `mkdtemp` dir is gone afterward (for Codex, the stable probe workspace stays and
+holds only the hook script and config).
 
 ## Profile field reference
 

@@ -27,6 +27,7 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 ```text
 <state root>/
 ├── locks/                      advisory-lock files, shared across this user's projects
+├── probe-workspaces/<profile>/ Codex `probe-adapter --probe` hook script + config (owner-only, emptied each run)
 └── <project key>/
     ├── <run-id>/               the run's control plane
     │   ├── events/             hook-event files written by `bmad-loop relay` (BMAD_LOOP_EVENTS_DIR)
@@ -101,7 +102,11 @@ Codex bills each stretch of its cumulative counts to the model of the latest tur
 
 The key is absent when no split was read (antigravity, or an unread OpenCode 2.x transcript). `state.json` keeps it on the session record as `tokens_by_model`, written only when non-empty; it never feeds any token total or budget.
 
-Claude and Codex also report the model they launched on in their SessionStart hook. The first such hook of a session journals one `session-model` entry (`task_id`, `model`, `cli`); later SessionStart hooks of the same session (a subagent's, a `/clear`) add none. On Codex only the session's first SessionStart counts, even when it names no model. Claude may omit the model, and Gemini, Copilot and antigravity send none that bmad-loop reads, so the row may be absent. A journal write that fails leaves a `session-model-unjournaled` line in `session-lifecycle.jsonl` instead.
+Claude and Codex also report the model they launched on in their SessionStart hook. The first such hook of a session journals one `session-model` entry (`task_id`, `model`, `cli`); later SessionStart hooks of the same session (a subagent's, a `/clear`) add none. On Codex only the session's first SessionStart counts, even when it names no model.
+
+Antigravity fires no SessionStart and names its model only on its Stop hook (`modelName`), so for it the row comes from the session's first fully-idle Stop that names one and that the spawn-marker check judged the session's own: never a yield's, a subagent's it identifies, or one it could not judge or read (a subagent Stop that arrives before its marker can still supply the row). That Stop usually ends the session, so the TUI agent line seldom shows an antigravity model; session-end `models` stays untracked for antigravity.
+
+Claude may omit the model, and Gemini and Copilot send none that bmad-loop reads, so the row may be absent. A journal write that fails leaves a `session-model-unjournaled` line in `session-lifecycle.jsonl` instead.
 
 `state.json` records the run's work source. A bmad-loop that does not know that source refuses to resume the run rather than drive it as a sprint run, so finish or abandon a run before downgrading bmad-loop.
 

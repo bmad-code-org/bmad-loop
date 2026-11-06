@@ -127,18 +127,18 @@ bmad-loop probe-adapter [--project PROJECT] [--probe] [--transcript TRANSCRIPT] 
                         [--binary BINARY] [--model MODEL] [--workspace PATH] [--timeout TIMEOUT] [--out OUT] [--json] cli
 ```
 
-| Option                      | Description                                                                                                                               |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `cli`                       | Profile name. Hookless (HTTP) profiles are refused.                                                                                       |
-| `--probe`                   | Live capture: one trivial turn in a temp workspace, recording only the shape of each hook payload. Default: a scan that launches nothing. |
-| `--transcript TRANSCRIPT`   | Transcript file to inspect; skips discovery.                                                                                              |
-| `--session-dir SESSION_DIR` | Directory searched for the newest transcript.                                                                                             |
-| `--binary BINARY`           | Binary for a CLI with no profile; produces a reduced report.                                                                              |
-| `--model MODEL`             | Model for the probe turn (`--probe` only).                                                                                                |
-| `--workspace PATH`          | Also report whether PATH is in the profile's `[workspace_trust]` list; exit 1 unless trusted or when the profile declares no such list.   |
-| `--timeout TIMEOUT`         | Probe turn timeout in seconds. Default: 90.                                                                                               |
-| `--out OUT`                 | Write the report (or JSON document) to this file instead of stdout.                                                                       |
-| `--json`                    | Emit a JSON document instead of the Markdown report.                                                                                      |
+| Option                      | Description                                                                                                                                                                                                                                              |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cli`                       | Profile name. Hookless (HTTP) profiles are refused.                                                                                                                                                                                                      |
+| `--probe`                   | Live capture: one trivial turn in a temp workspace (Codex: a stable per-user probe workspace under the state root; the first run exits 1 until you trust it once), recording only the shape of each hook payload. Default: a scan that launches nothing. |
+| `--transcript TRANSCRIPT`   | Transcript file to inspect; skips discovery.                                                                                                                                                                                                             |
+| `--session-dir SESSION_DIR` | Directory searched for the newest transcript.                                                                                                                                                                                                            |
+| `--binary BINARY`           | Binary for a CLI with no profile; produces a reduced report.                                                                                                                                                                                             |
+| `--model MODEL`             | Model for the probe turn (`--probe` only).                                                                                                                                                                                                               |
+| `--workspace PATH`          | Also report whether PATH is in the profile's `[workspace_trust]` list; exit 1 unless trusted or when the profile declares no such list.                                                                                                                  |
+| `--timeout TIMEOUT`         | Probe turn timeout in seconds. Default: 90.                                                                                                                                                                                                              |
+| `--out OUT`                 | Write the report (or JSON document) to this file instead of stdout.                                                                                                                                                                                      |
+| `--json`                    | Emit a JSON document instead of the Markdown report.                                                                                                                                                                                                     |
 
 - Exits 1 when the profile is unknown (without `--binary`), the leak self-check fires (nothing is written), or hook or workspace trust is not `trusted` (the report is still written).
 
@@ -345,7 +345,7 @@ Attaches the terminal to a run through the selected multiplexer backend.
 bmad-loop attach [--project PROJECT] [run_id]
 ```
 
-- Attaches to the run's control window when a sweep is waiting on a decision or no agent session is live; otherwise to the live agent session.
+- Attaches to the run's control window when a sweep is waiting on a decision or no agent session is live; otherwise to the live agent session, selecting its task window first (task windows open detached): the window named for the journal's open session, else the session's highest-index window.
 - Exits 1 with `nothing to attach for run <id>` when there is no target; otherwise exits with the multiplexer client's exit code.
 
 ### `stop`

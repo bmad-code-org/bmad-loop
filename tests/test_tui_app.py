@@ -4830,6 +4830,7 @@ async def test_attach_multiplexer_error_notifies(project, monkeypatch):
         raise MultiplexerError("backend server not reachable")
 
     monkeypatch.setattr("bmad_loop.tui.app.runs.attach_target_argv", boom)
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: None)
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     async with app.run_test() as pilot:
@@ -4967,6 +4968,7 @@ async def test_attach_warns_then_falls_back_to_the_agent_past_an_unproven_window
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
     monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 1))
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: None)
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
@@ -5066,11 +5068,21 @@ async def test_attach_outside_tmux_stamps_detach(project_tree, monkeypatch):
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
 async def test_attach_prefers_agent_session_without_decision(project_tree, monkeypatch):
+    # DW-635: task windows open detached, so the agent session's current window
+    # is its shell; the task window is selected BEFORE the attach runs, or the
+    # client lands on the shell. Ablate the select in action_attach and the
+    # order below loses its first entry.
     make_run(project_tree.project, "20260611-100000-aaaa", alive=True)
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "session_exists", lambda session: True)
     monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: ("@5", 0))
     calls, stamps = _patch_attach_exec(monkeypatch)
+    order: list[object] = []
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: order.append(("select", r)))
+    monkeypatch.setattr(
+        "bmad_loop.tui.app.subprocess.call",
+        lambda argv: calls.append(list(argv)) or order.append("attach") or 0,
+    )
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
         await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
@@ -5078,8 +5090,37 @@ async def test_attach_prefers_agent_session_without_decision(project_tree, monke
         await pilot.press("a")
         await until(pilot, lambda: bool(calls))
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-20260611-100000-aaaa"]]
+    assert order == [("select", "20260611-100000-aaaa"), "attach"]
     # attaching to a live agent session is not our parked window — nothing stamped
     assert stamps == []
+
+
+@pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
+async def test_attach_goes_ahead_when_the_agent_window_select_raises(project_tree, monkeypatch):
+    # The select is best-effort (DW-635): a MultiplexerError from it is toasted
+    # and the attach still runs, landing on the session's current window.
+    # Ablation: return on the guarded select's failure and `calls` stays empty.
+    make_run(project_tree.project, "20260611-100000-aaaa", alive=True)
+    monkeypatch.setattr(launch, "mux_available", lambda: True)
+    monkeypatch.setattr(launch, "session_exists", lambda session: True)
+    monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: (None, 0))
+
+    def boom(_project, _run_id):
+        raise MultiplexerError("select lost the server")
+
+    monkeypatch.setattr(launch, "select_agent_window", boom)
+    calls, _stamps = _patch_attach_exec(monkeypatch)
+    app = BmadLoopApp(project_tree.project)
+    async with app.run_test() as pilot:
+        await until(pilot, lambda: isinstance(app.screen, DashboardScreen))
+        await until(pilot, lambda: dashboard(app).selected_run_id is not None)
+        await pilot.press("a")
+        await until(pilot, lambda: bool(calls))
+        assert any(
+            "could not select the run's task window, attaching anyway: select lost the server" in m
+            for m in notifications(app)
+        )
+    assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-20260611-100000-aaaa"]]
 
 
 @pytest.mark.usefixtures("force_tmux_backend")  # pin tmux against win32-matching externals
@@ -5090,6 +5131,8 @@ async def test_attach_falls_back_to_ctl_window(project_tree, monkeypatch):
     monkeypatch.setattr(launch, "session_exists", lambda session: False)
     monkeypatch.setattr(launch, "ctl_window_lookup", lambda proj, run_id: ("@5", 0))
     monkeypatch.setattr(launch, "select_ctl_window_id", lambda w: selected.append(w))
+    agent_selected: list[str] = []
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: agent_selected.append(r))
     calls, stamps = _patch_attach_exec(monkeypatch)
     app = BmadLoopApp(project_tree.project)
     async with app.run_test() as pilot:
@@ -5098,6 +5141,7 @@ async def test_attach_falls_back_to_ctl_window(project_tree, monkeypatch):
         await pilot.press("a")
         await until(pilot, lambda: bool(calls))
     assert selected == ["@5"]
+    assert agent_selected == []  # the ctl attach leaves the agent session alone
     assert calls == [["tmux", "switch-client", "-t", "=bmad-loop-ctl"]]
     assert stamps == [("@5", "=main:%9")]
 
@@ -7902,6 +7946,7 @@ async def test_attach_reaches_the_agent_past_a_ctl_lookup_fault(project, monkeyp
     monkeypatch.setattr(launch, "mux_available", lambda: True)
     monkeypatch.setattr(launch, "agent_session_exists", lambda session: True)
     monkeypatch.setattr(launch, "ctl_window_lookup", boom)
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: None)
     make_run(project.project, "20260611-100000-aaaa")
     app = BmadLoopApp(project.project)
     monkeypatch.setattr(app, "_attach_to_target", lambda target, **_k: attached.append(target))

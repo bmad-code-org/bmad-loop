@@ -1416,6 +1416,19 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # there; a verdict-gated fallback keeps that drag alive for every rc-0
     # switch the gate merely cannot vouch for.
 
+    def _session_clients(self, session: str) -> int | None:
+        # The base's `-t =session:` read can answer for another server's
+        # session here; _attached_clients refuses that answer (see it). Its
+        # None is silent by design for the switch_client verdict; here it would
+        # stop an attached operator following tasks, so say why.
+        count = self._attached_clients(session)
+        if count is None:
+            self._warn_detached(
+                f"{self._BINARY} could not read the attached-client count of {session} "
+                "(the probe failed, or answered for another session)"
+            )
+        return count
+
     def _attached_clients(self, session: str) -> int | None:
         """Clients attached to ``session``, or None when psmux cannot say.
 

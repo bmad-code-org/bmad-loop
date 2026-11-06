@@ -1738,6 +1738,9 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
         "tmux",
         "-u",
         "new-window",
+        # DW-635: detached, so window 0 stays current and catches server-start
+        # config output instead of the agent's pane
+        "-d",
         "-t",
         "=s:",
         "-n",
@@ -1762,6 +1765,58 @@ def test_new_window_posix_argv_byte_identical(monkeypatch, tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    ("clients", "selected", "reason"),
+    [
+        (subprocess.CompletedProcess([], 0, stdout="1\n", stderr=""), True, None),
+        (subprocess.CompletedProcess([], 0, stdout="2\n", stderr=""), True, None),
+        (subprocess.CompletedProcess([], 0, stdout="0\n", stderr=""), False, None),
+        # the count cannot be read: the window stays detached, and stderr says why
+        (
+            subprocess.CompletedProcess([], 1, stdout="", stderr="no server"),
+            False,
+            "exited 1: no server",
+        ),
+        (subprocess.CompletedProcess([], 0, stdout="\n", stderr=""), False, "answered ''"),
+        (OSError("tmux vanished"), False, "OSError: tmux vanished"),
+    ],
+    ids=["one-client", "two-clients", "unwatched", "probe-rc", "probe-empty", "probe-raised"],
+)
+def test_new_window_follows_a_watched_session(
+    monkeypatch, tmp_path, capsys, clients, selected, reason
+):
+    """Task windows open detached (DW-635), but a client already attached to
+    the session follows each new one, as a non-detached new-window had it:
+    the count is read before the create and the window is selected after.
+    Ablate the select and the watched cases list no select-window; ablate the
+    count gate and the unwatched ones list one."""
+    seen: list[list[str]] = []
+
+    def fake(argv, **_k):
+        seen.append(argv)
+        if argv[2] == "display-message":
+            if isinstance(clients, BaseException):
+                raise clients
+            return clients
+        out = "@7 %9\n" if argv[2] == "new-window" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+    assert TmuxMultiplexer().new_window("s", "n", tmp_path, {}, "cmd") == "@7"
+    verbs = [argv[2] for argv in seen]
+    assert seen[0][2:] == ["display-message", "-p", "-t", "=s:", "#{session_attached}"]
+    if selected:
+        assert verbs == ["display-message", "new-window", "select-window"]
+        assert seen[-1][2:] == ["select-window", "-t", "=s:@7"]
+    else:
+        assert verbs == ["display-message", "new-window"]
+    # every unreadable count says why; a read count says nothing
+    err = capsys.readouterr().err
+    assert ("leaving its new window detached" in err) is (reason is not None)
+    if reason is not None:
+        assert reason in err
+
+
 def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
     # The contract says `command` is a shlex-joined argv, not a shell line.
     # The POSIX leaf must not parse or re-quote it: whatever the caller built
@@ -1774,10 +1829,11 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
     command = shlex.join(["echo", "a b", "&&", "reboot"])
     TmuxMultiplexer().new_window("s", "n", tmp_path, {}, command)
 
-    assert rec.argv[:12] == [
+    assert rec.argv[:13] == [
         "tmux",
         "-u",
         "new-window",
+        "-d",
         "-t",
         "=s:",
         "-n",
@@ -1789,7 +1845,7 @@ def test_new_window_posix_command_reaches_tmux_verbatim(monkeypatch, tmp_path):
         "#{window_id} #{pane_id}",
     ]
     assert rec.argv[-5:] == ["/bin/sh", "-c", tmux_base.LAUNCH_PRELUDE, "sh", command]
-    assert len(rec.argv) == 17
+    assert len(rec.argv) == 18
 
 
 _PID_PROBE = (
@@ -1885,7 +1941,7 @@ def test_base_window_launch_stays_dialect_neutral(monkeypatch, tmp_path):
 
     _ShellWrapOnlyLeaf().new_window("s", "n", tmp_path, {"K": "v"}, "claude --x")
 
-    assert rec.argv[11:] == ["-e", "K=v", "claude --x"]
+    assert rec.argv[12:] == ["-e", "K=v", "claude --x"]
 
 
 class _FakeDialect(TmuxMultiplexer):
@@ -1953,6 +2009,7 @@ def test_dialect_leaf_new_window_routes_launch_through_hook(monkeypatch, tmp_pat
         "tmux",
         "-u",
         "new-window",
+        "-d",
         "-t",
         "=s:",
         "-n",

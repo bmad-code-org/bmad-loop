@@ -109,7 +109,8 @@ breaking changes may land in a minor release.
   to `tokens`, `<unattributed>` for usage a parser cannot pin on a model), kept on the
   state.json session record and summed per task in `status --json`.
 - Record Antigravity token usage from agy's per-step transcript counts (checked against
-  1.4.9), subagent conversations included; models stay untracked.
+  1.4.9), subagent conversations included, and show its model on the TUI agent line from
+  the first fully-idle Stop's `modelName`; session-end `models` stays untracked.
 
 ### Changed
 
@@ -162,6 +163,19 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Open agent task windows detached, so a tmux config `run` or `run-shell` that fails or
+  prints when bmad-loop starts the server lands in view-mode on the session's `shell`
+  window instead of the agent's pane, where it refused every wake nudge and TUI answer
+  until someone pressed `q`. `bmad-loop attach` and the TUI's `a` select the task window
+  before attaching, and a client already attached to the session still follows each new
+  task window.
+- Make `probe-adapter codex --probe` able to capture: Codex keys hook trust by config path,
+  so a fresh temp dir always read untrusted and the probe never launched. Its hook config
+  now lives in a stable per-user workspace under the state root; the untrusted report says
+  to open Codex there once and accept the trust prompts. Captures stay in the temp dir.
+- Keep email redaction and leak detection in `diagnose` and `probe-adapter` linear on a
+  long line: an 80k-character alphanumeric run with no `@` took seconds to scan, and now
+  takes milliseconds. What counts as an email is unchanged.
 - Match agy's workspace-trust entries the way agy does: a forward-slash spelling of the
   project (`C:/Users/...`) now counts as trusted on Windows when seeding a worktree and
   in `probe-adapter --workspace`; case and trailing-separator variants still do not.

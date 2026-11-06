@@ -216,6 +216,130 @@ def test_scrub_text_without_max_chars_is_byte_identical():
     assert sanitize.scrub_text(text) == text  # no normalization, no lost newline
 
 
+# The single regex the anchored email scan replaced (DW-636). Kept here as the
+# oracle that the scan's spans equal what it found, so a change in what counts as
+# an email shows up as a test failure.
+_UNANCHORED_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "no at sign here",
+        "contact me@example.com",
+        "a@b.co c@d.org",  # two emails
+        "a@b.com.x@c.org",  # second local part starts inside the first domain
+        "a@b.co@c.org",  # first match ends exactly at the next `@`
+        "me@example.com123",  # trailing digits stop the TLD
+        "me@example.c",  # one-letter TLD: no match
+        "me@@example.com",  # empty local part before the second `@`
+        "me@.example.com",  # dot right after the `@`
+        "@example.com",  # no local part
+        "a..b%c+d-e_f@sub-1.Example.ORG.",  # every local and domain char class
+        "x@y.zz.q@w.ee",
+        "café@exämple.com",  # non-ASCII letters are outside both classes
+        "user@host",  # no dot
+        "a@b.c.de-f",
+        "line1 a@b.cc\nline2 c@d.ee",
+    ],
+)
+def test_email_spans_match_the_regex_they_replace(text):
+    expected = [m.span() for m in _UNANCHORED_EMAIL_RE.finditer(text)]
+    assert list(sanitize._email_spans(text)) == expected
+    assert sanitize.scrub_text(text) == _UNANCHORED_EMAIL_RE.sub("<redacted:email>", text)
+    assert ("email" in sanitize.assert_no_leak(text)) == bool(expected)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("mail me@example.com now", "mail <redacted:email> now"),
+        ("a@b.com.x@c.org", "<redacted:email><redacted:email>"),
+        ("me@example.com123", "<redacted:email>123"),
+        ("a+tag@sub.example.io, b@c.de", "<redacted:email>, <redacted:email>"),
+        ("user@host and me@example.c", "user@host and me@example.c"),
+    ],
+)
+def test_scrub_text_email_redaction_characterization(text, expected):
+    assert sanitize.scrub_text(text) == expected
+
+
+class _CountingMatcher:
+    """Stands in for ``_EMAIL_DOMAIN_RE``, counting each domain attempt."""
+
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self.calls = 0
+
+    def match(self, text, pos):
+        self.calls += 1
+        return self.pattern.match(text, pos)
+
+
+def test_email_scan_is_anchored_on_at_signs(monkeypatch):
+    """Email detection does one domain match per ``@`` and nothing else. That
+    keeps scrub_text and assert_no_leak linear on a long alphanumeric line. The
+    unanchored regex restarted a scan at every position of such a run, which is
+    quadratic (DW-636).
+
+    Ablation: restoring the unanchored regex in ``assert_no_leak`` leaves the
+    count at 0 where 1 is required. Restoring it in ``scrub_text`` leaves the
+    count at 1 where 2 is required.
+    """
+    counter = _CountingMatcher(sanitize._EMAIL_DOMAIN_RE)
+    monkeypatch.setattr(sanitize, "_EMAIL_DOMAIN_RE", counter)
+    run = "a" * 80_000
+
+    assert "email" not in sanitize.assert_no_leak(run)
+    assert sanitize.scrub_text(run) == run
+    assert counter.calls == 0
+
+    assert "email" in sanitize.assert_no_leak(run + " me@example.com")
+    assert counter.calls == 1
+    assert sanitize.scrub_text(run + "@example.com") == "<redacted:email>"
+    assert counter.calls == 2
+
+    # Many `@`s: one attempt each.
+    counter.calls = 0
+    assert sanitize.scrub_text("a@" * 1000) == "a@" * 1000
+    assert counter.calls == 1000
+
+
+class _MeteredStr(str):
+    """A ``str`` that tallies how many characters its slices copy out."""
+
+    sliced = 0
+
+    def __getitem__(self, key):
+        out = super().__getitem__(key)
+        if isinstance(key, slice):
+            type(self).sliced += len(out)
+        return out
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["a" * 80_000, "a@" * 5_000, ("x" * 50 + "@") * 1_000 + "me@example.com"],
+    ids=["no-at-run", "many-at-signs", "long-locals-then-email"],
+)
+def test_email_spans_never_rescan_earlier_text(monkeypatch, text):
+    """The left-hand scan for each ``@`` reads only the text since the previous
+    ``@`` or match, so all the slices together copy at most ``len(text)``
+    characters. Slicing from the start of the text at every ``@`` gives the
+    same spans but is quadratic in the number of ``@``s.
+
+    Ablation: slicing ``text[:at]`` (clamped with ``max(lo, ...)``) instead of
+    ``text[lo:at]`` copies about 25M characters on ``"a@" * 5000``, against a
+    bound of 10k.
+    """
+    monkeypatch.setattr(_MeteredStr, "sliced", 0)
+    metered = _MeteredStr(text)
+    spans = list(sanitize._email_spans(metered))
+    assert spans == [m.span() for m in _UNANCHORED_EMAIL_RE.finditer(text)]
+    assert _MeteredStr.sliced <= len(text)
+
+
 def test_scrub_event_payload_is_scrub_json(home):
     payload = {"session_id": "s-1", "cwd": f"{home}/proj", "n": 5}
     out = sanitize.scrub_event_payload(payload)

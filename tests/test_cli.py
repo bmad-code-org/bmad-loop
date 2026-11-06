@@ -3922,6 +3922,7 @@ def test_attach_warns_about_a_ctl_lookup_fault_and_still_attaches(project, monke
     _make_run_with_decision(project, run_id="20260101-000000-aaaa")
     monkeypatch.setattr(launch, "ctl_window_lookup", boom)
     monkeypatch.setattr(launch, "agent_session_exists", lambda s: True)
+    monkeypatch.setattr(launch, "select_agent_window", lambda p, r: None)
     monkeypatch.setattr(
         "bmad_loop.tui.launch.runs.attach_target_argv", lambda target: ["mux", "attach", target]
     )

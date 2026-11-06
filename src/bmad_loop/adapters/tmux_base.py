@@ -396,6 +396,9 @@ class BaseTmuxBackend(TerminalMultiplexer):
     ) -> None:
         # Window 0 is a plain shell so the session survives task windows closing,
         # named like every other window bmad-loop creates (see _INITIAL_WINDOW_NAME).
+        # It is also where server-start config output lands: task windows open
+        # detached (new_window), so window 0 stays current and a failing config
+        # `run` puts its view-mode here, not on a task pane (DW-635).
         # Geometry is pinned only when both dimensions are given (detached agent
         # sessions); the control session omits it and takes tmux's default size.
         geometry = ["-x", str(cols), "-y", str(lines)] if cols and lines else []
@@ -607,8 +610,20 @@ class BaseTmuxBackend(TerminalMultiplexer):
         # The launched pane's id comes back in the same create, so pane_target
         # pins exactly the pane this window started with, whatever splits or
         # swaps an operator or a hook makes before it is read (#948).
+        # -d: the window opens detached, so window 0 stays current. A config
+        # `run`/`run-shell` job still in flight from the server start reports
+        # (view-mode) on the pane active when it ends; that must be the shell
+        # window, never the agent's pane, whose wake nudges and answers a pane
+        # mode would refuse (DW-635). In an unwatched session the window is
+        # never selected here; an attach selects it (tui.launch.select_agent_window).
+        # In a session a client was already watching, read before the create
+        # (and after the launch argv is built, so a refused one spawns nothing),
+        # it is selected below.
+        launch = self._window_launch(env, command)
+        watched = (self._session_clients(session) or 0) > 0
         window_id, _, pane_id = self._tmux(
             "new-window",
+            "-d",
             "-t",
             f"={session}:",
             "-n",
@@ -618,7 +633,7 @@ class BaseTmuxBackend(TerminalMultiplexer):
             "-P",
             "-F",
             "#{window_id} #{pane_id}",
-            *self._window_launch(env, command),
+            *launch,
         ).partition(" ")
         panes = self._launched_panes()
         if pane_id.startswith("%"):
@@ -626,7 +641,42 @@ class BaseTmuxBackend(TerminalMultiplexer):
         else:
             # A restarted server can reuse the id: no stale pane may answer for it.
             panes.pop(window_id, None)
+        if watched:
+            # As a non-detached new-window would: an operator watching the run
+            # follows each task instead of staying on the ``shell`` window the
+            # previous task's exit dropped them on. A session with a client is
+            # long past its server start, so no config job is left to land on
+            # the task pane.
+            self.select_window(self.target(session, window_id))
         return window_id
+
+    def _session_clients(self, session: str) -> int | None:
+        """Clients attached to ``session``, or None when the backend cannot say
+        (new_window then reads the session as unwatched and leaves its window
+        detached). Every None says why on stderr: an operator watching the run
+        would otherwise stop following tasks with nothing to explain it."""
+        probe = f"{self._BINARY} display-message #{{session_attached}} on {session}"
+        try:
+            proc = self._run(
+                ["display-message", "-p", "-t", f"{self.target(session)}:", "#{session_attached}"],
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
+            self._warn_detached(f"{probe} failed: {type(exc).__name__}: {exc}")
+            return None
+        text = proc.stdout.strip()
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or "no stderr"
+            self._warn_detached(f"{probe} exited {proc.returncode}: {detail}")
+            return None
+        if not text.isdigit():
+            self._warn_detached(f"{probe} answered {text!r}, not a client count")
+            return None
+        return int(text)
+
+    @staticmethod
+    def _warn_detached(reason: str) -> None:
+        print(f"warning: {reason}; leaving its new window detached", file=sys.stderr)
 
     def new_parked_window(
         self, session: str, name: str, cwd: Path, argv: list[str], return_opt: str
@@ -779,11 +829,14 @@ class BaseTmuxBackend(TerminalMultiplexer):
 
         The mode a pane idles in is usually not one an operator chose: a user
         config whose ``run``/``run-shell`` fails or prints when a server starts
-        shows that output in view-mode on whichever pane is active then, and on
-        a server bmad-loop itself started that is its first task window. The
-        mode is read only on the refusal path, so a send keeps one probe; a
-        reply that is not a mode name (an unread probe, or a backend that does
-        not expand ``#{pane_mode}``) leaves the refusal unnamed."""
+        shows that output in view-mode on whichever pane is active then. On a
+        server bmad-loop itself started that is the session's ``shell`` window
+        0 (task windows open detached), and a task window only when an attach
+        selected it, or a task opened under an attached client, while the job
+        was still running. The mode is read only on the refusal path, so a send
+        keeps one probe; a reply that is not a mode name (an unread probe, or a
+        backend that does not expand ``#{pane_mode}``) leaves the refusal
+        unnamed."""
         if self._tmux("display-message", "-p", "-t", target, "#{pane_in_mode}") != "1":
             return
         try:

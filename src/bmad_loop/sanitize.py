@@ -68,7 +68,16 @@ _IDENTIFIER_MAX = 80
 # rather than relying on a hidden default.
 SCRUB_TEXT_MAX_CHARS = 200
 
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+# An email is `<local>@<domain>.<tld>`: a run of `_EMAIL_LOCAL_CHARS`, an `@`,
+# then `_EMAIL_DOMAIN_RE` -- the spans `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`
+# finds, scanned from the `@` outward. That pattern as one regex has no literal
+# anchor, so on a long alphanumeric run with no `@` every start position scanned
+# to the run's end: quadratic, and scrub_text and assert_no_leak both see
+# unbounded log tails and `--help` blobs. Neither class holds `@`, so each `@`
+# owns a disjoint left run and right run, and `_email_spans` touches every
+# character a bounded number of times.
+_EMAIL_LOCAL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._%+-"
+_EMAIL_DOMAIN_RE = re.compile(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 # Known credential token shapes — provider prefixes plus the JWT header. These
 # are exactly the strings that are identifier-shaped (so would pass the slug
@@ -94,7 +103,7 @@ _URL_CRED_RE = re.compile(r"https?://[^/\s]*:[^/@\s]+@")
 # leading fragment would still be sensitive once the rest is clipped away.
 # `scrub_text`'s cut retracts out of these -- see `_truncate_line`. This sits
 # beside assert_no_leak's rule list deliberately: a rule added there needs an
-# entry here only if a PREFIX of its match stays sensitive. `_EMAIL_RE` is absent
+# entry here only if a PREFIX of its match stays sensitive. The email rule is absent
 # because scrub_text redacts emails BEFORE it truncates, so none survives to be
 # split; `_ABS_HOME_RE` is absent because a fragment too short to match `/home/`
 # no longer carries the home tree the rule names.
@@ -185,6 +194,44 @@ def looks_like_secret(s: str) -> bool:
     return len(longest) >= _SECRET_RUN_MIN and _shannon_entropy(longest) >= _SECRET_ENTROPY_MIN
 
 
+def _email_spans(text: str) -> Iterator[tuple[int, int]]:
+    """``(start, end)`` of each email in ``text``, left to right, non-overlapping.
+
+    Matches the spans ``re.finditer`` would give for
+    ``[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}``, but scans outward from
+    each ``@``. The local class excludes ``@``, so a match must end its local part
+    at the first ``@`` after its start: the leftmost match is the local run
+    before the first ``@`` whose domain matches, cut at the previous match's
+    end, which is where ``finditer`` resumes. The domain class also excludes
+    ``@``, so the left run and the domain tail of one ``@`` never overlap those
+    of the next. That keeps the scan linear in ``len(text)``.
+    """
+    lo = 0  # the local run cannot reach left of the previous `@` or match end
+    at = text.find("@")
+    while at != -1:
+        start = lo + len(text[lo:at].rstrip(_EMAIL_LOCAL_CHARS))
+        domain = _EMAIL_DOMAIN_RE.match(text, at + 1) if start < at else None
+        if domain is not None:
+            yield start, domain.end()
+            lo = domain.end()
+        else:
+            lo = at + 1
+        at = text.find("@", lo)
+
+
+def _redact_emails(s: str) -> str:
+    parts: list[str] = []
+    prev = 0
+    for start, end in _email_spans(s):
+        parts.append(s[prev:start])
+        parts.append(_REDACTED_EMAIL)
+        prev = end
+    if not parts:
+        return s
+    parts.append(s[prev:])
+    return "".join(parts)
+
+
 def _truncate_line(line: str, max_chars: int) -> str:
     """One line clipped to ``max_chars``, never in a way that blinds the guard.
 
@@ -267,7 +314,7 @@ def scrub_text(s: str, *, max_lines: int | None = None, max_chars: int | None = 
     of the redaction step.
     """
     s = redact_home(s)
-    s = _EMAIL_RE.sub(_REDACTED_EMAIL, s)
+    s = _redact_emails(s)
     if max_lines is None and max_chars is None:
         return s
     lines = s.splitlines()
@@ -473,7 +520,7 @@ def assert_no_leak(text: str, *, extra: Iterable[str | tuple[str, str]] = ()) ->
     only, which are safe to print by construction.
     """
     fired: list[str] = []
-    if _EMAIL_RE.search(text):
+    if next(_email_spans(text), None) is not None:
         fired.append("email")
     if _URL_CRED_RE.search(text):
         fired.append("url-credentials")

@@ -34,11 +34,12 @@
 # cache reads. The parser sums the steps. A subagent's steps live only in its own
 # brain/<childId>/ transcript, so the parser folds in every child the parent's
 # spawn markers (see above) list, recursively. The transcript names no model
-# (checked through 1.5.0, same step layout), so the observed model stays
-# untracked; agy reports it only as the Stop payload's `modelName` (1.5.0), which
-# the relay does not read. agy 1.1.3 wrote no counts; its sessions
-# read as untracked. Never read conversations/<conversationId>.db, agy's internal
-# SQLite/protobuf store.
+# (checked through 1.5.0, same step layout), so session-end `models` stays
+# untracked; agy reports its model only as the Stop payload's `modelName` (1.5.0),
+# which the relay forwards as `model` and the first fully-idle top-level Stop
+# journals as the session's one `session-model` row (DW-634). agy 1.1.3 wrote no
+# counts; its sessions read as untracked. Never read
+# conversations/<conversationId>.db, agy's internal SQLite/protobuf store.
 #
 # Hook payloads are protojson: keys are camelCase (conversationId, transcriptPath,
 # workspacePaths) — NOT the snake_case claude/codex use. agy sends no `cwd`; the
