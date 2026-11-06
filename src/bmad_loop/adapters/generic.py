@@ -2837,6 +2837,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # real transcript is preserved for usage tallying.
                 continue
             spawn_marker = self.profile.subagent_spawn_marker
+            # Set when the filter below admits a Stop it could not judge as the
+            # session's own (a marker fault or an unjudgeable Stop): failing open
+            # lets it complete the session, but it never names the session's
+            # model (DW-634) — a missing row beats a child's model on it.
+            stop_owner_unjudged = False
             if event.event == "Stop" and spawn_marker:
                 # agy runs a subagent as a sibling conversation whose Stops reach
                 # this stream unannounced, so attribution admits them; its final
@@ -2862,6 +2867,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         settled=settled,
                     )
                 except OSError as e:
+                    stop_owner_unjudged = True
                     if not marker_unreadable_crumbed:
                         marker_unreadable_crumbed = True
                         self._note_lifecycle(
@@ -2880,6 +2886,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             fully_idle=event.fully_idle,
                         )
                         continue
+                    stop_owner_unjudged = verdict == "unjudged"
                     if verdict == "unjudged" and not marker_unjudged_crumbed:
                         marker_unjudged_crumbed = True
                         self._note_lifecycle(
@@ -3144,12 +3151,17 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 # Latched after the subagent filter above, which rejects a stop that
                 # is not the main session's turn-end. Never cleared.
                 stop_seen = True
-                if not session_model_noted and event.fully_idle is True and event.model:
+                if (
+                    not session_model_noted
+                    and event.fully_idle is True
+                    and event.model
+                    and not stop_owner_unjudged
+                ):
                     # agy fires no SessionStart and names its model only on Stop
-                    # (`modelName`, DW-634). Only a fully-idle Stop that got past
-                    # the spawn-marker child filter above, so never an identified
-                    # child's; an unjudged Stop, or a child's that beats its
-                    # marker, is admitted there and can still label the session.
+                    # (`modelName`, DW-634). Only a fully-idle Stop the spawn-marker
+                    # filter above judged the session's own, so never an identified
+                    # child's nor one it admitted unjudged (crumbed there); a
+                    # child's Stop that beats its marker still reads as own.
                     # `fully_idle` is agy-only, so no other CLI's Stop does.
                     session_model_noted = True
                     self._note_session_model(handle, event.model)

@@ -15425,11 +15425,12 @@ def test_agy_fully_idle_stop_journals_the_session_model(tmp_path):
     ABLATION: drop the note in the Stop branch and no row is written; drop its
     `fully_idle is True` test and move it above the `fully_idle is False` branch,
     and the yield's model lands."""
+    parent_t, _ = _agy_brain(tmp_path)
     adapter = _model_stop_adapter(tmp_path)
     adapter.watcher = _ScriptedWatcher(
         [
-            _agy_model_stop(False, "gemini-yield"),
-            _agy_model_stop(True, "gemini-4-argon-medium"),
+            _agy_model_stop(False, "gemini-yield", transcript=parent_t),
+            _agy_model_stop(True, "gemini-4-argon-medium", transcript=parent_t),
         ]
     )
     result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
@@ -15462,6 +15463,33 @@ def test_agy_child_stop_model_is_not_the_session_model(tmp_path):
     assert result.status == "completed"
     assert result.session_id == "agy-parent"
     assert [e["model"] for e in _session_model_entries(adapter)] == ["gemini-parent"]
+
+
+@pytest.mark.parametrize("fault", ["unjudged", "unreadable"])
+def test_agy_stop_admitted_unjudged_does_not_name_the_session_model(tmp_path, monkeypatch, fault):
+    """A Stop the spawn-marker filter admits without judging it own still
+    completes the session (fail open), but its model is not journaled: it may be
+    a child's.
+
+    ABLATION: drop `not stop_owner_unjudged` from the Stop note and both cases
+    journal the Stop's model."""
+    parent_t, _ = _agy_brain(tmp_path)
+    if fault == "unjudged":
+        transcript = "/final.jsonl"  # no ancestor named by the id: nowhere to look
+    else:
+        transcript = parent_t
+
+        def unreadable(*_args, **_kwargs):
+            raise PermissionError("brain listing denied")
+
+        monkeypatch.setattr(generic, "_spawn_marker_verdict", unreadable)
+    adapter = _model_stop_adapter(tmp_path)
+    adapter.watcher = _ScriptedWatcher([_agy_model_stop(True, "gemini-x", transcript=transcript)])
+    result = adapter.wait_for_completion(_dev_handle(), _dev_spec(tmp_path))
+    assert result.status == "completed"
+    assert _session_model_entries(adapter) == []
+    crumb = "subagent-marker-unjudged" if fault == "unjudged" else "subagent-marker-unreadable"
+    assert len(_lifecycle_events(adapter, crumb)) == 1  # the skip is visible
 
 
 def test_stop_model_without_fully_idle_is_not_journaled(tmp_path):

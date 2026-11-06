@@ -333,6 +333,7 @@ def test_both_relay_twins_forward_the_session_start_source(
     assert from_relay["source"] == expected
 
 
+@pytest.mark.parametrize("event_name", ["SessionStart", "Stop"])
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -354,9 +355,12 @@ def test_both_relay_twins_forward_the_session_start_source(
         ({"modelName": "m" * (events.RELAY_TEXT_MAX + 5)}, "m" * events.RELAY_TEXT_MAX),
     ],
 )
-def test_both_relay_twins_forward_the_hook_model(tmp_path, monkeypatch, payload, expected):
+def test_both_relay_twins_forward_the_hook_model(
+    tmp_path, monkeypatch, payload, expected, event_name
+):
     """#859: a hook payload's `model` (or, failing that, agy's `modelName`,
-    DW-634) reaches the event file from BOTH writers, and only when it is a
+    DW-634) reaches the event file from BOTH writers, on SessionStart and on
+    Stop (where agy sends it), and only when it is a
     non-empty string — otherwise the key is absent, so an event without one is
     unchanged (`test_relay_and_the_hook_shape_the_same_event`).
 
@@ -364,7 +368,7 @@ def test_both_relay_twins_forward_the_hook_model(tmp_path, monkeypatch, payload,
     on that side; write it unconditionally and the absent cases fail."""
     hook_run, relay_run = tmp_path / "hook", tmp_path / "relay"
     proc = subprocess.run(
-        [sys.executable, str(HOOK), "SessionStart"],
+        [sys.executable, str(HOOK), event_name],
         input=json.dumps(payload),
         env={
             "PATH": os.environ.get("PATH", ""),
@@ -377,7 +381,7 @@ def test_both_relay_twins_forward_the_hook_model(tmp_path, monkeypatch, payload,
         timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
-    assert _relay("SessionStart", payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
+    assert _relay(event_name, payload, monkeypatch, relay_run, task_id="1-1-a-dev-1") == 0
     from_hook = json.loads(next((hook_run / "events").glob("*.json")).read_text(encoding="utf-8"))
     from_relay = json.loads(next((relay_run / "events").glob("*.json")).read_text(encoding="utf-8"))
     if expected is None:
