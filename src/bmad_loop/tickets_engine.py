@@ -1761,6 +1761,7 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
             operator_park=self._operator_park_enabled(),
             on_results=self._review_command_sink(task),
             on_probes=self._review_probe_sink(task),
+            reuse=self._review_reuse_request(task),
         )
         if outcome.ok:
             self._accept_review_artifact_source(task)

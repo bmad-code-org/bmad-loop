@@ -177,6 +177,9 @@ _JOURNAL_ALIAS_FIELDS = {
     # fell through past (`attempt-preserve-fallthrough`, DW-481) — the sha a
     # reflog rescue starts from, so one HEAD gets one alias across both kinds.
     "head": "commit",
+    # The gate-time worktree tree hash `verify-pass-reused` records beside `head`
+    # (#1002) — a git object id, so the same `commit` alias namespace.
+    "tree": "commit",
     # The worktree snapshot `sweep._migration_reset` parked before a reset it then
     # refused (DW-435), on `ledger-snapshot-probe-failed` and
     # `sweep-migration-restore-diverged`. A REF NAME, not a sha —

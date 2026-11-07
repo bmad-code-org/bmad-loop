@@ -1223,6 +1223,527 @@ def test_post_review_verify_covers_both_skip_review_gates(project, monkeypatch):
     assert [r.stdout for r in second.command_results] == ["final-out"]
 
 
+# ------------------------------------------- [verify] reuse_unchanged (#1002)
+
+_REUSE_CMD = "pytest -q"
+
+
+def _reuse_policy(*, reuse=True, review=None, commands=(_REUSE_CMD,), **kw):
+    return Policy(
+        gates=kw.pop("gates", GatesPolicy(mode="none")),
+        notify=QUIET,
+        review=review if review is not None else ReviewPolicy(enabled=False),
+        limits=LimitsPolicy(max_dev_attempts=2),
+        verify=VerifyPolicy(commands=commands, reuse_unchanged=reuse),
+        **kw,
+    )
+
+
+def _green(out):
+    return [verify.CommandResult(_REUSE_CMD, 0, out, out, "")]
+
+
+def _red(out):
+    return [verify.CommandResult(_REUSE_CMD, 1, out, "", out)]
+
+
+def _script_verify_runs(monkeypatch, project, results, on_call=None):
+    """Script `run_verify_commands` from ``results`` (one list per pass) and
+    return the list of passes actually run — the count a reuse saves."""
+    pending = list(results)
+    ran = []
+
+    def next_results():
+        ran.append(len(ran))
+        if on_call is not None:
+            on_call(len(ran))
+        return pending.pop(0)
+
+    monkeypatch.setattr(
+        verify, "run_verify_commands", scripted_verify_runner(project.repo_root, next_results)
+    )
+    return ran
+
+
+def _entries(engine, kind):
+    return [e for e in engine.journal.entries() if e["kind"] == kind]
+
+
+def _verify_passes(engine):
+    return sorted(
+        {
+            (e["verification_stage"], e["verification_sequence"])
+            for e in _entries(engine, "verify-command-result")
+        },
+        key=lambda p: p[1],
+    )
+
+
+def _declines(engine):
+    return [e["decline"] for e in _entries(engine, "verify-reuse-declined")]
+
+
+def _skip_story(project, **dev_kw):
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    return [dev_effect(project, "1-1-a", followup_review=False, **dev_kw)]
+
+
+def test_verify_reuse_off_never_fingerprints(project, monkeypatch):
+    """Default off is byte-identical: no fingerprint is ever read, both passes
+    run, and neither reuse journal kind appears.
+
+    Ablation: drop `self.policy.verify.reuse_unchanged` from
+    `_verify_reuse_mintable` and the raising fingerprint crashes the run."""
+    engine, _ = make_engine(project, _skip_story(project), policy=_reuse_policy(reuse=False))
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+
+    def refuse(_repo):
+        raise AssertionError("fingerprinted with [verify] reuse_unchanged off")
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", refuse)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert len(ran) == 2
+    assert _verify_passes(engine) == [("dev", 1), ("review", 2)]
+    assert not _entries(engine, "verify-pass-reused")
+    assert not _entries(engine, "verify-reuse-declined")
+    (ctx,) = capture.of("post_review_verify")
+    assert (ctx.verification_stage, ctx.verification_sequence) == ("review", 2)
+    assert ctx.verification_reused is False
+
+
+@pytest.mark.parametrize(
+    "review",
+    [ReviewPolicy(enabled=True, trigger="recommended"), ReviewPolicy(enabled=False)],
+    ids=["not-recommended", "review-disabled"],
+)
+def test_verify_reuse_skip_gate_reuses_the_dev_pass(project, monkeypatch, review):
+    """The reporter's shape: a green dev pass on an unchanged tree stands in for
+    the skip-review gate's own run. One command pass, one `verify-pass-reused`
+    row joining back to it, and `post_review_verify` republishes the dev pass's
+    records under its own stage and sequence. The story commits."""
+    engine, _ = make_engine(project, _skip_story(project), policy=_reuse_policy(review=review))
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev-out")])
+    head_before = verify.rev_parse_head(project.project)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert len(ran) == 1
+    assert _verify_passes(engine) == [("dev", 1)]
+    (row,) = _entries(engine, "verify-pass-reused")
+    assert (row["story_key"], row["reused_stage"], row["reused_sequence"]) == ("1-1-a", "dev", 1)
+    assert row["command_count"] == 1
+    assert row["head"] == head_before and row["tree"]
+    assert not _entries(engine, "verify-reuse-declined")
+    (ctx,) = capture.of("post_review_verify")
+    assert (ctx.verification_stage, ctx.verification_sequence) == ("dev", 1)
+    assert [r.stdout for r in ctx.command_results] == ["dev-out"]
+    assert ctx.verification_reused is True
+    assert not ctx.verify_reason
+    assert verify.rev_parse_head(project.project) != head_before  # the commit landed
+
+
+def _gate_unit(project, monkeypatch, *, policy=None, story_key="1-1-a"):
+    """An engine plus a task whose spec and board already satisfy the skip-review
+    gate, so a test can mint a token with a real dev pass and then drive the
+    gate directly — the tree is written BEFORE the mint, never between."""
+    engine, _ = make_engine(project, [], policy=policy or _reuse_policy())
+    task = StoryTask(story_key=story_key, epic=1)
+    sp = spec_path(project, story_key)
+    write_spec(sp, "done", verify.rev_parse_head(project.project))
+    task.spec_file = str(sp)
+    write_sprint(project, {story_key: "done"})
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+    return engine, task, ran
+
+
+def test_verify_reuse_status_checks_still_gate(project, monkeypatch):
+    """A valid token never skips the status checks: a spec short of done at the
+    gate fails exactly as with reuse off — no command, no decision row."""
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+    assert engine._verify_reuse is not None
+    write_spec(Path(task.spec_file), "in-progress", verify.rev_parse_head(project.project))
+
+    outcome = engine._review_verify_gate(task, reuse_eligible=True)
+
+    off = verify.verify_review(
+        task,
+        engine.workspace.paths,
+        dataclasses.replace(
+            engine.policy, verify=VerifyPolicy(commands=(_REUSE_CMD,), reuse_unchanged=False)
+        ),
+        sprint_reached_done=True,
+    )
+    assert not outcome.ok and outcome.reason == off.reason
+    assert len(ran) == 1
+    assert not _entries(engine, "verify-pass-reused")
+    assert not _entries(engine, "verify-reuse-declined")
+
+
+def test_verify_reuse_fix_gate_reuses_the_fix_pass(project, monkeypatch):
+    """The repair path: a tracked edit between the dev pass and the first gate
+    declines with `tree-mismatch`, the red gate runs (review 2), the fix pass is
+    green (fix 3), and the post-fix gate reuses the FIX pass."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False), dev_effect(project, "1-1-a")],
+        policy=_reuse_policy(),
+    )
+    capture = _StageCaptureBus("post_review_verify")
+    engine._bus = capture
+    ran = _script_verify_runs(
+        monkeypatch, project, [_green("dev"), _red("review fail"), _green("fixed")]
+    )
+    real_gate = engine._review_verify_gate
+    gates_seen = []
+
+    def edit_then_gate(task, **kw):
+        gates_seen.append(kw.get("reuse_eligible"))
+        if len(gates_seen) == 1:
+            src = project.project / "src.txt"
+            src.write_text(src.read_text() + "between the passes\n")
+        return real_gate(task, **kw)
+
+    monkeypatch.setattr(engine, "_review_verify_gate", edit_then_gate)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert gates_seen == [True, True]
+    assert len(ran) == 3
+    assert _verify_passes(engine) == [("dev", 1), ("review", 2), ("fix", 3)]
+    assert _declines(engine) == ["tree-mismatch"]
+    (row,) = _entries(engine, "verify-pass-reused")
+    assert (row["reused_stage"], row["reused_sequence"]) == ("fix", 3)
+    first, second = capture.of("post_review_verify")
+    assert (first.verification_stage, first.verification_sequence) == ("review", 2)
+    assert (second.verification_stage, second.verification_sequence) == ("fix", 3)
+    assert [r.stdout for r in second.command_results] == ["fixed"]
+    # the declined gate ran its own commands; only the reused one is flagged
+    assert (first.verification_reused, second.verification_reused) == (False, True)
+
+
+def test_verify_reuse_post_fix_gate_never_reuses_the_dev_pass(project, monkeypatch):
+    """A fingerprint fault during the fix pass leaves the post-fix gate nothing
+    to reuse — not the dev pass: it runs its commands and declines with
+    `fingerprint-fault`, carrying the fault text. The fault never changes the
+    fix pass's outcome.
+
+    Ablation: drop the `_invalidate_verify_reuse("fingerprint-fault", ...)`
+    record in `_verify_reuse_fingerprint` and the decline reads `superseded`."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a", followup_review=False), dev_effect(project, "1-1-a")],
+        policy=_reuse_policy(),
+    )
+    ran = _script_verify_runs(
+        monkeypatch, project, [_green("dev"), _red("review fail"), _green("fixed"), _green("final")]
+    )
+    real_fp = verify.worktree_fingerprint
+    reads = []
+
+    def fp(repo):
+        reads.append(len(ran))
+        if len(ran) >= 2:  # the fix pass's reads: after the red review gate ran
+            raise verify.GitError("fingerprint exploded")
+        return real_fp(repo)
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", fp)
+    real_gate = engine._review_verify_gate
+    gates_seen = []
+
+    def edit_then_gate(task, **kw):
+        gates_seen.append(1)
+        if len(gates_seen) == 1:
+            src = project.project / "src.txt"
+            src.write_text(src.read_text() + "between the passes\n")
+        return real_gate(task, **kw)
+
+    monkeypatch.setattr(engine, "_review_verify_gate", edit_then_gate)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert len(ran) == 4
+    assert _verify_passes(engine) == [("dev", 1), ("review", 2), ("fix", 3), ("review", 4)]
+    assert _declines(engine) == ["tree-mismatch", "fingerprint-fault"]
+    fault = _entries(engine, "verify-reuse-declined")[1]
+    assert fault["detail"] == "fingerprint exploded"
+    assert "detail" not in _entries(engine, "verify-reuse-declined")[0]
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def test_verify_reuse_declines_after_a_workflow_session(project, monkeypatch):
+    """A plugin workflow session between the passes voids the token
+    (`session-launched`), even though it changed nothing on disk.
+
+    Ablation: drop the `_invalidate_verify_reuse("session-launched")` at the
+    top of `_run_session` and the gate reuses."""
+    from bmad_loop.plugins import PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin, PluginManifest, WorkflowSpec
+
+    manifest = PluginManifest(
+        name="wf",
+        api_version=1,
+        workflows=(WorkflowSpec(name="doc", stage="post_dev_phase", role="review", prompt="/doc"),),
+    )
+    script = _skip_story(project) + [lambda spec: SessionResult(status="completed", result_json={})]
+    engine, adapter = make_engine(
+        project,
+        script,
+        policy=_reuse_policy(),
+        registry=PluginRegistry([LoadedPlugin(manifest=manifest)]),
+    )
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert len(adapter.sessions) == 2  # dev + the workflow session
+    assert len(ran) == 2
+    assert _declines(engine) == ["session-launched"]
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def test_verify_reuse_declines_a_pass_that_mutated_the_tree(project, monkeypatch):
+    """A command that writes a tracked file during the dev pass mints nothing:
+    the gate runs its commands and declines with `pass-mutated-tree`.
+
+    Ablation: mint whatever `after` reads (skip the equality check) and the
+    gate's tree read matches the post-pass tree, so it reuses."""
+    engine, _ = make_engine(project, _skip_story(project), policy=_reuse_policy())
+
+    def mutate(n):
+        if n == 1:
+            src = project.project / "src.txt"
+            src.write_text(src.read_text() + "written by the verify command\n")
+
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")], mutate)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert len(ran) == 2
+    assert _declines(engine) == ["pass-mutated-tree"]
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def _commit_an_unrelated_file(project):
+    (project.project / "other.txt").write_text("moved\n")
+    git(project.project, "add", "other.txt")
+    git(project.project, "commit", "-q", "-m", "move HEAD")
+
+
+@pytest.mark.parametrize(
+    "inject",
+    [
+        lambda p: (p.project / "src.txt").write_text("tracked edit\n"),
+        lambda p: (p.project / "new-untracked.txt").write_text("untracked\n"),
+        _commit_an_unrelated_file,
+    ],
+    ids=["tracked-edit", "untracked-file", "head-move"],
+)
+def test_verify_reuse_declines_on_a_tree_mismatch(project, monkeypatch, inject):
+    """Anything git can see moving between the pass and the gate forces a real
+    run: a tracked edit, a new untracked file, or a HEAD move.
+
+    Ablation: make `verify._decide_reuse` skip its `now != reuse.fingerprint`
+    check and every case reuses."""
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+    inject(project)
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+
+    assert len(ran) == 2
+    assert _declines(engine) == ["tree-mismatch"]
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def test_verify_reuse_declines_on_a_policy_mismatch(project, monkeypatch):
+    """Commands swapped between the pass and the gate: `policy-mismatch`.
+
+    Ablation: make `verify._decide_reuse` skip its key comparison and the gate
+    reuses a pass of different commands."""
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+    engine.policy = dataclasses.replace(
+        engine.policy,
+        verify=dataclasses.replace(engine.policy.verify, commands=("pytest -q -x",)),
+    )
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+
+    assert len(ran) == 2
+    assert _declines(engine) == ["policy-mismatch"]
+
+
+def test_verify_reuse_declines_on_a_gitlink(project, monkeypatch):
+    """An untracked embedded repo (staged as a gitlink) refuses the fingerprint,
+    so nothing is minted and the gate declines with `gitlinks`.
+
+    Ablation: drop the `FingerprintRefused` arm in `_verify_reuse_fingerprint`
+    and the refusal escapes the dev pass."""
+    nested = project.project / "vendored"
+    nested.mkdir()
+    git(nested, "init", "-q")
+    (nested / "f.txt").write_text("x\n")
+    git(nested, "add", "f.txt")
+    git(nested, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "n")
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    outcome, _ = engine._verify_commands_with_results(task, "dev")
+    assert outcome.ok  # the refusal never changes the pass's outcome
+    assert engine._verify_reuse is None
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+
+    assert len(ran) == 2
+    assert _declines(engine) == ["gitlinks"]
+
+
+@pytest.mark.parametrize(
+    "site, reason",
+    [
+        ("_safe_reset", "reset"),
+        ("_rollback_or_pause", "rollback"),
+        ("_discard_unit_for_restart", "worktree-discard"),
+    ],
+)
+def test_verify_reuse_tree_rewinds_void_the_token(project, monkeypatch, site, reason):
+    """A reset, a rollback and a worktree discard each drop a minted token and
+    record why — the decline a later gate journals.
+
+    Ablation: delete the site's `_invalidate_verify_reuse` call and the token
+    survives."""
+    engine, task, _ = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+    assert engine._verify_reuse is not None
+    monkeypatch.setattr(engine._recovery_flow, "safe_reset", lambda *a, **k: None)
+    monkeypatch.setattr(engine._recovery_flow, "rollback_or_pause", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "_after_code_rollback", lambda *a, **k: None)
+    monkeypatch.setattr("bmad_loop.engine.discard_worktree", lambda *a, **k: None)
+    monkeypatch.setattr(task, "release_mount_owned_state", lambda *a, **k: None, raising=False)
+
+    getattr(engine, site)(task)
+
+    assert engine._verify_reuse is None
+    assert engine._verify_reuse_void == (reason, None)
+
+
+def test_verify_reuse_never_survives_a_pause(project, monkeypatch):
+    """A `per-story-spec-approval` pause, then a fresh Engine on the same run
+    dir: the token was never persisted, so the skip gate runs its commands and
+    declines with `no-token`. The paused process voided its own copy too."""
+    gated = _reuse_policy(gates=GatesPolicy(mode="per-story-spec-approval"))
+    engine, _ = make_engine(project, _skip_story(project), policy=gated)
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+
+    assert engine.run().paused
+    assert engine._verify_reuse is None and engine._verify_reuse_void == ("paused", None)
+
+    resumed, _ = resume_engine(project, engine, [], policy=gated)
+    summary = resumed.run()
+
+    assert summary.done == 1
+    assert len(ran) == 2
+    assert _declines(resumed) == ["no-token"]
+    assert not _entries(resumed, "verify-pass-reused")
+
+
+def test_verify_reuse_review_enabled_gates_never_reuse(project, monkeypatch):
+    """A gate verifying a review session's product is not eligible: even when
+    the review changed nothing, the converged gate runs its commands and writes
+    no reuse or decline row.
+
+    Ablation: pass `reuse_eligible=True` at the converged gate and it journals
+    a `session-launched` decline."""
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [dev_effect(project, "1-1-a"), review_effect(project, "1-1-a", clean=True)],
+        policy=_reuse_policy(review=ReviewPolicy(enabled=True, trigger="recommended")),
+    )
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("review")])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert len(ran) == 2
+    assert _verify_passes(engine) == [("dev", 1), ("review", 2)]
+    assert not _entries(engine, "verify-pass-reused")
+    assert not _entries(engine, "verify-reuse-declined")
+
+
+def test_verify_reuse_without_commands_fingerprints_nothing(project, monkeypatch):
+    """No `[verify] commands`: nothing to reuse, so no fingerprint and no row.
+
+    Ablation: drop the `bool(self.policy.verify.commands)` term in
+    `_verify_reuse_mintable` and the raising fingerprint crashes the run."""
+    engine, _ = make_engine(project, _skip_story(project), policy=_reuse_policy(commands=()))
+
+    def refuse(_repo):
+        raise AssertionError("fingerprinted with no [verify] commands")
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", refuse)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert not _entries(engine, "verify-pass-reused")
+    assert not _entries(engine, "verify-reuse-declined")
+
+
+def test_verify_reuse_token_is_one_shot(project, monkeypatch):
+    """A successful reuse consumes the token: a second eligible gate for the same
+    task with no fresh pass runs its commands and declines with `no-token`.
+
+    Ablation: keep the token in `_review_reuse_request` after a match (drop the
+    pop); the second gate reuses too and `ran` stays at 1."""
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+    assert len(ran) == 1
+    assert len(_entries(engine, "verify-pass-reused")) == 1
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+    assert len(ran) == 2
+    assert _declines(engine) == ["no-token"]
+    assert len(_entries(engine, "verify-pass-reused")) == 1
+
+
+def test_verify_reuse_token_is_not_consumed_by_another_story(project, monkeypatch):
+    """Story A's green pass never stands in for story B's gate.
+
+    Ablation: drop the `story_key` comparison in `_review_reuse_request` and
+    story B reuses A's pass (same commands, same tree)."""
+    engine, task_a, ran = _gate_unit(project, monkeypatch, story_key="1-1-a")
+    task_b = StoryTask(story_key="1-2-b", epic=1)
+    sp = spec_path(project, "1-2-b")
+    write_spec(sp, "done", verify.rev_parse_head(project.project))
+    task_b.spec_file = str(sp)
+    write_sprint(project, {"1-1-a": "done", "1-2-b": "done"})
+    assert engine._verify_commands_with_results(task_a, "dev")[0].ok
+
+    assert engine._review_verify_gate(task_b, reuse_eligible=True).ok
+
+    assert len(ran) == 2
+    assert [(e["story_key"], e["decline"]) for e in _entries(engine, "verify-reuse-declined")] == [
+        ("1-2-b", "no-token")
+    ]
+    assert not _entries(engine, "verify-pass-reused")
+
+
 def test_post_review_verify_does_not_republish_an_earlier_gates_records(project):
     """A gate that fails before its commands publishes `NO_VERIFY_COMMANDS`, even
     right after a gate that did record — never the earlier gate's records.

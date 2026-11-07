@@ -1287,3 +1287,109 @@ def test_unity_setup_fails_loud_when_agent_config_leaks(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_FORCE_URL", "http://localhost:23191")
     # isolation check rejects -> non-zero so the engine defers the unit (no work)
     assert mod._setup_ivanmurzak(tmp_path) == 1
+
+
+# ------------------------------- [verify] reuse_unchanged vs plugin hooks (#1002)
+#
+# Only sessions void a reuse token; a plugin HOOK's writes are caught by the
+# gate-time fingerprint alone, and only where git can see them.
+
+
+def _reuse_hook_run(project, monkeypatch, write):
+    from conftest import dev_effect, scripted_verify_runner, write_sprint
+
+    from bmad_loop import verify
+    from bmad_loop.adapters.mock import MockAdapter
+    from bmad_loop.journal import Journal
+    from bmad_loop.model import RunState, TokenUsage
+    from bmad_loop.plugins import Plugin, PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin
+    from bmad_loop.policy import GatesPolicy, ReviewPolicy, VerifyPolicy
+
+    class Writer(Plugin):
+        def on_post_dev_phase(self, c):
+            write(project.project)
+
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    manifest = PluginManifest(name="writer", api_version=1)
+    run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
+    engine = Engine(
+        paths=project,
+        policy=Policy(
+            gates=GatesPolicy(mode="none"),
+            notify=QUIET,
+            review=ReviewPolicy(enabled=False),
+            verify=VerifyPolicy(commands=("pytest -q",), reuse_unchanged=True),
+        ),
+        adapter=MockAdapter(
+            [dev_effect(project, "1-1-a", followup_review=False)],
+            usage_per_session=TokenUsage(input_tokens=1, output_tokens=1),
+        ),
+        run_dir=run_dir,
+        journal=Journal(run_dir),
+        state=RunState(run_id="test-run", project=str(project.project), started_at="now"),
+        registry=PluginRegistry([LoadedPlugin(manifest=manifest, instance=Writer(manifest, {}))]),
+    )
+    ran = []
+    green = [verify.CommandResult("pytest -q", 0, "ok", "ok", "")]
+    monkeypatch.setattr(
+        verify,
+        "run_verify_commands",
+        scripted_verify_runner(project.repo_root, lambda: ran.append(1) or green),
+    )
+    summary = engine.run()
+    kinds = {
+        kind: [e for e in engine.journal.entries() if e["kind"] == kind]
+        for kind in ("verify-pass-reused", "verify-reuse-declined")
+    }
+    return summary, ran, kinds
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda root: (root / "src.txt").write_text("hook rewrote a tracked file\n"),
+        lambda root: (root / "hook-output.txt").write_text("untracked, not ignored\n"),
+    ],
+    ids=["tracked", "untracked"],
+)
+def test_verify_reuse_sees_a_post_dev_phase_hook_write(project, monkeypatch, write):
+    """A Python hook on `post_dev_phase` (between the dev pass and the skip
+    gate) writing a git-visible file forces a real run with `tree-mismatch` —
+    the fingerprint, not a hook-dispatch void, is what catches it.
+
+    Ablation: make `verify._decide_reuse` skip its tree comparison and the
+    gate reuses."""
+    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, write)
+
+    assert summary.done == 1
+    assert len(ran) == 2
+    assert [e["decline"] for e in kinds["verify-reuse-declined"]] == ["tree-mismatch"]
+    assert not kinds["verify-pass-reused"]
+
+
+def test_verify_reuse_is_blind_to_a_hook_writing_an_ignored_file(project, monkeypatch):
+    """The documented blind spot: a hook that writes only an IGNORED file leaves
+    the fingerprint equal, and hook dispatch does not void the token (only
+    sessions do), so the gate still reuses the dev pass."""
+    gitignore = project.project / ".gitignore"
+    existing = gitignore.read_text() if gitignore.exists() else ""
+    gitignore.write_text(existing + "hook-cache/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=project.project, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "ignore"],
+        cwd=project.project,
+        check=True,
+    )
+
+    def write_ignored(root):
+        (root / "hook-cache").mkdir(exist_ok=True)
+        (root / "hook-cache" / "state.bin").write_text("ignored\n")
+
+    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, write_ignored)
+
+    assert (project.project / "hook-cache" / "state.bin").exists()  # the hook ran
+    assert summary.done == 1
+    assert len(ran) == 1
+    assert [e["reused_stage"] for e in kinds["verify-pass-reused"]] == ["dev"]
+    assert not kinds["verify-reuse-declined"]

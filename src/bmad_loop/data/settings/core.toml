@@ -269,6 +269,12 @@ maximum = 255
 default_ref = "VerifyPolicy.env_fault_rc"
 label = "environment-fault exit status"
 description = "exit status a verify command uses to declare an environment fault (pause, attempt not charged) instead of a code failure · 0 = disabled; 75 (EX_TEMPFAIL) is a good choice"
+[[section.field]]
+key = "reuse_unchanged"
+kind = "switch"
+default_ref = "VerifyPolicy.reuse_unchanged"
+label = "reuse unchanged verify pass"
+description = "ON: a skip-review gate reuses the green dev/fix verify pass instead of re-running the commands when HEAD and the git-visible state of the whole repository are unchanged since it (status checks and environment probes still run) · reuse trusts that nothing outside git-visible state changed: untracked ignored files, files under .bmad-loop/, staged-only index changes, changes git's clean filters normalise away (CRLF conversion, LFS pointers), non-git state and plugin hooks that write ignored files are blind spots · a submodule refuses reuse, and any session or pause in between forces a real run · leave OFF for suites that depend on external state · OFF: the gate always re-runs the commands"
 
 [[section]]
 name = "environment"

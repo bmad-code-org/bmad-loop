@@ -14,6 +14,7 @@ from conftest import (
     git,
     install_build_auto_skill,
     nested_repo_root_paths,
+    scripted_verify_runner,
     seed_outer_decoy_ledger,
     write_gated_ledger,
     write_ledger,
@@ -3052,3 +3053,173 @@ def test_relative_stories_folder_joins_the_project_under_a_nested_repo_root(proj
     wt.mkdir()
     engine.workspace = Workspace(root=wt.resolve(), paths=paths.rebased(wt))
     assert engine._stories_folder() == wt.resolve() / "app" / engine._spec_folder_rel
+
+
+# ----------------------------- [verify] reuse_unchanged in stories mode (#1002)
+
+_REUSE_CMD = "pytest -q"
+
+
+def _reuse_stories_policy(*, reuse=True, review=None) -> Policy:
+    return _stories_policy(
+        review=review if review is not None else ReviewPolicy(enabled=False),
+        verify=VerifyPolicy(commands=(_REUSE_CMD,), reuse_unchanged=reuse),
+    )
+
+
+def _green(out):
+    return [verify.CommandResult(_REUSE_CMD, 0, out, out, "")]
+
+
+def _script_reuse_verify_runs(monkeypatch, project, results):
+    """Script `run_verify_commands` from ``results`` (one list per pass) and
+    return the list of passes actually run — the count a reuse saves."""
+    pending = list(results)
+    ran = []
+
+    def next_results():
+        ran.append(len(ran))
+        return pending.pop(0)
+
+    monkeypatch.setattr(
+        verify, "run_verify_commands", scripted_verify_runner(project.repo_root, next_results)
+    )
+    return ran
+
+
+def _reuse_verify_passes(engine):
+    return sorted(
+        {
+            (e["verification_stage"], e["verification_sequence"])
+            for e in _kinds(engine.journal, "verify-command-result")
+        },
+        key=lambda p: p[1],
+    )
+
+
+class _ReviewVerifyCaptureBus:
+    """Hook-bus double that binds only `post_review_verify` and keeps its contexts."""
+
+    def __init__(self):
+        self.contexts = []
+
+    def active(self, stage):
+        return stage == "post_review_verify"
+
+    def emit(self, stage, ctx):
+        self.contexts.append(ctx)
+        return ctx
+
+
+@pytest.mark.parametrize(
+    "review",
+    [ReviewPolicy(enabled=True, trigger="recommended"), ReviewPolicy(enabled=False)],
+    ids=["not-recommended", "review-disabled"],
+)
+def test_stories_verify_reuse_skip_gate_reuses_the_dev_pass(project, monkeypatch, review):
+    """The #1002 reporter's shape in stories mode: a green dev pass on an
+    unchanged tree stands in for the skip-review gate's own run. One command
+    pass, one `verify-pass-reused` row joining back to `("dev", 1)`, no decline,
+    `post_review_verify` republishes the dev pass, and the story commits.
+
+    Ablation: drop `reuse=self._review_reuse_request(task)` from
+    `StoriesEngine._verify_review` and the gate runs its commands — a second
+    pass, and `pending.pop` on the empty script raises."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project, [stories_dev_effect()], policy=_reuse_stories_policy(review=review)
+    )
+    capture = _ReviewVerifyCaptureBus()
+    engine._bus = capture
+    ran = _script_reuse_verify_runs(monkeypatch, project, [_green("dev-out")])
+    head_before = rev_parse_head(project.project)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert len(ran) == 1
+    assert _reuse_verify_passes(engine) == [("dev", 1)]
+    (row,) = _kinds(engine.journal, "verify-pass-reused")
+    assert (row["story_key"], row["reused_stage"], row["reused_sequence"]) == ("1", "dev", 1)
+    assert row["command_count"] == 1 and row["attempt"] == 1
+    assert row["head"] == head_before and row["tree"]
+    assert not _kinds(engine.journal, "verify-reuse-declined")
+    (ctx,) = capture.contexts
+    assert ctx.verification_reused is True
+    assert (ctx.verification_stage, ctx.verification_sequence) == ("dev", 1)
+    assert [r.stdout for r in ctx.command_results] == ["dev-out"]
+    assert status_of(read_frontmatter(story_spec(project, "1"))) == "done"
+    assert rev_parse_head(project.project) != head_before  # the story commit landed
+
+
+def test_stories_verify_reuse_plan_halt_leg_mints_nothing(project, monkeypatch):
+    """A spec_checkpoint plan-halt leg runs no verify pass, so it reads no
+    fingerprint and mints no token; the resumed implement leg then runs the one
+    dev pass and its skip-review gate reuses THAT pass.
+
+    Ablation: make `StoriesEngine._run_verify_commands_after_dev` return True
+    on a plan-halt leg and leg 1 runs a command pass and fingerprints the tree
+    (`ran`/`reads` non-empty before the pause)."""
+    setup_stories(project, [entry("1", spec_checkpoint=True)])
+    policy = _reuse_stories_policy()
+    engine, _ = make_engine(project, [stories_checkpoint_effect()], policy=policy)
+    ran = _script_reuse_verify_runs(monkeypatch, project, [_green("impl")])
+    real_fp = verify.worktree_fingerprint
+    reads = []
+
+    def fp(repo):
+        reads.append(len(ran))
+        return real_fp(repo)
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", fp)
+
+    summary = engine.run()
+
+    assert summary.paused and summary.done == 0
+    assert load_state(engine.run_dir).paused_stage == PAUSE_PLAN_CHECKPOINT
+    assert ran == [] and reads == []
+    assert engine._verify_reuse is None
+    assert not _kinds(engine.journal, "verify-command-result")
+    assert not _kinds(engine.journal, "verify-pass-reused")
+    assert not _kinds(engine.journal, "verify-reuse-declined")
+
+    resumed, _ = resume_engine(project, engine, [stories_checkpoint_effect()])
+    rsummary = resumed.run()
+
+    assert rsummary.done == 1
+    assert len(ran) == 1
+    assert reads and set(reads) <= {0, 1}  # only the implement leg's dev pass + gate
+    passes = _reuse_verify_passes(resumed)
+    assert [stage for stage, _ in passes] == ["dev"]
+    (row,) = _kinds(resumed.journal, "verify-pass-reused")
+    assert (row["reused_stage"], row["reused_sequence"]) == ("dev", passes[0][1])
+    assert not _kinds(resumed.journal, "verify-reuse-declined")
+
+
+def test_stories_verify_reuse_off_never_fingerprints(project, monkeypatch):
+    """Default off is byte-identical in stories mode: no fingerprint is ever
+    read, both the dev pass and the skip-review gate run their commands, and
+    neither reuse journal kind appears.
+
+    Ablation: drop `self.policy.verify.reuse_unchanged` from
+    `Engine._verify_reuse_mintable` and the raising fingerprint crashes the run;
+    drop it from `Engine._review_reuse_request` and the gate journals a
+    `no-token` decline."""
+    setup_stories(project, [entry("1")])
+    engine, _ = make_engine(
+        project, [stories_dev_effect()], policy=_reuse_stories_policy(reuse=False)
+    )
+    ran = _script_reuse_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+
+    def refuse(_repo):
+        raise AssertionError("fingerprinted with [verify] reuse_unchanged off")
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", refuse)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.crashed
+    assert len(ran) == 2
+    assert _reuse_verify_passes(engine) == [("dev", 1), ("review", 2)]
+    assert not _kinds(engine.journal, "verify-pass-reused")
+    assert not _kinds(engine.journal, "verify-reuse-declined")

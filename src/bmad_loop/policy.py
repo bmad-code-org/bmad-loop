@@ -251,6 +251,16 @@ class VerifyPolicy:
     # instead of an ordinary, budget-burning verify failure. 0 = disabled. 75
     # (EX_TEMPFAIL) is the documented suggestion: no common tool exits with it.
     env_fault_rc: int = 0
+    # reuse_unchanged lets the two skip-review gates reuse the dev (or fix) pass
+    # instead of re-running every [verify] command, when nothing git-visible
+    # changed between that green pass and the gate: same commands, timeout,
+    # env_fault_rc and cwd, the same HEAD, and the same worktree tree hash
+    # (taken through a temporary index, ignored paths and .bmad-loop/ left out).
+    # Reuse trusts that nothing outside git-visible state changed in between:
+    # ignored files (node_modules, build output, caches) and non-git state
+    # (databases, services, env) are blind spots. Off by default; status checks
+    # and the environment-probe preflight still run at a reused gate.
+    reuse_unchanged: bool = False
 
 
 @dataclass(frozen=True)
@@ -1189,6 +1199,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
             verify_d, "verify", "stream_capture_kb", VerifyPolicy.stream_capture_kb
         ),
         env_fault_rc=_typed_int(verify_d, "verify", "env_fault_rc", VerifyPolicy.env_fault_rc),
+        reuse_unchanged=_typed_bool(
+            verify_d, "verify", "reuse_unchanged", VerifyPolicy.reuse_unchanged
+        ),
     )
     if verify.command_timeout_min < 1:
         raise PolicyError(
@@ -1614,6 +1627,7 @@ commands = []                # e.g. ["pytest -q", "ruff check ."]
 command_timeout_min = 30     # per-command wall-clock bound (minutes); a command running past it is killed and fails as an ordinary verify failure
 stream_capture_kb = 256      # per-stream cap (KiB) on the verifier stdout/stderr retained under the run's verify/ directory; the TAIL is kept and the journal records the full byte count plus a truncation flag. 0 = capture nothing (records still land, with null pointers)
 env_fault_rc = 0             # exit status a [verify] command uses to declare an environment fault (pause, attempt not charged) instead of a code failure. 0 = disabled; 75 (EX_TEMPFAIL) is a good choice
+reuse_unchanged = false      # true: a skip-review gate reuses the green dev/fix pass instead of re-running the commands when HEAD and the git-visible worktree are unchanged since it; ignored files and non-git state are blind spots
 
 [environment]
 # Orchestrator-run health checks (e.g. a local container or database). They run

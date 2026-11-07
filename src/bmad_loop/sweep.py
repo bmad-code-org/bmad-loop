@@ -9622,6 +9622,20 @@ class SweepEngine(Engine):
             )
         return outcome
 
+    def _verify_reuse_supported(self) -> bool:
+        """Sweeps never reuse a green verify pass (``[verify] reuse_unchanged``).
+
+        The engine itself writes the tree between the passes: the dev leg's
+        ``_post_dev_accepted_sync`` closes the bundle's ledger entries AFTER the
+        dev verify pass, and ``_verify_review`` re-closes them right before the
+        review gate's commands. The gate's fingerprint would therefore never
+        match the pass's, and carving the ledger out of the fingerprint would let
+        a verify suite that reads it run green against a different ledger. Sweep
+        reuse is deferred; with the flag on, the dev pass mints no token (no
+        fingerprint is read) and every eligible gate journals a
+        ``mode-unsupported`` decline and runs its commands."""
+        return False
+
     def _verify_review(self, task: StoryTask):
         # Generic bundle dev sessions are told not to edit deferred-work.md; the
         # orchestrator is the ledger writer. A follow-up review can rewrite the
@@ -9637,6 +9651,10 @@ class SweepEngine(Engine):
                 kind="sweep-bundle-reclosed",
                 site="bundle-reclose-locked",
             )
+        # Always None here (`_verify_reuse_supported` is False): on an eligible
+        # skip-review gate with the flag on it journals the `mode-unsupported`
+        # decline, and verify_review_bundle takes no reuse.
+        self._review_reuse_request(task)
         outcome = verify.verify_review_bundle(
             task,
             self.workspace.paths,

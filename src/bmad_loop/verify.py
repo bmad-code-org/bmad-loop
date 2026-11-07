@@ -7524,8 +7524,7 @@ def apply_incoming_collision_plan(
         parent = (repo / path).parent.resolve()
         if parent != repo_res and not parent.is_relative_to(repo_res):
             raise OSError(
-                f"refusing to clean incoming collision outside repository {repo_res}: "
-                f"{repo / path}"
+                f"refusing to clean incoming collision outside repository {repo_res}: {repo / path}"
             )
         prune_starts[path] = parent
     tracked_cleaned = [path for path in plan.cleaned if path not in untracked]
@@ -9206,8 +9205,7 @@ def verify_dev_bundle(
         status = status_of(fm)
         if status not in accept_statuses:
             return VerifyOutcome.retry(
-                f"spec status is {status!r}, expected one of {sorted(accept_statuses)}: "
-                f"{spec_path}"
+                f"spec status is {status!r}, expected one of {sorted(accept_statuses)}: {spec_path}"
             )
         expected_status = status
     gate = _verify_shared_gates(
@@ -9465,8 +9463,7 @@ def verify_dev_tickets(
                     f"result instead: {claimed_path} (expected plan {plan})"
                 )
             return VerifyOutcome.retry(
-                f"dev result names {claimed_path}, but ticket {ticket_id!r} is bound "
-                f"to plan {plan}"
+                f"dev result names {claimed_path}, but ticket {ticket_id!r} is bound to plan {plan}"
             )
     if not plan.is_file():
         return VerifyOutcome.retry(f"bound ticket plan does not exist: {plan}")
@@ -10259,12 +10256,194 @@ def environment_preflight_outcome(probe: ProbeOutcome) -> VerifyOutcome:
     return _env_fault_outcome(probe.failed, f"environment probe {probe.reason}", "probe")
 
 
+@dataclass(frozen=True)
+class TreeFingerprint:
+    """What :func:`worktree_fingerprint` saw: the HEAD commit and the tree hash of
+    the git-visible worktree staged over it. Two equal fingerprints mean nothing
+    git can see moved between the two reads — see the blind spots there."""
+
+    head: str
+    tree: str
+
+
+@dataclass(frozen=True)
+class VerifyReuseKey:
+    """The policy inputs a green ``[verify]`` pass's verdict depends on, so a
+    reuse is refused the moment any of them differs from the pass being reused.
+
+    ``cwd`` is the resolved, ``normcase``-folded root the commands ran in (a
+    differently-cased spelling of one Windows root is the same root).
+    ``stream_capture_kb`` is left out on purpose: it bounds what is captured, not
+    how a result is classified, so two passes that differ only there agree."""
+
+    cwd: str
+    commands: tuple[str, ...]
+    command_timeout_min: int
+    env_fault_rc: int
+
+
+def verify_reuse_key(policy: Policy, cwd: Path) -> VerifyReuseKey:
+    """The :class:`VerifyReuseKey` for running ``policy``'s ``[verify]`` commands
+    in ``cwd``."""
+    return VerifyReuseKey(
+        cwd=os.path.normcase(str(Path(cwd).resolve())),
+        commands=tuple(policy.verify.commands),
+        command_timeout_min=policy.verify.command_timeout_min,
+        env_fault_rc=policy.verify.env_fault_rc,
+    )
+
+
+class FingerprintRefused(Exception):
+    """:func:`worktree_fingerprint` declined to fingerprint the worktree at all —
+    today only because it holds a gitlink (a submodule, or an untracked nested
+    repo ``add -A`` stages as one), whose working tree the parent's tree hash
+    cannot see. Not a :class:`GitError`: git answered; the answer cannot vouch
+    for the tree."""
+
+
+@dataclass(frozen=True)
+class ReuseDecision:
+    """The verdict of one reuse attempt at a review gate.
+
+    ``reused`` is the answer; on a decline ``decline`` names why (one of
+    ``policy-mismatch``, ``fingerprint-fault``, ``gitlinks``, ``tree-mismatch``,
+    ``hard-stop``)
+    and ``detail`` carries the fault text for ``fingerprint-fault``.
+    ``fingerprint`` is the gate-time fingerprint when one was taken."""
+
+    reused: bool
+    decline: str | None
+    detail: str | None
+    fingerprint: TreeFingerprint | None
+
+
+@dataclass(frozen=True)
+class VerifyReuse:
+    """A request to reuse an earlier green ``[verify]`` pass at a review gate:
+    the pass's :class:`VerifyReuseKey` and :class:`TreeFingerprint` (both taken
+    by the caller around that pass), the outcome to hand back on a match, and
+    ``on_decision``, which observes every decision, reused or declined. The same
+    must-not-raise contract as ``verify_commands_outcome``'s ``on_results``
+    applies to ``on_decision``."""
+
+    key: VerifyReuseKey
+    fingerprint: TreeFingerprint
+    outcome: VerifyOutcome
+    on_decision: Callable[[ReuseDecision], None]
+
+
+def worktree_fingerprint(repo: Path) -> TreeFingerprint:
+    """Fingerprint ``repo``'s git-visible working state: HEAD, plus the tree
+    hash of the worktree staged over HEAD in a throwaway index.
+
+    Modelled on :func:`snapshot_worktree`: a temp ``GIT_INDEX_FILE`` is seeded
+    from HEAD (``read-tree``), then ``add -A`` stages every tracked edit, deletion
+    and non-ignored untracked file, and ``write-tree`` names the result. The
+    scope is the WHOLE enclosing worktree (``:/``), not just ``repo``: a project
+    living in a subdirectory of a larger repository can have verify commands that
+    read its siblings. Files the real index tracks although an ignore rule
+    matches them (``git add -f``, possibly not yet in HEAD) are restaged into the
+    temp index too (``update-index --add --remove``), because the commit that
+    follows a reuse takes them. The real index is only read, and the working
+    tree never touched, so an operator's staged state survives the read byte for
+    byte. ``.bmad-loop/`` is excluded by an explicit
+    pathspec, not left to ``.gitignore`` (the orchestrator writes its run state
+    there between the two reads); ``-c core.safecrlf=false`` keeps a mixed-EOL
+    file under ``core.autocrlf`` + ``core.safecrlf=true`` from failing the stage,
+    the same override the dirty-tree probes use.
+
+    Blind spots, by construction: untracked ignored files (``node_modules``,
+    build output, caches) are not staged, and staged-only state is not read (an
+    index entry that differs from its worktree file counts as the worktree
+    file), so a change there leaves the fingerprint equal; non-git state (a
+    database, a running service, the environment) is invisible; and the stage
+    runs git's clean filters, so a change those normalise away (CRLF conversion,
+    LFS pointers) reads as no change.
+
+    Raises :class:`FingerprintRefused` when the staged tree holds a gitlink (a
+    submodule, or an untracked embedded repo ``add -A`` stages as one): its
+    working tree is not in the hash, so equality would vouch for nothing. Raises
+    :class:`GitError` on any git failure (an unborn HEAD included) and lets an
+    ``OSError`` from the temp directory through; it never returns a partial
+    result. Every git call goes through the ``_run_git`` chokepoint."""
+    head = rev_parse_head(repo)
+    scope = ("--", ":/", f":(exclude){AUTOMATOR_DIR_REL}")
+    # Read from the REAL index (read-only: ls-files takes no lock and writes
+    # nothing): the tracked paths an ignore rule matches, i.e. force-added files.
+    listed = git_bytes(repo, "ls-files", "-z", "-c", "-i", "--exclude-standard", *scope)
+    if listed.returncode != 0:
+        raise GitError(
+            f"git ls-files (fingerprint) failed in {repo}: "
+            f"{os.fsdecode(listed.stdout + listed.stderr).strip()}"
+        )
+    with tempfile.TemporaryDirectory() as td:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
+        rc, out = _git_env(repo, "read-tree", head, env=env)
+        if rc != 0:
+            raise GitError(f"git read-tree (fingerprint) failed in {repo}: {out}")
+        rc, out = _git_env(repo, "-c", "core.safecrlf=false", "add", "-A", *scope, env=env)
+        if rc != 0:
+            raise GitError(f"git add (fingerprint) failed in {repo}: {out}")
+        if listed.stdout:
+            proc = _run_git(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "core.safecrlf=false",
+                    "update-index",
+                    "--add",
+                    "--remove",
+                    "-z",
+                    "--stdin",
+                ],
+                repo,
+                env=env,
+                binary=True,
+                input_data=listed.stdout,
+            )
+            if proc.returncode != 0:
+                raise GitError(
+                    f"git update-index (fingerprint) failed in {repo}: "
+                    f"{os.fsdecode(proc.stdout + proc.stderr).strip()}"
+                )
+        rc, listing, detail = _git_out(repo, "ls-files", "-s", "--", ":/", env=env)
+        if rc != 0:
+            raise GitError(f"git ls-files (fingerprint) failed in {repo}: {detail}")
+        if any(line.startswith("160000 ") for line in listing.splitlines()):
+            raise FingerprintRefused("gitlinks")
+        rc, tree, detail = _git_out(repo, "write-tree", env=env)
+        if rc != 0:
+            raise GitError(f"git write-tree (fingerprint) failed in {repo}: {detail}")
+    return TreeFingerprint(head=head, tree=tree)
+
+
+def _decide_reuse(reuse: VerifyReuse, policy: Policy, cwd: Path) -> ReuseDecision:
+    """Whether ``reuse`` may stand in for running ``policy``'s commands in
+    ``cwd``. Checked in a fixed order: the policy key first (a mismatch never
+    spends a fingerprint), then the gate-time fingerprint. Any fingerprint fault
+    declines — a fault is never a match."""
+    if verify_reuse_key(policy, cwd) != reuse.key:
+        return ReuseDecision(False, "policy-mismatch", None, None)
+    try:
+        now = worktree_fingerprint(cwd)
+    except FingerprintRefused:
+        return ReuseDecision(False, "gitlinks", None, None)
+    except (GitError, OSError) as exc:  # GitSpawnError is a GitError
+        return ReuseDecision(False, "fingerprint-fault", str(exc), None)
+    if now != reuse.fingerprint:
+        return ReuseDecision(False, "tree-mismatch", None, now)
+    return ReuseDecision(True, None, None, now)
+
+
 def verify_commands_outcome(
     policy: Policy,
     cwd: Path,
     *,
     on_results: CommandSink | None = None,
     on_probes: ProbeSink | None = None,
+    reuse: VerifyReuse | None = None,
 ) -> VerifyOutcome:
     """Run the policy's deterministic verify commands and classify the results.
 
@@ -10272,7 +10451,7 @@ def verify_commands_outcome(
     same order ``Engine._verify_commands_with_results`` uses on the dev side:
     journal first, decide second, so the record exists whatever the classifier
     then does with it — including an escalation that ends the run. It is called
-    exactly once per invocation, with an empty tuple when no commands are
+    exactly once per invocation unless a reuse fired, with an empty tuple when no commands are
     configured, because "the pass ran and executed nothing" and "no pass ran" are
     different facts and only the second one is signalled by never getting here.
 
@@ -10291,13 +10470,35 @@ def verify_commands_outcome(
     returns :func:`environment_preflight_outcome` straight away — no ``[verify]``
     command runs, so ``on_results`` is NOT called (nothing ran to record). The
     same must-not-raise contract applies to ``on_probes``, save that the
-    engine's sink raises ``RunStopped`` on an interrupted pass, deliberately."""
+    engine's sink raises ``RunStopped`` on an interrupted pass, deliberately.
+
+    ``reuse`` (``[verify] reuse_unchanged``) asks to stand an earlier green pass
+    in for the commands. It is decided AFTER the preflight, which therefore still
+    runs (and a failed preflight returns before any decision), and only
+    ``run_verify_commands`` is replaced: ``reuse.on_decision`` observes the
+    :class:`ReuseDecision` either way, and on a match ``reuse.outcome`` is
+    returned as stored — ``on_results`` is not called (no command ran) and
+    nothing is re-classified. A match with a hard stop pending declines
+    (``hard-stop``) instead, so the stop is honoured before any commit. On a
+    decline the commands run as if no reuse had been asked. ``on_decision`` must not raise, under the same contract as
+    ``on_results``."""
     if preflight_required(policy):
         probe = run_environment_probes(policy, cwd)
         if on_probes is not None:
             on_probes(probe)
         if not probe.ok:
             return environment_preflight_outcome(probe)
+    if reuse is not None:
+        decision = _decide_reuse(reuse, policy, cwd)
+        if decision.reused and childrun.hard_stop_pending():
+            # A hard stop that landed before or during the fingerprint read must
+            # not let a stored green pass commit the story: decline, and the
+            # commands below yield interrupted, unspawned results, which the
+            # caller's sink turns into the stop exactly as on a real pass.
+            decision = ReuseDecision(False, "hard-stop", None, decision.fingerprint)
+        reuse.on_decision(decision)
+        if decision.reused:
+            return reuse.outcome
     results = run_verify_commands(policy, cwd)
     if on_results is not None:
         on_results(tuple(results))
@@ -10315,6 +10516,7 @@ def _verify_review_commands(
     *,
     on_results: CommandSink | None = None,
     on_probes: ProbeSink | None = None,
+    reuse: VerifyReuse | None = None,
 ) -> VerifyOutcome:
     """Run a review gate's ``[verify] commands`` in ``paths.repo_root``.
 
@@ -10349,8 +10551,9 @@ def _verify_review_commands(
     whole dataclass to keep the three call sites uniform, not because it consults
     anything else. A future caller must not infer that artifact paths reach here.
 
-    ``on_results`` (and ``on_probes``, the environment preflight's) is forwarded,
-    not consumed: an engine-supplied sink is how
+    ``on_results`` (and ``on_probes``, the environment preflight's, and
+    ``reuse``, a skip-review gate's request to stand an unchanged green pass in
+    for the commands) is forwarded, not consumed: an engine-supplied sink is how
     review-gate results reach the journal, which the dev side has always had and
     these gates had not. Optional, so the gates stay callable from core (and from
     tests) with no engine at all — no sink simply means nothing is recorded,
@@ -10361,7 +10564,7 @@ def _verify_review_commands(
     — see ``tests/test_portability_guard.py``.
     """
     return verify_commands_outcome(
-        policy, paths.repo_root, on_results=on_results, on_probes=on_probes
+        policy, paths.repo_root, on_results=on_results, on_probes=on_probes, reuse=reuse
     )
 
 
@@ -10374,6 +10577,7 @@ def verify_review(
     operator_park: bool = False,
     on_results: CommandSink | None = None,
     on_probes: ProbeSink | None = None,
+    reuse: VerifyReuse | None = None,
 ) -> VerifyOutcome:
     """Gate a completed review pass: spec at ``done``, sprint-status at ``done``,
     deterministic verify commands green.
@@ -10451,7 +10655,9 @@ def verify_review(
             f"sprint-status for {task.story_key} is {sprint!r}, expected {expected!r}"
         )
 
-    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
+    return _verify_review_commands(
+        policy, paths, on_results=on_results, on_probes=on_probes, reuse=reuse
+    )
 
 
 def _is_signoff_regression(sprint: str | None, sprint_reached_done: bool) -> bool:
@@ -10477,6 +10683,7 @@ def verify_review_stories(
     *,
     on_results: CommandSink | None = None,
     on_probes: ProbeSink | None = None,
+    reuse: VerifyReuse | None = None,
 ) -> VerifyOutcome:
     """verify_review for stories mode: same spec-done + verify-commands gates,
     minus the sprint-status gate (stories mode has no sprint board — the story
@@ -10495,7 +10702,9 @@ def verify_review_stories(
     status = status_of(fm)
     if status != "done":
         return VerifyOutcome.retry(f"spec status is {status!r}, expected 'done'")
-    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
+    return _verify_review_commands(
+        policy, paths, on_results=on_results, on_probes=on_probes, reuse=reuse
+    )
 
 
 def verify_review_tickets(
@@ -10507,6 +10716,7 @@ def verify_review_tickets(
     operator_park: bool = False,
     on_results: CommandSink | None = None,
     on_probes: ProbeSink | None = None,
+    reuse: VerifyReuse | None = None,
 ) -> VerifyOutcome:
     """verify_review for a BMAD v7 ticket: the plan ``task.spec_file``
     (:func:`verify_dev_tickets` recorded it) read back, then the verify commands.
@@ -10547,7 +10757,9 @@ def verify_review_tickets(
         actions = _operator_actions_gate(fm, task.story_key)
         if actions is not None:
             return actions
-        return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
+        return _verify_review_commands(
+            policy, paths, on_results=on_results, on_probes=on_probes, reuse=reuse
+        )
     expected = PLAN_DONE if entered_status == PLAN_DONE else PLAN_BUILT
     if status != expected:
         if _is_plan_regression(status, entered_status):
@@ -10562,7 +10774,9 @@ def verify_review_tickets(
                 contradiction=True,
             )
         return VerifyOutcome.retry(f"plan status is {status!r}, expected {expected!r}: {plan}")
-    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
+    return _verify_review_commands(
+        policy, paths, on_results=on_results, on_probes=on_probes, reuse=reuse
+    )
 
 
 def _is_plan_regression(status: str, entered_status: str) -> bool:
@@ -11233,8 +11447,7 @@ def _commit_paths(
         if candidate_fault is not None:
             failed_path, error, stage = candidate_fault
             raise GitError(
-                f"no exact commit operand remains after {stage} failed "
-                f"for {failed_path}: {error}"
+                f"no exact commit operand remains after {stage} failed for {failed_path}: {error}"
             ) from error
         return None
     # Every operand is forced LITERAL: git reads a positional operand as a PATHSPEC,

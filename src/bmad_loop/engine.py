@@ -287,6 +287,30 @@ class VerifyCommandRecords:
 
 NO_VERIFY_COMMANDS = VerifyCommandRecords()
 
+
+@dataclass(frozen=True)
+class VerifyReuseToken:
+    """A green dev/fix ``[verify]`` pass a skip-review gate may stand in for its
+    own commands (``[verify] reuse_unchanged``).
+
+    Minted only by ``Engine._verify_commands_with_results``, when the worktree
+    fingerprint read immediately before the commands equals the one read
+    immediately after them; consumed (popped, so one-shot) by the next
+    skip-review gate of the same ``story_key``/``generation``. ``key`` and
+    ``fingerprint`` are what the gate re-checks; ``outcome`` is handed back as
+    classified, never re-classified; ``records`` are republished to
+    ``post_review_verify`` under their original ``stage`` and ``sequence``.
+    In memory only — never persisted, never inferred from the journal."""
+
+    story_key: str
+    generation: int
+    stage: str  # "dev" | "fix"
+    key: verify.VerifyReuseKey
+    fingerprint: verify.TreeFingerprint
+    outcome: VerifyOutcome
+    records: VerifyCommandRecords
+
+
 # The sentence a kept-tree usage relaunch (DW-615) adds after the spec or plan
 # pointer, ahead of the injected clauses. Bare and backtick-free, like them.
 USAGE_RELAUNCH_RESUME = (
@@ -1034,6 +1058,21 @@ class Engine:
         # pass vouched for. A root, not a flag: probes may be cwd-sensitive, so a
         # pass in one worktree vouches for nothing in another.
         self._env_probes_fresh_root: Path | None = None
+        # `[verify] reuse_unchanged` (#1002): the green dev/fix pass a skip-review
+        # gate may reuse, and why there is none. Transient on purpose — never
+        # persisted: a resumed process has run no pass it could vouch for. Minted
+        # by `_verify_commands_with_results`, voided by every new pass, session
+        # launch, rollback, reset, worktree discard and pause (NOT by plugin hook
+        # dispatch: hook writes are caught by the gate's fingerprint only), and
+        # popped by `_review_reuse_request`. The void reason is what a gate that
+        # finds no token journals as its decline.
+        self._verify_reuse: VerifyReuseToken | None = None
+        self._verify_reuse_void: tuple[str, str | None] = ("no-token", None)
+        # Whether the review gate in flight is one of `_skip_review_and_commit`'s
+        # two (the only reuse-eligible gates), and whether it reused a pass — set
+        # per gate by `_review_verify_gate`.
+        self._review_reuse_eligible = False
+        self._review_verify_reused = False
         # Per-unit worktree isolation + integration flow (issue #244 F-3/F-9a).
         # Built from narrow deps + engine callbacks; the same-name Engine._* worktree
         # methods below delegate to it. `emit` is late-bound (a lambda, not the bound
@@ -1269,6 +1308,8 @@ class Engine:
                 if self._owns_signals and self.policy.adapter.cleanup_session_on_finish:
                     self._kill_run_session()
             except RunPaused as pause:
+                # A pause hands the tree to a human: no green pass survives it.
+                self._invalidate_verify_reuse("paused")
                 usage = pause.usage_limit
                 self.state.record_pause(
                     pause.reason,
@@ -1925,6 +1966,8 @@ class Engine:
         # cwd-sensitive probe may have passed on config the failed attempt wrote —
         # so the next dispatch re-probes the restored tree (DW-523).
         self._env_probes_fresh_root = None
+        # The same holds for a green verify pass (#1002).
+        self._invalidate_verify_reuse("rollback")
         self._recovery_flow.rollback_or_pause(task, cause=cause, restart=restart)
         self._after_code_rollback(task)
 
@@ -2022,6 +2065,7 @@ class Engine:
         # A probe pass vouched for the discarded tree, not the replacement a later
         # mount may open at the same path (DW-523).
         self._env_probes_fresh_root = None
+        self._invalidate_verify_reuse("worktree-discard")
         # before the clears below: the relativization is measured against this field's
         # mount project (DW-379)
         task.release_mount_owned_state(self._mount_project(task))
@@ -2063,8 +2107,10 @@ class Engine:
         )
 
     def _safe_reset(self, task: StoryTask, *, preserve: tuple[str, ...] = ()) -> None:
-        # Same as `_rollback_or_pause`: the reset invalidates a probe pass (DW-523).
+        # Same as `_rollback_or_pause`: the reset invalidates a probe pass (DW-523)
+        # and a green verify pass (#1002).
         self._env_probes_fresh_root = None
+        self._invalidate_verify_reuse("reset")
         self._recovery_flow.safe_reset(task, preserve=preserve)
 
     def _restore_patch(self, task: StoryTask) -> None:
@@ -4950,7 +4996,7 @@ class Engine:
         and the journal says which."""
         self.journal.append(kind, story_key=task.story_key)
         # No review session ran on this path: session_status/result_json stay None.
-        outcome = self._review_verify_gate(task)
+        outcome = self._review_verify_gate(task, reuse_eligible=True)
         if not outcome.ok and outcome.fixable:
             # The repair spends a dev attempt: re-probe first (DW-523).
             gated = self._env_gate_decision(
@@ -4967,7 +5013,7 @@ class Engine:
                     fix.reason or f"verify failed with review disabled: {outcome.reason}",
                 )
                 return
-            outcome = self._review_verify_gate(task)
+            outcome = self._review_verify_gate(task, reuse_eligible=True)
         if not outcome.ok:
             # same event kind as the review-enabled loop so journal consumers
             # see the structured env_fault flag on this path too
@@ -7032,7 +7078,15 @@ class Engine:
         including the zero-command case: "the pass ran and executed nothing" and
         "no pass ran" are different facts, and only the caller that never reaches
         here may publish the second one.
+
+        With ``[verify] reuse_unchanged`` on, a green dev/fix pass whose worktree
+        fingerprint is equal immediately before and after its commands mints the
+        :class:`VerifyReuseToken` the next skip-review gate may reuse. Every call
+        first voids any older token (``superseded``); a fingerprint fault voids
+        too and never changes the outcome. With the key off nothing is
+        fingerprinted.
         """
+        self._invalidate_verify_reuse("superseded")
         if verify.preflight_required(self.policy):
             # The environment preflight (DW-523): a failed probe is an env fault
             # with cause "probe", returned BEFORE any command runs — so there are
@@ -7041,6 +7095,11 @@ class Engine:
             probe = self._run_environment_probes(task, site=f"verify:{verification_stage}")
             if not probe.ok:
                 return verify.environment_preflight_outcome(probe), NO_VERIFY_COMMANDS
+        before = (
+            self._verify_reuse_fingerprint()
+            if self._verify_reuse_mintable(verification_stage)
+            else None
+        )
         results = tuple(verify.run_verify_commands(self.policy, self.workspace.root))
         sequence = self._journal_verify_command_results(task, verification_stage, results)
         self._stop_if_verify_interrupted(results)
@@ -7050,9 +7109,146 @@ class Engine:
             env_fault_rc=self.policy.verify.env_fault_rc,
             command_timeout_min=self.policy.verify.command_timeout_min,
         )
-        return outcome, VerifyCommandRecords(
-            results=results, stage=verification_stage, sequence=sequence
+        records = VerifyCommandRecords(results=results, stage=verification_stage, sequence=sequence)
+        if outcome.ok and sequence is not None and before is not None:
+            self._mint_verify_reuse(task, verification_stage, before, outcome, records)
+        return outcome, records
+
+    def _verify_reuse_supported(self) -> bool:
+        """Whether this mode's skip-review gates may reuse a green pass
+        (``[verify] reuse_unchanged``). True in the base engine."""
+        return True
+
+    def _invalidate_verify_reuse(self, reason: str, detail: str | None = None) -> None:
+        """Drop any reusable verify pass and record why, for the decline a later
+        skip-review gate journals when it finds no token."""
+        self._verify_reuse = None
+        self._verify_reuse_void = (reason, detail)
+
+    def _verify_reuse_mintable(self, verification_stage: str) -> bool:
+        return (
+            self.policy.verify.reuse_unchanged
+            and self._verify_reuse_supported()
+            and verification_stage in ("dev", "fix")
+            and bool(self.policy.verify.commands)
         )
+
+    def _verify_reuse_fingerprint(self) -> verify.TreeFingerprint | None:
+        """The workspace fingerprint, or ``None`` after recording the fault as
+        the void reason — a fault means no token, never a different outcome."""
+        try:
+            return verify.worktree_fingerprint(self.workspace.root)
+        except verify.FingerprintRefused:
+            self._invalidate_verify_reuse("gitlinks")
+        except (verify.GitError, OSError) as exc:  # GitSpawnError is a GitError
+            self._invalidate_verify_reuse("fingerprint-fault", str(exc))
+        return None
+
+    def _mint_verify_reuse(
+        self,
+        task: StoryTask,
+        verification_stage: str,
+        before: verify.TreeFingerprint,
+        outcome: VerifyOutcome,
+        records: VerifyCommandRecords,
+    ) -> None:
+        after = self._verify_reuse_fingerprint()
+        if after is None:
+            return
+        if after != before:
+            self._invalidate_verify_reuse("pass-mutated-tree")
+            return
+        self._verify_reuse = VerifyReuseToken(
+            story_key=task.story_key,
+            generation=task.generation,
+            stage=verification_stage,
+            key=verify.verify_reuse_key(self.policy, self.workspace.root),
+            fingerprint=before,
+            outcome=outcome,
+            records=records,
+        )
+
+    def _review_reuse_request(self, task: StoryTask) -> verify.VerifyReuse | None:
+        """The reuse request a skip-review gate forwards to its verifier, or
+        ``None`` for a real run.
+
+        Silent (no journal row) unless the gate is eligible (one of
+        ``_skip_review_and_commit``'s two), ``[verify] reuse_unchanged`` is on
+        and commands are configured. Then: an unsupported mode declines with
+        ``mode-unsupported``; the token is popped (one-shot) and a missing or
+        foreign one declines with the recorded void reason; otherwise the
+        verifier decides, and ``on_decision`` journals ``verify-pass-reused``
+        (republishing the reused pass's records) or ``verify-reuse-declined``.
+        Neither row allocates a ``verification_sequence``: a reuse is not a pass."""
+        if (
+            not self._review_reuse_eligible
+            or not self.policy.verify.reuse_unchanged
+            or not self.policy.verify.commands
+        ):
+            return None
+        if not self._verify_reuse_supported():
+            self._journal_verify_reuse_declined(task, "mode-unsupported", None)
+            return None
+        token, self._verify_reuse = self._verify_reuse, None
+        if token is not None and (
+            token.story_key != task.story_key or token.generation != task.generation
+        ):
+            # Not this task's pass; consumed regardless (the token is one-shot).
+            self._invalidate_verify_reuse("no-token")
+            token = None
+        if token is None:
+            reason, detail = self._verify_reuse_void
+            self._journal_verify_reuse_declined(task, reason, detail)
+            return None
+        self._invalidate_verify_reuse("no-token")
+
+        def on_decision(decision: verify.ReuseDecision) -> None:
+            if not decision.reused:
+                self._journal_verify_reuse_declined(
+                    task, decision.decline or "unknown", decision.detail
+                )
+                return
+            gate_fp = decision.fingerprint or token.fingerprint
+            self.journal.append(
+                "verify-pass-reused",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                reused_stage=token.stage,
+                reused_sequence=token.records.sequence,
+                command_count=len(token.records.results),
+                head=gate_fp.head,
+                tree=gate_fp.tree,
+            )
+            self._review_verify_records = token.records
+            self._review_verify_reused = True
+
+        return verify.VerifyReuse(
+            key=token.key,
+            fingerprint=token.fingerprint,
+            outcome=token.outcome,
+            on_decision=on_decision,
+        )
+
+    def _journal_verify_reuse_declined(
+        self, task: StoryTask, decline: str, detail: str | None
+    ) -> None:
+        # Two literal writes rather than a conditional `**` splat, so the journal
+        # field guard reads every name; `detail` appears only on a fault.
+        if detail is None:
+            self.journal.append(
+                "verify-reuse-declined",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                decline=decline,
+            )
+        else:
+            self.journal.append(
+                "verify-reuse-declined",
+                story_key=task.story_key,
+                attempt=task.attempt,
+                decline=decline,
+                detail=detail,
+            )
 
     def _run_environment_probes(
         self, task: StoryTask, *, site: str, root: Path | None = None
@@ -8635,6 +8831,7 @@ class Engine:
         *,
         session_status: str | None = None,
         result_json: object = None,
+        reuse_eligible: bool = False,
     ) -> VerifyOutcome:
         """Evaluate the review verify gate and publish it to ``post_review_verify``.
 
@@ -8651,9 +8848,20 @@ class Engine:
         command pass publishes ``NO_VERIFY_COMMANDS`` (stage/sequence ``None``,
         no results) rather than a previous gate's. A hard stop mid-pass raises
         ``RunStopped`` out of the sink, so an interrupted pass is never emitted.
+
+        ``reuse_eligible`` is passed only by ``_skip_review_and_commit``'s two
+        gates (``[verify] reuse_unchanged``): there ``_review_reuse_request`` may
+        stand the story's unchanged green dev/fix pass in for the commands, and
+        the emit then republishes that pass's records under its own stage and
+        sequence. Gates that verify a review session's product never reuse.
         """
         self._review_verify_records = NO_VERIFY_COMMANDS
-        outcome = self._verify_review(task)
+        self._review_reuse_eligible = reuse_eligible
+        self._review_verify_reused = False
+        try:
+            outcome = self._verify_review(task)
+        finally:
+            self._review_reuse_eligible = False
         records = self._review_verify_records
         self._emit(
             "post_review_verify",
@@ -8664,6 +8872,7 @@ class Engine:
             command_results=records.results,
             verification_stage=records.stage,
             verification_sequence=records.sequence,
+            verification_reused=self._review_verify_reused,
         )
         return outcome
 
@@ -8680,6 +8889,7 @@ class Engine:
             operator_park=self._operator_park_enabled(),
             on_results=self._review_command_sink(task),
             on_probes=self._review_probe_sink(task),
+            reuse=self._review_reuse_request(task),
         )
         if outcome.ok:
             self._accept_review_artifact_source(task)
@@ -9000,8 +9210,9 @@ class Engine:
         commit_engine_ledger: bool = False,
     ) -> SessionResult:
         # A session may change the environment a probe pass vouched for, so no
-        # pass survives a launch (DW-523).
+        # pass survives a launch (DW-523) — nor a green verify pass (#1002).
         self._env_probes_fresh_root = None
+        self._invalidate_verify_reuse("session-launched")
         # ``label`` names a non-standard session (a plugin-provided workflow) so
         # its task_id stays distinct from the role's own dev/review attempts.
         task_id = _session_task_id(task.story_key, label if label else role, seq, task.generation)

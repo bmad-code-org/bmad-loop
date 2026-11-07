@@ -15899,3 +15899,408 @@ def test_worktree_clean_excludes_a_nested_projects_policy_at_its_offset(project)
 
     (app / "src.txt").write_text("real work\n", encoding="utf-8")
     assert not verify.worktree_clean(repo, project=app)
+
+
+# --- [verify] reuse_unchanged: worktree fingerprint + reuse seam (#1002) ------------
+
+
+def _fp(repo: Path) -> verify.TreeFingerprint:
+    return verify.worktree_fingerprint(repo)
+
+
+def test_worktree_fingerprint_stable_on_clean_tree(project):
+    repo = project.project
+    first = _fp(repo)
+    assert first == _fp(repo)
+    assert first.head == git(repo, "rev-parse", "HEAD")
+    assert first.tree == git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_worktree_fingerprint_tracked_edit_moves_tree(project):
+    repo = project.project
+    before = _fp(repo)
+    (repo / "src.txt").write_text("edited\n")
+    after = _fp(repo)
+    assert after.head == before.head
+    assert after.tree != before.tree
+
+
+def test_worktree_fingerprint_untracked_file_moves_tree(project):
+    repo = project.project
+    before = _fp(repo)
+    (repo / "new.txt").write_text("new\n")
+    assert _fp(repo).tree != before.tree
+
+
+def test_worktree_fingerprint_ignored_file_is_a_blind_spot(project):
+    """Pins the documented blind spot: an ignored path never reaches the tree, so
+    a change there (node_modules, build output) leaves the fingerprint equal.
+    `.git/info/exclude` keeps the ignore rule itself out of the tree."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("build/\n")
+    before = _fp(repo)
+    (repo / "build").mkdir()
+    (repo / "build" / "out.bin").write_text("artifact\n")
+    assert _fp(repo) == before
+
+
+def test_worktree_fingerprint_excludes_automator_dir_without_ignore(project):
+    """`.bmad-loop/` is excluded by pathspec, not by `.gitignore`: the sandbox
+    ignores only `.bmad-loop/runs/`, so a file beside it is NOT ignored and must
+    still leave the fingerprint equal.
+
+    Ablation: drop the `:(exclude)` pathspec from `worktree_fingerprint`'s `add`;
+    the file is staged and the trees differ."""
+    repo = project.project
+    before = _fp(repo)
+    (repo / ".bmad-loop").mkdir(exist_ok=True)
+    (repo / ".bmad-loop" / "notes.txt").write_text("orchestrator state\n")
+    assert "notes.txt" in git(repo, "status", "--porcelain", "-uall")  # not ignored
+    assert _fp(repo) == before
+
+
+def test_worktree_fingerprint_commit_moves_head(project):
+    repo = project.project
+    before = _fp(repo)
+    (repo / "src.txt").write_text("committed\n")
+    git(repo, "commit", "-qam", "move")
+    after = _fp(repo)
+    assert after.head != before.head
+    assert after.head == git(repo, "rev-parse", "HEAD")
+
+
+def test_worktree_fingerprint_never_touches_real_index(project):
+    """An operator's staged state survives the read byte for byte: the staged
+    `src.txt` differs from both HEAD and the worktree, and stays staged.
+
+    Ablation: point the fingerprint's `add` at the real index (drop the
+    `GIT_INDEX_FILE` env); the bytes change and `staged` is overwritten."""
+    repo = project.project
+    (repo / "src.txt").write_text("staged\n")
+    git(repo, "add", "src.txt")
+    (repo / "src.txt").write_text("edited\n")
+    (repo / "new.txt").write_text("new\n")
+    assert git(repo, "diff", "--cached", "--name-only") == "src.txt"
+    assert git(repo, "show", ":src.txt") == "staged"
+    index = repo / ".git" / "index"
+    before = index.read_bytes()
+    _fp(repo)
+    assert index.read_bytes() == before
+    assert git(repo, "diff", "--cached", "--name-only") == "src.txt"
+    assert git(repo, "show", ":src.txt") == "staged"
+
+
+def test_worktree_fingerprint_covers_siblings_of_a_subdirectory_project(project):
+    """A project in a subdirectory of a larger repo: its verify commands may read
+    a sibling, so a sibling edit (tracked or untracked) moves the fingerprint.
+
+    Ablation: scope the fingerprint's `add` to `.` instead of `:/`; both edits
+    leave the fingerprint taken from `app/` equal."""
+    repo = project.project
+    app = repo / "app"
+    app.mkdir()
+    (app / "main.txt").write_text("app\n")
+    git(repo, "add", "app")
+    git(repo, "commit", "-qm", "app")
+    before = _fp(app)
+    (repo / "src.txt").write_text("sibling edit\n")
+    tracked = _fp(app)
+    assert tracked.tree != before.tree
+    (repo / "shared.txt").write_text("sibling new\n")
+    assert _fp(app).tree != tracked.tree
+
+
+def test_worktree_fingerprint_covers_force_added_ignored_files(project):
+    """A file the real index tracks although an ignore rule matches it (`add -f`,
+    not yet in HEAD) is what the commit after a reuse takes, so an edit or a
+    deletion of it moves the fingerprint.
+
+    Ablation: drop the `update-index` restage; the edit and the deletion both
+    leave the fingerprint equal."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("gen/\n")
+    (repo / "gen").mkdir()
+    (repo / "gen" / "out.txt").write_text("generated\n")
+    git(repo, "add", "-f", "gen/out.txt")
+    before = _fp(repo)
+    (repo / "gen" / "out.txt").write_text("regenerated\n")
+    edited = _fp(repo)
+    assert edited.tree != before.tree
+    (repo / "gen" / "out.txt").unlink()
+    assert _fp(repo).tree not in (before.tree, edited.tree)
+
+
+def _embedded_repo(repo: Path, name: str = "sub") -> None:
+    sub = repo / name
+    sub.mkdir()
+    git(sub, "init", "-q", "-b", "main")
+    (sub / "f.txt").write_text("inner\n")
+    git(sub, "add", "f.txt")
+    git(sub, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "inner")
+
+
+def _tracked_gitlink(repo: Path) -> None:
+    """A committed gitlink with its checkout present: the submodule shape, minus
+    the `.gitmodules` URL plumbing a clone would need."""
+    _embedded_repo(repo, "vendored")
+    git(repo, "add", "vendored")
+    git(repo, "commit", "-qm", "gitlink")
+
+
+@pytest.mark.parametrize("make", [_embedded_repo, _tracked_gitlink], ids=["embedded", "submodule"])
+def test_worktree_fingerprint_refuses_gitlinks(project, make):
+    """A gitlink's working tree is not in the parent's tree hash, so equality would
+    vouch for nothing: an untracked embedded repo (which `add -A` stages as a
+    gitlink) and a committed gitlink both refuse.
+
+    Ablation: drop the `160000 ` scan; both rows return a fingerprint."""
+    repo = project.project
+    make(repo)
+    with pytest.raises(verify.FingerprintRefused, match="gitlinks"):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_unborn_head_raises(project):
+    repo = project.project
+    git(repo, "checkout", "-q", "--orphan", "unborn")
+    with pytest.raises(verify.GitError):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_mixed_eol_under_safecrlf(project):
+    """`core.autocrlf=true` + `core.safecrlf=true` makes `add` refuse an
+    irreversible EOL conversion, which a mixed-EOL tracked file is.
+
+    Ablation: drop `-c core.safecrlf=false`; the `add` fails and this raises
+    GitError."""
+    repo = project.project
+    git(repo, "config", "core.autocrlf", "true")
+    git(repo, "config", "core.safecrlf", "true")
+    (repo / "src.txt").write_bytes(b"one\r\ntwo\nthree\r\n")
+    fp = _fp(repo)
+    assert fp.head == git(repo, "rev-parse", "HEAD")
+
+
+def test_verify_reuse_key_folds_case_under_normcase(tmp_path, monkeypatch):
+    import ntpath
+
+    monkeypatch.setattr(os.path, "normcase", ntpath.normcase)
+    pol = Policy(verify=VerifyPolicy(commands=(_OK,)))
+    assert verify.verify_reuse_key(pol, tmp_path / "Root") == verify.verify_reuse_key(
+        pol, tmp_path / "ROOT"
+    )
+    assert verify.verify_reuse_key(pol, tmp_path / "a") != verify.verify_reuse_key(
+        pol, tmp_path / "b"
+    )
+
+
+def test_verify_reuse_key_ignores_stream_capture_kb(tmp_path):
+    a = Policy(verify=VerifyPolicy(commands=(_OK,), stream_capture_kb=1))
+    b = Policy(verify=VerifyPolicy(commands=(_OK,), stream_capture_kb=2))
+    assert verify.verify_reuse_key(a, tmp_path) == verify.verify_reuse_key(b, tmp_path)
+
+
+_REUSE_FP = verify.TreeFingerprint(head="h" * 40, tree="t" * 40)
+_REUSE_OUTCOME = verify.VerifyOutcome(ok=True, reason="stored green pass")
+
+
+class _ReuseRig:
+    """Counts `run_verify_commands` calls and fingerprint reads, and records every
+    reuse decision; `fp` is what the stubbed fingerprint answers (an exception
+    instance is raised instead)."""
+
+    def __init__(self, monkeypatch, fp: object = _REUSE_FP):
+        self.runs = 0
+        self.fp_reads = 0
+        self.fp = fp
+        self.decisions: list[verify.ReuseDecision] = []
+        self.results: list[tuple] = []
+
+        def run(policy, cwd):
+            self.runs += 1
+            return []
+
+        def fingerprint(repo):
+            self.fp_reads += 1
+            if isinstance(self.fp, BaseException):
+                raise self.fp
+            return self.fp
+
+        monkeypatch.setattr(verify, "run_verify_commands", run)
+        monkeypatch.setattr(verify, "worktree_fingerprint", fingerprint)
+
+    def request(self, key: verify.VerifyReuseKey) -> verify.VerifyReuse:
+        return verify.VerifyReuse(
+            key=key,
+            fingerprint=_REUSE_FP,
+            outcome=_REUSE_OUTCOME,
+            on_decision=self.decisions.append,
+        )
+
+
+def _reuse_policy(**kw) -> Policy:
+    return Policy(verify=VerifyPolicy(commands=(_OK,), **kw))
+
+
+def test_reuse_seam_match_returns_stored_outcome_without_running(project, monkeypatch):
+    rig = _ReuseRig(monkeypatch)
+    pol = _reuse_policy()
+    reuse = rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    out = verify._verify_review_commands(pol, project, on_results=rig.results.append, reuse=reuse)
+    assert out is _REUSE_OUTCOME
+    assert rig.runs == 0
+    assert rig.results == []
+    assert rig.decisions == [verify.ReuseDecision(True, None, None, _REUSE_FP)]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"commands": ("exit 0", "exit 0")},
+        {"command_timeout_min": 7},
+        {"env_fault_rc": 75},
+        {"cwd": "elsewhere"},
+    ],
+    ids=["commands", "timeout", "env_fault_rc", "cwd"],
+)
+def test_reuse_seam_policy_mismatch_runs(project, monkeypatch, field):
+    """Each key field on its own refuses the reuse, before any fingerprint is spent.
+
+    Ablation: drop the key comparison in `_decide_reuse`; every row reuses."""
+    rig = _ReuseRig(monkeypatch)
+    pol = _reuse_policy()
+    key = dataclasses.replace(verify.verify_reuse_key(pol, project.repo_root), **field)
+    out = verify._verify_review_commands(pol, project, reuse=rig.request(key))
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 1
+    assert rig.fp_reads == 0
+    assert [d.decline for d in rig.decisions] == ["policy-mismatch"]
+    assert not rig.decisions[0].reused
+
+
+def test_reuse_seam_tree_mismatch_runs(project, monkeypatch):
+    """Ablation: drop the fingerprint comparison in `_decide_reuse`; it reuses."""
+    moved = verify.TreeFingerprint(head=_REUSE_FP.head, tree="u" * 40)
+    rig = _ReuseRig(monkeypatch, fp=moved)
+    pol = _reuse_policy()
+    out = verify._verify_review_commands(
+        pol, project, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 1
+    assert rig.decisions == [verify.ReuseDecision(False, "tree-mismatch", None, moved)]
+
+
+@pytest.mark.parametrize(
+    ("exc", "decline", "detail"),
+    [
+        (verify.GitError("git broke"), "fingerprint-fault", "git broke"),
+        (verify.GitSpawnError("no spawn"), "fingerprint-fault", "no spawn"),
+        (OSError("disk full"), "fingerprint-fault", "disk full"),
+        (verify.FingerprintRefused("gitlinks"), "gitlinks", None),
+    ],
+    ids=["git", "spawn", "oserror", "gitlinks"],
+)
+def test_reuse_seam_fingerprint_fault_runs(project, monkeypatch, exc, decline, detail):
+    """A fault is never a match: it declines with its reason and the commands run.
+
+    Ablation: let `_decide_reuse` treat a fault as a match; every row reuses."""
+    rig = _ReuseRig(monkeypatch, fp=exc)
+    pol = _reuse_policy()
+    out = verify._verify_review_commands(
+        pol, project, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 1
+    assert rig.decisions == [verify.ReuseDecision(False, decline, detail, None)]
+
+
+def test_reuse_seam_hard_stop_declines_a_match(project, monkeypatch):
+    """A hard stop pending once the fingerprint matched must not let the stored
+    green pass commit the story: the match declines with `hard-stop` and the
+    commands run, where a pending stop yields interrupted, unspawned results.
+
+    Ablation: drop the `hard_stop_pending()` check in `verify_commands_outcome`;
+    the stored outcome comes back and nothing runs."""
+    rig = _ReuseRig(monkeypatch)
+    monkeypatch.setattr(childrun, "hard_stop_pending", lambda: True)
+    pol = _reuse_policy()
+    out = verify._verify_review_commands(
+        pol, project, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 1
+    assert rig.decisions == [verify.ReuseDecision(False, "hard-stop", None, _REUSE_FP)]
+
+
+def test_reuse_seam_failed_preflight_decides_nothing(project, monkeypatch):
+    """The environment preflight still runs ahead of a reuse, and a failed one
+    returns before any decision is taken.
+
+    Ablation: move the reuse decision above the preflight; a decision lands."""
+    rig = _ReuseRig(monkeypatch)
+    pol = Policy(
+        verify=VerifyPolicy(commands=(_OK,)), environment=EnvironmentPolicy(probes=(_FAIL,))
+    )
+    out = verify._verify_review_commands(
+        pol, project, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert not out.ok
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 0
+    assert rig.decisions == []
+
+
+def test_verify_review_status_failure_decides_nothing(project, monkeypatch):
+    """Status checks stay ahead of the commands: a spec short of `done` fails the
+    gate with no reuse decision and no run."""
+    task, gate = _review_gate_at_done(project, "review")
+    write_spec(Path(task.spec_file), "in-progress", task.baseline_commit)
+    rig = _ReuseRig(monkeypatch)
+    pol = _reuse_policy()
+    out = gate(
+        task, project, pol, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert not out.ok and "spec status" in out.reason
+    assert rig.runs == 0
+    assert rig.decisions == []
+
+
+@pytest.mark.parametrize(
+    "mode", ["review", "review_stories", "review_tickets", "review_tickets_park"]
+)
+def test_review_gates_forward_reuse(project, monkeypatch, mode):
+    """Each eligible review gate threads `reuse=` through to the seam, the tickets
+    gate on both of its command paths (built, and the awaiting-operator park).
+
+    Ablation: drop `reuse=reuse` from a gate's `_verify_review_commands` call; its
+    row runs the commands."""
+    kw: dict[str, object] = {}
+    if mode == "review_tickets":
+        task, _ = _reviewed_ticket(project, "built")
+        gate = verify.verify_review_tickets
+    elif mode == "review_tickets_park":
+        task, _ = _reviewed_ticket(project, "awaiting-operator", operator_actions=["publish DNS"])
+        gate = verify.verify_review_tickets
+        kw["operator_park"] = True
+    else:
+        task, gate = _review_gate_at_done(project, mode)
+    rig = _ReuseRig(monkeypatch)
+    pol = _reuse_policy()
+    out = gate(
+        task,
+        project,
+        pol,
+        reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root)),
+        **kw,
+    )
+    assert out is _REUSE_OUTCOME
+    assert rig.runs == 0
+    assert [d.reused for d in rig.decisions] == [True]
+
+
+def test_verify_review_bundle_takes_no_reuse():
+    """Sweep is excluded from reuse in v1: the bundle gate has no `reuse` kwarg."""
+    assert "reuse" not in inspect.signature(verify.verify_review_bundle).parameters

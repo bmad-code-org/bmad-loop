@@ -25,6 +25,7 @@ from conftest import (
     V7Layout,
     git,
     run_tickets,
+    scripted_verify_runner,
     ticket_row,
     write_ticket_tree,
 )
@@ -58,6 +59,7 @@ from bmad_loop.policy import (
     ReviewPolicy,
     ScmPolicy,
     TicketsPolicy,
+    VerifyPolicy,
 )
 from bmad_loop.ticketmodel import EpicRow
 from bmad_loop.tickets_engine import TicketsEngine
@@ -4379,3 +4381,189 @@ def test_stale_binding_gate_follows_a_renamed_project(project_v7, tmp_path):
     task.phase, task.spec_file = Phase.REVIEW_VERIFY, task.ticket.plan
 
     engine._gate_stale_binding(task)  # must not raise
+
+
+# ----------------------------------------- [verify] reuse_unchanged (#1002)
+#
+# The skip-review gates of a tickets run reuse the dev leg's unchanged green
+# verify pass exactly as the base engine's do (tests/test_engine.py), with the
+# plan-status read-back of `verify_review_tickets` still ahead of the reuse.
+
+_REUSE_CMD = "pytest -q"
+
+
+def _reuse_policy() -> Policy:
+    return dataclasses.replace(
+        _policy(), verify=VerifyPolicy(commands=(_REUSE_CMD,), reuse_unchanged=True)
+    )
+
+
+def _green(out: str) -> list[verify.CommandResult]:
+    return [verify.CommandResult(_REUSE_CMD, 0, out, out, "")]
+
+
+def _script_verify_runs(monkeypatch, layout: V7Layout, results: list) -> list[int]:
+    """Script `run_verify_commands` from ``results`` (one list per pass) and
+    return the passes actually run — the count a reuse saves."""
+    pending = list(results)
+    ran: list[int] = []
+
+    def next_results():
+        ran.append(len(ran))
+        return pending.pop(0)
+
+    monkeypatch.setattr(
+        verify, "run_verify_commands", scripted_verify_runner(layout.project, next_results)
+    )
+    return ran
+
+
+def _verify_passes(engine: TicketsEngine) -> list[tuple[str, int]]:
+    return sorted(
+        {
+            (e["verification_stage"], e["verification_sequence"])
+            for e in _kinds(engine, "verify-command-result")
+        },
+        key=lambda p: p[1],
+    )
+
+
+def _gate_status_reads(monkeypatch, engine: TicketsEngine) -> list[tuple[str, str, int]]:
+    """Record each plan read `verify_review_tickets` makes for its status check:
+    the plan, the status it read, and how many `verify-pass-reused` rows the
+    journal held at that moment (0 = the read came before the reuse)."""
+    reads: list[tuple[str, str, int]] = []
+    real_read = verify._gate_frontmatter
+    real_gate = verify.verify_review_tickets
+    in_gate = [False]
+
+    def read(spec_path):
+        fm = real_read(spec_path)
+        if in_gate[0]:
+            status = "" if isinstance(fm, verify.VerifyOutcome) else status_of(fm)
+            reads.append((str(spec_path), status, len(_kinds(engine, "verify-pass-reused"))))
+        return fm
+
+    def gate(*args, **kwargs):
+        in_gate[0] = True
+        try:
+            return real_gate(*args, **kwargs)
+        finally:
+            in_gate[0] = False
+
+    monkeypatch.setattr(verify, "_gate_frontmatter", read)
+    monkeypatch.setattr(verify, "verify_review_tickets", gate)
+    return reads
+
+
+def test_verify_reuse_tickets_skip_gate_reuses_the_dev_pass(project_v7, monkeypatch):
+    """Review disabled: the skip-review gate reads the bound plan back at `built`
+    (the status check runs, before any reuse decision), then stands the dev
+    leg's unchanged green pass in for its commands — one command pass, one
+    `verify-pass-reused` row joining back to ("dev", 1) — and the ticket is
+    marked done and committed.
+
+    Ablation: drop `reuse=self._review_reuse_request(task)` from
+    `TicketsEngine._verify_review` (or `reuse=reuse` from the `built` arm's
+    `_verify_review_commands` call in `verify.verify_review_tickets`) and the gate
+    runs its own pass: two passes, no reuse row — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _marking_tree(tree, plan, monkeypatch)
+    engine, adapter = make_engine(
+        project_v7,
+        tree,
+        policy=_reuse_policy(),
+        script=[_builds(project_v7, tree, plan)],
+        max_stories=1,
+    )
+    ran = _script_verify_runs(monkeypatch, project_v7, [_green("dev-out"), _green("gate")])
+    reads = _gate_status_reads(monkeypatch, engine)
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.DONE and task.commit_sha
+    assert len(adapter.sessions) == 1
+    assert len(ran) == 1
+    assert _verify_passes(engine) == [("dev", 1)]
+    (row,) = _kinds(engine, "verify-pass-reused")
+    assert (row["story_key"], row["reused_stage"], row["reused_sequence"]) == ("1.1", "dev", 1)
+    assert row["command_count"] == 1 and row["head"] and row["tree"]
+    assert _kinds(engine, "verify-reuse-declined") == []
+    assert reads == [(str(plan), "built", 0)]
+    assert [(m.target, m.reason) for m in tree.marks] == [("done", "accept")]
+    assert _committed_status(project_v7, task.commit_sha, plan) == "done"
+
+
+def test_verify_reuse_tickets_plan_status_still_gates(project_v7, monkeypatch):
+    """A valid token never skips the plan-status read-back: a plan the dev leg
+    left at `done` (the orchestrator owns `done`) is already on disk when the
+    green dev pass mints its token, so the gate's fingerprint would match — and
+    the gate still fails with the same status reason as with reuse off, runs no
+    command and reuses nothing.
+
+    Ablation: decide the reuse ahead of the status checks in
+    `verify.verify_review_tickets` (call `_verify_review_commands(..., reuse=reuse)`
+    before reading `status`) and the token's green outcome passes the gate —
+    this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(project_v7, tree, policy=_reuse_policy())
+    task = _bound(engine, tree)
+    head = verify.rev_parse_head(project_v7.project)
+    task.baseline_commit = head
+    _write_plan(plan, "done", baseline=head)  # written BEFORE the mint, never between
+    task.spec_file = str(plan)
+    ran = _script_verify_runs(monkeypatch, project_v7, [_green("dev"), _green("gate")])
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+    assert engine._verify_reuse is not None
+
+    outcome = engine._review_verify_gate(task, reuse_eligible=True)
+
+    off = verify.verify_review_tickets(
+        task,
+        engine.workspace.paths,
+        dataclasses.replace(engine.policy, verify=VerifyPolicy(commands=(_REUSE_CMD,))),
+    )
+    assert not outcome.ok and outcome.reason == off.reason
+    assert "plan status is 'done', expected 'built'" in outcome.reason
+    assert len(ran) == 1
+    assert _kinds(engine, "verify-pass-reused") == []
+
+
+def test_verify_reuse_tickets_operator_park_gate_reuses(project_v7, monkeypatch):
+    """The awaiting-operator park path (`_skip_review_and_commit` with
+    `review-skipped-awaiting-operator`) is a skip-review gate too: the plan's
+    owed actions are checked, then the dev leg's green pass is reused — one
+    command pass, one `verify-pass-reused` row — and the park commits as the
+    `blocked` mark.
+
+    Ablation: drop `reuse=reuse` from the `operator_park and status ==
+    AWAITING_OPERATOR` arm's `_verify_review_commands` call in
+    `verify.verify_review_tickets` and the gate runs its own pass — this FAILS."""
+    tree = _tree(project_v7, ready_to_start=(ticket_row("1.1"),))
+    plan = Path(tree.finds["1.1"].plan)
+    _park_marking_tree(tree, plan, monkeypatch)
+    engine, _ = make_engine(
+        project_v7,
+        tree,
+        policy=_reuse_policy(),
+        script=[_parks(project_v7, tree, plan)],
+        max_stories=1,
+    )
+    ran = _script_verify_runs(monkeypatch, project_v7, [_green("dev-out"), _green("gate")])
+    reads = _gate_status_reads(monkeypatch, engine)
+
+    engine.run()
+
+    task = load_state(engine.run_dir).tasks["1.1"]
+    assert task.phase == Phase.AWAITING_OPERATOR and task.commit_sha
+    assert len(_kinds(engine, "review-skipped-awaiting-operator")) == 1
+    assert len(ran) == 1
+    assert _verify_passes(engine) == [("dev", 1)]
+    (row,) = _kinds(engine, "verify-pass-reused")
+    assert (row["story_key"], row["reused_stage"], row["reused_sequence"]) == ("1.1", "dev", 1)
+    assert _kinds(engine, "verify-reuse-declined") == []
+    assert reads == [(str(plan), "awaiting-operator", 0)]
+    assert [(m.target, m.reason) for m in tree.marks] == [("blocked", "park")]
