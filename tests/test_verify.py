@@ -15971,14 +15971,65 @@ def test_worktree_fingerprint_commit_moves_head(project):
 
 
 def test_worktree_fingerprint_never_touches_real_index(project):
+    """An operator's staged state survives the read byte for byte: the staged
+    `src.txt` differs from both HEAD and the worktree, and stays staged.
+
+    Ablation: point the fingerprint's `add` at the real index (drop the
+    `GIT_INDEX_FILE` env); the bytes change and `staged` is overwritten."""
     repo = project.project
+    (repo / "src.txt").write_text("staged\n")
+    git(repo, "add", "src.txt")
     (repo / "src.txt").write_text("edited\n")
     (repo / "new.txt").write_text("new\n")
+    assert git(repo, "diff", "--cached", "--name-only") == "src.txt"
+    assert git(repo, "show", ":src.txt") == "staged"
     index = repo / ".git" / "index"
     before = index.read_bytes()
     _fp(repo)
     assert index.read_bytes() == before
-    assert git(repo, "diff", "--cached", "--name-only") == ""
+    assert git(repo, "diff", "--cached", "--name-only") == "src.txt"
+    assert git(repo, "show", ":src.txt") == "staged"
+
+
+def test_worktree_fingerprint_covers_siblings_of_a_subdirectory_project(project):
+    """A project in a subdirectory of a larger repo: its verify commands may read
+    a sibling, so a sibling edit (tracked or untracked) moves the fingerprint.
+
+    Ablation: scope the fingerprint's `add` to `.` instead of `:/`; both edits
+    leave the fingerprint taken from `app/` equal."""
+    repo = project.project
+    app = repo / "app"
+    app.mkdir()
+    (app / "main.txt").write_text("app\n")
+    git(repo, "add", "app")
+    git(repo, "commit", "-qm", "app")
+    before = _fp(app)
+    (repo / "src.txt").write_text("sibling edit\n")
+    tracked = _fp(app)
+    assert tracked.tree != before.tree
+    (repo / "shared.txt").write_text("sibling new\n")
+    assert _fp(app).tree != tracked.tree
+
+
+def test_worktree_fingerprint_covers_force_added_ignored_files(project):
+    """A file the real index tracks although an ignore rule matches it (`add -f`,
+    not yet in HEAD) is what the commit after a reuse takes, so an edit or a
+    deletion of it moves the fingerprint.
+
+    Ablation: drop the `update-index` restage; the edit and the deletion both
+    leave the fingerprint equal."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("gen/\n")
+    (repo / "gen").mkdir()
+    (repo / "gen" / "out.txt").write_text("generated\n")
+    git(repo, "add", "-f", "gen/out.txt")
+    before = _fp(repo)
+    (repo / "gen" / "out.txt").write_text("regenerated\n")
+    edited = _fp(repo)
+    assert edited.tree != before.tree
+    (repo / "gen" / "out.txt").unlink()
+    assert _fp(repo).tree not in (before.tree, edited.tree)
 
 
 def _embedded_repo(repo: Path, name: str = "sub") -> None:
@@ -16011,11 +16062,9 @@ def test_worktree_fingerprint_refuses_gitlinks(project, make):
         _fp(repo)
 
 
-def test_worktree_fingerprint_unborn_head_raises(tmp_path):
-    repo = tmp_path / "unborn"
-    repo.mkdir()
-    git(repo, "init", "-q", "-b", "main")
-    (repo / "a.txt").write_text("a\n")
+def test_worktree_fingerprint_unborn_head_raises(project):
+    repo = project.project
+    git(repo, "checkout", "-q", "--orphan", "unborn")
     with pytest.raises(verify.GitError):
         _fp(repo)
 
@@ -16166,6 +16215,24 @@ def test_reuse_seam_fingerprint_fault_runs(project, monkeypatch, exc, decline, d
     assert out is not _REUSE_OUTCOME
     assert rig.runs == 1
     assert rig.decisions == [verify.ReuseDecision(False, decline, detail, None)]
+
+
+def test_reuse_seam_hard_stop_declines_a_match(project, monkeypatch):
+    """A hard stop pending once the fingerprint matched must not let the stored
+    green pass commit the story: the match declines with `hard-stop` and the
+    commands run, where a pending stop yields interrupted, unspawned results.
+
+    Ablation: drop the `hard_stop_pending()` check in `verify_commands_outcome`;
+    the stored outcome comes back and nothing runs."""
+    rig = _ReuseRig(monkeypatch)
+    monkeypatch.setattr(childrun, "hard_stop_pending", lambda: True)
+    pol = _reuse_policy()
+    out = verify._verify_review_commands(
+        pol, project, reuse=rig.request(verify.verify_reuse_key(pol, project.repo_root))
+    )
+    assert out is not _REUSE_OUTCOME
+    assert rig.runs == 1
+    assert rig.decisions == [verify.ReuseDecision(False, "hard-stop", None, _REUSE_FP)]
 
 
 def test_reuse_seam_failed_preflight_decides_nothing(project, monkeypatch):

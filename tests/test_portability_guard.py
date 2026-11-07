@@ -750,8 +750,8 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # instead of reusing a green pass. A closed engine-minted vocabulary
         # (no-token, superseded, session-launched, rollback, worktree-discard,
         # reset, paused, pass-mutated-tree, gitlinks, fingerprint-fault,
-        # policy-mismatch, tree-mismatch, mode-unsupported), never authored text;
-        # a fault's text rides the separately-dropped `detail`.
+        # policy-mismatch, tree-mismatch, hard-stop, mode-unsupported), never
+        # authored text; a fault's text rides the separately-dropped `detail`.
         "decline",
         "deduped",
         # `sweep-migrated`'s completion identity (DW-317): a fresh `uuid4().hex`

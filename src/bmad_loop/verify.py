@@ -10306,7 +10306,8 @@ class ReuseDecision:
     """The verdict of one reuse attempt at a review gate.
 
     ``reused`` is the answer; on a decline ``decline`` names why (one of
-    ``policy-mismatch``, ``fingerprint-fault``, ``gitlinks``, ``tree-mismatch``)
+    ``policy-mismatch``, ``fingerprint-fault``, ``gitlinks``, ``tree-mismatch``,
+    ``hard-stop``)
     and ``detail`` carries the fault text for ``fingerprint-fault``.
     ``fingerprint`` is the gate-time fingerprint when one was taken."""
 
@@ -10337,19 +10338,27 @@ def worktree_fingerprint(repo: Path) -> TreeFingerprint:
 
     Modelled on :func:`snapshot_worktree`: a temp ``GIT_INDEX_FILE`` is seeded
     from HEAD (``read-tree``), then ``add -A`` stages every tracked edit, deletion
-    and non-ignored untracked file, and ``write-tree`` names the result. The real
-    index and the working tree are never touched, so an operator's staged state
-    survives the read byte for byte. ``.bmad-loop/`` is excluded by an explicit
+    and non-ignored untracked file, and ``write-tree`` names the result. The
+    scope is the WHOLE enclosing worktree (``:/``), not just ``repo``: a project
+    living in a subdirectory of a larger repository can have verify commands that
+    read its siblings. Files the real index tracks although an ignore rule
+    matches them (``git add -f``, possibly not yet in HEAD) are restaged into the
+    temp index too (``update-index --add --remove``), because the commit that
+    follows a reuse takes them. The real index is only read, and the working
+    tree never touched, so an operator's staged state survives the read byte for
+    byte. ``.bmad-loop/`` is excluded by an explicit
     pathspec, not left to ``.gitignore`` (the orchestrator writes its run state
     there between the two reads); ``-c core.safecrlf=false`` keeps a mixed-EOL
     file under ``core.autocrlf`` + ``core.safecrlf=true`` from failing the stage,
     the same override the dirty-tree probes use.
 
-    Blind spots, by construction: ignored files (``node_modules``, build output,
-    caches) are not staged, so a change there leaves the fingerprint equal;
-    non-git state (a database, a running service, the environment) is invisible;
-    and the stage runs git's clean filters, so a change those normalise away
-    (CRLF conversion, LFS pointers) reads as no change.
+    Blind spots, by construction: untracked ignored files (``node_modules``,
+    build output, caches) are not staged, and staged-only state is not read (an
+    index entry that differs from its worktree file counts as the worktree
+    file), so a change there leaves the fingerprint equal; non-git state (a
+    database, a running service, the environment) is invisible; and the stage
+    runs git's clean filters, so a change those normalise away (CRLF conversion,
+    LFS pointers) reads as no change.
 
     Raises :class:`FingerprintRefused` when the staged tree holds a gitlink (a
     submodule, or an untracked embedded repo ``add -A`` stages as one): its
@@ -10358,25 +10367,48 @@ def worktree_fingerprint(repo: Path) -> TreeFingerprint:
     ``OSError`` from the temp directory through; it never returns a partial
     result. Every git call goes through the ``_run_git`` chokepoint."""
     head = rev_parse_head(repo)
+    scope = ("--", ":/", f":(exclude){AUTOMATOR_DIR_REL}")
+    # Read from the REAL index (read-only: ls-files takes no lock and writes
+    # nothing): the tracked paths an ignore rule matches, i.e. force-added files.
+    listed = git_bytes(repo, "ls-files", "-z", "-c", "-i", "--exclude-standard", *scope)
+    if listed.returncode != 0:
+        raise GitError(
+            f"git ls-files (fingerprint) failed in {repo}: "
+            f"{os.fsdecode(listed.stdout + listed.stderr).strip()}"
+        )
     with tempfile.TemporaryDirectory() as td:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
         rc, out = _git_env(repo, "read-tree", head, env=env)
         if rc != 0:
             raise GitError(f"git read-tree (fingerprint) failed in {repo}: {out}")
-        rc, out = _git_env(
-            repo,
-            "-c",
-            "core.safecrlf=false",
-            "add",
-            "-A",
-            "--",
-            ".",
-            f":(exclude){AUTOMATOR_DIR_REL}",
-            env=env,
-        )
+        rc, out = _git_env(repo, "-c", "core.safecrlf=false", "add", "-A", *scope, env=env)
         if rc != 0:
             raise GitError(f"git add (fingerprint) failed in {repo}: {out}")
-        rc, listing, detail = _git_out(repo, "ls-files", "-s", env=env)
+        if listed.stdout:
+            proc = _run_git(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "-c",
+                    "core.safecrlf=false",
+                    "update-index",
+                    "--add",
+                    "--remove",
+                    "-z",
+                    "--stdin",
+                ],
+                repo,
+                env=env,
+                binary=True,
+                input_data=listed.stdout,
+            )
+            if proc.returncode != 0:
+                raise GitError(
+                    f"git update-index (fingerprint) failed in {repo}: "
+                    f"{os.fsdecode(proc.stdout + proc.stderr).strip()}"
+                )
+        rc, listing, detail = _git_out(repo, "ls-files", "-s", "--", ":/", env=env)
         if rc != 0:
             raise GitError(f"git ls-files (fingerprint) failed in {repo}: {detail}")
         if any(line.startswith("160000 ") for line in listing.splitlines()):
@@ -10446,8 +10478,9 @@ def verify_commands_outcome(
     ``run_verify_commands`` is replaced: ``reuse.on_decision`` observes the
     :class:`ReuseDecision` either way, and on a match ``reuse.outcome`` is
     returned as stored — ``on_results`` is not called (no command ran) and
-    nothing is re-classified. On a decline the commands run as if no reuse had
-    been asked. ``on_decision`` must not raise, under the same contract as
+    nothing is re-classified. A match with a hard stop pending declines
+    (``hard-stop``) instead, so the stop is honoured before any commit. On a
+    decline the commands run as if no reuse had been asked. ``on_decision`` must not raise, under the same contract as
     ``on_results``."""
     if preflight_required(policy):
         probe = run_environment_probes(policy, cwd)
@@ -10457,6 +10490,12 @@ def verify_commands_outcome(
             return environment_preflight_outcome(probe)
     if reuse is not None:
         decision = _decide_reuse(reuse, policy, cwd)
+        if decision.reused and childrun.hard_stop_pending():
+            # A hard stop that landed before or during the fingerprint read must
+            # not let a stored green pass commit the story: decline, and the
+            # commands below yield interrupted, unspawned results, which the
+            # caller's sink turns into the stop exactly as on a real pass.
+            decision = ReuseDecision(False, "hard-stop", None, decision.fingerprint)
         reuse.on_decision(decision)
         if decision.reused:
             return reuse.outcome

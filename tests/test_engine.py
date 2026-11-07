@@ -1703,6 +1703,25 @@ def test_verify_reuse_without_commands_fingerprints_nothing(project, monkeypatch
     assert not _entries(engine, "verify-reuse-declined")
 
 
+def test_verify_reuse_token_is_one_shot(project, monkeypatch):
+    """A successful reuse consumes the token: a second eligible gate for the same
+    task with no fresh pass runs its commands and declines with `no-token`.
+
+    Ablation: keep the token in `_review_reuse_request` after a match (drop the
+    pop); the second gate reuses too and `ran` stays at 1."""
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+    assert len(ran) == 1
+    assert len(_entries(engine, "verify-pass-reused")) == 1
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+    assert len(ran) == 2
+    assert _declines(engine) == ["no-token"]
+    assert len(_entries(engine, "verify-pass-reused")) == 1
+
+
 def test_verify_reuse_token_is_not_consumed_by_another_story(project, monkeypatch):
     """Story A's green pass never stands in for story B's gate.
 
