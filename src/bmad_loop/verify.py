@@ -10335,25 +10335,86 @@ class VerifyReuse:
     exclude: tuple[str, ...] = ()
 
 
+_CONFIG_FALSE = frozenset({"false", "no", "off", "0"})
+
+
+def _seed_fingerprint_index(repo: Path, head: str, env: dict[str, str]) -> str | None:
+    """Seed :func:`worktree_fingerprint`'s temp index from a copy of the real one,
+    so ``add -A`` reuses its stat cache instead of re-hashing every tracked file.
+
+    Returns ``None`` when seeded, else the reason the seed was refused; the caller
+    then builds the temp index fresh from HEAD. The copy keeps the real index's
+    mtime (git's racy-clean check compares entry mtimes against it), and a
+    one-tree, index-only ``read-tree -m -i`` makes its entries exactly HEAD's —
+    so no staged-only state reaches the tree — while keeping stat info wherever
+    the blob matches.
+    Refused: a split index or a shared-index file beside it (the copy cannot
+    carry the shared half), fsmonitor (its valid bits stand in for the stat
+    check), no index, an unmerged index, and any entry still flagged
+    assume-unchanged or skip-worktree after the merge (``add -A`` would skip it).
+    A non-zero git rc or a copy ``OSError`` refuses too; a ``GitError`` from the
+    chokepoint (timeout, spawn) propagates. The real index is only read."""
+    config = git_bytes(repo, "config", "--get-regexp", r"^core\.(splitindex|fsmonitor)$")
+    if config.returncode not in (0, 1):
+        return "config"
+    settings: dict[str, str] = {}
+    for line in os.fsdecode(config.stdout).splitlines():
+        name, _, value = line.partition(" ")
+        settings[name] = value
+    for name, reason in (("core.splitindex", "split-index"), ("core.fsmonitor", "fsmonitor")):
+        if name in settings and settings[name].strip().lower() not in _CONFIG_FALSE:
+            return reason
+    located = git_bytes(repo, "rev-parse", "--git-path", "index")
+    if located.returncode != 0:
+        return "index-path"
+    # Relative to `repo` (`-C`), or absolute in a linked worktree.
+    index = repo / os.fsdecode(located.stdout).rstrip("\r\n")
+    if not index.is_file():
+        return "no-index"
+    if any(index.parent.glob("sharedindex.*")):
+        return "shared-index"
+    try:
+        shutil.copy2(index, env["GIT_INDEX_FILE"])
+    except OSError:
+        return "copy"
+    # `-i`: merge in the index alone. Without it git refuses ("not uptodate")
+    # any entry differing from HEAD whose worktree file differs from it too.
+    rc, _ = _git_env(repo, "read-tree", "-m", "-i", head, env=env)
+    if rc != 0:
+        return "read-tree-m"
+    listed = git_bytes(repo, "ls-files", "-v", "-z", "--", ":/", env=env)
+    if listed.returncode != 0:
+        return "ls-files"
+    if any(not entry.startswith(b"H ") for entry in listed.stdout.split(b"\0") if entry):
+        return "index-flags"
+    return None
+
+
 def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerprint:
     """Fingerprint ``repo``'s git-visible working state: HEAD, plus the tree
     hash of the worktree staged over HEAD in a throwaway index.
 
-    Modelled on :func:`snapshot_worktree`: a temp ``GIT_INDEX_FILE`` is seeded
-    from HEAD (``read-tree``), then ``add -A`` stages every tracked edit, deletion
-    and non-ignored untracked file, and ``write-tree`` names the result. The
-    scope is the WHOLE enclosing worktree (``:/``), not just ``repo``: a project
-    living in a subdirectory of a larger repository can have verify commands that
-    read its siblings. Files the real index tracks although an ignore rule
-    matches them (``git add -f``, possibly not yet in HEAD) are restaged into the
-    temp index too (``update-index --add --remove``), because the commit that
-    follows a reuse takes them. The real index is only read, and the working
-    tree never touched, so an operator's staged state survives the read byte for
-    byte. ``.bmad-loop/`` is excluded by an explicit
-    pathspec, not left to ``.gitignore`` (the orchestrator writes its run state
-    there between the two reads); ``-c core.safecrlf=false`` keeps a mixed-EOL
-    file under ``core.autocrlf`` + ``core.safecrlf=true`` from failing the stage,
-    the same override the dirty-tree probes use.
+    Modelled on :func:`snapshot_worktree`: a temp ``GIT_INDEX_FILE`` is seeded from
+    a copy of the real index merged onto HEAD (``read-tree -m -i``, see
+    :func:`_seed_fingerprint_index`), which holds HEAD's entries but keeps the stat
+    cache; when that seed is refused it is built fresh from HEAD (``read-tree``)
+    instead. The two give the same tree unless the cache is stale: a file whose
+    conversion rules changed out of tree (``core.autocrlf``, ``.git/info/attributes``)
+    since its stat was cached keeps its cached blob in the seed, as ``git status``
+    reads it clean, while the fresh build re-hashes it. Then ``add -A`` stages every
+    tracked edit, deletion and non-ignored untracked file, and ``write-tree`` names
+    the result. The scope
+    is the WHOLE enclosing worktree (``:/``), not just ``repo``: a project living in
+    a subdirectory of a larger repository can have verify commands that read its
+    siblings. Files the real index tracks although an ignore rule matches them
+    (``git add -f``, possibly not yet in HEAD) are restaged into the temp index too
+    (``update-index --add --remove``), because the commit that follows a reuse takes
+    them. The real index is only read, and the working tree never touched, so an
+    operator's staged state survives the read byte for byte. ``.bmad-loop/`` is
+    excluded by an explicit pathspec, not left to ``.gitignore`` (the orchestrator
+    writes its run state there between the two reads); ``-c core.safecrlf=false``
+    keeps a mixed-EOL file under ``core.autocrlf`` + ``core.safecrlf=true`` from
+    failing the stage, the same override the dirty-tree probes use.
 
     ``exclude`` names further paths (posix, relative to ``repo``) to leave out:
     after both stages each is reset (``reset -q HEAD -- :(literal)<path>``) to
@@ -10389,10 +10450,13 @@ def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerp
             f"{os.fsdecode(listed.stdout + listed.stderr).strip()}"
         )
     with tempfile.TemporaryDirectory() as td:
-        env = {**os.environ, "GIT_INDEX_FILE": str(Path(td) / "index")}
-        rc, out = _git_env(repo, "read-tree", head, env=env)
-        if rc != 0:
-            raise GitError(f"git read-tree (fingerprint) failed in {repo}: {out}")
+        temp_index = Path(td) / "index"
+        env = {**os.environ, "GIT_INDEX_FILE": str(temp_index)}
+        if _seed_fingerprint_index(repo, head, env) is not None:
+            temp_index.unlink(missing_ok=True)
+            rc, out = _git_env(repo, "read-tree", head, env=env)
+            if rc != 0:
+                raise GitError(f"git read-tree (fingerprint) failed in {repo}: {out}")
         rc, out = _git_env(repo, "-c", "core.safecrlf=false", "add", "-A", *scope, env=env)
         if rc != 0:
             raise GitError(f"git add (fingerprint) failed in {repo}: {out}")

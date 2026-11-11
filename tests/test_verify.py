@@ -16147,6 +16147,293 @@ def test_worktree_fingerprint_mixed_eol_under_safecrlf(project):
     assert fp.head == git(repo, "rev-parse", "HEAD")
 
 
+# --- fingerprint temp index seeded from the real index (DW-638) -------------------
+
+
+def _fresh_fp(repo: Path, monkeypatch, exclude: tuple[str, ...] = ()) -> verify.TreeFingerprint:
+    """The fingerprint with the seed forced off: the temp index built from HEAD."""
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_seed_fingerprint_index", lambda *_args: "forced")
+        return verify.worktree_fingerprint(repo, exclude)
+
+
+def _seeded_fp(repo: Path, monkeypatch, exclude: tuple[str, ...] = ()) -> verify.TreeFingerprint:
+    """The fingerprint, asserting it really took the seeded path."""
+    real = verify._seed_fingerprint_index
+    reasons: list[str | None] = []
+
+    def spy(*args):
+        reasons.append(real(*args))
+        return reasons[-1]
+
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_seed_fingerprint_index", spy)
+        fp = verify.worktree_fingerprint(repo, exclude)
+    assert reasons == [None]
+    return fp
+
+
+def _seed_reason(repo: Path, tmp_path: Path) -> str | None:
+    """`_seed_fingerprint_index` run directly against a temp index outside the repo."""
+    env = {**os.environ, "GIT_INDEX_FILE": str(tmp_path / "seed-index")}
+    return verify._seed_fingerprint_index(repo, git(repo, "rev-parse", "HEAD"), env)
+
+
+def _debug_stat(repo: Path, index: Path, rel: str) -> tuple[str, str]:
+    """`(mtime, size)` of `rel`'s entry in `index`, from `ls-files --debug`."""
+    out = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--debug", "--", rel],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "GIT_INDEX_FILE": str(index)},
+    ).stdout
+    mtime = re.search(r"mtime: (\S+)", out)
+    size = re.search(r"size: (\d+)", out)
+    assert mtime and size, out
+    return mtime[1], size[1]
+
+
+def test_fingerprint_seed_matches_fresh_build_over_staged_only_state(project, monkeypatch):
+    """The seeded read equals the fresh build in a state mixing worktree changes
+    with every kind of staged-only real-index state the copy carries: a staged edit
+    that differs from the worktree, a staged new file since deleted, an `add -N`
+    entry, a staged file under the excluded `.bmad-loop/`, and a `git rm --cached`
+    of a committed file `.git/info/exclude` matches.
+
+    Ablation: drop the `read-tree -m -i` and fingerprint the raw copy; the staged
+    `.bmad-loop/` file and the `rm --cached` file diverge from the fresh build."""
+    repo = project.project
+    _committed(repo, "gone.txt", "doomed\n").unlink()
+    staged = _committed(repo, "staged.txt", "head\n")
+    cached = _committed(repo, "cached.log", "kept in HEAD\n")
+    (repo / "src.txt").write_text("edited\n")
+    (repo / "new.txt").write_text("untracked\n")
+    staged.write_text("staged\n")
+    git(repo, "add", "staged.txt")
+    staged.write_text("worktree\n")
+    (repo / "ghost.txt").write_text("staged then deleted\n")
+    git(repo, "add", "ghost.txt")
+    (repo / "ghost.txt").unlink()
+    (repo / "intent.txt").write_text("intent to add\n")
+    git(repo, "add", "-N", "intent.txt")
+    (repo / ".bmad-loop").mkdir(exist_ok=True)
+    (repo / ".bmad-loop" / "staged.txt").write_text("orchestrator\n")
+    git(repo, "add", ".bmad-loop/staged.txt")
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("*.log\n")
+    git(repo, "rm", "-q", "--cached", "cached.log")
+    assert cached.exists()
+
+    seeded = _seeded_fp(repo, monkeypatch)
+    assert seeded == _fresh_fp(repo, monkeypatch)
+    assert seeded.tree != git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_fingerprint_seed_matches_fresh_build_with_exclude_and_force_added(project, monkeypatch):
+    """An `exclude` and a force-added ignored file take the same tree seeded as
+    fresh, both before and after an edit to each."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("gen/\n")
+    ledger = _committed(repo, "notes/ledger.md", "open\n")
+    (repo / "gen").mkdir()
+    (repo / "gen" / "out.txt").write_text("generated\n")
+    git(repo, "add", "-f", "gen/out.txt")
+    exclude = ("notes/ledger.md",)
+    before = _seeded_fp(repo, monkeypatch, exclude)
+    assert before == _fresh_fp(repo, monkeypatch, exclude)
+    ledger.write_text("done\n")
+    (repo / "gen" / "out.txt").write_text("regenerated\n")
+    after = _seeded_fp(repo, monkeypatch, exclude)
+    assert after == _fresh_fp(repo, monkeypatch, exclude)
+    assert after.tree != before.tree
+
+
+def test_fingerprint_seed_keeps_the_stat_cache(project, tmp_path):
+    """The point of the seed: an entry whose blob matches HEAD keeps the real
+    index's stat info (a fresh `read-tree HEAD` has none, so `add -A` re-hashes).
+
+    Ablation: swap `read-tree -m -i` for a plain `read-tree` on the copy; the entry
+    comes back with a zero mtime and size."""
+    repo = project.project
+    past = time.time() - 100  # well before the index write: never racily clean
+    os.utime(repo / "src.txt", (past, past))
+    git(repo, "update-index", "-q", "--refresh")
+    real = _debug_stat(repo, repo / ".git" / "index", "src.txt")
+    assert real[1] != "0"
+    assert _seed_reason(repo, tmp_path) is None
+    assert _debug_stat(repo, tmp_path / "seed-index", "src.txt") == real
+
+
+def test_fingerprint_seed_leaves_the_real_index_untouched(project, monkeypatch):
+    """A seeded read only copies the real index: its bytes and its mtime survive.
+
+    Ablation: seed by running `read-tree -m` on the real index (drop the copy and
+    the temp `GIT_INDEX_FILE` from the seed); the staged edit is lost."""
+    repo = project.project
+    (repo / "src.txt").write_text("staged\n")
+    git(repo, "add", "src.txt")
+    (repo / "src.txt").write_text("edited\n")
+    index = repo / ".git" / "index"
+    before = (index.read_bytes(), index.stat().st_mtime_ns)
+    _seeded_fp(repo, monkeypatch)
+    assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+
+
+def _subdir_project(repo: Path) -> Path:
+    app = repo / "app"
+    app.mkdir()
+    (app / "main.txt").write_text("app\n")
+    git(repo, "add", "app")
+    git(repo, "commit", "-qm", "app")
+    return app
+
+
+def test_fingerprint_seed_from_a_subdirectory_project(project, monkeypatch):
+    """A project in a subdirectory seeds too: `--git-path index` answers relative
+    to it (`../.git/index`), and a dirty sibling lands the same tree as fresh."""
+    app = _subdir_project(project.project)
+    (project.project / "src.txt").write_text("sibling edit\n")
+    assert _seeded_fp(app, monkeypatch) == _fresh_fp(app, monkeypatch)
+
+
+def test_fingerprint_seed_flags_check_covers_siblings(project, tmp_path, monkeypatch):
+    """A flagged entry outside a subdirectory project still refuses: `add -A :/`
+    would skip the sibling's edit, so the flags check reads the whole index.
+
+    Ablation: drop the `:/` pathspec from the `ls-files -v`; the reason is
+    `None`."""
+    repo = project.project
+    app = _subdir_project(repo)
+    git(repo, "update-index", "--assume-unchanged", "src.txt")
+    (repo / "src.txt").write_text("sibling edit\n")
+    assert _seed_reason(app, tmp_path) == "index-flags"
+    assert verify.worktree_fingerprint(app) == _fresh_fp(app, monkeypatch)
+
+
+def _assert_refused_to_fresh(repo: Path, tmp_path: Path, monkeypatch, reason: str) -> None:
+    """The seed refuses with `reason`, and the fingerprint still answers — the
+    fresh build's tree, which carries the dirty `src.txt`."""
+    (repo / "src.txt").write_text("dirty\n")
+    assert _seed_reason(repo, tmp_path) == reason
+    fp = verify.worktree_fingerprint(repo)
+    assert fp == _fresh_fp(repo, monkeypatch)
+    assert fp.tree != git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_fingerprint_seed_refuses_split_index(project, tmp_path, monkeypatch):
+    """A split index's shared half is not in the copy.
+
+    Ablation: drop the `core.splitindex` check; the reason becomes
+    `shared-index` (or `None` once the shared file is gone)."""
+    repo = project.project
+    git(repo, "config", "core.splitIndex", "true")
+    git(repo, "update-index", "--split-index")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "split-index")
+
+
+def test_fingerprint_seed_refuses_a_shared_index_file(project, tmp_path, monkeypatch):
+    """A `sharedindex.*` beside the index refuses even with `core.splitIndex` unset.
+
+    Ablation: drop the `sharedindex.*` glob; the seed returns `None`."""
+    repo = project.project
+    (repo / ".git" / "sharedindex.0").write_bytes(b"")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "shared-index")
+
+
+@pytest.mark.parametrize("value", ["true", "", "a-hook"])
+def test_fingerprint_seed_refuses_fsmonitor(project, tmp_path, value):
+    """Any `core.fsmonitor` value but a clear false refuses — its valid bits stand
+    in for the stat check. Reason only: a fingerprint under `true` would spawn the
+    fsmonitor daemon; the full fallback runs in the hook row of the next test.
+
+    Ablation: drop the `core.fsmonitor` check; every row returns `None`."""
+    repo = project.project
+    git(repo, "config", "core.fsmonitor", value)
+    assert _seed_reason(repo, tmp_path) == "fsmonitor"
+
+
+def test_fingerprint_seed_fsmonitor_hook_falls_back(project, tmp_path, monkeypatch):
+    """A (missing) fsmonitor hook refuses and the fresh build still answers.
+
+    Ablation: drop the `core.fsmonitor` check; the reason is `None`."""
+    repo = project.project
+    git(repo, "config", "core.fsmonitor", str(tmp_path / "missing-hook"))
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "fsmonitor")
+
+
+@pytest.mark.parametrize("value", ["false", "No", "OFF", "0"])
+def test_fingerprint_seed_accepts_a_clear_false_fsmonitor(project, tmp_path, monkeypatch, value):
+    """A clear-false `core.fsmonitor` does not refuse.
+
+    Ablation: treat any set value as on; every row refuses `fsmonitor`."""
+    repo = project.project
+    git(repo, "config", "core.fsmonitor", value)
+    assert _seed_reason(repo, tmp_path) is None
+    (repo / "src.txt").write_text("dirty\n")
+    assert _seeded_fp(repo, monkeypatch) == _fresh_fp(repo, monkeypatch)
+
+
+def test_fingerprint_seed_refuses_a_missing_index(project, tmp_path, monkeypatch):
+    """No real index file, nothing to copy.
+
+    Ablation: drop the `is_file()` check; the copy fails and the reason is
+    `copy`."""
+    repo = project.project
+    (repo / ".git" / "index").unlink()
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "no-index")
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_fingerprint_seed_refuses_flagged_entries(project, tmp_path, monkeypatch, flag):
+    """`read-tree -m` keeps an entry's assume-unchanged / skip-worktree bit, and
+    `add -A` would then skip the flagged file's edit.
+
+    Ablation: drop the `ls-files -v` tag check; the reason is `None` and the
+    seeded tree misses the `src.txt` edit."""
+    repo = project.project
+    git(repo, "update-index", flag, "src.txt")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "index-flags")
+
+
+def test_fingerprint_seed_refuses_an_unmerged_index(project, tmp_path, monkeypatch):
+    """A conflicted merge leaves stages `read-tree -m -i` will not merge onto.
+
+    Ablation: swap `read-tree -m -i` for a plain `read-tree`; it discards the
+    stages and the reason is `None`."""
+    repo = project.project
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "src.txt").write_text("side\n")
+    git(repo, "commit", "-qam", "side")
+    git(repo, "checkout", "-q", "-")
+    (repo / "src.txt").write_text("main\n")
+    git(repo, "commit", "-qam", "main")
+    merge = subprocess.run(["git", "-C", str(repo), "merge", "-q", "side"], capture_output=True)
+    assert merge.returncode != 0
+    assert git(repo, "ls-files", "-u")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "read-tree-m")
+
+
+def test_fingerprint_seed_refuses_a_config_read_fault(project, tmp_path, monkeypatch):
+    """A `config --get-regexp` rc other than 0/1 is a fault, not "unset".
+
+    Ablation: accept any rc from the config read; the reason is `None`."""
+    repo = project.project
+    (repo / "src.txt").write_text("dirty\n")
+    fresh = _fresh_fp(repo, monkeypatch)
+    real = verify.git_bytes
+
+    def faulty(repo_: Path, *args: str, **kwargs):
+        if args[:2] == ("config", "--get-regexp"):
+            return subprocess.CompletedProcess(list(args), 2, b"", b"config broke")
+        return real(repo_, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "git_bytes", faulty)
+    assert _seed_reason(repo, tmp_path) == "config"
+    assert verify.worktree_fingerprint(repo) == fresh
+
+
 def test_verify_reuse_key_folds_case_under_normcase(tmp_path, monkeypatch):
     import ntpath
 
