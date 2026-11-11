@@ -16032,6 +16032,70 @@ def test_worktree_fingerprint_covers_force_added_ignored_files(project):
     assert _fp(repo).tree not in (before.tree, edited.tree)
 
 
+def _committed(repo: Path, rel: str, text: str, *, force: bool = False) -> Path:
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    git(repo, "add", *(("-f",) if force else ()), rel)
+    git(repo, "commit", "-qm", f"add {rel}")
+    return path
+
+
+def test_worktree_fingerprint_exclude_leaves_the_path_out(project):
+    """An `exclude` path is left out of the fingerprint: an edit to it keeps the
+    fingerprint equal, while an edit to any other path still moves it.
+
+    Ablation: drop the excluded-path `reset` from `worktree_fingerprint`; the
+    excluded edit moves the tree."""
+    repo = project.project
+    ledger = _committed(repo, "notes/ledger.md", "open\n")
+    exclude = ("notes/ledger.md",)
+    before = verify.worktree_fingerprint(repo, exclude)
+    ledger.write_text("done\n")
+    assert verify.worktree_fingerprint(repo, exclude) == before
+    assert _fp(repo).tree != before.tree  # the edit is real; only the exclusion hides it
+    (repo / "src.txt").write_text("edited\n")
+    assert verify.worktree_fingerprint(repo, exclude).tree != before.tree
+
+
+def test_worktree_fingerprint_exclude_covers_a_force_added_path(project):
+    """An excluded file an ignore rule matches (tracked by `add -f`) is restaged
+    by the force-added listing, and the exclusion still leaves its edit out —
+    without git refusing the stage over a pathspec that names an ignored path.
+
+    Ablation: spell the exclusion as `:(exclude,literal)` pathspecs on the
+    listing and the `add` instead of the `reset`; `add` refuses ("paths are
+    ignored") and the fingerprint raises `GitError`."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("gen/\n")
+    ledger = _committed(repo, "gen/ledger.md", "open\n", force=True)
+    exclude = ("gen/ledger.md",)
+    before = verify.worktree_fingerprint(repo, exclude)
+    ledger.write_text("done\n")
+    assert verify.worktree_fingerprint(repo, exclude) == before
+    assert _fp(repo).tree != before.tree
+
+
+def test_worktree_fingerprint_exclude_of_an_untracked_ignored_path(project):
+    """A gitignored, untracked excluded file (a ledger under an ignored output
+    folder) fingerprints at all — `add` never sees a pathspec naming it — and a
+    new excluded file that is NOT ignored stays out of the tree too.
+
+    Ablation: spell the exclusion as `:(exclude,literal)` pathspecs on the
+    `add`; the ignored case raises `GitError`."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("out/\n")
+    (repo / "out").mkdir()
+    (repo / "out" / "ledger.md").write_text("open\n")
+    before = verify.worktree_fingerprint(repo, ("out/ledger.md",))
+    assert before == _fp(repo)
+    (repo / "notes").mkdir()
+    (repo / "notes" / "ledger.md").write_text("new\n")
+    assert verify.worktree_fingerprint(repo, ("notes/ledger.md",)) == before
+
+
 def _embedded_repo(repo: Path, name: str = "sub") -> None:
     sub = repo / name
     sub.mkdir()
@@ -16217,6 +16281,37 @@ def test_reuse_seam_fingerprint_fault_runs(project, monkeypatch, exc, decline, d
     assert rig.decisions == [verify.ReuseDecision(False, decline, detail, None)]
 
 
+def test_decide_reuse_fingerprints_with_the_request_exclude(project):
+    """`_decide_reuse` takes the gate-time fingerprint with `VerifyReuse.exclude`,
+    so a pass fingerprinted with an exclusion matches at the gate after a change
+    to the excluded path alone — and declines `tree-mismatch` without it.
+
+    Ablation: call `worktree_fingerprint(cwd)` in `_decide_reuse` regardless of
+    the request's `exclude`; the first decision declines."""
+    repo = project.repo_root
+    ledger = _committed(repo, "notes/ledger.md", "open\n")
+    exclude = ("notes/ledger.md",)
+    pol = _reuse_policy()
+    key = verify.verify_reuse_key(pol, repo)
+    minted = verify.worktree_fingerprint(repo, exclude)
+    ledger.write_text("done\n")
+
+    def request(excl: tuple[str, ...]) -> verify.VerifyReuse:
+        return verify.VerifyReuse(
+            key=key,
+            fingerprint=minted,
+            outcome=_REUSE_OUTCOME,
+            on_decision=lambda _d: None,
+            exclude=excl,
+        )
+
+    assert verify._decide_reuse(request(exclude), pol, repo) == verify.ReuseDecision(
+        True, None, None, minted
+    )
+    declined = verify._decide_reuse(request(()), pol, repo)
+    assert (declined.reused, declined.decline) == (False, "tree-mismatch")
+
+
 def test_reuse_seam_hard_stop_declines_a_match(project, monkeypatch):
     """A hard stop pending once the fingerprint matched must not let the stored
     green pass commit the story: the match declines with `hard-stop` and the
@@ -16269,11 +16364,12 @@ def test_verify_review_status_failure_decides_nothing(project, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode", ["review", "review_stories", "review_tickets", "review_tickets_park"]
+    "mode", ["review", "review_stories", "review_bundle", "review_tickets", "review_tickets_park"]
 )
 def test_review_gates_forward_reuse(project, monkeypatch, mode):
     """Each eligible review gate threads `reuse=` through to the seam, the tickets
-    gate on both of its command paths (built, and the awaiting-operator park).
+    gate on both of its command paths (built, and the awaiting-operator park), and
+    the sweep bundle gate past its ledger done-check.
 
     Ablation: drop `reuse=reuse` from a gate's `_verify_review_commands` call; its
     row runs the commands."""
@@ -16299,8 +16395,3 @@ def test_review_gates_forward_reuse(project, monkeypatch, mode):
     assert out is _REUSE_OUTCOME
     assert rig.runs == 0
     assert [d.reused for d in rig.decisions] == [True]
-
-
-def test_verify_review_bundle_takes_no_reuse():
-    """Sweep is excluded from reuse in v1: the bundle gate has no `reuse` kwarg."""
-    assert "reuse" not in inspect.signature(verify.verify_review_bundle).parameters

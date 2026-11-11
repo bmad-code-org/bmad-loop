@@ -255,7 +255,8 @@ class VerifyPolicy:
     # instead of re-running every [verify] command, when nothing git-visible
     # changed between that green pass and the gate: same commands, timeout,
     # env_fault_rc and cwd, the same HEAD, and the same worktree tree hash
-    # (taken through a temporary index, ignored paths and .bmad-loop/ left out).
+    # (taken through a temporary index, ignored paths and .bmad-loop/ left out;
+    # a sweep also leaves its deferred-work ledger out and pins it by content).
     # Reuse trusts that nothing outside git-visible state changed in between:
     # ignored files (node_modules, build output, caches) and non-git state
     # (databases, services, env) are blind spots. Off by default; status checks

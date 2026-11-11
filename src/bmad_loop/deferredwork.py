@@ -1502,6 +1502,23 @@ def _apply_done_many(
     return text, marked
 
 
+def apply_reopenable_close(
+    text: str, dw_ids: Sequence[str], date: str, note: str, operation_id: str
+) -> str:
+    """The ledger text :func:`mark_done_many_reopenable` would publish over
+    `text`: the same pure fold (:func:`_apply_done_many`) under the same undo
+    owner, with no `Path`, no lock and no I/O. `text` comes back unchanged when
+    no id would flip. `date` and `operation_id` are validated as the writer
+    validates them.
+
+    The projection a caller needs to recognise its own close in a ledger it
+    read earlier — a sweep's verify reuse pins the pre-close ledger and this
+    projection of it, and accepts a gate-time ledger only when it is one of
+    the two."""
+    _require_iso_date(date)
+    return _apply_done_many(text, dw_ids, date, note, None, _operation_digest(operation_id))[0]
+
+
 def _mark_done_many(
     path: Path,
     dw_ids: Sequence[str],

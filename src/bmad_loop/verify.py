@@ -20,7 +20,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -10324,15 +10324,18 @@ class VerifyReuse:
     by the caller around that pass), the outcome to hand back on a match, and
     ``on_decision``, which observes every decision, reused or declined. The same
     must-not-raise contract as ``verify_commands_outcome``'s ``on_results``
-    applies to ``on_decision``."""
+    applies to ``on_decision``. ``exclude`` is the pass's
+    :func:`worktree_fingerprint` exclusion, re-applied to the gate-time read so
+    both fingerprints leave out the same paths."""
 
     key: VerifyReuseKey
     fingerprint: TreeFingerprint
     outcome: VerifyOutcome
     on_decision: Callable[[ReuseDecision], None]
+    exclude: tuple[str, ...] = ()
 
 
-def worktree_fingerprint(repo: Path) -> TreeFingerprint:
+def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerprint:
     """Fingerprint ``repo``'s git-visible working state: HEAD, plus the tree
     hash of the worktree staged over HEAD in a throwaway index.
 
@@ -10351,6 +10354,15 @@ def worktree_fingerprint(repo: Path) -> TreeFingerprint:
     there between the two reads); ``-c core.safecrlf=false`` keeps a mixed-EOL
     file under ``core.autocrlf`` + ``core.safecrlf=true`` from failing the stage,
     the same override the dirty-tree probes use.
+
+    ``exclude`` names further paths (posix, relative to ``repo``) to leave out:
+    after both stages each is reset (``reset -q HEAD -- :(literal)<path>``) to
+    its HEAD entry in the temp index — or dropped from it when HEAD has none —
+    so the tree carries the HEAD copy of an excluded path whatever its worktree
+    copy holds, tracked, force-added or ignored. A sweep passes its
+    deferred-work ledger, which the engine itself rewrites between a pass and its
+    gate (the caller pins that file by content instead). A caller comparing two
+    fingerprints must pass the same ``exclude`` to both.
 
     Blind spots, by construction: untracked ignored files (``node_modules``,
     build output, caches) are not staged, and staged-only state is not read (an
@@ -10408,6 +10420,15 @@ def worktree_fingerprint(repo: Path) -> TreeFingerprint:
                     f"git update-index (fingerprint) failed in {repo}: "
                     f"{os.fsdecode(proc.stdout + proc.stderr).strip()}"
                 )
+        if exclude:
+            # Back to HEAD's entry (or out, when HEAD has none) AFTER both stages,
+            # not as `:(exclude)` pathspecs on them: `add` refuses with "paths are
+            # ignored" whenever such a pathspec names an ignored path, and a
+            # gitignored ledger is a supported layout.
+            literal = (f":(literal){path}" for path in exclude)
+            rc, out = _git_env(repo, "reset", "-q", head, "--", *literal, env=env)
+            if rc != 0:
+                raise GitError(f"git reset (fingerprint) failed in {repo}: {out}")
         rc, listing, detail = _git_out(repo, "ls-files", "-s", "--", ":/", env=env)
         if rc != 0:
             raise GitError(f"git ls-files (fingerprint) failed in {repo}: {detail}")
@@ -10422,12 +10443,15 @@ def worktree_fingerprint(repo: Path) -> TreeFingerprint:
 def _decide_reuse(reuse: VerifyReuse, policy: Policy, cwd: Path) -> ReuseDecision:
     """Whether ``reuse`` may stand in for running ``policy``'s commands in
     ``cwd``. Checked in a fixed order: the policy key first (a mismatch never
-    spends a fingerprint), then the gate-time fingerprint. Any fingerprint fault
-    declines — a fault is never a match."""
+    spends a fingerprint), then the gate-time fingerprint, taken with the
+    request's ``exclude``. Any fingerprint fault declines — a fault is never a
+    match."""
     if verify_reuse_key(policy, cwd) != reuse.key:
         return ReuseDecision(False, "policy-mismatch", None, None)
     try:
-        now = worktree_fingerprint(cwd)
+        now = (
+            worktree_fingerprint(cwd, reuse.exclude) if reuse.exclude else worktree_fingerprint(cwd)
+        )
     except FingerprintRefused:
         return ReuseDecision(False, "gitlinks", None, None)
     except (GitError, OSError) as exc:  # GitSpawnError is a GitError
@@ -10801,6 +10825,7 @@ def verify_review_bundle(
     on_results: CommandSink | None = None,
     on_probes: ProbeSink | None = None,
     accept_statuses: frozenset[str] | None = None,
+    reuse: VerifyReuse | None = None,
 ) -> VerifyOutcome:
     """verify_review for a deferred-work bundle: no sprint-status check, but
     every dw id the bundle owns must be marked done in the ledger on disk. The
@@ -10816,7 +10841,8 @@ def verify_review_bundle(
     ``on_results`` is handed straight to ``_verify_review_commands`` and is the
     engine's hook for journalling this gate's verifier results; see there. It is
     invoked only if the gate reaches its commands — an earlier refusal ran
-    nothing, so there is nothing to record."""
+    nothing, so there is nothing to record. ``reuse`` is forwarded the same way,
+    and is decided only once the spec and ledger checks above it pass."""
     if not task.spec_file:
         return VerifyOutcome.retry("no spec file recorded for task")
     fm = _gate_frontmatter(Path(task.spec_file))
@@ -10866,7 +10892,9 @@ def verify_review_bundle(
             fixable=True,
         )
 
-    return _verify_review_commands(policy, paths, on_results=on_results, on_probes=on_probes)
+    return _verify_review_commands(
+        policy, paths, on_results=on_results, on_probes=on_probes, reuse=reuse
+    )
 
 
 def commit_story(repo: Path, message: str) -> str:

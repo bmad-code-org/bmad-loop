@@ -4575,17 +4575,10 @@ def test_bundle_review_gate_journals_its_verify_commands(project):
     assert entry["command"] == _OK and entry["story_key"] == "dw-fix"
 
 
-def test_bundle_skip_review_gate_declines_verify_reuse_as_mode_unsupported(project, monkeypatch):
-    """Sweeps never reuse a green verify pass under `[verify] reuse_unchanged`
-    (#1002): the engine closes the bundle's ledger entries after the dev pass
-    and re-closes them before the gate, so no fingerprint would ever match.
-    With the flag on, the dev pass reads no fingerprint (mints no token), the
-    skip-review gate journals exactly one `mode-unsupported` decline, and both
-    passes run their commands.
-
-    Ablation: remove the `SweepEngine._verify_reuse_supported` override and the
-    dev pass fingerprints — the raising stub fires and the run crashes — and,
-    with a real fingerprint, the gate reuses the dev pass instead of declining."""
+def _reuse_sweep(project, monkeypatch, *, on_run=None):
+    """A one-bundle skip-review sweep with `[verify] reuse_unchanged` on, and the
+    list of `run_verify_commands` calls it makes (`on_run(n)` runs after the
+    n-th call's commands, before the engine reads anything back)."""
     write_ledger(project, {"DW-1": "open"})
     plan = triage_result(
         ["DW-1"], bundles=[{"name": "fix", "dw_ids": ["DW-1"], "intent": "resolve DW-1"}]
@@ -4612,22 +4605,17 @@ def test_bundle_skip_review_gate_declines_verify_reuse_as_mode_unsupported(proje
 
     def counting_run(policy, cwd):
         ran.append(cwd)
-        return real_run(policy, cwd)
-
-    def refuse(_repo):
-        raise AssertionError("sweep fingerprinted the worktree for verify reuse")
+        results = real_run(policy, cwd)
+        if on_run is not None:
+            on_run(len(ran))
+        return results
 
     monkeypatch.setattr(verify, "run_verify_commands", counting_run)
-    monkeypatch.setattr(verify, "worktree_fingerprint", refuse)
+    return engine, ran
 
-    summary = engine.run()
 
-    assert not summary.crashed and not summary.paused
-    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
-    entries = engine.journal.entries()
-    assert "review-skipped" in {e["kind"] for e in entries}
-    assert len(ran) == 2
-    passes = sorted(
+def _verify_passes(entries):
+    return sorted(
         {
             (e["verification_stage"], e["verification_sequence"])
             for e in entries
@@ -4635,11 +4623,215 @@ def test_bundle_skip_review_gate_declines_verify_reuse_as_mode_unsupported(proje
         },
         key=lambda p: p[1],
     )
-    assert passes == [("dev", 1), ("review", 2)]
-    declines = [e for e in entries if e["kind"] == "verify-reuse-declined"]
-    assert [e["decline"] for e in declines] == ["mode-unsupported"]
-    assert declines[0]["story_key"] == "dw-fix"
+
+
+def _reuse_declines(entries):
+    return [e for e in entries if e["kind"] == "verify-reuse-declined"]
+
+
+def test_bundle_skip_review_gate_reuses_the_dev_verify_pass(project, monkeypatch):
+    """A skip-review sweep under `[verify] reuse_unchanged` reuses its green dev
+    pass at the gate, although the engine closes the bundle's ledger entries
+    between the two (DW-637): the ledger is carved out of both fingerprints and
+    pinned by content, and the gate-time ledger is exactly the close projection
+    of the one the pass ran against.
+
+    Ablation: restore `SweepEngine._verify_reuse_supported` to False and the gate
+    journals `mode-unsupported` and runs its commands a second time; drop the
+    `_verify_reuse_exclude` override and it declines `tree-mismatch` (the closed
+    ledger moves the fingerprint)."""
+    engine, ran = _reuse_sweep(project, monkeypatch)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    entries = engine.journal.entries()
+    assert "review-skipped" in {e["kind"] for e in entries}
+    assert len(ran) == 1
+    assert _verify_passes(entries) == [("dev", 1)]
+    assert _reuse_declines(entries) == []
+    (reused,) = [e for e in entries if e["kind"] == "verify-pass-reused"]
+    assert reused["story_key"] == "dw-fix" and reused["reused_stage"] == "dev"
+    (entry,) = deferredwork.parse_ledger(project.deferred_work.read_text(encoding="utf-8"))
+    assert entry.id == "DW-1" and entry.status.startswith("done")
+
+
+def test_bundle_skip_review_gate_declines_reuse_on_a_foreign_ledger_edit(project, monkeypatch):
+    """Any ledger change between the dev pass and the gate other than this
+    bundle's own engine close declines the reuse as `ledger-mismatch`, and the
+    gate runs its commands. Only the ledger the pass ran against, or that ledger
+    after the bundle's own close (accepted although the pass never read it), is
+    reused.
+
+    Ablation: delete the ledger check in `Engine._review_reuse_request` and the
+    gate reuses the dev pass (the fingerprint leaves the ledger out), so the
+    decline and the second run are missing."""
+    engine, ran = _reuse_sweep(project, monkeypatch)
+    real_close = engine._close_bundle_ledger_when_spec_status
+
+    def close_then_edit(*args, **kwargs):
+        real_close(*args, **kwargs)
+        ledger = project.deferred_work
+        ledger.write_text(ledger.read_text(encoding="utf-8") + "\nforeign note\n", encoding="utf-8")
+
+    monkeypatch.setattr(engine, "_close_bundle_ledger_when_spec_status", close_then_edit)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    entries = engine.journal.entries()
+    assert len(ran) == 2
+    assert _verify_passes(entries) == [("dev", 1), ("review", 2)]
+    declines = _reuse_declines(entries)
+    assert [e["decline"] for e in declines] == ["ledger-mismatch"]
+    assert declines[0]["story_key"] == "dw-fix" and "detail" not in declines[0]
     assert not [e for e in entries if e["kind"] == "verify-pass-reused"]
+
+
+def _fault_ledger_reads_inside(monkeypatch, engine, method: str, project):
+    """Make `deferredwork.observe_ledger` fault on the run's ledger while
+    `engine.<method>` runs, and answer normally everywhere else."""
+    real_observe = deferredwork.observe_ledger
+    faulting = []
+
+    def observe(path):
+        if faulting and Path(path) == project.deferred_work:
+            return None, "PermissionError: [Errno 13] ledger refused"
+        return real_observe(path)
+
+    real_method = getattr(engine, method)
+
+    def wrapped(*args, **kwargs):
+        faulting.append(True)
+        try:
+            return real_method(*args, **kwargs)
+        finally:
+            faulting.pop()
+
+    monkeypatch.setattr(deferredwork, "observe_ledger", observe)
+    monkeypatch.setattr(engine, method, wrapped)
+
+
+def test_bundle_skip_review_gate_declines_reuse_on_a_gate_ledger_fault(project, monkeypatch):
+    """An unreadable ledger at the gate declines the reuse as `ledger-fault`,
+    with the read fault as `detail`, and the gate runs its commands — the read is
+    observation, so it neither raises nor reads as a match.
+
+    Ablation: delete the fault arm of the gate's ledger check and the faulted
+    read digests as an absent ledger, which matches neither pin: the decline
+    reads `ledger-mismatch` with no `detail`."""
+    engine, ran = _reuse_sweep(project, monkeypatch)
+    _fault_ledger_reads_inside(monkeypatch, engine, "_review_reuse_request", project)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    entries = engine.journal.entries()
+    assert len(ran) == 2
+    (decline,) = _reuse_declines(entries)
+    assert decline["decline"] == "ledger-fault"
+    assert decline["detail"] == "PermissionError: [Errno 13] ledger refused"
+    assert not [e for e in entries if e["kind"] == "verify-pass-reused"]
+
+
+def test_bundle_dev_pass_that_edits_the_ledger_mints_no_reuse(project, monkeypatch):
+    """A dev pass whose verify commands change the ledger mints no token, though
+    the fingerprint leaves the ledger out: the content pin read around the
+    commands differs, so the gate declines `pass-mutated-tree` and runs them.
+
+    Ablation: drop the ledger from the before/after comparison in
+    `Engine._mint_verify_reuse` and the pass mints a token; its pin no longer
+    matches the gate ledger, so the decline reads `ledger-mismatch` instead."""
+
+    def edit_ledger_on_dev_pass(n):
+        if n == 1:
+            ledger = project.deferred_work
+            ledger.write_text(
+                ledger.read_text(encoding="utf-8") + "\nsuite wrote this\n", encoding="utf-8"
+            )
+
+    engine, ran = _reuse_sweep(project, monkeypatch, on_run=edit_ledger_on_dev_pass)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    entries = engine.journal.entries()
+    assert len(ran) == 2
+    assert [e["decline"] for e in _reuse_declines(entries)] == ["pass-mutated-tree"]
+
+
+def test_bundle_dev_pass_ledger_fault_mints_no_reuse(project, monkeypatch):
+    """A ledger read fault around the dev pass mints no token: the void reason is
+    `ledger-fault` with the fault as `detail`, which the gate journals as its
+    decline before running its commands. The dev pass's own outcome is
+    untouched (it ran green and the unit lands).
+
+    Ablation: delete the fault arm of `Engine._verify_reuse_snapshot` and the
+    faulted read pins an absent ledger: the pass mints, and the gate declines
+    `ledger-mismatch` instead."""
+    engine, ran = _reuse_sweep(project, monkeypatch)
+    _fault_ledger_reads_inside(monkeypatch, engine, "_verify_commands_with_results", project)
+
+    summary = engine.run()
+
+    assert not summary.crashed and not summary.paused
+    assert engine.state.tasks["dw-fix"].phase == Phase.DONE
+    entries = engine.journal.entries()
+    assert len(ran) == 2
+    (decline,) = _reuse_declines(entries)
+    assert decline["decline"] == "ledger-fault"
+    assert decline["detail"] == "PermissionError: [Errno 13] ledger refused"
+
+
+def test_bundle_verify_reuse_pins_a_ledger_outside_the_workspace_root(
+    project, monkeypatch, tmp_path
+):
+    """A ledger outside `workspace.root` is not excluded from the fingerprint (no
+    `..` pathspec) but is still pinned by content: the token carries no
+    exclusion, the gate's request re-applies none, and the close projection
+    still admits the engine's own close.
+
+    Ablation: make `SweepEngine._verify_reuse_exclude` return the
+    `os.path.relpath` spelling and the token carries a `..` path."""
+    engine, _ = _reuse_sweep(project, monkeypatch)
+    outside = tmp_path / "outside-artifacts"
+    outside.mkdir()
+    paths = replace(project, implementation_artifacts=outside)
+    write_ledger(paths, {"DW-1": "open"}, commit=False)
+    engine.workspace = replace(engine.workspace, paths=paths)
+    real_fp = verify.worktree_fingerprint
+    shapes = []
+
+    def fp(repo, *exclude):
+        shapes.append(exclude)
+        return real_fp(repo, *exclude)
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", fp)
+    task = StoryTask(story_key="dw-fix", epic=0, dw_ids=["DW-1"])
+
+    assert engine._verify_reuse_exclude() == ()
+    outcome, _ = engine._verify_commands_with_results(task, "dev")
+    assert outcome.ok
+    token = engine._verify_reuse
+    assert token is not None and token.exclude == () and token.ledger is not None
+    assert shapes == [(), ()]
+    deferredwork.mark_done_many_reopenable(
+        paths.deferred_work,
+        ["DW-1"],
+        engine._today(),
+        engine._bundle_close_note(task),
+        engine._bundle_close_operation_id(task),
+    )
+    engine._review_reuse_eligible = True
+
+    request = engine._review_reuse_request(task)
+
+    assert request is not None and request.exclude == ()
+    assert _reuse_declines(engine.journal.entries()) == []
 
 
 def test_bundle_ledger_close_skips_on_unreadable_spec(project, monkeypatch):

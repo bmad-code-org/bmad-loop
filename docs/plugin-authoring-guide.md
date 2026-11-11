@@ -713,6 +713,11 @@ gate that could not reuse journals `verify-reuse-declined` with a `decline` reas
 runs its commands as usual. `verification_reused` is a Python-plugin context property;
 declarative hooks get no environment variable for it.
 
+A sweep's bundle gate reuses too. Its fingerprint leaves the deferred-work ledger out,
+and the gate instead declines with `ledger-mismatch` when the ledger is neither the one
+the pass ran against nor that ledger after the bundle's own close, or with `ledger-fault`
+(plus a `detail`) when it cannot read it.
+
 ### Commit
 
 | Stage             | When                                        | Mutable surface                                                                          |

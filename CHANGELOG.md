@@ -113,7 +113,9 @@ breaking changes may land in a minor release.
   the first fully-idle Stop's `modelName`; session-end `models` stays untracked.
 - Add opt-in `[verify] reuse_unchanged`: a skip-review gate reuses an unchanged green
   dev/fix verify pass instead of re-running `[verify] commands`; journalled as
-  `verify-pass-reused` / `verify-reuse-declined` (#1002).
+  `verify-pass-reused` / `verify-reuse-declined` (#1002). Sweeps reuse too, with the
+  deferred-work ledger pinned by content rather than fingerprinted: any change but the
+  bundle's own close declines `ledger-mismatch`, an unreadable ledger `ledger-fault`.
 
 ### Changed
 
