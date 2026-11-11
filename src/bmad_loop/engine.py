@@ -1048,7 +1048,11 @@ class Engine:
         # (e.g. the Unity plugin's editor_mode↔scm.isolation coupling) so the run
         # fails fast rather than mid-unit.
         self._registry.validate(policy)
-        self._bus = HookBus(self._registry, journal)
+        # a hook from a plugin not declared `read_only` voids any reusable verify
+        # pass before it runs (#1002 / DW-640); the callback only touches state.
+        self._bus = HookBus(
+            self._registry, journal, on_writer_dispatch=self._void_reuse_on_plugin_hook
+        )
         # stages at which some active plugin injects a provided workflow session
         # (Phase 4). Precomputed once for an O(1) guard so a run whose plugins
         # provide no workflows stays byte-identical (no extra sessions, no journal).
@@ -1099,9 +1103,10 @@ class Engine:
         # gate may reuse, and why there is none. Transient on purpose — never
         # persisted: a resumed process has run no pass it could vouch for. Minted
         # by `_verify_commands_with_results`, voided by every new pass, session
-        # launch, rollback, reset, worktree discard and pause (NOT by plugin hook
-        # dispatch: hook writes are caught by the gate's fingerprint only), and
-        # popped by `_review_reuse_request`. The void reason is what a gate that
+        # launch, rollback, reset, worktree discard, pause and hook dispatch from
+        # a plugin not declared `read_only` (`plugin-hook`; a read-only plugin's
+        # writes are left to the gate's fingerprint), and popped by
+        # `_review_reuse_request`. The void reason is what a gate that
         # finds no token journals as its decline.
         self._verify_reuse: VerifyReuseToken | None = None
         self._verify_reuse_void: tuple[str, str | None] = ("no-token", None)
@@ -7185,6 +7190,16 @@ class Engine:
         skip-review gate journals when it finds no token."""
         self._verify_reuse = None
         self._verify_reuse_void = (reason, detail)
+
+    def _void_reuse_on_plugin_hook(self, plugin: str, stage: str) -> None:
+        """The bus's ``on_writer_dispatch`` callback: a plugin not declared
+        ``read_only`` is about to run a hook for ``stage``, and may write ignored
+        files or non-git state the gate's fingerprint cannot see — so no pass
+        survives it. Voids only a live token: with none, the void reason already
+        recorded (a fingerprint fault and its text, ``session-launched``, ...)
+        is the truer decline and must not be relabelled ``plugin-hook``."""
+        if self._verify_reuse is not None:
+            self._invalidate_verify_reuse("plugin-hook", f"{plugin}:{stage}")
 
     def _verify_reuse_mintable(self, verification_stage: str) -> bool:
         return (

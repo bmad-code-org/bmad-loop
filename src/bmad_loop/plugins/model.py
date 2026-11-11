@@ -179,6 +179,10 @@ class PluginManifest:
     seed_globs: tuple[str, ...] = ()
     # ordering across plugins at a shared stage: lower runs first, then load order.
     priority: int = 0
+    # the plugin's hooks (declarative and [python]) write nothing a verify pass
+    # reads: a dispatch leaves a `[verify] reuse_unchanged` token intact. False
+    # (the default) voids it on every dispatch (decline `plugin-hook`).
+    read_only: bool = False
     scripts_dir: str = ""
     source: str = "project"
 

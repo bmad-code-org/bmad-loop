@@ -749,7 +749,7 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `verify-reuse-declined` (#1002): why a skip-review gate ran its commands
         # instead of reusing a green pass. A closed engine-minted vocabulary
         # (no-token, superseded, session-launched, rollback, worktree-discard,
-        # reset, paused, pass-mutated-tree, gitlinks, fingerprint-fault,
+        # reset, paused, plugin-hook, pass-mutated-tree, gitlinks, fingerprint-fault,
         # policy-mismatch, tree-mismatch, hard-stop, mode-unsupported), never
         # authored text; a fault's text rides the separately-dropped `detail`.
         "decline",

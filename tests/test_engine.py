@@ -1515,6 +1515,96 @@ def test_verify_reuse_declines_after_a_workflow_session(project, monkeypatch):
     assert not _entries(engine, "verify-pass-reused")
 
 
+def _post_dev_verify_plugin(*, read_only):
+    """A trusted in-process plugin observing ``post_dev_verify`` — the stage that
+    fires after the dev pass minted its token and before the skip-review gate.
+    It writes nothing; only its manifest's ``read_only`` differs."""
+    from bmad_loop.plugins import Plugin, PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin, PluginManifest
+
+    seen = []
+
+    class Observer(Plugin):
+        def on_post_dev_verify(self, ctx):
+            seen.append(ctx.verification_stage)
+
+    manifest = PluginManifest(name="obs", api_version=1, read_only=read_only)
+    registry = PluginRegistry([LoadedPlugin(manifest=manifest, instance=Observer(manifest, {}))])
+    return registry, seen
+
+
+def test_verify_reuse_declines_after_a_writer_plugin_hook(project, monkeypatch):
+    """A hook from a plugin not declared `read_only`, dispatched between the dev
+    pass and the skip-review gate, voids the token: the gate runs its commands
+    and declines `plugin-hook`, naming `<plugin>:<stage>` — though the hook
+    changed nothing git can see.
+
+    Ablation: drop the `_invalidate_verify_reuse("plugin-hook", ...)` call in
+    `Engine._void_reuse_on_plugin_hook` and the gate reuses (one pass, a
+    `verify-pass-reused` row, no decline)."""
+    registry, seen = _post_dev_verify_plugin(read_only=False)
+    engine, _ = make_engine(
+        project, _skip_story(project), policy=_reuse_policy(), registry=registry
+    )
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen == ["dev"]
+    assert len(ran) == 2
+    (row,) = _entries(engine, "verify-reuse-declined")
+    assert (row["decline"], row["detail"]) == ("plugin-hook", "obs:post_dev_verify")
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def test_verify_reuse_writer_plugin_hook_keeps_an_earlier_void_reason(project, monkeypatch):
+    """A writer hook that fires when no token is live leaves the recorded void
+    reason alone: a fingerprint fault during the dev pass still surfaces as the
+    gate's `fingerprint-fault` decline with its fault text, not `plugin-hook`.
+
+    Ablation: drop the `self._verify_reuse is not None` guard in
+    `Engine._void_reuse_on_plugin_hook` and the decline reads `plugin-hook`."""
+    registry, seen = _post_dev_verify_plugin(read_only=False)
+    engine, _ = make_engine(
+        project, _skip_story(project), policy=_reuse_policy(), registry=registry
+    )
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+
+    def fp(repo):
+        raise verify.GitError("fingerprint exploded")
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", fp)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen == ["dev"]
+    assert len(ran) == 2
+    (row,) = _entries(engine, "verify-reuse-declined")
+    assert row["decline"] == "fingerprint-fault"
+    assert "fingerprint exploded" in row["detail"]
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def test_verify_reuse_survives_a_read_only_plugin_hook(project, monkeypatch):
+    """The same hook from a plugin declared `read_only` leaves the token intact:
+    the gate reuses the dev pass and runs no second command pass."""
+    registry, seen = _post_dev_verify_plugin(read_only=True)
+    engine, _ = make_engine(
+        project, _skip_story(project), policy=_reuse_policy(), registry=registry
+    )
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev")])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen == ["dev"]
+    assert len(ran) == 1
+    assert len(_entries(engine, "verify-pass-reused")) == 1
+    assert not _entries(engine, "verify-reuse-declined")
+
+
 def test_verify_reuse_declines_a_pass_that_mutated_the_tree(project, monkeypatch):
     """A command that writes a tracked file during the dev pass mints nothing:
     the gate runs its commands and declines with `pass-mutated-tree`.

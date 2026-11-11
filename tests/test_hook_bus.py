@@ -556,6 +556,85 @@ def test_shared_persists_across_stages():
     assert shared == {"count": 3}
 
 
+# --------------------------------------------------- writer-dispatch callback
+
+
+def _writer_bus(*loaded: LoadedPlugin, events: list) -> HookBus:
+    def runner(cmd, *, cwd, env, timeout):
+        events.append(("hook", env["BMAD_LOOP_PLUGIN"]))
+        return 0, ""
+
+    return HookBus(
+        registry_of(*loaded),
+        runner=runner,
+        on_writer_dispatch=lambda plugin, stage: events.append(("void", plugin, stage)),
+    )
+
+
+def test_writer_dispatch_fires_only_for_bound_active_non_read_only_plugins():
+    """The callback names exactly the plugin about to dispatch that is not
+    ``read_only``, before its hook runs: a read-only plugin, a plugin not bound
+    to the stage and an inactive (untrusted) one dispatch nothing to announce."""
+    writer = declarative("pre_story", name="writer")
+    reader = LoadedPlugin(
+        manifest=manifest("reader", read_only=True, hooks=(HookSpec(stage="pre_story", cmd="X"),))
+    )
+    unbound = declarative("post_commit", name="unbound")
+    inactive = LoadedPlugin(
+        manifest=manifest("inactive", hooks=(HookSpec(stage="pre_story", cmd="X"),)),
+        trusted=False,
+    )
+    events: list = []
+    _writer_bus(writer, reader, unbound, inactive, events=events).emit("pre_story", ctx())
+    assert events == [("void", "writer", "pre_story"), ("hook", "writer"), ("hook", "reader")]
+
+
+def test_writer_dispatch_fires_once_per_plugin_per_emit():
+    """A plugin with both a declarative hook and an ``on_<stage>`` method for the
+    stage announces once, and again on the next emit."""
+    calls: list = []
+
+    class P(Plugin):
+        def on_pre_story(self, c):
+            calls.append("py")
+
+    m = manifest("both", hooks=(HookSpec(stage="pre_story", cmd="X"),))
+    events: list = []
+    bus = _writer_bus(LoadedPlugin(manifest=m, instance=P(m, {})), events=events)
+    bus.emit("pre_story", ctx())
+    bus.emit("pre_story", ctx())
+    assert [e for e in events if e[0] == "void"] == [("void", "both", "pre_story")] * 2
+    assert calls == ["py", "py"]
+
+
+def test_writer_dispatch_covers_python_hooks_and_honours_read_only():
+    class P(Plugin):
+        def on_pre_story(self, c):
+            pass
+
+    events: list = []
+    writer = py_plugin(P, "pywriter")
+    m = manifest("pyreader", read_only=True)
+    reader = LoadedPlugin(manifest=m, instance=P(m, {}))
+    _writer_bus(writer, reader, events=events).emit("pre_story", ctx())
+    assert events == [("void", "pywriter", "pre_story")]
+
+
+def test_writer_dispatch_skips_a_bus_disabled_plugin():
+    """An instance the bus disabled after it raised dispatches nothing more, so it
+    announces nothing more."""
+
+    class Boom(Plugin):
+        def on_pre_story(self, c):
+            raise RuntimeError("x")
+
+    events: list = []
+    bus = _writer_bus(py_plugin(Boom, "boom"), events=events)
+    bus.emit("pre_story", ctx())
+    bus.emit("pre_story", ctx())
+    assert events == [("void", "boom", "pre_story")]
+
+
 # ====================================================== engine integration
 
 
