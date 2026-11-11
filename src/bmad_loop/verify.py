@@ -10411,19 +10411,25 @@ def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerp
     (``update-index --add --remove``), because the commit that follows a reuse takes
     them. The real index is only read, and the working tree never touched, so an
     operator's staged state survives the read byte for byte. ``.bmad-loop/`` is
-    excluded by an explicit pathspec, not left to ``.gitignore`` (the orchestrator
-    writes its run state there between the two reads); ``-c core.safecrlf=false``
-    keeps a mixed-EOL file under ``core.autocrlf`` + ``core.safecrlf=true`` from
-    failing the stage, the same override the dirty-tree probes use.
+    always left out, not left to ``.gitignore`` (the orchestrator writes its run
+    state there between the two reads), by the same post-stage reset as
+    ``exclude`` below. A ``:(exclude)`` pathspec on the ``add`` only prunes the
+    walk (``init`` leaves ``.bmad-loop/archive/`` tarballs un-ignored), and only
+    while ``check-ignore`` reads the directory as not ignored: ``add`` refuses
+    ("paths are ignored") a pathspec naming an ignored path, and skips an ignored
+    directory anyway. ``-c core.safecrlf=false`` keeps a mixed-EOL file under
+    ``core.autocrlf`` + ``core.safecrlf=true`` from failing the stage, the same
+    override the dirty-tree probes use.
 
     ``exclude`` names further paths (posix, relative to ``repo``) to leave out:
-    after both stages each is reset (``reset -q HEAD -- :(literal)<path>``) to
-    its HEAD entry in the temp index — or dropped from it when HEAD has none —
-    so the tree carries the HEAD copy of an excluded path whatever its worktree
-    copy holds, tracked, force-added or ignored. A sweep passes its
-    deferred-work ledger, which the engine itself rewrites between a pass and its
-    gate (the caller pins that file by content instead). A caller comparing two
-    fingerprints must pass the same ``exclude`` to both.
+    after both stages each, with ``.bmad-loop``, is reset
+    (``reset -q HEAD -- :(literal)<path>``) to its HEAD entry in the temp index —
+    or dropped from it when HEAD has none — so the tree carries the HEAD copy of
+    an excluded path whatever its worktree copy holds, tracked, force-added or
+    ignored. A sweep passes its deferred-work ledger, which the engine itself
+    rewrites between a pass and its gate (the caller pins that file by content
+    instead). A caller comparing two fingerprints must pass the same ``exclude``
+    to both.
 
     Blind spots, by construction: untracked ignored files (``node_modules``,
     build output, caches) are not staged, and staged-only state is not read (an
@@ -10440,7 +10446,15 @@ def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerp
     ``OSError`` from the temp directory through; it never returns a partial
     result. Every git call goes through the ``_run_git`` chokepoint."""
     head = rev_parse_head(repo)
-    scope = ("--", ":/", f":(exclude){AUTOMATOR_DIR_REL}")
+    scope = ("--", ":/")
+    # Prune `.bmad-loop/` from the `add` walk while git would accept the pathspec:
+    # check-ignore exits 0 when the directory is ignored, 1 when it is not. The
+    # trailing slash reads a still-missing directory as ignored under a dir-only
+    # rule, so one created before the `add` cannot turn the prune into a refusal.
+    rc, out = _git(repo, "check-ignore", "-q", "--no-index", "--", f"{AUTOMATOR_DIR_REL}/")
+    if rc not in (0, 1):
+        raise GitError(f"git check-ignore (fingerprint) failed in {repo}: {out}")
+    prune = () if rc == 0 else (f":(exclude){AUTOMATOR_DIR_REL}",)
     # Read from the REAL index (read-only: ls-files takes no lock and writes
     # nothing): the tracked paths an ignore rule matches, i.e. force-added files.
     listed = git_bytes(repo, "ls-files", "-z", "-c", "-i", "--exclude-standard", *scope)
@@ -10457,7 +10471,7 @@ def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerp
             rc, out = _git_env(repo, "read-tree", head, env=env)
             if rc != 0:
                 raise GitError(f"git read-tree (fingerprint) failed in {repo}: {out}")
-        rc, out = _git_env(repo, "-c", "core.safecrlf=false", "add", "-A", *scope, env=env)
+        rc, out = _git_env(repo, "-c", "core.safecrlf=false", "add", "-A", *scope, *prune, env=env)
         if rc != 0:
             raise GitError(f"git add (fingerprint) failed in {repo}: {out}")
         if listed.stdout:
@@ -10484,15 +10498,15 @@ def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerp
                     f"git update-index (fingerprint) failed in {repo}: "
                     f"{os.fsdecode(proc.stdout + proc.stderr).strip()}"
                 )
-        if exclude:
-            # Back to HEAD's entry (or out, when HEAD has none) AFTER both stages,
-            # not as `:(exclude)` pathspecs on them: `add` refuses with "paths are
-            # ignored" whenever such a pathspec names an ignored path, and a
-            # gitignored ledger is a supported layout.
-            literal = (f":(literal){path}" for path in exclude)
-            rc, out = _git_env(repo, "reset", "-q", head, "--", *literal, env=env)
-            if rc != 0:
-                raise GitError(f"git reset (fingerprint) failed in {repo}: {out}")
+        # Back to HEAD's entry (or out, when HEAD has none) AFTER both stages:
+        # this, not a `:(exclude)` pathspec, is what leaves these paths out (the
+        # `.bmad-loop` prune above only spares the walk). `add` refuses with
+        # "paths are ignored" whenever such a pathspec names an ignored path, and
+        # both a gitignored `.bmad-loop/` and a gitignored ledger are supported.
+        literal = (f":(literal){path}" for path in (AUTOMATOR_DIR_REL, *exclude))
+        rc, out = _git_env(repo, "reset", "-q", head, "--", *literal, env=env)
+        if rc != 0:
+            raise GitError(f"git reset (fingerprint) failed in {repo}: {out}")
         rc, listing, detail = _git_out(repo, "ls-files", "-s", "--", ":/", env=env)
         if rc != 0:
             raise GitError(f"git ls-files (fingerprint) failed in {repo}: {detail}")

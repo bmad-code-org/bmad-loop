@@ -15946,18 +15946,118 @@ def test_worktree_fingerprint_ignored_file_is_a_blind_spot(project):
 
 
 def test_worktree_fingerprint_excludes_automator_dir_without_ignore(project):
-    """`.bmad-loop/` is excluded by pathspec, not by `.gitignore`: the sandbox
-    ignores only `.bmad-loop/runs/`, so a file beside it is NOT ignored and must
-    still leave the fingerprint equal.
+    """`.bmad-loop/` is left out by the fingerprint itself, not by `.gitignore`:
+    the sandbox ignores only `.bmad-loop/runs/`, so a file beside it is NOT
+    ignored and must still leave the fingerprint equal.
 
-    Ablation: drop the `:(exclude)` pathspec from `worktree_fingerprint`'s `add`;
-    the file is staged and the trees differ."""
+    Ablation: drop both the `:(exclude)` walk prune on `worktree_fingerprint`'s
+    `add` and `AUTOMATOR_DIR_REL` from its post-stage `reset`; the file is staged
+    and the trees differ (either one alone still leaves it out)."""
     repo = project.project
     before = _fp(repo)
     (repo / ".bmad-loop").mkdir(exist_ok=True)
     (repo / ".bmad-loop" / "notes.txt").write_text("orchestrator state\n")
     assert "notes.txt" in git(repo, "status", "--porcelain", "-uall")  # not ignored
     assert _fp(repo) == before
+
+
+@pytest.mark.parametrize("rule", [".bmad-loop/", ".bmad-loop/runs/"])
+def test_worktree_fingerprint_under_an_ignored_automator_dir(project, rule):
+    """A project that gitignores the whole `.bmad-loop/` (this repo's own layout)
+    fingerprints at all, as does one ignoring only `.bmad-loop/runs/`: edits under
+    `.bmad-loop/` — a tracked file there (force-added under the whole-dir rule)
+    and new run state — leave the fingerprint equal, while a code edit moves it.
+
+    Ablation: pass the `:(exclude).bmad-loop` prune to the `add` whatever
+    `check-ignore` says; the whole-dir case raises `GitError` ("paths are
+    ignored"). Dropping `AUTOMATOR_DIR_REL` from the post-stage `reset` instead
+    restages the force-added file and moves the whole-dir tree."""
+    repo = project.project
+    tracked = _committed(repo, ".bmad-loop/profiles/x.toml", "a = 1\n", force=True)
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write(f"{rule}\n")
+    before = _fp(repo)
+    assert before.tree == git(repo, "rev-parse", "HEAD^{tree}")
+    tracked.write_text("a = 2\n")
+    runs = repo / ".bmad-loop" / "runs" / "r1"
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "journal.jsonl").write_text("{}\n")
+    (repo / ".bmad-loop" / "notes.txt").write_text("orchestrator state\n")
+    assert _fp(repo) == before
+    (repo / "src.txt").write_text("edited\n")
+    after = _fp(repo)
+    assert after.head == before.head
+    assert after.tree != before.tree
+
+
+def test_worktree_fingerprint_never_hashes_the_automator_archive(project):
+    """In the `init` layout (only `.bmad-loop/runs/` ignored) an archived run's
+    tarball under `.bmad-loop/archive/` is not ignored, yet the fingerprint never
+    walks it: its blob never reaches the object store, and it leaves the
+    fingerprint equal.
+
+    Ablation: drop the `:(exclude)` walk prune from `worktree_fingerprint`'s
+    `add`; the tarball is hashed (its blob is written) before the reset drops it."""
+    repo = project.project
+
+    def ignored(rel: str) -> bool:
+        cmd = ["git", "-C", str(repo), "check-ignore", "-q", "--no-index", rel]
+        return subprocess.run(cmd, capture_output=True, check=False).returncode == 0
+
+    assert ignored(".bmad-loop/runs/x") and not ignored(".bmad-loop")
+    before = _fp(repo)
+    archive = repo / ".bmad-loop" / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "20261111-000000-abcd.tar.gz").write_bytes(b"archived run state\n")
+    assert ".bmad-loop/archive/" in git(repo, "status", "--porcelain", "-uall")  # not ignored
+    blob = git(repo, "hash-object", ".bmad-loop/archive/20261111-000000-abcd.tar.gz")
+    assert _fp(repo) == before
+    probe = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", blob], capture_output=True, check=False
+    )
+    assert probe.returncode != 0, "the archive blob was written to the object store"
+
+
+def test_worktree_fingerprint_check_ignore_fault_raises(project, monkeypatch):
+    """A `check-ignore` that neither answers ignored (0) nor not ignored (1) is a
+    git fault: the fingerprint raises rather than guessing a prune.
+
+    Ablation: treat any non-zero exit as "not ignored"; no `GitError` is raised."""
+    repo = project.project
+    real = verify._git
+
+    def broken(where: Path, *args: str) -> tuple[int, str]:
+        if args[:1] == ("check-ignore",):
+            return 128, "fatal: simulated"
+        return real(where, *args)
+
+    monkeypatch.setattr(verify, "_git", broken)
+    with pytest.raises(verify.GitError, match="check-ignore"):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_automator_dir_created_after_the_ignore_check(project, monkeypatch):
+    """Under a dir-only whole-dir rule, a `.bmad-loop/` missing at the ignore check
+    and created before the `add` still fingerprints: the check reads the missing
+    directory as ignored, so no prune pathspec is passed for git to refuse.
+
+    Ablation: drop the trailing slash from the `check-ignore` path; the missing
+    directory reads as not ignored, the prune is passed, and `add` raises."""
+    repo = project.project
+    assert not (repo / ".bmad-loop").exists()
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write(".bmad-loop/\n")
+    real = verify._git
+
+    def creating(where: Path, *args: str) -> tuple[int, str]:
+        result = real(where, *args)
+        if args[:1] == ("check-ignore",):
+            (repo / ".bmad-loop").mkdir(exist_ok=True)
+            (repo / ".bmad-loop" / "late.txt").write_text("written mid-read\n")
+        return result
+
+    monkeypatch.setattr(verify, "_git", creating)
+    assert _fp(repo).tree == git(repo, "rev-parse", "HEAD^{tree}")
 
 
 def test_worktree_fingerprint_commit_moves_head(project):
