@@ -472,6 +472,66 @@ def test_verify_reuse_skip_gate_reuses_the_dev_pass_inside_the_unit_worktree(pro
     assert "unit-merged" in journal_kinds(engine)
 
 
+def test_verify_reuse_reuses_with_an_unpopulated_submodule_inside_the_unit_worktree(
+    project, tmp_path, monkeypatch
+):
+    """A unit worktree leaves every submodule unpopulated (an empty directory at
+    the gitlink path). That pins the gitlink as `(path, None, None)` rather than
+    refusing, so the dev pass mints a token and the skip-review gate reuses it:
+    one command pass, no decline, and the story merges back."""
+    origin = tmp_path / "sub-origin"
+    origin.mkdir()
+    git(origin, "init", "-q")
+    (origin / "payload.txt").write_text("submodule payload\n")
+    git(origin, "add", "payload.txt")
+    git(origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "sub")
+    repo = project.project
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), "module")
+    git(repo, "commit", "-q", "-m", "add populated submodule")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    mounted: dict[str, Path] = {}
+    base_effect = wt_dev_effect(project, "1-1-a", followup_review=False)
+
+    def dev(spec):
+        mounted["root"] = session_checkout_root(project, spec.cwd).resolve()
+        return base_effect(spec)
+
+    ran: list[Path] = []
+    real_run = verify.run_verify_commands
+
+    def counting_run(policy, cwd):
+        ran.append(Path(cwd).resolve())
+        return real_run(policy, cwd)
+
+    fingerprints: list[tuple[Path, verify.TreeFingerprint]] = []
+    real_fingerprint = verify.worktree_fingerprint
+
+    def spy_fingerprint(repo):
+        fp = real_fingerprint(repo)
+        fingerprints.append((Path(repo).resolve(), fp))
+        return fp
+
+    monkeypatch.setattr(verify, "run_verify_commands", counting_run)
+    monkeypatch.setattr(verify, "worktree_fingerprint", spy_fingerprint)
+    policy = replace(wt_policy(), verify=VerifyPolicy(commands=(_OK,), reuse_unchanged=True))
+    engine, _ = make_engine(project, [dev], policy=policy)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    unit_root = mounted["root"]
+    assert unit_root != project.repo_root.resolve()
+    assert ran == [unit_root]
+    declines = [e for e in engine.journal.entries() if e["kind"] == "verify-reuse-declined"]
+    assert not declines, [(d.get("decline"), d.get("detail")) for d in declines]
+    assert len([e for e in engine.journal.entries() if e["kind"] == "verify-pass-reused"]) == 1
+    assert len(fingerprints) == 3
+    for root, fp in fingerprints:
+        assert root == unit_root
+        assert fp.submodules == (("module", None, None),)
+    assert "unit-merged" in journal_kinds(engine)
+
+
 def test_prior_dispatch_does_not_block_fresh_mounted_spec_binding(project):
     """A none-to-worktree re-drive relocates accepted input, then replaces old authority."""
     rel = "_bmad-output/implementation-artifacts/accepted-rearm.md"

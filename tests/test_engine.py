@@ -1678,18 +1678,67 @@ def test_verify_reuse_declines_on_a_policy_mismatch(project, monkeypatch):
     assert _declines(engine) == ["policy-mismatch"]
 
 
-def test_verify_reuse_declines_on_a_gitlink(project, monkeypatch):
-    """An untracked embedded repo (staged as a gitlink) refuses the fingerprint,
-    so nothing is minted and the gate declines with `gitlinks`.
-
-    Ablation: drop the `FingerprintRefused` arm in `_verify_reuse_fingerprint`
-    and the refusal escapes the dev pass."""
-    nested = project.project / "vendored"
+def _nested_repo(project, name="vendored"):
+    """An untracked repository with one commit inside the project; `add -A`
+    stages it as a gitlink. Returns its checkout."""
+    nested = project.project / name
     nested.mkdir()
     git(nested, "init", "-q")
     (nested / "f.txt").write_text("x\n")
     git(nested, "add", "f.txt")
     git(nested, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "n")
+    return nested
+
+
+def test_verify_reuse_reuses_over_a_nested_repo(project, monkeypatch):
+    """An untracked embedded repo (staged as a gitlink) is fingerprinted by its
+    own HEAD and working tree, so the dev pass mints a token and an unchanged
+    gate reuses it: one command pass, no decline."""
+    _nested_repo(project)
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+    assert engine._verify_reuse is not None
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+
+    assert len(ran) == 1
+    assert len(_entries(engine, "verify-pass-reused")) == 1
+    assert not _entries(engine, "verify-reuse-declined")
+
+
+def test_verify_reuse_declines_tree_mismatch_after_a_submodule_edit(project, monkeypatch):
+    """A tracked file edited inside a nested repo between the pass and the gate
+    moves neither the parent's tree nor the nested HEAD, only the nested
+    working tree: the gate still declines with `tree-mismatch` and runs.
+
+    Ablation: make `verify._fingerprint_gitlink` append `(path, sub_head,
+    None)` instead of recursing; the edit is invisible and the gate reuses."""
+    nested = _nested_repo(project)
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+    assert engine._verify_reuse is not None
+    (nested / "f.txt").write_text("edited inside the nested repo\n")
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+
+    assert len(ran) == 2
+    assert _declines(engine) == ["tree-mismatch"]
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def test_verify_reuse_gitlinks_decline_journals_the_cause(project, monkeypatch):
+    """A committed gitlink whose directory holds files but no repository cannot
+    be read: nothing is minted, and the gate's `gitlinks` decline journals the
+    refusal cause and path as its `detail`.
+
+    Ablation: drop `str(exc)` from the `FingerprintRefused` arm in
+    `Engine._verify_reuse_fingerprint`; the row carries no `detail`."""
+    repo = project.project
+    head = verify.rev_parse_head(repo)
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{head},vendored")
+    git(repo, "commit", "-q", "-m", "gitlink with no checkout")
+    (repo / "vendored").mkdir()
+    (repo / "vendored" / "stray.txt").write_text("stray\n")
     engine, task, ran = _gate_unit(project, monkeypatch)
     outcome, _ = engine._verify_commands_with_results(task, "dev")
     assert outcome.ok  # the refusal never changes the pass's outcome
@@ -1698,7 +1747,9 @@ def test_verify_reuse_declines_on_a_gitlink(project, monkeypatch):
     assert engine._review_verify_gate(task, reuse_eligible=True).ok
 
     assert len(ran) == 2
-    assert _declines(engine) == ["gitlinks"]
+    (row,) = _entries(engine, "verify-reuse-declined")
+    assert row["decline"] == "gitlinks"
+    assert row["detail"] == "not-a-checkout: vendored"
 
 
 @pytest.mark.parametrize(

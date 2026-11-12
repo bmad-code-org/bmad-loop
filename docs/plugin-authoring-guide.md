@@ -724,6 +724,13 @@ does not set `read_only = true` voids the reusable pass: the gate declines with
 hook of the plugin writes files (ignored ones included) or other state a verify
 command reads.
 
+Checked-out submodules and nested repositories are fingerprinted recursively, by their
+own HEAD and working tree; an unpopulated submodule directory counts as empty. One the
+fingerprint cannot read (a symlink, a directory holding files but no repository of its
+own, more than 8 levels deep) declines with `gitlinks` and a `detail` of
+`<cause>: <path>`, such as `not-a-checkout: vendor/lib`. Ignored files inside a
+submodule are blind spots, as in the parent.
+
 A sweep's bundle gate reuses too. Its fingerprint leaves the deferred-work ledger out,
 and the gate instead declines with `ledger-mismatch` when the ledger is neither the one
 the pass ran against nor that ledger after the bundle's own close, or with `ledger-fault`

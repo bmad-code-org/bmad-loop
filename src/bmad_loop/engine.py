@@ -7217,8 +7217,8 @@ class Engine:
             if exclude:
                 return verify.worktree_fingerprint(root, exclude)
             return verify.worktree_fingerprint(root)
-        except verify.FingerprintRefused:
-            self._invalidate_verify_reuse("gitlinks")
+        except verify.FingerprintRefused as exc:
+            self._invalidate_verify_reuse("gitlinks", str(exc))
         except (verify.GitError, OSError) as exc:  # GitSpawnError is a GitError
             self._invalidate_verify_reuse("fingerprint-fault", str(exc))
         return None
@@ -7351,7 +7351,8 @@ class Engine:
         self, task: StoryTask, decline: str, detail: str | None
     ) -> None:
         # Two literal writes rather than a conditional `**` splat, so the journal
-        # field guard reads every name; `detail` appears only on a fault.
+        # field guard reads every name; `detail` appears only on a fault or a
+        # `gitlinks` refusal, where it carries the cause and path.
         if detail is None:
             self.journal.append(
                 "verify-reuse-declined",
