@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import itertools
 import os
 import queue
 import re
@@ -20,7 +21,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -2303,11 +2304,13 @@ def under_floor_git_message(found: str) -> str:
     )
 
 
-def rev_parse_head(repo: Path) -> str:
+def rev_parse_head(repo: Path, *, env: Mapping[str, str] | None = None) -> str:
     """The sha HEAD resolves to. Reads stdout alone (`_git_out`): git exits 0 while
     still warning on stderr, and a warning-suffixed "sha" flows into every commit
-    comparison and into persisted run baselines (#442)."""
-    rc, out, detail = _git_out(repo, "rev-parse", "HEAD")
+    comparison and into persisted run baselines (#442). ``env`` replaces the
+    inherited environment for the call (a nested repository's read takes one
+    scrubbed of the parent's repo-local git variables)."""
+    rc, out, detail = _git_out(repo, "rev-parse", "HEAD", env=None if env is None else dict(env))
     if rc != 0:
         raise GitError(f"git rev-parse HEAD failed in {repo}: {detail}")
     return out
@@ -10260,10 +10263,19 @@ def environment_preflight_outcome(probe: ProbeOutcome) -> VerifyOutcome:
 class TreeFingerprint:
     """What :func:`worktree_fingerprint` saw: the HEAD commit and the tree hash of
     the git-visible worktree staged over it. Two equal fingerprints mean nothing
-    git can see moved between the two reads — see the blind spots there."""
+    git can see moved between the two reads — see the blind spots there.
+
+    ``tree`` is always a real git tree object id. ``submodules`` holds one
+    ``(path, head, tree)`` entry per gitlink (a submodule or an untracked nested
+    repository), at any depth, sorted by ``path``: the path is POSIX and relative
+    to the top level's worktree root, and ``head``/``tree`` are the nested
+    checkout's own HEAD and staged-worktree tree hash — both ``None`` for an
+    empty, unpopulated gitlink directory. It is ``()`` when the worktree holds no
+    gitlink."""
 
     head: str
     tree: str
+    submodules: tuple[tuple[str, str | None, str | None], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -10294,11 +10306,15 @@ def verify_reuse_key(policy: Policy, cwd: Path) -> VerifyReuseKey:
 
 
 class FingerprintRefused(Exception):
-    """:func:`worktree_fingerprint` declined to fingerprint the worktree at all —
-    today only because it holds a gitlink (a submodule, or an untracked nested
-    repo ``add -A`` stages as one), whose working tree the parent's tree hash
-    cannot see. Not a :class:`GitError`: git answered; the answer cannot vouch
-    for the tree."""
+    """:func:`worktree_fingerprint` declined to fingerprint the worktree at all,
+    because a gitlink's checkout cannot be read as a repository of its own: it is
+    a symlink, missing, not a directory, resolves outside its level, is a
+    non-empty directory whose git toplevel is somewhere else, or sits deeper than
+    the recursion cap. The message is ``"<cause>: <path>"`` — the cause one of
+    ``symlink``, ``missing``, ``not-a-directory``, ``escapes``,
+    ``not-a-checkout``, ``depth`` — with the gitlink's POSIX path relative to the
+    top level's worktree root. Not a :class:`GitError`: git answered; the answer
+    cannot vouch for the tree."""
 
 
 @dataclass(frozen=True)
@@ -10308,7 +10324,8 @@ class ReuseDecision:
     ``reused`` is the answer; on a decline ``decline`` names why (one of
     ``policy-mismatch``, ``fingerprint-fault``, ``gitlinks``, ``tree-mismatch``,
     ``hard-stop``)
-    and ``detail`` carries the fault text for ``fingerprint-fault``.
+    and ``detail`` carries the fault text for ``fingerprint-fault`` and the
+    :class:`FingerprintRefused` cause and path for ``gitlinks``.
     ``fingerprint`` is the gate-time fingerprint when one was taken."""
 
     reused: bool
@@ -10337,8 +10354,53 @@ class VerifyReuse:
 
 _CONFIG_FALSE = frozenset({"false", "no", "off", "0"})
 
+# The repository-local variables `git rev-parse --local-env-vars` lists (git
+# 2.56): each points git at one repository's dir, index, object store or
+# worktree, so one leaking from the parent level into a nested repository's git
+# call reads or writes the parent's state instead — an inherited absolute
+# GIT_INDEX_FILE would stage the nested tree straight into the parent's temp
+# index. GIT_CONFIG_PARAMETERS and GIT_CONFIG_COUNT stay out of the set, as git's
+# own submodule recursion (prepare_submodule_repo_env) keeps them: they carry
+# `-c` overrides, not repository state.
+_REPO_LOCAL_GIT_ENV = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    }
+)
 
-def _seed_fingerprint_index(repo: Path, head: str, env: dict[str, str]) -> str | None:
+# A level's `add -A` checks each gitlink it stages for dirt by spawning `git
+# status` inside the checkout (with the repo-local variables unset), and that
+# status opportunistically rewrites the checkout's REAL index to refresh its stat
+# cache. The child inherits this, which keeps every real index unwritten.
+_NO_OPTIONAL_LOCKS = {"GIT_OPTIONAL_LOCKS": "0"}
+
+# How many gitlink levels below the top level :func:`worktree_fingerprint`
+# descends; a gitlink deeper than this refuses the fingerprint.
+_FINGERPRINT_MAX_DEPTH = 8
+
+
+def _nested_git_env() -> dict[str, str]:
+    """``os.environ`` without :data:`_REPO_LOCAL_GIT_ENV`: the base environment of
+    every git call :func:`worktree_fingerprint` makes inside a nested repository,
+    so each call finds that repository from its own working directory."""
+    return {name: value for name, value in os.environ.items() if name not in _REPO_LOCAL_GIT_ENV}
+
+
+def _seed_fingerprint_index(
+    repo: Path, head: str, env: dict[str, str], base_env: dict[str, str] | None = None
+) -> str | None:
     """Seed :func:`worktree_fingerprint`'s temp index from a copy of the real one,
     so ``add -A`` reuses its stat cache instead of re-hashing every tracked file.
 
@@ -10353,8 +10415,15 @@ def _seed_fingerprint_index(repo: Path, head: str, env: dict[str, str]) -> str |
     check), no index, an unmerged index, and any entry still flagged
     assume-unchanged or skip-worktree after the merge (``add -A`` would skip it).
     A non-zero git rc or a copy ``OSError`` refuses too; a ``GitError`` from the
-    chokepoint (timeout, spawn) propagates. The real index is only read."""
-    config = git_bytes(repo, "config", "--get-regexp", r"^core\.(splitindex|fsmonitor)$")
+    chokepoint (timeout, spawn) propagates. The real index is only read.
+
+    ``base_env`` is the environment for the two reads that locate the real
+    index (``config`` and ``rev-parse --git-path index``); ``None`` inherits the
+    process environment. It must not carry ``env``'s ``GIT_INDEX_FILE``, or
+    ``--git-path index`` names the temp index itself."""
+    config = git_bytes(
+        repo, "config", "--get-regexp", r"^core\.(splitindex|fsmonitor)$", env=base_env
+    )
     if config.returncode not in (0, 1):
         return "config"
     settings: dict[str, str] = {}
@@ -10364,7 +10433,7 @@ def _seed_fingerprint_index(repo: Path, head: str, env: dict[str, str]) -> str |
     for name, reason in (("core.splitindex", "split-index"), ("core.fsmonitor", "fsmonitor")):
         if name in settings and settings[name].strip().lower() not in _CONFIG_FALSE:
             return reason
-    located = git_bytes(repo, "rev-parse", "--git-path", "index")
+    located = git_bytes(repo, "rev-parse", "--git-path", "index", env=base_env)
     if located.returncode != 0:
         return "index-path"
     # Relative to `repo` (`-C`), or absolute in a linked worktree.
@@ -10439,12 +10508,33 @@ def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerp
     runs git's clean filters, so a change those normalise away (CRLF conversion,
     LFS pointers) reads as no change.
 
-    Raises :class:`FingerprintRefused` when the staged tree holds a gitlink (a
-    submodule, or an untracked embedded repo ``add -A`` stages as one): its
-    working tree is not in the hash, so equality would vouch for nothing. Raises
-    :class:`GitError` on any git failure (an unborn HEAD included) and lets an
-    ``OSError`` from the temp directory through; it never returns a partial
-    result. Every git call goes through the ``_run_git`` chokepoint."""
+    A gitlink in the staged tree (a submodule, or an untracked nested repository
+    ``add -A`` stages as one) pins only a commit, not the working tree behind it,
+    so each is fingerprinted as a level of its own and recorded in
+    :attr:`TreeFingerprint.submodules`: an empty directory (an unpopulated
+    submodule) as ``(path, None, None)``; any other checkout whose git toplevel,
+    read from inside it, is the checkout itself as ``(path, head, tree)`` — its
+    own HEAD, and the tree of its worktree staged the same way in its own temp
+    index (seeded from its own real index, or read fresh from its HEAD), with its
+    force-added files restaged, recursing into the gitlinks it holds. Every git
+    call inside a nested repository runs in ``os.environ`` scrubbed of the
+    repository-local git variables (:data:`_REPO_LOCAL_GIT_ENV`), plus its own
+    temp ``GIT_INDEX_FILE`` where it stages, never the parent level's
+    environment; each level stages under ``GIT_OPTIONAL_LOCKS=0``, so the
+    ``git status`` that ``add`` runs inside a gitlink checkout leaves that
+    checkout's real index unwritten too. Inside a nested repository ignored files are the same blind spot
+    as at the top, and neither ``.bmad-loop/`` nor ``exclude`` is applied there:
+    a change in such a path moves the fingerprint.
+
+    Raises :class:`FingerprintRefused` when a gitlink's checkout is a symlink,
+    missing, not a directory, resolves outside its level, is a non-empty
+    directory whose git toplevel is elsewhere (``not-a-checkout``), or would
+    recurse past ``_FINGERPRINT_MAX_DEPTH`` levels: its working tree cannot be
+    hashed, so equality would vouch for nothing. Raises :class:`GitError` on any
+    git failure (an unborn HEAD included, at the top or in a nested repository)
+    and lets an ``OSError`` from the temp directory or a checkout probe through;
+    it never returns a partial result. Every git call goes through the
+    ``_run_git`` chokepoint."""
     head = rev_parse_head(repo)
     scope = ("--", ":/")
     # Prune `.bmad-loop/` from the `add` walk while git would accept the pathspec:
@@ -10463,59 +10553,210 @@ def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerp
             f"git ls-files (fingerprint) failed in {repo}: "
             f"{os.fsdecode(listed.stdout + listed.stderr).strip()}"
         )
+    entries: list[tuple[str, str | None, str | None]] = []
     with tempfile.TemporaryDirectory() as td:
         temp_index = Path(td) / "index"
-        env = {**os.environ, "GIT_INDEX_FILE": str(temp_index)}
-        if _seed_fingerprint_index(repo, head, env) is not None:
-            temp_index.unlink(missing_ok=True)
-            rc, out = _git_env(repo, "read-tree", head, env=env)
-            if rc != 0:
-                raise GitError(f"git read-tree (fingerprint) failed in {repo}: {out}")
-        rc, out = _git_env(repo, "-c", "core.safecrlf=false", "add", "-A", *scope, *prune, env=env)
+        env = {**os.environ, "GIT_INDEX_FILE": str(temp_index), **_NO_OPTIONAL_LOCKS}
+        tree = _fingerprint_level(
+            repo,
+            head,
+            env,
+            None,
+            force_added=listed.stdout,
+            prune=prune,
+            exclude=(AUTOMATOR_DIR_REL, *exclude),
+            prefix="",
+            depth=0,
+            out=entries,
+            tmpdir=Path(td),
+            counter=itertools.count(1),
+        )
+    return TreeFingerprint(head=head, tree=tree, submodules=tuple(sorted(entries)))
+
+
+def _fingerprint_level(
+    level: Path,
+    head: str,
+    env: dict[str, str],
+    base_env: dict[str, str] | None,
+    *,
+    force_added: bytes,
+    prune: tuple[str, ...],
+    exclude: tuple[str, ...],
+    prefix: str,
+    depth: int,
+    out: list[tuple[str, str | None, str | None]],
+    tmpdir: Path,
+    counter: Iterator[int],
+) -> str:
+    """Stage one level of :func:`worktree_fingerprint` into the temp index
+    ``env`` names and return its tree oid, appending an entry to ``out`` for
+    every gitlink at or below it (see :func:`_fingerprint_gitlink`).
+
+    ``base_env`` is the environment without the temp index (``None``: the
+    process's own), ``force_added`` the real index's force-added paths to
+    restage, ``prune`` the ``add`` walk's ``:(exclude)`` pathspecs and
+    ``exclude`` the paths reset to HEAD after the stages; a nested level passes
+    neither. ``prefix`` is the level's POSIX path from the top level's worktree
+    root (``""`` at the top, else ending in ``/``) and ``depth`` its gitlink
+    depth (0 at the top)."""
+    scope = ("--", ":/")
+    if _seed_fingerprint_index(level, head, env, base_env) is not None:
+        Path(env["GIT_INDEX_FILE"]).unlink(missing_ok=True)
+        rc, msg = _git_env(level, "read-tree", head, env=env)
         if rc != 0:
-            raise GitError(f"git add (fingerprint) failed in {repo}: {out}")
-        if listed.stdout:
-            proc = _run_git(
-                [
-                    "git",
-                    "-C",
-                    str(repo),
-                    "-c",
-                    "core.safecrlf=false",
-                    "update-index",
-                    "--add",
-                    "--remove",
-                    "-z",
-                    "--stdin",
-                ],
-                repo,
-                env=env,
-                binary=True,
-                input_data=listed.stdout,
+            raise GitError(f"git read-tree (fingerprint) failed in {level}: {msg}")
+    rc, msg = _git_env(level, "-c", "core.safecrlf=false", "add", "-A", *scope, *prune, env=env)
+    if rc != 0:
+        raise GitError(f"git add (fingerprint) failed in {level}: {msg}")
+    if force_added:
+        proc = _run_git(
+            [
+                "git",
+                "-C",
+                str(level),
+                "-c",
+                "core.safecrlf=false",
+                "update-index",
+                "--add",
+                "--remove",
+                "-z",
+                "--stdin",
+            ],
+            level,
+            env=env,
+            binary=True,
+            input_data=force_added,
+        )
+        if proc.returncode != 0:
+            raise GitError(
+                f"git update-index (fingerprint) failed in {level}: "
+                f"{os.fsdecode(proc.stdout + proc.stderr).strip()}"
             )
-            if proc.returncode != 0:
-                raise GitError(
-                    f"git update-index (fingerprint) failed in {repo}: "
-                    f"{os.fsdecode(proc.stdout + proc.stderr).strip()}"
-                )
+    if exclude:
         # Back to HEAD's entry (or out, when HEAD has none) AFTER both stages:
         # this, not a `:(exclude)` pathspec, is what leaves these paths out (the
-        # `.bmad-loop` prune above only spares the walk). `add` refuses with
-        # "paths are ignored" whenever such a pathspec names an ignored path, and
-        # both a gitignored `.bmad-loop/` and a gitignored ledger are supported.
-        literal = (f":(literal){path}" for path in (AUTOMATOR_DIR_REL, *exclude))
-        rc, out = _git_env(repo, "reset", "-q", head, "--", *literal, env=env)
+        # `.bmad-loop` prune only spares the walk). `add` refuses with "paths are
+        # ignored" whenever such a pathspec names an ignored path, and both a
+        # gitignored `.bmad-loop/` and a gitignored ledger are supported.
+        literal = (f":(literal){path}" for path in exclude)
+        rc, msg = _git_env(level, "reset", "-q", head, "--", *literal, env=env)
         if rc != 0:
-            raise GitError(f"git reset (fingerprint) failed in {repo}: {out}")
-        rc, listing, detail = _git_out(repo, "ls-files", "-s", "--", ":/", env=env)
-        if rc != 0:
-            raise GitError(f"git ls-files (fingerprint) failed in {repo}: {detail}")
-        if any(line.startswith("160000 ") for line in listing.splitlines()):
-            raise FingerprintRefused("gitlinks")
-        rc, tree, detail = _git_out(repo, "write-tree", env=env)
-        if rc != 0:
-            raise GitError(f"git write-tree (fingerprint) failed in {repo}: {detail}")
-    return TreeFingerprint(head=head, tree=tree)
+            raise GitError(f"git reset (fingerprint) failed in {level}: {msg}")
+    gitlinks = _staged_gitlinks(level, env)
+    if gitlinks:
+        if depth == 0:
+            rc, top, detail = _git_out(level, "rev-parse", "--show-toplevel", env=env)
+            if rc != 0 or not top:
+                raise GitError(
+                    f"git rev-parse --show-toplevel (fingerprint) failed in {level}: {detail}"
+                )
+            level_top = Path(top)
+        else:
+            level_top = level
+        for rel in gitlinks:
+            _fingerprint_gitlink(level_top, rel, prefix, depth, out, tmpdir, counter)
+    rc, tree, detail = _git_out(level, "write-tree", env=env)
+    if rc != 0:
+        raise GitError(f"git write-tree (fingerprint) failed in {level}: {detail}")
+    return tree
+
+
+def _staged_gitlinks(level: Path, env: dict[str, str]) -> list[str]:
+    """The stage-0 gitlink (mode ``160000``) paths in ``env``'s temp index, POSIX
+    and relative to ``level``'s worktree root (``--full-name``, NUL-separated, so
+    no ``core.quotePath`` quoting)."""
+    proc = git_bytes(level, "ls-files", "-s", "-z", "--full-name", "--", ":/", env=env)
+    if proc.returncode != 0:
+        raise GitError(
+            f"git ls-files (fingerprint) failed in {level}: "
+            f"{os.fsdecode(proc.stdout + proc.stderr).strip()}"
+        )
+    paths: list[str] = []
+    for record in proc.stdout.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, _oid, stage = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise GitError(f"git ls-files (fingerprint) output is malformed in {level}") from exc
+        if not raw_path:
+            raise GitError(f"git ls-files (fingerprint) output is malformed in {level}")
+        if mode == b"160000" and stage == b"0":
+            paths.append(os.fsdecode(raw_path))
+    return paths
+
+
+def _fingerprint_gitlink(
+    level_top: Path,
+    rel: str,
+    prefix: str,
+    depth: int,
+    out: list[tuple[str, str | None, str | None]],
+    tmpdir: Path,
+    counter: Iterator[int],
+) -> None:
+    """Classify the gitlink ``rel`` (relative to ``level_top``, the worktree root
+    of the level at ``depth`` that staged it) and append its entry to ``out``:
+    ``(path, None, None)`` for an empty directory, else the checkout's own HEAD
+    and staged-worktree tree, recursing into it as a level of its own. Raises
+    :class:`FingerprintRefused` for a checkout that cannot be read as a
+    repository rooted at ``rel``."""
+    path = prefix + rel
+    checkout = level_top.joinpath(*rel.split("/"))
+    if checkout.is_symlink():
+        raise FingerprintRefused(f"symlink: {path}")
+    if not checkout.exists():
+        raise FingerprintRefused(f"missing: {path}")
+    if not checkout.is_dir():
+        raise FingerprintRefused(f"not-a-directory: {path}")
+    expected = os.path.normcase(str(level_top.resolve(strict=True).joinpath(*rel.split("/"))))
+    if os.path.normcase(str(checkout.resolve(strict=True))) != expected:
+        raise FingerprintRefused(f"escapes: {path}")
+    if not any(checkout.iterdir()):
+        # An unpopulated gitlink (a submodule never initialised, or deinit'ed):
+        # pinned as empty, so populating it between two reads moves the entry.
+        out.append((path, None, None))
+        return
+    if depth + 1 > _FINGERPRINT_MAX_DEPTH:
+        raise FingerprintRefused(f"depth: {path}")
+    base = _nested_git_env()
+    # Run from inside the checkout with no inherited GIT_DIR/GIT_WORK_TREE: a
+    # directory with files but no repository of its own (or one whose
+    # `core.worktree` points elsewhere) answers with some other toplevel.
+    rc, top, detail = _git_out(checkout, "rev-parse", "--show-toplevel", env=base)
+    if rc != 0 or not top:
+        raise GitError(
+            f"git rev-parse --show-toplevel (fingerprint) failed in {checkout}: {detail}"
+        )
+    if os.path.normcase(str(Path(top).resolve(strict=True))) != expected:
+        raise FingerprintRefused(f"not-a-checkout: {path}")
+    sub_head = rev_parse_head(checkout, env=base)
+    listed = git_bytes(
+        checkout, "ls-files", "-z", "-c", "-i", "--exclude-standard", "--", ":/", env=base
+    )
+    if listed.returncode != 0:
+        raise GitError(
+            f"git ls-files (fingerprint) failed in {checkout}: "
+            f"{os.fsdecode(listed.stdout + listed.stderr).strip()}"
+        )
+    env = {**base, "GIT_INDEX_FILE": str(tmpdir / f"index-{next(counter)}"), **_NO_OPTIONAL_LOCKS}
+    sub_tree = _fingerprint_level(
+        checkout,
+        sub_head,
+        env,
+        base,
+        force_added=listed.stdout,
+        prune=(),
+        exclude=(),
+        prefix=path + "/",
+        depth=depth + 1,
+        out=out,
+        tmpdir=tmpdir,
+        counter=counter,
+    )
+    out.append((path, sub_head, sub_tree))
 
 
 def _decide_reuse(reuse: VerifyReuse, policy: Policy, cwd: Path) -> ReuseDecision:
@@ -10530,8 +10771,8 @@ def _decide_reuse(reuse: VerifyReuse, policy: Policy, cwd: Path) -> ReuseDecisio
         now = (
             worktree_fingerprint(cwd, reuse.exclude) if reuse.exclude else worktree_fingerprint(cwd)
         )
-    except FingerprintRefused:
-        return ReuseDecision(False, "gitlinks", None, None)
+    except FingerprintRefused as exc:
+        return ReuseDecision(False, "gitlinks", str(exc), None)
     except (GitError, OSError) as exc:  # GitSpawnError is a GitError
         return ReuseDecision(False, "fingerprint-fault", str(exc), None)
     if now != reuse.fingerprint:
