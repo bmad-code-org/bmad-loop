@@ -10506,7 +10506,12 @@ def worktree_fingerprint(repo: Path, exclude: Sequence[str] = ()) -> TreeFingerp
     file), so a change there leaves the fingerprint equal; non-git state (a
     database, a running service, the environment) is invisible; and the stage
     runs git's clean filters, so a change those normalise away (CRLF conversion,
-    LFS pointers) reads as no change.
+    LFS pointers) reads as no change. The seeded index trusts the real index's
+    stat cache as ``git status`` does: a tracked file rewritten in place (same
+    inode) at the same size with its mtime restored to the cached value, while
+    its ctime also matches (``core.trustctime=false``, or the rewrite landing in
+    the same second the real index was written), keeps its cached blob and reads
+    as no change.
 
     A gitlink in the staged tree (a submodule, or an untracked nested repository
     ``add -A`` stages as one) pins only a commit, not the working tree behind it,
