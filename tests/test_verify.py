@@ -15946,18 +15946,118 @@ def test_worktree_fingerprint_ignored_file_is_a_blind_spot(project):
 
 
 def test_worktree_fingerprint_excludes_automator_dir_without_ignore(project):
-    """`.bmad-loop/` is excluded by pathspec, not by `.gitignore`: the sandbox
-    ignores only `.bmad-loop/runs/`, so a file beside it is NOT ignored and must
-    still leave the fingerprint equal.
+    """`.bmad-loop/` is left out by the fingerprint itself, not by `.gitignore`:
+    the sandbox ignores only `.bmad-loop/runs/`, so a file beside it is NOT
+    ignored and must still leave the fingerprint equal.
 
-    Ablation: drop the `:(exclude)` pathspec from `worktree_fingerprint`'s `add`;
-    the file is staged and the trees differ."""
+    Ablation: drop both the `:(exclude)` walk prune on `worktree_fingerprint`'s
+    `add` and `AUTOMATOR_DIR_REL` from its post-stage `reset`; the file is staged
+    and the trees differ (either one alone still leaves it out)."""
     repo = project.project
     before = _fp(repo)
     (repo / ".bmad-loop").mkdir(exist_ok=True)
     (repo / ".bmad-loop" / "notes.txt").write_text("orchestrator state\n")
     assert "notes.txt" in git(repo, "status", "--porcelain", "-uall")  # not ignored
     assert _fp(repo) == before
+
+
+@pytest.mark.parametrize("rule", [".bmad-loop/", ".bmad-loop/runs/"])
+def test_worktree_fingerprint_under_an_ignored_automator_dir(project, rule):
+    """A project that gitignores the whole `.bmad-loop/` (this repo's own layout)
+    fingerprints at all, as does one ignoring only `.bmad-loop/runs/`: edits under
+    `.bmad-loop/` — a tracked file there (force-added under the whole-dir rule)
+    and new run state — leave the fingerprint equal, while a code edit moves it.
+
+    Ablation: pass the `:(exclude).bmad-loop` prune to the `add` whatever
+    `check-ignore` says; the whole-dir case raises `GitError` ("paths are
+    ignored"). Dropping `AUTOMATOR_DIR_REL` from the post-stage `reset` instead
+    restages the force-added file and moves the whole-dir tree."""
+    repo = project.project
+    tracked = _committed(repo, ".bmad-loop/profiles/x.toml", "a = 1\n", force=True)
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write(f"{rule}\n")
+    before = _fp(repo)
+    assert before.tree == git(repo, "rev-parse", "HEAD^{tree}")
+    tracked.write_text("a = 2\n")
+    runs = repo / ".bmad-loop" / "runs" / "r1"
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "journal.jsonl").write_text("{}\n")
+    (repo / ".bmad-loop" / "notes.txt").write_text("orchestrator state\n")
+    assert _fp(repo) == before
+    (repo / "src.txt").write_text("edited\n")
+    after = _fp(repo)
+    assert after.head == before.head
+    assert after.tree != before.tree
+
+
+def test_worktree_fingerprint_never_hashes_the_automator_archive(project):
+    """In the `init` layout (only `.bmad-loop/runs/` ignored) an archived run's
+    tarball under `.bmad-loop/archive/` is not ignored, yet the fingerprint never
+    walks it: its blob never reaches the object store, and it leaves the
+    fingerprint equal.
+
+    Ablation: drop the `:(exclude)` walk prune from `worktree_fingerprint`'s
+    `add`; the tarball is hashed (its blob is written) before the reset drops it."""
+    repo = project.project
+
+    def ignored(rel: str) -> bool:
+        cmd = ["git", "-C", str(repo), "check-ignore", "-q", "--no-index", rel]
+        return subprocess.run(cmd, capture_output=True, check=False).returncode == 0
+
+    assert ignored(".bmad-loop/runs/x") and not ignored(".bmad-loop")
+    before = _fp(repo)
+    archive = repo / ".bmad-loop" / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "20261111-000000-abcd.tar.gz").write_bytes(b"archived run state\n")
+    assert ".bmad-loop/archive/" in git(repo, "status", "--porcelain", "-uall")  # not ignored
+    blob = git(repo, "hash-object", ".bmad-loop/archive/20261111-000000-abcd.tar.gz")
+    assert _fp(repo) == before
+    probe = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", blob], capture_output=True, check=False
+    )
+    assert probe.returncode != 0, "the archive blob was written to the object store"
+
+
+def test_worktree_fingerprint_check_ignore_fault_raises(project, monkeypatch):
+    """A `check-ignore` that neither answers ignored (0) nor not ignored (1) is a
+    git fault: the fingerprint raises rather than guessing a prune.
+
+    Ablation: treat any non-zero exit as "not ignored"; no `GitError` is raised."""
+    repo = project.project
+    real = verify._git
+
+    def broken(where: Path, *args: str) -> tuple[int, str]:
+        if args[:1] == ("check-ignore",):
+            return 128, "fatal: simulated"
+        return real(where, *args)
+
+    monkeypatch.setattr(verify, "_git", broken)
+    with pytest.raises(verify.GitError, match="check-ignore"):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_automator_dir_created_after_the_ignore_check(project, monkeypatch):
+    """Under a dir-only whole-dir rule, a `.bmad-loop/` missing at the ignore check
+    and created before the `add` still fingerprints: the check reads the missing
+    directory as ignored, so no prune pathspec is passed for git to refuse.
+
+    Ablation: drop the trailing slash from the `check-ignore` path; the missing
+    directory reads as not ignored, the prune is passed, and `add` raises."""
+    repo = project.project
+    assert not (repo / ".bmad-loop").exists()
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write(".bmad-loop/\n")
+    real = verify._git
+
+    def creating(where: Path, *args: str) -> tuple[int, str]:
+        result = real(where, *args)
+        if args[:1] == ("check-ignore",):
+            (repo / ".bmad-loop").mkdir(exist_ok=True)
+            (repo / ".bmad-loop" / "late.txt").write_text("written mid-read\n")
+        return result
+
+    monkeypatch.setattr(verify, "_git", creating)
+    assert _fp(repo).tree == git(repo, "rev-parse", "HEAD^{tree}")
 
 
 def test_worktree_fingerprint_commit_moves_head(project):
@@ -16032,6 +16132,70 @@ def test_worktree_fingerprint_covers_force_added_ignored_files(project):
     assert _fp(repo).tree not in (before.tree, edited.tree)
 
 
+def _committed(repo: Path, rel: str, text: str, *, force: bool = False) -> Path:
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    git(repo, "add", *(("-f",) if force else ()), rel)
+    git(repo, "commit", "-qm", f"add {rel}")
+    return path
+
+
+def test_worktree_fingerprint_exclude_leaves_the_path_out(project):
+    """An `exclude` path is left out of the fingerprint: an edit to it keeps the
+    fingerprint equal, while an edit to any other path still moves it.
+
+    Ablation: drop the excluded-path `reset` from `worktree_fingerprint`; the
+    excluded edit moves the tree."""
+    repo = project.project
+    ledger = _committed(repo, "notes/ledger.md", "open\n")
+    exclude = ("notes/ledger.md",)
+    before = verify.worktree_fingerprint(repo, exclude)
+    ledger.write_text("done\n")
+    assert verify.worktree_fingerprint(repo, exclude) == before
+    assert _fp(repo).tree != before.tree  # the edit is real; only the exclusion hides it
+    (repo / "src.txt").write_text("edited\n")
+    assert verify.worktree_fingerprint(repo, exclude).tree != before.tree
+
+
+def test_worktree_fingerprint_exclude_covers_a_force_added_path(project):
+    """An excluded file an ignore rule matches (tracked by `add -f`) is restaged
+    by the force-added listing, and the exclusion still leaves its edit out —
+    without git refusing the stage over a pathspec that names an ignored path.
+
+    Ablation: spell the exclusion as `:(exclude,literal)` pathspecs on the
+    listing and the `add` instead of the `reset`; `add` refuses ("paths are
+    ignored") and the fingerprint raises `GitError`."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("gen/\n")
+    ledger = _committed(repo, "gen/ledger.md", "open\n", force=True)
+    exclude = ("gen/ledger.md",)
+    before = verify.worktree_fingerprint(repo, exclude)
+    ledger.write_text("done\n")
+    assert verify.worktree_fingerprint(repo, exclude) == before
+    assert _fp(repo).tree != before.tree
+
+
+def test_worktree_fingerprint_exclude_of_an_untracked_ignored_path(project):
+    """A gitignored, untracked excluded file (a ledger under an ignored output
+    folder) fingerprints at all — `add` never sees a pathspec naming it — and a
+    new excluded file that is NOT ignored stays out of the tree too.
+
+    Ablation: spell the exclusion as `:(exclude,literal)` pathspecs on the
+    `add`; the ignored case raises `GitError`."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("out/\n")
+    (repo / "out").mkdir()
+    (repo / "out" / "ledger.md").write_text("open\n")
+    before = verify.worktree_fingerprint(repo, ("out/ledger.md",))
+    assert before == _fp(repo)
+    (repo / "notes").mkdir()
+    (repo / "notes" / "ledger.md").write_text("new\n")
+    assert verify.worktree_fingerprint(repo, ("notes/ledger.md",)) == before
+
+
 def _embedded_repo(repo: Path, name: str = "sub") -> None:
     sub = repo / name
     sub.mkdir()
@@ -16050,16 +16214,372 @@ def _tracked_gitlink(repo: Path) -> None:
 
 
 @pytest.mark.parametrize("make", [_embedded_repo, _tracked_gitlink], ids=["embedded", "submodule"])
-def test_worktree_fingerprint_refuses_gitlinks(project, make):
-    """A gitlink's working tree is not in the parent's tree hash, so equality would
-    vouch for nothing: an untracked embedded repo (which `add -A` stages as a
-    gitlink) and a committed gitlink both refuse.
-
-    Ablation: drop the `160000 ` scan; both rows return a fingerprint."""
+def test_worktree_fingerprint_fingerprints_gitlinks(project, make):
+    """A gitlink's working tree is fingerprinted as a level of its own: an
+    untracked embedded repo (which `add -A` stages as a gitlink) and a committed
+    gitlink both read stable, with the checkout's HEAD in `submodules`."""
     repo = project.project
     make(repo)
-    with pytest.raises(verify.FingerprintRefused, match="gitlinks"):
+    first = _fp(repo)
+    assert first == _fp(repo)
+    assert len(first.submodules) == 1
+    path, head, tree = first.submodules[0]
+    assert head == git(repo / path, "rev-parse", "HEAD")
+    assert tree is not None
+
+
+def _add_submodule(repo: Path, tmp_path: Path, name: str = "module") -> Path:
+    """A populated submodule at `name`, committed in `repo`; returns its checkout.
+    Mirrors `_add_test_submodule` in test_verify_worktree.py."""
+    origin = tmp_path / f"{name}-origin"
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    git(origin, "config", "user.email", "test@example.com")
+    git(origin, "config", "user.name", "Test")
+    (origin / "payload.txt").write_text("submodule old\n")
+    git(origin, "add", "payload.txt")
+    git(origin, "commit", "-q", "-m", "submodule baseline")
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(origin), name)
+    git(repo, "commit", "-q", "-m", f"add submodule {name}")
+    checkout = repo / name
+    git(checkout, "config", "user.email", "test@example.com")
+    git(checkout, "config", "user.name", "Test")
+    return checkout
+
+
+def _uninitialized_submodule(repo: Path, tmp_path: Path) -> Path:
+    """A populated submodule deinitialised: gitlink in the index, `.gitmodules`
+    in place, and an empty directory at the path — the shape a clone without
+    `--recurse-submodules` leaves every gitlink in."""
+    checkout = _add_submodule(repo, tmp_path)
+    git(repo, "submodule", "deinit", "-q", "-f", "--", "module")
+    assert checkout.is_dir() and not any(checkout.iterdir())
+    return checkout
+
+
+def _nested_submodule(repo: Path, tmp_path: Path) -> Path:
+    """`module` holding its own submodule `inner`, both checked out; returns the
+    `inner` checkout."""
+    inner_origin = tmp_path / "inner-origin"
+    inner_origin.mkdir()
+    git(inner_origin, "init", "-q", "-b", "main")
+    (inner_origin / "deep.txt").write_text("deep\n")
+    git(inner_origin, "add", "deep.txt")
+    git(inner_origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "deep")
+    outer_origin = tmp_path / "outer-origin"
+    outer_origin.mkdir()
+    git(outer_origin, "init", "-q", "-b", "main")
+    (outer_origin / "payload.txt").write_text("outer\n")
+    git(
+        outer_origin,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(inner_origin),
+        "inner",
+    )
+    git(outer_origin, "add", "-A")
+    git(outer_origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "outer")
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        str(outer_origin),
+        "module",
+    )
+    git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "-q",
+        "--init",
+        "--recursive",
+    )
+    git(repo, "commit", "-q", "-m", "add nested submodule")
+    inner = repo / "module" / "inner"
+    assert (inner / "deep.txt").is_file()
+    return inner
+
+
+def _same_dir(a: str | Path, b: Path) -> bool:
+    return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(b.resolve()))
+
+
+def _entry(fp: verify.TreeFingerprint, path: str) -> tuple[str, str | None, str | None]:
+    found = [entry for entry in fp.submodules if entry[0] == path]
+    assert len(found) == 1, fp.submodules
+    return found[0]
+
+
+def test_worktree_fingerprint_submodule_tracked_edit_moves(project, tmp_path):
+    """A tracked edit inside a submodule leaves the parent's tree hash (it pins
+    only the gitlink commit) equal, and still moves the fingerprint.
+
+    Ablation: skip the recursion (append the entry without fingerprinting the
+    checkout); the two reads compare equal."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    before = _fp(repo)
+    (checkout / "payload.txt").write_text("edited\n")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert after != before
+
+
+def test_worktree_fingerprint_submodule_untracked_file_moves(project, tmp_path):
+    """A new untracked file inside a submodule moves the fingerprint.
+
+    Ablation: skip the recursion; the two reads compare equal."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    before = _fp(repo)
+    (checkout / "new.txt").write_text("new\n")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert after != before
+
+
+def test_worktree_fingerprint_submodule_head_moves(project, tmp_path):
+    """A commit inside a submodule moves its recorded HEAD (and the parent's
+    staged gitlink).
+
+    Ablation: drop `sub_head` from the entry; the entry no longer names the new
+    commit."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    before = _fp(repo)
+    git(checkout, "commit", "-q", "--allow-empty", "-m", "moved")
+    after = _fp(repo)
+    assert after != before
+    assert _entry(after, "module")[1] == git(checkout, "rev-parse", "HEAD")
+
+
+def test_worktree_fingerprint_submodule_ignore_all_head_moves(project, tmp_path):
+    """Under `.gitmodules`' `ignore = all` the parent's `add -A` keeps the old
+    gitlink commit, and an empty commit leaves the submodule's tree alike: only
+    the recorded HEAD sees the move.
+
+    Ablation: drop `sub_head` from the entry; the two reads compare equal."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    git(repo, "config", "-f", ".gitmodules", "submodule.module.ignore", "all")
+    git(repo, "commit", "-q", "-am", "ignore all")
+    before = _fp(repo)
+    git(checkout, "commit", "-q", "--allow-empty", "-m", "moved")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert _entry(after, "module")[2] == _entry(before, "module")[2]
+    assert after != before
+
+
+def test_worktree_fingerprint_nested_submodule_recurses(project, tmp_path):
+    """A submodule inside a submodule is found in the outer one's own listing and
+    fingerprinted at its top-relative path; an edit there moves only its entry.
+
+    Ablation: a depth cap of 1; the read refuses `depth: module/inner`."""
+    repo = project.project
+    inner = _nested_submodule(repo, tmp_path)
+    before = _fp(repo)
+    assert [entry[0] for entry in before.submodules] == ["module", "module/inner"]
+    assert before == _fp(repo)
+    (inner / "deep.txt").write_text("edited\n")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert _entry(after, "module") == _entry(before, "module")
+    assert _entry(after, "module/inner") != _entry(before, "module/inner")
+
+
+def test_worktree_fingerprint_gitlink_beside_a_subdirectory_project(project, tmp_path):
+    """Read from a project in a subdirectory, a submodule at the repository root
+    is still found at its root-relative path and fingerprinted.
+
+    Ablation: drop `--full-name` from the gitlink listing; the path reads
+    `../module` from `app/` and the read refuses."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    app = repo / "app"
+    app.mkdir()
+    (app / "main.txt").write_text("app\n")
+    git(repo, "add", "app")
+    git(repo, "commit", "-q", "-m", "app")
+    before = _fp(app)
+    assert [entry[0] for entry in before.submodules] == ["module"]
+    (checkout / "payload.txt").write_text("edited\n")
+    assert _fp(app) != before
+
+
+def test_worktree_fingerprint_depth_cap_refuses(project, tmp_path, monkeypatch):
+    """A gitlink deeper than the cap refuses with its top-relative path.
+
+    Ablation: drop the depth check; the read returns a fingerprint."""
+    repo = project.project
+    _nested_submodule(repo, tmp_path)
+    monkeypatch.setattr(verify, "_FINGERPRINT_MAX_DEPTH", 1)
+    with pytest.raises(verify.FingerprintRefused, match=r"^depth: module/inner$"):
         _fp(repo)
+
+
+def test_worktree_fingerprint_uninitialized_submodule_is_stable(project, tmp_path):
+    """An unpopulated submodule (an empty directory) is pinned as empty, and reads
+    stable.
+
+    Ablation: classify an empty directory like a populated one; the toplevel
+    probe names the superproject and the read refuses `not-a-checkout`."""
+    repo = project.project
+    _uninitialized_submodule(repo, tmp_path)
+    first = _fp(repo)
+    assert first.submodules == (("module", None, None),)
+    assert first == _fp(repo)
+
+
+def test_worktree_fingerprint_unpopulated_then_populated_moves(project, tmp_path):
+    """Populating an uninitialised submodule at its pinned commit leaves the
+    parent's staged gitlink equal, and still moves the fingerprint.
+
+    Ablation: record no entry for either an unpopulated directory or a checked-out
+    one (skip the recursion); the two reads compare equal."""
+    repo = project.project
+    _uninitialized_submodule(repo, tmp_path)
+    before = _fp(repo)
+    git(repo, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+    after = _fp(repo)
+    assert after.tree == before.tree
+    assert after != before
+    assert _entry(after, "module")[1] is not None
+
+
+def test_worktree_fingerprint_unpopulated_dir_with_files_refuses(project, tmp_path):
+    """Files written into an unpopulated submodule's directory belong to no
+    repository of their own (git keeps the gitlink staged): the toplevel probe
+    from inside names the superproject, so the read refuses.
+
+    Ablation: drop the toplevel check; the read no longer refuses
+    `not-a-checkout`."""
+    repo = project.project
+    checkout = _uninitialized_submodule(repo, tmp_path)
+    (checkout / "stray.txt").write_text("stray\n")
+    with pytest.raises(verify.FingerprintRefused, match=r"^not-a-checkout: module$"):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_unborn_nested_head_faults(project, tmp_path):
+    """A submodule switched to an unborn branch cannot be staged or read: a
+    git fault, never a fingerprint."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    git(checkout, "checkout", "-q", "--orphan", "unborn")
+    with pytest.raises(verify.GitError):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_nested_repo_without_commit_faults(project):
+    """An untracked nested repo with no commit is a git fault (`add -A` refuses
+    it), never a fingerprint."""
+    repo = project.project
+    nested = repo / "fresh"
+    nested.mkdir()
+    git(nested, "init", "-q", "-b", "main")
+    (nested / "f.txt").write_text("x\n")
+    with pytest.raises(verify.GitError):
+        _fp(repo)
+
+
+def test_worktree_fingerprint_submodule_real_index_untouched(project, tmp_path):
+    """A submodule's staged state survives the read byte for byte, like the
+    parent's (`test_worktree_fingerprint_never_touches_real_index`).
+
+    Ablation: drop the nested level's own `GIT_INDEX_FILE` (stage into the
+    submodule's real index); the bytes change and `staged` is overwritten.
+    Ablation: drop `GIT_OPTIONAL_LOCKS=0`; the `git status` the parent's `add`
+    runs inside the submodule refreshes its index, and the bytes change."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    (checkout / "payload.txt").write_text("staged\n")
+    git(checkout, "add", "payload.txt")
+    (checkout / "payload.txt").write_text("edited\n")
+    (checkout / "new.txt").write_text("new\n")
+    index = checkout / git(checkout, "rev-parse", "--git-path", "index")
+    before = index.read_bytes()
+    _fp(repo)
+    assert index.read_bytes() == before
+    assert git(checkout, "diff", "--cached", "--name-only") == "payload.txt"
+    assert git(checkout, "show", ":payload.txt") == "staged"
+
+
+def test_worktree_fingerprint_nested_env_isolated(project, tmp_path, monkeypatch):
+    """No git call inside a submodule inherits the parent level's environment:
+    not its temp `GIT_INDEX_FILE` (which would stage the submodule into the
+    parent's temp index), nor a repository-local variable from the process
+    environment. The parent tree stays the fresh build's.
+
+    Ablation: pass the parent level's `env` down as the nested `base`; the
+    parent's `GIT_INDEX_FILE` reaches the submodule's calls."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    (checkout / "payload.txt").write_text("edited\n")
+    monkeypatch.setenv("GIT_REPLACE_REF_BASE", "refs/fingerprint-test-replace/")
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+    real = verify._run_git
+
+    def spy(cmd, repo_arg, **kwargs):
+        calls.append((list(cmd), kwargs.get("env")))
+        return real(cmd, repo_arg, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_run_git", spy)
+        fp = _fp(repo)
+    parent_indexes = {
+        env["GIT_INDEX_FILE"]
+        for cmd, env in calls
+        if env and "GIT_INDEX_FILE" in env and cmd[2] == str(repo)
+    }
+    assert len(parent_indexes) == 1
+    nested = [(cmd, env) for cmd, env in calls if cmd[1] == "-C" and _same_dir(cmd[2], checkout)]
+    assert nested
+    for cmd, env in nested:
+        assert env is not None, cmd
+        assert "GIT_REPLACE_REF_BASE" not in env, cmd
+        assert "GIT_DIR" not in env and "GIT_WORK_TREE" not in env, cmd
+        assert env.get("GIT_INDEX_FILE") not in parent_indexes, cmd
+    assert fp.tree == _fresh_fp(repo, monkeypatch).tree
+
+
+def test_worktree_fingerprint_submodule_mixed_eol_under_safecrlf(project, tmp_path):
+    """`core.autocrlf=true` + `core.safecrlf=true` inside a submodule: the nested
+    `add` takes the same `-c core.safecrlf=false` as the top level.
+
+    Ablation: drop `-c core.safecrlf=false`; the nested `add` fails and this
+    raises GitError."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    git(checkout, "config", "core.autocrlf", "true")
+    git(checkout, "config", "core.safecrlf", "true")
+    (checkout / "payload.txt").write_bytes(b"one\r\ntwo\nthree\r\n")
+    fp = _fp(repo)
+    assert _entry(fp, "module")[1] == git(checkout, "rev-parse", "HEAD")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_worktree_fingerprint_symlinked_gitlink_refuses(project, tmp_path):
+    """A gitlink whose checkout is a symlink refuses. `add -A` restages a symlink
+    as a link, so the gitlink survives only where the post-stage reset restores
+    HEAD's entry: an `exclude`d path.
+
+    Ablation: drop the `is_symlink` check; the read follows the link and returns."""
+    repo = project.project
+    _tracked_gitlink(repo)
+    elsewhere = tmp_path / "elsewhere"
+    (repo / "vendored").rename(elsewhere)
+    (repo / "vendored").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(verify.FingerprintRefused, match=r"^symlink: vendored$"):
+        verify.worktree_fingerprint(repo, ("vendored",))
 
 
 def test_worktree_fingerprint_unborn_head_raises(project):
@@ -16081,6 +16601,320 @@ def test_worktree_fingerprint_mixed_eol_under_safecrlf(project):
     (repo / "src.txt").write_bytes(b"one\r\ntwo\nthree\r\n")
     fp = _fp(repo)
     assert fp.head == git(repo, "rev-parse", "HEAD")
+
+
+# --- fingerprint temp index seeded from the real index (DW-638) -------------------
+
+
+def _fresh_fp(repo: Path, monkeypatch, exclude: tuple[str, ...] = ()) -> verify.TreeFingerprint:
+    """The fingerprint with the seed forced off: the temp index built from HEAD."""
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_seed_fingerprint_index", lambda *_args: "forced")
+        return verify.worktree_fingerprint(repo, exclude)
+
+
+def _seeded_fp(repo: Path, monkeypatch, exclude: tuple[str, ...] = ()) -> verify.TreeFingerprint:
+    """The fingerprint, asserting it really took the seeded path."""
+    real = verify._seed_fingerprint_index
+    reasons: list[str | None] = []
+
+    def spy(*args):
+        reasons.append(real(*args))
+        return reasons[-1]
+
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_seed_fingerprint_index", spy)
+        fp = verify.worktree_fingerprint(repo, exclude)
+    assert reasons == [None]
+    return fp
+
+
+def test_fingerprint_seed_with_a_submodule_matches_fresh_build(project, tmp_path, monkeypatch):
+    """Each level seeds its own temp index from its own real index (the nested
+    seed locates the submodule's index, not the parent's temp one), and the
+    seeded read equals the fresh build with edits at both levels.
+
+    Ablation: hand the nested seed its temp-index `env` as `base_env`; `--git-path
+    index` names the temp index itself and the nested seed is refused."""
+    repo = project.project
+    checkout = _add_submodule(repo, tmp_path)
+    (checkout / "payload.txt").write_text("edited\n")
+    (checkout / "new.txt").write_text("new\n")
+    (repo / "top.txt").write_text("top\n")
+    real = verify._seed_fingerprint_index
+    reasons: list[str | None] = []
+
+    def spy(*args):
+        reasons.append(real(*args))
+        return reasons[-1]
+
+    with monkeypatch.context() as m:
+        m.setattr(verify, "_seed_fingerprint_index", spy)
+        seeded = verify.worktree_fingerprint(repo)
+    assert reasons == [None, None]
+    assert seeded == _fresh_fp(repo, monkeypatch)
+    assert _entry(seeded, "module")[1] == git(checkout, "rev-parse", "HEAD")
+
+
+def _seed_reason(repo: Path, tmp_path: Path) -> str | None:
+    """`_seed_fingerprint_index` run directly against a temp index outside the repo."""
+    env = {**os.environ, "GIT_INDEX_FILE": str(tmp_path / "seed-index")}
+    return verify._seed_fingerprint_index(repo, git(repo, "rev-parse", "HEAD"), env)
+
+
+def _debug_stat(repo: Path, index: Path, rel: str) -> tuple[str, str]:
+    """`(mtime, size)` of `rel`'s entry in `index`, from `ls-files --debug`."""
+    out = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--debug", "--", rel],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "GIT_INDEX_FILE": str(index)},
+    ).stdout
+    mtime = re.search(r"mtime: (\S+)", out)
+    size = re.search(r"size: (\d+)", out)
+    assert mtime and size, out
+    return mtime[1], size[1]
+
+
+def test_fingerprint_seed_matches_fresh_build_over_staged_only_state(project, monkeypatch):
+    """The seeded read equals the fresh build in a state mixing worktree changes
+    with every kind of staged-only real-index state the copy carries: a staged edit
+    that differs from the worktree, a staged new file since deleted, an `add -N`
+    entry, a staged file under the excluded `.bmad-loop/`, and a `git rm --cached`
+    of a committed file `.git/info/exclude` matches.
+
+    Ablation: drop the `read-tree -m -i` and fingerprint the raw copy; the staged
+    `.bmad-loop/` file and the `rm --cached` file diverge from the fresh build."""
+    repo = project.project
+    _committed(repo, "gone.txt", "doomed\n").unlink()
+    staged = _committed(repo, "staged.txt", "head\n")
+    cached = _committed(repo, "cached.log", "kept in HEAD\n")
+    (repo / "src.txt").write_text("edited\n")
+    (repo / "new.txt").write_text("untracked\n")
+    staged.write_text("staged\n")
+    git(repo, "add", "staged.txt")
+    staged.write_text("worktree\n")
+    (repo / "ghost.txt").write_text("staged then deleted\n")
+    git(repo, "add", "ghost.txt")
+    (repo / "ghost.txt").unlink()
+    (repo / "intent.txt").write_text("intent to add\n")
+    git(repo, "add", "-N", "intent.txt")
+    (repo / ".bmad-loop").mkdir(exist_ok=True)
+    (repo / ".bmad-loop" / "staged.txt").write_text("orchestrator\n")
+    git(repo, "add", ".bmad-loop/staged.txt")
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("*.log\n")
+    git(repo, "rm", "-q", "--cached", "cached.log")
+    assert cached.exists()
+
+    seeded = _seeded_fp(repo, monkeypatch)
+    assert seeded == _fresh_fp(repo, monkeypatch)
+    assert seeded.tree != git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_fingerprint_seed_matches_fresh_build_with_exclude_and_force_added(project, monkeypatch):
+    """An `exclude` and a force-added ignored file take the same tree seeded as
+    fresh, both before and after an edit to each."""
+    repo = project.project
+    with (repo / ".git" / "info" / "exclude").open("a") as f:
+        f.write("gen/\n")
+    ledger = _committed(repo, "notes/ledger.md", "open\n")
+    (repo / "gen").mkdir()
+    (repo / "gen" / "out.txt").write_text("generated\n")
+    git(repo, "add", "-f", "gen/out.txt")
+    exclude = ("notes/ledger.md",)
+    before = _seeded_fp(repo, monkeypatch, exclude)
+    assert before == _fresh_fp(repo, monkeypatch, exclude)
+    ledger.write_text("done\n")
+    (repo / "gen" / "out.txt").write_text("regenerated\n")
+    after = _seeded_fp(repo, monkeypatch, exclude)
+    assert after == _fresh_fp(repo, monkeypatch, exclude)
+    assert after.tree != before.tree
+
+
+def test_fingerprint_seed_keeps_the_stat_cache(project, tmp_path):
+    """The point of the seed: an entry whose blob matches HEAD keeps the real
+    index's stat info (a fresh `read-tree HEAD` has none, so `add -A` re-hashes).
+
+    Ablation: swap `read-tree -m -i` for a plain `read-tree` on the copy; the entry
+    comes back with a zero mtime and size."""
+    repo = project.project
+    past = time.time() - 100  # well before the index write: never racily clean
+    os.utime(repo / "src.txt", (past, past))
+    git(repo, "update-index", "-q", "--refresh")
+    real = _debug_stat(repo, repo / ".git" / "index", "src.txt")
+    assert real[1] != "0"
+    assert _seed_reason(repo, tmp_path) is None
+    assert _debug_stat(repo, tmp_path / "seed-index", "src.txt") == real
+
+
+def test_fingerprint_seed_leaves_the_real_index_untouched(project, monkeypatch):
+    """A seeded read only copies the real index: its bytes and its mtime survive.
+
+    Ablation: seed by running `read-tree -m` on the real index (drop the copy and
+    the temp `GIT_INDEX_FILE` from the seed); the staged edit is lost."""
+    repo = project.project
+    (repo / "src.txt").write_text("staged\n")
+    git(repo, "add", "src.txt")
+    (repo / "src.txt").write_text("edited\n")
+    index = repo / ".git" / "index"
+    before = (index.read_bytes(), index.stat().st_mtime_ns)
+    _seeded_fp(repo, monkeypatch)
+    assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+
+
+def _subdir_project(repo: Path) -> Path:
+    app = repo / "app"
+    app.mkdir()
+    (app / "main.txt").write_text("app\n")
+    git(repo, "add", "app")
+    git(repo, "commit", "-qm", "app")
+    return app
+
+
+def test_fingerprint_seed_from_a_subdirectory_project(project, monkeypatch):
+    """A project in a subdirectory seeds too: `--git-path index` answers relative
+    to it (`../.git/index`), and a dirty sibling lands the same tree as fresh."""
+    app = _subdir_project(project.project)
+    (project.project / "src.txt").write_text("sibling edit\n")
+    assert _seeded_fp(app, monkeypatch) == _fresh_fp(app, monkeypatch)
+
+
+def test_fingerprint_seed_flags_check_covers_siblings(project, tmp_path, monkeypatch):
+    """A flagged entry outside a subdirectory project still refuses: `add -A :/`
+    would skip the sibling's edit, so the flags check reads the whole index.
+
+    Ablation: drop the `:/` pathspec from the `ls-files -v`; the reason is
+    `None`."""
+    repo = project.project
+    app = _subdir_project(repo)
+    git(repo, "update-index", "--assume-unchanged", "src.txt")
+    (repo / "src.txt").write_text("sibling edit\n")
+    assert _seed_reason(app, tmp_path) == "index-flags"
+    assert verify.worktree_fingerprint(app) == _fresh_fp(app, monkeypatch)
+
+
+def _assert_refused_to_fresh(repo: Path, tmp_path: Path, monkeypatch, reason: str) -> None:
+    """The seed refuses with `reason`, and the fingerprint still answers — the
+    fresh build's tree, which carries the dirty `src.txt`."""
+    (repo / "src.txt").write_text("dirty\n")
+    assert _seed_reason(repo, tmp_path) == reason
+    fp = verify.worktree_fingerprint(repo)
+    assert fp == _fresh_fp(repo, monkeypatch)
+    assert fp.tree != git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_fingerprint_seed_refuses_split_index(project, tmp_path, monkeypatch):
+    """A split index's shared half is not in the copy.
+
+    Ablation: drop the `core.splitindex` check; the reason becomes
+    `shared-index` (or `None` once the shared file is gone)."""
+    repo = project.project
+    git(repo, "config", "core.splitIndex", "true")
+    git(repo, "update-index", "--split-index")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "split-index")
+
+
+def test_fingerprint_seed_refuses_a_shared_index_file(project, tmp_path, monkeypatch):
+    """A `sharedindex.*` beside the index refuses even with `core.splitIndex` unset.
+
+    Ablation: drop the `sharedindex.*` glob; the seed returns `None`."""
+    repo = project.project
+    (repo / ".git" / "sharedindex.0").write_bytes(b"")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "shared-index")
+
+
+@pytest.mark.parametrize("value", ["true", "", "a-hook"])
+def test_fingerprint_seed_refuses_fsmonitor(project, tmp_path, value):
+    """Any `core.fsmonitor` value but a clear false refuses — its valid bits stand
+    in for the stat check. Reason only: a fingerprint under `true` would spawn the
+    fsmonitor daemon; the full fallback runs in the hook row of the next test.
+
+    Ablation: drop the `core.fsmonitor` check; every row returns `None`."""
+    repo = project.project
+    git(repo, "config", "core.fsmonitor", value)
+    assert _seed_reason(repo, tmp_path) == "fsmonitor"
+
+
+def test_fingerprint_seed_fsmonitor_hook_falls_back(project, tmp_path, monkeypatch):
+    """A (missing) fsmonitor hook refuses and the fresh build still answers.
+
+    Ablation: drop the `core.fsmonitor` check; the reason is `None`."""
+    repo = project.project
+    git(repo, "config", "core.fsmonitor", str(tmp_path / "missing-hook"))
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "fsmonitor")
+
+
+@pytest.mark.parametrize("value", ["false", "No", "OFF", "0"])
+def test_fingerprint_seed_accepts_a_clear_false_fsmonitor(project, tmp_path, monkeypatch, value):
+    """A clear-false `core.fsmonitor` does not refuse.
+
+    Ablation: treat any set value as on; every row refuses `fsmonitor`."""
+    repo = project.project
+    git(repo, "config", "core.fsmonitor", value)
+    assert _seed_reason(repo, tmp_path) is None
+    (repo / "src.txt").write_text("dirty\n")
+    assert _seeded_fp(repo, monkeypatch) == _fresh_fp(repo, monkeypatch)
+
+
+def test_fingerprint_seed_refuses_a_missing_index(project, tmp_path, monkeypatch):
+    """No real index file, nothing to copy.
+
+    Ablation: drop the `is_file()` check; the copy fails and the reason is
+    `copy`."""
+    repo = project.project
+    (repo / ".git" / "index").unlink()
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "no-index")
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_fingerprint_seed_refuses_flagged_entries(project, tmp_path, monkeypatch, flag):
+    """`read-tree -m` keeps an entry's assume-unchanged / skip-worktree bit, and
+    `add -A` would then skip the flagged file's edit.
+
+    Ablation: drop the `ls-files -v` tag check; the reason is `None` and the
+    seeded tree misses the `src.txt` edit."""
+    repo = project.project
+    git(repo, "update-index", flag, "src.txt")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "index-flags")
+
+
+def test_fingerprint_seed_refuses_an_unmerged_index(project, tmp_path, monkeypatch):
+    """A conflicted merge leaves stages `read-tree -m -i` will not merge onto.
+
+    Ablation: swap `read-tree -m -i` for a plain `read-tree`; it discards the
+    stages and the reason is `None`."""
+    repo = project.project
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "src.txt").write_text("side\n")
+    git(repo, "commit", "-qam", "side")
+    git(repo, "checkout", "-q", "-")
+    (repo / "src.txt").write_text("main\n")
+    git(repo, "commit", "-qam", "main")
+    merge = subprocess.run(["git", "-C", str(repo), "merge", "-q", "side"], capture_output=True)
+    assert merge.returncode != 0
+    assert git(repo, "ls-files", "-u")
+    _assert_refused_to_fresh(repo, tmp_path, monkeypatch, "read-tree-m")
+
+
+def test_fingerprint_seed_refuses_a_config_read_fault(project, tmp_path, monkeypatch):
+    """A `config --get-regexp` rc other than 0/1 is a fault, not "unset".
+
+    Ablation: accept any rc from the config read; the reason is `None`."""
+    repo = project.project
+    (repo / "src.txt").write_text("dirty\n")
+    fresh = _fresh_fp(repo, monkeypatch)
+    real = verify.git_bytes
+
+    def faulty(repo_: Path, *args: str, **kwargs):
+        if args[:2] == ("config", "--get-regexp"):
+            return subprocess.CompletedProcess(list(args), 2, b"", b"config broke")
+        return real(repo_, *args, **kwargs)
+
+    monkeypatch.setattr(verify, "git_bytes", faulty)
+    assert _seed_reason(repo, tmp_path) == "config"
+    assert verify.worktree_fingerprint(repo) == fresh
 
 
 def test_verify_reuse_key_folds_case_under_normcase(tmp_path, monkeypatch):
@@ -16199,14 +17033,20 @@ def test_reuse_seam_tree_mismatch_runs(project, monkeypatch):
         (verify.GitError("git broke"), "fingerprint-fault", "git broke"),
         (verify.GitSpawnError("no spawn"), "fingerprint-fault", "no spawn"),
         (OSError("disk full"), "fingerprint-fault", "disk full"),
-        (verify.FingerprintRefused("gitlinks"), "gitlinks", None),
+        (
+            verify.FingerprintRefused("not-a-checkout: vendored"),
+            "gitlinks",
+            "not-a-checkout: vendored",
+        ),
     ],
     ids=["git", "spawn", "oserror", "gitlinks"],
 )
 def test_reuse_seam_fingerprint_fault_runs(project, monkeypatch, exc, decline, detail):
     """A fault is never a match: it declines with its reason and the commands run.
+    A refusal's cause and path ride in `detail`, like a fault's text.
 
-    Ablation: let `_decide_reuse` treat a fault as a match; every row reuses."""
+    Ablation: let `_decide_reuse` treat a fault as a match; every row reuses.
+    Ablation: decline `gitlinks` with a `None` detail; the `gitlinks` row fails."""
     rig = _ReuseRig(monkeypatch, fp=exc)
     pol = _reuse_policy()
     out = verify._verify_review_commands(
@@ -16215,6 +17055,37 @@ def test_reuse_seam_fingerprint_fault_runs(project, monkeypatch, exc, decline, d
     assert out is not _REUSE_OUTCOME
     assert rig.runs == 1
     assert rig.decisions == [verify.ReuseDecision(False, decline, detail, None)]
+
+
+def test_decide_reuse_fingerprints_with_the_request_exclude(project):
+    """`_decide_reuse` takes the gate-time fingerprint with `VerifyReuse.exclude`,
+    so a pass fingerprinted with an exclusion matches at the gate after a change
+    to the excluded path alone — and declines `tree-mismatch` without it.
+
+    Ablation: call `worktree_fingerprint(cwd)` in `_decide_reuse` regardless of
+    the request's `exclude`; the first decision declines."""
+    repo = project.repo_root
+    ledger = _committed(repo, "notes/ledger.md", "open\n")
+    exclude = ("notes/ledger.md",)
+    pol = _reuse_policy()
+    key = verify.verify_reuse_key(pol, repo)
+    minted = verify.worktree_fingerprint(repo, exclude)
+    ledger.write_text("done\n")
+
+    def request(excl: tuple[str, ...]) -> verify.VerifyReuse:
+        return verify.VerifyReuse(
+            key=key,
+            fingerprint=minted,
+            outcome=_REUSE_OUTCOME,
+            on_decision=lambda _d: None,
+            exclude=excl,
+        )
+
+    assert verify._decide_reuse(request(exclude), pol, repo) == verify.ReuseDecision(
+        True, None, None, minted
+    )
+    declined = verify._decide_reuse(request(()), pol, repo)
+    assert (declined.reused, declined.decline) == (False, "tree-mismatch")
 
 
 def test_reuse_seam_hard_stop_declines_a_match(project, monkeypatch):
@@ -16269,11 +17140,12 @@ def test_verify_review_status_failure_decides_nothing(project, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode", ["review", "review_stories", "review_tickets", "review_tickets_park"]
+    "mode", ["review", "review_stories", "review_bundle", "review_tickets", "review_tickets_park"]
 )
 def test_review_gates_forward_reuse(project, monkeypatch, mode):
     """Each eligible review gate threads `reuse=` through to the seam, the tickets
-    gate on both of its command paths (built, and the awaiting-operator park).
+    gate on both of its command paths (built, and the awaiting-operator park), and
+    the sweep bundle gate past its ledger done-check.
 
     Ablation: drop `reuse=reuse` from a gate's `_verify_review_commands` call; its
     row runs the commands."""
@@ -16299,8 +17171,3 @@ def test_review_gates_forward_reuse(project, monkeypatch, mode):
     assert out is _REUSE_OUTCOME
     assert rig.runs == 0
     assert [d.reused for d in rig.decisions] == [True]
-
-
-def test_verify_review_bundle_takes_no_reuse():
-    """Sweep is excluded from reuse in v1: the bundle gate has no `reuse` kwarg."""
-    assert "reuse" not in inspect.signature(verify.verify_review_bundle).parameters

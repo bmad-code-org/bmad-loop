@@ -20,6 +20,7 @@ from bmad_loop.deferredwork import (
     append_decision,
     append_entries,
     append_entry,
+    apply_reopenable_close,
     archive_closed,
     classify,
     field_line_present,
@@ -416,6 +417,30 @@ def test_mark_open_reopens_only_closes_from_this_operation(tmp_path):
     entries = {e.id: e for e in parse_ledger(path.read_text(encoding="utf-8"))}
     assert entries["DW-1"].status == "done 2026-06-11"
     assert entries["DW-3"].open
+
+
+def test_apply_reopenable_close_is_the_text_the_reopenable_writer_publishes(tmp_path):
+    """The pure projection a sweep's verify-reuse ledger pin is built from is
+    exactly what `mark_done_many_reopenable` publishes over the same text —
+    already-done (DW-2) and missing (DW-9) ids skipped the same way — and an
+    all-skipped batch projects the text unchanged.
+
+    Ablation: build the projection with no undo owner (the plain `mark_done_many`
+    fold); the `resolution-undo:` line is missing and the texts differ."""
+    path = write_ledger(tmp_path)
+    ids = ["DW-1", "DW-2", "DW-3", "DW-9"]
+    projected = apply_reopenable_close(LEDGER, ids, "2026-06-11", "by dw-a", OPERATION_ID)
+
+    assert mark_done_many_reopenable(path, ids, "2026-06-11", "by dw-a", OPERATION_ID) == [
+        "DW-1",
+        "DW-3",
+    ]
+    assert path.read_text(encoding="utf-8") == projected
+    assert apply_reopenable_close(projected, ids, "2026-06-11", "by dw-a", OPERATION_ID) == (
+        projected
+    )
+    with pytest.raises(ValueError):
+        apply_reopenable_close(LEDGER, ids, "11/06/2026", "by dw-a", OPERATION_ID)
 
 
 def test_mark_open_refuses_the_wrong_operation_id(tmp_path):

@@ -1515,6 +1515,96 @@ def test_verify_reuse_declines_after_a_workflow_session(project, monkeypatch):
     assert not _entries(engine, "verify-pass-reused")
 
 
+def _post_dev_verify_plugin(*, read_only):
+    """A trusted in-process plugin observing ``post_dev_verify`` — the stage that
+    fires after the dev pass minted its token and before the skip-review gate.
+    It writes nothing; only its manifest's ``read_only`` differs."""
+    from bmad_loop.plugins import Plugin, PluginRegistry
+    from bmad_loop.plugins.model import LoadedPlugin, PluginManifest
+
+    seen = []
+
+    class Observer(Plugin):
+        def on_post_dev_verify(self, ctx):
+            seen.append(ctx.verification_stage)
+
+    manifest = PluginManifest(name="obs", api_version=1, read_only=read_only)
+    registry = PluginRegistry([LoadedPlugin(manifest=manifest, instance=Observer(manifest, {}))])
+    return registry, seen
+
+
+def test_verify_reuse_declines_after_a_writer_plugin_hook(project, monkeypatch):
+    """A hook from a plugin not declared `read_only`, dispatched between the dev
+    pass and the skip-review gate, voids the token: the gate runs its commands
+    and declines `plugin-hook`, naming `<plugin>:<stage>` — though the hook
+    changed nothing git can see.
+
+    Ablation: drop the `_invalidate_verify_reuse("plugin-hook", ...)` call in
+    `Engine._void_reuse_on_plugin_hook` and the gate reuses (one pass, a
+    `verify-pass-reused` row, no decline)."""
+    registry, seen = _post_dev_verify_plugin(read_only=False)
+    engine, _ = make_engine(
+        project, _skip_story(project), policy=_reuse_policy(), registry=registry
+    )
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen == ["dev"]
+    assert len(ran) == 2
+    (row,) = _entries(engine, "verify-reuse-declined")
+    assert (row["decline"], row["detail"]) == ("plugin-hook", "obs:post_dev_verify")
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def test_verify_reuse_writer_plugin_hook_keeps_an_earlier_void_reason(project, monkeypatch):
+    """A writer hook that fires when no token is live leaves the recorded void
+    reason alone: a fingerprint fault during the dev pass still surfaces as the
+    gate's `fingerprint-fault` decline with its fault text, not `plugin-hook`.
+
+    Ablation: drop the `self._verify_reuse is not None` guard in
+    `Engine._void_reuse_on_plugin_hook` and the decline reads `plugin-hook`."""
+    registry, seen = _post_dev_verify_plugin(read_only=False)
+    engine, _ = make_engine(
+        project, _skip_story(project), policy=_reuse_policy(), registry=registry
+    )
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev"), _green("gate")])
+
+    def fp(repo):
+        raise verify.GitError("fingerprint exploded")
+
+    monkeypatch.setattr(verify, "worktree_fingerprint", fp)
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen == ["dev"]
+    assert len(ran) == 2
+    (row,) = _entries(engine, "verify-reuse-declined")
+    assert row["decline"] == "fingerprint-fault"
+    assert "fingerprint exploded" in row["detail"]
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def test_verify_reuse_survives_a_read_only_plugin_hook(project, monkeypatch):
+    """The same hook from a plugin declared `read_only` leaves the token intact:
+    the gate reuses the dev pass and runs no second command pass."""
+    registry, seen = _post_dev_verify_plugin(read_only=True)
+    engine, _ = make_engine(
+        project, _skip_story(project), policy=_reuse_policy(), registry=registry
+    )
+    ran = _script_verify_runs(monkeypatch, project, [_green("dev")])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    assert seen == ["dev"]
+    assert len(ran) == 1
+    assert len(_entries(engine, "verify-pass-reused")) == 1
+    assert not _entries(engine, "verify-reuse-declined")
+
+
 def test_verify_reuse_declines_a_pass_that_mutated_the_tree(project, monkeypatch):
     """A command that writes a tracked file during the dev pass mints nothing:
     the gate runs its commands and declines with `pass-mutated-tree`.
@@ -1588,18 +1678,67 @@ def test_verify_reuse_declines_on_a_policy_mismatch(project, monkeypatch):
     assert _declines(engine) == ["policy-mismatch"]
 
 
-def test_verify_reuse_declines_on_a_gitlink(project, monkeypatch):
-    """An untracked embedded repo (staged as a gitlink) refuses the fingerprint,
-    so nothing is minted and the gate declines with `gitlinks`.
-
-    Ablation: drop the `FingerprintRefused` arm in `_verify_reuse_fingerprint`
-    and the refusal escapes the dev pass."""
-    nested = project.project / "vendored"
+def _nested_repo(project, name="vendored"):
+    """An untracked repository with one commit inside the project; `add -A`
+    stages it as a gitlink. Returns its checkout."""
+    nested = project.project / name
     nested.mkdir()
     git(nested, "init", "-q")
     (nested / "f.txt").write_text("x\n")
     git(nested, "add", "f.txt")
     git(nested, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "n")
+    return nested
+
+
+def test_verify_reuse_reuses_over_a_nested_repo(project, monkeypatch):
+    """An untracked embedded repo (staged as a gitlink) is fingerprinted by its
+    own HEAD and working tree, so the dev pass mints a token and an unchanged
+    gate reuses it: one command pass, no decline."""
+    _nested_repo(project)
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+    assert engine._verify_reuse is not None
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+
+    assert len(ran) == 1
+    assert len(_entries(engine, "verify-pass-reused")) == 1
+    assert not _entries(engine, "verify-reuse-declined")
+
+
+def test_verify_reuse_declines_tree_mismatch_after_a_submodule_edit(project, monkeypatch):
+    """A tracked file edited inside a nested repo between the pass and the gate
+    moves neither the parent's tree nor the nested HEAD, only the nested
+    working tree: the gate still declines with `tree-mismatch` and runs.
+
+    Ablation: make `verify._fingerprint_gitlink` append `(path, sub_head,
+    None)` instead of recursing; the edit is invisible and the gate reuses."""
+    nested = _nested_repo(project)
+    engine, task, ran = _gate_unit(project, monkeypatch)
+    assert engine._verify_commands_with_results(task, "dev")[0].ok
+    assert engine._verify_reuse is not None
+    (nested / "f.txt").write_text("edited inside the nested repo\n")
+
+    assert engine._review_verify_gate(task, reuse_eligible=True).ok
+
+    assert len(ran) == 2
+    assert _declines(engine) == ["tree-mismatch"]
+    assert not _entries(engine, "verify-pass-reused")
+
+
+def test_verify_reuse_gitlinks_decline_journals_the_cause(project, monkeypatch):
+    """A committed gitlink whose directory holds files but no repository cannot
+    be read: nothing is minted, and the gate's `gitlinks` decline journals the
+    refusal cause and path as its `detail`.
+
+    Ablation: drop `str(exc)` from the `FingerprintRefused` arm in
+    `Engine._verify_reuse_fingerprint`; the row carries no `detail`."""
+    repo = project.project
+    head = verify.rev_parse_head(repo)
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{head},vendored")
+    git(repo, "commit", "-q", "-m", "gitlink with no checkout")
+    (repo / "vendored").mkdir()
+    (repo / "vendored" / "stray.txt").write_text("stray\n")
     engine, task, ran = _gate_unit(project, monkeypatch)
     outcome, _ = engine._verify_commands_with_results(task, "dev")
     assert outcome.ok  # the refusal never changes the pass's outcome
@@ -1608,7 +1747,9 @@ def test_verify_reuse_declines_on_a_gitlink(project, monkeypatch):
     assert engine._review_verify_gate(task, reuse_eligible=True).ok
 
     assert len(ran) == 2
-    assert _declines(engine) == ["gitlinks"]
+    (row,) = _entries(engine, "verify-reuse-declined")
+    assert row["decline"] == "gitlinks"
+    assert row["detail"] == "not-a-checkout: vendored"
 
 
 @pytest.mark.parametrize(

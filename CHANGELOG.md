@@ -113,7 +113,13 @@ breaking changes may land in a minor release.
   the first fully-idle Stop's `modelName`; session-end `models` stays untracked.
 - Add opt-in `[verify] reuse_unchanged`: a skip-review gate reuses an unchanged green
   dev/fix verify pass instead of re-running `[verify] commands`; journalled as
-  `verify-pass-reused` / `verify-reuse-declined` (#1002).
+  `verify-pass-reused` / `verify-reuse-declined` (#1002). Sweeps reuse too, with the
+  deferred-work ledger pinned by content rather than fingerprinted: any change but the
+  bundle's own close declines `ledger-mismatch`, an unreadable ledger `ledger-fault`.
+  Submodules and nested repositories are fingerprinted recursively; one that cannot be
+  read declines `gitlinks` with its cause and path.
+- Add the `[plugin] read_only` manifest flag: a hook from a plugin not declared
+  `read_only` voids a reusable verify pass, and the gate declines `plugin-hook`.
 
 ### Changed
 

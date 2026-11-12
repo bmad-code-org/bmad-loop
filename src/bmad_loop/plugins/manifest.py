@@ -230,6 +230,12 @@ def parse_manifest(
     except CONVERSION_FAULTS:
         raise fail(f"[plugin] api_version must be an integer: got {raw_api!r}") from None
 
+    # strict, unlike a hook's `blocking`/`fail_closed`: a `"false"` string would
+    # coerce truthy and silently exempt a writer plugin from voiding verify reuse.
+    read_only = plugin_d.get("read_only", False)
+    if not isinstance(read_only, bool):
+        raise fail(f"[plugin] read_only must be a boolean: got {read_only!r}")
+
     seed_files = _str_list(plugin_d, "seed_files", fail)
     _check_relative_paths(seed_files, "seed_files", fail)
     seed_globs = _str_list(plugin_d, "seed_globs", fail)
@@ -248,6 +254,7 @@ def parse_manifest(
         seed_files=seed_files,
         seed_globs=seed_globs,
         priority=int(plugin_d.get("priority", 0)),
+        read_only=read_only,
         scripts_dir=scripts_dir,
         source=origin,
     )

@@ -255,10 +255,13 @@ class VerifyPolicy:
     # instead of re-running every [verify] command, when nothing git-visible
     # changed between that green pass and the gate: same commands, timeout,
     # env_fault_rc and cwd, the same HEAD, and the same worktree tree hash
-    # (taken through a temporary index, ignored paths and .bmad-loop/ left out).
+    # (taken through a temporary index, ignored paths and .bmad-loop/ left out;
+    # a sweep also leaves its deferred-work ledger out and pins it by content).
     # Reuse trusts that nothing outside git-visible state changed in between:
     # ignored files (node_modules, build output, caches) and non-git state
-    # (databases, services, env) are blind spots. Off by default; status checks
+    # (databases, services, env) are blind spots. Submodules and nested repos
+    # are fingerprinted recursively by their own HEAD and worktree tree; ignored
+    # files inside them are blind spots too. Off by default; status checks
     # and the environment-probe preflight still run at a reused gate.
     reuse_unchanged: bool = False
 
@@ -1627,7 +1630,7 @@ commands = []                # e.g. ["pytest -q", "ruff check ."]
 command_timeout_min = 30     # per-command wall-clock bound (minutes); a command running past it is killed and fails as an ordinary verify failure
 stream_capture_kb = 256      # per-stream cap (KiB) on the verifier stdout/stderr retained under the run's verify/ directory; the TAIL is kept and the journal records the full byte count plus a truncation flag. 0 = capture nothing (records still land, with null pointers)
 env_fault_rc = 0             # exit status a [verify] command uses to declare an environment fault (pause, attempt not charged) instead of a code failure. 0 = disabled; 75 (EX_TEMPFAIL) is a good choice
-reuse_unchanged = false      # true: a skip-review gate reuses the green dev/fix pass instead of re-running the commands when HEAD and the git-visible worktree are unchanged since it; ignored files and non-git state are blind spots
+reuse_unchanged = false      # true: a skip-review gate reuses the green dev/fix pass instead of re-running the commands when HEAD and the git-visible worktree are unchanged since it (submodules and nested repos fingerprinted recursively); ignored files, including those inside submodules, and non-git state are blind spots
 
 [environment]
 # Orchestrator-run health checks (e.g. a local container or database). They run

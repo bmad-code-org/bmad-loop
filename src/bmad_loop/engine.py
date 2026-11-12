@@ -289,6 +289,38 @@ NO_VERIFY_COMMANDS = VerifyCommandRecords()
 
 
 @dataclass(frozen=True)
+class LedgerPin:
+    """The deferred-work ledger a reusable verify pass ran against, pinned by
+    content for a mode whose worktree fingerprint leaves the ledger out
+    (``Engine._verify_reuse_pins_ledger``).
+
+    Both fields are :func:`ledger_digest` values: ``minted`` of the text the
+    pass read, ``closed`` of that text after the mode's own engine close edits
+    (``Engine._verify_reuse_ledger_closed``). A gate may reuse the pass only
+    when its ledger digests to one of the two."""
+
+    minted: str
+    closed: str
+
+
+def ledger_digest(text: str | None) -> str:
+    """The sha256 hex of a ledger's text; an absent ledger (``None``) digests as
+    the literal ``"absent"``, which no hex digest can equal."""
+    if text is None:
+        return "absent"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class _ReuseSnapshot(NamedTuple):
+    """One side of a reusable pass's before/after read
+    (``Engine._verify_reuse_snapshot``): the fingerprint, and the ledger text
+    when the mode pins it — ``None`` when absent or not pinned."""
+
+    fingerprint: verify.TreeFingerprint
+    ledger: str | None
+
+
+@dataclass(frozen=True)
 class VerifyReuseToken:
     """A green dev/fix ``[verify]`` pass a skip-review gate may stand in for its
     own commands (``[verify] reuse_unchanged``).
@@ -300,6 +332,9 @@ class VerifyReuseToken:
     ``fingerprint`` are what the gate re-checks; ``outcome`` is handed back as
     classified, never re-classified; ``records`` are republished to
     ``post_review_verify`` under their original ``stage`` and ``sequence``.
+    ``exclude`` is the fingerprint exclusion both reads used, re-applied at the
+    gate; ``ledger`` pins the excluded ledger by content when the mode asked
+    for it (``None`` otherwise).
     In memory only — never persisted, never inferred from the journal."""
 
     story_key: str
@@ -309,6 +344,8 @@ class VerifyReuseToken:
     fingerprint: verify.TreeFingerprint
     outcome: VerifyOutcome
     records: VerifyCommandRecords
+    exclude: tuple[str, ...] = ()
+    ledger: LedgerPin | None = None
 
 
 # The sentence a kept-tree usage relaunch (DW-615) adds after the spec or plan
@@ -1011,7 +1048,11 @@ class Engine:
         # (e.g. the Unity plugin's editor_mode↔scm.isolation coupling) so the run
         # fails fast rather than mid-unit.
         self._registry.validate(policy)
-        self._bus = HookBus(self._registry, journal)
+        # a hook from a plugin not declared `read_only` voids any reusable verify
+        # pass before it runs (#1002 / DW-640); the callback only touches state.
+        self._bus = HookBus(
+            self._registry, journal, on_writer_dispatch=self._void_reuse_on_plugin_hook
+        )
         # stages at which some active plugin injects a provided workflow session
         # (Phase 4). Precomputed once for an O(1) guard so a run whose plugins
         # provide no workflows stays byte-identical (no extra sessions, no journal).
@@ -1062,9 +1103,10 @@ class Engine:
         # gate may reuse, and why there is none. Transient on purpose — never
         # persisted: a resumed process has run no pass it could vouch for. Minted
         # by `_verify_commands_with_results`, voided by every new pass, session
-        # launch, rollback, reset, worktree discard and pause (NOT by plugin hook
-        # dispatch: hook writes are caught by the gate's fingerprint only), and
-        # popped by `_review_reuse_request`. The void reason is what a gate that
+        # launch, rollback, reset, worktree discard, pause and hook dispatch from
+        # a plugin not declared `read_only` (`plugin-hook`; a read-only plugin's
+        # writes are left to the gate's fingerprint), and popped by
+        # `_review_reuse_request`. The void reason is what a gate that
         # finds no token journals as its decline.
         self._verify_reuse: VerifyReuseToken | None = None
         self._verify_reuse_void: tuple[str, str | None] = ("no-token", None)
@@ -7085,6 +7127,13 @@ class Engine:
         first voids any older token (``superseded``); a fingerprint fault voids
         too and never changes the outcome. With the key off nothing is
         fingerprinted.
+
+        A mode whose engine writes its ledger between a pass and the gate
+        (``_verify_reuse_pins_ledger``) leaves that path out of both
+        fingerprints (``_verify_reuse_exclude``, carried on the token) and pins
+        it by content instead: the ledger is read next to each fingerprint, a
+        read fault voids with ``ledger-fault``, a pass that changed it voids with
+        ``pass-mutated-tree``, and the token carries a :class:`LedgerPin`.
         """
         self._invalidate_verify_reuse("superseded")
         if verify.preflight_required(self.policy):
@@ -7095,11 +7144,9 @@ class Engine:
             probe = self._run_environment_probes(task, site=f"verify:{verification_stage}")
             if not probe.ok:
                 return verify.environment_preflight_outcome(probe), NO_VERIFY_COMMANDS
-        before = (
-            self._verify_reuse_fingerprint()
-            if self._verify_reuse_mintable(verification_stage)
-            else None
-        )
+        mintable = self._verify_reuse_mintable(verification_stage)
+        exclude = self._verify_reuse_exclude() if mintable else ()
+        before = self._verify_reuse_snapshot(exclude) if mintable else None
         results = tuple(verify.run_verify_commands(self.policy, self.workspace.root))
         sequence = self._journal_verify_command_results(task, verification_stage, results)
         self._stop_if_verify_interrupted(results)
@@ -7111,7 +7158,7 @@ class Engine:
         )
         records = VerifyCommandRecords(results=results, stage=verification_stage, sequence=sequence)
         if outcome.ok and sequence is not None and before is not None:
-            self._mint_verify_reuse(task, verification_stage, before, outcome, records)
+            self._mint_verify_reuse(task, verification_stage, exclude, before, outcome, records)
         return outcome, records
 
     def _verify_reuse_supported(self) -> bool:
@@ -7119,11 +7166,40 @@ class Engine:
         (``[verify] reuse_unchanged``). True in the base engine."""
         return True
 
+    def _verify_reuse_exclude(self) -> tuple[str, ...]:
+        """Paths (posix, relative to ``workspace.root``) the verify-reuse
+        fingerprints leave out — the same exclusion at the mint and at the gate,
+        since the token carries it. Base: none."""
+        return ()
+
+    def _verify_reuse_pins_ledger(self) -> bool:
+        """Whether a reusable pass pins the deferred-work ledger by content
+        (:class:`LedgerPin`), for a mode whose engine rewrites the ledger between
+        the pass and its gate and whose fingerprint therefore leaves it out.
+        Base: False — the ledger is just another fingerprinted file."""
+        return False
+
+    def _verify_reuse_ledger_closed(self, task: StoryTask, text: str) -> str:
+        """The ledger ``text`` after this mode's own engine close edits for
+        ``task`` — the pin's second admissible gate-time ledger. Called only
+        when :meth:`_verify_reuse_pins_ledger`; must be pure. Base: unchanged."""
+        return text
+
     def _invalidate_verify_reuse(self, reason: str, detail: str | None = None) -> None:
         """Drop any reusable verify pass and record why, for the decline a later
         skip-review gate journals when it finds no token."""
         self._verify_reuse = None
         self._verify_reuse_void = (reason, detail)
+
+    def _void_reuse_on_plugin_hook(self, plugin: str, stage: str) -> None:
+        """The bus's ``on_writer_dispatch`` callback: a plugin not declared
+        ``read_only`` is about to run a hook for ``stage``, and may write ignored
+        files or non-git state the gate's fingerprint cannot see — so no pass
+        survives it. Voids only a live token: with none, the void reason already
+        recorded (a fingerprint fault and its text, ``session-launched``, ...)
+        is the truer decline and must not be relabelled ``plugin-hook``."""
+        if self._verify_reuse is not None:
+            self._invalidate_verify_reuse("plugin-hook", f"{plugin}:{stage}")
 
     def _verify_reuse_mintable(self, verification_stage: str) -> bool:
         return (
@@ -7133,39 +7209,67 @@ class Engine:
             and bool(self.policy.verify.commands)
         )
 
-    def _verify_reuse_fingerprint(self) -> verify.TreeFingerprint | None:
+    def _verify_reuse_fingerprint(self, exclude: tuple[str, ...]) -> verify.TreeFingerprint | None:
         """The workspace fingerprint, or ``None`` after recording the fault as
         the void reason — a fault means no token, never a different outcome."""
+        root = self.workspace.root
         try:
-            return verify.worktree_fingerprint(self.workspace.root)
-        except verify.FingerprintRefused:
-            self._invalidate_verify_reuse("gitlinks")
+            if exclude:
+                return verify.worktree_fingerprint(root, exclude)
+            return verify.worktree_fingerprint(root)
+        except verify.FingerprintRefused as exc:
+            self._invalidate_verify_reuse("gitlinks", str(exc))
         except (verify.GitError, OSError) as exc:  # GitSpawnError is a GitError
             self._invalidate_verify_reuse("fingerprint-fault", str(exc))
         return None
+
+    def _verify_reuse_snapshot(self, exclude: tuple[str, ...]) -> _ReuseSnapshot | None:
+        """One side of a pass's before/after read: the fingerprint and, when the
+        mode pins it, the ledger text (``None`` = absent). ``None`` after
+        recording a fault as the void reason. The ledger read is observation
+        (``deferredwork.observe_ledger``): it never raises and never writes."""
+        fingerprint = self._verify_reuse_fingerprint(exclude)
+        if fingerprint is None:
+            return None
+        if not self._verify_reuse_pins_ledger():
+            return _ReuseSnapshot(fingerprint, None)
+        text, fault = deferredwork.observe_ledger(self.workspace.paths.deferred_work)
+        if fault is not None:
+            self._invalidate_verify_reuse("ledger-fault", fault)
+            return None
+        return _ReuseSnapshot(fingerprint, text)
 
     def _mint_verify_reuse(
         self,
         task: StoryTask,
         verification_stage: str,
-        before: verify.TreeFingerprint,
+        exclude: tuple[str, ...],
+        before: _ReuseSnapshot,
         outcome: VerifyOutcome,
         records: VerifyCommandRecords,
     ) -> None:
-        after = self._verify_reuse_fingerprint()
+        after = self._verify_reuse_snapshot(exclude)
         if after is None:
             return
         if after != before:
+            # The tree, or (when pinned) the ledger the fingerprint leaves out.
             self._invalidate_verify_reuse("pass-mutated-tree")
             return
+        pin = None
+        if self._verify_reuse_pins_ledger():
+            text = before.ledger
+            closed = None if text is None else self._verify_reuse_ledger_closed(task, text)
+            pin = LedgerPin(minted=ledger_digest(text), closed=ledger_digest(closed))
         self._verify_reuse = VerifyReuseToken(
             story_key=task.story_key,
             generation=task.generation,
             stage=verification_stage,
             key=verify.verify_reuse_key(self.policy, self.workspace.root),
-            fingerprint=before,
+            fingerprint=before.fingerprint,
             outcome=outcome,
             records=records,
+            exclude=exclude,
+            ledger=pin,
         )
 
     def _review_reuse_request(self, task: StoryTask) -> verify.VerifyReuse | None:
@@ -7176,9 +7280,14 @@ class Engine:
         ``_skip_review_and_commit``'s two), ``[verify] reuse_unchanged`` is on
         and commands are configured. Then: an unsupported mode declines with
         ``mode-unsupported``; the token is popped (one-shot) and a missing or
-        foreign one declines with the recorded void reason; otherwise the
-        verifier decides, and ``on_decision`` journals ``verify-pass-reused``
-        (republishing the reused pass's records) or ``verify-reuse-declined``.
+        foreign one declines with the recorded void reason; a token carrying a
+        :class:`LedgerPin` re-reads the ledger and declines ``ledger-fault``
+        (with the fault as ``detail``) on a read fault, or ``ledger-mismatch``
+        when the ledger is neither the one the pass ran against nor its
+        engine-close projection; otherwise the verifier decides (re-applying
+        the token's fingerprint exclusion), and ``on_decision`` journals
+        ``verify-pass-reused`` (republishing the reused pass's records) or
+        ``verify-reuse-declined``.
         Neither row allocates a ``verification_sequence``: a reuse is not a pass."""
         if (
             not self._review_reuse_eligible
@@ -7201,6 +7310,14 @@ class Engine:
             self._journal_verify_reuse_declined(task, reason, detail)
             return None
         self._invalidate_verify_reuse("no-token")
+        if token.ledger is not None:
+            text, fault = deferredwork.observe_ledger(self.workspace.paths.deferred_work)
+            if fault is not None:
+                self._journal_verify_reuse_declined(task, "ledger-fault", fault)
+                return None
+            if ledger_digest(text) not in (token.ledger.minted, token.ledger.closed):
+                self._journal_verify_reuse_declined(task, "ledger-mismatch", None)
+                return None
 
         def on_decision(decision: verify.ReuseDecision) -> None:
             if not decision.reused:
@@ -7227,13 +7344,15 @@ class Engine:
             fingerprint=token.fingerprint,
             outcome=token.outcome,
             on_decision=on_decision,
+            exclude=token.exclude,
         )
 
     def _journal_verify_reuse_declined(
         self, task: StoryTask, decline: str, detail: str | None
     ) -> None:
         # Two literal writes rather than a conditional `**` splat, so the journal
-        # field guard reads every name; `detail` appears only on a fault.
+        # field guard reads every name; `detail` appears only on a fault or a
+        # `gitlinks` refusal, where it carries the cause and path.
         if detail is None:
             self.journal.append(
                 "verify-reuse-declined",

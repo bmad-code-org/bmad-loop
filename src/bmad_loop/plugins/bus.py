@@ -25,6 +25,11 @@ plugins. It enforces the two invariants that keep plugins safe:
     re-derives trust from a manifest's source. A granted plugin's ``{scripts}``
     already points at its verified snapshot. Declarative hooks run with
     ``PYTHONDONTWRITEBYTECODE=1`` so a Python hook never writes ``.pyc`` files.
+  * **Writer dispatches are announced.** Before an active plugin whose manifest
+    is not ``read_only`` dispatches anything for a stage, the bus calls the
+    optional ``on_writer_dispatch(plugin, stage)`` callback — once per plugin per
+    ``emit`` — so the engine can void a ``[verify] reuse_unchanged`` token the
+    hook may have staled. ``read_only`` plugins dispatch silently.
 
 Dispatch order is registry order (manifest ``priority`` then load order).
 Mutations pipeline — a later plugin sees an earlier plugin's edits. Vetoes are
@@ -152,10 +157,14 @@ class HookBus:
         journal: Any = None,
         *,
         runner: HookRunner | None = None,
+        on_writer_dispatch: Callable[[str, str], None] | None = None,
     ):
         self._registry = registry
         self._journal = journal
         self._runner = runner or _run_subprocess
+        # (plugin name, stage) -> None, called before a non-read_only plugin
+        # dispatches; the engine's verify-reuse void (see module docstring).
+        self._on_writer_dispatch = on_writer_dispatch
         # plugins disabled mid-run after an in-process hook raised (failure
         # isolation): skipped for every subsequent stage.
         self._disabled: set[str] = set()
@@ -206,9 +215,16 @@ class HookBus:
             if not lp.active or lp.name in self._disabled:
                 continue
             hook = lp.manifest.hook_for(stage)
+            py = lp.instance is not None and stage in self._py_stages.get(lp.name, ())
+            if (
+                (hook is not None or py)
+                and not lp.manifest.read_only
+                and self._on_writer_dispatch is not None
+            ):
+                self._on_writer_dispatch(lp.name, stage)
             if hook is not None:
                 self._dispatch_declarative(lp, hook, ctx)
-            if lp.instance is not None and stage in self._py_stages.get(lp.name, ()):
+            if py:
                 self._dispatch_python(lp, stage, ctx)
         return ctx
 

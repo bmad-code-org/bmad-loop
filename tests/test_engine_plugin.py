@@ -1291,11 +1291,12 @@ def test_unity_setup_fails_loud_when_agent_config_leaks(tmp_path, monkeypatch):
 
 # ------------------------------- [verify] reuse_unchanged vs plugin hooks (#1002)
 #
-# Only sessions void a reuse token; a plugin HOOK's writes are caught by the
-# gate-time fingerprint alone, and only where git can see them.
+# A hook from a plugin not declared `read_only` voids a reuse token at dispatch
+# (`plugin-hook`); a `read_only` plugin's writes are caught by the gate-time
+# fingerprint alone, and only where git can see them.
 
 
-def _reuse_hook_run(project, monkeypatch, write):
+def _reuse_hook_run(project, monkeypatch, write, *, read_only=True):
     from conftest import dev_effect, scripted_verify_runner, write_sprint
 
     from bmad_loop import verify
@@ -1311,7 +1312,7 @@ def _reuse_hook_run(project, monkeypatch, write):
             write(project.project)
 
     write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
-    manifest = PluginManifest(name="writer", api_version=1)
+    manifest = PluginManifest(name="writer", api_version=1, read_only=read_only)
     run_dir = project.project / ".bmad-loop" / "runs" / "test-run"
     engine = Engine(
         paths=project,
@@ -1356,7 +1357,8 @@ def _reuse_hook_run(project, monkeypatch, write):
 def test_verify_reuse_sees_a_post_dev_phase_hook_write(project, monkeypatch, write):
     """A Python hook on `post_dev_phase` (between the dev pass and the skip
     gate) writing a git-visible file forces a real run with `tree-mismatch` —
-    the fingerprint, not a hook-dispatch void, is what catches it.
+    the plugin is declared `read_only` (wrongly), so the fingerprint, not a
+    hook-dispatch void, is what catches it.
 
     Ablation: make `verify._decide_reuse` skip its tree comparison and the
     gate reuses."""
@@ -1368,10 +1370,7 @@ def test_verify_reuse_sees_a_post_dev_phase_hook_write(project, monkeypatch, wri
     assert not kinds["verify-pass-reused"]
 
 
-def test_verify_reuse_is_blind_to_a_hook_writing_an_ignored_file(project, monkeypatch):
-    """The documented blind spot: a hook that writes only an IGNORED file leaves
-    the fingerprint equal, and hook dispatch does not void the token (only
-    sessions do), so the gate still reuses the dev pass."""
+def _ignore_hook_cache(project):
     gitignore = project.project / ".gitignore"
     existing = gitignore.read_text() if gitignore.exists() else ""
     gitignore.write_text(existing + "hook-cache/\n")
@@ -1382,11 +1381,36 @@ def test_verify_reuse_is_blind_to_a_hook_writing_an_ignored_file(project, monkey
         check=True,
     )
 
-    def write_ignored(root):
-        (root / "hook-cache").mkdir(exist_ok=True)
-        (root / "hook-cache" / "state.bin").write_text("ignored\n")
 
-    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, write_ignored)
+def _write_ignored(root):
+    (root / "hook-cache").mkdir(exist_ok=True)
+    (root / "hook-cache" / "state.bin").write_text("ignored\n")
+
+
+def test_verify_reuse_voids_on_a_writer_hook_writing_an_ignored_file(project, monkeypatch):
+    """A plugin not declared `read_only` closes the ignored-file blind spot: its
+    hook's dispatch voids the token (`plugin-hook`, detail `<plugin>:<stage>`)
+    although the fingerprint stays equal, so the gate runs its commands."""
+    _ignore_hook_cache(project)
+
+    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, _write_ignored, read_only=False)
+
+    assert (project.project / "hook-cache" / "state.bin").exists()  # the hook ran
+    assert summary.done == 1
+    assert len(ran) == 2
+    assert [(e["decline"], e["detail"]) for e in kinds["verify-reuse-declined"]] == [
+        ("plugin-hook", "writer:post_dev_phase")
+    ]
+    assert not kinds["verify-pass-reused"]
+
+
+def test_verify_reuse_is_blind_to_a_read_only_hook_writing_an_ignored_file(project, monkeypatch):
+    """The documented blind spot of `read_only`: a plugin declared so whose
+    hook writes only an IGNORED file leaves the fingerprint equal and voids
+    nothing, so the gate still reuses the dev pass."""
+    _ignore_hook_cache(project)
+
+    summary, ran, kinds = _reuse_hook_run(project, monkeypatch, _write_ignored)
 
     assert (project.project / "hook-cache" / "state.bin").exists()  # the hook ran
     assert summary.done == 1

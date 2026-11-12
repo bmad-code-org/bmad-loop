@@ -9623,18 +9623,53 @@ class SweepEngine(Engine):
         return outcome
 
     def _verify_reuse_supported(self) -> bool:
-        """Sweeps never reuse a green verify pass (``[verify] reuse_unchanged``).
+        """Sweeps reuse a green verify pass (``[verify] reuse_unchanged``) with a
+        ledger carve-out.
 
-        The engine itself writes the tree between the passes: the dev leg's
-        ``_post_dev_accepted_sync`` closes the bundle's ledger entries AFTER the
-        dev verify pass, and ``_verify_review`` re-closes them right before the
-        review gate's commands. The gate's fingerprint would therefore never
-        match the pass's, and carving the ledger out of the fingerprint would let
-        a verify suite that reads it run green against a different ledger. Sweep
-        reuse is deferred; with the flag on, the dev pass mints no token (no
-        fingerprint is read) and every eligible gate journals a
-        ``mode-unsupported`` decline and runs its commands."""
-        return False
+        The engine itself writes the ledger between the passes: the dev leg's
+        ``_post_dev_accepted_sync`` closes the bundle's entries AFTER the dev
+        verify pass, and ``_verify_review`` re-closes them right before the
+        review gate's commands. So the ledger is left out of both fingerprints
+        (``_verify_reuse_exclude``) and pinned by content instead
+        (``_verify_reuse_pins_ledger``): the gate reuses only when its ledger is
+        the text the pass ran against, or exactly that text after this bundle's
+        own close (``_verify_reuse_ledger_closed``). That own-close projection
+        is accepted although the pass never read it. Any other ledger — a
+        foreign edit, a read fault — declines (``ledger-mismatch`` /
+        ``ledger-fault``)."""
+        return True
+
+    def _verify_reuse_exclude(self) -> tuple[str, ...]:
+        """The deferred-work ledger, relative to the resolved ``workspace.root``
+        (where both fingerprints are read). ``()`` when the ledger lies outside
+        that root, or resolution faults: an unexcluded ledger the engine rewrites
+        only declines the reuse (``tree-mismatch``), the safe direction, and an
+        outside path is never spelled as a ``..`` pathspec."""
+        try:
+            ledger = self.workspace.paths.deferred_work.resolve()
+            root = self.workspace.root.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return ()
+        try:
+            rel = ledger.relative_to(root)
+        except ValueError:
+            return ()
+        return (rel.as_posix(),)
+
+    def _verify_reuse_pins_ledger(self) -> bool:
+        return True
+
+    def _verify_reuse_ledger_closed(self, task: StoryTask, text: str) -> str:
+        """``text`` after ``_close_bundle_ledger_when_spec_status``'s close: the
+        same pure fold ``mark_done_many_reopenable`` publishes, with the same
+        date, note and operation id."""
+        return deferredwork.apply_reopenable_close(
+            text,
+            task.dw_ids,
+            self._today(),
+            self._bundle_close_note(task),
+            self._bundle_close_operation_id(task),
+        )
 
     def _verify_review(self, task: StoryTask):
         # Generic bundle dev sessions are told not to edit deferred-work.md; the
@@ -9651,10 +9686,10 @@ class SweepEngine(Engine):
                 kind="sweep-bundle-reclosed",
                 site="bundle-reclose-locked",
             )
-        # Always None here (`_verify_reuse_supported` is False): on an eligible
-        # skip-review gate with the flag on it journals the `mode-unsupported`
-        # decline, and verify_review_bundle takes no reuse.
-        self._review_reuse_request(task)
+        # After the reclose, so the gate's ledger pin sees the closed ledger.
+        # None on a real run; on an eligible skip-review gate it is the dev
+        # pass's reuse request, or None after journalling its decline.
+        reuse = self._review_reuse_request(task)
         outcome = verify.verify_review_bundle(
             task,
             self.workspace.paths,
@@ -9662,6 +9697,7 @@ class SweepEngine(Engine):
             on_results=self._review_command_sink(task),
             on_probes=self._review_probe_sink(task),
             accept_statuses=self._bundle_success_statuses("review"),
+            reuse=reuse,
         )
         if outcome.ok:
             self._accept_review_artifact_source(task)

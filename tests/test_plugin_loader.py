@@ -53,6 +53,7 @@ author = "me"
 seed_files = [".mcp.json"]
 seed_globs = [".claude/skills/*"]
 priority = 5
+read_only = true
 
 [hooks.pre_session]
 cmd = 'python3 "{scripts}/probe.py"'
@@ -127,6 +128,7 @@ def test_full_manifest_parses(tmp_path):
     )
     assert full.seed_files == (".mcp.json",)
     assert full.seed_globs == (".claude/skills/*",)
+    assert full.read_only is True
     # hooks keyed by stage; placeholder + flags carried through
     pre = full.hook_for("pre_session")
     assert pre is not None and pre.blocking is True and pre.timeout_sec == 30
@@ -142,6 +144,12 @@ def test_full_manifest_parses(tmp_path):
     wf = full.workflows[0]
     assert (wf.stage, wf.role, wf.blocking) == ("post_dev_phase", "dev", True)
     assert wf.prompt == "/lint-sweep {story_key}"
+
+
+def test_read_only_defaults_false(tmp_path):
+    """An omitted ``read_only`` is a writer: its hooks void a verify-reuse token."""
+    write_plugin(tmp_path, "plain", MINIMAL.format(name="plain"))
+    assert load_plugins(tmp_path)["plain"].read_only is False
 
 
 # --------------------------------------------------------- rejections
@@ -217,6 +225,10 @@ def test_full_manifest_parses(tmp_path):
             '[plugin]\nname = "e"\napi_version = 1\n' '[workflows.w]\nstage = "post_dev_phase"\n',
             "requires a 'prompt'",
         ),
+        # read_only is strict: a string or an int is refused, never coerced the way a
+        # hook's `blocking` is — "false" would read truthy and exempt a writer.
+        ('[plugin]\nname = "e"\napi_version = 1\nread_only = "true"\n', "read_only"),
+        ('[plugin]\nname = "e"\napi_version = 1\nread_only = 1\n', "read_only"),
         # missing [plugin] table
         ("[other]\nx = 1\n", "missing \\[plugin\\] table"),
     ],

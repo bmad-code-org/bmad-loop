@@ -124,10 +124,15 @@ needs. The manifest parses into the immutable `PluginManifest`
 | `priority`    | int    | `0`     | Cross-plugin ordering at a shared stage; **lower runs first**, then load order. |
 | `seed_files`  | list   | `[]`    | Project-relative gitignored files to copy into each isolated worktree.          |
 | `seed_globs`  | list   | `[]`    | Project-relative glob patterns to expand + copy into each worktree.             |
+| `read_only`   | bool   | `false` | The plugin's hooks write nothing a verify pass reads; see below.                |
 
 `seed_files` / `seed_globs` must be **project-relative** (an absolute path is
 rejected at load). They let a plugin prime an isolated checkout with gitignored
 paths it needs — e.g. the Unity plugin seeds an MCP-generated skill tree.
+
+`read_only` must be a TOML boolean (any other type is refused at load). It covers
+every hook the plugin has, declarative and `[python]`, and matters only under
+`[verify] reuse_unchanged` — see [Reused skip-review gates](#reused-skip-review-gates).
 
 ### `[[settings]]` — settings schema
 
@@ -712,6 +717,24 @@ the gate (`reused_stage`, `reused_sequence`, `command_count`, `head`, `tree`), a
 gate that could not reuse journals `verify-reuse-declined` with a `decline` reason and
 runs its commands as usual. `verification_reused` is a Python-plugin context property;
 declarative hooks get no environment variable for it.
+
+Any hook dispatched between the pass and the gate by a plugin whose `[plugin]` table
+does not set `read_only = true` voids the reusable pass: the gate declines with
+`plugin-hook` and a `detail` of `<plugin>:<stage>`. Declare `read_only` only when no
+hook of the plugin writes files (ignored ones included) or other state a verify
+command reads.
+
+Checked-out submodules and nested repositories are fingerprinted recursively, by their
+own HEAD and working tree; an unpopulated submodule directory counts as empty. One the
+fingerprint cannot read (a symlink, a directory holding files but no repository of its
+own, more than 8 levels deep) declines with `gitlinks` and a `detail` of
+`<cause>: <path>`, such as `not-a-checkout: vendor/lib`. Ignored files inside a
+submodule are blind spots, as in the parent.
+
+A sweep's bundle gate reuses too. Its fingerprint leaves the deferred-work ledger out,
+and the gate instead declines with `ledger-mismatch` when the ledger is neither the one
+the pass ran against nor that ledger after the bundle's own close, or with `ledger-fault`
+(plus a `detail`) when it cannot read it.
 
 ### Commit
 
