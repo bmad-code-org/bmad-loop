@@ -391,6 +391,32 @@ def test_blocking_workflow_no_work_escalates_instead_of_deferring(project):
     assert "story-deferred" not in kinds  # escalated, not deferred
 
 
+def test_blocking_workflow_silent_hook_channel_escalates_instead_of_deferring(project):
+    """#752: a blocking workflow session no hook event reached escalates the run
+    (re-arm restores the budget) instead of deferring the story for a relay
+    fault; the workflow-end entry carries `hook_channel_silent: True`.
+
+    ABLATION: delete the blocking-workflow silent-channel escalate arm in
+    `Engine._run_workflows` and the story is deferred instead."""
+    setup_story(project)
+    reg = PluginRegistry([LoadedPlugin(manifest=wf_manifest("wf", blocking=True))])
+    script = [
+        dev_effect(project, "1-1-a"),
+        SessionResult(status="timeout", hook_channel_silent=True),
+    ]
+    engine, adapter = make_engine(project, script, reg)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert engine.state.paused_reason.startswith("hook channel silent: blocking workflow 'doc'")
+    assert len(adapter.sessions) == 2  # dev + the one workflow session, no relaunch
+    end = [e for e in engine.journal.entries() if e["kind"] == "workflow-end"][-1]
+    assert end["hook_channel_silent"] is True
+    kinds = [e["kind"] for e in engine.journal.entries()]
+    assert "story-deferred" not in kinds  # escalated, not deferred
+
+
 def test_blocking_workflow_lost_session_says_so_in_the_defer_reason(project):
     """#489 on the one path that DEFERS rather than retries: a blocking workflow
     whose mux session was destroyed must not be filed as "the workflow ran and

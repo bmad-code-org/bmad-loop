@@ -16820,6 +16820,76 @@ def test_session_with_no_work_pauses_dev_without_burning_budget(project):
     assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
 
 
+def test_session_with_silent_hook_channel_pauses_dev_without_burning_budget(project):
+    """#752: a dev session no hook event of any kind reached (an unregistered,
+    untrusted or env-less relay) pauses the run at the first story rather than
+    charging the attempt and launching a second session into the same silent
+    channel; `dev-decision` and `session-end` both carry the flag, and re-arm
+    restores the budget (attempt -> 0). The pause routes only: the session is
+    never completed, so the story stays unverified.
+
+    ABLATION: delete the `hook_channel_silent` arm in `decide_dev` and this
+    RETRYs — a second dev session is launched and the story ends deferred."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, adapter = make_engine(
+        project,
+        [SessionResult(status="timeout", hook_channel_silent=True)],
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev"]  # no retry session burned
+    task = engine.state.tasks["1-1-a"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1
+    assert engine.state.paused_stage == PAUSE_ESCALATION
+    assert engine.state.paused_reason.startswith("hook channel silent: dev session timeout (")
+
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"][-1]
+    assert dec["action"] == "pause"
+    assert dec["hook_channel_silent"] is True
+    assert dec["produced_work"] is True
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["hook_channel_silent"] is True
+    assert "stop_seen" not in end  # no Stop reached a silent channel
+
+    rearm_escalation(engine.run_dir, isolated_redrive=False, resolution_recorded=True)
+    assert load_state(engine.run_dir).tasks["1-1-a"].attempt == 0
+
+
+def test_review_with_silent_hook_channel_pauses_without_charging_a_cycle(project):
+    """#752 review twin: a silent-channel review timeout pauses through
+    `_escalate_decision` instead of retrying, deferring or salvaging the review.
+
+    ABLATION: delete the `hook_channel_silent` arm in `decide_review_session` and
+    a second review session is launched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    silent = SessionResult(status="timeout", hook_channel_silent=True)
+    engine, adapter = make_engine(project, [dev_effect(project, "1-1-a"), silent, silent])
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review"]
+    assert engine.state.tasks["1-1-a"].phase == Phase.ESCALATED
+    assert engine.state.paused_reason.startswith("hook channel silent: review session timeout (")
+    end = [e for e in engine.journal.entries() if e["kind"] == "session-end"][-1]
+    assert end["hook_channel_silent"] is True
+
+
+def test_unsilent_session_end_carries_no_hook_channel_silent_key(project):
+    """Present-only on session-end (the `parked` convention); `stop_seen` rides
+    only a non-completed session that saw a Stop."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    turned = SessionResult(status="timeout", stop_seen=True)
+    engine, _ = make_engine(project, [turned, turned])
+    engine.run()
+    ends = [e for e in engine.journal.entries() if e["kind"] == "session-end"]
+    assert len(ends) == 2 and all("hook_channel_silent" not in e for e in ends)
+    assert all(e["stop_seen"] is True for e in ends)
+    dec = [e for e in engine.journal.entries() if e["kind"] == "dev-decision"]
+    assert dec and all(d["hook_channel_silent"] is False for d in dec)
+
+
 def test_parked_session_pauses_dev_without_burning_budget(project):
     """DW-348/DW-350 acceptance: a dev session the adapter ended parked — the CLI
     was waiting on a human, so the stall nudge was withheld — pauses the run at
@@ -17330,6 +17400,44 @@ def test_fix_phase_no_work_session_escalates(project):
     fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
     assert fix["produced_work"] is False
     assert fix["parked"] is False
+
+
+def test_fix_phase_silent_hook_channel_session_escalates(project):
+    """#752: a fix session no hook event reached escalates uncharged instead of
+    spending the remaining dev budget relaunching repairs into the same silent
+    channel; `fix-decision` carries the flag.
+
+    ABLATION: delete the fix site's `hook_channel_silent` escalate arm and a
+    second fix session is launched."""
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    marker = project.project / "fixed.marker"
+
+    def dev_with_marker(spec):
+        marker.write_text("ok\n")
+        return dev_effect(project, "1-1-a")(spec)
+
+    def breaking_review(spec):
+        marker.unlink()  # ordinary fixable failure -> routes to a fix session
+        return review_effect(project, "1-1-a", clean=True)(spec)
+
+    silent_fix = SessionResult(status="timeout", hook_channel_silent=True)
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        verify=VerifyPolicy(commands=(_file_exists_cmd(marker), _OK)),
+        limits=LimitsPolicy(max_dev_attempts=3),  # budget left -> must not be spent
+    )
+    engine, adapter = make_engine(
+        project, [dev_with_marker, breaking_review, silent_fix, silent_fix], policy=policy
+    )
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1 and summary.deferred == 0
+    assert [s.role for s in adapter.sessions] == ["dev", "review", "dev"]  # one fix, then stop
+    assert engine.state.paused_reason.startswith("hook channel silent: fix session timeout (")
+    fix = [e for e in engine.journal.entries() if e["kind"] == "fix-decision"][-1]
+    assert fix["hook_channel_silent"] is True
+    assert fix["produced_work"] is True
 
 
 def test_max_stories_limit(project):

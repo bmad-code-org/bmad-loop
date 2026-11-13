@@ -561,6 +561,18 @@ def decide_dev(
                 Action.PAUSE,
                 no_work_pause_reason("dev", result),
             )
+        if result.hook_channel_silent:
+            # No hook event of any kind reached the session (#752): the relay is
+            # unregistered, untrusted or lost its environment, so the timeout says
+            # nothing about the agent's work and a RETRY would relaunch into the
+            # same silent channel. Pause ahead of the budget, uncharged, like the
+            # no-work arm; re-arm resets the attempt. This routes only — it never
+            # reads or accepts result.json, so it is no completion path. After
+            # no-work, whose verdict (nothing happened at all) is the stronger one.
+            return Decision(
+                Action.PAUSE,
+                hook_channel_silent_pause_reason("dev", result),
+            )
         reason = session_failure_reason("dev", result)
         if budget_left:
             return Decision(Action.RETRY, reason)
@@ -609,7 +621,8 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
     """After a review session returns, before interpreting its done/followup status.
 
     A non-completed session is read in the same order as `decide_dev`: env fault,
-    then parked, then no work produced (#727), each a PAUSE ahead of the
+    then parked, then no work produced (#727), then a silent hook channel (#752),
+    each a PAUSE ahead of the
     `review.on_timeout` routing — a review that never ran has nothing to salvage
     and nothing a deferral or retry would change."""
     critical_reason = critical_session_reason("review", result.result_json)
@@ -644,6 +657,11 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
             # salvage a review that would relaunch into the same wall (see
             # decide_dev). After env_fault and parked, which explain it better.
             return Decision(Action.PAUSE, no_work_pause_reason("review", result))
+        if result.hook_channel_silent:
+            # silent hook channel (#752): pause rather than retry, defer or
+            # salvage — the timeout is the relay's, not the review's (see
+            # decide_dev). Ahead of the `review.on_timeout` routing.
+            return Decision(Action.PAUSE, hook_channel_silent_pause_reason("review", result))
         reason = session_failure_reason("review", result)
         if result.status in REVIEW_TIMEOUT_STATUSES:
             mode = policy.review.on_timeout

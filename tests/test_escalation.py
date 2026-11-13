@@ -465,6 +465,74 @@ def test_hook_channel_silent_defaults_false():
     assert dataclasses.fields(SessionResult)[-1].name == "hook_channel_silent"
 
 
+def test_dev_hook_channel_silent_pauses_even_with_budget_left():
+    """#752: a dev session no hook event of any kind reached PAUSEs uncharged
+    instead of RETRYing into the same silent relay — and outranks budget
+    exhaustion too, so a spent budget cannot file a relay fault as deferred work.
+
+    ABLATION: delete the `hook_channel_silent` arm in `decide_dev` and this
+    RETRYs (budget left) / DEFERs (budget spent)."""
+    silent = SessionResult(status="timeout", hook_channel_silent=True)
+    for attempt in (1, 2):  # budget left, budget spent
+        decision = decide_dev(_task(attempt=attempt), silent, None, POLICY)
+        assert decision.action == Action.PAUSE
+        assert decision.reason.startswith("hook channel silent: dev session timeout (")
+        assert "the attempt is not charged" in decision.reason
+        assert not decision.budget_exhausted
+        assert not decision.uncharged  # a pause, not an uncharged relaunch
+
+
+def test_dev_hook_channel_silent_default_keeps_todays_routing():
+    """The flag defaults False, so a plain timeout keeps RETRY-with-budget /
+    DEFER-without; and a COMPLETED session never reaches the arm — the pause only
+    routes a non-completed session, it is no completion path."""
+    plain = SessionResult(status="timeout")
+    assert plain.hook_channel_silent is False
+    retried = decide_dev(_task(attempt=1), plain, None, POLICY)
+    assert retried.action == Action.RETRY
+    assert "hook channel silent" not in retried.reason
+    assert decide_dev(_task(attempt=2), plain, None, POLICY).action == Action.DEFER
+    completed = SessionResult(status="completed", hook_channel_silent=True)
+    assert (
+        decide_dev(_task(attempt=1), completed, VerifyOutcome.passed(), POLICY).action
+        == Action.PROCEED
+    )
+
+
+def test_dev_no_work_outranks_hook_channel_silent():
+    """The fixed arm order is usage_relaunch, env_fault, parked, no_work,
+    hook_channel_silent: a session that never did anything at all is the stronger
+    verdict, and every earlier arm keeps its reason when the flag rides along."""
+    both = SessionResult(status="timeout", produced_work=False, hook_channel_silent=True)
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.reason.startswith("no work produced: dev session timeout")
+    parked = SessionResult(
+        status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE, hook_channel_silent=True
+    )
+    assert decide_dev(_task(attempt=1), parked, None, POLICY).reason.startswith("parked: ")
+    env = SessionResult(status="timeout", env_fault=True, hook_channel_silent=True)
+    assert decide_dev(_task(attempt=1), env, None, POLICY).reason.startswith("environment fault: ")
+
+
+@pytest.mark.parametrize("on_timeout", ["retry", "defer", "salvage-if-done"])
+def test_review_hook_channel_silent_pauses_whatever_the_timeout_mode(on_timeout):
+    """#752: a silent-channel review timeout pauses ahead of the
+    `review.on_timeout` routing — salvaging, deferring or retrying a review whose
+    relay never spoke blames the review for the relay.
+
+    ABLATION: delete the `hook_channel_silent` arm in `decide_review_session` and
+    this RETRYs, DEFERs or SALVAGEs per mode."""
+    silent = SessionResult(status="timeout", hook_channel_silent=True)
+    decision = decide_review_session(_task(review_cycle=1), silent, _policy(on_timeout))
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("hook channel silent: review session timeout (")
+    assert not decision.budget_exhausted
+    both = SessionResult(status="timeout", produced_work=False, hook_channel_silent=True)
+    assert decide_review_session(
+        _task(review_cycle=1), both, _policy(on_timeout)
+    ).reason.startswith("no work produced: ")
+
+
 # The #610 credit-exhaustion pane line, split so this file carries no line the
 # shipped claude usage patterns match (test_pane_capture_patterns_do_not_match_this_repo).
 _USAGE_EVIDENCE = (
