@@ -1544,6 +1544,11 @@ JOURNAL_KINDS = frozenset(
         # profile's bypass tokens — one per affected launched role. `role`,
         # `profile` and `missing` are config names/flags from the resolved profile.
         "bypass-dropped",
+        # #752: a real launch whose hooked role's project hook config does not
+        # register the relay — one per affected launched role. `role` and
+        # `profile` are config names; `problem` (benign by name) is a prose
+        # sentence naming the config path, which `scrub_json` redacts whole.
+        "hook-relay-unregistered",
         # DW-591: `resolve --at-reset`'s wait for a usage-limit reset — its start
         # (`reset_at`, `margin_min`, `wake_at`) and end (`wake_at`, `interrupted`,
         # `waited_s`); every field declared benign.
