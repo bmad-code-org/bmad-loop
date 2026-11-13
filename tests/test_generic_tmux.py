@@ -15269,6 +15269,114 @@ def test_session_start_missing_journal_write_failure_is_swallowed(tmp_path, monk
     assert [e["waited_s"] for e in _start_missing_entries(adapter)] == [150]
 
 
+# ------------------------------------------- hook-channel-silent stamp (#752)
+#
+# Routing signal only. A `timeout`/`stalled` exit on a profile that maps
+# SessionStart, with no hook event of any kind heard by the wait loop, is
+# stamped `hook_channel_silent`; every other exit keeps the default False.
+
+
+def test_generic_timeout_with_no_hook_events_stamps_channel_silent(tmp_path, monkeypatch):
+    """A session whose relay never fired runs to the timeout and is stamped. The
+    stamp never completes it: result.json on disk stays unread."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    (adapter.tasks_dir / "b-1" / "result.json").write_text('{"ok": true}')
+    result = _run_start_missing(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert result.hook_channel_silent is True
+    assert result.result_json is None
+
+
+def test_generic_timeout_after_session_start_is_not_channel_silent(tmp_path, monkeypatch):
+    """An admitted SessionStart proves the relay fires, so a later timeout is an
+    ordinary (charged) one.
+
+    ABLATION: drop the `not self._hook_events_heard` clause and this stamps."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    result = _run_start_missing(adapter, clock, tmp_path, events=[_start_event(transcript)])
+    assert result.status == "timeout"
+    assert result.hook_channel_silent is False
+
+
+def test_channel_silent_evidence_resets_per_attempt(tmp_path, monkeypatch):
+    """One adapter drives every attempt of its role, so an event heard by an
+    earlier session must not vouch for a later, silent one.
+
+    ABLATION: drop the reset at the top of `_wait_loop` and the second run
+    does not stamp."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    first = _run_start_missing(adapter, clock, tmp_path, events=[_start_event(transcript)])
+    assert first.hook_channel_silent is False
+    second = _run_start_missing(adapter, clock, tmp_path)
+    assert second.status == "timeout"
+    assert second.hook_channel_silent is True
+
+
+@pytest.mark.parametrize("kind", ["foreign", "idless"])
+def test_foreign_or_idless_event_counts_as_heard(tmp_path, monkeypatch, kind):
+    """Any event the channel delivers proves the relay fires, whether attribution
+    drops it as foreign (a never-own id's SessionEnd under a pinned launch,
+    DW-508) or admits it without a session id.
+
+    ABLATION: set `_hook_events_heard` after `attribution.admit` admits the event
+    instead of before, and the foreign row stamps; drop the set and both stamp."""
+
+    def events(pinned):
+        if kind == "foreign":
+            return [_hook_event("SessionEnd", session_id="never-own", transcript_path="/x.jsonl")]
+        return [_hook_event("Notification", session_id=None)]
+
+    adapter, result, _ = _pinned_timeout_run(tmp_path, monkeypatch, events)
+    dropped = _lifecycle_events(adapter, "foreign-hook-event-ignored")
+    assert len(dropped) == (1 if kind == "foreign" else 0)
+    assert result.hook_channel_silent is False
+
+
+def test_stop_only_profile_never_stamps_channel_silent(tmp_path, monkeypatch):
+    """Antigravity maps only Stop, so silence until the timeout is its normal
+    shape, not a lost channel.
+
+    ABLATION: drop the SessionStart gate and this stamps."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch, hooks_from="antigravity")
+    assert "SessionStart" not in adapter.profile.hooks.events.values()
+    result = _run_start_missing(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert result.hook_channel_silent is False
+
+
+def test_hookless_profile_never_stamps_channel_silent(tmp_path, monkeypatch):
+    """A hookless profile observes completion itself; its hook channel is never
+    expected to speak. The events map keeps SessionStart here so the SessionStart
+    gate cannot mask the hookless one.
+
+    ABLATION: drop the `not self.profile.hookless` clause and this stamps."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    adapter.profile = dataclasses.replace(
+        adapter.profile, hooks=dataclasses.replace(adapter.profile.hooks, dialect="none")
+    )
+    assert adapter.profile.hookless
+    assert "SessionStart" in adapter.profile.hooks.events.values()
+    result = _run_start_missing(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert result.hook_channel_silent is False
+
+
+def test_crashed_session_is_not_channel_silent(tmp_path, monkeypatch):
+    """A window that died is a crash, whatever the channel did: only a
+    timeout/stall is the lost-channel signature.
+
+    ABLATION: add "crashed" to the status gate and this stamps."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    adapter._window_alive = lambda handle: False
+    result = _run_start_missing(adapter, clock, tmp_path)
+    assert result.status == "crashed"
+    assert result.hook_channel_silent is False
+
+
 # ------------------------------------------------ session-model notice (#859)
 #
 # Observation only. The first admitted SessionStart whose hook carries a `model`

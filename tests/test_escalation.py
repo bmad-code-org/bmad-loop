@@ -409,6 +409,16 @@ def test_review_env_fault_outranks_parked_and_no_work():
         ("parked: dev session stalled (x)", None, "Paused (parked prompt): 1-1"),
         ("no work produced: fix session timeout (x)", None, "Paused (no work): 1-1"),
         ("usage limit: dev session stalled (x)", None, "Paused (usage limit): 1-1"),
+        (
+            "hook channel silent: triage session timeout (x)",
+            None,
+            "Paused (hook channel silent): 1-1",
+        ),
+        (
+            "session failed: triage session timeout after 2 attempt(s)",
+            None,
+            "Paused (session failed): 1-1",
+        ),
         ("environment fault: dev session crashed (x)", None, "Paused (environment fault): 1-1"),
         # a verify-detected fault carries no prefix: the recorded site classifies it
         ("verify command exited 127", "verify:dev", "Paused (environment fault): 1-1"),
@@ -422,6 +432,37 @@ def test_review_env_fault_outranks_parked_and_no_work():
 )
 def test_pause_title_classifies_by_reason_prefix(reason, env_fault_site, title):
     assert pause_title(reason, "1-1", env_fault_site=env_fault_site) == title
+
+
+def test_hook_channel_silent_reason_names_validate_not_init():
+    """#752: the silent-channel reason points at `validate` and the commit-before-resume
+    step, never at `init` — the same signature covers untrusted Codex hooks and a
+    CLI on a shared daemon, where re-running init is the wrong fix."""
+    result = SessionResult(status="timeout", hook_channel_silent=True)
+    reason = escalation.hook_channel_silent_pause_reason("triage", result)
+    assert reason.startswith("hook channel silent: triage session timeout (")
+    assert "no hook event of any kind arrived" in reason
+    assert "`bmad-loop validate`" in reason
+    assert "before `bmad-loop resume`" in reason
+    assert "the attempt is not charged" in reason
+    assert "init" not in reason
+    assert pause_title(reason, "1-1") == "Paused (hook channel silent): 1-1"
+
+
+def test_hook_channel_silent_reason_keeps_lost_session_suffix():
+    """Composed over `session_failure_reason`: the #489 lost-session note survives."""
+    result = SessionResult(status="stalled", hook_channel_silent=True, session_vanished=True)
+    reason = escalation.hook_channel_silent_pause_reason("dev", result)
+    assert reason.startswith(
+        f"hook channel silent: {escalation.session_failure_reason('dev', result)} ("
+    )
+
+
+def test_hook_channel_silent_defaults_false():
+    """The #752 flag is appended last and defaults off, so every existing
+    construction keeps its routing."""
+    assert SessionResult(status="timeout").hook_channel_silent is False
+    assert dataclasses.fields(SessionResult)[-1].name == "hook_channel_silent"
 
 
 # The #610 credit-exhaustion pane line, split so this file carries no line the

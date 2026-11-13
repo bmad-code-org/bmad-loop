@@ -370,11 +370,35 @@ def no_work_pause_reason(role: str, result: SessionResult) -> str:
     )
 
 
+def hook_channel_silent_pause_reason(role: str, result: SessionResult) -> str:
+    """The pause reason for a non-completed session whose hook channel stayed
+    silent (#752): ``hook channel silent: <role> session <status> (...)``.
+
+    Composed over `session_failure_reason`, like its siblings, so the #489
+    lost-session suffix survives. The adapter stamps
+    ``result.hook_channel_silent`` when no hook event of any kind arrived, which
+    a working relay never allows, so the verdict says nothing about the agent's
+    output. The parenthetical names the likely causes and points at
+    ``bmad-loop validate`` rather than ``init``: the same signature covers
+    untrusted Codex hooks and a CLI attached to a shared daemon, where re-running
+    init is the wrong fix. "Commit before resume" because a dirty migration
+    resume resets the checkout and would revert an uncommitted hook-config fix."""
+    return (
+        f"hook channel silent: {session_failure_reason(role, result)} (no hook event "
+        "of any kind arrived for this attempt — the CLI's hook relay may be "
+        "unregistered, untrusted, or running without the window's BMAD_LOOP_* "
+        "environment; run `bmad-loop validate`, commit any hook-config fix before "
+        "`bmad-loop resume`, and see the CLI's first-run note; the attempt is not charged)"
+    )
+
+
 def pause_title(reason: str, story_key: str, *, env_fault_site: str | None = None) -> str:
     """The notification title for an escalation pause, classified by the reason's
-    prefix (#727): a parked, no-work, usage-limit or environment-fault pause is a
-    human-needed stop but not a CRITICAL contradiction, and titling it as one
-    sends the operator hunting for a spec conflict that is not there.
+    prefix (#727): a parked, no-work, usage-limit, hook-channel-silent (#752),
+    session-failed (#752: a session that never completed, capped) or
+    environment-fault pause is a human-needed stop but not a CRITICAL
+    contradiction, and titling it as one sends the operator hunting for a spec
+    conflict that is not there.
 
     ``env_fault_site`` (DW-523) is the fallback for environment faults whose
     reason carries no prefix — a verify-detected fault reads as the verify
@@ -386,6 +410,10 @@ def pause_title(reason: str, story_key: str, *, env_fault_site: str | None = Non
         kind = "no work"
     elif reason.startswith("usage limit: "):
         kind = "usage limit"
+    elif reason.startswith("hook channel silent: "):
+        kind = "hook channel silent"
+    elif reason.startswith("session failed: "):
+        kind = "session failed"
     elif reason.startswith("environment fault: ") or env_fault_site is not None:
         kind = "environment fault"
     else:

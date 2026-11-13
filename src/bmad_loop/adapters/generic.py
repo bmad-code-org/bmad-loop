@@ -1321,6 +1321,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # rescue), and a fault must read as one record, not three. Keyed by
         # launch, not task id alone, because a re-armed run reuses task ids.
         self._log_evidence_faulted: dict[str, int] = {}
+        # Whether ANY hook event — admitted, foreign or id-less — reached the
+        # current `_wait_loop` (#752). Reset at the loop's start, read by
+        # `wait_for_completion` to stamp `SessionResult.hook_channel_silent`.
+        self._hook_events_heard = False
 
     # --------------------------------------------------------- multiplexer
 
@@ -1552,7 +1556,23 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             self._note_session_unparked(handle, notice, "ended")
         if quota.closed_s > 0:
             result = dataclasses.replace(result, quota_wait_s=round(quota.closed_s, 3))
+        if self._hook_channel_silent(result):
+            result = dataclasses.replace(result, hook_channel_silent=True)
         return result
+
+    def _hook_channel_silent(self, result: SessionResult) -> bool:
+        """Whether `result` carries the lost-hook-channel signature (#752): a
+        `timeout`/`stalled` exit on a profile that maps `SessionStart`, with no
+        hook event of any kind heard by the wait loop. A working relay delivers
+        SessionStart even for a hung agent, so silence means the relay never
+        fired. Same profile gate as `_note_session_start_missing`. Routing
+        only: it never reads result.json and never makes a session complete."""
+        return (
+            result.status in ("timeout", "stalled")
+            and not self._hook_events_heard
+            and not self.profile.hookless
+            and "SessionStart" in self.profile.hooks.events.values()
+        )
 
     def _relabel_dead_window(
         self,
@@ -1620,6 +1640,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         notice: _ParkedNotice,
         stop_failure: _StopFailureLatch,
     ) -> SessionResult:
+        # #752: no event heard yet this attempt (see `_hook_channel_silent`).
+        self._hook_events_heard = False
         deadline = time.monotonic() + spec.timeout_s
         # Wall-clock co-bound (#157): a host suspend freezes time.monotonic(),
         # silently extending the monotonic deadline by the nap's length. The
@@ -2554,6 +2576,10 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 timeout_s=min(remaining, 5.0),
                 since_ns=handle.launched_ns,
             )
+            if event is not None:
+                # Any event at all proves the relay fires (#752), so it counts
+                # BEFORE attribution: a foreign or id-less event is heard too.
+                self._hook_events_heard = True
             # Second poll, and the reason there are two (#319). The arm at the top of
             # the loop is separated from its next run by everything between: the 5s
             # wait above, plus whichever dispatch leg the event selects — a
