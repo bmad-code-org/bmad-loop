@@ -846,6 +846,11 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "grace_s",
         "graceful",
         "harvest_attempt",
+        # `triage-decision` / `migrate-decision` (#752): whether no hook event of
+        # any kind reached the attempt. A bare boolean about the channel — it
+        # names no story, no path and no text, and `True` routed the result to
+        # the uncharged silent-channel PAUSE.
+        "hook_channel_silent",
         # `quota-wait-ended` (DW-396): what ended the wait, a closed slug the
         # adapter chose (`transcript-active` / `latch` / `cap` / `session-exit`);
         # `session-unparked` (#855) likewise (`stop` / `activity` / `ended`).
