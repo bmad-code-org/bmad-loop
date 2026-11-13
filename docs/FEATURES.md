@@ -106,6 +106,9 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A session silent for `dev_stall_grace_s` (default 600) gets up to `dev_stall_nudges` wake nudges, then ends `stalled` and is charged as a failed attempt.
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
   - A session that did no work, or is still parked on a prompt only a human should answer when it stalls or times out, pauses the run instead of being charged; a non-blocking workflow's is journaled and the run continues.
+  - A session that times out or stalls before any hook event of any kind reached it, on a CLI that maps `SessionStart`, pauses uncharged with a `hook channel silent:` reason pointing at `bmad-loop validate`; the fault is the relay, not the work, and its `result.json` is never read as a completion. This covers dev, review, fix, blocking-workflow, sweep triage and migration sessions.
+  - A sweep triage or migration that reaches its attempt cap without its last session completing pauses as `session failed:`, not as a validation failure, and a non-completed attempt hands the next one no new `--feedback`.
+  - `run`, `sweep` and `resume` warn on stderr, and journal `hook-relay-unregistered`, when a role's project hook config does not register the relay; the launch is never refused.
   - A session approved past its permission prompt that then goes silent gets the stall nudge, not a parked pause.
   - When a Claude Code turn ends on an API error (its `StopFailure` hook), the adapter acts at once and never counts it as a completion: a transient error gets the stall nudge right away and is charged if never recovered, and an account error (billing, authentication, an account hold, a wrong model, a broken cloud credential) pauses the run uncharged with a reason naming the error.
   - `validate --probes` launches each role's CLI once with no prompt and fails when its first screen shows a startup dialog that would park an unattended session.
@@ -116,8 +119,8 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - In relaunch mode the session ends at the limit instead of waiting for its reset, a Claude Code `rate_limit` error naming no known limit counts as one, and the relaunched session gets `BMAD_LOOP_USAGE_RELAUNCH=<n>` so a wrapper can switch accounts.
   - Before an attempt is reset, its commits go to an `attempt-preserve/<run>-<tip8>` branch and uncommitted work to a `refs/attempt-preserve-dirty/*` snapshot.
 - **Config:** `[limits] max_dev_attempts`, `[limits] max_review_cycles`, `[limits] session_timeout_min`, `[limits] dev_stall_grace_s`, `[limits] dev_stall_nudges`, `[limits] dev_stall_nudges_cap`, `[limits] quota_wait_max_min`, `[limits] usage_limit_action`, `[limits] max_usage_relaunches`, `[scm] preserve_keep`
-- **Tested by:** `tests/test_escalation.py`, `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_panematch.py`, `tests/test_sweep.py`, `tests/test_verify.py`, `tests/test_recovery_flow.py`, `tests/test_stories_e2e.py`
-- **Docs:** [Preserved attempts](escalations-guide.md#preserved-attempts), [Usage-limit pauses](escalations-guide.md#usage-limit-pauses), [Account rotation](plugin-authoring-guide.md#account-rotation), [StopFailure signals](adapter-authoring-guide.md#stopfailure-signals), [[limits] reference](reference/configuration.md#limits), [[scm] reference](reference/configuration.md#scm)
+- **Tested by:** `tests/test_escalation.py`, `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_panematch.py`, `tests/test_sweep.py`, `tests/test_verify.py`, `tests/test_recovery_flow.py`, `tests/test_stories_e2e.py`, `tests/test_cli.py`
+- **Docs:** [Preserved attempts](escalations-guide.md#preserved-attempts), [Usage-limit pauses](escalations-guide.md#usage-limit-pauses), [Silent hook channel pauses](escalations-guide.md#silent-hook-channel-pauses), [Account rotation](plugin-authoring-guide.md#account-rotation), [StopFailure signals](adapter-authoring-guide.md#stopfailure-signals), [[limits] reference](reference/configuration.md#limits), [[scm] reference](reference/configuration.md#scm)
 
 ### Plateau-defer
 
@@ -139,7 +142,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, or adopting a kept branch, and closes a tickets epic at an `epic-boundary` pause.
 - **Properties:**
   - A CRITICAL escalation marks the story `escalated`, sends a `CRITICAL escalation: <story>` notice and pauses the run at `escalation`.
-  - A pause that is not a CRITICAL contradiction is titled by its reason: `Paused (parked prompt): <story>`, `Paused (no work): <story>`, `Paused (usage limit): <story>` or `Paused (environment fault): <story>`.
+  - A pause that is not a CRITICAL contradiction is titled by its reason: `Paused (parked prompt): <story>`, `Paused (no work): <story>`, `Paused (usage limit): <story>`, `Paused (hook channel silent): <story>`, `Paused (session failed): <story>` or `Paused (environment fault): <story>`.
   - A PREFERENCE escalation is journaled as `preference-escalation` and the run continues.
   - A story still escalated after a resume cleared the pause can still be resolved; `resume`, `status` and the TUI header point at it.
   - A resume that fails before its engine starts puts back the pause it cleared.

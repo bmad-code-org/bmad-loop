@@ -120,6 +120,9 @@ breaking changes may land in a minor release.
   read declines `gitlinks` with its cause and path.
 - Add the `[plugin] read_only` manifest flag: a hook from a plugin not declared
   `read_only` voids a reusable verify pass, and the gate declines `plugin-hook`.
+- Warn on stderr at `run`, `sweep` and `resume`, and journal `hook-relay-unregistered`
+  per role, when a role's project hook config does not register the bmad-loop relay;
+  never refuses the launch (#752).
 
 ### Changed
 
@@ -287,6 +290,12 @@ breaking changes may land in a minor release.
 - Classify a Claude session cut off mid-response as an environment fault instead of
   charging a dev attempt when Claude Code 2.1.317 prints `Connection lost`, not `closed`,
   after `API Error`.
+- Pause triage, migration, dev, review, fix and blocking-workflow sessions uncharged
+  when no hook event of any kind reached them before they timed out or stalled
+  (`hook channel silent:`), instead of spending every attempt on a dead relay (#752).
+- Stop blaming validation for a sweep session that never completed: its cap reads
+  `session failed:`, and the next attempt gets no `--feedback` claiming its output
+  failed validation (#752).
 
 ### Security
 

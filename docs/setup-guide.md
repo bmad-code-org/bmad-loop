@@ -479,6 +479,7 @@ By default, Codex attaches to a shared background app-server daemon, which may h
 - **Overlay profiles:** a `.bmad-loop/profiles/codex.toml` that sets `launch_args` must keep `--no-daemon` in them. It goes in `launch_args`, not `bypass_args`: a stage's `extra_args` replace `bypass_args`.
 - **Check:** `bmad-loop validate` reports `adapter.codex-version`. It warns when the installed Codex is older than 0.156 (it rejects `--no-daemon`, so every session exits at launch), when the profile's `launch_args` lack `--no-daemon`, or when the version can't be read. It never fails validation.
 - **Symptom:** when a CLI that maps `SessionStart` sends none within `[limits] session_start_grace_s` (default 120 s), the run journals one `session-start-missing` entry (`task_id`, `waited_s`, `grace_s`, `cli`, plus a `hint` naming the daemon for Codex). The notice is observation only and never ends the session. A sweep triage session on Codex that reports no hook events adds the same hint to its escalation text (`; hint: …`).
+- **Outcome:** a session that gets no hook event at all before it times out or stalls pauses the run uncharged with a `hook channel silent:` reason instead of spending its attempts. Fix the daemon setting or hook trust, commit the fix, and recover as in [Silent hook channel pauses](escalations-guide.md#silent-hook-channel-pauses).
 
 ### Skill location
 

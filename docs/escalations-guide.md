@@ -48,12 +48,14 @@ Escalations come in two severities:
 
 Some escalation pauses are not a contradiction in the spec, and their notices say so by reason:
 
-| Reason starts with                      | Notice title                          | Cause                                                                                           |
-| --------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `parked:`                               | `Paused (parked prompt): <story>`     | the session waited on a prompt only a human should answer                                       |
-| `no work produced:`                     | `Paused (no work): <story>`           | a dev, review, fix, triage, migration or blocking-workflow session ended without producing work |
-| `usage limit:`                          | `Paused (usage limit): <story>`       | the coding CLI hit a [usage limit](#usage-limit-pauses)                                         |
-| `environment fault:`, or a verify fault | `Paused (environment fault): <story>` | an [environment fault](#environment-faults) during the story                                    |
+| Reason starts with                      | Notice title                            | Cause                                                                                                               |
+| --------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `parked:`                               | `Paused (parked prompt): <story>`       | the session waited on a prompt only a human should answer                                                           |
+| `no work produced:`                     | `Paused (no work): <story>`             | a dev, review, fix, triage, migration or blocking-workflow session ended without producing work                     |
+| `usage limit:`                          | `Paused (usage limit): <story>`         | the coding CLI hit a [usage limit](#usage-limit-pauses)                                                             |
+| `hook channel silent:`                  | `Paused (hook channel silent): <story>` | no hook event reached a timed-out or stalled session: see [Silent hook channel pauses](#silent-hook-channel-pauses) |
+| `session failed:`                       | `Paused (session failed): <story>`      | a sweep triage or migration session that never completed used up its attempts                                       |
+| `environment fault:`, or a verify fault | `Paused (environment fault): <story>`   | an [environment fault](#environment-faults) during the story                                                        |
 
 Every other reason keeps the `CRITICAL escalation: <story>` title. Fix the cause (answer or dismiss the prompt, check the CLI's login, credits or permission mode), then resolve as below.
 
@@ -301,6 +303,26 @@ A session-window limit the CLI waits out by itself does not pause at all at firs
 A Claude Code `model_not_found` or `cloud_credential_error` is never relaunched, since no relaunch or account switch fixes a wrong model name or a broken cloud credential: it pauses with a `parked:` reason exactly as in pause mode.
 
 With `[environment] probes` configured, a dev relaunch runs them first, before the kept tree is used or after the rollback. A failing probe rolls a kept tree back as any retry does (with `[scm] rollback_on_failure` off in the main checkout, that is the manual-recovery pause instead), then pauses the run at the `environment` stage with a reason starting `environment fault before dev session dispatch`; the relaunch stays refunded and nothing else is charged. Fix the environment and run `bmad-loop resume <run-id>`: the probes re-run, then the relaunch dispatches from the attempt baseline. A review relaunch is probed by the review dispatch gate the same way. A fix relaunch skips the probes.
+
+### Silent hook channel pauses
+
+A session completes only on its CLI's hook events. When no hook event of any kind reached a session before it timed out or stalled, on a CLI whose profile maps `SessionStart`, the fault is the hook channel, not the agent's work. A dev, review, fix, blocking-workflow, sweep triage or migration session in that state pauses uncharged with a reason of the form:
+
+```text
+hook channel silent: triage session timeout (no hook event of any kind arrived for this attempt — the CLI's hook relay may be unregistered, untrusted, or running without the window's BMAD_LOOP_* environment; run `bmad-loop validate`, commit any hook-config fix before `bmad-loop resume`, and see the CLI's first-run note; the attempt is not charged)
+```
+
+A sweep pause also carries the `[result.json: …; hook events: none]` diagnostic. A `result.json` the session wrote is never read as a completion. The journal's decision row and `session-end` row carry `hook_channel_silent: true`.
+
+Likely causes: the relay is not registered in the CLI's hook config, Codex hooks are untrusted or Codex attached to its [shared app-server daemon](setup-guide.md#codex-shared-app-server-daemon), or the window lost its `BMAD_LOOP_*` environment.
+
+To recover:
+
+1. `bmad-loop validate` and fix what it reports. Check the CLI's [first-run note](setup-guide.md#first-run-notes) too: a Codex hook trust prompt left unanswered silences every hook.
+2. Commit any hook-config fix. A resume or re-arm can reset uncommitted changes in the checkout, the fix included.
+3. A story run: `bmad-loop resolve <run-id> --no-interactive`, which re-arms with a fresh budget and resumes. A sweep: `bmad-loop resume <run-id>`, which restarts triage or the migration with a fresh budget.
+
+`run`, `sweep` and `resume` also warn at launch when a role's relay looks unregistered (see [`run`](reference/cli.md#run)).
 
 ## Worktree merge-back failures
 
