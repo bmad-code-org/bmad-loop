@@ -918,9 +918,11 @@ class _RelayRegistration:
 def _read_relay_registration(project: Path, profile: CLIProfile) -> _RelayRegistration:
     """The registration core ``validate``'s ``hooks.*`` checks and the launch
     warning (:func:`_warn_hook_relay_unregistered`) share. It reads only
-    ``project / profile.hooks.config_path``: a relay registered in a user- or
-    local-scope settings file is invisible here. A read error other than invalid
-    JSON propagates, as it always has for validate."""
+    ``project / profile.hooks.config_path``. Project-only is the contract
+    (DW-645): a relay registered in a user- or local-scope settings file (or a
+    CLI's managed/plugin hooks) is not seen here, though the CLI may still merge
+    it; ``bmad-loop init`` registers the relay in the project config. A read error
+    other than invalid JSON propagates, as it always has for validate."""
     hook_config = project / profile.hooks.config_path
     registered = False
     fault: str | None = None
@@ -1383,8 +1385,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else:
             report.fail(
                 "hooks.registered",
-                f"bmad-loop hooks not registered for {profile.name} — "
-                f"run `bmad-loop init --cli {profile.name}`",
+                f"bmad-loop hooks not registered for {profile.name} in {hook_config} — "
+                f"run `bmad-loop init --cli {profile.name}` to register the relay there "
+                "(validate reads only the project hook config; a user- or local-scope "
+                "registration is not seen)",
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
 
@@ -2711,8 +2715,9 @@ def _warn_hook_relay_unregistered(
     event per affected role. It never refuses and never touches stdout or the rc.
 
     The wording hedges ("may be unregistered") because the check reads only the
-    project hook config (:func:`_read_relay_registration`), and the CLI may merge
-    hooks from user- or local-scope settings too.
+    project hook config (:func:`_read_relay_registration`) — the documented
+    contract — while the CLI may merge hooks from user- or local-scope settings
+    too.
 
     Under ``scm.isolation = "worktree"`` the dev primitives
     (:data:`install.DEV_PRIMITIVE_ROLES`) run in provisioned worktrees that register
@@ -2742,8 +2747,8 @@ def _warn_hook_relay_unregistered(
             f"{', '.join(profile_roles)} ({name}): the bmad-loop hook relay may be "
             f"unregistered — {problem}. A session whose hook events never arrive runs "
             "to session_timeout_min instead of completing. This check reads only the project "
-            "hook config: run `bmad-loop validate`, or register the relay with "
-            f"`bmad-loop init --cli {name}`."
+            "hook config, not user- or local-scope settings: run `bmad-loop validate`, or "
+            f"register the relay in the project config with `bmad-loop init --cli {name}`."
         )
         if after_silent_pause:
             message += (

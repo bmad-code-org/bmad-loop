@@ -122,7 +122,7 @@ breaking changes may land in a minor release.
   `read_only` voids a reusable verify pass, and the gate declines `plugin-hook`.
 - Warn on stderr at `run`, `sweep` and `resume`, and journal `hook-relay-unregistered`
   per role, when a role's project hook config does not register the bmad-loop relay;
-  never refuses the launch (#752).
+  never refuses the launch (#752). It reads only the project hook config and says so.
 - Add `resolve --adopt-result` for a sweep paused `hook channel silent:` on triage: show
   the attempt's `result.json` and, on an explicit `y` (never skipped), have the resumed
   sweep use it as the triage plan after re-checking its sha256 and validating it against
@@ -136,6 +136,9 @@ breaking changes may land in a minor release.
 
 ### Changed
 
+- Name the project hook config in `validate`'s `hooks.registered` problem and state the
+  contract: only the project config is read, where `bmad-loop init` registers the relay;
+  a user- or local-scope registration is not seen.
 - **Require Codex 0.156 or newer.** Codex sessions run with `--no-daemon`, so tools and
   hooks see the session's `BMAD_LOOP_*` environment instead of a shared app-server
   daemon's (`validate`: `adapter.codex-version`). A session whose CLI sends no

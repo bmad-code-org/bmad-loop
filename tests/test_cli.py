@@ -15181,6 +15181,9 @@ def test_real_run_warns_and_journals_when_relay_unregistered(project, monkeypatc
     config = project.project / ".claude/settings.json"
     assert line.startswith(f"warning: dev, review (claude): {_RELAY_MARK} — {config} does not")
     assert "`bmad-loop validate`" in line and "`bmad-loop init --cli claude`" in line
+    # DW-645: the project-only contract is stated, not just implied
+    assert "not user- or local-scope settings" in line
+    assert "in the project config with `bmad-loop init --cli claude`" in line
     assert _SILENT_RESUME_MARK not in line
     entries = _relay_journal(project.project / ".bmad-loop" / "runs" / run_id)
     assert [(e["role"], e["profile"]) for e in entries] == [
@@ -15338,7 +15341,10 @@ def test_relay_warning_never_writes_stdout_under_json(project, monkeypatch, caps
     assert [(f["severity"], f["message"]) for f in registered] == [
         (
             "problem",
-            "bmad-loop hooks not registered for claude — run `bmad-loop init --cli claude`",
+            "bmad-loop hooks not registered for claude in "
+            f"{project.project / '.claude' / 'settings.json'} — run `bmad-loop init --cli "
+            "claude` to register the relay there (validate reads only the project hook "
+            "config; a user- or local-scope registration is not seen)",
         )
     ]
 
