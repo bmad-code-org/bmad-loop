@@ -1737,6 +1737,12 @@ JOURNAL_KINDS = frozenset(
         "max-stories-reached",
         "notify-desktop-unavailable",
         "operator-index-failed",
+        # engine.py `_carry_ignored_story_artifacts`: an ignored spec / park record
+        # copied from the unit worktree to the main checkout, or the fault that
+        # stopped it. `path` and `error` are presence-only in
+        # `diagnostics._JOURNAL_DROP_FIELDS`; `story_key` is aliased.
+        "story-artifact-carried",
+        "story-artifact-carry-failed",
         "park-proof-of-work-skipped",
         "park-record-rollback-failed",
         "plugin-veto",

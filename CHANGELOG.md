@@ -177,6 +177,11 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Carry a gitignored story spec and park record from the unit worktree to the main
+  checkout before teardown under worktree isolation, so finished specs survive and
+  `confirm` can find a story parked at `awaiting-operator`. Journals
+  `story-artifact-carried` / `story-artifact-carry-failed`; sweep bundle specs stay
+  with artifact publication.
 - Open agent task windows detached, so a tmux config `run` or `run-shell` that fails or
   prints when bmad-loop starts the server lands in view-mode on the session's `shell`
   window instead of the agent's pane, where it refused every wake nudge and TUI answer
