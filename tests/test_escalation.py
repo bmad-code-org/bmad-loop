@@ -1246,3 +1246,94 @@ def test_charged_attempts_subtract_refunds():
     assert review_retry_or_exhaust(review_task, POLICY, "r").action == Action.RETRY
     full = _task(review_cycle=POLICY.limits.max_review_cycles)
     assert review_retry_or_exhaust(full, POLICY, "r").action == Action.DEFER
+
+
+# --- noncompletion_verdict (DW-644) ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kw", "verdict", "needles"),
+    [
+        (
+            {"env_fault": True, "env_fault_evidence": "ECONNRESET"},
+            "env-fault",
+            ("environment fault: ECONNRESET",),
+        ),
+        (
+            {"env_fault": True},
+            "env-fault",
+            ("environment fault: transport-failure pattern in session log",),
+        ),
+        (
+            {"parked": True, "parked_evidence": "PermissionPrompt"},
+            "parked",
+            ("parked: PermissionPrompt", "waiting on a human"),
+        ),
+        ({"parked": True}, "parked", ("parked: parked-session signal",)),
+        ({"produced_work": False}, "no-work", ("no work produced: ", "permission prompt")),
+        (
+            {"hook_channel_silent": True},
+            "hook-channel-silent",
+            ("hook channel silent: ", "bmad-loop validate"),
+        ),
+        # precedence mirrors the engine's pause arms
+        ({"env_fault": True, "hook_channel_silent": True}, "env-fault", ("environment fault",)),
+        ({"parked": True, "produced_work": False}, "parked", ("parked: ",)),
+        (
+            {"produced_work": False, "hook_channel_silent": True},
+            "no-work",
+            ("no work produced",),
+        ),
+        (
+            {"env_fault": True, "parked": True, "produced_work": False},
+            "env-fault",
+            ("environment fault",),
+        ),
+    ],
+)
+def test_noncompletion_verdict_classifies_in_pause_arm_order(kw, verdict, needles):
+    got = escalation.noncompletion_verdict(SessionResult(status="timeout", **kw))
+    assert got is not None
+    assert got[0] == verdict
+    note = got[1]
+    for needle in needles:
+        assert needle in note
+    # one line, and nothing pause-shaped: the retro never pauses
+    assert "\n" not in note and "—" not in note
+    assert "resume" not in note and "resolve" not in note and "not charged" not in note
+
+
+@pytest.mark.parametrize(
+    ("kw", "verdict"), [({"env_fault": True}, "env-fault"), ({"parked": True}, "parked")]
+)
+def test_noncompletion_verdict_usage_limit_keeps_verdict_and_names_the_limit(kw, verdict):
+    result = SessionResult(
+        status="stalled",
+        usage_limited="You've hit your limit",
+        usage_limit_resets="2026-11-13T18:00:00+00:00",
+        **kw,
+    )
+    assert escalation.noncompletion_verdict(result) == (
+        verdict,
+        "usage limit: You've hit your limit; resets 2026-11-13T18:00:00+00:00",
+    )
+    no_reset = dataclasses.replace(result, usage_limit_resets=None)
+    assert escalation.noncompletion_verdict(no_reset) == (
+        verdict,
+        "usage limit: You've hit your limit",
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        SessionResult(status="completed"),
+        # a completed session's flags are not a non-completion cause
+        SessionResult(status="completed", hook_channel_silent=True, produced_work=False),
+        SessionResult(status="stalled"),
+        SessionResult(status="crashed"),
+    ],
+    ids=["completed", "completed-flagged", "stalled", "crashed"],
+)
+def test_noncompletion_verdict_none_without_a_classified_cause(result):
+    assert escalation.noncompletion_verdict(result) is None

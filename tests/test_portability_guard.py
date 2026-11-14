@@ -927,6 +927,10 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "model",
         "name",
         "next",
+        # `retro-auto-failed` (DW-644): why the retro session did not complete, a
+        # closed `escalation.noncompletion_verdict` token (env-fault / parked /
+        # no-work / hook-channel-silent); the free-text note rides the notice only.
+        "noncompletion",
         "normalized",
         "ok",
         # `old_baseline` is NOT here any more: it moved to `_JOURNAL_ALIAS_FIELDS`

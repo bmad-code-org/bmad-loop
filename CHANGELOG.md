@@ -296,6 +296,9 @@ breaking changes may land in a minor release.
 - Stop blaming validation for a sweep session that never completed: its cap reads
   `session failed:`, and the next attempt gets no `--feedback` claiming its output
   failed validation (#752).
+- Name why a failed auto retrospective's session did not complete (hook channel silent,
+  environment fault, parked or no work) in its notice and on `retro-auto-failed`
+  (`noncompletion`), instead of a generic failure.
 
 ### Security
 
