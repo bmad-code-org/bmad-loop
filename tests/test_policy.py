@@ -784,6 +784,25 @@ def test_max_usage_relaunches_default_parse_and_template():
         policy.loads("[limits]\nmax_usage_relaunches = -1\n")
 
 
+def test_session_start_exit_default_parse_and_template():
+    import tomllib
+
+    # defaults off (opt-in); overridable to true
+    assert policy.loads("").limits.session_start_exit is False
+    loaded = policy.loads("[limits]\nsession_start_exit = true\n")
+    assert loaded.limits.session_start_exit is True
+    # the emitted template documents the knob at its dataclass default
+    doc = tomllib.loads(policy.POLICY_TEMPLATE)
+    assert doc["limits"]["session_start_exit"] == policy.LimitsPolicy.session_start_exit
+
+
+def test_session_start_exit_rejects_non_boolean():
+    """Ablation: parse the key with a bare `limits_d.get` instead of
+    `_typed_bool`; this test fails because the string is accepted."""
+    with pytest.raises(policy.PolicyError, match=r"limits\.session_start_exit must be a boolean"):
+        policy.loads('[limits]\nsession_start_exit = "true"\n')
+
+
 def test_dev_contract_nudge_default_parse_and_template():
     import tomllib
 

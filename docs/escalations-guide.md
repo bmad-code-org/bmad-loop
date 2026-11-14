@@ -313,6 +313,8 @@ A session completes only on its CLI's hook events. When no hook event of any kin
 hook channel silent: triage session timeout (no hook event of any kind arrived for this attempt — the CLI's hook relay may be unregistered, untrusted, or running without the window's BMAD_LOOP_* environment; run `bmad-loop validate`, commit any hook-config fix before `bmad-loop resume`, and see the CLI's first-run note; the attempt is not charged)
 ```
 
+By default such a session runs to `[limits] session_timeout_min` before it pauses. With `[limits] session_start_exit = true`, one whose CLI maps `SessionStart` ends non-completed at `[limits] session_start_grace_s` (default 120 s) instead, as `stalled`, and takes the same uncharged pauses: `hook channel silent:`, or `parked:` when the visible pane shows a parked prompt at that moment (Claude Code's workspace-trust dialog matches one), or `no work produced:` when the pane never changed (a static startup dialog no parked pattern matches, such as Codex's "Update available" prompt).
+
 A sweep pause also carries the `[result.json: …; hook events: none]` diagnostic. A `result.json` the session wrote is never read as a completion. The journal's decision row and `session-end` row carry `hook_channel_silent: true`.
 
 Likely causes: the relay is not registered in the CLI's hook config, Codex hooks are untrusted or Codex attached to its [shared app-server daemon](setup-guide.md#codex-shared-app-server-daemon), or the window lost its `BMAD_LOOP_*` environment.

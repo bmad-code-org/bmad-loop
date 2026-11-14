@@ -137,9 +137,17 @@ class LimitsPolicy:
     # a terminal spec/result.
     dev_stall_grace_s: int = 600
     # seconds a session whose CLI maps SessionStart may run without one before
-    # the journal gets a one-shot session-start-missing notice. Observation only:
-    # no deadline, nudge or verdict depends on it. 0 = off.
+    # the journal gets a one-shot session-start-missing notice. With
+    # session_start_exit off (the default) it is observation only: no deadline,
+    # nudge or verdict depends on it. 0 = off (the notice and the exit).
     session_start_grace_s: int = 120
+    # Opt-in early exit at session_start_grace_s: a session whose CLI maps
+    # SessionStart and whose wait loop has heard no hook event of any kind by
+    # the grace ends non-completed instead of running to session_timeout_min,
+    # taking the existing uncharged pauses at the grace (hook channel silent, or
+    # parked / no work produced when the pane shows a parked prompt or never
+    # changed). Never a completion path. False keeps the notice observation only.
+    session_start_exit: bool = False
     # how many best-effort wake nudges a silent dev/review session receives on
     # dev_stall_grace_s expiry before it is called stalled. Transport activity
     # re-arms the grace without spending a nudge; fresh Stop/idle evidence also
@@ -1078,6 +1086,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         session_start_grace_s=_typed_int(
             limits_d, "limits", "session_start_grace_s", LimitsPolicy.session_start_grace_s
         ),
+        session_start_exit=_typed_bool(
+            limits_d, "limits", "session_start_exit", LimitsPolicy.session_start_exit
+        ),
         dev_stall_nudges=_typed_int(
             limits_d, "limits", "dev_stall_nudges", LimitsPolicy.dev_stall_nudges
         ),
@@ -1610,7 +1621,8 @@ git_timeout_s = 120          # bound on any single git subprocess; exceeding it 
 teardown_grace_s = 20        # verified teardown: poll a killed session window up to this long, then force-kill its pane pids and re-kill (#157). 0 = single unverified best-effort kill
 stop_without_result_nudges = 1
 dev_stall_grace_s = 600      # silence grace armed at dev/review launch and re-armed by transport activity or fresh Stop/idle evidence before bounded recovery; also the transcript-idle notice threshold (journal session-idle/session-active, TUI idle age). 0 = no launch timer (and no idle notice), but a result-less turn end still fails fast
-session_start_grace_s = 120  # seconds a session whose CLI maps SessionStart may run without one before a journal-only session-start-missing notice; 0 = off
+session_start_grace_s = 120  # seconds a session whose CLI maps SessionStart may run without one before a session-start-missing journal notice (and, with session_start_exit, the early exit); 0 = off
+session_start_exit = false   # true: a session whose CLI maps SessionStart and that has delivered no hook event of any kind by session_start_grace_s ends there non-completed instead of waiting out session_timeout_min, taking the existing uncharged pauses (hook channel silent, or parked / no work produced when the pane shows a parked prompt or never changed). false: the notice stays observation only
 dev_stall_nudges = 2         # best-effort wake nudges per silent grace before stalling; fresh Stop/idle evidence restores this budget. 0 = stall on grace expiry
 dev_stall_nudges_cap = 6     # total (never-restored) nudge bound per dev/review session; bounds launch-time recovery and Stop/idle budget refills because an accepted nudge does not guarantee a wake. 0 = stall on first grace expiry
 workflow_stall_nudges_cap = 3 # total (never-restored) stall nudges for an injected plugin-workflow session before it is called stalled; bounds a session that finished its work but never wrote its completion marker. 0 = stall on first grace expiry

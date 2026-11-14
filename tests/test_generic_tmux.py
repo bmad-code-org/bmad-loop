@@ -15090,10 +15090,11 @@ def test_unparsed_reset_is_crumbed_and_kept_raw(tmp_path, monkeypatch, clause, r
 
 # ------------------------------- session-start-missing notice
 #
-# Observation only. A session whose profile maps SessionStart but that has run
-# `limits.session_start_grace_s` without one gets one latched journal entry; a
-# Codex profile's entry names the shared-daemon cause. Nothing here ends, nudges
-# or reclassifies the session.
+# Observation only (with `limits.session_start_exit` off, the default; the
+# opt-in exit has its own section below). A session whose profile maps
+# SessionStart but that has run `limits.session_start_grace_s` without one gets
+# one latched journal entry; a Codex profile's entry names the shared-daemon
+# cause. Nothing here ends, nudges or reclassifies the session.
 
 
 def _start_missing_adapter(tmp_path, monkeypatch, *, hooks_from="claude", grace=None):
@@ -15267,6 +15268,292 @@ def test_session_start_missing_journal_write_failure_is_swallowed(tmp_path, monk
     assert result.status == "timeout"
     assert attempts == ["session-start-missing", "session-start-missing"]
     assert [e["waited_s"] for e in _start_missing_entries(adapter)] == [150]
+
+
+# ------------------------------- session-start early exit (opt-in)
+#
+# `limits.session_start_exit`: a session whose profile maps SessionStart and
+# whose wait loop has heard no hook event of any kind by
+# `session_start_grace_s` ends there non-completed (via `stall_exit`), so the
+# hook-channel-silent stamp routes it to the uncharged pause. Off by default.
+# The `_start_missing_*` harness scripts one heartbeat per watcher call (waited
+# 0, 30, 60, 90, 120 ...), so the default 120 s grace is crossed at call 5.
+
+
+def _start_exit_adapter(tmp_path, monkeypatch, **kw):
+    adapter, clock, sent = _start_missing_adapter(tmp_path, monkeypatch, **kw)
+    adapter._session_start_exit = True
+    return adapter, clock, sent
+
+
+def _run_start_exit(adapter, clock, tmp_path, events=(), handle=None):
+    """`_run_start_missing` with the watcher's call count exposed and an optional
+    (pinned) handle."""
+    watcher = _ScriptedWatcher(list(events), on_call=_start_missing_script(clock))
+    adapter.watcher = watcher
+    result = adapter.wait_for_completion(
+        handle or _budget_handle(), _budget_spec(tmp_path, mode="off", timeout_s=5000.0)
+    )
+    return result, watcher.calls
+
+
+def _start_exit_crumbs(adapter):
+    return _lifecycle_events(adapter, "session-start-exit", task_id="b-1")
+
+
+def _later_stop(root):
+    """Six silent calls, then a Stop that would complete the session (result.json
+    is on disk): an exit at the grace (call 5) must come before it."""
+    transcript = root / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    return [None] * 6 + [_stop_event("b-1", "sess", str(transcript))]
+
+
+def test_session_start_exit_ends_a_silent_session_at_grace(tmp_path, monkeypatch):
+    """Switch on, no hook event by the 120 s grace: the notice is journaled, a
+    `session-start-exit` crumb written, and the session ends `stalled` +
+    `hook_channel_silent` at call 5, ahead of the Stop the script would deliver at
+    call 7. No nudge is sent, the result.json on disk is never read, and the
+    engine's pause arms route it to the silent-channel pause.
+
+    ABLATION: drop the `_session_start_exit_due` return in the heartbeat block and
+    the session completes on the Stop at call 7."""
+    from bmad_loop import escalation
+    from bmad_loop.model import StoryTask
+
+    adapter, clock, sent = _start_exit_adapter(tmp_path, monkeypatch)
+    (adapter.tasks_dir / "b-1" / "result.json").write_text('{"ok": true}')
+    result, calls = _run_start_exit(adapter, clock, tmp_path, events=_later_stop(tmp_path))
+    assert calls == 5
+    assert result.status == "stalled"
+    assert result.hook_channel_silent is True
+    assert result.parked is False
+    assert result.result_json is None
+    assert sent == []
+    assert [e["waited_s"] for e in _start_missing_entries(adapter)] == [120]
+    (crumb,) = _start_exit_crumbs(adapter)
+    assert (crumb["waited_s"], crumb["grace_s"]) == (120.0, 120.0)
+    assert adapter.mux.captures == ["@1"]  # one look at the pane for a parked prompt
+    # The dev arm pauses it, even on a spent attempt budget (uncharged).
+    task = StoryTask(story_key="9-0-x", epic=9, attempt=99)
+    decision = escalation.decide_dev(task, result, None, Policy())
+    assert decision.action == escalation.Action.PAUSE
+    assert decision.reason.startswith(escalation.HOOK_CHANNEL_SILENT_PREFIX)
+
+
+def test_session_start_exit_on_dev_adapter_precedes_the_stall_nudge(tmp_path, monkeypatch):
+    """The dev/review adapter arms a stall timer and wake nudges (default
+    `dev_stall_grace_s` 600 s, past the 120 s grace): a silent session there ends
+    `stalled` + `hook_channel_silent` at the grace, with the crumb and without a
+    single nudge typed into the pane.
+
+    ABLATION: drop the `_session_start_exit_due` return in the heartbeat block and
+    the session runs on past call 5 until the stall grace expires and a wake nudge
+    reaches the mux."""
+    monkeypatch.setattr(generic, "RESULT_GRACE_S", 0.0)
+    monkeypatch.setattr(generic, "RESULT_POLL_S", 0.0)
+    mux = _UnitMux()
+    adapter, _ = make_dev_adapter(tmp_path, mux=mux)
+    assert adapter._stall_grace_s == 600.0 and adapter._stall_nudges > 0  # read from policy
+    adapter._session_start_exit = True
+    adapter._window_alive = lambda handle: True
+    adapter.journal = _FakeJournal()
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        monotonic = staticmethod(lambda: clock["t"])
+        time = staticmethod(lambda: 0.0)
+        sleep = staticmethod(lambda *_: None)
+        time_ns = staticmethod(lambda: 0)
+
+    monkeypatch.setattr(generic, "time", _Clock)
+    watcher = _ScriptedWatcher([], on_call=_start_missing_script(clock, end_at=10_000))
+    adapter.watcher = watcher
+    spec = dataclasses.replace(_dev_spec(tmp_path), timeout_s=5000.0)
+    result = adapter.wait_for_completion(_dev_handle(), spec)
+    assert mux.sent == []
+    assert watcher.calls == 5
+    assert result.status == "stalled"
+    assert result.hook_channel_silent is True
+    (crumb,) = _lifecycle_events(adapter, "session-start-exit")
+    assert (crumb["waited_s"], crumb["grace_s"]) == (120.0, 120.0)
+
+
+def test_session_start_exit_off_by_default(tmp_path, monkeypatch):
+    """Without the switch (the policy default) the same session keeps today's
+    behavior: the notice only, and the Stop at call 7 completes it.
+
+    ABLATION: default `LimitsPolicy.session_start_exit` to True and this ends
+    stalled at call 5."""
+    adapter, clock, sent = _start_missing_adapter(tmp_path, monkeypatch)
+    assert adapter._session_start_exit is False  # read from policy
+    (adapter.tasks_dir / "b-1" / "result.json").write_text('{"ok": true}')
+    result, _ = _run_start_exit(adapter, clock, tmp_path, events=_later_stop(tmp_path))
+    assert result.status == "completed"
+    assert sent == []
+    assert len(_start_missing_entries(adapter)) == 1
+    assert _start_exit_crumbs(adapter) == []
+
+
+def test_session_start_exit_off_runs_a_silent_session_to_timeout(tmp_path, monkeypatch):
+    """Switch off and no event at all: the session runs to its timeout, as before.
+
+    ABLATION: same as above — the default flipped ends this stalled at call 5."""
+    adapter, clock, _ = _start_missing_adapter(tmp_path, monkeypatch)
+    result, calls = _run_start_exit(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert calls == 10
+    assert _start_exit_crumbs(adapter) == []
+
+
+@pytest.mark.parametrize("kind", ["foreign", "idless"])
+def test_session_start_exit_skipped_once_any_event_is_heard(tmp_path, monkeypatch, kind):
+    """Any event the channel delivers proves the relay fires, even one attribution
+    drops as foreign (a never-own id under a pinned launch) or admits without a
+    session id; neither is a SessionStart, so the notice still fires, but the
+    session is not ended early.
+
+    ABLATION: gate the exit on `saw_session_start` instead of
+    `_hook_events_heard` and both rows end stalled at call 5."""
+    adapter, clock, _ = _start_exit_adapter(tmp_path, monkeypatch)
+    handle = None
+    if kind == "foreign":
+        handle = SessionHandle(
+            task_id="b-1", native_id="@1", launched_ns=0, pinned_session_id=str(uuid.uuid4())
+        )
+        event = _hook_event(
+            "SessionEnd", task_id="b-1", session_id="never-own", transcript_path="/x.jsonl"
+        )
+    else:
+        event = _hook_event("Notification", task_id="b-1", session_id=None)
+    result, _ = _run_start_exit(adapter, clock, tmp_path, events=[event], handle=handle)
+    assert result.status == "timeout"
+    assert result.hook_channel_silent is False
+    dropped = _lifecycle_events(adapter, "foreign-hook-event-ignored", task_id="b-1")
+    assert len(dropped) == (1 if kind == "foreign" else 0)
+    assert len(_start_missing_entries(adapter)) == 1
+    assert _start_exit_crumbs(adapter) == []
+
+
+def test_session_start_exit_skipped_after_session_start(tmp_path, monkeypatch):
+    """An admitted SessionStart is a normal session: no exit, no notice.
+
+    ABLATION: drop the `not self._hook_events_heard` clause and this ends stalled
+    at call 5."""
+    adapter, clock, _ = _start_exit_adapter(tmp_path, monkeypatch)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_bytes(b"{}\n")
+    result, _ = _run_start_exit(adapter, clock, tmp_path, events=[_start_event(transcript)])
+    assert result.status == "timeout"
+    assert _start_exit_crumbs(adapter) == []
+
+
+def test_session_start_exit_skipped_for_profile_without_session_start(tmp_path, monkeypatch):
+    """Antigravity maps only Stop, so silence until the grace is its normal shape,
+    not a lost channel.
+
+    ABLATION: drop the SessionStart gate and this ends stalled at call 5."""
+    adapter, clock, _ = _start_exit_adapter(tmp_path, monkeypatch, hooks_from="antigravity")
+    assert "SessionStart" not in adapter.profile.hooks.events.values()
+    result, _ = _run_start_exit(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert _start_exit_crumbs(adapter) == []
+
+
+def test_session_start_exit_skipped_for_hookless_profile(tmp_path, monkeypatch):
+    """A hookless profile (hook dialect `none`) has no channel to lose. A valid
+    one maps no events at all, so the SessionStart gate already skips it; the
+    event table is kept here to pin the `hookless` clause on its own, mirroring
+    `_hook_channel_silent`.
+
+    ABLATION: drop the `hookless` gate and this ends stalled at call 5."""
+    adapter, clock, _ = _start_exit_adapter(tmp_path, monkeypatch)
+    hooks = dataclasses.replace(adapter.profile.hooks, dialect="none")
+    adapter.profile = dataclasses.replace(adapter.profile, hooks=hooks)
+    assert adapter.profile.hookless
+    assert "SessionStart" in adapter.profile.hooks.events.values()
+    result, _ = _run_start_exit(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert _start_exit_crumbs(adapter) == []
+
+
+def test_session_start_exit_disabled_at_zero_grace(tmp_path, monkeypatch):
+    """Grace 0 turns the exit off along with the notice.
+
+    ABLATION: drop the `grace > 0` clause and this ends stalled on the first
+    heartbeat (waited 0 >= grace 0)."""
+    adapter, clock, _ = _start_exit_adapter(tmp_path, monkeypatch, grace=0.0)
+    result, _ = _run_start_exit(adapter, clock, tmp_path)
+    assert result.status == "timeout"
+    assert _start_missing_entries(adapter) == []
+    assert _start_exit_crumbs(adapter) == []
+
+
+def test_session_start_exit_on_parked_pane_ends_parked(tmp_path, monkeypatch):
+    """A startup dialog that matches a parked pattern (the claude footer Claude's
+    workspace-trust prompt paints) ends the session parked with that evidence,
+    so the parked pause arm takes it ahead of the silent-channel one.
+
+    ABLATION: pass None instead of the pane hit to `stall_exit` and the result is
+    not parked."""
+    adapter, clock, sent = _start_exit_adapter(tmp_path, monkeypatch)
+    adapter.mux = _UnitMux(screen=f"Do you trust the files in this folder?\r\n{BYPASS_FOOTER}\r\n")
+    result, calls = _run_start_exit(adapter, clock, tmp_path)
+    assert calls == 5
+    assert result.status == "stalled"
+    assert result.parked is True
+    assert result.parked_evidence is not None and BYPASS_FOOTER in result.parked_evidence
+    assert result.hook_channel_silent is True
+    assert sent == []
+    assert len(_start_exit_crumbs(adapter)) == 1
+
+
+def test_session_start_exit_on_dead_window_is_crashed(tmp_path, monkeypatch):
+    """`stall_exit`'s liveness re-probe finding the window gone makes the exit a
+    crash, never a stall.
+
+    ABLATION: return the stalled result regardless of the probe in `stall_exit`
+    and this reads `stalled`."""
+    adapter, clock, _ = _start_exit_adapter(tmp_path, monkeypatch)
+    adapter._probe_liveness = lambda handle, site: site != "stall"
+    result, calls = _run_start_exit(adapter, clock, tmp_path)
+    assert calls == 5
+    assert result.status == "crashed"
+    assert result.hook_channel_silent is False
+    assert len(_start_exit_crumbs(adapter)) == 1
+
+
+def test_session_start_exit_held_while_quota_wait_is_open(tmp_path, monkeypatch):
+    """An open usage-limit quota wait holds the exit: the session ends at the wait's
+    cap (500 s) with the usage evidence instead of at the 120 s grace.
+
+    ABLATION: drop the `not quota.waiting` clause and this ends at call 5 with a
+    `session-start-exit` crumb and no usage evidence."""
+    adapter, clock, _ = _start_exit_adapter(tmp_path, monkeypatch)
+    evidence = "pane matched 'x': limit"
+    real_quota_wait = generic._QuotaWait
+
+    def open_wait():
+        return real_quota_wait(
+            waiting=True,
+            started_mono=clock["t"],
+            started_wall=clock["wall"],
+            frozen_remaining=4000.0,
+            evidence=evidence,
+        )
+
+    monkeypatch.setattr(generic, "_QuotaWait", open_wait)
+    watcher = _ScriptedWatcher([], on_call=_start_missing_script(clock, end_at=10_000))
+    adapter.watcher = watcher
+    spec = dataclasses.replace(
+        _budget_spec(tmp_path, mode="off", timeout_s=5000.0), quota_wait_max_s=500.0
+    )
+    result = adapter.wait_for_completion(_budget_handle(), spec)
+    assert result.status == "stalled"
+    assert result.parked is True
+    assert result.usage_limited == evidence
+    assert _start_exit_crumbs(adapter) == []
+    assert len(_start_missing_entries(adapter)) == 1
 
 
 # ------------------------------------------- hook-channel-silent stamp (#752)

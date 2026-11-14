@@ -1297,9 +1297,13 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # policy field; 0 disables the notice along with the stall timer.
         self._idle_threshold_s = float(policy.limits.dev_stall_grace_s)
         # Grace for the one-shot `session-start-missing` journal notice
-        # (`_note_session_start_missing`). Observation only, like the idle notice,
-        # so every adapter reads it, the plain one included; 0 disables it.
+        # (`_note_session_start_missing`). Every adapter reads it, the plain one
+        # included; 0 disables it along with the opt-in early exit below.
         self._session_start_grace_s = float(policy.limits.session_start_grace_s)
+        # Opt-in early non-completion exit at that grace for a session whose
+        # hook channel delivered nothing (`_session_start_exit_due`). Off by
+        # default, leaving the notice observation only.
+        self._session_start_exit = bool(policy.limits.session_start_exit)
         # Wake-nudges to spend on grace expiry before stalling. 0 here is moot for
         # the base adapter (grace 0 never opens the window); the dev adapter sets
         # it from policy so an idle wait is re-invoked rather than killed outright.
@@ -1849,7 +1853,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             None,
         )
         # An admitted SessionStart arrived, and the one-shot `session-start-missing`
-        # notice was journaled; see `_note_session_start_missing`. Observes only.
+        # notice was journaled; see `_note_session_start_missing`. Observes only
+        # (the opt-in early exit gates on `_hook_events_heard`, not on these).
         saw_session_start = False
         session_start_noted = False
         # The first admitted SessionStart carrying a hook `model` (on Codex, the
@@ -2379,6 +2384,23 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     session_start_noted = self._note_session_start_missing(
                         handle, now - loop_started
                     )
+                if not quota.waiting and self._session_start_exit_due(now - loop_started):
+                    # Opt-in early exit (`limits.session_start_exit`): no hook
+                    # event of any kind by the grace is a relay that never
+                    # fires, so end now rather than at the session timeout.
+                    # Non-completed only, through `stall_exit` (a dead window is
+                    # `crashed`); the funnel stamps `hook_channel_silent`. One
+                    # look at the pane first, so a startup dialog that matches
+                    # a parked pattern (Claude's workspace-trust prompt) ends
+                    # parked and pauses as one.
+                    self._note_lifecycle(
+                        handle.task_id,
+                        "session-start-exit",
+                        waited_s=round(now - loop_started, 3),
+                        grace_s=self._session_start_grace_s,
+                    )
+                    (start_parked,) = self._pane_evidence(handle, self._parked_prompt_patterns)
+                    return stall_exit(start_parked[0] if start_parked else None, None)
                 self._write_heartbeat(
                     handle.task_id,
                     {
@@ -3579,6 +3601,23 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                 idle.open_since = idle.last_change_wall
         return True
 
+    def _session_start_exit_due(self, waited_s: float) -> bool:
+        """Whether the opt-in early exit (`limits.session_start_exit`) ends the
+        session now: the switch is on, the grace is positive and has elapsed,
+        the profile maps SessionStart (and is not hookless), and the wait loop
+        has heard no hook event of any kind — admitted, foreign or id-less. The
+        gate is the channel, not SessionStart: any event proves the relay fires.
+        Same profile gate as `_hook_channel_silent`, so a stalled exit here is
+        always stamped `hook_channel_silent`; the existing pause arms route it."""
+        return (
+            self._session_start_exit
+            and self._session_start_grace_s > 0
+            and waited_s >= self._session_start_grace_s
+            and not self._hook_events_heard
+            and not self.profile.hookless
+            and "SessionStart" in self.profile.hooks.events.values()
+        )
+
     def _note_session_start_missing(self, handle: SessionHandle, waited_s: float) -> bool:
         """Journal one `session-start-missing` (`task_id`, `waited_s`, `grace_s`,
         `cli`) for a session whose profile maps SessionStart but that has run
@@ -3590,10 +3629,11 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         relay that exits silently, so the session would otherwise look healthy
         until `session_timeout_min`. A `codex-hooks-json` profile adds `hint`,
         naming that cause. Observation only: no deadline, nudge or verdict reads
-        it, and it fires on the plain adapter too, which arms no stall timer. No
-        journal, grace 0, a window that is not alive (or a liveness probe that
-        raised) or an unwritable journal writes nothing and leaves it unlatched,
-        and the session runs on."""
+        it (the opt-in early exit, `_session_start_exit_due`, applies its own
+        gate after it), and it fires on the plain adapter too, which arms no
+        stall timer. No journal, grace 0, a window that is not alive (or a
+        liveness probe that raised) or an unwritable journal writes nothing and
+        leaves it unlatched, and the session runs on."""
         if (
             self.journal is None
             or "SessionStart" not in self.profile.hooks.events.values()

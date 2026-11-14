@@ -163,7 +163,13 @@ key = "session_start_grace_s"
 kind = "int"
 minimum = 0
 default_ref = "LimitsPolicy.session_start_grace_s"
-description = "seconds a session whose CLI maps SessionStart may run without one before a journal-only session-start-missing notice; 0 = off"
+description = "seconds a session whose CLI maps SessionStart may run without one before a session-start-missing journal notice (and, with the session start exit switch on, the early exit) · 0 = off"
+[[section.field]]
+key = "session_start_exit"
+kind = "switch"
+default_ref = "LimitsPolicy.session_start_exit"
+label = "session start exit"
+description = "ON: a session whose CLI maps SessionStart and that has delivered no hook event of any kind by the session start grace ends there non-completed instead of waiting out the session timeout, taking the existing uncharged pauses (hook channel silent, or parked / no work produced when the pane shows a parked prompt or never changed) · OFF: the session-start-missing notice stays observation only"
 [[section.field]]
 key = "dev_stall_nudges"
 kind = "int"
