@@ -232,7 +232,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `auto` runs `/bmad-retrospective -H <epic>` on the `[adapter.retro]` role (falling back to the base `[adapter]` when that is unset), before the per-epic auto-sweep.
   - An auto retro succeeds only if the session completed, result.json says done, the board reads done and a retro doc exists. It is then committed as `chore(retro): epic N retrospective`.
   - A failed or refused auto retro (unless already done) tells you to run it by hand and never fails the run. If it leaves uncommitted changes, the run pauses at the epic boundary.
-  - When a failed auto retro's session did not complete, the notice names why (hook channel silent, environment fault, parked or no work) and `retro-auto-failed` records it as `noncompletion`. This is diagnostic only: the run neither pauses nor retries on it.
+  - When a failed auto retro's session did not complete for a classified cause (hook channel silent, environment fault, parked or no work), the notice names it and `retro-auto-failed` records it as `noncompletion`. A plain crash or stall carries neither. This is diagnostic only: the run neither pauses nor retries on it.
   - The retro doc's verdict is reported in the done notice. A `rejected` verdict sends an extra attention notice, and the run continues.
   - In tickets mode `auto` runs `/bmad-retrospective -H <epic-slug>`, and whatever the `retrospective` value the run pauses at `epic-boundary` for you to close the epic with bmad-agent-po. A `rejected` verdict pauses again at every pick while the epic stays open.
 - **Config:** `[gates] retrospective`, `[adapter.retro] name` / `model` / `effort` / `extra_args`
