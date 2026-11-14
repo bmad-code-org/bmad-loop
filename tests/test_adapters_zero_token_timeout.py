@@ -111,3 +111,27 @@ def test_usage_read_fault_leaves_verdict_unchanged(tmp_path, exc):
     result = adapter.run(_spec(tmp_path))
     assert result == scripted
     assert adapter.usage_reads == 1
+
+
+def test_silent_channel_timeout_is_not_reclassified_env_fault(tmp_path):
+    """#752: a silent hook channel carries no `transcript_path` (only a hook
+    supplies it), so the generic adapter's `read_usage` returns None and the
+    zero-token post-mortem leaves the timeout alone: the silent-channel pause,
+    not the env-fault one, owns it, and the stamp rides through `run()`.
+    ABLATION: have `read_usage` return a zero TokenUsage for a transcript-less
+    result and this fails."""
+    from bmad_loop.adapters.generic import GenericTmuxAdapter
+    from bmad_loop.adapters.profile import get_profile
+    from bmad_loop.policy import Policy
+
+    silent = SessionResult(status="timeout", hook_channel_silent=True)
+    generic = GenericTmuxAdapter(
+        run_dir=tmp_path / "run", policy=Policy(), profile=get_profile("claude")
+    )
+    assert generic.read_usage(silent) is None
+    assert generic._classify_zero_token_timeout(silent) == silent
+
+    adapter = _CountingAdapter([silent], usage_per_session=None)
+    result = adapter.run(_spec(tmp_path))
+    assert result.env_fault is False
+    assert result.hook_channel_silent is True

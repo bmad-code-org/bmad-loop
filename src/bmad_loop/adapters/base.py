@@ -419,6 +419,19 @@ class SessionResult:
     # `wait_for_completion` returns. Diagnostic, plus #959 usage-relaunch
     # routing (`account` qualifies, `account-fatal` never does). APPENDED.
     stop_failure_action: str | None = None
+    # Lost-hook-channel signal (#752): the session ended `timeout` or `stalled`
+    # on a hook-signal adapter whose profile maps `SessionStart`, and NO hook
+    # event of any kind — admitted, foreign or id-less — reached the wait loop
+    # for this attempt. On a working relay even a hung agent delivers its
+    # SessionStart, so this means the relay never fired: unregistered, untrusted
+    # hooks, a CLI attached to a shared daemon, or a window that lost its
+    # BMAD_LOOP_* environment. Stamped only by `GenericAdapter.wait_for_completion`;
+    # `False` on every other adapter (MockAdapter, opencode-http's SSE channel),
+    # on a Stop-only or hookless profile, and on every completed, crashed,
+    # over_budget or aborted result. It NEVER makes a session complete and never
+    # reads result.json: it only routes a non-completed session to an uncharged
+    # pause instead of a charged retry. APPENDED.
+    hook_channel_silent: bool = False
 
 
 class CodingCLIAdapter(ABC):

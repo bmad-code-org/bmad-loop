@@ -846,6 +846,12 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "grace_s",
         "graceful",
         "harvest_attempt",
+        # `triage-decision` / `migrate-decision` / `dev-decision` /
+        # `fix-decision` / `workflow-end` / `session-end` (#752): whether no hook
+        # event of any kind reached the attempt. A bare boolean about the channel
+        # — it names no story, no path and no text, and `True` routed the result
+        # to the uncharged silent-channel PAUSE.
+        "hook_channel_silent",
         # `quota-wait-ended` (DW-396): what ended the wait, a closed slug the
         # adapter chose (`transcript-active` / `latch` / `cap` / `session-exit`);
         # `session-unparked` (#855) likewise (`stop` / `activity` / `ended`).
@@ -1101,6 +1107,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # row. `reason` is still written beside it, unchanged, carrying the same
         # token — this field adds a surviving copy, it does not replace one.
         "stop_cause",
+        # `session-end` (#752 forensics): a `Stop` hook arrived on a session that
+        # still ended non-completed. A bare present-only `True`, no text.
+        "stop_seen",
         "strategy",
         # `session-parked` (#855): the hook Notification subtype that latched
         # the prompt (`permission_prompt`, `elicitation_dialog`, ...), a CLI
@@ -1331,6 +1340,8 @@ JOURNAL_SPLAT_FIELDS = {
             "env_fault",
             "env_fault_evidence",
             "session_vanished",
+            "hook_channel_silent",
+            "stop_seen",
             "parked",
             "parked_evidence",
             "usage_limited",
@@ -1533,6 +1544,11 @@ JOURNAL_KINDS = frozenset(
         # profile's bypass tokens — one per affected launched role. `role`,
         # `profile` and `missing` are config names/flags from the resolved profile.
         "bypass-dropped",
+        # #752: a real launch whose hooked role's project hook config does not
+        # register the relay — one per affected launched role. `role` and
+        # `profile` are config names; `problem` (benign by name) is a prose
+        # sentence naming the config path, which `scrub_json` redacts whole.
+        "hook-relay-unregistered",
         # DW-591: `resolve --at-reset`'s wait for a usage-limit reset — its start
         # (`reset_at`, `margin_min`, `wake_at`) and end (`wake_at`, `interrupted`,
         # `waited_s`); every field declared benign.

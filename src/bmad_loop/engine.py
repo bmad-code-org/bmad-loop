@@ -51,6 +51,7 @@ from .escalation import (
     display_pause_reason,
     env_fault_claim,
     env_fault_pause_reason,
+    hook_channel_silent_pause_reason,
     no_work_pause_reason,
     parked_pause_reason,
     pause_title,
@@ -3232,6 +3233,8 @@ class Engine:
                     wf_extras["parked_evidence"] = result.parked_evidence
             if not result.produced_work:
                 wf_extras["produced_work"] = False
+            if result.hook_channel_silent:
+                wf_extras["hook_channel_silent"] = True
             if result.usage_limited:
                 wf_extras["usage_limited"] = result.usage_limited
             if result.usage_limit_resets:
@@ -3279,6 +3282,17 @@ class Engine:
                     self._escalate(
                         task,
                         no_work_pause_reason(f"blocking workflow {wf.name!r} ({lp.name})", result),
+                    )
+                if result.hook_channel_silent:
+                    # No hook event of any kind arrived (#752): the timeout is the
+                    # relay's, not the workflow's — a deferral would charge the
+                    # story for it. Escalate uncharged (re-arm restores the budget),
+                    # after no-work, mirroring that arm.
+                    self._escalate(
+                        task,
+                        hook_channel_silent_pause_reason(
+                            f"blocking workflow {wf.name!r} ({lp.name})", result
+                        ),
                     )
                 reason = session_failure_reason(
                     f"blocking workflow {wf.name!r} ({lp.name})", result
@@ -4137,6 +4151,9 @@ class Engine:
                 # non-completed result to the parked PAUSE.
                 parked=result.parked,
                 parked_evidence=result.parked_evidence,
+                # No hook event of any kind reached the session (#752); True is
+                # what routed a non-completed result to the silent-channel PAUSE.
+                hook_channel_silent=result.hook_channel_silent,
                 # An uncharged usage relaunch (#959) and the story's running
                 # count of them (dev and review together).
                 uncharged=decision.uncharged,
@@ -4155,6 +4172,7 @@ class Engine:
                 produced_work=result.produced_work,
                 parked=result.parked,
                 parked_evidence=result.parked_evidence,
+                hook_channel_silent=result.hook_channel_silent,
                 uncharged=decision.uncharged,
                 usage_relaunches=task.usage_relaunches,
                 env_fault_site=decision.env_site,
@@ -9239,6 +9257,16 @@ class Engine:
         # first frame, so a grep for the field finds exactly the parked sessions.
         if not result.produced_work:
             extras["produced_work"] = False
+        # silent-channel diagnosis (#752): same present-only convention, so a grep
+        # finds exactly the non-completed sessions no hook event of any kind
+        # reached — the relay was unregistered, untrusted or lost its environment.
+        if result.hook_channel_silent:
+            extras["hook_channel_silent"] = True
+        # a turn ended on a session that still did not complete (#752 forensics):
+        # present-only on non-completed rows, where `Stop` arriving is the
+        # informative half — every completed session saw one.
+        if result.stop_seen and result.status != "completed":
+            extras["stop_seen"] = True
         # parked-session diagnosis (DW-348/DW-350): same present-only convention,
         # so a grep for the field finds exactly the sessions whose stall nudge
         # was withheld because the CLI was waiting on a human.
@@ -10482,6 +10510,9 @@ class Engine:
                 parked_evidence=result.parked_evidence,
                 # No work at all (#727): what routed it to the no-work escalate below.
                 produced_work=result.produced_work,
+                # No hook event of any kind (#752): what routed it to the
+                # silent-channel escalate below.
+                hook_channel_silent=result.hook_channel_silent,
                 # An uncharged usage relaunch (#959) and the story's running count.
                 uncharged=relaunch is not None,
                 usage_relaunches=task.usage_relaunches,
@@ -10537,6 +10568,11 @@ class Engine:
                 # same wall. Pause (re-arm restores the budget), after env_fault
                 # and parked, which explain the silence better.
                 self._escalate(task, no_work_pause_reason("fix", result))
+            if result.status != "completed" and result.hook_channel_silent:
+                # No hook event of any kind arrived (#752): the timeout is the
+                # relay's, and another attempt would relaunch into the same silent
+                # channel. Pause (re-arm restores the budget), after no-work.
+                self._escalate(task, hook_channel_silent_pause_reason("fix", result))
             if outcome is not None and not outcome.ok and not outcome.retryable:
                 # escalate-grade failure (environment fault): another repair
                 # session cannot fix the run environment — stop spending the

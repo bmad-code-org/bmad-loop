@@ -14767,6 +14767,240 @@ def test_resume_silent_when_the_bypass_is_kept(project, monkeypatch, capsys):
     assert _bypass_journal(run_dir) == []
 
 
+# ------------------------- #752: unregistered hook relay at a REAL launch
+
+_RELAY_MARK = "the bmad-loop hook relay may be unregistered"
+_SILENT_RESUME_MARK = "resuming will hit the same silent channel"
+
+
+def _relay_err_lines(err: str) -> list[str]:
+    return [ln for ln in err.splitlines() if _RELAY_MARK in ln]
+
+
+def _relay_journal(run_dir) -> list[dict]:
+    from bmad_loop.journal import JOURNAL_FILE
+
+    path = run_dir / JOURNAL_FILE
+    if not path.is_file():
+        return []
+    records = [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+    return [r for r in records if r["kind"] == "hook-relay-unregistered"]
+
+
+def _relay_launch_fixture(project, policy: str, *, registered: bool) -> None:
+    """`_launch_fixture`, with claude's relay registered by `init` first when
+    ``registered`` (before the commit, so the launch's clean-tree gate holds)."""
+    from conftest import git, install_base_skills
+
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    install_base_skills(project)
+    write_sprint(project, {"1-1-a": "ready-for-dev"})
+    _write_policy(project.project, policy)
+    if registered:
+        assert install_into(project.project, clis=("claude",), skills=False) == 0
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "setup")
+
+
+def _call_relay_warning(project, capsys, policy: str, roles, *, profiles=None):
+    """Call `_warn_hook_relay_unregistered` directly; returns its stderr warning
+    lines and its journal entries, after pinning that it wrote no stdout."""
+    from bmad_loop.journal import Journal
+
+    _write_policy(project.project, policy)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    run_dir = project.project / ".bmad-loop" / "runs" / "20990101-000000-r752"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    capsys.readouterr()
+    cli._warn_hook_relay_unregistered(
+        pol, project.project, roles, profiles=profiles, journal=Journal(run_dir)
+    )
+    out, err = capsys.readouterr()
+    assert out == ""
+    return _relay_err_lines(err), _relay_journal(run_dir)
+
+
+def test_real_run_warns_and_journals_when_relay_unregistered(project, monkeypatch, capsys):
+    """#752: a real `run` whose claude relay is not registered in the project hook
+    config prints ONE stderr `warning:` line for the claude-backed roles before
+    the engine runs, hedged ("may be") and pointing at `bmad-loop validate`, and
+    journals one `hook-relay-unregistered` per launched role; rc unchanged.
+
+    ABLATION: delete the `_warn_hook_relay_unregistered` call in `_launch_run`, or
+    its `journal.append` — this reddens."""
+    _relay_launch_fixture(project, '[adapter]\nname = "claude"\n', registered=False)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+
+    run_id = "20990101-000000-r752"
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+    (line,) = _relay_err_lines(seen[0])
+    config = project.project / ".claude/settings.json"
+    assert line.startswith(f"warning: dev, review (claude): {_RELAY_MARK} — {config} does not")
+    assert "`bmad-loop validate`" in line and "`bmad-loop init --cli claude`" in line
+    assert _SILENT_RESUME_MARK not in line
+    entries = _relay_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [(e["role"], e["profile"]) for e in entries] == [
+        ("dev", "claude"),
+        ("review", "claude"),
+    ]
+    assert all(e["problem"] == f"{config} does not exist" for e in entries)
+
+
+def test_registered_relay_and_hookless_profile_stay_silent(project, monkeypatch, capsys):
+    """A registered relay warns nothing at a real launch, and a hookless profile
+    (opencode: HTTP/SSE, no hook config) is skipped even when no config exists.
+
+    ABLATION: make `_warn_hook_relay_unregistered` warn regardless of
+    `_relay_registration_problem` and the registered half reddens; delete its
+    `profile.hookless` skip and the hookless half reddens."""
+    from bmad_loop.adapters.profile import get_profile
+
+    _relay_launch_fixture(project, '[adapter]\nname = "claude"\n', registered=True)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+    run_id = "20990101-000000-r753"
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+    run_dir = project.project / ".bmad-loop" / "runs" / run_id
+    assert run_dir.is_dir()  # control: the run really composed
+    assert _relay_err_lines(seen[0] + capsys.readouterr().err) == []
+    assert _relay_journal(run_dir) == []
+
+    opencode = get_profile("opencode", project.project)
+    assert opencode.hookless
+    (project.project / ".claude/settings.json").unlink()  # claude would warn now
+    lines, journal = _call_relay_warning(
+        project,
+        capsys,
+        '[adapter]\nname = "claude"\n',
+        ("dev", "review"),
+        profiles={"dev": opencode, "review": opencode},
+    )
+    assert lines == [] and journal == []
+
+
+@pytest.mark.parametrize(
+    ("isolation", "warned"),
+    [("worktree", "triage, retro"), ("none", "triage, dev, review, retro")],
+)
+def test_worktree_isolation_checks_only_main_checkout_roles(project, capsys, isolation, warned):
+    """Under `scm.isolation = "worktree"` dev and review run in provisioned
+    worktrees that register the relay themselves, so only triage and retro (the
+    main-checkout roles) are checked; under "none" every launched role is.
+
+    ABLATION: delete the isolation filter and the worktree case reddens."""
+    lines, journal = _call_relay_warning(
+        project,
+        capsys,
+        f'[scm]\nisolation = "{isolation}"\n[adapter]\nname = "claude"\n',
+        ("triage", "dev", "review", "retro"),
+    )
+    (line,) = lines
+    assert line.startswith(f"warning: {warned} (claude): ")
+    assert [e["role"] for e in journal] == warned.split(", ")
+
+
+def test_real_sweep_warns_for_triage_relay(project, monkeypatch, capsys):
+    """#752: a real `sweep` launches triage (in the main checkout) plus the bundle
+    dev/review sessions, so an unregistered relay warns and journals for all
+    three before the engine runs.
+
+    ABLATION: delete the `_warn_hook_relay_unregistered` call in `_start_sweep`
+    and this reddens."""
+    from conftest import git, write_ledger
+
+    _relay_launch_fixture(project, '[adapter]\nname = "claude"\n', registered=False)
+    write_ledger(project, {"DW-1": "open"}, commit=False)
+    git(project.project, "add", "-A")
+    git(project.project, "commit", "-q", "-m", "ledger")
+    seen = _err_at_engine_run(monkeypatch, capsys, "SweepEngine")
+
+    run_id = "20990101-000000-r754"
+    assert cli.main(["sweep", "--project", str(project.project), "--run-id", run_id]) == 0
+    (line,) = _relay_err_lines(seen[0])
+    assert line.startswith("warning: triage, dev, review (claude): ")
+    entries = _relay_journal(project.project / ".bmad-loop" / "runs" / run_id)
+    assert [e["role"] for e in entries] == ["triage", "dev", "review"]
+
+
+@pytest.mark.parametrize(
+    ("paused_reason", "names_the_risk"),
+    [
+        (
+            "hook channel silent: dev session timeout (no hook event reached the session)",
+            True,
+        ),
+        ("escalation", False),
+    ],
+    ids=["silent-pause", "other-pause"],
+)
+def test_resume_after_silent_channel_pause_names_the_risk(
+    project, monkeypatch, capsys, paused_reason, names_the_risk
+):
+    """A resume still warns about an unregistered relay; when the run paused on a
+    silent hook channel, the warning adds that resuming will hit the same silent
+    channel. Any other pause gets the plain warning.
+
+    ABLATION: delete the `_warn_hook_relay_unregistered` call in
+    `_resume_paused_run` and both cases redden; pass `after_silent_pause=True`
+    unconditionally and the other-pause case reddens."""
+    from bmad_loop import runs
+
+    _relay_launch_fixture(project, '[adapter]\nname = "claude"\n', registered=False)
+    run_dir = _make_run_with_state(
+        project.project,
+        "20990101-000000-r755",
+        paused_reason=paused_reason,
+        paused_stage="escalation",
+    )
+    monkeypatch.setattr(runs, "kill_session", lambda rid: None)
+    seen = _err_at_engine_run(monkeypatch, capsys, "Engine")
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    (line,) = _relay_err_lines(seen[0])
+    assert line.startswith("warning: dev, review (claude): ")
+    assert (_SILENT_RESUME_MARK in line) is names_the_risk
+    assert [e["role"] for e in _relay_journal(run_dir)] == ["dev", "review"]
+
+
+def test_relay_warning_never_writes_stdout_under_json(project, monkeypatch, capsys):
+    """The warning is stderr-only. No launch command takes `--json`, so the
+    contract to hold is twofold: a real launch's stdout never carries the warning,
+    and `validate --json` (whose registration core the warning now shares) still
+    prints one JSON object on stdout with its unchanged `hooks.registered` problem.
+
+    ABLATION: print the warning to stdout and the launch half reddens."""
+    _relay_launch_fixture(project, '[adapter]\nname = "claude"\n', registered=False)
+    seen: list[tuple[str, str]] = []
+
+    class _SnapshotEngine(_StubEngine):
+        def run(self):
+            seen.append(tuple(capsys.readouterr()))
+            return super().run()
+
+    monkeypatch.setattr(cli, "Engine", _SnapshotEngine)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: None for r in cli.ROLES})
+    run_id = "20990101-000000-r756"
+    assert cli.main(["run", "--project", str(project.project), "--run-id", run_id]) == 0
+    ((out, err),) = seen
+    assert len(_relay_err_lines(err)) == 1  # control: the warning did fire
+    assert _RELAY_MARK not in out + capsys.readouterr().out
+    assert out.splitlines() == [f"run {run_id} starting (attach: bmad-loop attach)"]
+
+    _rc, doc = _validate_json(project.project, capsys)  # asserts stderr is empty too
+    registered = [
+        f
+        for f in doc["findings"]
+        if f["check"] == "hooks.registered" and f["detail"]["profile"] == "claude"
+    ]
+    assert [(f["severity"], f["message"]) for f in registered] == [
+        (
+            "problem",
+            "bmad-loop hooks not registered for claude — run `bmad-loop init --cli claude`",
+        )
+    ]
+
+
 def test_validate_stories_mode_skips_sprint_gate(project, capsys):
     """Item 8: a stories-mode project (no sprint-status.yaml) validates its
     stories.yaml manifest instead of failing on the missing sprint gate."""

@@ -882,8 +882,73 @@ def _report_bmad_config(report: ValidationReport, paths: bmadconfig.ProjectPaths
         )
 
 
+@dataclass(frozen=True)
+class _RelayRegistration:
+    """One hooked profile's project hook config, read the way ``validate`` reads it.
+
+    ``parsed`` is the loaded JSON (``{}`` when the file is missing or not JSON).
+    ``registered`` is :func:`install.relay_registered` over it, forced False by a
+    malformed handler list. ``fault`` is validate's ``hooks.config-parse`` message,
+    or None when the file is absent or parsed cleanly."""
+
+    config_path: Path
+    parsed: object
+    registered: bool
+    fault: str | None
+
+
+def _read_relay_registration(project: Path, profile: CLIProfile) -> _RelayRegistration:
+    """The registration core ``validate``'s ``hooks.*`` checks and the launch
+    warning (:func:`_warn_hook_relay_unregistered`) share. It reads only
+    ``project / profile.hooks.config_path``: a relay registered in a user- or
+    local-scope settings file is invisible here. A read error other than invalid
+    JSON propagates, as it always has for validate."""
+    hook_config = project / profile.hooks.config_path
+    registered = False
+    fault: str | None = None
+    parsed: object = {}
+    if hook_config.is_file():
+        try:
+            parsed = json.loads(hook_config.read_text(encoding="utf-8"))
+            registered = isinstance(parsed, dict) and install.relay_registered(
+                parsed, profile.hooks.dialect, profile.hooks.events
+            )
+            if isinstance(parsed, dict):
+                container = install.hook_event_container(parsed, profile.hooks.dialect)
+                malformed = [
+                    event
+                    for event in profile.hooks.events
+                    if event in container and not isinstance(container[event], list)
+                ]
+                if malformed:
+                    registered = False
+                    fault = f"{hook_config} has malformed handlers for {', '.join(malformed)}"
+        except json.JSONDecodeError:
+            fault = f"{hook_config} is not valid JSON"
+    return _RelayRegistration(hook_config, parsed, registered, fault)
+
+
+def _relay_registration_problem(project: Path, profile: CLIProfile) -> str | None:
+    """Why a hooked ``profile``'s relay looks unregistered in the project hook
+    config, or None when it is registered. A hookless profile has no hook config;
+    the caller skips it, as validate does.
+
+    Unlike validate, an unreadable config is a problem to report, not a crash: the
+    launch warning that calls this must never abort a launch."""
+    try:
+        registration = _read_relay_registration(project, profile)
+    except (OSError, ValueError) as error:
+        return f"{project / profile.hooks.config_path} could not be read ({type(error).__name__})"
+    if registration.registered:
+        return None
+    if registration.fault is not None:
+        return registration.fault
+    if not registration.config_path.is_file():
+        return f"{registration.config_path} does not exist"
+    return f"{registration.config_path} does not register the bmad-loop relay"
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
-    from .install import relay_registered
 
     project = _project(args)
     report = ValidationReport()
@@ -1268,35 +1333,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"profile": profile.name},
             )
             continue
-        hook_config = project / profile.hooks.config_path
-        hooks_ok = False
-        parsed: dict = {}
-        if hook_config.is_file():
-            try:
-                parsed = json.loads(hook_config.read_text(encoding="utf-8"))
-                hooks_ok = isinstance(parsed, dict) and relay_registered(
-                    parsed, profile.hooks.dialect, profile.hooks.events
-                )
-                if isinstance(parsed, dict):
-                    container = install.hook_event_container(parsed, profile.hooks.dialect)
-                    malformed = [
-                        event
-                        for event in profile.hooks.events
-                        if event in container and not isinstance(container[event], list)
-                    ]
-                    if malformed:
-                        hooks_ok = False
-                        report.fail(
-                            "hooks.config-parse",
-                            f"{hook_config} has malformed handlers for {', '.join(malformed)}",
-                            {"profile": profile.name, "config_path": str(hook_config)},
-                        )
-            except json.JSONDecodeError:
-                report.fail(
-                    "hooks.config-parse",
-                    f"{hook_config} is not valid JSON",
-                    {"profile": profile.name, "config_path": str(hook_config)},
-                )
+        registration = _read_relay_registration(project, profile)
+        hook_config = registration.config_path
+        hooks_ok = registration.registered
+        parsed = registration.parsed
+        if registration.fault is not None:
+            report.fail(
+                "hooks.config-parse",
+                registration.fault,
+                {"profile": profile.name, "config_path": str(hook_config)},
+            )
         if isinstance(parsed, dict):
             registered_relays.update(
                 install.registered_relay_paths(
@@ -1314,6 +1360,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"bmad-loop hooks registered for {profile.name}",
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
+            assert isinstance(parsed, dict)  # `registered` is only ever True over a dict
             _check_hook_events_complete(report, profile, parsed, hook_config)
         else:
             report.fail(
@@ -2624,6 +2671,71 @@ def _warn_bypass_dropped(
                 journal.append(
                     "bypass-dropped", role=role, profile=profile.name, missing=list(missing)
                 )
+
+
+def _warn_hook_relay_unregistered(
+    pol,
+    project: Path,
+    roles: tuple[str, ...],
+    *,
+    profiles: Mapping[str, CLIProfile] | None = None,
+    journal: Journal | None = None,
+    after_silent_pause: bool = False,
+) -> None:
+    """Launch-time twin of validate's ``hooks.registered`` check (#752), for every
+    real launch (run, sweep, resume); never a dry run.
+
+    A session whose relay never reports a hook event runs to
+    ``session_timeout_min`` instead of completing. This warns before
+    that happens, once per hooked profile the launched ``roles`` resolve to (the
+    same resolution as :func:`_warn_bypass_dropped`), with one stderr ``warning:``
+    line naming the roles. ``journal`` also records one ``hook-relay-unregistered``
+    event per affected role. It never refuses and never touches stdout or the rc.
+
+    The wording hedges ("may be unregistered") because the check reads only the
+    project hook config (:func:`_read_relay_registration`), and the CLI may merge
+    hooks from user- or local-scope settings too.
+
+    Under ``scm.isolation = "worktree"`` the dev primitives
+    (:data:`install.DEV_PRIMITIVE_ROLES`) run in provisioned worktrees that register
+    the relay themselves, so only the main-checkout roles (triage, retro) are
+    checked. ``after_silent_pause`` (a resume of a run paused on a silent hook
+    channel) adds that resuming will hit the same silent channel."""
+    from .adapters.profile import ProfileError, get_profile
+
+    if pol.scm.isolation == "worktree":
+        roles = tuple(role for role in roles if role not in install.DEV_PRIMITIVE_ROLES)
+    by_profile: dict[str, tuple[CLIProfile, list[str]]] = {}
+    for role in roles:
+        profile = profiles.get(role) if profiles is not None else None
+        if profile is None:
+            try:
+                profile = get_profile(pol.adapter.resolved(role).name, project)
+            except ProfileError:
+                continue
+        if profile.hookless:
+            continue
+        by_profile.setdefault(profile.name, (profile, []))[1].append(role)
+    for name, (profile, profile_roles) in by_profile.items():
+        problem = _relay_registration_problem(project, profile)
+        if problem is None:
+            continue
+        message = (
+            f"{', '.join(profile_roles)} ({name}): the bmad-loop hook relay may be "
+            f"unregistered — {problem}. A session whose hook events never arrive runs "
+            "to session_timeout_min instead of completing. This check reads only the project "
+            "hook config: run `bmad-loop validate`, or register the relay with "
+            f"`bmad-loop init --cli {name}`."
+        )
+        if after_silent_pause:
+            message += (
+                " This run paused on a silent hook channel; resuming will hit the same"
+                " silent channel unless the relay is registered."
+            )
+        print(f"warning: {message}", file=sys.stderr)
+        if journal is not None:
+            for role in profile_roles:
+                journal.append("hook-relay-unregistered", role=role, profile=name, problem=problem)
 
 
 def _warn_prior_sweep_closes(project: Path, run_id: str, journal: Journal) -> None:
@@ -4449,12 +4561,10 @@ def _launch_run(
         plugin_grants=plugin_grants,
         parent_initiative=parent_initiative,
     )
-    _warn_bypass_dropped(
-        pol,
-        project,
-        worksource.launch_roles(source, pol.gates.retrospective),
-        profiles=profiles,
-        journal=composed.journal,
+    launched_roles = worksource.launch_roles(source, pol.gates.retrospective)
+    _warn_bypass_dropped(pol, project, launched_roles, profiles=profiles, journal=composed.journal)
+    _warn_hook_relay_unregistered(
+        pol, project, launched_roles, profiles=profiles, journal=composed.journal
     )
     print(f"run {composed.run_id} starting (attach: bmad-loop attach)")
     return composed
@@ -5738,6 +5848,13 @@ def _start_sweep(
         profiles=profiles,
         journal=composed.journal,
     )
+    _warn_hook_relay_unregistered(
+        pol,
+        project,
+        ("triage", "dev", "review"),
+        profiles=profiles,
+        journal=composed.journal,
+    )
     _warn_prior_sweep_closes(project, composed.run_id, composed.journal)
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
@@ -6954,18 +7071,23 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
             sweep_options=sweep_options,
             plugin_grants=plugin_grants,
         )
+        resumed_roles = (
+            ("triage", "dev", "review")
+            if state.run_type == "sweep"
+            else worksource.launch_roles(
+                worksource.resumed_traits_for(state.source).name, pol.gates.retrospective
+            )
+        )
         _warn_bypass_dropped(
+            pol, project, resumed_roles, profiles=profiles, journal=composed.journal
+        )
+        _warn_hook_relay_unregistered(
             pol,
             project,
-            (
-                ("triage", "dev", "review")
-                if state.run_type == "sweep"
-                else worksource.launch_roles(
-                    worksource.resumed_traits_for(state.source).name, pol.gates.retrospective
-                )
-            ),
+            resumed_roles,
             profiles=profiles,
             journal=composed.journal,
+            after_silent_pause=(pause.paused_reason or "").startswith("hook channel silent: "),
         )
     except BaseException as e:
         # make_adapters raises SystemExit for every refusal; anything escaping

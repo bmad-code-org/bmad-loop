@@ -6174,6 +6174,199 @@ def test_migration_session_no_work_escalates_without_consuming_attempts(project)
     assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
 
 
+# --- #752: a silent hook channel pauses uncharged; a non-completed cap blames the session ---
+
+
+def _silent(artifact=None, ledger=None):
+    """A timed-out session whose hook channel stayed silent (#752): the adapter
+    stamp is scripted, because make_sweep's MockAdapter has no profile and never
+    stamps."""
+    return failed_session_effect(
+        artifact=artifact,
+        ledger=ledger,
+        result=SessionResult(status="timeout", hook_channel_silent=True),
+    )
+
+
+def test_triage_silent_hook_channel_pauses_uncharged_on_attempt_one(project):
+    """#752's incident replay: a timed-out triage that wrote a VALID result.json and
+    delivered no hook event pauses after ONE session, titled as a channel fault,
+    with no misleading --feedback written, and the artifact is never accepted.
+
+    ABLATION, performed: replace the triage arm's condition with `False` and a
+    second (charged) session launches."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(project, [_silent(VALID_TRIAGE), _silent(VALID_TRIAGE)])
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-triage"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1
+    assert len(adapter.sessions) == 1
+    reason = engine.state.paused_reason
+    assert reason.startswith("hook channel silent: triage session timeout")
+    assert reason.endswith("[result.json: valid; hook events: none]")
+    assert "bmad-loop validate" in reason
+    assert not (engine.run_dir / "triage.json").exists()  # never a completion
+    assert not (engine.run_dir / "feedback").exists()
+    dec = _decisions(engine, "triage-decision")[-1]
+    assert dec["hook_channel_silent"] is True
+    assert dec["ok"] is False
+
+
+def test_triage_silent_channel_resume_restores_budget(project):
+    """The silent pause is uncharged: the ESCALATED resume resets the attempt to 0
+    and a fresh session launches (once the relay is fixed, it completes)."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [_silent()])
+    assert engine.run().paused
+    assert engine.state.paused_reason.startswith("hook channel silent: ")
+
+    resumed, radapter = resume_sweep(project, engine, [triage_effect(VALID_TRIAGE)])
+    assert not resumed.run().paused
+    task = resumed.state.tasks["sweep-triage"]
+    assert task.phase == Phase.DONE
+    assert task.attempt == 1
+    assert len(radapter.sessions) == 1
+    assert "--feedback" not in radapter.sessions[0].prompt
+
+
+def test_migration_silent_hook_channel_pauses_uncharged(project):
+    """The migration twin: pauses on attempt 1 with the legacy ledger untouched,
+    exactly as the no-work migration sibling leaves it, and journals the flag.
+
+    ABLATION, performed: replace the migration arm's condition with `False` and a
+    second (charged) session launches."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [_silent(), _silent()])
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-migrate"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 1
+    assert len(adapter.sessions) == 1
+    assert engine.state.paused_reason.startswith("hook channel silent: migration session timeout")
+    assert "[result.json: missing; hook events: none]" in engine.state.paused_reason
+    assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
+    assert not (engine.run_dir / "feedback").exists()
+    dec = _decisions(engine, "migrate-decision")[-1]
+    assert dec["hook_channel_silent"] is True
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [{"hook_channel_silent": True}, {"env_fault": True}],
+    ids=["silent", "env-fault-sibling"],
+)
+def test_migration_silent_pause_over_a_rewrite_matches_the_env_fault_sibling(project, flag):
+    """Pause-before-reset, like the sibling arms: a silent session that rewrote the
+    ledger leaves the rewrite in place at the pause, and the resume then takes the
+    sibling's own route over that unaccepted rewrite (an evidence refusal naming
+    the restore), never a dispatch over it."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    rewrite = (project.deferred_work, migrated_ledger())
+    engine, _ = make_sweep(
+        project,
+        [failed_session_effect(ledger=rewrite, result=SessionResult(status="timeout", **flag))],
+    )
+    assert engine.run().paused
+    assert engine.state.tasks["sweep-migrate"].attempt == 1
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+
+    resumed, radapter = resume_sweep(project, engine, [SessionResult(status="completed")])
+    assert resumed.run().paused
+    assert radapter.sessions == []
+    assert resumed.state.paused_reason.startswith("migration recovery evidence is invalid: ")
+
+
+def test_triage_non_completed_cap_says_session_failed_and_writes_no_feedback(project):
+    """Without the silent flag a timeout stays charged (both attempts spent), but
+    the cap no longer blames output that was never validated: it reads
+    "session failed:", and attempt 2 gets no --feedback claiming a validation
+    failure.
+
+    ABLATION, performed: always write feedback and attempt 2's prompt carries
+    --feedback; always use the validation prefix and the cap assertion reddens."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(project, [failed_session_effect(artifact=VALID_TRIAGE)] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    task = engine.state.tasks["sweep-triage"]
+    assert task.phase == Phase.ESCALATED
+    assert task.attempt == 2
+    assert len(adapter.sessions) == 2
+    reason = engine.state.paused_reason
+    assert reason.startswith("session failed: triage session timeout after 2 attempt(s)")
+    assert reason.endswith("[result.json: valid; hook events: none]")
+    assert "--feedback" not in adapter.sessions[1].prompt
+    assert not (engine.run_dir / "feedback").exists()
+    assert [d["hook_channel_silent"] for d in _decisions(engine, "triage-decision")] == [
+        False,
+        False,
+    ]
+
+
+def test_migration_non_completed_cap_says_session_failed_and_writes_no_feedback(project):
+    """The migration twin of the non-completed cap wording and feedback contract."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, adapter = make_sweep(project, [failed_session_effect()] * 2)
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-migrate"].attempt == 2
+    assert len(adapter.sessions) == 2
+    assert engine.state.paused_reason.startswith(
+        "session failed: migration session timeout after 2 attempt(s)"
+    )
+    assert "--feedback" not in adapter.sessions[1].prompt
+    assert not (engine.run_dir / "feedback").exists()
+
+
+def test_triage_validation_failure_cap_keeps_failed_validation_prefix(project):
+    """Control: a COMPLETED session whose output fails validation still caps as
+    "triage output failed validation:" and still feeds attempt 2 the errors."""
+    write_ledger(project, {"DW-1": "open"})
+    bad = triage_result(["DW-1"])
+    engine, adapter = make_sweep(project, [triage_effect(bad), triage_effect(bad)])
+    summary = engine.run()
+
+    assert summary.paused
+    assert engine.state.tasks["sweep-triage"].attempt == 2
+    reason = engine.state.paused_reason
+    assert reason.startswith("triage output failed validation: ")
+    assert "attempt(s)" not in reason
+    assert "--feedback" in adapter.sessions[1].prompt
+
+
+def test_non_completed_attempt_keeps_the_prior_validation_feedback(project):
+    """A real validation failure's feedback survives a later non-completed attempt:
+    attempt 3 still gets attempt 1's --feedback, never one about attempt 2's
+    unvalidated output."""
+    write_ledger(project, {"DW-1": "open"})
+    bad = triage_result(["DW-1"])
+    policy = Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        sweep=SweepPolicy(max_triage_attempts=3),
+    )
+    engine, adapter = make_sweep(
+        project,
+        [triage_effect(bad), failed_session_effect(), triage_effect(VALID_TRIAGE)],
+        policy=policy,
+    )
+    assert not engine.run().paused
+
+    prompts = [s.prompt for s in adapter.sessions]
+    assert "--feedback" not in prompts[0]
+    assert "--feedback" in prompts[1]
+    assert prompts[2].split("--feedback", 1)[1] == prompts[1].split("--feedback", 1)[1]
+    assert len(list((engine.run_dir / "feedback").iterdir())) == 1
+
+
 def test_triage_escalation_resume_retries_triage(project):
     write_ledger(project, {"DW-1": "open"})
     bad = triage_result(["DW-1"])
@@ -38060,7 +38253,7 @@ def test_interrupted_final_validation_retry_escalates_on_the_attempt_cap(project
     assert persisted.paused_stage == PAUSE_ESCALATION
     task = persisted.tasks[MIGRATE_KEY]
     assert task.phase == Phase.ESCALATED and task.migration_rewrite_rejected is False
-    assert "migration failed deterministic validation" in (persisted.paused_reason or "")
+    assert (persisted.paused_reason or "").startswith("migration retry interrupted: ")
     assert project.deferred_work.read_text(encoding="utf-8") == LEGACY_LEDGER
 
 

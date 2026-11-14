@@ -409,6 +409,16 @@ def test_review_env_fault_outranks_parked_and_no_work():
         ("parked: dev session stalled (x)", None, "Paused (parked prompt): 1-1"),
         ("no work produced: fix session timeout (x)", None, "Paused (no work): 1-1"),
         ("usage limit: dev session stalled (x)", None, "Paused (usage limit): 1-1"),
+        (
+            "hook channel silent: triage session timeout (x)",
+            None,
+            "Paused (hook channel silent): 1-1",
+        ),
+        (
+            "session failed: triage session timeout after 2 attempt(s)",
+            None,
+            "Paused (session failed): 1-1",
+        ),
         ("environment fault: dev session crashed (x)", None, "Paused (environment fault): 1-1"),
         # a verify-detected fault carries no prefix: the recorded site classifies it
         ("verify command exited 127", "verify:dev", "Paused (environment fault): 1-1"),
@@ -422,6 +432,105 @@ def test_review_env_fault_outranks_parked_and_no_work():
 )
 def test_pause_title_classifies_by_reason_prefix(reason, env_fault_site, title):
     assert pause_title(reason, "1-1", env_fault_site=env_fault_site) == title
+
+
+def test_hook_channel_silent_reason_names_validate_not_init():
+    """#752: the silent-channel reason points at `validate` and the commit-before-resume
+    step, never at `init` — the same signature covers untrusted Codex hooks and a
+    CLI on a shared daemon, where re-running init is the wrong fix."""
+    result = SessionResult(status="timeout", hook_channel_silent=True)
+    reason = escalation.hook_channel_silent_pause_reason("triage", result)
+    assert reason.startswith("hook channel silent: triage session timeout (")
+    assert "no hook event of any kind arrived" in reason
+    assert "`bmad-loop validate`" in reason
+    assert "before `bmad-loop resume`" in reason
+    assert "the attempt is not charged" in reason
+    assert "init" not in reason
+    assert pause_title(reason, "1-1") == "Paused (hook channel silent): 1-1"
+
+
+def test_hook_channel_silent_reason_keeps_lost_session_suffix():
+    """Composed over `session_failure_reason`: the #489 lost-session note survives."""
+    result = SessionResult(status="stalled", hook_channel_silent=True, session_vanished=True)
+    reason = escalation.hook_channel_silent_pause_reason("dev", result)
+    assert reason.startswith(
+        f"hook channel silent: {escalation.session_failure_reason('dev', result)} ("
+    )
+
+
+def test_hook_channel_silent_defaults_false():
+    """The #752 flag is appended last and defaults off, so every existing
+    construction keeps its routing."""
+    assert SessionResult(status="timeout").hook_channel_silent is False
+    assert dataclasses.fields(SessionResult)[-1].name == "hook_channel_silent"
+
+
+def test_dev_hook_channel_silent_pauses_even_with_budget_left():
+    """#752: a dev session no hook event of any kind reached PAUSEs uncharged
+    instead of RETRYing into the same silent relay — and outranks budget
+    exhaustion too, so a spent budget cannot file a relay fault as deferred work.
+
+    ABLATION: delete the `hook_channel_silent` arm in `decide_dev` and this
+    RETRYs (budget left) / DEFERs (budget spent)."""
+    silent = SessionResult(status="timeout", hook_channel_silent=True)
+    for attempt in (1, 2):  # budget left, budget spent
+        decision = decide_dev(_task(attempt=attempt), silent, None, POLICY)
+        assert decision.action == Action.PAUSE
+        assert decision.reason.startswith("hook channel silent: dev session timeout (")
+        assert "the attempt is not charged" in decision.reason
+        assert not decision.budget_exhausted
+        assert not decision.uncharged  # a pause, not an uncharged relaunch
+
+
+def test_dev_hook_channel_silent_default_keeps_todays_routing():
+    """The flag defaults False, so a plain timeout keeps RETRY-with-budget /
+    DEFER-without; and a COMPLETED session never reaches the arm — the pause only
+    routes a non-completed session, it is no completion path."""
+    plain = SessionResult(status="timeout")
+    assert plain.hook_channel_silent is False
+    retried = decide_dev(_task(attempt=1), plain, None, POLICY)
+    assert retried.action == Action.RETRY
+    assert "hook channel silent" not in retried.reason
+    assert decide_dev(_task(attempt=2), plain, None, POLICY).action == Action.DEFER
+    completed = SessionResult(status="completed", hook_channel_silent=True)
+    assert (
+        decide_dev(_task(attempt=1), completed, VerifyOutcome.passed(), POLICY).action
+        == Action.PROCEED
+    )
+
+
+def test_dev_no_work_outranks_hook_channel_silent():
+    """The fixed arm order is usage_relaunch, env_fault, parked, no_work,
+    hook_channel_silent: a session that never did anything at all is the stronger
+    verdict, and every earlier arm keeps its reason when the flag rides along."""
+    both = SessionResult(status="timeout", produced_work=False, hook_channel_silent=True)
+    decision = decide_dev(_task(attempt=1), both, None, POLICY)
+    assert decision.reason.startswith("no work produced: dev session timeout")
+    parked = SessionResult(
+        status="stalled", parked=True, parked_evidence=_PARKED_EVIDENCE, hook_channel_silent=True
+    )
+    assert decide_dev(_task(attempt=1), parked, None, POLICY).reason.startswith("parked: ")
+    env = SessionResult(status="timeout", env_fault=True, hook_channel_silent=True)
+    assert decide_dev(_task(attempt=1), env, None, POLICY).reason.startswith("environment fault: ")
+
+
+@pytest.mark.parametrize("on_timeout", ["retry", "defer", "salvage-if-done"])
+def test_review_hook_channel_silent_pauses_whatever_the_timeout_mode(on_timeout):
+    """#752: a silent-channel review timeout pauses ahead of the
+    `review.on_timeout` routing — salvaging, deferring or retrying a review whose
+    relay never spoke blames the review for the relay.
+
+    ABLATION: delete the `hook_channel_silent` arm in `decide_review_session` and
+    this RETRYs, DEFERs or SALVAGEs per mode."""
+    silent = SessionResult(status="timeout", hook_channel_silent=True)
+    decision = decide_review_session(_task(review_cycle=1), silent, _policy(on_timeout))
+    assert decision.action == Action.PAUSE
+    assert decision.reason.startswith("hook channel silent: review session timeout (")
+    assert not decision.budget_exhausted
+    both = SessionResult(status="timeout", produced_work=False, hook_channel_silent=True)
+    assert decide_review_session(
+        _task(review_cycle=1), both, _policy(on_timeout)
+    ).reason.startswith("no work produced: ")
 
 
 # The #610 credit-exhaustion pane line, split so this file carries no line the

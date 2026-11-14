@@ -370,11 +370,35 @@ def no_work_pause_reason(role: str, result: SessionResult) -> str:
     )
 
 
+def hook_channel_silent_pause_reason(role: str, result: SessionResult) -> str:
+    """The pause reason for a non-completed session whose hook channel stayed
+    silent (#752): ``hook channel silent: <role> session <status> (...)``.
+
+    Composed over `session_failure_reason`, like its siblings, so the #489
+    lost-session suffix survives. The adapter stamps
+    ``result.hook_channel_silent`` when no hook event of any kind arrived, which
+    a working relay never allows, so the verdict says nothing about the agent's
+    output. The parenthetical names the likely causes and points at
+    ``bmad-loop validate`` rather than ``init``: the same signature covers
+    untrusted Codex hooks and a CLI attached to a shared daemon, where re-running
+    init is the wrong fix. "Commit before resume" because a dirty migration
+    resume resets the checkout and would revert an uncommitted hook-config fix."""
+    return (
+        f"hook channel silent: {session_failure_reason(role, result)} (no hook event "
+        "of any kind arrived for this attempt — the CLI's hook relay may be "
+        "unregistered, untrusted, or running without the window's BMAD_LOOP_* "
+        "environment; run `bmad-loop validate`, commit any hook-config fix before "
+        "`bmad-loop resume`, and see the CLI's first-run note; the attempt is not charged)"
+    )
+
+
 def pause_title(reason: str, story_key: str, *, env_fault_site: str | None = None) -> str:
     """The notification title for an escalation pause, classified by the reason's
-    prefix (#727): a parked, no-work, usage-limit or environment-fault pause is a
-    human-needed stop but not a CRITICAL contradiction, and titling it as one
-    sends the operator hunting for a spec conflict that is not there.
+    prefix (#727): a parked, no-work, usage-limit, hook-channel-silent (#752),
+    session-failed (#752: a session that never completed, capped) or
+    environment-fault pause is a human-needed stop but not a CRITICAL
+    contradiction, and titling it as one sends the operator hunting for a spec
+    conflict that is not there.
 
     ``env_fault_site`` (DW-523) is the fallback for environment faults whose
     reason carries no prefix — a verify-detected fault reads as the verify
@@ -386,6 +410,10 @@ def pause_title(reason: str, story_key: str, *, env_fault_site: str | None = Non
         kind = "no work"
     elif reason.startswith("usage limit: "):
         kind = "usage limit"
+    elif reason.startswith("hook channel silent: "):
+        kind = "hook channel silent"
+    elif reason.startswith("session failed: "):
+        kind = "session failed"
     elif reason.startswith("environment fault: ") or env_fault_site is not None:
         kind = "environment fault"
     else:
@@ -533,6 +561,18 @@ def decide_dev(
                 Action.PAUSE,
                 no_work_pause_reason("dev", result),
             )
+        if result.hook_channel_silent:
+            # No hook event of any kind reached the session (#752): the relay is
+            # unregistered, untrusted or lost its environment, so the timeout says
+            # nothing about the agent's work and a RETRY would relaunch into the
+            # same silent channel. Pause ahead of the budget, uncharged, like the
+            # no-work arm; re-arm resets the attempt. This routes only — it never
+            # reads or accepts result.json, so it is no completion path. After
+            # no-work, whose verdict (nothing happened at all) is the stronger one.
+            return Decision(
+                Action.PAUSE,
+                hook_channel_silent_pause_reason("dev", result),
+            )
         reason = session_failure_reason("dev", result)
         if budget_left:
             return Decision(Action.RETRY, reason)
@@ -581,7 +621,8 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
     """After a review session returns, before interpreting its done/followup status.
 
     A non-completed session is read in the same order as `decide_dev`: env fault,
-    then parked, then no work produced (#727), each a PAUSE ahead of the
+    then parked, then no work produced (#727), then a silent hook channel (#752),
+    each a PAUSE ahead of the
     `review.on_timeout` routing — a review that never ran has nothing to salvage
     and nothing a deferral or retry would change."""
     critical_reason = critical_session_reason("review", result.result_json)
@@ -616,6 +657,11 @@ def decide_review_session(task: StoryTask, result: SessionResult, policy: Policy
             # salvage a review that would relaunch into the same wall (see
             # decide_dev). After env_fault and parked, which explain it better.
             return Decision(Action.PAUSE, no_work_pause_reason("review", result))
+        if result.hook_channel_silent:
+            # silent hook channel (#752): pause rather than retry, defer or
+            # salvage — the timeout is the relay's, not the review's (see
+            # decide_dev). Ahead of the `review.on_timeout` routing.
+            return Decision(Action.PAUSE, hook_channel_silent_pause_reason("review", result))
         reason = session_failure_reason("review", result)
         if result.status in REVIEW_TIMEOUT_STATUSES:
             mode = policy.review.on_timeout

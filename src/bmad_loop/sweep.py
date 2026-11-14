@@ -40,6 +40,7 @@ from .escalation import (
     critical_session_reason,
     display_critical_reason,
     env_fault_pause_reason,
+    hook_channel_silent_pause_reason,
     no_work_pause_reason,
     parked_pause_reason,
     pause_title,
@@ -68,6 +69,7 @@ from .statemachine import advance
 from .worksource import EpicProgress, Pick, WorkSource
 
 if TYPE_CHECKING:
+    from .adapters.base import SessionResult
     from .plugins import HookContext
 
 
@@ -1419,6 +1421,36 @@ def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
     if diagnostic.get("hint"):
         hooks += f"; hint: {diagnostic['hint']}"
     return f" [result.json: {artifact}; hook events: {hooks}]"
+
+
+_VALIDATION_CAP_PREFIX = {
+    "triage": "triage output failed validation: ",
+    "migration": "migration failed deterministic validation: ",
+}
+
+
+def _cap_reason(
+    leg: str,
+    result: SessionResult,
+    errors: list[str],
+    task: StoryTask,
+    diagnostic: dict[str, Any] | None,
+) -> str:
+    """The attempt-cap escalation reason of the triage or migration leg (#752).
+
+    A completed session's output was validated and rejected, so the cap blames
+    the output. A non-completed session's output was never validated (a
+    timeout's result.json is not read as a completion), so blaming it sends the
+    operator hunting for an output defect that is not there: the cap reads
+    ``session failed:`` instead, which ``pause_title`` titles as a non-CRITICAL
+    pause."""
+    if result.status != "completed":
+        prefix = "session failed: "
+        tail = f" after {task.attempt} attempt(s)"
+    else:
+        prefix = _VALIDATION_CAP_PREFIX[leg]
+        tail = ""
+    return prefix + "; ".join(errors) + tail + _diagnostic_suffix(diagnostic)
 
 
 class NoBoardWorkSource:
@@ -4637,8 +4669,10 @@ class SweepEngine(Engine):
                 if task.attempt >= self.policy.sweep.max_migration_attempts:
                     self._escalate(
                         task,
-                        "migration failed deterministic validation: the validation-retry "
-                        f"leg was interrupted after rejecting attempt {task.attempt} of "
+                        # The latch is set on every rejection, a session
+                        # failure included, so this reason names no cause (#752).
+                        "migration retry interrupted: the retry leg was interrupted "
+                        f"after rejecting attempt {task.attempt} of "
                         f"{self.policy.sweep.max_migration_attempts}",
                     )
                 task.phase = Phase.PENDING  # deliberate reset, not a normal transition
@@ -4903,6 +4937,7 @@ class SweepEngine(Engine):
                 env_fault=result.env_fault,
                 parked=result.parked,
                 produced_work=result.produced_work,
+                hook_channel_silent=result.hook_channel_silent,
                 diagnostic=diagnostic,
             )
             if result.status != "completed" and result.env_fault:
@@ -4933,6 +4968,17 @@ class SweepEngine(Engine):
                 self._escalate(
                     task,
                     no_work_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                )
+            if result.status != "completed" and result.hook_channel_silent:
+                # No hook event of any kind reached this attempt (#752): the relay
+                # is unregistered, untrusted or env-less, so the session's outcome
+                # was never observable. Pause uncharged (fresh budget on resume, as
+                # for the arms above) instead of spending the cap on a channel
+                # fault; the result.json is never read as a completion here.
+                self._escalate(
+                    task,
+                    hook_channel_silent_pause_reason("migration", result)
+                    + _diagnostic_suffix(diagnostic),
                 )
             if not errors:
                 # This record is the durable proof that validation accepted the
@@ -5072,17 +5118,16 @@ class SweepEngine(Engine):
                     ledger_rival=anchor is not _LedgerAnchor.NONE,
                 )
             if task.attempt >= self.policy.sweep.max_migration_attempts:
-                self._escalate(
+                self._escalate(task, _cap_reason("migration", result, errors, task, diagnostic))
+            if result.status == "completed":
+                # A non-completed attempt never had its output validated (#752):
+                # the skill reads --feedback as validation errors to fix exactly,
+                # so it keeps the prior feedback instead of a misleading one.
+                feedback = self._write_feedback(
                     task,
-                    "migration failed deterministic validation: "
-                    + "; ".join(errors)
-                    + _diagnostic_suffix(diagnostic),
+                    "The legacy-ledger migration failed deterministic validation:\n- "
+                    + "\n- ".join(errors),
                 )
-            feedback = self._write_feedback(
-                task,
-                "The legacy-ledger migration failed deterministic validation:\n- "
-                + "\n- ".join(errors),
-            )
 
     def _session_failure_diagnostic(
         self,
@@ -5320,6 +5365,7 @@ class SweepEngine(Engine):
                 env_fault=result.env_fault,
                 parked=result.parked,
                 produced_work=result.produced_work,
+                hook_channel_silent=result.hook_channel_silent,
                 diagnostic=diagnostic,
             )
             if result.status != "completed" and result.env_fault:
@@ -5347,6 +5393,14 @@ class SweepEngine(Engine):
                 self._escalate(
                     task,
                     no_work_pause_reason("triage", result) + _diagnostic_suffix(diagnostic),
+                )
+            if result.status != "completed" and result.hook_channel_silent:
+                # No hook event of any kind reached this attempt (#752): pause
+                # uncharged, like the migration twin, after the arms above.
+                self._escalate(
+                    task,
+                    hook_channel_silent_pause_reason("triage", result)
+                    + _diagnostic_suffix(diagnostic),
                 )
             if plan is not None:
                 advance(task, Phase.DONE)
@@ -5399,16 +5453,14 @@ class SweepEngine(Engine):
                 self._emit("post_triage", task)
                 return plan
             if task.attempt >= self.policy.sweep.max_triage_attempts:
-                self._escalate(
+                self._escalate(task, _cap_reason("triage", result, errors, task, diagnostic))
+            if result.status == "completed":
+                # See the migration twin: no --feedback for unvalidated output (#752).
+                feedback = self._write_feedback(
                     task,
-                    "triage output failed validation: "
-                    + "; ".join(errors)
-                    + _diagnostic_suffix(diagnostic),
+                    "The triage result.json failed deterministic validation:\n- "
+                    + "\n- ".join(errors),
                 )
-            feedback = self._write_feedback(
-                task,
-                "The triage result.json failed deterministic validation:\n- " + "\n- ".join(errors),
-            )
 
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None
