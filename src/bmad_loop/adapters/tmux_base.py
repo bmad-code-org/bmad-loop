@@ -108,6 +108,12 @@ class BaseTmuxBackend(TerminalMultiplexer):
     #: psmux words it the same for tmux parity (``psmux: can't find window:
     #: @N``, the #545 client-side validator, source-read at v3.3.8).
     _WINDOW_GONE_STDERR: tuple[str, ...] = ("can't find window",)
+    #: Whether an exit-0 listing with no rows is a real answer ("this session
+    #: has no windows") in :meth:`_list_session_rows`. True for tmux, whose
+    #: client exits non-zero whenever it cannot read the server. A leaf whose
+    #: client can print nothing and exit 0 for a live session sets it False, so
+    #: that silence raises instead of reading as a death (#525's contract).
+    _EMPTY_LISTING_IS_AN_ANSWER = True
     #: Prefixes of a ``list-sessions`` row that cannot be a session name, on
     #: top of the empty row :meth:`_is_session_row` always refuses: the
     #: client's own words printed where a server's answer belongs (#919). A
@@ -748,7 +754,13 @@ class BaseTmuxBackend(TerminalMultiplexer):
                 f"{self._BINARY} {verb[0]} on {session} exited {probe.returncode} "
                 f"without proving the session gone: {probe.stderr.strip() or '(no stderr)'}"
             )
-        return probe.stdout.splitlines()
+        rows = probe.stdout.splitlines()
+        if not self._EMPTY_LISTING_IS_AN_ANSWER and not any(row.strip() for row in rows):
+            raise TmuxError(
+                f"{self._BINARY} {verb[0]} on {session} exited 0 with no rows, "
+                "which this backend cannot tell from a dropped reply"
+            )
+        return rows
 
     def pipe_pane(self, window_id: str, log_file: Path) -> None:
         # A CLI that crashes on launch (bad args, instant auth failure) can take

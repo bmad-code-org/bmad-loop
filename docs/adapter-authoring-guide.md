@@ -74,7 +74,7 @@ Rules that span methods:
 
 - `new_window(session, name, cwd, env, command)`: run `command` with `env` layered on; return the native window id.
 - `new_parked_window(session, name, cwd, argv, return_opt)`: run `argv`, print `PARKED_BANNER`, park on a key, then return any attached client via `return_opt`.
-- `list_window_ids(session)`: same id form as `new_window`. Answer `[]` only for an empty listing or a proved-gone session; otherwise raise.
+- `list_window_ids(session)`: same id form as `new_window`. Answer `[]` only for an empty listing or a proved-gone session; otherwise raise. A tmux-family leaf whose client can exit 0 with nothing for a live session sets `_EMPTY_LISTING_IS_AN_ANSWER = False`, so that empty listing raises too (psmux does).
 - `list_windows(session, fields)`: one tuple per window in field order; best-effort `[]` on failure.
 - `window_alive(session, window_id)`: `True` while the window is listed AND its pane is alive; a window the multiplexer keeps listed after its pane exited (`remain-on-exit on`) is not alive. Membership alone is `list_window_ids`. Raise when liveness cannot be known; never answer `False` for that.
 - `kill_window(target)`: tolerate the window already being gone; no-op on a transport failure.

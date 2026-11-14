@@ -493,6 +493,19 @@ def test_list_window_ids_raises_when_a_nonzero_exit_proves_nothing(monkeypatch, 
         TmuxMultiplexer().window_alive("s", "@1")
 
 
+def test_tmux_takes_an_exit_zero_empty_listing_as_an_answer(monkeypatch):
+    """Only a leaf that opts out (psmux) distrusts an exit-0 empty listing; tmux
+    exits non-zero whenever it could not read its server, so its silence stays
+    "no windows" and nothing about the tmux probe changes."""
+    monkeypatch.setattr(
+        tmux_base.subprocess,
+        "run",
+        lambda argv, **_k: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+    )
+    assert TmuxMultiplexer().list_window_ids("s") == []
+    assert TmuxMultiplexer().window_alive("s", "@1") is False
+
+
 def test_gone_stderr_match_is_case_insensitive_and_substring(monkeypatch):
     """The fragments are matched inside a longer line and without regard to case:
     every measured wording embeds them in a sentence (`psmux: no server running

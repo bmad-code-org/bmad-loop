@@ -177,6 +177,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop reading an empty psmux window listing as a dead session. psmux can drop a live
+  server's reply and exit 0 with nothing, which the liveness probe took for a crashed CLI
+  and the control-window prune for a verified kill. That listing now counts as a failed
+  probe: the session runs on and the prune reports the kill as undetermined.
 - Open agent task windows detached, so a tmux config `run` or `run-shell` that fails or
   prints when bmad-loop starts the server lands in view-mode on the session's `shell`
   window instead of the agent's pane, where it refused every wake nudge and TUI answer

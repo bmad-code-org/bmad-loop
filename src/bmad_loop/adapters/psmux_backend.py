@@ -203,6 +203,14 @@ class PsmuxMultiplexer(BaseTmuxBackend):
     # named on stderr as `psmux: list-sessions: session <name>: <reason>` and
     # the command exits 1 after printing the rows that did answer.
     _PARTIAL_LISTING_STDERR_PREFIX = "psmux: list-sessions: session "
+    # A live psmux session always has a window (its server exits with the
+    # last one), and the client can answer one at exit 0 with nothing: its
+    # reply loop stops on any read error but a timeout and prints what it got
+    # (`send_control_with_response_bounded`, source-read at v3.4.0). The live
+    # gate caught it once: list-windows answered empty between two window
+    # mints. Read as an answer, that silence is a crash to the liveness probe
+    # and a verified kill to the prune, so it raises instead.
+    _EMPTY_LISTING_IS_AN_ANSWER = False
 
     def __init__(self, *, default_registry: bool = False, registry_root: str | None = None) -> None:
         """``default_registry=True`` binds this instance to psmux's OWN registry
@@ -775,6 +783,9 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # connection timed out`. Both were rc 1 with the windows demonstrably
         # alive — this backend is where the bug was actually reachable, because
         # a per-session TCP server has failure modes tmux's socket does not.
+        #
+        # An exit-0 EMPTY listing proves nothing either; see
+        # `_EMPTY_LISTING_IS_AN_ANSWER` below.
         return [
             self._qualified_window_id(session, window_id)
             for window_id in super().list_window_ids(session)
