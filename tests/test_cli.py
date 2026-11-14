@@ -6878,8 +6878,16 @@ def test_resolve_adopt_result_refuses_a_non_escalation_pause(tmp_path, monkeypat
         ("{not json", "JSONDecodeError"),
         ("[1, 2]", "not a JSON object"),
         ({"workflow": "something-else"}, "is not a valid triage plan"),
+        (
+            {
+                **_ADOPTABLE_TRIAGE,
+                "escalations": [{"type": "intent-gap", "severity": "CRITICAL", "detail": "gap"}],
+            },
+            "carries a CRITICAL escalation from triage session: gap — adopting it would "
+            "bypass that escalation",
+        ),
     ],
-    ids=["missing", "malformed", "not-object", "invalid-plan"],
+    ids=["missing", "malformed", "not-object", "invalid-plan", "critical-escalation"],
 )
 def test_resolve_adopt_result_refuses_a_missing_or_bad_artifact(
     tmp_path, monkeypatch, capsys, artifact, msg

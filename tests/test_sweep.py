@@ -6345,6 +6345,38 @@ def test_adopt_marker_over_a_moved_ledger_pauses_and_closes_nothing(project):
     assert project.deferred_work.read_text(encoding="utf-8") == ledger_before
 
 
+def test_adopt_marker_over_a_critical_escalation_pauses_and_closes_nothing(project):
+    """The adopted result.json is a valid plan that also escalates CRITICAL: the
+    session path's gate (`critical_session_reason`, which `validate_triage` does
+    not apply) holds for an adoption too, so the plan's already-resolved close of
+    DW-1 never lands and the run pauses `adopt rejected:` naming the escalation.
+
+    ABLATION, performed: drop the adoption's `critical_session_reason` refusal and
+    the plan is adopted (DW-1 closes, nothing pauses)."""
+    critical = {
+        **RESOLVED_TRIAGE,
+        "escalations": [
+            {"type": "intent-gap", "severity": "CRITICAL", "detail": "DW-1 is ambiguous"}
+        ],
+    }
+    engine = _silent_triage_pause(project, critical)
+    marker, _ = _write_adopt_marker(engine)
+    ledger_before = project.deferred_work.read_text(encoding="utf-8")
+
+    resumed, radapter = resume_sweep(project, engine, [triage_effect(VALID_TRIAGE)])
+    assert resumed.run().paused
+
+    assert radapter.sessions == []
+    reason = resumed.state.paused_reason
+    assert reason.startswith("adopt rejected: ")
+    assert "CRITICAL escalation from triage session: DW-1 is ambiguous" in reason
+    assert resumed.state.tasks["sweep-triage"].phase == Phase.ESCALATED
+    assert not marker.exists()
+    assert not (resumed.run_dir / "triage.json").exists()
+    assert _decisions(resumed, "sweep-triage-adopted") == []
+    assert project.deferred_work.read_text(encoding="utf-8") == ledger_before
+
+
 def test_adopt_rejected_pause_is_lifted_by_a_plain_resume(project):
     """After an `adopt rejected:` pause a plain resume relaunches triage with a
     fresh budget, exactly as after the silent pause itself."""

@@ -90,6 +90,8 @@ from .engine import Engine, _publication_refusal
 from .escalation import (
     HOOK_CHANNEL_SILENT_PREFIX,
     cleared_pause_escalation_keys,
+    critical_session_reason,
+    display_critical_reason,
     display_pause_reason,
     resume_skipped_escalation_keys,
 )
@@ -8784,8 +8786,8 @@ def _resolve_adopt_result(
 
     `cmd_resolve` has already run the shared gates. This refuses anything but a
     sweep paused ``hook channel silent:`` on a triage task, reads the attempt's
-    artifact once (hashing and parsing the same bytes), validates it structurally
-    on a copy, and shows it in full. Only an explicit ``y`` continues: no flag
+    artifact once (hashing and parsing the same bytes), refuses one that carries a
+    CRITICAL escalation, validates it structurally on a copy, and shows it in full. Only an explicit ``y`` continues: no flag
     skips the confirm, and EOF declines. Under the run lock it re-checks the
     pause, the engine's liveness, the task's phase/attempt/generation and the
     artifact's sha256, then writes ``adopt-<key>.json`` and journals
@@ -8810,6 +8812,15 @@ def _resolve_adopt_result(
         print(
             f"error: triage attempt {task_id} left no result.json "
             f"({triage_artifact_path(run_dir, task_id)}) — {relaunch}",
+            file=sys.stderr,
+        )
+        return 1
+    # The session path escalates on a CRITICAL before it validates a plan; a
+    # session that asked for a human is not overruled by adopting its document.
+    if (critical := critical_session_reason("triage", artifact.doc)) is not None:
+        print(
+            f"error: the result.json of {task_id} carries a {display_critical_reason(critical)}"
+            f" — adopting it would bypass that escalation; {relaunch}",
             file=sys.stderr,
         )
         return 1

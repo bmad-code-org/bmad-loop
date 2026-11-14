@@ -5556,7 +5556,8 @@ class SweepEngine(Engine):
         selectors and the migration), so this is the authoritative check. The
         marker is accepted only when it names this key and the escalated task's
         current attempt id, the attempt's ``result.json`` still hashes to the
-        confirmed sha256, and `validate_triage` passes against ``open_now``.
+        confirmed sha256, the document carries no CRITICAL escalation (the
+        session path's gate), and `validate_triage` passes against ``open_now``.
         Accepting writes the cache and moves the task to DONE; the attempt's
         session record and ``triage-decision`` row stay non-completed — the human
         gesture substitutes the plan, it does not complete the session.
@@ -5617,8 +5618,15 @@ class SweepEngine(Engine):
         plan: TriagePlan | None = None
         repairs: tuple[_BundleNameRepair, ...] = ()
         if not errors and artifact is not None:
-            repairs = _normalize_bundle_names(artifact.doc)
-            plan, errors = validate_triage(artifact.doc, open_now)
+            # The session path's CRITICAL gate, which `validate_triage` does not
+            # apply: a session that asked for a human before its channel went
+            # silent is not overruled by adopting its plan.
+            critical_reason = critical_session_reason("triage", artifact.doc)
+            if critical_reason is not None:
+                errors.append(f"result.json of {task_id} carries a {critical_reason}")
+            else:
+                repairs = _normalize_bundle_names(artifact.doc)
+                plan, errors = validate_triage(artifact.doc, open_now)
         if plan is None or artifact is None:
             self._reject_triage_adoption(triage_key, task, marker_path, errors, task_id=task_id)
             raise AssertionError("adoption rejection returned")

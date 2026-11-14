@@ -126,7 +126,8 @@ breaking changes may land in a minor release.
 - Add `resolve --adopt-result` for a sweep paused `hook channel silent:` on triage: show
   the attempt's `result.json` and, on an explicit `y` (never skipped), have the resumed
   sweep use it as the triage plan after re-checking its sha256 and validating it against
-  the live ledger; a refused adoption pauses `adopt rejected:`.
+  the live ledger; a result carrying a CRITICAL escalation is never adopted, and a
+  refused adoption pauses `adopt rejected:`.
 
 ### Changed
 
