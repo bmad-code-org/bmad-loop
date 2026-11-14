@@ -37,6 +37,7 @@ from . import (
     codex_trust,
     deferredwork,
     gates,
+    operatoractions,
     sprintstatus,
     ticketstore,
     verify,
@@ -84,7 +85,13 @@ from .install import (
 )
 from .model import Phase
 from .mountpaths import rebased_project
-from .platform_util import atomic_write_text, filesystem_type, root_identity_record
+from .platform_util import (
+    atomic_write_bytes_confined,
+    atomic_write_text,
+    filesystem_type,
+    make_dirs_confined,
+    root_identity_record,
+)
 from .workspace import (
     UnitWorkspace,
     Workspace,
@@ -4884,6 +4891,7 @@ class WorktreeFlow:
             return
         self._warn_isolated_ledger_uncarried(task, unit)
         self._refuse_pinned_config_edits(task, unit.path)
+        self._carry_ignored_story_artifacts(task, unit)
         scm = self.policy.scm
         close_unit_workspace(
             unit,
@@ -4897,6 +4905,68 @@ class WorktreeFlow:
             ),
         )
         self._drop_pinned_config_record(task)
+
+    def _carry_ignored_story_artifacts(self, task: StoryTask, unit: UnitWorkspace) -> None:
+        """Copy the story's spec and park record to the main checkout when ignored.
+
+        The last member of the #351 carry family. Both files are written into the
+        unit worktree and are meant to reach the target through the story commit:
+        the dev session finalizes the spec there, and ``Engine._write_park_record``
+        writes the record there so ``finalize_commit``'s ``git add -A`` folds it in.
+        A project that gitignores its artifacts dir (or ``.bmad-loop/``) gets
+        neither into the commit, so both die with the worktree at the teardown
+        below — the main checkout keeps a stale spec (or none at all), and
+        ``bmad-loop confirm`` finds no record for a story the board shows as
+        ``awaiting-operator``.
+
+        Runs here, after the merge and immediately before the successful teardown,
+        because this is the last moment the mount is readable; the merge replay
+        reaches it too, through its reopened unit. A replay whose mount is already
+        gone (``unit is None`` above) has nothing to read.
+
+        Only an IGNORED destination is written: a tracked or untracked-unignored
+        file rides the merge (``git add -A`` took it), so the main checkout already
+        holds the merged bytes. ``verify.path_ignored`` asks the question ``git add``
+        does, index included. Nothing is committed — git refuses an ignored path.
+        An identical destination is left alone, so a replay is idempotent.
+
+        Best effort, like the ledger and board carries: the story's code is on the
+        target already, and a lost copy costs bookkeeping, not work — every fault is
+        journaled as ``story-artifact-carry-failed`` and the teardown goes on.
+        """
+        mount = unit.workspace.paths
+        sources: list[Path] = []
+        # A sweep bundle's spec is already published by `artifact_publication` from
+        # the bytes frozen at accepted verification; copying the mount's copy here
+        # would overwrite that with whatever the worktree holds now.
+        if task.spec_file and not task.dw_ids:
+            sources.append(verify.resolve_spec_path(task.spec_file, mount))
+        if task.operator_actions:
+            sources.append(operatoractions.record_path(mount.project, task.story_key))
+        main_project = self.paths.project
+        for src in sources:
+            rel = ""
+            try:
+                if mount.in_shared_store(src) or not src.is_file():
+                    continue
+                rel = src.resolve().relative_to(mount.project.resolve()).as_posix()
+                dst = main_project / rel
+                if not verify.path_ignored(self.paths.repo_root, dst):
+                    continue
+                data = src.read_bytes()
+                if dst.is_file() and dst.read_bytes() == data:
+                    continue
+                make_dirs_confined(dst.parent, confine_root=main_project)
+                atomic_write_bytes_confined(dst, data, confine_root=main_project)
+            except (OSError, RuntimeError, ValueError, verify.GitError) as e:
+                self.journal.append(
+                    "story-artifact-carry-failed",
+                    story_key=task.story_key,
+                    path=rel or src.name,
+                    error=f"{type(e).__name__}: {e}",
+                )
+                continue
+            self.journal.append("story-artifact-carried", story_key=task.story_key, path=rel)
 
     def _drop_pinned_config_record(self, task: StoryTask) -> None:
         """Forget the pinned-config record once the worktree is really gone.

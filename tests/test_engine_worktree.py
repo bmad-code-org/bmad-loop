@@ -48,7 +48,7 @@ from conftest import (
     write_sprint,
 )
 
-from bmad_loop import deferredwork, runs, sprintstatus, verify, worktree_flow
+from bmad_loop import deferredwork, operatoractions, runs, sprintstatus, verify, worktree_flow
 from bmad_loop.adapters.base import SessionResult
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.bmadconfig import ProjectPaths
@@ -14183,3 +14183,68 @@ def test_t2_unversioned_journals_under_mark_done_never(project_v7, monkeypatch):
     assert _plan_status(plan) == "built" and not tree.marks
     assert not _kinds(engine, "ticket-mark-latched")
     assert [e["layout"] for e in _kinds(engine, "store-unversioned")] == ["T2"]
+
+
+def test_done_isolated_unit_carries_a_gitignored_spec_to_the_main_checkout(project):
+    """A gitignored story spec is finalized in the unit worktree and never rides the
+    story commit, so it dies with the worktree at teardown unless the post-merge
+    carry copies it back. Ablation: drop the `_carry_ignored_story_artifacts` call
+    and the main checkout holds no spec."""
+    ignore_before_commit(project, "spec-*.md")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused and not summary.crashed
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    rel = spec.relative_to(project.project).as_posix()
+    assert spec.is_file() and "status: 'done'" in spec.read_text(encoding="utf-8")
+    assert not verify.path_tracked(project.project, rel)
+    carried = [e for e in engine.journal.entries() if e["kind"] == "story-artifact-carried"]
+    assert [e["path"] for e in carried] == [rel]
+    assert worktree_clean(project.project)
+
+
+def test_tracked_spec_is_left_to_the_merge(project):
+    """A tracked spec rides the story commit, so the carry writes nothing for it."""
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(project, [wt_dev_effect(project, "1-1-a", followup_review=False)])
+
+    summary = engine.run()
+
+    assert summary.done == 1
+    spec = project.implementation_artifacts / "spec-1-1-a.md"
+    assert verify.path_tracked(project.project, spec.relative_to(project.project).as_posix())
+    assert [e for e in engine.journal.entries() if e["kind"].startswith("story-artifact-")] == []
+
+
+def test_awaiting_operator_isolated_unit_carries_ignored_spec_and_park_record(project):
+    """With both the spec and `.bmad-loop/operator/` gitignored, the park record and
+    the parked spec reach the main checkout, so `confirm` can see the story.
+    Ablation: drop the carry and `operatoractions.resolve` lists nothing."""
+    ignore_before_commit(project, "spec-*.md", ".bmad-loop/operator/")
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    engine, _ = make_engine(
+        project,
+        [
+            wt_dev_effect(
+                project,
+                "1-1-a",
+                final_status="awaiting-operator",
+                followup_review=False,
+                operator_actions=["publish the DNS record"],
+            )
+        ],
+    )
+
+    summary = engine.run()
+
+    assert summary.awaiting_operator == 1
+    record = operatoractions.record_path(project.project, "1-1-a")
+    assert record.is_file()
+    parked = operatoractions.resolve(project.project, project)
+    assert [p.story_key for p in parked] == ["1-1-a"]
+    assert parked[0].spec_path is not None and parked[0].spec_path.is_file()
+    assert list(parked[0].actions) == ["publish the DNS record"]
+    assert worktree_clean(project.project)
