@@ -900,54 +900,6 @@ def _report_bmad_config(report: ValidationReport, paths: bmadconfig.ProjectPaths
         )
 
 
-@dataclass(frozen=True)
-class _RelayRegistration:
-    """One hooked profile's project hook config, read the way ``validate`` reads it.
-
-    ``parsed`` is the loaded JSON (``{}`` when the file is missing or not JSON).
-    ``registered`` is :func:`install.relay_registered` over it, forced False by a
-    malformed handler list. ``fault`` is validate's ``hooks.config-parse`` message,
-    or None when the file is absent or parsed cleanly."""
-
-    config_path: Path
-    parsed: object
-    registered: bool
-    fault: str | None
-
-
-def _read_relay_registration(project: Path, profile: CLIProfile) -> _RelayRegistration:
-    """The registration core ``validate``'s ``hooks.*`` checks and the launch
-    warning (:func:`_warn_hook_relay_unregistered`) share. It reads only
-    ``project / profile.hooks.config_path``. Project-only is the contract
-    (DW-645): a relay registered in a user- or local-scope settings file (or a
-    CLI's managed/plugin hooks) is not seen here, though the CLI may still merge
-    it; ``bmad-loop init`` registers the relay in the project config. A read error
-    other than invalid JSON propagates, as it always has for validate."""
-    hook_config = project / profile.hooks.config_path
-    registered = False
-    fault: str | None = None
-    parsed: object = {}
-    if hook_config.is_file():
-        try:
-            parsed = json.loads(hook_config.read_text(encoding="utf-8"))
-            registered = isinstance(parsed, dict) and install.relay_registered(
-                parsed, profile.hooks.dialect, profile.hooks.events
-            )
-            if isinstance(parsed, dict):
-                container = install.hook_event_container(parsed, profile.hooks.dialect)
-                malformed = [
-                    event
-                    for event in profile.hooks.events
-                    if event in container and not isinstance(container[event], list)
-                ]
-                if malformed:
-                    registered = False
-                    fault = f"{hook_config} has malformed handlers for {', '.join(malformed)}"
-        except json.JSONDecodeError:
-            fault = f"{hook_config} is not valid JSON"
-    return _RelayRegistration(hook_config, parsed, registered, fault)
-
-
 def _relay_registration_problem(project: Path, profile: CLIProfile) -> str | None:
     """Why a hooked ``profile``'s relay looks unregistered in the project hook
     config, or None when it is registered. A hookless profile has no hook config;
@@ -956,7 +908,7 @@ def _relay_registration_problem(project: Path, profile: CLIProfile) -> str | Non
     Unlike validate, an unreadable config is a problem to report, not a crash: the
     launch warning that calls this must never abort a launch."""
     try:
-        registration = _read_relay_registration(project, profile)
+        registration = install.read_relay_registration(project, profile)
     except (OSError, ValueError) as error:
         return f"{project / profile.hooks.config_path} could not be read ({type(error).__name__})"
     if registration.registered:
@@ -1353,7 +1305,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"profile": profile.name},
             )
             continue
-        registration = _read_relay_registration(project, profile)
+        registration = install.read_relay_registration(project, profile)
         hook_config = registration.config_path
         hooks_ok = registration.registered
         parsed = registration.parsed
@@ -2715,7 +2667,7 @@ def _warn_hook_relay_unregistered(
     event per affected role. It never refuses and never touches stdout or the rc.
 
     The wording hedges ("may be unregistered") because the check reads only the
-    project hook config (:func:`_read_relay_registration`) — the documented
+    project hook config (:func:`install.read_relay_registration`) — the documented
     contract — while the CLI may merge hooks from user- or local-scope settings
     too.
 

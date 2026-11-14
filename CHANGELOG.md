@@ -322,6 +322,10 @@ breaking changes may land in a minor release.
   session rewrote or deleted, and restart the migration, instead of refusing until the
   ledger is restored by hand. A ledger edited or committed since the pause still refuses,
   as does native Windows.
+- Report a broken project hook config in `probe-adapter`'s scan (invalid JSON, unreadable,
+  not a JSON object, or malformed handlers for a declared event) as a config fault with a
+  next step to fix it, instead of an unregistered relay blamed on user- or local-scope
+  settings. `validate` also reports a non-object config as `hooks.config-parse`.
 
 ### Security
 

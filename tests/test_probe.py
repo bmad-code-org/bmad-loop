@@ -385,6 +385,81 @@ def test_scan_reports_registered_state(project, cli):
     assert not any("hooks not registered" in s for s in finding2.next_steps)
 
 
+def _break_hook_config(proj: Path, cli: str, fault: str, monkeypatch) -> None:
+    """Leave the project hook config for `cli` in the named broken state."""
+    from bmad_loop.install import install_into
+
+    profile = get_profile(cli)
+    config = proj / profile.hooks.config_path
+    if fault == "malformed":
+        # a valid installed Stop relay beside a dict-valued SessionStart:
+        # relay_registered alone reads it registered
+        install_into(proj, clis=(cli,))
+        data = json.loads(config.read_text(encoding="utf-8"))
+        data["hooks"]["SessionStart"] = {}
+        config.write_text(json.dumps(data), encoding="utf-8")
+        return
+    config.parent.mkdir(parents=True, exist_ok=True)
+    if fault == "invalid-json":
+        config.write_text("{not json", encoding="utf-8")
+    elif fault == "non-object":
+        config.write_text("[]", encoding="utf-8")
+    else:
+        assert fault == "unreadable"
+        install_into(proj, clis=(cli,))
+        real_read_text = Path.read_text
+
+        def read_text(self, *args, **kwargs):
+            if self == config:
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+
+
+@pytest.mark.parametrize(
+    ("cli", "fault", "expected"),
+    [
+        ("claude", "invalid-json", "is not valid JSON"),
+        ("antigravity", "invalid-json", "is not valid JSON"),
+        ("claude", "non-object", "is not a JSON object"),
+        ("antigravity", "non-object", "is not a JSON object"),
+        ("claude", "malformed", "has malformed handlers for SessionStart"),
+        ("claude", "unreadable", "could not be read (PermissionError)"),
+    ],
+)
+def test_scan_reports_hook_config_fault(project, monkeypatch, cli, fault, expected):
+    """A broken project hook config is a config fault with its own next step, not
+    an unregistered relay blamed on user- or local-scope settings (DW-648)."""
+    proj = project.project
+    profile = get_profile(cli)
+    _break_hook_config(proj, cli, fault, monkeypatch)
+    finding = probe.scan(cli=cli, profile=profile, project=proj, hints=probe.Hints())
+    assert finding.registered is False
+    fault_text = f"{profile.hooks.config_path} {expected}"
+    warnings = [w for w in finding.warnings if "project hook config" in w]
+    assert warnings == [f"project hook config {fault_text}"]
+    steps = [s for s in finding.next_steps if "project hook config" in s]
+    assert len(steps) == 1
+    assert steps[0].startswith(f"fix the project hook config: {fault_text}; ")
+    assert f"`bmad-loop init --cli {cli}` against this project registers" in steps[0]
+    assert not any("hooks not registered" in s for s in finding.next_steps)
+    assert not any("user- or local-scope" in s for s in finding.next_steps)
+    for text in (*warnings, *steps):
+        assert str(proj) not in text
+
+
+def test_scan_missing_hook_config_has_no_fault_warning(project):
+    proj = project.project
+    profile = get_profile("claude")
+    assert not (proj / profile.hooks.config_path).exists()
+    finding = probe.scan(cli="claude", profile=profile, project=proj, hints=probe.Hints())
+    assert finding.registered is False
+    assert not any("project hook config" in w for w in finding.warnings)
+    assert not any(s.startswith("fix the project hook config") for s in finding.next_steps)
+    assert len([s for s in finding.next_steps if "hooks not registered" in s]) == 1
+
+
 # ----------------------------------------------------------- CLI plumbing
 
 

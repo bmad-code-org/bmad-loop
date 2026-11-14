@@ -15193,6 +15193,23 @@ def test_real_run_warns_and_journals_when_relay_unregistered(project, monkeypatc
     assert all(e["problem"] == f"{config} does not exist" for e in entries)
 
 
+def test_relay_registration_problem_names_non_object_config(project):
+    """A `[]` project hook config is named as not a JSON object, not as a config
+    that merely lacks the relay.
+
+    ABLATION: drop the non-object fault in `install.read_relay_registration` and
+    this reddens."""
+    from bmad_loop.adapters.profile import get_profile
+
+    config = project.project / ".claude/settings.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("[]", encoding="utf-8")
+    problem = cli._relay_registration_problem(
+        project.project, get_profile("claude", project.project)
+    )
+    assert problem == f"{config} is not a JSON object"
+
+
 def test_registered_relay_and_hookless_profile_stay_silent(project, monkeypatch, capsys):
     """A registered relay warns nothing at a real launch, and a hookless profile
     (opencode: HTTP/SSE, no hook config) is skipped even when no config exists.
@@ -15539,6 +15556,28 @@ def test_validate_json_reports_null_hook_handlers_without_crashing(project, caps
         and finding["severity"] == "problem"
         and "Stop" in finding["message"]
         for finding in doc["findings"]
+    )
+
+
+def test_validate_reports_non_object_hook_config_as_config_parse(project, capsys):
+    """A `[]` top level is a config fault beside the failed registration, not only
+    an unregistered relay; the rc stays the failed-registration rc."""
+    from bmad_loop.install import install_into
+
+    install_bmad_config(project)
+    _write_policy(project.project)
+    assert install_into(project.project, clis=("claude",), skills=False) == 0
+    (project.project / ".claude/settings.json").write_text("[]")
+    capsys.readouterr()
+
+    rc, doc = _validate_json(project.project, capsys)
+    assert rc == 1
+    parse = [f for f in doc["findings"] if f["check"] == "hooks.config-parse"]
+    assert len(parse) == 1
+    assert parse[0]["severity"] == "problem"
+    assert "is not a JSON object" in parse[0]["message"]
+    assert any(
+        f["check"] == "hooks.registered" and f["severity"] == "problem" for f in doc["findings"]
     )
 
 

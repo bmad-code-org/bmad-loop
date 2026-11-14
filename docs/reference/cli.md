@@ -140,7 +140,7 @@ bmad-loop probe-adapter [--project PROJECT] [--probe] [--transcript TRANSCRIPT] 
 | `--out OUT`                 | Write the report (or JSON document) to this file instead of stdout.                                                                                                                                                                                      |
 | `--json`                    | Emit a JSON document instead of the Markdown report.                                                                                                                                                                                                     |
 
-- The hook-registration check (`hooks registered`; JSON `hooks_registered`) reads only the project hook config (the profile's `config_path`, where `bmad-loop init --cli <profile>` registers the relay), never user- or local-scope settings, managed policy or plugin hooks: the same file `validate`'s `hooks.registered` reads. A relay registered only there reads as unregistered, and the next step says so.
+- The hook-registration check (`hooks registered`; JSON `hooks_registered`) reads only the project hook config (the profile's `config_path`, where `bmad-loop init --cli <profile>` registers the relay), never user- or local-scope settings, managed policy or plugin hooks: the same file `validate`'s `hooks.registered` reads. A relay registered only there reads as unregistered, and the next step says so. A broken project config (invalid JSON, unreadable, not a JSON object, or malformed handlers for a declared event) also reads as unregistered, but is reported as a config fault: a warning and a next step to fix that file, in place of the scope explanation.
 - Exits 1 when the profile is unknown (without `--binary`), the leak self-check fires (nothing is written), or hook or workspace trust is not `trusted` (the report is still written).
 
 JSON: [`probe-adapter --json`](#probe-adapter---json).
@@ -169,7 +169,7 @@ bmad-loop run [--project PROJECT] [--spec FOLDER] [--epic EPIC] [--story STORY] 
 - On a parent initiative, `run` builds the children one run each: the first child `next <parent>` lists as ready, skipping one with no folder or nothing left to dispatch, then the next after each run that finishes. Before each pick, its first included (after the clean-worktree, skills and plugin-trust checks, and journaled in the first child's run), it marks every drained child's initiative `done` and prints `... closed <child> (drained)`, or `... leaves <child> open (<why>: ...)` while a run holds the child, its first pick still finds work, or its store is refused. It prints `initiative chain <parent>: <child> -> <next>` per switch, or `... ends (<why>)` with each waiting child's unmet prerequisites and their status, and stops at a run that does not finish, including each child's pause at `epic-boundary` after every epic it finishes; `resume` or `resolve` driving that run to finished continues the chain. `--epic` and `--story` exit 1 there; `--run-id` names the first child's run; `--max-stories` is one budget for the whole chain, and the chain ends `max-stories` once it is spent.
 - A launch check that refuses the next child's run of a parent initiative (a dirty worktree, the skills, plugin trust, the child's store) ends the chain `launch-refused`, and `run` exits with that check's exit code.
 - `--dry-run` in tickets mode reads the active initiative through its `tickets.py` and marks nothing. It prints the startable tickets in build order (initiative epic table, then entry order), each with its badges, its `ticket <ref>` dispatch (`thorough` when `[tickets] thorough_review` selects it, `Halt after planning.` on an unrefined plan-checkpoint ticket) and its env, then the first pause a run would reach (`predicted:`), the `next` group counts and the tree's problems. A `tickets.py` failure exits 1. On a parent initiative it lists the children in build order (status, closed and total tickets, unmet prerequisites, and a tag: `next`, `ready`, `ready, passed over (<why>)`, `waiting`, `no folder`, `drained (the run closes it first)`, `done` or `dropped`), prints the `next` child's block, and ends `predicted: chain starts with <child>; later children are chosen as each finishes`, or with the chain's end line when no child can start. It closes no drained child but picks as if the run had, and the predicted line names them. `--max-stories` caps the first child's block only, `--epic` and `--story` exit 1, and the banner warns when the preflight would refuse the parent.
-- Warns, never refuses, when a role's CLI hook config does not register the bmad-loop relay: one `warning: <roles> (<profile>): the bmad-loop hook relay may be unregistered — <problem>. …` line on stderr per hooked profile, and one `hook-relay-unregistered` journal row per role (`role`, `profile`, `problem`). `<problem>` names the config: missing, not valid JSON, malformed handlers, no relay, or unreadable. The check reads only the project hook config (the profile's `config_path`, where `bmad-loop init --cli <profile>` registers the relay), never user- or local-scope settings, managed policy or plugin hooks, so a relay registered only there still warns. `bmad-loop validate` reads the same config for `hooks.registered`, so it fails there too. Under worktree isolation only the main-checkout roles (triage, retro) are checked. A dry run does not check.
+- Warns, never refuses, when a role's CLI hook config does not register the bmad-loop relay: one `warning: <roles> (<profile>): the bmad-loop hook relay may be unregistered — <problem>. …` line on stderr per hooked profile, and one `hook-relay-unregistered` journal row per role (`role`, `profile`, `problem`). `<problem>` names the config: missing, not valid JSON, not a JSON object, malformed handlers, no relay, or unreadable. The check reads only the project hook config (the profile's `config_path`, where `bmad-loop init --cli <profile>` registers the relay), never user- or local-scope settings, managed policy or plugin hooks, so a relay registered only there still warns. `bmad-loop validate` reads the same config for `hooks.registered`, so it fails there too. Under worktree isolation only the main-checkout roles (triage, retro) are checked. A dry run does not check.
 - Prints `run <id> starting (attach: bmad-loop attach)`, then the run summary; exits 0 once the engine has run.
 
 ### `sweep`
@@ -511,21 +511,21 @@ Each row: `name`, `origin`, `path` (POSIX path from the code root), `surface` (`
 
 ### `probe-adapter --json`
 
-| Field                           | Type           | Meaning                                                         |
-| ------------------------------- | -------------- | --------------------------------------------------------------- |
-| `cli`, `binary`                 | str            | probed CLI and binary                                           |
-| `mode`                          | str            | `scan` or `probe`                                               |
-| `known_profile`, `binary_found` | bool           | a packaged profile exists; the binary resolved                  |
-| `dialect`                       | str \| null    | hook dialect                                                    |
-| `usage_parser`                  | str            | usage parser (`none` without a known profile)                   |
-| `hooks_registered`              | bool \| null   | relay hooks are present in the project hook config              |
-| `hook_trust`, `workspace_trust` | str \| null    | `trusted`, `untrusted` or `unverifiable`                        |
-| `declared_events`               | object         | native event → canonical event, as the profile declares         |
-| `version`, `help`               | str \| null    | the CLI's own `--version` / `--help` output                     |
-| `captured_events`               | array          | `{native_event, canonical_event, payload_keys, payload_schema}` |
-| `transcript`                    | object \| null | location, format and size of the discovered transcript          |
-| `tokens`                        | object \| null | token-schema inference                                          |
-| `warnings`, `next_steps`        | list[str]      | advisory text                                                   |
+| Field                           | Type           | Meaning                                                                             |
+| ------------------------------- | -------------- | ----------------------------------------------------------------------------------- |
+| `cli`, `binary`                 | str            | probed CLI and binary                                                               |
+| `mode`                          | str            | `scan` or `probe`                                                                   |
+| `known_profile`, `binary_found` | bool           | a packaged profile exists; the binary resolved                                      |
+| `dialect`                       | str \| null    | hook dialect                                                                        |
+| `usage_parser`                  | str            | usage parser (`none` without a known profile)                                       |
+| `hooks_registered`              | bool \| null   | relay hooks are registered in the project hook config, which parsed without a fault |
+| `hook_trust`, `workspace_trust` | str \| null    | `trusted`, `untrusted` or `unverifiable`                                            |
+| `declared_events`               | object         | native event → canonical event, as the profile declares                             |
+| `version`, `help`               | str \| null    | the CLI's own `--version` / `--help` output                                         |
+| `captured_events`               | array          | `{native_event, canonical_event, payload_keys, payload_schema}`                     |
+| `transcript`                    | object \| null | location, format and size of the discovered transcript                              |
+| `tokens`                        | object \| null | token-schema inference                                                              |
+| `warnings`, `next_steps`        | list[str]      | advisory text                                                                       |
 
 ### `decisions --json`
 
@@ -658,7 +658,7 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `adapter.kind`                         | ok / problem           | the profile's `adapter` kind is registered                                                                                                              |
 | `adapter.external`                     | warning                | a third-party adapter entry point failed to load                                                                                                        |
 | `adapter.external-profile`             | warning                | a third-party profile entry point failed to load                                                                                                        |
-| `hooks.config-parse`                   | problem                | the hook config file is not valid JSON or has malformed handlers                                                                                        |
+| `hooks.config-parse`                   | problem                | the hook config file is not valid JSON, is not a JSON object, or has malformed handlers                                                                 |
 | `hooks.registered`                     | ok / problem           | relay hooks are registered for the profile's events in the project hook config, where `init` writes them; user- or local-scope settings are not read    |
 | `hooks.events-incomplete`              | ok / warning           | a mapped hook event besides Stop has no relay; the warning names `bmad-loop init --cli <profile>`, or the CLI version it needs                          |
 | `hooks.trust`                          | ok / problem           | Codex project hook trust is current                                                                                                                     |

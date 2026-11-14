@@ -30,6 +30,7 @@ import tempfile
 import tomllib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from importlib import resources
 from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -2351,6 +2352,70 @@ def relay_registered(config: dict, dialect: str, events: Mapping[str, str]) -> b
     if foreign_group_relay_hazards(config, dialect, events):
         return False
     return all(native in satisfied for native in stop_natives)
+
+
+@dataclass(frozen=True)
+class RelayRegistration:
+    """One hooked profile's project hook config, as :func:`read_relay_registration`
+    reads it.
+
+    ``parsed`` is the loaded JSON (``{}`` when the file is missing or not JSON).
+    ``registered`` is :func:`relay_registered` over it, False for a non-object top
+    level and forced False by a malformed handler list. ``fault_detail`` is the
+    config fault without the path ("is not valid JSON", "is not a JSON object",
+    "has malformed handlers for A, B"), or None when the file is absent or parsed
+    cleanly; a caller that must render a relative path joins it to
+    ``profile.hooks.config_path`` itself."""
+
+    config_path: Path
+    parsed: object
+    registered: bool
+    fault_detail: str | None
+
+    @property
+    def fault(self) -> str | None:
+        """``fault_detail`` behind the absolute ``config_path`` (validate's
+        ``hooks.config-parse`` message), or None when there is no fault."""
+        if self.fault_detail is None:
+            return None
+        return f"{self.config_path} {self.fault_detail}"
+
+
+def read_relay_registration(project: Path, profile: CLIProfile) -> RelayRegistration:
+    """The registration core shared by ``validate``'s ``hooks.*`` checks, the
+    launch relay warning and ``probe-adapter``'s scan.
+
+    It reads only ``project / profile.hooks.config_path``. Project-only is the
+    contract (DW-645): a relay registered in a user- or local-scope settings file
+    (or a CLI's managed/plugin hooks) is not seen here, though the CLI may still
+    merge it; ``bmad-loop init`` registers the relay in the project config.
+
+    A missing file is unregistered with no fault. Invalid JSON, a non-object top
+    level, and a non-list handler value under a declared native event are faults
+    (``fault_detail``) and read unregistered. Any other read error (``OSError``,
+    ``UnicodeDecodeError``) propagates, as it always has for validate; a caller
+    that must not raise catches ``(OSError, ValueError)``."""
+    hook_config = project / profile.hooks.config_path
+    if not hook_config.is_file():
+        return RelayRegistration(hook_config, {}, False, None)
+    try:
+        parsed: object = json.loads(hook_config.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return RelayRegistration(hook_config, {}, False, "is not valid JSON")
+    if not isinstance(parsed, dict):
+        return RelayRegistration(hook_config, parsed, False, "is not a JSON object")
+    registered = relay_registered(parsed, profile.hooks.dialect, profile.hooks.events)
+    container = hook_event_container(parsed, profile.hooks.dialect)
+    malformed = [
+        event
+        for event in profile.hooks.events
+        if event in container and not isinstance(container[event], list)
+    ]
+    if malformed:
+        return RelayRegistration(
+            hook_config, parsed, False, f"has malformed handlers for {', '.join(malformed)}"
+        )
+    return RelayRegistration(hook_config, parsed, registered, None)
 
 
 def missing_relay_events(config: dict, dialect: str, events: Mapping[str, str]) -> list[str]:
