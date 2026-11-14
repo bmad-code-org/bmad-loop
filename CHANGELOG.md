@@ -136,9 +136,10 @@ breaking changes may land in a minor release.
 
 ### Changed
 
-- Name the project hook config in `validate`'s `hooks.registered` problem and state the
-  contract: only the project config is read, where `bmad-loop init` registers the relay;
-  a user- or local-scope registration is not seen.
+- Name the project hook config in `validate`'s `hooks.registered` problem and
+  `probe-adapter`'s unregistered-hooks next step, and state the contract: only the
+  project config is read, where `bmad-loop init` registers the relay; a user- or
+  local-scope registration is not seen.
 - **Require Codex 0.156 or newer.** Codex sessions run with `--no-daemon`, so tools and
   hooks see the session's `BMAD_LOOP_*` environment instead of a shared app-server
   daemon's (`validate`: `adapter.codex-version`). A session whose CLI sends no

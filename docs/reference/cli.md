@@ -140,6 +140,7 @@ bmad-loop probe-adapter [--project PROJECT] [--probe] [--transcript TRANSCRIPT] 
 | `--out OUT`                 | Write the report (or JSON document) to this file instead of stdout.                                                                                                                                                                                      |
 | `--json`                    | Emit a JSON document instead of the Markdown report.                                                                                                                                                                                                     |
 
+- The hook-registration check (`hooks registered`; JSON `hooks_registered`) reads only the project hook config (the profile's `config_path`, where `bmad-loop init --cli <profile>` registers the relay), never user- or local-scope settings, managed policy or plugin hooks: the same file `validate`'s `hooks.registered` reads. A relay registered only there reads as unregistered, and the next step says so.
 - Exits 1 when the profile is unknown (without `--binary`), the leak self-check fires (nothing is written), or hook or workspace trust is not `trusted` (the report is still written).
 
 JSON: [`probe-adapter --json`](#probe-adapter---json).
@@ -517,7 +518,7 @@ Each row: `name`, `origin`, `path` (POSIX path from the code root), `surface` (`
 | `known_profile`, `binary_found` | bool           | a packaged profile exists; the binary resolved                  |
 | `dialect`                       | str \| null    | hook dialect                                                    |
 | `usage_parser`                  | str            | usage parser (`none` without a known profile)                   |
-| `hooks_registered`              | bool \| null   | relay hooks are present                                         |
+| `hooks_registered`              | bool \| null   | relay hooks are present in the project hook config              |
 | `hook_trust`, `workspace_trust` | str \| null    | `trusted`, `untrusted` or `unverifiable`                        |
 | `declared_events`               | object         | native event → canonical event, as the profile declares         |
 | `version`, `help`               | str \| null    | the CLI's own `--version` / `--help` output                     |

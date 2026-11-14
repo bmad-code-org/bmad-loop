@@ -146,8 +146,11 @@ Both modes emit the same sanitized finding: markdown on stdout, or a file with `
 
 Runs `<binary> --version` and `--help`, finds the newest existing session transcript by
 convention, reads the declared hook config, and infers the token schema from the
-transcript. Use it first for any CLI that already has a profile or that you have run by
-hand.
+transcript. The hook check reads only the project hook config (the profile's
+`config_path`), not user- or local-scope settings, managed policy or plugin hooks, so a
+relay registered only there reports as unregistered; `bmad-loop init --cli <profile>`
+registers it in the project config. Use it first for any CLI that already has a profile
+or that you have run by hand.
 
 #### PROBE (`--probe`, opt-in live capture)
 

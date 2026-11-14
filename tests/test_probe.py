@@ -370,12 +370,19 @@ def test_scan_reports_registered_state(project, cli):
     profile = get_profile(cli)
     finding = probe.scan(cli=cli, profile=profile, project=proj, hints=probe.Hints())
     assert finding.registered is False  # nothing installed in the sandbox
+    # the next step states the project-only contract and the fix
+    hook_steps = [s for s in finding.next_steps if "hooks not registered" in s]
+    assert len(hook_steps) == 1
+    assert f"project hook config {profile.hooks.config_path}" in hook_steps[0]
+    assert "user- or local-scope settings, managed policy or plugin hooks" in hook_steps[0]
+    assert f"`bmad-loop init --cli {cli}` against this project registers" in hook_steps[0]
     # now install hooks and re-scan
     from bmad_loop.install import install_into
 
     install_into(proj, clis=(cli,))
     finding2 = probe.scan(cli=cli, profile=profile, project=proj, hints=probe.Hints())
     assert finding2.registered is True
+    assert not any("hooks not registered" in s for s in finding2.next_steps)
 
 
 # ----------------------------------------------------------- CLI plumbing

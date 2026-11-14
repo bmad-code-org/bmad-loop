@@ -535,6 +535,15 @@ def infer_token_schema(
 
 
 def _hooks_registered(project: Path, profile: CLIProfile) -> bool:
+    """Whether the bmad-loop relay is registered for the profile's events. It
+    reads only ``project / profile.hooks.config_path``, the same single file
+    ``validate``'s ``hooks.registered`` check and the launch relay warning read:
+    project-only is the contract. A relay registered in a user- or local-scope
+    settings file (or a CLI's managed-policy/plugin hooks) is not seen here,
+    though the CLI may still merge it; ``bmad-loop init --cli <profile>``
+    registers the relay in the project config. Unlike validate's reader it does
+    not separate faults: a missing, unreadable, invalid-JSON or non-object config
+    reads as unregistered, and malformed handlers are not flagged."""
     config_path = project / profile.hooks.config_path
     if not config_path.is_file():
         return False
@@ -670,8 +679,11 @@ def scan(
         _check_hook_trust(finding, project, profile, binary)
         if not finding.registered:
             finding.next_steps.append(
-                f"hooks not registered in {profile.hooks.config_path}; "
-                f"`bmad-loop init --cli {cli}` to validate the dialect end-to-end, "
+                "hooks not registered in the project hook config "
+                f"{profile.hooks.config_path} (only this file is read: a relay in "
+                "user- or local-scope settings, managed policy or plugin hooks reads "
+                f"as unregistered); `bmad-loop init --cli {cli}` against this project "
+                "registers the relay there so a run validates the dialect end-to-end, "
                 "or re-run with --probe"
             )
 
