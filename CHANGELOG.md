@@ -123,6 +123,10 @@ breaking changes may land in a minor release.
 - Warn on stderr at `run`, `sweep` and `resume`, and journal `hook-relay-unregistered`
   per role, when a role's project hook config does not register the bmad-loop relay;
   never refuses the launch (#752).
+- Add `resolve --adopt-result` for a sweep paused `hook channel silent:` on triage: show
+  the attempt's `result.json` and, on an explicit `y` (never skipped), have the resumed
+  sweep use it as the triage plan after re-checking its sha256 and validating it against
+  the live ledger; a refused adoption pauses `adopt rejected:`.
 
 ### Changed
 

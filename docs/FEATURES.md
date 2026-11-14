@@ -107,6 +107,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
   - A session that did no work, or is still parked on a prompt only a human should answer when it stalls or times out, pauses the run instead of being charged; a non-blocking workflow's is journaled and the run continues.
   - A session that times out or stalls before any hook event of any kind reached it, on a CLI that maps `SessionStart`, pauses uncharged with a `hook channel silent:` reason pointing at `bmad-loop validate`; the fault is the relay, not the work, and its `result.json` is never read as a completion. This covers dev, review, fix, blocking-workflow, sweep triage and migration sessions.
+  - `resolve --adopt-result` shows a silent sweep triage attempt's `result.json` and, only on an explicit `y`, has the resumed sweep use it as the triage plan instead of relaunching triage; the sweep first re-checks its sha256 and validates it against the live ledger, and pauses `adopt rejected:` when it no longer fits.
   - A sweep triage or migration that reaches its attempt cap without its last session completing pauses as `session failed:`, not as a validation failure, and a non-completed attempt hands the next one no new `--feedback`.
   - `run`, `sweep` and `resume` warn on stderr, and journal `hook-relay-unregistered`, when a role's project hook config does not register the relay; the launch is never refused.
   - A session approved past its permission prompt that then goes silent gets the stall nudge, not a parked pause.
@@ -139,10 +140,10 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 ### Typed escalations and resolve
 
 - **Stability:** stable
-- **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, or adopting a kept branch, and closes a tickets epic at an `epic-boundary` pause.
+- **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, adopting a kept branch, or adopting a silent sweep triage attempt's result, and closes a tickets epic at an `epic-boundary` pause.
 - **Properties:**
   - A CRITICAL escalation marks the story `escalated`, sends a `CRITICAL escalation: <story>` notice and pauses the run at `escalation`.
-  - A pause that is not a CRITICAL contradiction is titled by its reason: `Paused (parked prompt): <story>`, `Paused (no work): <story>`, `Paused (usage limit): <story>`, `Paused (hook channel silent): <story>`, `Paused (session failed): <story>` or `Paused (environment fault): <story>`.
+  - A pause that is not a CRITICAL contradiction is titled by its reason: `Paused (parked prompt): <story>`, `Paused (no work): <story>`, `Paused (usage limit): <story>`, `Paused (hook channel silent): <story>`, `Paused (session failed): <story>`, `Paused (adopt rejected): <story>` or `Paused (environment fault): <story>`.
   - A PREFERENCE escalation is journaled as `preference-escalation` and the run continues.
   - A story still escalated after a resume cleared the pause can still be resolved; `resume`, `status` and the TUI header point at it.
   - A resume that fails before its engine starts puts back the pause it cleared.
@@ -151,7 +152,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `--reverify` re-runs `[verify]` on a deferred or environment-fault story's kept work without a dev session; on a finished run it replays a kept worktree unit in a new run.
   - In tickets mode the re-arm moves the ticket's plan through `tickets.py mark` and clears its `blocked_*` fields.
   - On a tickets `epic-boundary` pause, resolve opens bmad-agent-po on the epic and resumes only when the epic reads `done` or `dropped` with its folder committed; otherwise it exits 1 with the run still paused.
-- **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`, `--at-reset`, `--margin-min`
+- **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--adopt-result`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`, `--at-reset`, `--margin-min`
 - **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`, `tests/test_runs.py`, `tests/test_tui_app.py`, `tests/test_tickets_source.py`, `tests/test_tickets_e2e.py`
 - **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [Epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [resolve CLI reference](reference/cli.md#resolve)
 

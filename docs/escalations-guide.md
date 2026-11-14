@@ -55,6 +55,7 @@ Some escalation pauses are not a contradiction in the spec, and their notices sa
 | `usage limit:`                          | `Paused (usage limit): <story>`         | the coding CLI hit a [usage limit](#usage-limit-pauses)                                                             |
 | `hook channel silent:`                  | `Paused (hook channel silent): <story>` | no hook event reached a timed-out or stalled session: see [Silent hook channel pauses](#silent-hook-channel-pauses) |
 | `session failed:`                       | `Paused (session failed): <story>`      | a sweep triage or migration session that never completed used up its attempts                                       |
+| `adopt rejected:`                       | `Paused (adopt rejected): <story>`      | a sweep refused a [confirmed triage adoption](#adopt-a-silent-triage-attempts-result) when it resumed               |
 | `environment fault:`, or a verify fault | `Paused (environment fault): <story>`   | an [environment fault](#environment-faults) during the story                                                        |
 
 Every other reason keeps the `CRITICAL escalation: <story>` title. Fix the cause (answer or dismiss the prompt, check the CLI's login, credits or permission mode), then resolve as below.
@@ -81,7 +82,7 @@ The reason names both sides. The work is kept: uncommitted in the checkout, or o
 - `--no-resume` only re-arms and prints `resume when ready: bmad-loop resume <id>`.
 - `--force` proceeds when the engine's liveness cannot be verified. A running engine always blocks: run `bmad-loop stop <run-id>` first.
 
-`--restore-patch`, `--adopt-branch`, `--reverify` and `--abandon` are mutually exclusive.
+`--restore-patch`, `--adopt-branch`, `--adopt-result`, `--reverify` and `--abandon` are mutually exclusive.
 
 ### Re-arm with the resolve agent
 
@@ -320,7 +321,17 @@ To recover:
 
 1. `bmad-loop validate` and fix what it reports. Check the CLI's [first-run note](setup-guide.md#first-run-notes) too: a Codex hook trust prompt left unanswered silences every hook.
 2. Commit any hook-config fix. A resume or re-arm can reset uncommitted changes in the checkout, the fix included.
-3. A story run: `bmad-loop resolve <run-id> --no-interactive`, which re-arms with a fresh budget and resumes. A sweep: `bmad-loop resume <run-id>`, which restarts triage or the migration with a fresh budget.
+3. A story run: `bmad-loop resolve <run-id> --no-interactive`, which re-arms with a fresh budget and resumes. A sweep: `bmad-loop resume <run-id>`, which restarts triage or the migration with a fresh budget, unless a triage adoption is recorded (see below): then the resume adopts that `result.json` instead of restarting triage.
+
+#### Adopt a silent triage attempt's result
+
+A sweep triage session that timed out on a silent channel may still have written a valid `result.json`. When relaunching triage would hit the same silent channel, `bmad-loop resolve <run-id> --adopt-result` can use that file as the triage plan instead:
+
+1. It shows the file's path, mtime, size and sha256, a summary of the plan, and the full document, then asks `adopt this result.json as the triage plan of run <id>?`. The confirm is always asked: `--resume`, `--no-interactive` and `--force` do not skip it. Any answer other than `y` or `yes`, or end of input, exits 0 and leaves the run paused with nothing written.
+2. After a `y` it re-checks the pause, the engine's liveness, the task and the file's sha256, writes the adoption marker `adopt-<triage-key>.json` in the run directory, journals `sweep-triage-adopt-confirmed`, and resumes (`--no-resume`: prints the resume hint instead). A file that changed after it was shown is refused with exit 1.
+3. The resumed sweep reads the marker when it reaches that triage cycle; a sweep that exits earlier (for example, with nothing open) leaves it on disk, and every later resume adopts it. It reads the file again. When it still has the confirmed sha256 and validates against the current ledger, the sweep uses it as the plan without launching a triage session and journals `sweep-triage-adopted`. Otherwise it journals `sweep-triage-adopt-rejected` and pauses at the escalation with an `adopt rejected:` reason (titled `Paused (adopt rejected): <key>`); no ledger entry is closed, and `bmad-loop resume <run-id>` relaunches triage.
+
+`--adopt-result` applies only to a sweep paused with a `hook channel silent:` reason on a triage task. It refuses, with exit 1 and nothing written, any other run, task or pause reason, and a `result.json` that is missing, unreadable or not a valid triage plan. The silent session still counts as not completed: its `session-end` and `triage-decision` rows are unchanged. A migration's result is never adopted. When an adoption is already recorded, `--adopt-result` says so before the confirm, and declining withdraws it: the marker is removed, `sweep-triage-adopt-withdrawn` is journaled, and a plain resume then restarts triage.
 
 `run`, `sweep` and `resume` also warn at launch when a role's relay looks unregistered (see [`run`](reference/cli.md#run)).
 

@@ -75,6 +75,7 @@ Each project gets a subtree keyed by the first 16 hex characters of the SHA-256 
 ├── restore/<story>.patch       tickets mode: a plan's intent-gap patch, moved out of the tree at re-arm
 ├── ctl-window                  TUI: the control window that last accepted this run
 ├── decisions.json              sweep runs: run-scoped triage decisions
+├── adopt-<triage-key>.json     sweep runs: a confirmed `resolve --adopt-result`, until the resumed sweep consumes it
 └── bundles/<name>/intent.md    sweep runs: per-bundle intent
 ```
 
@@ -87,6 +88,8 @@ The opencode adapter's environment-fault classifier scans `<task_id>.server.out`
 - **`heartbeat.json`** (in `tasks/<task_id>/`) — the wait loop's proof of life, overwritten at most every 30 seconds while a session runs: remaining budget, stall-recovery state and probe or sampling failure counts. A session that can wait out a usage-limit reset (`[limits] quota_wait_max_min` above 0 and a profile with `usage_wait_patterns`) also carries `quota_waiting` and `quota_wait_s` (cumulative seconds waited), plus `quota_resets_at` while it waits on a line that named a reset. A session whose last turn ended on a Claude Code `StopFailure` that no later `Stop` cleared carries `stop_failure`, the reported `error` value.
 
 A `session-end` entry carries `hook_channel_silent: true` when no hook event of any kind reached the session before it timed out or stalled (see [Silent hook channel pauses](../escalations-guide.md#silent-hook-channel-pauses)), and `stop_seen: true` when a session that did not complete had seen its Stop event; each is absent otherwise. `dev-decision`, `fix-decision`, `triage-decision` and `migrate-decision` entries always carry `hook_channel_silent`, and `workflow-end` carries it only when true. A real `run`, `sweep` or `resume` journals one `hook-relay-unregistered` entry (`role`, `profile`, `problem`) per role whose project hook config does not register the bmad-loop relay.
+
+- **`adopt-<triage-key>.json`** — written by `bmad-loop resolve --adopt-result` after the operator confirms a silent-channel triage attempt's `result.json`: `story_key`, `task_id`, `attempt`, `generation`, the artifact's `sha256`, `mtime_ns` and `size`, and `adopted_at`. The resumed sweep reads it only when it reaches that triage cycle, and removes it then; a sweep that exits before that (for example, with nothing open) leaves it on disk. Declining a later `resolve --adopt-result` withdraws it. The name never matches the `triage*.json` plan caches. Four journal kinds trace it: `sweep-triage-adopt-confirmed` (`story_key`, `task_id`, `sha256`; the confirm, written by `resolve`), `sweep-triage-adopted` (`story_key`, `task_id`, `sha256` and the plan's `bundles`, `decisions`, `already_resolved`, `blocked`, `skip` counts; the resumed sweep used it as the triage plan), `sweep-triage-adopt-rejected` (`story_key`, `task_id`, `errors`; the resumed sweep refused it), and `sweep-triage-adopt-withdrawn` (`story_key`, `task_id`; a declined `resolve --adopt-result` removed it).
 
 A `session-start` entry's `model` is the configured model (`""` when the CLI's own default is used), never the model the CLI ran. That comes from the transcript or usage file the CLI wrote, read when the session ends, and a `session-end` entry carries it in one of three states:
 

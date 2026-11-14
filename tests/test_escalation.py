@@ -419,6 +419,7 @@ def test_review_env_fault_outranks_parked_and_no_work():
             None,
             "Paused (session failed): 1-1",
         ),
+        ("adopt rejected: result.json changed (x)", None, "Paused (adopt rejected): 1-1"),
         ("environment fault: dev session crashed (x)", None, "Paused (environment fault): 1-1"),
         # a verify-detected fault carries no prefix: the recorded site classifies it
         ("verify command exited 127", "verify:dev", "Paused (environment fault): 1-1"),

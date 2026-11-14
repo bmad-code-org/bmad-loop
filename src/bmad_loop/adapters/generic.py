@@ -456,7 +456,17 @@ def load_result_document(tasks_dir: Path, task_id: str) -> dict | None:
         return None
     if not stat.S_ISREG(mode):
         return None
-    data = json.loads(path.read_text(encoding="utf-8"))
+    return parse_result_document(path.read_text(encoding="utf-8"))
+
+
+def parse_result_document(text: str) -> dict:
+    """Parse one result document's text as the completion read-back does: the
+    parsed JSON object, or ``ValueError`` (unparseable JSON, a non-object top
+    level, an unencodable string) / ``RecursionError`` for a document the
+    read-back refuses. Split from `load_result_document` so a caller that must
+    hash the exact bytes it parses (``resolve --adopt-result``, DW-642) reads
+    the file once and still applies the same refusals."""
+    data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError(f"result.json is not a JSON object: {type(data).__name__}")
     # Plugin HookContext makes this same defensive copy before exposing

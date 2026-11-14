@@ -6268,6 +6268,7 @@ def test_resolve_at_reset_refuses_a_replacement_pause(
         ["--abandon"],
         ["--restore-patch", "x.patch"],
         ["--adopt-branch"],
+        ["--adopt-result"],
         ["--reverify"],
         ["--margin-min", "-1"],
     ],
@@ -6649,6 +6650,307 @@ def test_resolve_adopt_branch_and_restore_patch_are_mutually_exclusive(tmp_path,
                 "p.patch",
             ]
         )
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+# --- DW-642: `resolve --adopt-result` ---
+
+_SILENT_REASON = "hook channel silent: triage session timeout (no hook event of any kind arrived)"
+_ADOPTABLE_TRIAGE = {
+    "workflow": "deferred-sweep-triage",
+    "open_ids": ["DW-1"],
+    "already_resolved": [],
+    "bundles": [],
+    "blocked": [],
+    "skip": [{"id": "DW-1", "reason": "moot"}],
+    "decisions": [],
+    "escalations": [],
+}
+
+
+def _silent_triage_run(
+    tmp_path,
+    *,
+    story="sweep-triage",
+    run_type="sweep",
+    reason=_SILENT_REASON,
+    artifact=_ADOPTABLE_TRIAGE,
+):
+    """A sweep paused at the escalation of attempt 1 of ``story`` with ``reason``,
+    whose session left ``artifact`` (a dict, raw text, or None for none) as its
+    result.json. Returns ``(run_dir, result_path)``."""
+    from bmad_loop import sweep as sweep_mod
+
+    run = escalated_run(tmp_path, "r1", story_key=story, run_type=run_type, paused_reason=reason)
+    result_path = sweep_mod.triage_artifact_path(run.run_dir, sweep_mod.triage_attempt_id(run.task))
+    if artifact is not None:
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        text = artifact if isinstance(artifact, str) else json.dumps(artifact)
+        result_path.write_text(text, encoding="utf-8")
+    return run.run_dir, result_path
+
+
+def _adopt_marker(run_dir, key="sweep-triage"):
+    from bmad_loop import sweep as sweep_mod
+
+    return sweep_mod.adopt_marker_path(run_dir, key)
+
+
+def _answer(monkeypatch, answer):
+    """Script the confirm's `input()`: a string answer, or EOFError for None."""
+
+    def fake_input(_prompt=""):
+        if answer is None:
+            raise EOFError
+        return answer
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+
+def test_resolve_adopt_result_no_resume_writes_the_marker(tmp_path, monkeypatch, capsys):
+    """The happy path's CLI half: the artifact is shown (path, mtime, sha256, the
+    full document), an explicit `y` writes the hash-bound marker and journals the
+    confirm, and `--no-resume` leaves the run paused with the resume hint."""
+    from datetime import datetime, timezone
+
+    from bmad_loop.journal import Journal, load_state
+    from bmad_loop.model import PAUSE_ESCALATION, Phase
+
+    run_dir, result_path = _silent_triage_run(tmp_path)
+    _answer(monkeypatch, "y")
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("--no-resume must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--no-resume"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
+    mtime = datetime.fromtimestamp(
+        result_path.stat().st_mtime_ns / 1e9, tz=timezone.utc
+    ).astimezone()
+    assert str(result_path) in out
+    assert mtime.isoformat() in out
+    assert sha in out
+    assert '"reason": "moot"' in out  # the full document
+    assert "bmad-loop resume r1" in out
+    marker = json.loads(_adopt_marker(run_dir).read_text(encoding="utf-8"))
+    assert marker["story_key"] == "sweep-triage"
+    assert marker["sha256"] == sha
+    assert marker["attempt"] == 1 and marker["generation"] == 0
+    assert marker["size"] == result_path.stat().st_size
+    [row] = [e for e in Journal(run_dir).entries() if e["kind"] == "sweep-triage-adopt-confirmed"]
+    assert row["sha256"] == sha and row["task_id"] == marker["task_id"]
+    state = load_state(run_dir)
+    assert state.paused_stage == PAUSE_ESCALATION
+    assert state.tasks["sweep-triage"].phase == Phase.ESCALATED
+
+
+def test_resolve_adopt_result_resume_resumes_after_the_confirm(tmp_path, monkeypatch, capsys):
+    run_dir, _ = _silent_triage_run(tmp_path)
+    _answer(monkeypatch, "yes")
+    resumed = []
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda proj, rd: resumed.append(rd) or 0)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--resume"])
+
+    assert rc == 0, capsys.readouterr().err
+    assert resumed == [run_dir]
+    assert _adopt_marker(run_dir).exists()
+
+
+@pytest.mark.parametrize("answer", ["n", "", "maybe", None], ids=["n", "empty", "other", "eof"])
+@pytest.mark.parametrize(
+    "flags",
+    [[], ["--resume"], ["--no-interactive", "--resume"], ["--force", "--no-resume"]],
+    ids=["bare", "resume", "no-interactive", "force"],
+)
+def test_resolve_adopt_result_without_a_y_writes_nothing(
+    tmp_path, monkeypatch, capsys, answer, flags
+):
+    """No flag skips the confirm, and anything but y/yes — EOF included — declines
+    with exit 0, no marker and the run still paused.
+
+    ABLATION, performed: guard the `_confirm` call with `args.resume is None` (as
+    `--adopt-branch` does) and every row passing `--resume`/`--no-resume` writes a
+    marker."""
+    run_dir, _ = _silent_triage_run(tmp_path)
+    before = _state_bytes(run_dir)
+    asked = []
+
+    def fake_input(prompt=""):
+        asked.append(prompt)
+        if answer is None:
+            raise EOFError
+        return answer
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("a decline must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", *flags])
+
+    assert rc == 0
+    assert len(asked) == 1
+    assert "cancelled — run is still paused at the escalation" in capsys.readouterr().out
+    assert not _adopt_marker(run_dir).exists()
+    assert _state_bytes(run_dir) == before
+
+
+def test_resolve_adopt_result_decline_withdraws_a_recorded_adoption(tmp_path, monkeypatch, capsys):
+    """A marker an earlier `y` left (`--no-resume`) does not outlive a later
+    decline: the next plain resume must not adopt what the operator turned down.
+
+    ABLATION, performed: drop the decline path's `marker.unlink` and the marker
+    survives the decline."""
+    from bmad_loop.journal import Journal
+
+    run_dir, _ = _silent_triage_run(tmp_path)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *a, **k: pytest.fail("must not resume"))
+    _answer(monkeypatch, "y")
+    assert (
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--no-resume"])
+        == 0
+    )
+    assert _adopt_marker(run_dir).exists()
+    capsys.readouterr()
+
+    _answer(monkeypatch, "n")
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--no-resume"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "an adoption is already recorded" in out
+    assert "was withdrawn" in out
+    assert not _adopt_marker(run_dir).exists()
+    [row] = [e for e in Journal(run_dir).entries() if e["kind"] == "sweep-triage-adopt-withdrawn"]
+    assert row["story_key"] == "sweep-triage"
+
+
+@pytest.mark.parametrize(
+    "shape, msg",
+    [
+        ({"run_type": "story", "story": "s1"}, "applies only to sweep runs"),
+        ({"story": "sweep-migrate"}, "is not a triage task"),
+        ({"reason": "CRITICAL escalation"}, "not paused on a silent hook channel"),
+        ({"reason": "adopt rejected: x"}, "not paused on a silent hook channel"),
+    ],
+    ids=["story-run", "migrate-key", "critical-reason", "adopt-rejected-reason"],
+)
+def test_resolve_adopt_result_refuses_the_wrong_run_shape(
+    tmp_path, monkeypatch, capsys, shape, msg
+):
+    run_dir, _ = _silent_triage_run(tmp_path, **shape)
+    before = _state_bytes(run_dir)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("a refusal must not ask"))
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--resume"])
+
+    assert rc == 1
+    assert msg in capsys.readouterr().err
+    assert _state_bytes(run_dir) == before
+    assert not list(run_dir.glob("adopt-*.json"))
+
+
+def test_resolve_adopt_result_refuses_a_non_escalation_pause(tmp_path, monkeypatch, capsys):
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, _ = _silent_triage_run(tmp_path)
+    state = load_state(run_dir)
+    state.paused_stage = "story-gate"
+    save_state(run_dir, state)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("a refusal must not ask"))
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--resume"])
+
+    assert rc == 1
+    assert "not paused at an escalation" in capsys.readouterr().err
+    assert not _adopt_marker(run_dir).exists()
+
+
+@pytest.mark.parametrize(
+    "artifact, msg",
+    [
+        (None, "left no result.json"),
+        ("{not json", "JSONDecodeError"),
+        ("[1, 2]", "not a JSON object"),
+        ({"workflow": "something-else"}, "is not a valid triage plan"),
+    ],
+    ids=["missing", "malformed", "not-object", "invalid-plan"],
+)
+def test_resolve_adopt_result_refuses_a_missing_or_bad_artifact(
+    tmp_path, monkeypatch, capsys, artifact, msg
+):
+    run_dir, _ = _silent_triage_run(tmp_path, artifact=artifact)
+    monkeypatch.setattr(cli, "_confirm", lambda _q: pytest.fail("a refusal must not ask"))
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--resume"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert msg in err
+    assert "`bmad-loop resume r1` relaunches triage" in err
+    assert not _adopt_marker(run_dir).exists()
+
+
+def test_resolve_adopt_result_refuses_an_artifact_changed_after_display(
+    tmp_path, monkeypatch, capsys
+):
+    """The bytes the operator saw are the bytes adopted: a result.json rewritten
+    between the display and the locked write is refused, and no marker lands.
+
+    ABLATION, performed: drop the under-lock `current.sha256 != artifact.sha256`
+    refusal and this writes a marker."""
+    run_dir, result_path = _silent_triage_run(tmp_path)
+
+    def confirm_after_an_edit(_question):
+        edited = dict(_ADOPTABLE_TRIAGE, skip=[{"id": "DW-1", "reason": "edited"}])
+        result_path.write_text(json.dumps(edited), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(cli, "_confirm", confirm_after_an_edit)
+    monkeypatch.setattr(
+        cli, "_resume_paused_run", lambda *a, **k: pytest.fail("a refusal must not resume")
+    )
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--resume"])
+
+    assert rc == 1
+    assert "changed after it was shown" in capsys.readouterr().err
+    assert not _adopt_marker(run_dir).exists()
+
+
+def test_resolve_adopt_result_refuses_a_pause_changed_during_the_confirm(
+    tmp_path, monkeypatch, capsys
+):
+    """Re-checked under the lock: a pause that moved while the operator read the
+    document (another resolve, a resume) is not adopted over."""
+    from bmad_loop.journal import load_state, save_state
+
+    run_dir, _ = _silent_triage_run(tmp_path)
+
+    def confirm_after_a_rival(_question):
+        state = load_state(run_dir)
+        state.tasks["sweep-triage"].generation += 1
+        save_state(run_dir, state)
+        return True
+
+    monkeypatch.setattr(cli, "_confirm", confirm_after_a_rival)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--no-resume"])
+
+    assert rc == 1
+    assert "changed while resolve was in progress" in capsys.readouterr().err
+    assert not _adopt_marker(run_dir).exists()
+
+
+def test_resolve_adopt_result_is_exclusive_with_the_other_modes(tmp_path, capsys):
+    _silent_triage_run(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--adopt-branch"])
     assert exc.value.code == 2
     assert "not allowed with argument" in capsys.readouterr().err
 

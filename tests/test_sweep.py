@@ -6232,6 +6232,184 @@ def test_triage_silent_channel_resume_restores_budget(project):
     assert "--feedback" not in radapter.sessions[0].prompt
 
 
+# --- DW-642: `resolve --adopt-result` hands a silent triage attempt's result.json over ---
+
+RESOLVED_TRIAGE = triage_result(
+    ["DW-1"], already_resolved=[{"id": "DW-1", "evidence": "fixed in abc123"}]
+)
+
+
+def _silent_triage_pause(project, artifact=RESOLVED_TRIAGE):
+    """A sweep paused `hook channel silent:` on attempt 1 of `sweep-triage`, whose
+    session left ``artifact`` as its result.json."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, _ = make_sweep(project, [_silent(artifact)])
+    assert engine.run().paused
+    assert engine.state.paused_reason.startswith("hook channel silent: ")
+    return engine
+
+
+def _write_adopt_marker(engine, **overrides):
+    """The marker `resolve --adopt-result` writes on a `y`, built by the CLI's own
+    document builder over the attempt's artifact as it stands now."""
+    from bmad_loop import cli
+
+    task = engine.state.tasks["sweep-triage"]
+    task_id = sweep_mod.triage_attempt_id(task)
+    artifact = sweep_mod.read_triage_artifact(engine.run_dir, task_id)
+    assert artifact is not None
+    doc = json.loads(cli._adopt_marker_document("sweep-triage", task, task_id, artifact))
+    doc.update(overrides)
+    marker = sweep_mod.adopt_marker_path(engine.run_dir, "sweep-triage")
+    marker.write_text(json.dumps(doc), encoding="utf-8")
+    return marker, artifact
+
+
+def test_adopt_marker_adopts_the_silent_attempts_result_without_a_session(project):
+    """DW-642's happy path: a confirmed marker over the escalated attempt's own,
+    unchanged, ledger-valid result.json is the plan — no triage session launches,
+    the cache is written, the task is DONE, the plan acts (DW-1 closes), and the
+    marker is consumed. The attempt's session record stays non-completed.
+
+    ABLATION, performed: drop the `_consume_triage_adoption` call from
+    `_ensure_triage` and a triage session launches (sessions == 1)."""
+    engine = _silent_triage_pause(project)
+    marker, artifact = _write_adopt_marker(engine)
+
+    resumed, radapter = resume_sweep(project, engine, [triage_effect(VALID_TRIAGE)])
+    assert not resumed.run().paused
+
+    assert radapter.sessions == []
+    task = resumed.state.tasks["sweep-triage"]
+    assert task.phase == Phase.DONE
+    assert [r.status for r in task.sessions] == ["timeout"]
+    assert not marker.exists()
+    cache = json.loads((resumed.run_dir / "triage.json").read_text(encoding="utf-8"))
+    assert cache["already_resolved"] == RESOLVED_TRIAGE["already_resolved"]
+    [row] = _decisions(resumed, "sweep-triage-adopted")
+    assert row["sha256"] == artifact.sha256
+    assert row["task_id"] == sweep_mod.triage_attempt_id(task)
+    assert row["already_resolved"] == 1
+    assert _decisions(resumed, "sweep-triage-adopt-rejected") == []
+    assert "status: done" in project.deferred_work.read_text(encoding="utf-8")
+
+
+def test_adopt_marker_hash_mismatch_pauses_without_a_session(project):
+    """The artifact edited after the operator's confirm — even into another valid
+    plan — is refused: `adopt rejected:` pause at the escalation, no session, task
+    still ESCALATED, marker consumed, ledger untouched.
+
+    ABLATION, performed: skip the `artifact.sha256 != expected_sha` refusal and the
+    edited plan is adopted (the run finishes, nothing pauses)."""
+    engine = _silent_triage_pause(project)
+    marker, artifact = _write_adopt_marker(engine)
+    artifact.path.write_text(json.dumps(VALID_TRIAGE), encoding="utf-8")
+    ledger_before = project.deferred_work.read_text(encoding="utf-8")
+
+    resumed, radapter = resume_sweep(project, engine, [triage_effect(VALID_TRIAGE)])
+    assert resumed.run().paused
+
+    assert radapter.sessions == []
+    assert resumed.state.paused_stage == PAUSE_ESCALATION
+    assert resumed.state.paused_story_key == "sweep-triage"
+    reason = resumed.state.paused_reason
+    assert reason.startswith("adopt rejected: ")
+    assert "changed since the confirm" in reason
+    assert resumed.state.tasks["sweep-triage"].phase == Phase.ESCALATED
+    assert not marker.exists()
+    assert not (resumed.run_dir / "triage.json").exists()
+    [row] = _decisions(resumed, "sweep-triage-adopt-rejected")
+    assert any("changed since the confirm" in e for e in row["errors"])
+    assert project.deferred_work.read_text(encoding="utf-8") == ledger_before
+
+
+def test_adopt_marker_over_a_moved_ledger_pauses_and_closes_nothing(project):
+    """The ledger moved after the confirm (DW-2 opened): the full open-set check
+    refuses the adoption, so the plan's already-resolved close of DW-1 never lands.
+
+    ABLATION, performed: pass `None` instead of `open_now` to the adoption's
+    `validate_triage` and the plan is adopted (DW-1 closes, nothing pauses)."""
+    engine = _silent_triage_pause(project)
+    marker, _ = _write_adopt_marker(engine)
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    ledger_before = project.deferred_work.read_text(encoding="utf-8")
+
+    resumed, radapter = resume_sweep(project, engine, [triage_effect(VALID_TRIAGE)])
+    assert resumed.run().paused
+
+    assert radapter.sessions == []
+    assert resumed.state.paused_reason.startswith("adopt rejected: ")
+    assert "DW-2" in resumed.state.paused_reason
+    assert resumed.state.tasks["sweep-triage"].phase == Phase.ESCALATED
+    assert not marker.exists()
+    assert project.deferred_work.read_text(encoding="utf-8") == ledger_before
+
+
+def test_adopt_rejected_pause_is_lifted_by_a_plain_resume(project):
+    """After an `adopt rejected:` pause a plain resume relaunches triage with a
+    fresh budget, exactly as after the silent pause itself."""
+    engine = _silent_triage_pause(project)
+    _write_adopt_marker(engine, sha256="0" * 64)
+    resumed, _ = resume_sweep(project, engine, [])
+    assert resumed.run().paused
+    assert resumed.state.paused_reason.startswith("adopt rejected: ")
+
+    again, adapter = resume_sweep(project, resumed, [triage_effect(VALID_TRIAGE)])
+    assert not again.run().paused
+    assert len(adapter.sessions) == 1
+    assert again.state.tasks["sweep-triage"].phase == Phase.DONE
+    assert _decisions(again, "sweep-triage-adopted") == []
+
+
+@pytest.mark.parametrize(
+    "overrides, fragment",
+    [
+        ({"task_id": "sweep-triage-triage-9"}, "not the escalated attempt"),
+        ({"story_key": "sweep-triage-2"}, "not sweep-triage"),
+        ({"sha256": None}, "carries no sha256"),
+    ],
+    ids=["other-attempt", "other-key", "no-sha"],
+)
+def test_adopt_marker_naming_something_else_pauses(project, overrides, fragment):
+    """A marker that does not name this key and this attempt is refused the same
+    loud way as a changed artifact."""
+    engine = _silent_triage_pause(project)
+    _write_adopt_marker(engine, **overrides)
+
+    resumed, radapter = resume_sweep(project, engine, [triage_effect(VALID_TRIAGE)])
+    assert resumed.run().paused
+
+    assert radapter.sessions == []
+    assert resumed.state.paused_reason.startswith("adopt rejected: ")
+    assert fragment in resumed.state.paused_reason
+
+
+def test_adopt_marker_without_an_escalated_task_is_dropped(project):
+    """A marker with no ESCALATED triage task to apply to (here: a fresh sweep) is
+    journaled as rejected and removed, and triage runs as if it were not there."""
+    write_ledger(project, {"DW-1": "open"})
+    engine, adapter = make_sweep(project, [triage_effect(VALID_TRIAGE)])
+    marker = sweep_mod.adopt_marker_path(engine.run_dir, "sweep-triage")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"story_key": "sweep-triage"}), encoding="utf-8")
+
+    assert not engine.run().paused
+
+    assert len(adapter.sessions) == 1
+    assert not marker.exists()
+    [row] = _decisions(engine, "sweep-triage-adopt-rejected")
+    assert any("is not escalated" in e for e in row["errors"])
+
+
+def test_adopt_marker_name_stays_outside_the_triage_cache_glob(tmp_path):
+    """`decisions` globs `triage*.json` for cached plans; the marker must never match."""
+    for key in ("sweep-triage", "sweep-triage-2"):
+        assert not sweep_mod.adopt_marker_path(tmp_path, key).match("triage*.json")
+        assert sweep_mod.TRIAGE_KEY_RE.match(key)
+    assert not sweep_mod.TRIAGE_KEY_RE.match(MIGRATE_KEY)
+    assert not sweep_mod.TRIAGE_KEY_RE.match("sweep-triage-0")
+
+
 def test_migration_silent_hook_channel_pauses_uncharged(project):
     """The migration twin: pauses on attempt 1 with the legacy ledger untouched,
     exactly as the no-work migration sibling leaves it, and journals the flag.

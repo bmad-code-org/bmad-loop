@@ -284,6 +284,9 @@ RUN_STATE_TRANSACTIONS = {
     ("cli.py", "_resolve_adopt"),
     ("cli.py", "_resolve_reverify"),
     ("cli.py", "_resolve_abandon"),
+    # DW-642: `resolve --adopt-result`'s locked re-check, marker write and
+    # `sweep-triage-adopt-confirmed` row
+    ("cli.py", "_resolve_adopt_result"),
     # DW-591: `resolve --at-reset`'s two wait rows, under the hold cleanup removes
     # the run in, so neither append recreates a removed run dir
     ("cli.py", "_resolve_at_reset"),
@@ -353,6 +356,9 @@ REFUSAL_HELPER_DEFS = {
     ("runs.py", "_refuse_uncontained_run_dir"),
     ("sweep.py", "_refuse_advanced_migration_head"),  # DW-427/428, test_sweep.py
     ("sweep.py", "_refuse_dirty_migration_input"),  # DW-437, test_sweep.py
+    # DW-642: a `resolve --adopt-result` marker the resumed sweep refuses; test_sweep.py
+    # test_adopt_marker_hash_mismatch_pauses_without_a_session and siblings
+    ("sweep.py", "_reject_triage_adoption"),
     # a parent initiative's status/next view; test_ticketmodel.py test_*_parent_view_raises_*
     ("ticketmodel.py", "_refuse_parent_view"),
     # DW-554: the v6_key claims read fault pause around the base gate check;
@@ -1078,6 +1084,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "sentinel_kind",
         "session_status",
         "session_vanished",
+        # DW-642: the hex sha256 of a triage attempt's result.json on the
+        # `resolve --adopt-result` rows — a digest, never the document.
+        "sha256",
         # `spec-deferrals-harvested` (#913): how many filed findings carried a
         # severity the alias table does not know — a count, never the text.
         "severity_unrecognized",
@@ -2359,6 +2368,17 @@ JOURNAL_KINDS = frozenset(
         # (`JOURNAL_BENIGN_FIELDS`), so no `diagnostics` routing row is needed.
         "sweep-triage-cache-write-failed",
         "sweep-triage-reload-failed",
+        # DW-642: `resolve --adopt-result`. `sweep-triage-adopt-confirmed` (cli.py)
+        # is the operator's confirm of a silent-channel triage attempt's
+        # result.json; `sweep-triage-adopted` the resumed engine's acceptance
+        # (plan counts) and `sweep-triage-adopt-rejected` its refusal (`errors`,
+        # benign). `story_key`/`task_id` are routed; `sha256` is a digest.
+        # `sweep-triage-adopt-withdrawn` (cli.py): a later declined confirm removed
+        # a recorded marker.
+        "sweep-triage-adopt-confirmed",
+        "sweep-triage-adopt-rejected",
+        "sweep-triage-adopt-withdrawn",
+        "sweep-triage-adopted",
         "sweep-triage-result",
         "triage-decision",
         # tickets_engine.py — the tickets-mode pick: rows the pick passed over
