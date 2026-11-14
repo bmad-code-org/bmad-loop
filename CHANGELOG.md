@@ -316,6 +316,11 @@ breaking changes may land in a minor release.
 - Name why a failed auto retrospective's session did not complete (hook channel silent,
   environment fault, parked or no work) in its notice and on `retro-auto-failed`
   (`noncompletion`), instead of a generic failure.
+- Put the pre-migration ledger back on `bmad-loop resume` after a sweep migration paused
+  uncharged (environment fault, parked, no work, hook channel silent) over a ledger its
+  session rewrote or deleted, and restart the migration, instead of refusing until the
+  ledger is restored by hand. A ledger edited or committed since the pause still refuses,
+  as does native Windows.
 
 ### Security
 

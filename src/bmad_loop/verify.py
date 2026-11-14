@@ -5330,6 +5330,13 @@ def path_absent_at_revision(repo: Path, revision: str, rel: str) -> bool:
     return _entry_at_revision(repo, revision, rel) is None
 
 
+def path_entry_unchanged_between(repo: Path, older: str, newer: str, rel: str) -> bool:
+    """True when literal path ``rel`` has the same tree entry (mode, type and
+    object id, or absence) at ``older`` and ``newer`` — the commits between them
+    left it alone. A git failure raises GitError, never quietly "unchanged"."""
+    return _entry_at_revision(repo, older, rel) == _entry_at_revision(repo, newer, rel)
+
+
 def file_bytes_at_revision(repo: Path, revision: str, rel: str) -> bytes | None:
     """Read one blob byte-exactly from ``revision``.
 

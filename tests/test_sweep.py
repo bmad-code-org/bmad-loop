@@ -6465,30 +6465,231 @@ def test_migration_silent_hook_channel_pauses_uncharged(project):
     assert dec["hook_channel_silent"] is True
 
 
-@pytest.mark.parametrize(
-    "flag",
-    [{"hook_channel_silent": True}, {"env_fault": True}],
-    ids=["silent", "env-fault-sibling"],
-)
-def test_migration_silent_pause_over_a_rewrite_matches_the_env_fault_sibling(project, flag):
-    """Pause-before-reset, like the sibling arms: a silent session that rewrote the
-    ledger leaves the rewrite in place at the pause, and the resume then takes the
-    sibling's own route over that unaccepted rewrite (an evidence refusal naming
-    the restore), never a dispatch over it."""
+# --- DW-646: an uncharged migration pause over a rewrite restores on a plain resume ---
+
+_UNCHARGED_MIGRATION_ARMS = [
+    pytest.param({"hook_channel_silent": True}, id="silent"),
+    pytest.param({"env_fault": True}, id="env-fault"),
+    pytest.param({"parked": True}, id="parked"),
+    pytest.param({"produced_work": False}, id="no-work"),
+]
+
+
+def _pause_uncharged_over_a_rewrite(project, flag, rewrite: str | None = None):
+    """Pause a migration through one uncharged arm after its session rewrote the
+    ledger (``rewrite``; ``None`` = the session DELETED it). Pause-before-reset,
+    like every uncharged arm: the session's ledger is still live at the pause, and
+    the latch holds its digest."""
     write_legacy_ledger(project, LEGACY_LEDGER)
-    rewrite = (project.deferred_work, migrated_ledger())
-    engine, _ = make_sweep(
-        project,
-        [failed_session_effect(ledger=rewrite, result=SessionResult(status="timeout", **flag))],
+    result = SessionResult(status="timeout", **flag)
+    if rewrite is None:
+
+        def effect(spec):
+            project.deferred_work.unlink()
+            return result
+
+    else:
+        effect = failed_session_effect(ledger=(project.deferred_work, rewrite), result=result)
+    engine, adapter = make_sweep(project, [effect])
+    assert engine.run().paused and len(adapter.sessions) == 1
+    task = load_state(engine.run_dir).tasks[MIGRATE_KEY]
+    assert task.phase == Phase.ESCALATED and task.attempt == 1
+    assert task.migration_uncharged_rewrite == sweep_mod._ledger_digest(rewrite)
+    if rewrite is None:
+        assert not project.deferred_work.exists()
+    else:
+        assert project.deferred_work.read_text(encoding="utf-8") == rewrite
+    return engine
+
+
+def _resume_into_a_fresh_migration(project, engine):
+    """Plain resume scripted with a valid migration then a triage; returns the
+    resumed engine, its adapter, its summary and the ledger the migration saw."""
+    seen: list[str] = []
+    migrate = migrate_effect(project, migrated_ledger(), _valid_migration_mapping())
+
+    def observing_migrate(spec):
+        seen.append(project.deferred_work.read_text(encoding="utf-8"))
+        return migrate(spec)
+
+    plan = triage_result(["DW-2"], skip=[{"id": "DW-2", "reason": "not this cycle"}])
+    resumed, adapter = resume_sweep(project, engine, [observing_migrate, triage_effect(plan)])
+    return resumed, adapter, resumed.run(), seen
+
+
+def _assert_restored_and_remigrated(project, resumed, adapter, summary, seen):
+    assert not summary.crashed and not summary.paused
+    assert len(adapter.sessions) == 2 and "--migrate" in adapter.sessions[0].prompt
+    assert seen == [LEGACY_LEDGER]  # the fresh migration graded the restored baseline
+    [row] = _records(resumed, "sweep-migration-paused-rewrite-restored")
+    assert row["story_key"] == MIGRATE_KEY and row["ledger"] == str(project.deferred_work)
+    assert _records(resumed, "sweep-migration-recovery-invalid") == []
+    assert _records(resumed, "resume-restart")[-1]["phase"] == str(Phase.ESCALATED)
+    task = resumed.state.tasks[MIGRATE_KEY]
+    assert task.phase == Phase.DONE and task.migration_uncharged_rewrite is None
+    assert "chore(sweep): migrate legacy" in git(project.project, "log", "--oneline")
+
+
+@needs_dir_fd_recovery
+@pytest.mark.parametrize("flag", _UNCHARGED_MIGRATION_ARMS)
+def test_uncharged_migration_pause_over_a_rewrite_restores_on_a_plain_resume(project, flag):
+    """DW-646: every uncharged arm (silent, env-fault, parked, no-work) pauses
+    before the reset, so the session's rewrite is still live at the pause. A plain
+    resume with nothing else changed puts the pre-migration ledger back, journals
+    the restore once, and re-enters the migration with a fresh budget, instead of
+    refusing over an uncharged pause whose documented remedy is "fix, resume".
+
+    ABLATION, performed: drop the latch branch in `_hold_escalated_migration` and
+    every row reddens (the DW-426 refusal, no session); drop the latch assignment in
+    `_pause_uncharged_migration` and every row reddens at the latch assertion."""
+    engine = _pause_uncharged_over_a_rewrite(project, flag, migrated_ledger())
+
+    _assert_restored_and_remigrated(project, *_resume_into_a_fresh_migration(project, engine))
+
+
+@needs_dir_fd_recovery
+def test_uncharged_migration_pause_over_a_deleted_ledger_restores_it(project):
+    """DW-646: a session that DELETED the ledger latches ``"absent"``, distinct from
+    an emptied ledger, and the resume writes the baseline back the same way."""
+    engine = _pause_uncharged_over_a_rewrite(project, {"hook_channel_silent": True}, None)
+
+    _assert_restored_and_remigrated(project, *_resume_into_a_fresh_migration(project, engine))
+
+
+@needs_dir_fd_recovery
+def test_uncharged_migration_pause_refuses_a_ledger_edited_after_the_pause(project):
+    """DW-646: the restore is only for the text the paused session left. A ledger
+    edited after the pause no longer matches the latch, so the resume re-pauses
+    loudly and leaves the edit (and the latch) in place."""
+    engine = _pause_uncharged_over_a_rewrite(project, {"env_fault": True}, migrated_ledger())
+    project.deferred_work.write_text(migrated_ledger(5), encoding="utf-8")
+    detail = (
+        "live ledger changed after the uncharged pause (it no longer matches the text "
+        "the paused migration session left), so a plain resume will not overwrite it; "
+        f"{_dw426_remedy(engine.run_dir)}"
     )
-    assert engine.run().paused
-    assert engine.state.tasks["sweep-migrate"].attempt == 1
+
+    resumed = _assert_escalation_held(project, engine, detail)
+
+    assert _records(resumed, "sweep-migration-paused-rewrite-restored") == []
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger(5)
+
+
+@needs_dir_fd_recovery
+def test_uncharged_migration_pause_restores_over_a_head_that_left_the_ledger_alone(project):
+    """DW-646: the silent-channel remedy is "commit the fix, resume", which moves
+    HEAD without touching the ledger. That resume still restores and re-migrates:
+    the restart re-stamps the baseline at the operator's commit (DW-430).
+
+    ABLATION, performed: require HEAD == baseline (drop the untouched-ledger
+    probe) and this reddens: the resume re-pauses with no session."""
+    engine = _pause_uncharged_over_a_rewrite(
+        project, {"hook_channel_silent": True}, migrated_ledger()
+    )
+    baseline = load_state(engine.run_dir).tasks[MIGRATE_KEY].baseline_commit
+    (project.project / "hook-fix.txt").write_text("hook channel fixed\n", encoding="utf-8")
+    git(project.project, "add", "hook-fix.txt")
+    git(project.project, "commit", "-q", "-m", "fix the hook channel")
+    assert git(project.project, "rev-parse", "HEAD") != baseline
+
+    _assert_restored_and_remigrated(project, *_resume_into_a_fresh_migration(project, engine))
+
+
+@needs_dir_fd_recovery
+def test_uncharged_migration_pause_refuses_a_head_that_committed_the_ledger(project):
+    """DW-646: a commit above the baseline that changed the ledger (here: the
+    session's rewrite, committed by the operator) is operator work the restore
+    must not overwrite, so the resume re-pauses loudly with the ledger untouched
+    and no session dispatched.
+
+    ABLATION, performed: drop the HEAD gate and this reddens: the resume restores
+    the baseline and dispatches a migration session."""
+    engine = _pause_uncharged_over_a_rewrite(project, {"parked": True}, migrated_ledger())
+    baseline = load_state(engine.run_dir).tasks[MIGRATE_KEY].baseline_commit
+    git(project.project, "add", "-f", str(project.deferred_work))
+    git(project.project, "commit", "-q", "-m", "operator commits the rewrite")
+    head = git(project.project, "rev-parse", "HEAD")
+    assert head != baseline
+    detail = (
+        f"HEAD moved from the migration baseline {baseline} to {head} after the "
+        "uncharged pause and the commits above the baseline changed the ledger (or "
+        "that could not be verified), so a plain resume will not write the "
+        f"pre-migration ledger over them; {_dw426_remedy(engine.run_dir)}"
+    )
+
+    resumed = _assert_escalation_held(project, engine, detail)
+
+    assert _records(resumed, "sweep-migration-paused-rewrite-restored") == []
     assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
 
-    resumed, radapter = resume_sweep(project, engine, [SessionResult(status="completed")])
-    assert resumed.run().paused
-    assert radapter.sessions == []
+
+@needs_dir_fd_recovery
+def test_uncharged_migration_pause_journals_a_head_probe_fault_and_refuses(project, monkeypatch):
+    """DW-646: a probe fault over a moved HEAD is uncertainty, which never
+    authorizes the write: the resume re-pauses with the ledger untouched, and the
+    fault is journaled as `ledger-baseline-probe-failed` rather than discarded.
+
+    ABLATION, performed: drop the journal append in the probe's `except` arm and
+    this reddens at the journaled-row assertion."""
+    engine = _pause_uncharged_over_a_rewrite(
+        project, {"hook_channel_silent": True}, migrated_ledger()
+    )
+    baseline = load_state(engine.run_dir).tasks[MIGRATE_KEY].baseline_commit
+    (project.project / "hook-fix.txt").write_text("hook channel fixed\n", encoding="utf-8")
+    git(project.project, "add", "hook-fix.txt")
+    git(project.project, "commit", "-q", "-m", "fix the hook channel")
+    head = git(project.project, "rev-parse", "HEAD")
+
+    def probe_fault(*_args, **_kwargs):
+        raise verify.GitError("injected ls-tree fault")
+
+    monkeypatch.setattr(sweep_mod.verify, "path_entry_unchanged_between", probe_fault)
+    detail = (
+        f"HEAD moved from the migration baseline {baseline} to {head} after the "
+        "uncharged pause and the commits above the baseline changed the ledger (or "
+        "that could not be verified), so a plain resume will not write the "
+        f"pre-migration ledger over them; {_dw426_remedy(engine.run_dir)}"
+    )
+
+    resumed = _assert_escalation_held(project, engine, detail)
+
+    [row] = _records(resumed, "ledger-baseline-probe-failed")
+    assert row["story_key"] == MIGRATE_KEY and row["error"] == "injected ls-tree fault"
+    assert _records(resumed, "sweep-migration-paused-rewrite-restored") == []
+
+
+def test_uncharged_migration_pause_on_a_fallback_host_refuses_the_restore(project, monkeypatch):
+    """DW-646 reads the baseline through the validated records, so a DW-315
+    fallback host (no dir-fd anchoring, e.g. native Windows) refuses there, fail
+    closed: no session, ledger untouched, no restore row."""
+    engine = _pause_uncharged_over_a_rewrite(project, {"env_fault": True}, migrated_ledger())
+    monkeypatch.setattr(sweep_mod, "DIR_FD_ANCHORED_WRITES", False)
+
+    resumed, adapter = resume_sweep(project, engine, [SessionResult(status="completed")])
+    summary = resumed.run()
+
+    assert summary.paused and not summary.crashed and adapter.sessions == []
     assert resumed.state.paused_reason.startswith("migration recovery evidence is invalid: ")
+    assert "without dir-fd anchoring" in resumed.state.paused_reason
+    assert resumed.state.tasks[MIGRATE_KEY].phase == Phase.ESCALATED
+    assert project.deferred_work.read_text(encoding="utf-8") == migrated_ledger()
+    assert _records(resumed, "sweep-migration-paused-rewrite-restored") == []
+
+
+def test_charged_migration_escalation_over_a_rewrite_still_refuses(project):
+    """DW-646 touches only the uncharged arms: a CRITICAL escalation over a
+    non-legacy rewrite latches nothing, and its resume keeps the DW-426 refusal.
+
+    ABLATION, performed: stamp the latch in `_escalate`'s migrate path instead of
+    the uncharged arms and this reddens: the resume restores and re-migrates."""
+    write_legacy_ledger(project, LEGACY_LEDGER)
+    engine, _ = make_sweep(project, [_critical_migration(project, migrated_ledger())])
+    assert engine.run().paused
+    assert load_state(engine.run_dir).tasks[MIGRATE_KEY].migration_uncharged_rewrite is None
+
+    resumed = _assert_escalation_held(project, engine, _dw426_non_legacy_detail(engine.run_dir))
+
+    assert _records(resumed, "sweep-migration-paused-rewrite-restored") == []
 
 
 def test_triage_non_completed_cap_says_session_failed_and_writes_no_feedback(project):

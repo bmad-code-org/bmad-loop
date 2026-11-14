@@ -2273,6 +2273,10 @@ JOURNAL_KINDS = frozenset(
         # closed slug (`restored` | `no-dir-fd` | `no-snapshot`, DW-201 convention);
         # `ledger` is the same path the diverged sibling above carries.
         "sweep-migration-snapshot-restore",
+        # DW-646: an ESCALATED resume put the pre-migration baseline back over the
+        # ledger an uncharged migration pause left. Carries only `story_key` and the
+        # same `ledger` path as the diverged sibling above.
+        "sweep-migration-paused-rewrite-restored",
         "sweep-nothing-open",
         # DW-176/DW-182/DW-197. `_prune_pre_answers` refusing to prune because the
         # deferred-work ledger could not be read for a write — ABSENT (DW-176),

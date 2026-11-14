@@ -39,6 +39,7 @@ from .engine import (
 )
 from .escalation import (
     ADOPT_REJECTED_PREFIX,
+    UsageLimitPause,
     critical_session_reason,
     display_critical_reason,
     env_fault_pause_reason,
@@ -1468,6 +1469,15 @@ def _hook_verdict(kinds: set[str]) -> str:
     if "SessionStart" in kinds:
         return "session-start-without-stop"
     return "no-session-start-or-stop"
+
+
+def _ledger_digest(text: str | None) -> str:
+    """The DW-646 uncharged-pause latch value for one ledger read: ``"absent"``
+    for a deleted ledger (distinct from an emptied one), else ``"sha256:<hex>"``
+    of its UTF-8 bytes."""
+    if text is None:
+        return "absent"
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
@@ -3718,6 +3728,133 @@ class SweepEngine(Engine):
         task.migration_rewrite_rejected = False
         super()._escalate(task, reason)
 
+    def _pause_uncharged_migration(
+        self,
+        task: StoryTask,
+        reason: str,
+        rewrite: str | None,
+        usage_limit: UsageLimitPause | None,
+    ) -> NoReturn:
+        """Pause the migration uncharged, latching the ledger its session left (DW-646).
+
+        The env-fault, parked, no-work and hook-channel-silent arms pause BEFORE
+        the restore, so a session that rewrote the ledger leaves that rewrite
+        live. ``migration_uncharged_rewrite`` records its digest in the same
+        save that records ESCALATED, so :meth:`_hold_escalated_migration` can
+        tell "nothing changed since the pause" from a later edit and put the
+        pre-migration baseline back on a plain resume. ``usage_limit`` rides
+        out on the ``RunPaused`` as in ``Engine._escalate_session``.
+        """
+        task.migration_uncharged_rewrite = _ledger_digest(rewrite)
+        self._escalate_session(task, reason, usage_limit)
+        raise AssertionError("migration escalation returned")
+
+    def _ledger_untouched_since_baseline(self, task: StoryTask, head: str) -> bool:
+        """Whether the commits from the task baseline to ``head`` left the ledger's
+        tree entry alone (DW-646). The silent-channel remedy is "commit the fix,
+        resume", which moves HEAD without touching the ledger; a commit OF the
+        ledger (the session's rewrite included) must not be overwritten. A proven
+        external ledger is no revision's to change. A resolution or probe fault
+        answers False: uncertainty never authorizes the write. Each fault is
+        journaled as ``ledger-baseline-probe-failed``, as
+        ``Engine._ledger_baseline_text`` does, so the refusal is attributable."""
+        assert task.baseline_commit
+        rel, fault = self._ledger_rel()
+        if rel is None:
+            if fault is not None:
+                self.journal.append(
+                    "ledger-baseline-probe-failed", story_key=task.story_key, error=str(fault)
+                )
+                return False
+            return True
+        try:
+            return verify.path_entry_unchanged_between(
+                self.workspace.root, task.baseline_commit, head, rel
+            )
+        except (verify.GitError, OSError, RuntimeError) as exc:
+            self.journal.append(
+                "ledger-baseline-probe-failed", story_key=task.story_key, error=str(exc)
+            )
+            return False
+
+    def _restore_uncharged_migration_rewrite(self, task: StoryTask, live: str | None) -> None:
+        """Put the pre-migration ledger back over an uncharged pause's rewrite (DW-646).
+
+        Runs only for a latched ``migration_uncharged_rewrite`` whose live ledger
+        holds no legacy entries. Each gate refuses loudly and mutates nothing:
+        HEAD must still equal the task baseline, or the commits above it must
+        have left the ledger alone (legacy text written over a committed ledger
+        would overwrite operator work and leave the restart a dirty tree over an
+        advanced HEAD); the
+        live ledger must still match the latched digest, and the baseline must
+        come from validated records (a DW-315 fallback host refuses there).
+        The write is a compare-and-set under ``ledger_lock``, pure text under
+        the hold. On return the existing ESCALATED restart re-enters the
+        migration with a fresh budget, and clears the latch.
+        """
+        remedy = (
+            "restore the pre-migration ledger, delete the migrate-* records in "
+            f"{self.run_dir}, then resume to re-enter the migration — or resolve "
+            "the escalation explicitly"
+        )
+        if task.baseline_commit:
+            head = self._migration_head(task)
+            if head != task.baseline_commit and not self._ledger_untouched_since_baseline(
+                task, head
+            ):
+                self._migration_evidence_failure(
+                    task,
+                    f"HEAD moved from the migration baseline {task.baseline_commit} to "
+                    f"{head} after the uncharged pause and the commits above the "
+                    "baseline changed the ledger (or that could not be verified), so a "
+                    f"plain resume will not write the pre-migration ledger over them; "
+                    f"{remedy}",
+                    own_remedy=True,
+                )
+        latch = task.migration_uncharged_rewrite
+        if _ledger_digest(live) != latch:
+            self._migration_evidence_failure(
+                task,
+                "live ledger changed after the uncharged pause (it no longer matches "
+                "the text the paused migration session left), so a plain resume will "
+                f"not overwrite it; {remedy}",
+                own_remedy=True,
+            )
+        baseline, _manifest = self._migration_baseline_and_manifest(task)
+        ledger = self.workspace.paths.deferred_work
+        diverged = False
+        wrote = False
+        with deferredwork.ledger_lock(ledger):
+            # PURE TEXT ONLY under the hold.
+            try:
+                current = deferredwork.read_for_write(ledger)
+            except (deferredwork.LedgerReadError, OSError):
+                current = None
+                diverged = True
+            if diverged:
+                pass
+            elif current == baseline:
+                pass
+            elif _ledger_digest(current) == latch:
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(ledger, baseline)
+                wrote = True
+            else:
+                diverged = True
+        if diverged:
+            self._migration_evidence_failure(
+                task,
+                "live ledger changed underneath the uncharged pause's restore, so a "
+                f"plain resume will not overwrite it; {remedy}",
+                own_remedy=True,
+            )
+        if wrote:
+            self.journal.append(
+                "sweep-migration-paused-rewrite-restored",
+                story_key=MIGRATE_KEY,
+                ledger=str(ledger),
+            )
+
     def _resume_escalated_migration_commit(self, task: StoryTask) -> None:
         """Retry the idempotent commit tail of a migration ESCALATED from COMMITTING.
 
@@ -3774,9 +3911,14 @@ class SweepEngine(Engine):
         the task, and both exits bypass this arm: a restored ``has_legacy``
         ledger returns here so the existing restart path re-enters the
         migration, and ``bmad-loop resolve`` re-arms the task out of ESCALATED.
-        Anything else — non-legacy, absent or unreadable — re-pauses through
-        ``_escalate``'s already-ESCALATED arm. No record is re-validated and no
-        git, ledger or task state is touched.
+        One exception (DW-646): an uncharged pause latched
+        ``migration_uncharged_rewrite``, and
+        :meth:`_restore_uncharged_migration_rewrite` puts the pre-migration
+        ledger back when nothing changed since the pause, then returns to that
+        same restart path. Anything else — non-legacy, absent or unreadable —
+        re-pauses through ``_escalate``'s already-ESCALATED arm. Outside that
+        restore no record is re-validated and no git, ledger or task state is
+        touched.
         """
         remedy = (
             "restore the pre-migration ledger, delete the migrate-* records in "
@@ -3794,6 +3936,9 @@ class SweepEngine(Engine):
                 own_remedy=True,
             )
         if live is not None and deferredwork.has_legacy(live):
+            return
+        if task.migration_uncharged_rewrite is not None:
+            self._restore_uncharged_migration_rewrite(task, live)
             return
         self._migration_evidence_failure(
             task,
@@ -4820,6 +4965,7 @@ class SweepEngine(Engine):
                 task.baseline_untracked = None
             task.migration_ledger_rival = False  # leaving ESCALATED consumes the latch
             task.migration_rewrite_rejected = False  # and this attempt's rejection
+            task.migration_uncharged_rewrite = None  # and its uncharged pause (DW-646)
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
         # DW-437/DW-440: two pre-dispatch guards, AFTER the whole entry chain so
         # they cover every path that reaches dispatch (fresh, PENDING-with-marker,
@@ -4957,6 +5103,7 @@ class SweepEngine(Engine):
             task.attempt += 1
             advance(task, Phase.TRIAGE_RUNNING)
             task.migration_rewrite_rejected = False  # DW-436: a new attempt, no rejection
+            task.migration_uncharged_rewrite = None  # DW-646: nor its uncharged pause
             self._save()
             launch_floor_ns = time.time_ns()
             result = self._run_session(
@@ -5015,18 +5162,20 @@ class SweepEngine(Engine):
                 # task.attempt to 0 — fresh budget) instead of charging a migration
                 # attempt. Escalate BEFORE the _safe_reset/attempt-cap path; that
                 # resume also restores the ledger if the worktree is dirty.
-                self._escalate_session(
+                self._pause_uncharged_migration(
                     task,
                     env_fault_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                    rewrite,
                     usage_limit_pause(result),
                 )
             if result.status != "completed" and result.parked:
                 # Parked on a human prompt (DW-348/DW-350): the stall nudge was
                 # withheld, so no rewrite ran — pause (fresh budget on resume)
                 # rather than charge a migration attempt, like the env-fault arm.
-                self._escalate_session(
+                self._pause_uncharged_migration(
                     task,
                     parked_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                    rewrite,
                     usage_limit_pause(result),
                 )
             if result.status != "completed" and not result.produced_work:
@@ -5034,9 +5183,11 @@ class SweepEngine(Engine):
                 # gate, so a prompt-blocked session waits out the timeout with
                 # `parked` unset and this is its only route to a pause. Fresh budget
                 # on resume, as for env_fault and parked, which outrank it.
-                self._escalate(
+                self._pause_uncharged_migration(
                     task,
                     no_work_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                    rewrite,
+                    None,
                 )
             if result.status != "completed" and result.hook_channel_silent:
                 # No hook event of any kind reached this attempt (#752): the relay
@@ -5044,10 +5195,12 @@ class SweepEngine(Engine):
                 # was never observable. Pause uncharged (fresh budget on resume, as
                 # for the arms above) instead of spending the cap on a channel
                 # fault; the result.json is never read as a completion here.
-                self._escalate(
+                self._pause_uncharged_migration(
                     task,
                     hook_channel_silent_pause_reason("migration", result)
                     + _diagnostic_suffix(diagnostic),
+                    rewrite,
+                    None,
                 )
             if not errors:
                 # This record is the durable proof that validation accepted the
