@@ -130,9 +130,9 @@ breaking changes may land in a minor release.
   refused adoption pauses `adopt rejected:`.
 - Add opt-in `[limits] session_start_exit` (default off): a session whose CLI maps
   SessionStart and that delivers no hook event of any kind by `session_start_grace_s`
-  ends there non-completed and takes the existing uncharged pauses (`hook channel
-  silent:`, or `parked:` / `no work produced:` when the pane shows a parked prompt or
-  never changed) instead of waiting out `session_timeout_min`.
+  ends there non-completed and takes the existing uncharged pauses
+  (`hook channel silent:`, or `parked:` / `no work produced:` when the pane shows a
+  parked prompt or never changed) instead of waiting out `session_timeout_min`.
 
 ### Changed
 
