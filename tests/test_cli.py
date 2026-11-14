@@ -6947,6 +6947,38 @@ def test_resolve_adopt_result_refuses_a_pause_changed_during_the_confirm(
     assert not _adopt_marker(run_dir).exists()
 
 
+@pytest.mark.parametrize("answer", [False, True], ids=["decline-withdraw", "confirm"])
+def test_resolve_adopt_result_refuses_a_run_removed_during_the_confirm(
+    tmp_path, monkeypatch, capsys, answer
+):
+    """Cleanup removes a run under the same lock resolve takes after its confirm:
+    neither the decline's withdrawal nor the confirm's marker write may then
+    recreate the run dir (`Journal` mkdirs it) or traceback on the pinned reload.
+
+    ABLATION, performed: drop either branch's `runs.is_run` re-check and its row
+    FAILS — the decline recreates the run dir, the confirm raises out of
+    `load_state`."""
+    import shutil
+
+    run_dir, _ = _silent_triage_run(tmp_path)
+    monkeypatch.setattr(cli, "_resume_paused_run", lambda *a, **k: pytest.fail("must not resume"))
+    marker = _adopt_marker(run_dir)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")  # a recorded adoption to withdraw
+
+    def confirm_after_a_cleanup(_question):
+        shutil.rmtree(run_dir)
+        return answer
+
+    monkeypatch.setattr(cli, "_confirm", confirm_after_a_cleanup)
+
+    rc = cli.main(["resolve", "--project", str(tmp_path), "r1", "--adopt-result", "--no-resume"])
+
+    assert rc == 1
+    assert "no such run: r1" in capsys.readouterr().err
+    assert not run_dir.exists()
+
+
 def test_resolve_adopt_result_is_exclusive_with_the_other_modes(tmp_path, capsys):
     _silent_triage_run(tmp_path)
     with pytest.raises(SystemExit) as exc:

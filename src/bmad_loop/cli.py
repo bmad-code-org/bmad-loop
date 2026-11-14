@@ -8861,6 +8861,12 @@ def _resolve_adopt_result(
         # next plain resume: the decline is the operator's latest word.
         if recorded:
             with state_lock(run_dir):
+                # Cleanup removes the run under this same hold: a run removed while
+                # the operator read the document has nothing left to withdraw, and
+                # the Journal below must not recreate its directory.
+                if not runs.is_run(run_dir):
+                    print(f"no such run: {run_dir.name}", file=sys.stderr)
+                    return 1
                 try:
                     marker.unlink(missing_ok=True)
                 except OSError as e:
@@ -8877,7 +8883,11 @@ def _resolve_adopt_result(
         print("cancelled — run is still paused at the escalation")
         return 0
     with state_lock(run_dir):
-        # The checks above ran lock-free: repeat them against the last writer's state.
+        # The checks above ran lock-free: repeat them against the last writer's
+        # state — first that cleanup has not removed the run during the confirm.
+        if not runs.is_run(run_dir):
+            print(f"no such run: {run_dir.name}", file=sys.stderr)
+            return 1
         fresh_state = load_state(run_dir, pin=state)
         if (
             fresh_state.paused_stage,
