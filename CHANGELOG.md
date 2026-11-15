@@ -175,6 +175,7 @@ breaking changes may land in a minor release.
   run-state references live in `docs/reference/`.
 - With `[verify] reuse_unchanged` on, `post_review_verify` may carry the reused pass's
   `dev`/`fix` stage and sequence, flagged by the new `verification_reused` (#1002).
+- Name each BMAD-METHOD module folder in the module record's skill sources: `skills/core-tools` for `bmad`, `skills/method` for `bmad-build-auto`, `bmad-agent-po` and `bmad-retrospective`. BMAD-METHOD moved each module's skills into its own folder.
 
 ### Removed
 

@@ -4,12 +4,12 @@ version = "0.13.2"
 update_source = "github:bmad-code-org/bmad-loop/skills"
 skills = ["bmad-loop-setup", "bmad-loop-resolve", "bmad-loop-sweep"]
 required_skills = [
-  { skill = "bmad", version = "6.13.0", source = "github:bmad-code-org/BMAD-METHOD/skills" },
-  { skill = "bmad-build-auto", version = "6.13.0", source = "github:bmad-code-org/BMAD-METHOD/skills" },
+  { skill = "bmad", version = "6.13.0", source = "github:bmad-code-org/BMAD-METHOD/skills/core-tools" },
+  { skill = "bmad-build-auto", version = "6.13.0", source = "github:bmad-code-org/BMAD-METHOD/skills/method" },
 ]
 recommended_skills = [
-  { skill = "bmad-agent-po", source = "github:bmad-code-org/BMAD-METHOD/skills" },
-  { skill = "bmad-retrospective", source = "github:bmad-code-org/BMAD-METHOD/skills" },
+  { skill = "bmad-agent-po", source = "github:bmad-code-org/BMAD-METHOD/skills/method" },
+  { skill = "bmad-retrospective", source = "github:bmad-code-org/BMAD-METHOD/skills/method" },
 ]
 pre_install_message = ""
 post_install_message = """BMAD Loop skills are installed.
