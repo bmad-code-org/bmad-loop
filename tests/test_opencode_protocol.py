@@ -194,7 +194,8 @@ def test_v2_config_never_reallows_a_wildcard_skill_id(tmp_path):
 
 def test_v2_config_reads_every_project_tree_then_the_user_root_ids(tmp_path):
     """Under ``[skills] user_roots`` the V2 recipe lists both project trees in
-    ``skills`` and re-allows, after the deny-all, every project id of both
+    ``skills`` — primary last, since V2 lets the later explicit source supply a
+    duplicate id and the locator resolves the primary copy — and re-allows, after the deny-all, every project id of both
     trees and then the user-root BMAD ids the engine located — an id present
     twice is allowed once, and no user path is added (V2 scans those roots
     itself)."""
@@ -213,7 +214,7 @@ def test_v2_config_reads_every_project_tree_then_the_user_root_ids(tmp_path):
         )
     )
 
-    assert config["skills"] == [str(primary), str(extra)]
+    assert config["skills"] == [str(extra), str(primary)]
     rules = config["permissions"]
     skill_rules = [r for r in rules if r["action"] == "skill"]
     assert skill_rules == [

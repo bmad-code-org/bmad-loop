@@ -2489,6 +2489,7 @@ _EXTRA_REL_ERR = "extra_skill_trees entries must be project-relative paths"
 _EXTRA_HOME_ERR = "extra_skill_trees entries must not start with '~': a leading '~' is not expanded"
 _EXTRA_ALIAS_ERR = "extra_skill_trees entries must not name a Windows device"
 _EXTRA_SAME_ERR = "extra_skill_trees entries must differ from skill_tree"
+_EXTRA_DASH_ERR = "extra_skill_trees entries must not start with '-'"
 _EXTRA_DUP_ERR = "extra_skill_trees has duplicate entries"
 
 
@@ -2505,6 +2506,7 @@ _EXTRA_DUP_ERR = "extra_skill_trees has duplicate entries"
         pytest.param((".",), _EXTRA_REL_ERR, id="dot"),
         pytest.param(("CON",), _EXTRA_ALIAS_ERR, id="win32-device"),
         pytest.param((".agents/skills.",), _EXTRA_ALIAS_ERR, id="win32-trim"),
+        pytest.param(("-cprint(1)#",), _EXTRA_DASH_ERR, id="leading-dash"),
         # MINIMAL_PROFILE and _plugin_profile both keep the default skill_tree
         pytest.param((".claude/skills",), _EXTRA_SAME_ERR, id="same-as-skill-tree"),
         pytest.param(("./.claude//skills/",), _EXTRA_SAME_ERR, id="same-as-skill-tree-spelling"),

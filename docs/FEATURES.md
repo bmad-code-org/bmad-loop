@@ -356,7 +356,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Off by default: skills resolve only from the project's skill trees, and a skill found only in a user root keeps the run refused with a hint naming that copy.
   - On, `validate`, the run preflight, `run --dry-run`, session dispatch and worktree seeding resolve every skill through the same lookup, and `validate` reports where each driven skill was found (`skills.root`).
   - Only the folders a profile's `[user_skills]` table declares are searched; a root disabled by a set environment variable or unreadable is skipped and reported.
-  - With the switch on, a claude user copy outranks the project's, as Claude Code itself does; a user copy that competes with a project copy is reported as `skills.user-shadow` with the switch on or off.
+  - With the switch on, a claude user copy outranks the project's, as Claude Code itself does. A user copy the CLI runs instead of the project copy the checks read is reported as `skills.user-shadow`: for claude with the switch off, for codex and antigravity (no stated order) with the switch on or off.
   - Each session journals the skills it loads from a user root (`skill-user-root`); worktrees never copy from a user root.
   - opencode-http 2.x allows only the BMAD module skills a session needs from a user root, never the operator's personal skills; on 1.x the session refuses to start and `validate` warns.
   - A leading `~` in a profile's `skill_tree`, `extra_skill_trees`, `seed_files` or `hooks.config_path` is refused, and a skill tree linked outside the repository is refused at preflight under worktree isolation.

@@ -143,11 +143,13 @@ breaking changes may land in a minor release.
   1.x, whose sessions then refuse to start) and `-sandboxed`; sessions journal
   `skill-user-root`. opencode 2.x allows only the BMAD module skills a session needs
   from a user root. See ADR 0002 (#770).
-- Warn with `skills.user-shadow`, whatever `[skills] user_roots` says, when a
-  user-level copy of a driven skill outranks (claude) or competes with (codex,
-  antigravity) the project's.
+- Warn with `skills.user-shadow` when a user-level copy of a driven skill outranks
+  the project's checked copy (claude, with `[skills] user_roots` off) or competes with
+  it (codex, antigravity, whatever the switch).
 - Read opencode-http's project skills from `.agents/skills` as well as
-  `.claude/skills` (new profile field `extra_skill_trees`).
+  `.claude/skills` (new profile field `extra_skill_trees`, refused when an entry starts
+  with `-`); on opencode 2.x the `.claude/skills` copy wins a duplicate id, as
+  `validate` assumes.
 - Add a `{skill_dir}` profile prompt placeholder (the located skill folder); copilot's
   prompt uses it.
 
@@ -197,7 +199,8 @@ breaking changes may land in a minor release.
   and `hooks.config_path` at load: it is not expanded.
 - Report a skill tree, or a skill linked inside it, that resolves outside the project
   or repository as `skills.tree-outside`; under worktree isolation a link outside the
-  repository is refused at preflight instead of escalating mid-run.
+  repository is refused at preflight (and named by the `run --dry-run` banner) instead
+  of escalating mid-run.
 - Change copilot's default prompt template to `{skill_dir}`: the text is unchanged
   for project skills, but the config digest changes once, so the first resume of a
   copilot run after upgrading journals `security_config_changed`.

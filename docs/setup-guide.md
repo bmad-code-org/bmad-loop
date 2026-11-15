@@ -188,10 +188,11 @@ from the project's as `skills.user-root-version-skew`. With the switch off, a mi
 that one of the CLI's own user roots holds keeps the run refused, and the `skills.base-missing`
 message names that copy (`detail.outside`) and the switch.
 
-Whatever the switch, `validate` warns with `skills.user-shadow` when a copy in a user root
-competes with the project's: Claude Code runs `~/.claude/skills/<name>` instead of the
-project copy, and Codex and Antigravity load both. Remove the stale copy or bring the two to
-the same version.
+`validate` warns with `skills.user-shadow` when a copy in a user root competes with the
+project copy the checks read: with the switch off, Claude Code runs `~/.claude/skills/<name>`
+instead of the project copy; whatever the switch, Codex and Antigravity load both. (With the
+switch on, claude's user copy is the one resolved and checked, so it is not reported.)
+Remove the stale copy or bring the two to the same version.
 
 Worktrees never carry a user root: under worktree isolation a skill resolved from one is
 loaded from your home folder, and the worktree seeding gate skips it (journaled as
@@ -209,8 +210,9 @@ Known limitations:
 - The variables that disable a user root are read from bmad-loop's own environment plus the
   profile's `[env]`. A long-lived tmux or psmux server can hand sessions a different
   environment.
-- When one skill id is in both of opencode's project trees, which copy opencode loads is not
-  pinned. The skills CLI normally links the two, so they are identical.
+- When one skill id is in both of opencode's project trees, opencode 2.x loads the
+  `.claude/skills` copy, the one `validate` checks; on 1.x which copy loads is not pinned.
+  The skills CLI normally links the two, so they are identical.
 - The CLIs' folder lists change over time. The profiles reflect the vendor docs at the time
   of writing; recheck them when a CLI changes how it finds skills.
 

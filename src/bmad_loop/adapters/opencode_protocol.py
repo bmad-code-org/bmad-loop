@@ -1061,9 +1061,14 @@ class V2Protocol(OpencodeProtocol):
         ``OPENCODE_DISABLE_EXTERNAL_SKILLS``, so these rules are the only thing
         hiding the operator's personal and the built-in skills. ``skills``
         points discovery at the project trees (no user path: V2 scans those
-        roots anyway); ``model`` is the ``"provider/model"`` string when the
-        policy sets one. An id the rule matcher would read as a pattern is
-        never re-allowed (:meth:`refused_skill_ids`)."""
+        roots anyway), primary LAST: V2 registers explicit ``skills`` entries
+        above every discovered root and in array order, the later source
+        supplying a duplicate id, so the primary tree's copy — the one
+        :func:`bmad_loop.skill_locate.locate` resolves and validate reads —
+        wins a clash with an extra tree. ``model`` is the
+        ``"provider/model"`` string when the policy sets one. An id the rule
+        matcher would read as a pattern is never re-allowed
+        (:meth:`refused_skill_ids`)."""
         permissions: list[dict[str, str]] = [
             {"action": "*", "resource": "*", "effect": "allow"},
             {"action": "question", "resource": "*", "effect": "deny"},
@@ -1075,7 +1080,10 @@ class V2Protocol(OpencodeProtocol):
             for skill_id in _v2_skill_ids(dirs, user_skill_ids)
             if _V2_RULE_WILDCARDS.isdisjoint(skill_id)
         )
-        config: dict[str, Any] = {"permissions": permissions, "skills": [str(d) for d in dirs]}
+        config: dict[str, Any] = {
+            "permissions": permissions,
+            "skills": [str(d) for d in reversed(dirs)],
+        }
         if spec.model:
             config["model"] = spec.model
         return json.dumps(config)

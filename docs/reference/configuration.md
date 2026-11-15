@@ -276,7 +276,7 @@ Where skills are resolved from.
 
 | Key | Type | Default | Allowed | Description |
 | --- | --- | --- | --- | --- |
-| `user_roots` | boolean | `false` |  | ON: a skill missing from the project's skill trees may resolve from the user-level folders the coding CLI loads on its own (its profile's [user_skills] roots, e.g. ~/.agents/skills after `npx skills add -g`) · OFF (default): the project's skill trees only |
+| `user_roots` | boolean | `false` |  | ON: a skill missing from the project's skill trees may resolve from the user-level folders the coding CLI loads on its own (its profile's [user_skills] roots, e.g. ~/.agents/skills after `npx skills add -g`); when both hold a copy, the profile's precedence picks, so a precedence = "user" CLI (claude) runs the user copy over the project's · OFF (default): the project's skill trees only |
 
 ### `[mux]`
 
@@ -303,4 +303,4 @@ What changes with the switch on:
 - opencode-http 2.x allows those BMAD skills through its permission rules; 1.x cannot load them, so `validate` warns (`skills.user-root-unsupported`) and the session refuses to start.
 - A dev or review stage with `permission_mode = "sandboxed"` that loads a user-root skill gets a `skills.user-root-sandboxed` warning: the sandbox may not let the CLI read your home folder.
 
-The `skills.user-shadow` warning does not depend on the switch. Per-CLI roots, precedence and the fresh-clone guidance are in the [setup guide](../setup-guide.md#project-skills-and-user-level-skill-roots); the profile keys are in the [adapter authoring guide](../adapter-authoring-guide.md#user-level-skill-roots).
+`skills.user-shadow` is reported with the switch off too: claude's user copy overriding the project's warns only with the switch off (on, it is the copy resolved), and a codex or antigravity clash warns either way. Per-CLI roots, precedence and the fresh-clone guidance are in the [setup guide](../setup-guide.md#project-skills-and-user-level-skill-roots); the profile keys are in the [adapter authoring guide](../adapter-authoring-guide.md#user-level-skill-roots).

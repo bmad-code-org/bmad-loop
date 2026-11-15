@@ -2421,9 +2421,10 @@ def _user_root_findings(project: Path, scope: SkillScope, found: Located | None)
     """The user-root warnings for one scope; empty for a scope without user roots
     (every plain tree string).
 
-    - ``skills.user-shadow`` (whatever the switch): a skill the run drives sits in
-      both a project tree and a user root and the CLI may run the user copy
-      instead of the one the checks read (:func:`skill_locate.shadow`).
+    - ``skills.user-shadow``: a skill the run drives sits in both a project tree
+      and a user root and the CLI may run the user copy instead of the one the
+      checks read (:func:`skill_locate.shadow`) — ``user`` precedence with the
+      switch off, ``unordered`` precedence whatever the switch.
     - ``skills.user-root-unavailable`` (switch on only): a declared root that can
       never resolve — a disabler variable is set, the home is unknown, or the
       folder cannot be read.

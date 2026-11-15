@@ -63,7 +63,7 @@ Option D.
 
 - **One locator.** `skill_locate.locate(project, scope, name)` answers every skill question. A `SkillScope` carries the project trees, the declared user roots and the switch; a plain tree string is a project-only scope, which keeps every existing caller and output unchanged.
 - **Precedence follows the CLI.** `project`: the project copy, else a user copy. `user` (claude): the user copy, else the project's, so `validate` checks the copy Claude Code runs. `unordered` (codex, antigravity): the project copy is checked and a warning says both load.
-- **Shadowing is reported with the switch off.** `skills.user-shadow` warns whenever a user copy outranks or competes with the project's, because the CLI loads it whether or not bmad-loop resolves it.
+- **Shadowing is reported with the switch off.** `skills.user-shadow` warns whenever the CLI may run a user copy over or beside the project copy the checks read, because the CLI loads it whether or not bmad-loop resolves it. With the switch on, a `user`-precedence copy is the one resolved, so only an `unordered` clash still warns.
 - **Unavailable roots are skipped, not guessed.** A root whose disabling variable is set (in bmad-loop's environment plus the profile's `[env]`), that cannot be read, or that has no home folder is never resolved and is reported as `skills.user-root-unavailable`.
 - **Visibility.** `validate` emits a `skills.root` line per driven skill; `run --dry-run` prints a note for each user-root skill; each session journals `skill-user-root` rows.
 
@@ -83,4 +83,4 @@ A worktree is a clean checkout; it never carries the user's home folder. Seeding
 - Deliberate changes with the switch off: a leading `~` in a profile path is a load error; `skills.tree-outside` refuses at preflight under worktree isolation; `skills.user-shadow` warns; the `skills.base-missing` hint names only a copy in the CLI's own user roots; opencode-http also reads `.agents/skills`; copilot's prompt names the located skill folder through `{skill_dir}`, which changes its config digest once.
 - The vendor folder lists drift. The profiles carry the lists as data with source comments; they must be rechecked when a CLI changes how it discovers skills.
 - Disabling variables are read from bmad-loop's environment, not a long-lived multiplexer server's, which can differ.
-- Which copy opencode loads when one id is in both of its project trees is not pinned; the skills CLI normally links the two.
+- Which copy opencode 1.x loads when one id is in both of its project trees is not pinned (2.x lists the primary tree last, so its copy wins); the skills CLI normally links the two.

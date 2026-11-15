@@ -586,7 +586,7 @@ key = "user_roots"
 kind = "switch"
 default_ref = "SkillsPolicy.user_roots"
 label = "user-level skill folders"
-description = "ON: a skill missing from the project's skill trees may resolve from the user-level folders the coding CLI loads on its own (its profile's [user_skills] roots, e.g. ~/.agents/skills after `npx skills add -g`) · OFF (default): the project's skill trees only"
+description = "ON: a skill missing from the project's skill trees may resolve from the user-level folders the coding CLI loads on its own (its profile's [user_skills] roots, e.g. ~/.agents/skills after `npx skills add -g`); when both hold a copy, the profile's precedence picks, so a precedence = \"user\" CLI (claude) runs the user copy over the project's · OFF (default): the project's skill trees only"
 
 [[section]]
 name = "mux"

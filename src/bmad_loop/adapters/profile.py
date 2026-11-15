@@ -909,6 +909,13 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
                 "extra_skill_trees entries must not name a Windows device or end a "
                 f"component in a period or space: got {extra!r}"
             )
+        # An extra tree reaches the prompt as {skill_dir} ("<tree>/<skill>") and is
+        # outside the config digest, so it must never read as a command-line option.
+        if extra.startswith("-"):
+            raise fail(
+                "extra_skill_trees entries must not start with '-': the rendered "
+                f"{{skill_dir}} would read as a command-line option: got {extra!r}"
+            )
         if _same_tree(extra, profile.skill_tree):
             raise fail(f"extra_skill_trees entries must differ from skill_tree: got {extra!r}")
     if len({_tree_key(t) for t in profile.extra_skill_trees}) != len(profile.extra_skill_trees):

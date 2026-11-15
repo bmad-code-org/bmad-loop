@@ -254,7 +254,8 @@ def _user_copies(scope: SkillScope, name: str) -> list[Located]:
 
 def copies(project: Path, scope: SkillScope, name: str) -> list[Located]:
     """Every present copy of ``name``: the primary tree, the extra trees, then
-    the available user roots in declared order. An unreadable copy is absent."""
+    the available user roots in declared order. A copy whose folder cannot be
+    read is absent."""
     return [*_project_copies(project, scope, name), *_user_copies(scope, name)]
 
 

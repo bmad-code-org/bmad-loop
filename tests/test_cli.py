@@ -16458,11 +16458,13 @@ def test_validate_and_preflight_refuse_a_skill_linked_out_of_the_repo_under_work
 ):
     """The dev primitive linked to a shared install outside the repo: in place it
     loads through the link, but worktree seeding skips it and used to escalate the
-    unit mid-run. validate and the run-start preflight now refuse it alike.
+    unit mid-run. validate and the run-start preflight now refuse it alike, and
+    the dry-run banner says the real command would abort.
 
     Ablation: drop the validate call to `install.skill_trees_outside` and validate
     exits 0 (this is its only problem); drop the preflight call and
-    `_require_base_skills` returns True."""
+    `_require_base_skills` returns True; drop the banner's call and the preview
+    prints no `NOT runnable` line."""
     from bmad_loop.install import DEV_PRIMITIVE_LEGACY
 
     tree = ".claude/skills"
@@ -16513,6 +16515,11 @@ def test_validate_and_preflight_refuse_a_skill_linked_out_of_the_repo_under_work
         cli._require_base_skills(project.project, pol, project.project, GrantSet.empty()) is False
     )
     assert f"{tree}/{DEV_PRIMITIVE_LEGACY} resolves outside the repo" in capsys.readouterr().err
+
+    cli._warn_preflight_would_abort(project, pol)
+    err = capsys.readouterr().err
+    assert "this preview is NOT runnable as-is" in err
+    assert f"FAIL: {outside[0]['message']}" in err
 
 
 def test_validate_json_tickets_mode_document(project, capsys, monkeypatch):

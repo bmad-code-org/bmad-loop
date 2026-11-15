@@ -2893,7 +2893,7 @@ def _warn_preflight_would_abort(
 
     Mirrors the refusals the dry-run's early return skips past, and only those:
     the under-floor git `_reject_under_floor_git` refuses first, the finding list
-    `_require_base_skills` gates on, the #414 isolation conflict
+    `_require_base_skills` gates on (``skills.tree-outside`` included), the #414 isolation conflict
     `_reject_isolation_conflict` refuses ahead of it, and the unregistered adapter
     kind `make_adapters` aborts on (`_unknown_adapter_kinds` — a preview reads none
     of the fields that would give the misconfiguration away).
@@ -2962,6 +2962,13 @@ def _warn_preflight_would_abort(
             install.missing_sweep_skill(paths.project, _triage_trees(paths.project, pol))
             if require_sweep
             else []
+        )
+        if p.severity == "problem"
+    ]
+    problems += [
+        p.message
+        for p in install.skill_trees_outside(
+            paths.project, paths.repo_root, trees, isolation=pol.scm.isolation
         )
         if p.severity == "problem"
     ]
