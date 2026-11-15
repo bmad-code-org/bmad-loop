@@ -45,6 +45,7 @@ from bmad_loop.policy import (
     Policy,
     ReviewPolicy,
     ScmPolicy,
+    SkillsPolicy,
     StageAdapterPolicy,
     StoriesPolicy,
     SweepPolicy,
@@ -77,6 +78,7 @@ SECTION_DC = {
     "tui": TuiPolicy,
     "operator": OperatorPolicy,
     "mux": MuxPolicy,
+    "skills": SkillsPolicy,
     "dev": DevPolicy,
 }
 

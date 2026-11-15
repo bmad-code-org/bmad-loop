@@ -117,3 +117,17 @@ usage_limit_patterns = ['^provider-error event=\S+ type=provider[.]quota ']
 
 [hooks]
 dialect = "none"
+
+# The home-relative skill folders OpenCode loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). XDG_CONFIG_HOME moves
+# the first away from ~/.config.
+# Source: https://opencode.ai/docs/skills/ (2026-11-15).
+[user_skills]
+precedence = "project"
+roots = [
+  { path = "~/.config/opencode/skills", disabled_by = [
+    "XDG_CONFIG_HOME",
+  ] },
+  "~/.agents/skills",
+  "~/.claude/skills",
+]

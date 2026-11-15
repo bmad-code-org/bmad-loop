@@ -270,6 +270,14 @@ Stories that owe external, human-only actions.
 | `enabled` | boolean | `true` |  | let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed is recorded in the story spec's operator_actions: frontmatter, and `bmad-loop confirm <story-key>` completes the story once you have done it |
 | `on_review_demotion` | string | `"escalate"` | `escalate` / `park` | escalate: a review pass is never offered the park, and one that finalizes a done story at awaiting-operator is not accepted (default) · park: the review may demote it — the board moves done -&gt; awaiting-operator, the story commits and parks · sprint mode with parks enabled only |
 
+### `[skills]`
+
+Where skills are resolved from.
+
+| Key | Type | Default | Allowed | Description |
+| --- | --- | --- | --- | --- |
+| `user_roots` | boolean | `false` |  | ON: a skill missing from the project's skill trees may resolve from the user-level folders the coding CLI loads on its own (its profile's [user_skills] roots, e.g. ~/.agents/skills after `npx skills add -g`) · OFF (default): the project's skill trees only |
+
 ### `[mux]`
 
 Terminal-multiplexer backend (machine-specific — policy.toml is gitignored).

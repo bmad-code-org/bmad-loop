@@ -299,3 +299,11 @@ args = [
   '{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}',
 ]
 platforms = ["linux", "darwin"]
+
+# The home-relative skill folders Claude Code loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). Personal skills beat
+# project skills on a name clash, and CLAUDE_CONFIG_DIR moves the personal folder
+# away from ~/.claude. Source: https://code.claude.com/docs/en/skills (2026-11-15).
+[user_skills]
+precedence = "user"
+roots = [{ path = "~/.claude/skills", disabled_by = ["CLAUDE_CONFIG_DIR"] }]

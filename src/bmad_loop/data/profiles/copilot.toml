@@ -61,3 +61,19 @@ seed_files = [".github/copilot/settings.json"]
 dialect = "copilot-settings-json"
 config_path = ".github/copilot/settings.json"
 events = { agentStop = "Stop", sessionStart = "SessionStart", sessionEnd = "SessionEnd" }
+
+# The home-relative skill folders Copilot CLI loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). Project skills beat
+# personal ones; COPILOT_HOME moves ~/.copilot and stops it reading
+# ~/.agents/skills.
+# Source: https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills (2026-11-15).
+[user_skills]
+precedence = "project"
+roots = [
+  { path = "~/.copilot/skills", disabled_by = [
+    "COPILOT_HOME",
+  ] },
+  { path = "~/.agents/skills", disabled_by = [
+    "COPILOT_HOME",
+  ] },
+]
