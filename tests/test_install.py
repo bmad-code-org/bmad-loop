@@ -53,6 +53,7 @@ from bmad_loop.install import (
     RENDERER_CONFIG_UTILS_REL,
     RENDERER_ENTRY_REL,
     RENDERER_SCRIPT_REL,
+    REVIEW_FLOOR_TEXT,
     SNAPSHOT_TOKEN_RE,
     _absent_renderer_sources,
     _copy_traversable,
@@ -2967,11 +2968,10 @@ def test_floor_message_names_v7(tmp_path):
 
 def test_missing_base_skills_reports_absent_and_incomplete(tmp_path):
     claude = get_profile("claude")
-    # nothing installed → dev primitive + the two inline review layers reported
-    # missing (the hunters are required whenever the merged reviewer is absent —
-    # the primitive's step-04 invokes them on every run)
+    # nothing installed → only the dev primitive is reported missing: the review
+    # skills derive from it, so with nothing to derive from they are not demanded
     problems = missing_base_skills(tmp_path, [claude.skill_tree])
-    assert len(problems) == 3
+    assert len(problems) == 1
     assert {p.check for p in problems} == {"skills.base-missing"}
     assert all("BMAD-METHOD >= 6.10.0" in p.message for p in problems)
     assert all(BMAD_FLOOR_TEXT in p.message for p in problems)
@@ -3097,6 +3097,9 @@ def test_missing_stories_support_probes_step01_content(tmp_path):
 
     claude = get_profile("claude")
     tree = claude.skill_tree
+    # a resolvable primitive (SKILL.md is all the new name needs to resolve): an
+    # unresolved tree is named, but probed under DEV_PRIMITIVE_NEW, not this dir
+    _install_skills(tmp_path, tree, {STORIES_PROBE_SKILL: DEV_PRIMITIVE_MARKERS})
     step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
 
     # step-01 absent → reported (older/half install)
@@ -3127,12 +3130,9 @@ def test_missing_base_skills_findings_carry_ids_and_detail(tmp_path):
     assert all(f.severity == "problem" for f in absent)
     assert all(f.check in VALIDATE_CHECKS for f in absent)
     # an empty tree names the CURRENT spelling — the older one appears in the
-    # message as a hint, never as the thing a consumer keys on
-    assert {f.detail["skill"] for f in absent} == {
-        DEV_PRIMITIVE_NEW,
-        "bmad-review-adversarial-general",
-        "bmad-review-edge-case-hunter",
-    }
+    # message as a hint, never as the thing a consumer keys on — and only the
+    # primitive: the reviewers derive from it, so none is demanded without it
+    assert {f.detail["skill"] for f in absent} == {DEV_PRIMITIVE_NEW}
     assert all(f.detail["tree"] == claude.skill_tree for f in absent)
 
     _install_base_skills(tmp_path, claude.skill_tree)
@@ -3915,7 +3915,7 @@ def test_review_hunter_missing_without_merged_review_reported(tmp_path):
     }
     assert "bmad-review-edge-case-hunter" in problems[0].message
     assert "install the BMad Method" not in problems[0].message
-    assert "update bmm" in problems[0].message
+    assert REVIEW_FLOOR_TEXT in problems[0].message
 
 
 # The invoke-a-skill layer topology: four review layers, three invoking the merged
@@ -5774,6 +5774,8 @@ def test_missing_stories_support_findings_split_absent_from_stale(tmp_path):
 
     claude = get_profile("claude")
     tree = claude.skill_tree
+    # a complete legacy primitive resolves, so the probe reads THIS dir
+    _install_skills(tmp_path, tree, {STORIES_PROBE_SKILL: DEV_PRIMITIVE_MARKERS})
     step01 = tmp_path / tree / STORIES_PROBE_SKILL / STORIES_PROBE_FILE
 
     absent = missing_stories_support(tmp_path, [tree])
@@ -12651,3 +12653,439 @@ def test_missing_tickets_support_findings_split_absent_from_stale(tmp_path):
 
     install_build_auto_v7_skill(tmp_path, tree)
     assert missing_tickets_support(tmp_path, [tree]) == []
+
+
+# The BMAD v7 lens shape (BMAD-METHOD #2861), trimmed from the shipped
+# bmad-build-auto/customize.toml: a `review` selection plus two lens sets. Every
+# shipped lens says "Do not invoke any skill" — the derived requirement is empty.
+LENS_CUSTOMIZE = '''
+[workflow]
+review = "quick"
+
+[[workflow.quick_lenses]]
+id = "quick"
+name = "Quick"
+instruction = """
+Launch a context-free subagent with this prompt:
+
+Read `{plan_file}` and the unified diff at `{diff_file}`. Report findings.
+Do not invoke any skill, and do not spawn subagents of your own.
+"""
+
+[[workflow.thorough_lenses]]
+id = "blind-hunter"
+name = "Blind Hunter"
+instruction = """
+Launch a context-free subagent with this prompt:
+
+CONTENT: the unified diff at `{diff_file}`.
+Do not invoke any skill, and do not spawn subagents of your own.
+"""
+
+[[workflow.thorough_lenses]]
+id = "edge-case-hunter"
+name = "Edge Case Hunter"
+instruction = """
+Launch a context-free subagent with this prompt:
+
+Read `{skill-root}/review-prompts/edge-case-hunter.md` completely and follow it.
+Do not invoke any skill, and do not spawn subagents of your own.
+"""
+'''
+
+_HUNTERS = {"bmad-review-adversarial-general", "bmad-review-edge-case-hunter"}
+
+
+def _lens_tree(root, customize=LENS_CUSTOMIZE):
+    """A v7 primitive (bmad-build-auto) carrying ``customize``, alone in its tree."""
+    tree = get_profile("claude").skill_tree
+    _install_dev_auto(root, tree, skill=DEV_PRIMITIVE_NEW, customize=customize)
+    return tree
+
+
+def test_v7_lens_sets_require_no_review_skill(tmp_path):
+    """#768: a v7 tree reviews through its own lens prompts and invokes no skill, so
+    neither the merged reviewer nor the two long-deleted hunters is demanded.
+    Ablation: with the lens path removed from resolve_review_layers the shape reads
+    as unknown and the static fallback FAILs on both hunters."""
+    tree = _lens_tree(tmp_path)
+    assert not (tmp_path / tree / "bmad-review").exists()
+
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
+def test_v7_lens_resolution_is_layer_driven(tmp_path):
+    tree = _lens_tree(tmp_path)
+
+    resolved = resolve_review_layers(tmp_path, tree)
+
+    assert resolved is not None
+    assert resolved.source == "customize.toml"
+    assert resolved.layer_driven is True
+    assert resolved.required == {}
+    assert resolved.advisory == {}
+    # BOTH sets count: the selection that runs is decided at run time
+    assert resolved.active_layers == ("quick", "blind-hunter", "edge-case-hunter")
+    assert resolved.lens_sets == ("quick", "thorough")
+    assert resolved.selection == "quick"
+
+
+def test_v7_lens_invoking_a_skill_is_required_in_either_set(tmp_path):
+    """A thorough lens runs whenever the run asks for thorough (`auto` on a full
+    route, `--set workflow.review=thorough`, `[tickets] thorough_review`), so a
+    skill it invokes is required even while the configured selection is quick."""
+    invoking = LENS_CUSTOMIZE.replace(
+        "Read `{skill-root}/review-prompts/edge-case-hunter.md` completely and follow it.",
+        "Invoke the `bmad-foo` skill on this diff.",
+    )
+    tree = _lens_tree(tmp_path, invoking)
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-layer-missing"]
+    assert problems[0].severity == "problem"
+    assert problems[0].detail["skill"] == "bmad-foo"
+    assert problems[0].detail["layers"] == ["edge-case-hunter"]
+
+    _install_skills(tmp_path, tree, {"bmad-foo": ()})
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
+def test_v7_gated_lens_skill_is_advisory(tmp_path):
+    """#260: a `when`-gated lens may never run, so its skill only warns."""
+    gated = LENS_CUSTOMIZE.replace(
+        'name = "Blind Hunter"\n',
+        'name = "Blind Hunter"\nwhen = "the diff touches auth"\n',
+    ).replace(
+        "CONTENT: the unified diff at `{diff_file}`.",
+        "Invoke the `bmad-foo` skill on this diff.",
+    )
+    tree = _lens_tree(tmp_path, gated)
+
+    findings = missing_base_skills(tmp_path, [tree])
+
+    assert [(f.check, f.severity) for f in findings] == [
+        ("skills.review-layer-unresolved", "warning")
+    ]
+    assert findings[0].detail["layers"] == ["blind-hunter"]
+
+
+def test_v7_lens_override_replaces_by_id(tmp_path):
+    """The lens sets merge with project overrides keyed on `id`, per set — the
+    same deep merge BMAD's resolver applies at run time."""
+    tree = _lens_tree(tmp_path)
+    override = _write_override(
+        tmp_path,
+        '[[workflow.thorough_lenses]]\nid = "blind-hunter"\n'
+        'instruction = "Invoke the `bmad-foo` skill on this diff."\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [p.check for p in problems] == ["skills.review-layer-missing"]
+    assert problems[0].detail["layers"] == ["blind-hunter"]
+
+    # an override emptying the lens disables it: nothing is required any more
+    override.write_text(
+        '[[workflow.thorough_lenses]]\nid = "blind-hunter"\ninstruction = ""\n',
+        encoding="utf-8",
+    )
+    assert missing_base_skills(tmp_path, [tree]) == []
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None
+    assert "blind-hunter" not in resolved.active_layers
+
+
+_ALL_LENSES_OFF = (
+    '[[workflow.quick_lenses]]\nid = "quick"\ninstruction = ""\n'
+    '[[workflow.thorough_lenses]]\nid = "blind-hunter"\ninstruction = ""\n'
+    '[[workflow.thorough_lenses]]\nid = "edge-case-hunter"\ninstruction = ""\n'
+)
+
+
+def test_v7_all_lenses_disabled_is_reported(tmp_path):
+    """Every lens disabled under `auto` leaves the run nothing to launch on either
+    route. Ablation: drop the lens branch's empty check and this goes green."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path, '[workflow]\nreview = "auto"\n' + _ALL_LENSES_OFF, skill=DEV_PRIMITIVE_NEW
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-layers-empty"]
+    assert problems[0].severity == "problem"
+    assert "[[workflow.quick_lenses]]" in problems[0].message
+    assert "[[workflow.thorough_lenses]]" in problems[0].message
+
+
+@pytest.mark.parametrize(
+    ("selection", "disabled", "empty_table"),
+    [
+        ("quick", '[[workflow.quick_lenses]]\nid = "quick"\ninstruction = ""\n', "quick_lenses"),
+        (
+            "thorough",
+            '[[workflow.thorough_lenses]]\nid = "blind-hunter"\ninstruction = ""\n'
+            '[[workflow.thorough_lenses]]\nid = "edge-case-hunter"\ninstruction = ""\n',
+            "thorough_lenses",
+        ),
+    ],
+)
+def test_v7_selected_lens_set_disabled_is_reported(tmp_path, selection, disabled, empty_table):
+    """`quick`/`thorough` launch only their own set, so an enabled lens in the OTHER
+    set cannot serve the run. Ablation: check the combined active lenses instead of
+    the selected set and this goes green."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path, f'[workflow]\nreview = "{selection}"\n' + disabled, skill=DEV_PRIMITIVE_NEW
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-layers-empty"]
+    assert f"[[workflow.{empty_table}]]" in problems[0].message
+    # the set that cannot run is not offered as the culprit
+    other = "thorough_lenses" if empty_table == "quick_lenses" else "quick_lenses"
+    assert other not in problems[0].message
+
+
+def test_v7_auto_selection_needs_one_enabled_set(tmp_path):
+    """`auto` may route to either set, so one disabled set is not a HALT."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path,
+        '[workflow]\nreview = "auto"\n[[workflow.quick_lenses]]\nid = "quick"\ninstruction = ""\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    assert missing_base_skills(tmp_path, [tree]) == []
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None and resolved.active_sets == ("thorough",)
+
+
+@pytest.mark.parametrize("key", ["id", "code"])
+@pytest.mark.parametrize("value", ['["quick"]', "{ a = 1 }", "1", '""'])
+def test_v7_lens_override_with_malformed_key_is_reported_not_raised(tmp_path, key, value):
+    """v7's loader accepts only a non-empty string merge key and refuses to render
+    the skill otherwise; the preflight reports the override as a problem instead of
+    crashing with TypeError on an unhashable key, and leaves the file out whole.
+    Ablation: drop the `_MalformedMergeKey` guard and the array/table cases raise
+    TypeError out of missing_base_skills while the int/empty cases go clean."""
+    tree = _lens_tree(tmp_path)
+    shipped = LENS_CUSTOMIZE if key == "id" else LENS_CUSTOMIZE.replace("\nid = ", "\ncode = ")
+    _lens_tree(tmp_path, shipped)
+    _write_override(
+        tmp_path,
+        f'[[workflow.quick_lenses]]\n{key} = {value}\ninstruction = ""\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    findings = missing_base_skills(tmp_path, [tree])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.customize-unreadable", "problem")]
+    assert "fails to start" in findings[0].message
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None
+    assert "quick" in resolved.active_sets
+
+
+def test_v7_unparseable_override_is_a_problem(tmp_path):
+    """v7 renders the dev skill through a strict loader that raises on invalid TOML
+    in an override, so no dev run starts; the layer-era warning would let the run
+    preflight pass. Ablation: report it as a warning on every tree and this fails."""
+    tree = _lens_tree(tmp_path)
+    _write_override(tmp_path, "this is not = valid toml [[[", skill=DEV_PRIMITIVE_NEW)
+
+    findings = missing_base_skills(tmp_path, [tree])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.customize-unreadable", "problem")]
+
+
+def test_v7_all_lenses_disabled_with_review_none_is_clean(tmp_path):
+    """`review = "none"` launches no lens by design, so empty sets are legitimate.
+    Ablation: drop the `selection != "none"` guard and this reports empty lenses."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path, '[workflow]\nreview = "none"\n' + _ALL_LENSES_OFF, skill=DEV_PRIMITIVE_NEW
+    )
+
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+
+def test_v7_invalid_review_selection_is_a_problem(tmp_path):
+    """bmad-build-auto's workflow.md HALTs every run on a `workflow.review` outside
+    none/quick/thorough/auto — shipped or overridden, the last string wins."""
+    from bmad_loop.checks import VALIDATE_CHECKS
+
+    assert "skills.review-selection-invalid" in VALIDATE_CHECKS
+    tree = _lens_tree(tmp_path, LENS_CUSTOMIZE.replace('review = "quick"', 'review = "deep"'))
+
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [p.check for p in problems] == ["skills.review-selection-invalid"]
+    assert problems[0].detail["selection"] == "deep"
+
+    # an override fixing it clears the problem...
+    override = _write_override(tmp_path, '[workflow]\nreview = "auto"\n', skill=DEV_PRIMITIVE_NEW)
+    assert missing_base_skills(tmp_path, [tree]) == []
+
+    # ...and an override breaking a valid shipped value raises it
+    _lens_tree(tmp_path)
+    override.write_text('[workflow]\nreview = "deep"\n', encoding="utf-8")
+    problems = missing_base_skills(tmp_path, [tree])
+    assert [p.check for p in problems] == ["skills.review-selection-invalid"]
+
+
+@pytest.mark.parametrize(
+    ("literal", "shown"), [("false", "false"), ("1", "1"), ('["quick"]', '["quick"]')]
+)
+def test_v7_non_string_review_selection_is_a_problem(tmp_path, literal, shown):
+    """A non-string `review` is not "unset": the override still replaces the shipped
+    value and the template HALTs on it. Ablation: drop non-string values in
+    `_review_selection_of` and the shipped `quick` wins, reporting nothing."""
+    tree = _lens_tree(tmp_path)
+    _write_override(tmp_path, f"[workflow]\nreview = {literal}\n", skill=DEV_PRIMITIVE_NEW)
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-selection-invalid"]
+    assert problems[0].detail["selection"] == shown
+
+
+def test_review_layers_shape_still_wins_over_lenses(tmp_path):
+    """A shipped config carrying review layers keeps the v6.10-6.12 contract even
+    when it also carries lens tables: its layers decide the requirement."""
+    both = LAYER_CUSTOMIZE + LENS_CUSTOMIZE.replace('[workflow]\nreview = "quick"\n', "")
+    tree = _lens_tree(tmp_path, both)
+
+    resolved = resolve_review_layers(tmp_path, tree)
+
+    assert resolved is not None
+    assert resolved.lens_sets == ()
+    assert resolved.required == {
+        "bmad-review": ("blind-hunter", "edge-case-hunter", "verification-gap")
+    }
+    assert [p.check for p in missing_base_skills(tmp_path, [tree])] == [
+        "skills.review-layer-missing"
+    ]
+
+
+def test_v7_leftover_review_layers_override_is_inert(tmp_path):
+    """A v7 run reads only the lens sets, so a `review_layers` override left over
+    from a v6 install must not pull the preflight onto the layer path and require
+    the skills those dead layers name. Ablation: decide the shape on the MERGED
+    layers instead of the shipped file and bmad-review is required."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path,
+        '[[workflow.review_layers]]\nid = "blind-hunter"\n'
+        'instruction = "Invoke the `bmad-review` skill with only the `adversarial` lens"\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    assert missing_base_skills(tmp_path, [tree]) == []
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None and resolved.lens_sets == ("quick", "thorough")
+
+
+def test_unresolved_primitive_reports_only_base_missing(tmp_path):
+    """#768: with no primitive there is nothing to derive reviewers from, so the
+    one finding is the root cause — not the deleted hunters on top of it.
+    Ablation: remove the early return in _review_findings and both hunters FAIL."""
+    tree = get_profile("claude").skill_tree
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [(p.check, p.detail["skill"]) for p in problems] == [
+        ("skills.base-missing", DEV_PRIMITIVE_NEW)
+    ]
+    assert not any(h in p.message for p in problems for h in _HUNTERS)
+
+
+def test_tickets_dispatch_skips_unresolved_primitive(tmp_path):
+    """Callers that also run missing_base_skills skip an unresolved tree (it is
+    already reported); the default still reports it, under the CURRENT name —
+    never the legacy bmad-dev-auto dir nobody would install."""
+    from bmad_loop.install import missing_tickets_support
+
+    tree = get_profile("claude").skill_tree
+
+    assert missing_tickets_support(tmp_path, [tree], skip_unresolved=True) == []
+    reported = missing_tickets_support(tmp_path, [tree])
+    assert [f.check for f in reported] == ["skills.tickets-dispatch-missing"]
+    assert reported[0].detail["skill"] == DEV_PRIMITIVE_NEW
+    assert DEV_PRIMITIVE_LEGACY not in reported[0].message
+    # the combined preflight still refuses: the root cause is a problem
+    assert [p.check for p in missing_base_skills(tmp_path, [tree])] == ["skills.base-missing"]
+
+
+def test_stories_dispatch_skips_unresolved_primitive(tmp_path):
+    from bmad_loop.install import missing_stories_support
+
+    tree = get_profile("claude").skill_tree
+
+    assert missing_stories_support(tmp_path, [tree], skip_unresolved=True) == []
+    reported = missing_stories_support(tmp_path, [tree])
+    assert [f.check for f in reported] == ["skills.stories-dispatch-missing"]
+    assert reported[0].detail["skill"] == DEV_PRIMITIVE_NEW
+    assert DEV_PRIMITIVE_LEGACY not in reported[0].message
+    assert [p.check for p in missing_base_skills(tmp_path, [tree])] == ["skills.base-missing"]
+
+
+def test_review_remediation_names_core_tools(tmp_path):
+    """On v7 the merged bmad-review ships in core-tools, not the method module."""
+    tree = get_profile("claude").skill_tree
+    # unknown shape (unparseable customize.toml) → the static fallback
+    _install_dev_auto(tmp_path, tree, skill=DEV_PRIMITIVE_NEW, customize="x\n")
+    fallback = missing_base_skills(tmp_path, [tree])
+    assert {f.detail["skill"] for f in fallback} == _HUNTERS
+    assert all("core-tools" in f.message for f in fallback)
+
+    _install_dev_auto(tmp_path, tree, skill=DEV_PRIMITIVE_NEW, customize=LAYER_CUSTOMIZE)
+    derived = missing_base_skills(tmp_path, [tree])
+    assert [f.check for f in derived] == ["skills.review-layer-missing"]
+    assert "core-tools" in derived[0].message
+
+
+@pytest.mark.parametrize("root", [".claude/skills", ".agents/skills"])
+def test_outside_copy_hint_on_base_missing(tmp_path, root):
+    """A global (`npx skills add -g`) copy is named as a hint — the run still
+    refuses, because bmad-loop drives only the project's own tree."""
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    tree = get_profile("claude").skill_tree
+
+    bare = missing_base_skills(project, [tree], home=home)
+    assert "outside" not in bare[0].detail
+    assert "a copy exists" not in bare[0].message
+
+    _install_skills(home, root, {DEV_PRIMITIVE_NEW: ()})
+    problems = missing_base_skills(project, [tree], home=home)
+
+    assert [p.check for p in problems] == ["skills.base-missing"]
+    expected = PurePosixPath("~", root, DEV_PRIMITIVE_NEW).as_posix()
+    assert problems[0].detail["outside"] == expected
+    assert expected in problems[0].message
+    assert "npx skills add" in problems[0].message
+
+
+def test_outside_copy_hint_on_review_findings(tmp_path):
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    tree = get_profile("claude").skill_tree
+    _install_skills(home, ".claude/skills", {"bmad-review": (), **{h: () for h in _HUNTERS}})
+
+    _install_dev_auto(project, tree, skill=DEV_PRIMITIVE_NEW, customize=LAYER_CUSTOMIZE)
+    derived = missing_base_skills(project, [tree], home=home)
+    assert derived[0].detail["outside"] == "~/.claude/skills/bmad-review"
+
+    _install_dev_auto(project, tree, skill=DEV_PRIMITIVE_NEW, customize="x\n")
+    fallback = missing_base_skills(project, [tree], home=home)
+    assert {f.detail["outside"] for f in fallback} == {f"~/.claude/skills/{h}" for h in _HUNTERS}
+
+
+def test_outside_copy_unresolvable_home_is_no_hint(monkeypatch):
+    def no_home():
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(install_mod, "_outside_home", no_home)
+    assert install_mod._outside_copy(DEV_PRIMITIVE_NEW) is None
