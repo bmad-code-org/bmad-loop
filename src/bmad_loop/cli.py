@@ -1650,6 +1650,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
             {"trees": list(dict.fromkeys(dev_trees)), "dev_primitive": resolved},
         )
     report.extend(base_findings)
+    # The same probe `_require_base_skills` runs, against the same code root, so a
+    # skill linked out of the repo under worktree isolation fails both alike.
+    if dev_trees and pol is not None:
+        report.extend(
+            install.skill_trees_outside(project, clean_root, dev_trees, isolation=pol.scm.isolation)
+        )
     report.extend(install.dev_primitive_warnings(project, dev_trees))
     # Opt-in only: the probe executes project-controlled content (the stub's argv and
     # render_skill.py), and plain validate must stay non-executing for a fresh clone.
@@ -2975,6 +2981,9 @@ def _require_base_skills(
     gated (`_skill_trees`)."""
     skill_trees = _skill_trees(project, pol, root, grants, review_owed=review_owed)
     findings = install.missing_base_skills(project, skill_trees)
+    # A skill linked out of the repo is refused here rather than escalated mid-run,
+    # where worktree seeding would skip it.
+    findings += install.skill_trees_outside(project, root, skill_trees, isolation=pol.scm.isolation)
     if require_stories:
         # missing_base_skills above reports (and refuses) an unresolved primitive
         findings += install.missing_stories_support(project, skill_trees, skip_unresolved=True)

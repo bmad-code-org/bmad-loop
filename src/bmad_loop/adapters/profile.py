@@ -48,6 +48,7 @@ import regex
 from ..platform_util import (
     has_parent_ref,
     is_absolute_path,
+    names_home_ref,
     names_tree_root,
     names_win32_alias,
 )
@@ -592,6 +593,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             # `names_tree_root("")` is True, so this arm also carries the
             # "a real dialect must name a config_path at all" case.
             raise fail("hooks.config_path must be a project-relative path")
+        if names_home_ref(hooks.config_path):
+            raise fail(
+                "hooks.config_path must not start with '~': a leading '~' is not expanded; "
+                "hook config paths must be project-relative"
+            )
         if names_win32_alias(hooks.config_path):
             raise fail(
                 "hooks.config_path must not name a Windows device or end a component "
@@ -818,6 +824,12 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     ):
         raise fail("skill_tree must be a project-relative path")
 
+    if names_home_ref(profile.skill_tree):
+        raise fail(
+            "skill_tree must not start with '~': a leading '~' is not expanded; "
+            f"skill trees must be project-relative: got {profile.skill_tree!r}"
+        )
+
     if names_win32_alias(profile.skill_tree):
         raise fail(
             "skill_tree must not name a Windows device or end a component in a period or space"
@@ -830,6 +842,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     for seed in profile.seed_files:
         if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
+        if names_home_ref(seed):
+            raise fail(
+                "seed_files entries must not start with '~': a leading '~' is not "
+                f"expanded; seed files must be project-relative: got {seed!r}"
+            )
         if names_win32_alias(seed):
             raise fail(
                 "seed_files entries must not name a Windows device or end a component "

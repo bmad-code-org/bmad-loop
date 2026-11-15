@@ -2917,6 +2917,105 @@ def _confined_to(target: Path, root: Path) -> bool:
         return False
 
 
+TREE_OUTSIDE_CHECK = "skills.tree-outside"
+
+
+def _resolved_text(path: Path) -> str:
+    """``path`` resolved for a finding's ``target``; the raw spelling if resolving fails."""
+    try:
+        return str(path.resolve())
+    except (OSError, RuntimeError):
+        return str(path)
+
+
+def skill_trees_outside(
+    project: Path, repo_root: Path, trees: Iterable[str], *, isolation: str
+) -> list[Finding]:
+    """``skills.tree-outside``: a skill tree, or a skill the run needs from one,
+    that a link carries out of where bmad-loop can follow it.
+
+    Two shapes, judged by different roots because two different consumers refuse
+    them:
+
+    - The **tree itself** resolving outside ``project`` (a junction from
+      ``.agents/skills`` to a global folder). ``init`` refuses to write through it
+      (:func:`_confined_to`), so it is a ``warning`` — unless worktree isolation is
+      on and it also leaves ``repo_root``, where seeding cannot copy a single skill
+      out of it and the finding is a ``problem``. Its skill-level links are then
+      not reported again.
+    - A **required skill directory** — the resolved dev primitive plus every skill
+      its review step may invoke (:meth:`ReviewResolution.skills`; for a shape
+      that cannot be read, the merged-or-standalone fallback the worktree gate
+      uses) — resolving outside ``repo_root``. Only worktree isolation reads skills through a copy,
+      and its seeding skips a source outside the repo and then escalates the unit
+      mid-run, so it is a ``problem`` there and no finding at all otherwise: in
+      place, the session reads the link directly.
+
+    A link that stays inside the repo (``.claude/skills -> .agents/skills``, the
+    ``skills`` CLI's own layout) is fine on both counts. A skill that is absent or
+    unresolved is :func:`missing_base_skills`' to report, not this check's.
+    ``detail``: ``tree``, ``skill`` (skill-level only), ``target`` (the resolved
+    path) and ``isolation``."""
+    worktree = isolation == "worktree"
+    findings: list[Finding] = []
+    for tree in dict.fromkeys(trees):
+        tree_dir = project / tree
+        if not _confined_to(tree_dir, project):
+            leaves_repo = not _confined_to(tree_dir, repo_root)
+            target = _resolved_text(tree_dir)
+            fatal = worktree and leaves_repo
+            consequence = (
+                "; worktree isolation cannot seed skills from outside the repo, so every "
+                "isolated session would stall — install them per project or set "
+                '[scm] isolation = "none"'
+                if fatal
+                else ""
+            )
+            findings.append(
+                Finding(
+                    TREE_OUTSIDE_CHECK,
+                    "problem" if fatal else "warning",
+                    f"{tree} resolves outside the project ({target}) — `bmad-loop init` "
+                    f"refuses to install into it; install the skills into the project "
+                    f"(`npx skills add` without -g) rather than linking the tree"
+                    f"{consequence}",
+                    {"tree": tree, "target": target, "isolation": isolation},
+                )
+            )
+            if fatal:
+                continue
+        if not worktree:
+            continue
+        primitive = resolve_dev_primitive(project, tree)
+        review = resolve_review_layers(project, tree)
+        if review is not None:
+            review_skills = review.skills()
+        elif (tree_dir / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
+            # an unreadable review shape: the same merged-or-standalone fallback
+            # the worktree's required-skill gate applies
+            review_skills = (MERGED_REVIEW_SKILL,)
+        else:
+            review_skills = tuple(sorted(_REVIEW_LAYER_SKILLS))
+        required = (*((primitive,) if primitive is not None else ()), *review_skills)
+        for skill in dict.fromkeys(required):
+            skill_dir = tree_dir / skill
+            if not skill_dir.is_dir() or _confined_to(skill_dir, repo_root):
+                continue
+            target = _resolved_text(skill_dir)
+            findings.append(
+                Finding(
+                    TREE_OUTSIDE_CHECK,
+                    "problem",
+                    f"{tree}/{skill} resolves outside the repo ({target}) — worktree "
+                    f"isolation cannot seed a skill from outside the repo, so the isolated "
+                    f"session would stall on it; install it into the project (`npx skills "
+                    f'add` without -g) or set [scm] isolation = "none"',
+                    {"tree": tree, "skill": skill, "target": target, "isolation": isolation},
+                )
+            )
+    return findings
+
+
 # Bound on one `<binary> --version` probe for the hook-event version gate.
 CLI_VERSION_TIMEOUT_S = 10.0
 # Successful probes by resolved binary path and profile env: one launch per

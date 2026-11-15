@@ -1492,6 +1492,24 @@ def test_user_profile_overlay(tmp_path):
             MINIMAL_PROFILE.replace("[hooks]", 'parked_prompt_patterns = "Enter"\n[hooks]'),
             "parked_prompt_patterns must be a list of strings",
         ),
+        # a leading `~` is never expanded: each field resolves it to a literal
+        # `<project>/~/...` directory, so it is refused with its own message (#770)
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'skill_tree = "~/.agents/skills"\n[hooks]'),
+            "skill_tree must not start with '~': a leading '~' is not expanded",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                'config_path = ".mycli/settings.json"', 'config_path = "~/.mycli/settings.json"'
+            ),
+            "hooks.config_path must not start with '~': a leading '~' is not expanded",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                "[hooks]", 'seed_files = [".mcp.json", "~/.mcp.json"]\n[hooks]'
+            ),
+            "seed_files entries must not start with '~': a leading '~' is not expanded",
+        ),
     ],
 )
 def test_invalid_profiles_rejected(tmp_path, mutation, match):
@@ -1906,6 +1924,13 @@ def test_profile_scan_failure_degrades(profile_scan):
         ({"seed_files": ("/etc/passwd",)}, "seed_files"),
         ({"seed_files": (".",)}, "seed_files"),
         ({"hooks": HookSpec("claude-settings-json", "..", {"Stop": "Stop"})}, "relative"),
+        # a leading `~` is not expanded (#770)
+        ({"skill_tree": "~/.agents/skills"}, "skill_tree must not start with '~'"),
+        ({"seed_files": ("~/.mcp.json",)}, "seed_files entries must not start with '~'"),
+        (
+            {"hooks": HookSpec("claude-settings-json", "~\\.m\\s.json", {"Stop": "Stop"})},
+            "hooks.config_path must not start with '~'",
+        ),
         # a real dialect with nothing to write to
         ({"hooks": HookSpec("claude-settings-json", "", {"Stop": "Stop"})}, "config_path"),
         # hookless carrying hook plumbing is a contradiction either way in

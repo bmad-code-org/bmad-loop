@@ -215,6 +215,21 @@ def test_names_win32_alias_leaves_the_root_and_parent_spellings_to_its_siblings(
     assert platform_util.names_win32_alias(value) is False
 
 
+@pytest.mark.parametrize(
+    "value", ["~", "~/.agents/skills", "~\\.agents\\skills", "~user/skills", "~/", "~x"]
+)
+def test_names_home_ref_catches_home_spellings(value):
+    # Nothing expands `~`: every row resolves to a literal `<project>/~...` dir.
+    assert platform_util.names_home_ref(value) is True
+
+
+@pytest.mark.parametrize("value", ["PROGRA~1/x", "a/~b", ".claude/skills", "skills~", "x\\~y", ""])
+def test_names_home_ref_accepts_tilde_mid_name(value):
+    # Only the FIRST component counts: a Win32 short name or a `~` deeper in the
+    # path is an ordinary name.
+    assert platform_util.names_home_ref(value) is False
+
+
 # --------------------------------------------------------------- is_wsl_unc_path
 
 

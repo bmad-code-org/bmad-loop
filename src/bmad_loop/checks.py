@@ -130,6 +130,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.base-missing",
         "skills.base-incomplete",
         "skills.base-shim",
+        # a skill tree (or a required skill in one) linked out of the project/repo
+        "skills.tree-outside",
         "skills.customize-legacy",
         "skills.dev-renderer",
         "skills.dev-renderer-config",

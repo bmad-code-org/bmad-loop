@@ -16448,6 +16448,68 @@ def test_require_base_skills_unresolved_primitive_still_refuses(tmp_path, capsys
     assert "dispatch" not in err
 
 
+def test_validate_and_preflight_refuse_a_skill_linked_out_of_the_repo_under_worktree(
+    project, capsys, monkeypatch, tmp_path
+):
+    """The dev primitive linked to a shared install outside the repo: in place it
+    loads through the link, but worktree seeding skips it and used to escalate the
+    unit mid-run. validate and the run-start preflight now refuse it alike.
+
+    Ablation: drop the validate call to `install.skill_trees_outside` and validate
+    exits 0 (this is its only problem); drop the preflight call and
+    `_require_base_skills` returns True."""
+    from bmad_loop.install import DEV_PRIMITIVE_LEGACY
+
+    tree = ".claude/skills"
+    shared = tmp_path / "shared" / DEV_PRIMITIVE_LEGACY
+
+    def skills(root):
+        # Lay the primitive down, then move it out of the project before the
+        # fixture commits: nothing tracked sits where the link will go.
+        install_dev_base_skills(root, tree, folder_id=True)
+        shared.parent.mkdir(parents=True)
+        shutil.move(str(root / tree / DEV_PRIMITIVE_LEGACY), str(shared))
+
+    _make_validate_pass(
+        project,
+        monkeypatch,
+        capsys,
+        policy=CLAUDE_ONLY_POLICY + '\n[scm]\nisolation = "worktree"\n',
+        skills=skills,
+    )
+    link = project.project / tree / DEV_PRIMITIVE_LEGACY
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module; never os.symlink there
+
+        _winapi.CreateJunction(str(shared), str(link))
+    else:
+        link.symlink_to(shared, target_is_directory=True)
+    with (project.project / ".git" / "info" / "exclude").open("a", encoding="utf-8") as fh:
+        fh.write(f"/{tree}/{DEV_PRIMITIVE_LEGACY}\n")
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+
+    outside = [f for f in doc["findings"] if f["check"] == "skills.tree-outside"]
+    assert [(f["severity"], f["detail"]) for f in outside] == [
+        (
+            "problem",
+            {
+                "tree": tree,
+                "skill": DEV_PRIMITIVE_LEGACY,
+                "target": str(shared.resolve()),
+                "isolation": "worktree",
+            },
+        )
+    ]
+    assert doc["ok"] is False
+
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    assert (
+        cli._require_base_skills(project.project, pol, project.project, GrantSet.empty()) is False
+    )
+    assert f"{tree}/{DEV_PRIMITIVE_LEGACY} resolves outside the repo" in capsys.readouterr().err
+
+
 def test_validate_json_tickets_mode_document(project, capsys, monkeypatch):
     """A tickets project bmad-loop can drive validates ok: `mode` is `tickets`, the
     document names the active initiative and the v7 era, and the tickets checks ran

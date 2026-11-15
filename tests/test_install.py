@@ -12,6 +12,7 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from unittest import mock
 
 import pytest
 from conftest import (
@@ -37,6 +38,7 @@ import bmad_loop.install as install_mod
 import bmad_loop.worktree_flow as worktree_flow_mod
 from bmad_loop import verify
 from bmad_loop.adapters.profile import ProfileError, get_profile
+from bmad_loop.checks import Finding
 from bmad_loop.install import (
     BASE_SKILLS,
     BMAD_DIR,
@@ -11444,6 +11446,127 @@ def test_base_skills_seed_incomplete_ignores_inactive_catalog_symlink(tmp_path):
 
     assert not (wt / tree / obsolete).exists()
     assert base_skills_seed_incomplete(wt, repo, [tree]) == []
+
+
+def _link_dir(link, target):
+    """A directory link at ``link``: a junction on win32 (never ``os.symlink`` there —
+    it needs a privilege CI does not have), a symlink elsewhere."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        import _winapi  # Windows-only stdlib module
+
+        _winapi.CreateJunction(str(target), str(link))
+    elif hasattr(os, "symlink"):
+        link.symlink_to(target, target_is_directory=True)
+    else:
+        pytest.skip("no directory link primitive on this platform")
+
+
+def _global_tree_link(tmp_path):
+    """``repo/.agents/skills`` linked to a complete global install outside the repo —
+    the #770 junction workaround. Returns ``(repo, tree, target)``."""
+    repo, tree = tmp_path / "repo", ".agents/skills"
+    home_tree = tmp_path / "home" / ".agents" / "skills"
+    _install_dev_auto(
+        tmp_path / "home",
+        ".agents/skills",
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    _install_skills(tmp_path / "home", ".agents/skills", {"bmad-review": ()})
+    repo.mkdir()
+    _link_dir(repo / tree, home_tree)
+    return repo, tree, str(home_tree.resolve())
+
+
+def test_skill_tree_outside_tree_link_warns_without_worktree(tmp_path):
+    """In place, the session reads straight through the link, so it only warns —
+    `init` is what refuses to write through it."""
+    repo, tree, target = _global_tree_link(tmp_path)
+
+    assert install_mod.skill_trees_outside(repo, repo, [tree], isolation="none") == [
+        Finding(
+            "skills.tree-outside",
+            "warning",
+            mock.ANY,
+            {"tree": tree, "target": target, "isolation": "none"},
+        )
+    ]
+
+
+def test_skill_tree_outside_tree_link_problem_under_worktree(tmp_path):
+    """Worktree seeding cannot copy one skill out of a tree linked out of the repo:
+    one problem for the tree, and its skill-level links are not repeated."""
+    repo, tree, target = _global_tree_link(tmp_path)
+
+    findings = install_mod.skill_trees_outside(repo, repo, [tree], isolation="worktree")
+
+    assert findings == [
+        Finding(
+            "skills.tree-outside",
+            "problem",
+            mock.ANY,
+            {"tree": tree, "target": target, "isolation": "worktree"},
+        )
+    ]
+    assert "worktree isolation" in findings[0].message
+
+
+def test_skill_tree_outside_skill_link_only_under_worktree(tmp_path):
+    """A required reviewer linked to a shared install: invisible in place, and under
+    worktree isolation the preflight refusal that replaces the mid-run escalation.
+    The inactive catalog link beside it is not required, so it is not reported."""
+    repo, tree = tmp_path / "repo", ".claude/skills"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    for skill in ("bmad-review", "bmad-review-edge-case-hunter"):
+        _install_skills(tmp_path / "shared", "skills", {skill: ()})
+        _link_dir(repo / tree / skill, tmp_path / "shared" / "skills" / skill)
+
+    assert install_mod.skill_trees_outside(repo, repo, [tree], isolation="none") == []
+    assert install_mod.skill_trees_outside(repo, repo, [tree], isolation="worktree") == [
+        Finding(
+            "skills.tree-outside",
+            "problem",
+            mock.ANY,
+            {
+                "tree": tree,
+                "skill": "bmad-review",
+                "target": str((tmp_path / "shared" / "skills" / "bmad-review").resolve()),
+                "isolation": "worktree",
+            },
+        )
+    ]
+
+
+def test_skill_tree_outside_ignores_in_repo_link(tmp_path):
+    """The `skills` CLI's own layout — `.claude/skills` linked to `.agents/skills` —
+    stays inside the repo, so neither the tree nor its skills are reported, even
+    under worktree isolation.
+
+    Ablation: make either `_confined_to` comparison in `skill_trees_outside` always
+    False and this reddens."""
+    repo = tmp_path / "repo"
+    _install_dev_auto(
+        repo,
+        ".agents/skills",
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n" + _layer("blind", "bmad-review"),
+    )
+    _install_skills(repo, ".agents/skills", {"bmad-review": ()})
+    _link_dir(repo / ".claude" / "skills", repo / ".agents" / "skills")
+
+    for isolation in ("none", "worktree"):
+        assert (
+            install_mod.skill_trees_outside(
+                repo, repo, [".claude/skills", ".agents/skills"], isolation=isolation
+            )
+            == []
+        )
 
 
 @pytest.mark.parametrize(
