@@ -1182,6 +1182,30 @@ def test_render_prompt_passthrough_and_template():
     assert claude.render_prompt("just do it") == "just do it"
 
 
+def test_render_prompt_skill_dir_default_is_the_pre_placeholder_text():
+    """copilot's `{skill_dir}` defaults to `<skill_tree>/<skill>`, so a spec with no
+    located folder renders byte-identically to the pre-placeholder template —
+    including the `.agents/skills//SKILL.md` spelling of a slashless prompt — and
+    a given `skill_dir` substitutes. Ablation: default `skill_dir` to `""` (or drop
+    the default) and the byte-identity rows FAIL."""
+    copilot = get_profile("copilot")
+    tail = (
+        ", read its entire contents and follow its directions exactly, using subagents as needed: "
+    )
+    assert copilot.render_prompt("/bmad-dev-auto 1-1-a") == (
+        f"LOAD the FULL .agents/skills/bmad-dev-auto/SKILL.md{tail}1-1-a"
+    )
+    assert copilot.render_prompt("just do it") == (
+        f"LOAD the FULL .agents/skills//SKILL.md{tail}just do it"
+    )
+    assert copilot.render_prompt("/bmad-dev-auto 1-1-a", skill_dir="/home/u/.agents/skills/x") == (
+        f"LOAD the FULL /home/u/.agents/skills/x/SKILL.md{tail}1-1-a"
+    )
+    # a template without the placeholder ignores it
+    claude = get_profile("claude")
+    assert claude.render_prompt("/bmad-dev-auto 1-1-a", skill_dir="/x") == "/bmad-dev-auto 1-1-a"
+
+
 _BYPASS = ("--permission-mode", "bypassPermissions")
 
 

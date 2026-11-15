@@ -1095,6 +1095,9 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         # `ts`-shaped float the TUI ages the `· idle <age>` text from.
         "since_ts",
         "site",
+        # `skill-user-root` (#770): a plain skill id, bound by
+        # `install._SKILL_ID_RE` — never a path or free text.
+        "skill",
         "skip",
         "spec_folder",
         # DW-522: whether `story-reverify-armed` copied the stashed spec back (a
@@ -1174,6 +1177,8 @@ JOURNAL_BENIGN_FIELDS = frozenset(
         "models_unresolved",
         "verification_sequence",
         "verification_stage",
+        # `skill-user-root` (#770): a module record's `[bmod] version` string.
+        "version",
         "via",
         # `session-start-missing`: whole seconds the session had run without a
         # SessionStart when the notice fired — a measured integer.
@@ -1797,6 +1802,11 @@ JOURNAL_KINDS = frozenset(
         "session-rescued-post-kill",
         "session-start",
         "session-synthesized-from-frontmatter",
+        # `[skills] user_roots` (#770): one row per module skill a session's CLI
+        # loads from a user root — `task_id`, `role`, `skill` (a plain skill id),
+        # `root` (the root's `~/` spelling, dropped) and `version` (its module
+        # record's `[bmod] version`).
+        "skill-user-root",
         "spec-deferral-sighting-stale",
         "spec-deferrals-harvested",
         "spec-deferrals-malformed",

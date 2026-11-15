@@ -32,6 +32,7 @@ from . import (
     envvars,
     gates,
     operatoractions,
+    skill_locate,
     ticketstore,
     verify,
 )
@@ -65,7 +66,7 @@ from .escalation import (
     usage_relaunch,
 )
 from .frontmatter import FrontmatterWriteError
-from .install import dev_primitive_or_default
+from .install import dev_primitive_or_default, module_record_version, user_root_skill_ids
 from .journal import SELF_MINTED_FIELDS, Journal, save_state
 from .model import (
     ENV_FAULT_SITE_DISPATCH_PREFIX,
@@ -1077,12 +1078,12 @@ class Engine:
         self._graceful_stopped = False
         self._graceful_remaining: int | None = None
         # dev-primitive name resolved from disk, memoized per (workspace project
-        # root, skill tree) — see _dev_skill. By tree because one run can mix them
-        # (dev=claude reads .claude/skills, review=codex reads .agents/skills), with
-        # None for an adapter that carries no profile at all; by project root
+        # root, skill scope) — see _dev_skill. By scope because one run can mix
+        # them (dev=claude reads .claude/skills, review=codex reads .agents/skills),
+        # with None for an adapter that carries no profile at all; by project root
         # because under isolation each unit resolves against its OWN worktree and
         # one Engine drives every unit of a run.
-        self._dev_skill_cache: dict[tuple[Path, str | None], str] = {}
+        self._dev_skill_cache: dict[tuple[Path, skill_locate.SkillScope | None], str] = {}
         # story_key -> the highest `verify-command-result` sequence allocated so
         # far. None until the first verify pass seeds it from the journal — see
         # _next_verification_sequence, which owns the whole invariant.
@@ -5579,10 +5580,12 @@ class Engine:
         either era. This is NOT ``policy.dev.skill`` — that stays the adapter
         discriminator ``_generic_dev`` reads; only the spelled name moves.
 
-        Resolution is per skill tree because one run can mix them (dev=claude →
-        ``.claude/skills``, review=codex → ``.agents/skills``), and memoized
-        because every prompt build would otherwise re-stat the tree. An adapter
-        with no ``profile`` (test fakes) yields tree None, which
+        Resolution is per skill scope (:meth:`_skill_scope`) because one run can
+        mix them (dev=claude → ``.claude/skills``, review=codex →
+        ``.agents/skills``), and memoized because every prompt build would
+        otherwise re-stat the tree. Under ``[skills] user_roots`` a primitive
+        installed only in a user root the CLI loads resolves too. An adapter with
+        no ``profile`` (test fakes) yields scope None, which
         ``dev_primitive_or_default`` maps to the legacy name.
 
         Resolved against the WORKSPACE, never the main checkout: the session runs
@@ -5596,12 +5599,21 @@ class Engine:
         The cache is keyed on the workspace root for the same reason: one Engine
         drives every unit of a run, so a resumed unit's worktree must not answer
         for the fresh worktrees mounted after it."""
-        adapter = self.adapters.get(role)
-        tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
+        scope = self._skill_scope(role)
         project = self.workspace.paths.project
-        if (project, tree) not in self._dev_skill_cache:
-            self._dev_skill_cache[project, tree] = dev_primitive_or_default(project, tree)
-        return self._dev_skill_cache[project, tree]
+        if (project, scope) not in self._dev_skill_cache:
+            self._dev_skill_cache[project, scope] = dev_primitive_or_default(project, scope)
+        return self._dev_skill_cache[project, scope]
+
+    def _skill_scope(self, role: str) -> skill_locate.SkillScope | None:
+        """The skill scope ``role``'s sessions load skills from: its profile's
+        primary and extra trees, plus the profile's declared user roots — resolved
+        only under ``[skills] user_roots`` (#770). None for an adapter with no
+        ``profile`` (test fakes), which every caller reads as "nothing to locate"."""
+        profile = getattr(self.adapters.get(role), "profile", None)
+        if profile is None:
+            return None
+        return skill_locate.scope_for(profile, resolve_user=self.policy.skills.user_roots)
 
     def _operator_park_enabled(self) -> bool:
         """Whether a dev session may park a story at ``awaiting-operator`` (#335).
@@ -9551,6 +9563,28 @@ class Engine:
             self._commit_engine_ledger(task, site=role)
         if prelaunch_validator is not None:
             prelaunch_validator()
+        # Where the final prompt's skill lives (#770), read off the post-gate text
+        # like `expected_spec` below so a plugin rewrite cannot desynchronize them:
+        # the `{skill_dir}` a profile template spells, and — only under
+        # `[skills] user_roots` — the module skill ids the CLI loads from a user
+        # root, each journaled so the run records which skills came from outside
+        # the project.
+        skill_dir: str | None = None
+        user_skill_ids: tuple[str, ...] = ()
+        user_skill_rows: list[tuple[str, str, str | None]] = []
+        scope = self._skill_scope(role)
+        if scope is not None:
+            project = self.workspace.paths.project
+            skill_dir = skill_locate.prompt_skill_dir(project, scope, prompt)
+            if scope.resolve_user:
+                prompt_skill, _ = skill_locate.prompt_skill(prompt)
+                user_skill_ids = user_root_skill_ids(project, scope, prompt_skill)
+                for skill in user_skill_ids:
+                    found = skill_locate.locate(project, scope, skill)
+                    if found is not None:
+                        user_skill_rows.append(
+                            (skill, found.root, module_record_version(found.path.parent, skill))
+                        )
         spec = SessionSpec(
             task_id=task_id,
             role=role,
@@ -9623,8 +9657,19 @@ class Engine:
             # the v6 defaults (`done`, none) for every base and stories session.
             success_statuses=self._session_success_statuses(role, label),
             fallback_result_dirs=self._session_fallback_dirs(role, label),
+            skill_dir=skill_dir,
+            user_skill_ids=user_skill_ids,
         )
         self.journal.set_active_log(task_id)
+        for skill, root, version in user_skill_rows:
+            self.journal.append(
+                "skill-user-root",
+                task_id=task_id,
+                role=role,
+                skill=skill,
+                root=root,
+                version=version,
+            )
         self.journal.append(
             "session-start",
             task_id=task_id,
@@ -12611,9 +12656,13 @@ class Engine:
         if not clean:
             self._skip_auto_retro(epic, "dirty")
             return
-        adapter = self.adapters["retro"]
-        tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
-        if tree and not (self.workspace.paths.project / tree / RETRO_SKILL / "SKILL.md").is_file():
+        # The copy the retro CLI loads (#770): a user-root install counts under
+        # `[skills] user_roots`; an adapter with no profile is not probed.
+        scope = self._skill_scope("retro")
+        if (
+            scope is not None
+            and skill_locate.locate(self.workspace.paths.project, scope, RETRO_SKILL) is None
+        ):
             self._skip_auto_retro(epic, "skill-missing")
             return
 

@@ -2643,6 +2643,23 @@ def user_root_skill_ids(project: Path, scope: SkillTree, prompt_skill: str = "")
     return tuple(kept)
 
 
+def module_record_version(root: Path, skill: str) -> str | None:
+    """``[bmod] version`` of the first ``bmod-*/bmod.toml`` in ``root`` whose
+    ``[bmod] skills`` lists ``skill``, or None (no record names it, or it carries
+    no version). Display only: the run journals it beside each user-root skill."""
+    try:
+        manifests = sorted(root.glob("bmod-*/bmod.toml"))
+    except OSError:
+        return None
+    for manifest in manifests:
+        data = _read_toml(manifest)
+        bmod = data.get("bmod") if data is not None else None
+        listed = bmod.get("skills") if isinstance(bmod, dict) else None
+        if isinstance(listed, list) and skill in listed:
+            return _bmod_version(manifest)
+    return None
+
+
 def skill_root_findings(project: Path, scopes: Iterable[SkillTree]) -> list[Finding]:
     """``skills.root`` ok lines: where each skill the run drives (the dev primitive
     and its review skills) resolved, per scope. Validate-only — never part of

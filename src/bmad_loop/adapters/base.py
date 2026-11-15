@@ -261,6 +261,16 @@ class SessionSpec:
     # Appended after `quota_wait_max_s` so positional constructions stay valid.
     usage_relaunch_mode: bool = False
     usage_relaunch_left: bool = False
+    # Where the prompt's skill was located (`skill_locate.prompt_skill_dir`), for
+    # the profile's `{skill_dir}` placeholder: None for a primary-tree hit, a miss
+    # or a prompt naming no skill (the renderer then spells `<skill_tree>/<skill>`),
+    # `<extra_tree>/<skill>` for an extra project tree, or the absolute folder for
+    # a user-root hit. `user_skill_ids`: the BMAD module skill ids this session's
+    # CLI loads from a user root (`install.user_root_skill_ids`), empty unless
+    # `[skills] user_roots` is on. Both set by the engine only; appended LAST so
+    # positional constructions stay valid.
+    skill_dir: str | None = None
+    user_skill_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

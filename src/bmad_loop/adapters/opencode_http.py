@@ -929,7 +929,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             if not sess.sse_connected.wait(timeout=self.health_timeout_s):
                 raise OpencodeServerError("event stream did not connect")
 
-            self._prompt(sess, self.profile.render_prompt(spec.prompt))
+            self._prompt(sess, self.profile.render_prompt(spec.prompt, skill_dir=spec.skill_dir))
         except Exception:
             self._sessions.pop(spec.task_id, None)
             self._teardown(sess)

@@ -58,6 +58,7 @@ from bmad_loop.policy import (
     Policy,
     ReviewPolicy,
     ScmPolicy,
+    SkillsPolicy,
     TicketsPolicy,
     VerifyPolicy,
 )
@@ -3302,6 +3303,47 @@ def test_ticket_retro_happy_path_commits_doc_only(project_v7):
         "epic-closure",
         PAUSE_EPIC_BOUNDARY,
     )
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_ticket_retro_skill_probe_reads_user_roots_only_with_the_switch_on(
+    project_v7, monkeypatch, tmp_path, on
+):
+    """The retro CLI's `bmad-retrospective` installed only in its user root
+    (`~/.claude/skills` for claude) passes the probe under `[skills] user_roots`
+    and the retro session runs; off, the probe reads the project tree alone and
+    skips as `skill-missing`. Ablation: restore the project-tree-only probe in
+    `_ticket_epic_retro` and the switch-on row FAILS."""
+    from conftest import attach_profile
+
+    from bmad_loop import skill_locate
+
+    home = tmp_path / "home"
+    skill = home / ".claude" / "skills" / "bmad-retrospective" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bmad-retrospective\n---\n", encoding="utf-8")
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(skills=SkillsPolicy(user_roots=on)),
+        script=[_builds_finishing(project_v7, tree, plan)],
+    )
+    retro = attach_profile(MockAdapter([_retro_writes(project_v7)]), "claude", project_v7.project)
+    engine.adapters["retro"] = retro
+
+    engine.run()
+
+    if on:
+        assert len(retro.sessions) == 1
+        assert not _kinds(engine, "retro-auto-skipped")
+        assert load_state(engine.run_dir).ticket_epic_closures == {"epic-cart": "accepted"}
+    else:
+        assert retro.sessions == []
+        [skipped] = _kinds(engine, "retro-auto-skipped")
+        assert (skipped["reason"], skipped["epic_ref"]) == ("skill-missing", "epic-cart")
 
 
 def test_ticket_retro_verdict_rejected_hard_gates_until_epic_done(project_v7):

@@ -467,14 +467,21 @@ class CLIProfile:
             return self.subagent_transcript_dir
         return SUBAGENT_TRANSCRIPT_DIR_DEFAULTS.get(self.usage_parser, "")
 
-    def render_prompt(self, prompt: str) -> str:
+    def render_prompt(self, prompt: str, *, skill_dir: str | None = None) -> str:
         """Render the engine's canonical "/skill args" prompt for this CLI.
 
         Placeholders: {prompt} = the canonical string, {skill} = the leading
-        slash-command name without "/", {args} = everything after it.
+        slash-command name without "/", {args} = everything after it, {skill_dir}
+        = the folder holding the skill's SKILL.md — ``skill_dir`` when the engine
+        located it outside the primary tree (an extra tree, or the absolute folder
+        in a user root), else ``<skill_tree>/<skill>``.
         """
         skill, args = prompt_skill(prompt)
-        return self.prompt_template.format(prompt=prompt, skill=skill, args=args)
+        if skill_dir is None:
+            skill_dir = f"{self.skill_tree}/{skill}"
+        return self.prompt_template.format(
+            prompt=prompt, skill=skill, args=args, skill_dir=skill_dir
+        )
 
     def for_permission_mode(self, mode: str, platform: str = sys.platform) -> CLIProfile:
         """This profile with ``bypass_args`` set to ``mode``'s launch args.
