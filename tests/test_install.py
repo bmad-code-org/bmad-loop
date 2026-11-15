@@ -12804,10 +12804,12 @@ _ALL_LENSES_OFF = (
 
 
 def test_v7_all_lenses_disabled_is_reported(tmp_path):
-    """Every lens disabled while a review is selected leaves the run nothing to
-    launch. Ablation: drop the lens branch's empty check and this goes green."""
+    """Every lens disabled under `auto` leaves the run nothing to launch on either
+    route. Ablation: drop the lens branch's empty check and this goes green."""
     tree = _lens_tree(tmp_path)
-    _write_override(tmp_path, _ALL_LENSES_OFF, skill=DEV_PRIMITIVE_NEW)
+    _write_override(
+        tmp_path, '[workflow]\nreview = "auto"\n' + _ALL_LENSES_OFF, skill=DEV_PRIMITIVE_NEW
+    )
 
     problems = missing_base_skills(tmp_path, [tree])
 
@@ -12815,6 +12817,73 @@ def test_v7_all_lenses_disabled_is_reported(tmp_path):
     assert problems[0].severity == "problem"
     assert "[[workflow.quick_lenses]]" in problems[0].message
     assert "[[workflow.thorough_lenses]]" in problems[0].message
+
+
+@pytest.mark.parametrize(
+    ("selection", "disabled", "empty_table"),
+    [
+        ("quick", '[[workflow.quick_lenses]]\nid = "quick"\ninstruction = ""\n', "quick_lenses"),
+        (
+            "thorough",
+            '[[workflow.thorough_lenses]]\nid = "blind-hunter"\ninstruction = ""\n'
+            '[[workflow.thorough_lenses]]\nid = "edge-case-hunter"\ninstruction = ""\n',
+            "thorough_lenses",
+        ),
+    ],
+)
+def test_v7_selected_lens_set_disabled_is_reported(tmp_path, selection, disabled, empty_table):
+    """`quick`/`thorough` launch only their own set, so an enabled lens in the OTHER
+    set cannot serve the run. Ablation: check the combined active lenses instead of
+    the selected set and this goes green."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path, f'[workflow]\nreview = "{selection}"\n' + disabled, skill=DEV_PRIMITIVE_NEW
+    )
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-layers-empty"]
+    assert f"[[workflow.{empty_table}]]" in problems[0].message
+    # the set that cannot run is not offered as the culprit
+    other = "thorough_lenses" if empty_table == "quick_lenses" else "quick_lenses"
+    assert other not in problems[0].message
+
+
+def test_v7_auto_selection_needs_one_enabled_set(tmp_path):
+    """`auto` may route to either set, so one disabled set is not a HALT."""
+    tree = _lens_tree(tmp_path)
+    _write_override(
+        tmp_path,
+        '[workflow]\nreview = "auto"\n[[workflow.quick_lenses]]\nid = "quick"\ninstruction = ""\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    assert missing_base_skills(tmp_path, [tree]) == []
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None and resolved.active_sets == ("thorough",)
+
+
+@pytest.mark.parametrize("key", ["id", "code"])
+def test_v7_lens_override_with_unhashable_key_is_reported_not_raised(tmp_path, key):
+    """A list- or table-valued merge key cannot index the keyed merge; the preflight
+    reports the override as unreadable instead of crashing with TypeError, and the
+    file is left out whole. Ablation: drop the `_MalformedMergeKey` guard and this
+    raises TypeError out of missing_base_skills."""
+    tree = _lens_tree(tmp_path)
+    shipped = LENS_CUSTOMIZE if key == "id" else LENS_CUSTOMIZE.replace("\nid = ", "\ncode = ")
+    _lens_tree(tmp_path, shipped)
+    _write_override(
+        tmp_path,
+        f'[[workflow.quick_lenses]]\n{key} = ["quick"]\ninstruction = ""\n',
+        skill=DEV_PRIMITIVE_NEW,
+    )
+
+    findings = missing_base_skills(tmp_path, [tree])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.customize-unreadable", "warning")]
+    resolved = resolve_review_layers(tmp_path, tree)
+    assert resolved is not None
+    assert "quick" in resolved.active_sets
 
 
 def test_v7_all_lenses_disabled_with_review_none_is_clean(tmp_path):

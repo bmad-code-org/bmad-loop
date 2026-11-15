@@ -166,10 +166,11 @@ reviewers that copy will actually invoke — which on current sources is none at
   sets, because `auto`, an invocation's `--set workflow.review=…` and bmad-loop's own
   `[tickets] thorough_review` can each select either one. The shipped lenses invoke no
   skill, so a v7 tree requires no review skill. Any other `review` value is
-  `skills.review-selection-invalid`, because the primitive HALTs every run on it. With
-  every lens disabled and `review` not set to `none`, `validate` reports
-  `skills.review-layers-empty`. A `review_layers` override left over from a v6
-  install is ignored, as the v7 run ignores it.
+  `skills.review-selection-invalid`, because the primitive HALTs every run on it.
+  `validate` reports `skills.review-layers-empty` when the configured set has no
+  enabled lens: the `quick` or `thorough` set itself, or both sets under `auto`. A
+  `review = "none"` run launches no lens, so empty sets pass. A `review_layers`
+  override left over from a v6 install is ignored, as the v7 run ignores it.
 - **Layer-driven (post-6.10.0)** — `customize.toml` defines
   `[[workflow.review_layers]]`, and a layer's `instruction` may name a skill to hand
   off to. Current (6.11) sources define four layers — `blind-hunter`,

@@ -427,10 +427,12 @@ class ReviewResolution(NamedTuple):
     that failed to parse.
 
     ``lens_sets`` names the v7 lens sets read (``("quick", "thorough")``), and is
-    empty for every other shape; ``active_layers`` then spans both sets.
-    ``selection`` is the resolved ``workflow.review`` string of that shape, or None
-    when no string value is configured. Both trail with defaults so every positional
-    construction of the older shapes stays valid.
+    empty for every other shape; ``active_layers`` then spans both sets, and
+    ``active_sets`` names the sets holding at least one enabled lens — a ``quick`` or
+    ``thorough`` selection launches only its own set. ``selection`` is the resolved
+    ``workflow.review`` string of that shape, or None when no string value is
+    configured. All three trail with defaults so every positional construction of
+    the older shapes stays valid.
     """
 
     source: str
@@ -441,6 +443,7 @@ class ReviewResolution(NamedTuple):
     unreadable: tuple[str, ...]
     lens_sets: tuple[str, ...] = ()
     selection: str | None = None
+    active_sets: tuple[str, ...] = ()
 
     def skills(self) -> tuple[str, ...]:
         """Every skill this review step may invoke, required or advisory."""
@@ -505,6 +508,12 @@ def _review_selection_of(data: Any) -> str | None:
 _KEYED_MERGE_FIELDS = ("code", "id")
 
 
+class _MalformedMergeKey(ValueError):
+    """An array of tables keys on a value that cannot identify an entry (a TOML
+    array or table, e.g. ``id = ["quick"]``) — BMAD v7's resolver rejects the whole
+    customization on it rather than merging."""
+
+
 def _keyed_merge_field(items: list[Any]) -> str | None:
     """The key an array of tables merges on, or None to append.
 
@@ -530,10 +539,16 @@ def _merge_layer_arrays(base: list[Any], override: list[Any]) -> list[Any]:
     `src/scripts/resolve_customization.py`: keyed merge when the combined array
     opts into one (matching keys replace in place, new keys append), plain
     concatenation otherwise.
+
+    Raises :class:`_MalformedMergeKey` when the chosen key holds an array or table:
+    it cannot index the merge, and a bare ``TypeError`` would crash the preflight.
     """
     key = _keyed_merge_field(base + override)
     if key is None:
         return base + override
+    for item in base + override:
+        if isinstance(item[key], (list, dict)):
+            raise _MalformedMergeKey(f"`{key}` = {item[key]!r} is not a valid array-entry key")
     result: list[Any] = []
     index_by_key: dict[Any, int] = {}
     for item in base:
@@ -611,9 +626,18 @@ def _merged_review_layers(project: Path, tree: str, skill: str) -> _MergedReview
         if extra is None:
             unreadable.append(rel.as_posix())
             continue
-        layers = _merge_layer_arrays(layers, _layers_of(extra))
-        for name, lenses in _lens_sets_of(extra).items():
-            lens_sets[name] = _merge_layer_arrays(lens_sets.get(name, []), lenses)
+        try:
+            merged_layers = _merge_layer_arrays(layers, _layers_of(extra))
+            merged_sets = {
+                name: _merge_layer_arrays(lens_sets.get(name, []), lenses)
+                for name, lenses in _lens_sets_of(extra).items()
+            }
+        except _MalformedMergeKey:
+            # reported with the unparseable overrides; the file is left out whole
+            unreadable.append(rel.as_posix())
+            continue
+        layers = merged_layers
+        lens_sets.update(merged_sets)
         override_selection = _review_selection_of(extra)
         if override_selection is not None:
             selection = override_selection
@@ -713,9 +737,13 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
         required: dict[str, list[str]] = {}
         advisory: dict[str, list[str]] = {}
         active: list[str] = []
+        active_sets: list[str] = []
         if merged.lens_shape:
             for name, lenses in merged.lens_sets.items():
+                before = len(active)
                 _collect_layer_skills(lenses, required, advisory, active, name)
+                if len(active) > before:
+                    active_sets.append(name)
         else:
             _collect_layer_skills(merged.layers, required, advisory, active)
         return ReviewResolution(
@@ -728,6 +756,7 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
             unreadable,
             tuple(merged.lens_sets) if merged.lens_shape else (),
             merged.selection if merged.lens_shape else None,
+            tuple(active_sets),
         )
     try:
         step04 = (project / tree / primitive / "step-04-review.md").read_text(encoding="utf-8")
@@ -2129,9 +2158,10 @@ def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> l
             Finding(
                 "skills.customize-unreadable",
                 "warning",
-                f"{rel} could not be parsed as TOML — the run's resolver skips a broken "
-                f"override layer, so this project's review layers resolve without it; "
-                f"fix the file or remove it",
+                f"{rel} could not be read as a customize override (invalid TOML, or an "
+                f"array entry whose `id`/`code` is an array or table) — this project's "
+                f"review layers resolve without it here, and BMAD v7's resolver rejects "
+                f"it outright; fix the file or remove it",
                 {"tree": tree, "file": rel},
             )
         )
@@ -2150,15 +2180,25 @@ def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> l
             )
         )
     if resolved.lens_sets:
-        # an unset selection is left to the run: whether it HALTs is undecidable here
-        if not resolved.active_layers and selection is not None and selection != "none":
-            tables = " / ".join(f"[[workflow.{LENS_SETS[n]}]]" for n in resolved.lens_sets)
+        # `quick`/`thorough` launch only their own set, so an enabled lens in the other
+        # one cannot serve the run; `auto` may route to either, so it needs just one.
+        # An unset selection is left to the run: whether it HALTs is undecidable here.
+        if selection in LENS_SETS:
+            checked: tuple[str, ...] = (selection,)
+        else:
+            checked = resolved.lens_sets
+        if (
+            selection is not None
+            and selection != "none"
+            and not any(name in resolved.active_sets for name in checked)
+        ):
+            tables = " / ".join(f"[[workflow.{LENS_SETS[n]}]]" for n in checked)
             findings.append(
                 Finding(
                     "skills.review-layers-empty",
                     "problem",
                     f"{tree}/{primitive} has no enabled review lens (every `instruction` "
-                    f"in {tables} is empty) while workflow.review is "
+                    f"in {tables} is empty or absent) while workflow.review is "
                     f"{selection!r} — every dev run would HALT with no lens to launch; "
                     f're-enable a lens in {override_rel}, or set review = "none" there',
                     {"tree": tree, "source": resolved.source},

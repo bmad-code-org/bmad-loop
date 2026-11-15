@@ -194,7 +194,9 @@ breaking changes may land in a minor release.
 - Read BMAD v7's `quick_lenses`/`thorough_lenses` review sets in `validate` and the
   run preflight, so a v7 project is no longer required to install the deleted
   `bmad-review-adversarial-general` and `bmad-review-edge-case-hunter`. A `workflow.review`
-  value the dev skill would HALT on is reported as `skills.review-selection-invalid`.
+  value the dev skill would HALT on is reported as `skills.review-selection-invalid`,
+  and a `quick` or `thorough` selection whose own lens set is all disabled as
+  `skills.review-layers-empty`.
 - Report a missing dev primitive once, without stacking review-skill and dispatch
   failures under the legacy `bmad-dev-auto` name on top of it. Name core-tools as
   the v7 home of `bmad-review`, and note when a missing skill is installed only
