@@ -2276,8 +2276,9 @@ _PACKAGED_USER_SKILLS = {
 
 def test_packaged_profiles_declare_their_user_skill_roots():
     """Every shipped profile parses to exactly its documented `[user_skills]`
-    spec — order matters (it is the CLI's read order) — and none declares an
-    extra project skill tree."""
+    spec — order matters (it is the CLI's read order) — and only opencode-http
+    declares an extra project skill tree (`.agents/skills`, where the skills
+    CLI installs opencode's project skills)."""
     packaged = {
         tomllib.loads(entry.read_text(encoding="utf-8"))["name"]
         for entry in resources.files("bmad_loop.data").joinpath("profiles").iterdir()
@@ -2287,8 +2288,9 @@ def test_packaged_profiles_declare_their_user_skill_roots():
     assert packaged == set(_PACKAGED_USER_SKILLS)
     profiles = load_profiles()
     assert {name: profiles[name].user_skills for name in packaged} == _PACKAGED_USER_SKILLS
+    extra = {"opencode-http": (".agents/skills",)}
     for name in packaged:
-        assert profiles[name].extra_skill_trees == (), name
+        assert profiles[name].extra_skill_trees == extra.get(name, ()), name
 
 
 def test_user_skills_parses_string_and_table_roots(tmp_path):

@@ -2466,6 +2466,10 @@ JOURNAL_KINDS = frozenset(
         "worktree-opened",
         "worktree-seed-dropped",
         "worktree-seed-skipped",
+        # #770: required skills the seed gate exempted because they resolve from a
+        # user root; `entries` is benign (scrub_json), as on
+        # `worktree-module-skills-dropped`.
+        "worktree-skills-user-root",
         "worktree-teardown-degraded",
         # DW-390 workspace-trust seeding: `key` is benign, `path` and `reason`
         # are presence-only in `diagnostics._JOURNAL_DROP_FIELDS`.

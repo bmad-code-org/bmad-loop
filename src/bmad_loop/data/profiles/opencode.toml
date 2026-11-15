@@ -14,6 +14,10 @@ adapter = "opencode-http"
 prompt_template = "Use the {skill} skill now: {args}"
 usage_parser = "none"
 skill_tree = ".claude/skills"
+# The skills CLI (`npx skills add`) installs opencode's project skills into
+# .agents/skills, while bmad-loop init seeds .claude/skills: the session reads
+# both (V1 `skills.paths`, V2 `skills` plus an allow rule per id), primary first.
+extra_skill_trees = [".agents/skills"]
 first_run_note = "run `opencode auth login` once on this machine; headless servers reuse the stored credentials"
 
 # Transport/provider environment-fault classification (#194). Unlike the tmux

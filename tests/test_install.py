@@ -2957,6 +2957,60 @@ def test_provision_worktree_copies_base_skills_from_repo(tmp_path):
     assert (wt / claude.skill_tree / "bmad-dev-auto" / "step-04-review.md").is_file()
 
 
+def test_provision_worktree_copies_base_skills_from_the_extra_tree(tmp_path):
+    """opencode-http also reads `.agents/skills` (`extra_skill_trees`), where the
+    skills CLI installs its project skills: a repo carrying the upstream skills
+    only there gets them seeded into the same tree of the worktree, the gate is
+    satisfied, and the wheel's own MODULE_SKILLS stay in the primary tree."""
+    wt, repo = tmp_path / "wt", tmp_path / "repo"
+    opencode = get_profile("opencode-http")
+    (extra,) = opencode.extra_skill_trees
+    _install_base_skills(repo, extra)
+
+    skipped = provision_worktree(wt, [opencode], repo)
+
+    for skill in BASE_SKILLS:
+        assert (wt / extra / skill / "SKILL.md").is_file(), skill
+    assert not [rel for rel in skipped if rel.startswith(extra)]
+    assert (
+        base_skills_seed_incomplete(wt, repo, [_user_scope("opencode-http", None, on=False)]) == []
+    )
+    for skill in MODULE_SKILLS:
+        assert (wt / opencode.skill_tree / skill).is_dir()
+        assert not (wt / extra / skill).exists()
+
+
+def test_provision_worktree_never_copies_from_a_user_root(tmp_path, monkeypatch):
+    """Under `[skills] user_roots` a required skill located in the operator's home
+    is neither copied into the worktree nor reported missing by the seed gate —
+    the session loads it from the home in place — and `base_skills_user_rooted`
+    names it for the journal. With the switch off the same home is invisible.
+
+    Ablation: drop the user-root `continue` in `base_skills_seed_incomplete` and
+    the gate reports `~/.agents/skills/bmad-build-auto` (and its reviewers)."""
+    from bmad_loop import skill_locate
+    from bmad_loop.worktree_flow import base_skills_user_rooted
+
+    wt, repo, home = tmp_path / "wt", tmp_path / "repo", tmp_path / "home"
+    repo.mkdir()
+    _install_skills(home, ".agents/skills", _era_catalog(DEV_PRIMITIVE_NEW))
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    codex = get_profile("codex")
+
+    skipped = provision_worktree(wt, [codex], repo, user_roots=True)
+
+    assert not (wt / codex.skill_tree / DEV_PRIMITIVE_NEW).exists()
+    assert not [rel for rel in skipped if "~" in rel or DEV_PRIMITIVE_NEW in rel]
+    scope = _user_scope("codex", home, on=True)
+    assert base_skills_seed_incomplete(wt, repo, [scope]) == []
+    rooted = base_skills_user_rooted(repo, [scope])
+    assert f"~/.agents/skills/{DEV_PRIMITIVE_NEW}" in rooted
+    assert all(entry.startswith("~/.agents/skills/") for entry in rooted)
+    # plain trees and the switch off never resolve from the home
+    assert base_skills_user_rooted(repo, [codex.skill_tree]) == []
+    assert base_skills_user_rooted(repo, [_user_scope("codex", home, on=False)]) == []
+
+
 def test_floor_message_names_v7(tmp_path):
     """The base-skill floor text names both config eras: a v7 project gets its skills
     from the method module, so a v6-only floor would send its operator after bmm."""
@@ -5552,6 +5606,28 @@ def test_shield_tracked_dir_with_nothing_landed_drops_cleanly(project, tmp_path)
     assert git(repo, "ls-files", "-ci", "--exclude-standard") == ""
     assert f"/{tree}" not in exclude
     assert not [ln for ln in exclude if ln.startswith(f"/{tree}/")]
+
+
+def test_shield_covers_the_extra_skill_trees(project, tmp_path):
+    """opencode-http's extra project tree (`.agents/skills`) is shielded beside
+    its primary one, so the base skills seeded there never reach `git add -A`.
+
+    Ablation: build the shield from `p.skill_tree` alone and the extra-tree
+    pattern disappears."""
+    repo = project.project
+    opencode = get_profile("opencode-http")
+    (extra,) = opencode.extra_skill_trees
+    _install_base_skills(repo, extra)
+    wt = tmp_path / "wt"
+    verify.worktree_add(repo, wt, "feat", "main")
+
+    provision_worktree(wt, [opencode], repo)
+
+    exclude = _wt_private_exclude(wt).read_text(encoding="utf-8").splitlines()
+    assert f"/{opencode.skill_tree}" in exclude
+    assert f"/{extra}" in exclude
+    assert (wt / extra / DEV_PRIMITIVE_NEW / "SKILL.md").is_file()
+    assert git(wt, "status", "--porcelain", "--untracked-files=all", "--", extra) == ""
 
 
 def test_shield_untracked_skill_tree_keeps_dir_pattern_without_per_file_noise(project, tmp_path):

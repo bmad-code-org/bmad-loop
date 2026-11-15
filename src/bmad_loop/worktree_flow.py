@@ -37,6 +37,7 @@ from . import (
     codex_trust,
     deferredwork,
     gates,
+    skill_locate,
     sprintstatus,
     ticketstore,
     verify,
@@ -61,6 +62,7 @@ from .install import (
     RENDERER_SCRIPT_MARKER,
     RENDERER_SCRIPT_UNIT_REL,
     RENDERER_SEED_SENTINELS,
+    SkillTree,
     _absent_renderer_sources,
     _copy_traversable,
     _hook_command,
@@ -341,13 +343,13 @@ def _uncarried_ledger_changes(
     return unexplained, count
 
 
-def _worktree_skill_copy_candidates(repo_root: Path, tree: str) -> tuple[str, ...]:
-    """Every upstream skill worth best-effort copying into ``tree``."""
+def _worktree_skill_copy_candidates(repo_root: Path, tree: SkillTree) -> tuple[str, ...]:
+    """Every upstream skill worth best-effort copying into ``tree``'s project trees."""
     resolved = resolve_review_layers(repo_root, tree)
     return tuple(dict.fromkeys((*BASE_SKILLS, *(resolved.skills() if resolved else ()))))
 
 
-def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
+def _required_worktree_skills(repo_root: Path, tree: SkillTree) -> tuple[str, ...]:
     """Upstream skills whose absence deterministically stalls this tree's run.
 
     Match :func:`install.missing_base_skills`: gate the selected dev primitive and
@@ -359,7 +361,7 @@ def _required_worktree_skills(repo_root: Path, tree: str) -> tuple[str, ...]:
     resolved = resolve_review_layers(repo_root, tree)
     if resolved is not None:
         review_skills = tuple(resolved.required)
-    elif (repo_root / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
+    elif skill_locate.locate(repo_root, skill_locate.as_scope(tree), MERGED_REVIEW_SKILL):
         review_skills = (MERGED_REVIEW_SKILL,)
     else:
         review_skills = tuple(sorted(_REVIEW_LAYER_SKILLS))
@@ -929,7 +931,7 @@ def _central_config_seed_incomplete(
 def base_skills_seed_incomplete(
     worktree: Path,
     repo_root: Path,
-    trees: Sequence[str],
+    trees: Sequence[SkillTree],
     *,
     project: Path | None = None,
 ) -> list[str]:
@@ -952,37 +954,74 @@ def base_skills_seed_incomplete(
     CRITICAL escalation here. Stories mode adds its content-keyed dispatch probe at
     the caller, where the run mode is available.
 
-    The skill trees are project-local: probed under :func:`provision_roots`.
+    The skill trees are project-local: probed under :func:`provision_roots`. A
+    :class:`~bmad_loop.skill_locate.SkillScope` widens that to every project tree
+    (the copy :func:`~bmad_loop.skill_locate.locate` picks is the one checked) and,
+    with ``[skills] user_roots`` on, exempts a required skill located in a user
+    root: the session loads it from the operator's home, which no worktree
+    carries and seeding never copies (:func:`base_skills_user_rooted` names them
+    for the journal).
     """
     src_root, dst_root = provision_roots(worktree, repo_root, project)
     missing: list[str] = []
     for tree in dict.fromkeys(trees):
+        scope = skill_locate.as_scope(tree)
         primitive = dev_primitive_or_default(src_root, tree)
         for skill in _required_worktree_skills(src_root, tree):
-            repo_skill = src_root / tree / skill
-            worktree_skill = dst_root / tree / skill
-            if not _is_file(repo_skill / "SKILL.md"):
+            located = skill_locate.locate(src_root, scope, skill)
+            if located is not None and located.origin == "user":
+                continue
+            if located is None:
                 # Distinguish an unreadable directory from a skill the repo simply
                 # does not carry. The walk yields only the former as a directory leaf.
-                if any(_is_dir(src) for _, src in _walk_traversable_files(repo_skill)):
-                    missing.append(f"{tree}/{skill}")
+                for project_tree in scope.project_trees():
+                    repo_skill = src_root / project_tree / skill
+                    if any(_is_dir(src) for _, src in _walk_traversable_files(repo_skill)):
+                        missing.append(f"{project_tree}/{skill}")
+                        break
                 continue
+            located_tree = located.root
+            repo_skill = src_root / located_tree / skill
+            worktree_skill = dst_root / located_tree / skill
             if not _is_file(worktree_skill / "SKILL.md"):
-                missing.append(f"{tree}/{skill}")
+                missing.append(f"{located_tree}/{skill}")
                 continue
             if skill != primitive:
                 continue
             missing.extend(
-                f"{tree}/{skill}/{rel}"
+                f"{located_tree}/{skill}/{rel}"
                 for rel in DEV_PRIMITIVE_MARKERS
                 if _is_file(repo_skill / rel) and not _is_file(worktree_skill / rel)
             )
             missing.extend(
-                f"{tree}/{skill}/{rel}"
+                f"{located_tree}/{skill}/{rel}"
                 for rel in _absent_renderer_sources(worktree_skill)
                 if _is_file(repo_skill.joinpath(*rel.split("/")))
             )
     return missing
+
+
+def base_skills_user_rooted(
+    repo_root: Path,
+    trees: Sequence[SkillTree],
+    *,
+    project: Path | None = None,
+) -> list[str]:
+    """Required upstream skills :func:`base_skills_seed_incomplete` exempts
+    because :func:`~bmad_loop.skill_locate.locate` puts them in a user root
+    (``[skills] user_roots`` on), as display spellings (``~/.agents/skills/x``).
+    Plain tree strings never resolve to a user root, so they yield nothing."""
+    src_root = repo_root if project is None else project  # provision_roots' src_root
+    found: dict[str, None] = {}
+    for tree in dict.fromkeys(trees):
+        scope = skill_locate.as_scope(tree)
+        if not scope.resolve_user:
+            continue
+        for skill in _required_worktree_skills(src_root, tree):
+            located = skill_locate.locate(src_root, scope, skill)
+            if located is not None and located.origin == "user":
+                found[located.display] = None
+    return list(found)
 
 
 def worktree_seed_undelivered(
@@ -1200,6 +1239,7 @@ def provision_worktree(
     on_pinned: Callable[[str, str, str], None] | None = None,
     project: Path | None = None,
     on_hook_gated: Callable[[str], None] | None = None,
+    user_roots: bool = False,
 ) -> list[str]:
     """Make a freshly-created git worktree a self-sufficient bmad-loop project.
 
@@ -1466,8 +1506,10 @@ def provision_worktree(
     if _central_config_seed_incomplete(worktree, repo_root, project=project):
         skipped.append(CENTRAL_CONFIG_REL)
 
-    # bundled skills into each CLI's skill tree (deduped: codex+gemini share one);
-    # never clobber a skill the checkout already carries (tracked or pre-existing).
+    # bundled skills into each CLI's PRIMARY skill tree (deduped: codex+gemini share
+    # one); never clobber a skill the checkout already carries (tracked or
+    # pre-existing). An extra tree gets none: `module_skills_seed_undelivered`
+    # probes the primary trees only, and bmad-loop's own skills live there.
     for tree in dict.fromkeys(p.skill_tree for p in profiles):
         tree_dir = dst_root / tree
         for skill in MODULE_SKILLS:
@@ -1495,52 +1537,60 @@ def provision_worktree(
         # dev/review skill does. A future
         # worktree-resident consumer arms the gate via escalate_unit over that
         # predicate's result.
-        # The orchestrator-driven upstream skills are not in the wheel; copy them
-        # from the MAIN REPO's installed tree (same tree path) so an isolated
-        # worktree can still resolve the dev primitive and the review layers. Skip
-        # silently when the main repo lacks them — the run-start preflight reports
-        # it.
-        #
-        # BASE_SKILLS names BOTH primitive eras, which is what carries the skill
-        # across the rename: the resolution below returns REVIEW skills only, so a
-        # primitive the catalog did not name would be silently left behind (the
-        # is_dir guard swallows the miss) and every isolated session would stall on
-        # an Unknown command.
-        #
-        # BASE_SKILLS is only the floor. The review layers this project actually
-        # invokes are read from the installed primitive — resolved on disk, so a
-        # renamed project resolves its own layers rather than degrading to the
-        # static catalog — exactly as the preflight reads them, so a reviewer named
-        # by a project override (a custom or renamed skill) is provisioned too.
-        # Validating a skill here and then not copying it is how preflight passes in
-        # the main checkout while the isolated review fails on a skill that was
-        # never there.
-        for skill in _worktree_skill_copy_candidates(src_root, tree):
-            dst = tree_dir / skill
-            try:
-                src = (src_root / tree / skill).resolve()
-            except (OSError, RuntimeError, ValueError):
-                continue
-            if not src.is_relative_to(repo_root) or not _is_dir(src):
-                continue
-            landed = []
-            _copy_traversable(
-                src,
-                dst,
-                skip_existing=True,
-                worktree=worktree,
-                repo_root=repo_root,
-                copied_paths=landed,
-            )
-            written.update(_written_rels(worktree, landed))
+
+    # The orchestrator-driven upstream skills are not in the wheel; copy them
+    # from the MAIN REPO's installed trees (same tree paths) so an isolated
+    # worktree can still resolve the dev primitive and the review layers. Skip
+    # silently when the main repo lacks them — the run-start preflight reports
+    # it.
+    #
+    # BASE_SKILLS names BOTH primitive eras, which is what carries the skill
+    # across the rename: the resolution below returns REVIEW skills only, so a
+    # primitive the catalog did not name would be silently left behind (the
+    # is_dir guard swallows the miss) and every isolated session would stall on
+    # an Unknown command.
+    #
+    # BASE_SKILLS is only the floor. The review layers this project actually
+    # invokes are read from the installed primitive — resolved on disk, so a
+    # renamed project resolves its own layers rather than degrading to the
+    # static catalog — exactly as the preflight reads them, so a reviewer named
+    # by a project override (a custom or renamed skill) is provisioned too.
+    # Validating a skill here and then not copying it is how preflight passes in
+    # the main checkout while the isolated review fails on a skill that was
+    # never there.
+    #
+    # Every PROJECT tree of each profile (`skill_tree`, then `extra_skill_trees`)
+    # is seeded the same way, each from its own main-repo counterpart. A user
+    # root (`[skills] user_roots`) is never a source: the session reads that copy
+    # from the operator's home in place, and the gate below exempts it.
+    scopes = list(
+        dict.fromkeys(skill_locate.scope_for(p, resolve_user=user_roots) for p in profiles)
+    )
+    for scope in scopes:
+        candidates = _worktree_skill_copy_candidates(src_root, scope)
+        for tree in scope.project_trees():
+            for skill in candidates:
+                dst = dst_root / tree / skill
+                try:
+                    src = (src_root / tree / skill).resolve()
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if not src.is_relative_to(repo_root) or not _is_dir(src):
+                    continue
+                landed = []
+                _copy_traversable(
+                    src,
+                    dst,
+                    skip_existing=True,
+                    worktree=worktree,
+                    repo_root=repo_root,
+                    copied_paths=landed,
+                )
+                written.update(_written_rels(worktree, landed))
 
     # Re-ask the result rather than trusting copy bookkeeping. A user-authored seed
     # can happen to spell a skill rel, so only this disk predicate may arm the gate.
-    skipped.extend(
-        base_skills_seed_incomplete(
-            worktree, repo_root, [profile.skill_tree for profile in profiles], project=project
-        )
-    )
+    skipped.extend(base_skills_seed_incomplete(worktree, repo_root, scopes, project=project))
 
     # per-CLI signal-hook registration, baked to the main repo's relay (absolute).
     # Hookless profiles (HTTP/SSE transport) have no config to merge.
@@ -1726,7 +1776,9 @@ def provision_worktree(
     # Every rel below is spelled worktree-relative through `shield`: git reads the
     # exclude from the worktree root, and a nested project's surfaces sit under its
     # offset there (DW-379). `written` and `seeded_bmad` already are.
-    patterns = {f"/{shield(p.skill_tree)}" for p in profiles}
+    patterns = {
+        f"/{shield(tree)}" for p in profiles for tree in (p.skill_tree, *p.extra_skill_trees)
+    }
     # hookless profiles have no config_path, so there is nothing to shield: their
     # empty string would render as a bare "/", which git strips to a zero-length
     # pattern (the trailing slash becomes MUSTBEDIR) that matches nothing — inert,
@@ -2677,6 +2729,7 @@ class WorktreeFlow:
                 on_hook_gated=lambda note: self.journal.append(
                     "worktree-hook-gated", story_key=task.story_key, reason=note
                 ),
+                user_roots=self.policy.skills.user_roots,
             )
         except verify.GitError as e:
             # Every provisioning refusal carries its own cause — an unresolvable
@@ -2795,6 +2848,12 @@ class WorktreeFlow:
                 )
 
         trees = [p.skill_tree for p in profiles]
+        # Every project tree plus, under `[skills] user_roots`, the user roots each
+        # CLI loads: the gates below check the copy each session will really run.
+        user_roots = self.policy.skills.user_roots
+        scopes = list(
+            dict.fromkeys(skill_locate.scope_for(p, resolve_user=user_roots) for p in profiles)
+        )
         # The wheel's own bundled skills, journal-only like worktree-seed-dropped but
         # under their own kind so a user seed that spells a skill rel can neither forge
         # nor mask an entry. No MODULE_SKILLS entry has a worktree-resident consumer,
@@ -2813,8 +2872,17 @@ class WorktreeFlow:
         # renderer-era primitives. Re-probe disk rather than trusting skipped_seeds,
         # which a user-authored seed rel could otherwise forge. Check this first so a
         # wholly absent primitive is not misdiagnosed as a renderer-surface problem.
+        # A required skill located in a user root is exempt (no worktree carries
+        # the operator's home, and seeding never copies from it); say which.
+        user_rooted = base_skills_user_rooted(
+            self.paths.repo_root, scopes, project=self.paths.project
+        )
+        if user_rooted:
+            self.journal.append(
+                "worktree-skills-user-root", story_key=task.story_key, entries=user_rooted
+            )
         absent_skills = base_skills_seed_incomplete(
-            unit.path, self.paths.repo_root, trees, project=self.paths.project
+            unit.path, self.paths.repo_root, scopes, project=self.paths.project
         )
         if absent_skills:
             reason = (
@@ -2834,7 +2902,7 @@ class WorktreeFlow:
         # while a tracked stale worktree copy proves that existence alone is not
         # enough. Either shape would HALT a folder+id dispatch before writing a spec.
         stories_support = (
-            missing_stories_support(self._mount_roots(unit.path)[1], trees)
+            missing_stories_support(self._mount_roots(unit.path)[1], scopes)
             if worksource.resumed_traits_for(self.state.source).stories_primitive
             else []
         )
@@ -2858,7 +2926,7 @@ class WorktreeFlow:
         # renderer stub consumes the surface. The conjunct is load-bearing: inline
         # pre-#2601 SKILL.md projects may carry the same repo paths and must proceed.
         short_surface = [rel for rel in RENDERER_SEED_SENTINELS if rel in skipped_seeds]
-        if short_surface and renderer_stub_resolved(self.paths.project, trees):
+        if short_surface and renderer_stub_resolved(self.paths.project, scopes):
             reason = (
                 f"the dev primitive renders via {RENDERER_SCRIPT_MARKER} but the "
                 "worktree's renderer surface came up short of the repo's "

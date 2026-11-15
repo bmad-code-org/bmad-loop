@@ -4440,6 +4440,50 @@ def test_v2_spawn_crumbs_refused_wildcard_skill_ids(tmp_path, v2_fake):
     assert [c["ids"] for c in crumbs] == [["*"]]
 
 
+def test_v1_spawn_refuses_a_session_needing_user_root_skills(tmp_path, fake_opencode):
+    """opencode 1.x runs with OPENCODE_DISABLE_EXTERNAL_SKILLS, so a skill the
+    engine located in a user root could never load: the session is refused
+    before any server starts, naming the skills and both ways out."""
+    launcher, rec = fake_opencode
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "completed", user_skill_ids=("bmad-build-auto",))
+
+    with pytest.raises(OpencodeServerError, match="cannot load skills from user roots") as exc:
+        adapter.start_session(spec)
+
+    assert "bmad-build-auto" in str(exc.value) and "2.x" in str(exc.value)
+    assert not (tmp_path / "run" / "logs" / "t-1.server.out").exists()
+
+
+def test_v2_spawn_allows_and_crumbs_the_user_root_skill_ids(tmp_path, v2_fake):
+    """On 2.x the user-root ids join the allow-list after the project ids, and
+    the spawn records which ones in the lifecycle log."""
+    launcher, rec = v2_fake
+    adapter = make_adapter(tmp_path, binary=str(launcher))
+    spec = make_spec(tmp_path, rec, "completed", user_skill_ids=("bmad-build-auto",))
+
+    result = adapter.run(spec)
+
+    assert result.status == "completed"
+    crumbs = [c for c in _lifecycle(tmp_path) if c["event"] == "skill-ids-user-allowed"]
+    assert [c["ids"] for c in crumbs] == [["bmad-build-auto"]]
+    rules = json.loads(adapter._config_content(spec, V2Protocol()))["permissions"]
+    assert rules[-1] == {"action": "skill", "resource": "bmad-build-auto", "effect": "allow"}
+
+
+def test_config_content_lists_an_existing_agents_skill_tree(tmp_path):
+    """The opencode profile's extra tree (``.agents/skills``, where the skills
+    CLI installs opencode's project skills) joins the config once it exists."""
+    (tmp_path / ".agents" / "skills").mkdir(parents=True)
+    adapter = make_adapter(tmp_path)
+    spec = SessionSpec(task_id="t", role="triage", prompt="p", cwd=tmp_path)
+    config = json.loads(adapter._config_content(spec))
+    assert config["skills"]["paths"] == [
+        str(tmp_path / ".claude" / "skills"),
+        str(tmp_path / ".agents" / "skills"),
+    ]
+
+
 def test_v2_completed_scenario_end_to_end(tmp_path, v2_fake, monkeypatch):
     """A 2.x `--version` picks the V2 codec and one session runs to completion
     over `/api/*`: create with the task title and the project as its location,

@@ -595,7 +595,20 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
     def _config_content(self, spec: SessionSpec, protocol: OpencodeProtocol | None = None) -> str:
         """The OPENCODE_CONFIG_CONTENT JSON for this session, in ``protocol``'s
         dialect (V1 when omitted): see :meth:`V1Protocol.config_content`."""
-        return (protocol or _V1).config_content(spec, Path(spec.cwd) / self.profile.skill_tree)
+        primary, extras = self._skill_dirs(spec)
+        return (protocol or _V1).config_content(
+            spec, primary, extra_skill_dirs=extras, user_skill_ids=spec.user_skill_ids
+        )
+
+    def _skill_dirs(self, spec: SessionSpec) -> tuple[Path, list[Path]]:
+        """``(primary, extras)`` — the session's project skill trees under its
+        cwd: the profile's ``skill_tree`` (always), then each of its
+        ``extra_skill_trees`` that exists. A missing extra tree holds no skill
+        to load, so leaving it out keeps a single-tree project's config what
+        it always was."""
+        cwd = Path(spec.cwd)
+        extras = [cwd / t for t in self.profile.extra_skill_trees]
+        return cwd / self.profile.skill_tree, [d for d in extras if d.is_dir()]
 
     def _session_env(
         self, spec: SessionSpec, password: str, protocol: OpencodeProtocol | None = None
@@ -627,7 +640,7 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             # `opencode.cmd` shim that a bare-name Popen (which appends only
             # .exe) would never find.
             raise OpencodeServerError(
-                f"opencode binary {self.binary!r} not found on PATH; " f"see `bmad-loop validate`"
+                f"opencode binary {self.binary!r} not found on PATH; see `bmad-loop validate`"
             )
         protocol, version = self._protocol_for(resolved)
         self._note_lifecycle(
@@ -637,7 +650,21 @@ class OpencodeHttpAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
             major=protocol.major,
             verdict=support_verdict(version)[0],
         )
-        refused = protocol.refused_skill_ids(Path(spec.cwd) / self.profile.skill_tree)
+        if spec.user_skill_ids:
+            if protocol.major < 2:
+                raise OpencodeServerError(
+                    f"opencode {format_version(version)} cannot load skills from user roots "
+                    f"(it runs with OPENCODE_DISABLE_EXTERNAL_SKILLS): install "
+                    f"{', '.join(spec.user_skill_ids)} per project (`npx skills add` without -g) "
+                    f"or upgrade to opencode 2.x"
+                )
+            self._note_lifecycle(
+                spec.task_id, "skill-ids-user-allowed", ids=list(spec.user_skill_ids)
+            )
+        primary, extras = self._skill_dirs(spec)
+        refused = protocol.refused_skill_ids(
+            primary, extra_skill_dirs=extras, user_skill_ids=spec.user_skill_ids
+        )
         if refused:
             self._note_lifecycle(spec.task_id, "skill-ids-refused", ids=refused)
         password = secrets.token_urlsafe(16)

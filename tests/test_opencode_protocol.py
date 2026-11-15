@@ -192,6 +192,76 @@ def test_v2_config_never_reallows_a_wildcard_skill_id(tmp_path):
     assert V1Protocol().refused_skill_ids(skill_dir) == []
 
 
+def test_v2_config_reads_every_project_tree_then_the_user_root_ids(tmp_path):
+    """Under ``[skills] user_roots`` the V2 recipe lists both project trees in
+    ``skills`` and re-allows, after the deny-all, every project id of both
+    trees and then the user-root BMAD ids the engine located — an id present
+    twice is allowed once, and no user path is added (V2 scans those roots
+    itself)."""
+    primary = tmp_path / ".claude" / "skills"
+    extra = tmp_path / ".agents" / "skills"
+    _skill(primary, "bmad-dev-auto", "bmad-dev-auto")
+    _skill(extra, "bmad-review-adversarial", "bmad-review-adversarial")
+    _skill(extra, "bmad-dev-auto", "bmad-dev-auto")
+
+    config = json.loads(
+        V2Protocol().config_content(
+            _spec(tmp_path),
+            primary,
+            extra_skill_dirs=[extra],
+            user_skill_ids=("bmad-build-auto", "bmad-review-adversarial"),
+        )
+    )
+
+    assert config["skills"] == [str(primary), str(extra)]
+    rules = config["permissions"]
+    skill_rules = [r for r in rules if r["action"] == "skill"]
+    assert skill_rules == [
+        {"action": "skill", "resource": "*", "effect": "deny"},
+        {"action": "skill", "resource": "bmad-dev-auto", "effect": "allow"},
+        {"action": "skill", "resource": "bmad-review-adversarial", "effect": "allow"},
+        {"action": "skill", "resource": "bmad-build-auto", "effect": "allow"},
+    ]
+    assert rules.index(skill_rules[0]) < min(rules.index(r) for r in skill_rules[1:])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="`*` and `?` are not legal in Windows names")
+def test_v2_config_never_reallows_a_wildcard_id_from_an_extra_tree_or_a_user_root(tmp_path):
+    """The wildcard refusal covers every source of an allow: an extra-tree
+    directory named ``?x`` and a user-root id ``*`` stay denied and are named
+    for the spawn crumb."""
+    primary = tmp_path / ".claude" / "skills"
+    extra = tmp_path / ".agents" / "skills"
+    _skill(primary, "plain-skill", "plain-skill")
+    _skill(extra, "?x", "?x")
+    kw = {"extra_skill_dirs": [extra], "user_skill_ids": ("*", "bmad-build-auto")}
+
+    rules = json.loads(V2Protocol().config_content(_spec(tmp_path), primary, **kw))["permissions"]
+
+    assert [r["resource"] for r in rules if r["action"] == "skill"] == [
+        "*",
+        "plain-skill",
+        "bmad-build-auto",
+    ]
+    assert [r["effect"] for r in rules if r["action"] == "skill"] == ["deny", "allow", "allow"]
+    assert V2Protocol().refused_skill_ids(primary, **kw) == ["?x", "*"]
+
+
+def test_v1_config_lists_every_project_tree_and_ignores_user_ids(tmp_path):
+    """V1 keeps OPENCODE_DISABLE_EXTERNAL_SKILLS and widens only
+    ``skills.paths`` to both project trees; user-root ids never reach a 1.x
+    config (the adapter refuses that session at spawn)."""
+    primary = tmp_path / ".claude" / "skills"
+    extra = tmp_path / ".agents" / "skills"
+    config = json.loads(
+        V1Protocol().config_content(
+            _spec(tmp_path), primary, extra_skill_dirs=[extra], user_skill_ids=("bmad-x",)
+        )
+    )
+    assert config == {"permission": "allow", "skills": {"paths": [str(primary), str(extra)]}}
+    assert V1Protocol().extra_env() == {"OPENCODE_DISABLE_EXTERNAL_SKILLS": "1"}
+
+
 def test_v2_decode_frame_reads_data_envelope():
     """V2 frames carry the session id under `data`, not V1's `properties`."""
     v2 = V2Protocol()
@@ -589,8 +659,7 @@ def test_v2_tool_failure_and_nonzero_exit_are_on_the_line():
         ]
     )
     assert lines == [
-        f'{_G}[bmad] tool: shell {{"command": "rm -rf x"}} -> error: '
-        f"permission.rejected: no{_R}\n",
+        f'{_G}[bmad] tool: shell {{"command": "rm -rf x"}} -> error: permission.rejected: no{_R}\n',
         f'{_G}[bmad] tool: shell {{"command": "exit 1"}} -> exit 1{_R}\n',
     ]
 
