@@ -13245,49 +13245,77 @@ def test_review_remediation_names_core_tools(tmp_path):
     assert "core-tools" in derived[0].message
 
 
-@pytest.mark.parametrize("root", [".claude/skills", ".agents/skills"])
-def test_outside_copy_hint_on_base_missing(tmp_path, root):
-    """A global (`npx skills add -g`) copy is named as a hint — the run still
-    refuses, because bmad-loop drives only the project's own tree."""
+@pytest.mark.parametrize(
+    ("profile", "root"),
+    [
+        ("claude", ".claude/skills"),
+        ("codex", ".agents/skills"),
+        ("codex", ".codex/skills"),
+        ("gemini", ".gemini/skills"),
+        ("copilot", ".copilot/skills"),
+    ],
+)
+def test_home_hint_names_a_copy_in_the_profiles_own_root(tmp_path, profile, root):
+    """Switch off, a copy in one of the CLI's own user roots is named as a hint that
+    offers `[skills] user_roots` — the run still refuses."""
     home = tmp_path / "home"
     project = tmp_path / "project"
-    tree = get_profile("claude").skill_tree
+    scope = _user_scope(profile, home, on=False)
 
-    bare = missing_base_skills(project, [tree], home=home)
+    bare = missing_base_skills(project, [scope])
     assert "outside" not in bare[0].detail
     assert "a copy exists" not in bare[0].message
 
     _install_skills(home, root, {DEV_PRIMITIVE_NEW: ()})
-    problems = missing_base_skills(project, [tree], home=home)
+    problems = missing_base_skills(project, [scope])
 
     assert [p.check for p in problems] == ["skills.base-missing"]
     expected = PurePosixPath("~", root, DEV_PRIMITIVE_NEW).as_posix()
     assert problems[0].detail["outside"] == expected
     assert expected in problems[0].message
+    assert "`[skills] user_roots = true`" in problems[0].message
     assert "npx skills add" in problems[0].message
 
 
-def test_outside_copy_hint_on_review_findings(tmp_path):
+def test_home_hint_ignores_a_root_the_profile_does_not_load(tmp_path):
+    """claude loads only `~/.claude/skills`: a copy in `~/.agents/skills` is no hint,
+    since setting the switch would not make claude load it.
+
+    Ablation: add `"~/.agents/skills"` to claude.toml's `[user_skills] roots` and
+    the hint appears."""
+    home = tmp_path / "home"
+    _install_skills(home, ".agents/skills", {DEV_PRIMITIVE_NEW: ()})
+    problems = missing_base_skills(tmp_path / "project", [_user_scope("claude", home, on=False)])
+
+    assert [p.check for p in problems] == ["skills.base-missing"]
+    assert "outside" not in problems[0].detail
+    assert "a copy exists" not in problems[0].message
+
+
+def test_home_hint_on_review_findings(tmp_path):
     home = tmp_path / "home"
     project = tmp_path / "project"
-    tree = get_profile("claude").skill_tree
+    scope = _user_scope("claude", home, on=False)
+    tree = scope.tree
     _install_skills(home, ".claude/skills", {"bmad-review": (), **{h: () for h in _HUNTERS}})
 
     _install_dev_auto(project, tree, skill=DEV_PRIMITIVE_NEW, customize=LAYER_CUSTOMIZE)
-    derived = missing_base_skills(project, [tree], home=home)
+    derived = missing_base_skills(project, [scope])
     assert derived[0].detail["outside"] == "~/.claude/skills/bmad-review"
 
     _install_dev_auto(project, tree, skill=DEV_PRIMITIVE_NEW, customize="x\n")
-    fallback = missing_base_skills(project, [tree], home=home)
+    fallback = missing_base_skills(project, [scope])
     assert {f.detail["outside"] for f in fallback} == {f"~/.claude/skills/{h}" for h in _HUNTERS}
 
 
-def test_outside_copy_unresolvable_home_is_no_hint(monkeypatch):
-    def no_home():
-        raise RuntimeError("Could not determine home directory.")
-
-    monkeypatch.setattr(install_mod, "_outside_home", no_home)
-    assert install_mod._outside_copy(DEV_PRIMITIVE_NEW) is None
+def test_home_hint_absent_without_a_home_or_for_a_plain_tree(tmp_path):
+    """No determinable home is no hint, and a plain tree string declares no user
+    roots, so it never probes the home directory at all."""
+    project = tmp_path / "project"
+    no_home = missing_base_skills(project, [_user_scope("claude", None, on=False)])
+    assert "outside" not in no_home[0].detail
+    plain = missing_base_skills(project, [get_profile("claude").skill_tree])
+    assert "outside" not in plain[0].detail
 
 
 # --- user-level skill roots through SkillScope ---------------------------------

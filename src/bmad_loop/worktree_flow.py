@@ -1975,10 +1975,10 @@ class WorktreeFlow:
         fakes) contribute nothing, so provisioning is a no-op for them.
 
         The role set is :data:`install.DEV_PRIMITIVE_ROLES` — the same constant
-        `cli._skill_trees` starts from — rather than a local pair, so the gated set
+        `cli._skill_scopes` starts from — rather than a local pair, so the gated set
         stays a subset of the provisioned one: a tree gated but not provisioned
         ships a session into the `Unknown command` stall the preflight exists to
-        catch. The converse is deliberate: `cli._skill_trees` drops the review tree
+        catch. The converse is deliberate: `cli._skill_scopes` drops the review tree
         when ``[review]`` is off and no plugin binds a review workflow (DW-380), but
         provisioning keeps both profiles always — they drive per-CLI Stop-signal
         hook registration too, and a worktree without one stalls any session of

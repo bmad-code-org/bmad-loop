@@ -140,6 +140,10 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.user-root-unavailable",
         # user-root and project bmod-method records name different BMAD-METHOD versions
         "skills.user-root-version-skew",
+        # an opencode 1.x server while a needed skill resolves from a user root
+        "skills.user-root-unsupported",
+        # a sandboxed role whose skills resolve from a user root outside the project
+        "skills.user-root-sandboxed",
         "skills.customize-legacy",
         "skills.dev-renderer",
         "skills.dev-renderer-config",

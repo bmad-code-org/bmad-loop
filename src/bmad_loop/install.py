@@ -292,14 +292,9 @@ def _customize_overrides(skill: str) -> tuple[Path, ...]:
 SkillTree = str | SkillScope
 
 
-def _scope_items(trees: Iterable[SkillTree]) -> dict[SkillScope, SkillTree]:
-    """``trees`` deduplicated on their scope, each mapped to the first spelling
-    given — a plain string keeps the legacy out-of-project hint
-    (:func:`_missing_hint`), so the original is carried alongside its scope."""
-    items: dict[SkillScope, SkillTree] = {}
-    for tree in trees:
-        items.setdefault(as_scope(tree), tree)
-    return items
+def _scope_items(trees: Iterable[SkillTree]) -> list[SkillScope]:
+    """``trees`` as scopes, deduplicated in first-seen order."""
+    return list(dict.fromkeys(as_scope(tree) for tree in trees))
 
 
 def _skill_dir(project: Path, scope: SkillScope, name: str) -> Path:
@@ -1282,7 +1277,7 @@ def tickets_parent_problems(
 
 def tickets_preflight(
     paths: bmadconfig.ProjectPaths,
-    trees: Sequence[str],
+    trees: Sequence[SkillTree],
     *,
     probe_capability: bool,
     branch_per: str | None = None,
@@ -1612,9 +1607,7 @@ def missing_sweep_skill(project: Path, trees: Sequence[str]) -> list[Finding]:
     return problems
 
 
-def missing_base_skills(
-    project: Path, trees: Sequence[SkillTree], *, home: Path | None = None
-) -> list[Finding]:
+def missing_base_skills(project: Path, trees: Sequence[SkillTree]) -> list[Finding]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.
 
     The dev primitive (bmad-build-auto, or a complete pre-rename bmad-dev-auto) and
@@ -1656,10 +1649,10 @@ def missing_base_skills(
     can have a post-consolidation `.claude` tree and a pre-merge `.agents` one side
     by side — and, across the rename, a different primitive era in each.
 
-    A nothing-resolved ``skills.base-missing`` notes a global install of the
-    primitive (``~/.claude/skills`` or ``~/.agents/skills``) when one exists, with
-    its path in ``detail["outside"]``; ``home`` overrides the probed home directory
-    (tests inject it). That is a hint, never a resolution: the run still refuses.
+    A ``skills.base-missing`` (or ``review-layer-missing``) for a scope with
+    ``[skills] user_roots`` off notes a copy in one of that CLI's own user roots
+    (:func:`_home_hint`), with its display path in ``detail["outside"]``. That is
+    a hint, never a resolution: the run still refuses until the switch is set.
 
     ``skills.base-incomplete`` carries ``missing_markers`` as a list — the message
     joins it with ", " for the human line, which a consumer would otherwise have to
@@ -1689,7 +1682,7 @@ def missing_base_skills(
     """
     problems: list[Finding] = []
     resolved_stub = False
-    for scope, item in _scope_items(trees).items():
+    for scope in _scope_items(trees):
         tree = scope.tree
         found = _primitive_copy(project, scope)
         shim = _shim_copy(project, scope) if found is None else None
@@ -1715,7 +1708,7 @@ def missing_base_skills(
                 )
             )
         elif found is None:
-            hint, outside = _missing_hint(item, DEV_PRIMITIVE_NEW, home)
+            hint, outside = _home_hint(scope, DEV_PRIMITIVE_NEW)
             problems.append(
                 Finding(
                     "skills.base-missing",
@@ -1793,7 +1786,7 @@ def missing_base_skills(
                         },
                     )
                 )
-        problems.extend(_review_findings(project, item, home=home))
+        problems.extend(_review_findings(project, scope))
         problems.extend(_user_root_findings(project, scope, found))
     if resolved_stub and not (project / CENTRAL_CONFIG_REL).is_file():
         problems.append(
@@ -2197,48 +2190,6 @@ def dev_primitive_warnings(project: Path, trees: Sequence[SkillTree]) -> list[Fi
     return findings
 
 
-# Where `npx skills add -g` lays a skill down, relative to the home directory. Probed
-# read-only for a HINT only: bmad-loop drives skills from the project's own tree and
-# never resolves one from here (a session cwd'd in the project would not see it in
-# every CLI, and a worktree could not seed it). Claude Code's plugin cache is not
-# probed — BMAD no longer ships Claude plugins.
-_OUTSIDE_SKILL_ROOTS = (".claude/skills", ".agents/skills")
-
-
-def _outside_home() -> Path:
-    """The home directory :func:`_outside_copy` probes by default. A seam: the test
-    suite pins it (conftest) so an operator's real global skills never leak into a
-    finding a test asserts on."""
-    return Path.home()
-
-
-def _outside_copy(name: str, home: Path | None = None) -> str | None:
-    """``~/<root>/<name>`` for the first global install of skill ``name`` found under
-    :data:`_OUTSIDE_SKILL_ROOTS`, or None. An undeterminable or unreadable home is
-    None: this only decorates a finding, so it must never crash the preflight."""
-    try:
-        base = _outside_home() if home is None else home
-        for root in _OUTSIDE_SKILL_ROOTS:
-            if (base / root / name / "SKILL.md").is_file():
-                return f"~/{root}/{name}"
-    except (OSError, RuntimeError):
-        return None
-    return None
-
-
-def _outside_hint(name: str, tree: str, home: Path | None) -> tuple[str, dict[str, str]]:
-    """The message suffix and detail entry for a skill installed only outside the
-    project (:func:`_outside_copy`), or ``("", {})`` when there is none."""
-    outside = _outside_copy(name, home)
-    if outside is None:
-        return "", {}
-    return (
-        f"; a copy exists at {outside}, but bmad-loop only drives skills installed in "
-        f"this project's {tree} — install it per project (`npx skills add` without -g)",
-        {"outside": outside},
-    )
-
-
 def _home_hint(scope: SkillScope, name: str) -> tuple[str, dict[str, str]]:
     """The message suffix and ``outside`` detail entry for a skill the project lacks
     but one of the scope's own user roots holds while ``[skills] user_roots`` is
@@ -2258,14 +2209,6 @@ def _home_hint(scope: SkillScope, name: str) -> tuple[str, dict[str, str]]:
     )
 
 
-def _missing_hint(tree: SkillTree, name: str, home: Path | None) -> tuple[str, dict[str, str]]:
-    """The hint for a missing skill: the legacy fixed-folder probe
-    (:func:`_outside_hint`) for a plain tree string, :func:`_home_hint` for a scope."""
-    if isinstance(tree, str):
-        return _outside_hint(name, tree, home)
-    return _home_hint(tree, name)
-
-
 def _where_clause(layer_ids: Sequence[str]) -> str:
     """How a finding's message names the layers that reach for a skill."""
     if len(layer_ids) > 1:
@@ -2275,7 +2218,7 @@ def _where_clause(layer_ids: Sequence[str]) -> str:
     return "review step invokes"
 
 
-def _review_findings(project: Path, tree: SkillTree, *, home: Path | None = None) -> list[Finding]:
+def _review_findings(project: Path, tree: SkillTree) -> list[Finding]:
     """Findings for the review skills this tree's dev primitive invokes.
 
     Problems block; warnings never do. A skill is only a problem when the
@@ -2293,8 +2236,7 @@ def _review_findings(project: Path, tree: SkillTree, *, home: Path | None = None
     A tree whose primitive does not resolve gets NO review finding: the reviewers
     derive from the primitive, :func:`missing_base_skills` already reports that root
     cause, and the static fallback would otherwise demand the long-deleted hunters on
-    top of it. ``home`` overrides the home directory the out-of-project hint probes
-    (:func:`_outside_copy`); tests inject it.
+    top of it.
 
     Every skill is located through ``tree``'s scope, as in :func:`missing_base_skills`.
     """
@@ -2318,7 +2260,7 @@ def _review_findings(project: Path, tree: SkillTree, *, home: Path | None = None
         for skill in sorted(_REVIEW_LAYER_SKILLS):
             if present(skill):
                 continue
-            hint, outside = _missing_hint(tree, skill, home)
+            hint, outside = _home_hint(scope, skill)
             fallback.append(
                 Finding(
                     "skills.base-missing",
@@ -2405,7 +2347,7 @@ def _review_findings(project: Path, tree: SkillTree, *, home: Path | None = None
     for skill, layer_ids in sorted(resolved.required.items()):
         if present(skill):
             continue
-        hint, outside = _missing_hint(tree, skill, home)
+        hint, outside = _home_hint(scope, skill)
         findings.append(
             Finding(
                 "skills.review-layer-missing",

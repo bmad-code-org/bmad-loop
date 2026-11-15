@@ -1101,19 +1101,6 @@ def _stub_cli_version(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_outside_skill_home(monkeypatch, tmp_path_factory):
-    """Pin the home directory the out-of-project skill hint probes (#768).
-
-    `install.missing_base_skills` notes a global `~/.claude/skills` or
-    `~/.agents/skills` copy of a missing skill in the finding's message and detail.
-    Unpinned, every test asserting on such a finding would depend on what the host
-    has installed globally — a developer with `npx skills add -g` would see failures
-    CI never does. Tests of the hint pass `home=` explicitly instead."""
-    empty = tmp_path_factory.getbasetemp() / "no-outside-home"
-    monkeypatch.setattr(install, "_outside_home", lambda: empty)
-
-
-@pytest.fixture(autouse=True)
 def _isolate_user_skill_roots(monkeypatch, tmp_path_factory):
     """Pin the home directory and environment the skill locator reads.
 

@@ -40,6 +40,7 @@ from . import (
     resolve,
     runs,
     runsetup,
+    skill_locate,
     sprintstatus,
 )
 from . import stories as stories_mod
@@ -125,6 +126,7 @@ from .runsetup import ROLES
 from .runsetup import make_adapters as _make_adapters
 from .runsetup import mux_reason_label as _mux_reason_label
 from .runsetup import platform_preflight as _platform_preflight
+from .skill_locate import SkillScope
 from .stories_engine import StoriesEngine
 from .sweep import (
     DW_ID_RE,
@@ -693,10 +695,14 @@ def _validate_environment_probes(
         report.fail("environment.probe", message, detail)
 
 
-def _check_opencode_version(report: ValidationReport, profile_name: str, resolved: str) -> None:
+def _check_opencode_version(
+    report: ValidationReport, profile_name: str, resolved: str
+) -> tuple[int, int, int] | None:
     """``adapter.opencode-version``: which OpenCode server API ``resolved`` would
     run, judged by the same :func:`opencode_protocol.support_verdict` the adapter
-    refuses unsupported majors with. OK or a warning, never a problem.
+    refuses unsupported majors with. OK or a warning, never a problem. Returns the
+    parsed version (None when unreadable), which ``skills.user-root-unsupported``
+    reads.
 
     Called only once ``binary_runs`` saw ``--version`` exit 0, so a read that
     now fails, times out, or prints nothing is not ``adapter.binary-unrunnable``'s
@@ -718,7 +724,7 @@ def _check_opencode_version(report: ValidationReport, profile_name: str, resolve
             f"and refuse to start without one (supported: {supported_ranges()})",
             {"profile": profile_name, "path": resolved, "output": None},
         )
-        return
+        return None
     detail: dict[str, object] = {"profile": profile_name, "path": resolved, "output": first_line}
     version = parse_opencode_version(first_line)
     if version is None:
@@ -728,7 +734,7 @@ def _check_opencode_version(report: ValidationReport, profile_name: str, resolve
             f"OpenCode version — runs will refuse to start (supported: {supported_ranges()})",
             detail,
         )
-        return
+        return None
     verdict, message = support_verdict(version)
     detail["version"] = ".".join(str(part) for part in version)
     detail["verdict"] = verdict
@@ -746,6 +752,7 @@ def _check_opencode_version(report: ValidationReport, profile_name: str, resolve
             f"{profile_name}: {message} — it may work; upgrade if sessions misbehave",
             detail,
         )
+    return version
 
 
 def _check_codex_version(report: ValidationReport, profile: CLIProfile, resolved: str) -> None:
@@ -1035,11 +1042,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # parse failure.
     from .plugins import store as plugin_store
 
-    dev_trees = (
-        _skill_trees(project, pol, plugin_root, plugin_store.load_grants(project))
+    dev_profiles = (
+        _scoped_profiles(project, pol, plugin_root, plugin_store.load_grants(project))
         if pol is not None
-        else []
+        else {}
     )
+    dev_trees = list(dev_profiles)
 
     if paths:
         _QUEUE_VALIDATORS[source](
@@ -1236,6 +1244,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     registered_relays: set[tuple[Path, str]] = set()
     relay_interpreters: set[str] = set()
+    # the server version each probed opencode-http profile reports, for the
+    # user-root check below (`skills.user-root-unsupported`)
+    opencode_versions: dict[str, tuple[int, int, int] | None] = {}
     for profile in profiles:
         # Keyed on the adapter KIND, not on `hookless`. httpx is the bundled
         # opencode family's optional extra — a fact about one adapter class, which
@@ -1291,7 +1302,9 @@ def cmd_validate(args: argparse.Namespace) -> int:
             # compatibility contract.
             resolved_binary = runnable.get(profile.binary)
             if resolved_binary is not None:
-                _check_opencode_version(report, profile.name, resolved_binary)
+                opencode_versions[profile.name] = _check_opencode_version(
+                    report, profile.name, resolved_binary
+                )
         if profile.hooks.dialect == "codex-hooks-json":
             # The same packaged-provenance gate as the opencode read above; never
             # a problem, for the same rc contract.
@@ -1640,16 +1653,17 @@ def cmd_validate(args: argparse.Namespace) -> int:
         resolved = list(
             dict.fromkeys(
                 name
-                for tree in dict.fromkeys(dev_trees)
+                for tree in dev_trees
                 if (name := install.resolve_dev_primitive(project, tree)) is not None
             )
         )
         report.ok(
             "skills.base",
             f"upstream skills present ({' + '.join(resolved)} + review layers)",
-            {"trees": list(dict.fromkeys(dev_trees)), "dev_primitive": resolved},
+            {"trees": _tree_names(dev_trees), "dev_primitive": resolved},
         )
     report.extend(base_findings)
+    _report_skill_roots(report, project, pol, dev_profiles, opencode_versions)
     # The same probe `_require_base_skills` runs, against the same code root, so a
     # skill linked out of the repo under worktree isolation fails both alike.
     if dev_trees and pol is not None:
@@ -2256,10 +2270,12 @@ def _review_tree_gated(pol, root: Path, grants: GrantSet) -> bool:
     return "review" in roles
 
 
-def _skill_trees(
+def _skill_scopes(
     project: Path, pol, root: Path, grants: GrantSet, *, review_owed: bool = False
-) -> list[str]:
-    """The skill trees this run's dev-primitive adapters read, one per distinct name.
+) -> list[SkillScope]:
+    """The skill scopes this run's dev-primitive adapters load from, one per distinct
+    scope (:func:`skill_locate.scope_for`: the profile's project trees, plus its
+    declared user roots resolved under ``[skills] user_roots``).
 
     Shared by the real preflight and `cmd_validate` so the two cannot drift:
     validate's verdict has to key on exactly what makes run abort. Profiles that
@@ -2283,23 +2299,105 @@ def _skill_trees(
     per-CLI Stop-signal hook registration as well as seeding, and a worktree
     without the review profile would stall a review-role session on a missing
     completion signal rather than merely miss a skill."""
+    return list(_scoped_profiles(project, pol, root, grants, review_owed=review_owed))
+
+
+def _scoped_profiles(
+    project: Path, pol, root: Path, grants: GrantSet, *, review_owed: bool = False
+) -> dict[SkillScope, list[str]]:
+    """:func:`_skill_scopes` with the profile names behind each scope, in order —
+    validate names them on its user-root findings."""
     from .adapters.profile import ProfileError, get_profile
 
     roles = install.DEV_PRIMITIVE_ROLES
     if not review_owed and not _review_tree_gated(pol, root, grants):
         roles = tuple(role for role in roles if role != "review")
-    trees = []
+    scopes: dict[SkillScope, list[str]] = {}
     for name in dict.fromkeys(pol.adapter.resolved(role).name for role in roles):
         try:
-            trees.append(get_profile(name, project).skill_tree)
+            profile = get_profile(name, project)
         except ProfileError:
             continue
-    return trees
+        scope = skill_locate.scope_for(profile, resolve_user=pol.skills.user_roots)
+        scopes.setdefault(scope, []).append(name)
+    return scopes
+
+
+def _tree_names(scopes: list[SkillScope]) -> list[str]:
+    """The distinct primary tree spellings of ``scopes``, for a finding's detail —
+    a scope is not JSON, and two CLIs sharing a tree read it once."""
+    return list(dict.fromkeys(scope.tree for scope in scopes))
+
+
+def _report_skill_roots(
+    report: ValidationReport,
+    project: Path,
+    pol,
+    dev_profiles: dict[SkillScope, list[str]],
+    opencode_versions: Mapping[str, tuple[int, int, int] | None],
+) -> None:
+    """validate's user-root lines, over the same scopes the preflight gates on.
+
+    - ``skills.root`` (ok): where each driven skill resolved, named per profile.
+      Validate only, never routed through ``missing_base_skills``: the run
+      preflight prints every non-problem finding there as ``warning:``.
+    - ``skills.user-root-unsupported``: an opencode-http profile whose binary
+      reports a 1.x server while a skill it needs resolves from a user root — the
+      session spawn refuses exactly that pair.
+    - ``skills.user-root-sandboxed``: a role launched with ``permission_mode =
+      "sandboxed"`` whose skills resolve from a user root outside the project,
+      which a sandbox may not let the session read.
+
+    Warnings only: validate's exit code is a compatibility contract."""
+    from .adapters import registry as adapter_registry
+    from .adapters.profile import ProfileError, get_profile
+
+    for scope, names in dev_profiles.items():
+        label = ", ".join(names)
+        for finding in install.skill_root_findings(project, [scope]):
+            report.add(
+                finding.check,
+                finding.severity,
+                f"{label}: {finding.message}",
+                {"profile": label, **(finding.detail or {})},
+            )
+        if not scope.resolve_user:
+            continue
+        user_ids = install.user_root_skill_ids(project, scope)
+        if not user_ids:
+            continue
+        for name in names:
+            try:
+                kind = get_profile(name, project).adapter
+            except ProfileError:
+                continue
+            version = opencode_versions.get(name)
+            if kind == adapter_registry.OPENCODE_HTTP and version is not None and version[0] < 2:
+                shown = ".".join(str(part) for part in version)
+                report.warn(
+                    "skills.user-root-unsupported",
+                    f"{name}: opencode {shown} cannot load skills from user roots "
+                    f"({', '.join(user_ids)}) — its sessions will refuse to start; "
+                    f"install them per project (`npx skills add` without -g) or "
+                    f"upgrade to opencode 2.x",
+                    {"profile": name, "version": shown, "skills": list(user_ids)},
+                )
+        for role in install.DEV_PRIMITIVE_ROLES:
+            cfg = pol.adapter.resolved(role)
+            if cfg.name in names and cfg.permission_mode == "sandboxed":
+                report.warn(
+                    "skills.user-root-sandboxed",
+                    f'{role} ({cfg.name}) runs with permission_mode = "sandboxed" but '
+                    f"loads {', '.join(user_ids)} from a user root outside the project, "
+                    f"which the sandbox may not let it read — install them per project "
+                    f"(`npx skills add` without -g) if sessions cannot load them",
+                    {"profile": cfg.name, "role": role, "skills": list(user_ids)},
+                )
 
 
 def _dev_skill_for_role(pol, project: Path, role: str) -> str:
     """The dev-primitive skill name ``role``'s adapter would invoke, for dry-run
-    previews. Mirrors `_require_base_skills`' profile→skill_tree lookup so the
+    previews. Mirrors `_require_base_skills`' profile→scope lookup so the
     preview and the real dispatch (``Engine._dev_skill``) resolve identically —
     a pre-rename project previews ``/bmad-dev-auto``, a post-rename one
     ``/bmad-build-auto``. An unloadable profile falls back to the legacy name;
@@ -2307,10 +2405,13 @@ def _dev_skill_for_role(pol, project: Path, role: str) -> str:
     from .adapters.profile import ProfileError, get_profile
 
     try:
-        tree = get_profile(pol.adapter.resolved(role).name, project).skill_tree
+        scope = skill_locate.scope_for(
+            get_profile(pol.adapter.resolved(role).name, project),
+            resolve_user=pol.skills.user_roots,
+        )
     except ProfileError:
-        tree = None
-    return install.dev_primitive_or_default(project, tree)
+        scope = None
+    return install.dev_primitive_or_default(project, scope)
 
 
 def _unknown_adapter_kinds(project: Path, pol) -> list[str]:
@@ -2835,7 +2936,15 @@ def _warn_preflight_would_abort(
     It reads the grant store the way the launch would, without its warning."""
     from .plugins import store
 
-    trees = _skill_trees(paths.project, pol, paths.repo_root, store.load_grants(paths.project))
+    trees = _skill_scopes(paths.project, pol, paths.repo_root, store.load_grants(paths.project))
+    # Under `[skills] user_roots` a run drives a copy outside the project; say so,
+    # runnable or not, so the preview names what the sessions will load.
+    for found in install.skill_root_findings(paths.project, trees):
+        if (found.detail or {}).get("origin") == "user":
+            print(
+                f"note: {found.message} — `[skills] user_roots = true` in policy.toml",
+                file=sys.stderr,
+            )
     problems = [
         p.message
         for p in install.missing_base_skills(paths.project, trees)
@@ -2978,8 +3087,11 @@ def _require_base_skills(
     older install must fail loudly here rather than HALT `no stories.yaml`-style at
     dispatch time. ``require_tickets`` likewise probes it for the ticket-tree
     route tickets mode dispatches through. ``review_owed`` keeps the review tree
-    gated (`_skill_trees`)."""
-    skill_trees = _skill_trees(project, pol, root, grants, review_owed=review_owed)
+    gated (`_skill_scopes`).
+
+    Every question is asked of the same scopes ``cmd_validate`` builds, so a skill
+    resolved from a user root under ``[skills] user_roots`` passes both alike."""
+    skill_trees = _skill_scopes(project, pol, root, grants, review_owed=review_owed)
     findings = install.missing_base_skills(project, skill_trees)
     # A skill linked out of the repo is refused here rather than escalated mid-run,
     # where worktree seeding would skip it.
@@ -3008,10 +3120,10 @@ def _triage_trees(project: Path, pol) -> list[str]:
     """The skill tree the triage adapter reads — where a sweep dispatches
     ``/bmad-loop-sweep``. A list (empty or one entry) so it composes with the
     ``Sequence[str]`` probes; an unloadable profile is skipped exactly as
-    :func:`_skill_trees` skips one, since an unknown adapter name is the policy
+    :func:`_skill_scopes` skips one, since an unknown adapter name is the policy
     loader's problem, not the skill probe's.
 
-    Separate from :func:`_skill_trees` on purpose, not a widening of it: that
+    Separate from :func:`_skill_scopes` on purpose, not a widening of it: that
     helper's role set is the one `WorktreeFlow.worktree_profiles` provisions and
     every question it answers is a dev-primitive one (see its docstring)."""
     from .adapters.profile import ProfileError, get_profile
@@ -3091,7 +3203,7 @@ def _validate_stories_folder(
     return None
 
 
-def _all_resolve(project: Path, trees: list[str]) -> bool:
+def _all_resolve(project: Path, trees: list[SkillScope]) -> bool:
     """Every tree resolves a dev primitive — the precondition for a dispatch-probe ok
     line, since the probes skip an unresolved tree rather than report it."""
     return all(install.resolve_dev_primitive(project, tree) is not None for tree in trees)
@@ -3101,7 +3213,7 @@ def _validate_stories_queue(
     project: Path,
     paths: bmadconfig.ProjectPaths,
     spec_folder: str,
-    skill_trees: list[str],
+    skill_trees: list[SkillScope],
     report: ValidationReport,
 ) -> None:
     """Stories-mode counterpart of ``cmd_validate``'s sprint-status gate: validate
@@ -3144,7 +3256,7 @@ def _validate_stories_queue(
         report.ok(
             "skills.stories-dispatch",
             f"{' + '.join(probed)} supports folder+id dispatch (stories mode)",
-            {"trees": list(dict.fromkeys(skill_trees)), "dev_primitive": probed},
+            {"trees": _tree_names(skill_trees), "dev_primitive": probed},
         )
     report.extend(stories_probs)
 
@@ -3370,7 +3482,7 @@ def _validate_sprint_mode_queue(
     project: Path,
     paths: bmadconfig.ProjectPaths,
     spec_folder: str,
-    dev_trees: list[str],
+    dev_trees: list[SkillScope],
     report: ValidationReport,
     probes: bool,
     pol,
@@ -3402,7 +3514,7 @@ def _validate_stories_mode_queue(
     project: Path,
     paths: bmadconfig.ProjectPaths,
     spec_folder: str,
-    dev_trees: list[str],
+    dev_trees: list[SkillScope],
     report: ValidationReport,
     probes: bool,
     pol,
@@ -3419,7 +3531,7 @@ def _validate_tickets_mode_queue(
     project: Path,
     paths: bmadconfig.ProjectPaths,
     spec_folder: str,
-    dev_trees: list[str],
+    dev_trees: list[SkillScope],
     report: ValidationReport,
     probes: bool,
     pol,
@@ -3456,7 +3568,7 @@ def _validate_tickets_mode_queue(
         report.ok(
             "skills.tickets-dispatch",
             f"{' + '.join(probed)} dispatches from the ticket tree (tickets mode)",
-            {"trees": list(dict.fromkeys(dev_trees)), "dev_primitive": probed},
+            {"trees": _tree_names(dev_trees), "dev_primitive": probed},
         )
     report.extend(tickets_probs)
 
@@ -3466,7 +3578,9 @@ def _validate_tickets_mode_queue(
 # `validate --probes`.
 _QUEUE_VALIDATORS: dict[
     str,
-    Callable[[Path, bmadconfig.ProjectPaths, str, list[str], ValidationReport, bool, Any], None],
+    Callable[
+        [Path, bmadconfig.ProjectPaths, str, list[SkillScope], ValidationReport, bool, Any], None
+    ],
 ] = {
     worksource.SOURCE_SPRINT: _validate_sprint_mode_queue,
     worksource.SOURCE_STORIES: _validate_stories_mode_queue,
@@ -8272,15 +8386,22 @@ def _resolve_epic_close(
         from .adapters.profile import ProfileError, get_profile
 
         try:
-            tree = get_profile(pol.adapter.resolved("dev").name, project).skill_tree
+            # located as the session will load it: a user-root copy counts under
+            # `[skills] user_roots`, exactly as the run's own sessions resolve one
+            epic_scope = skill_locate.scope_for(
+                get_profile(pol.adapter.resolved("dev").name, project),
+                resolve_user=pol.skills.user_roots,
+            )
         except ProfileError as e:
             print(
                 f"cannot resolve {run_id}: cannot load the dev adapter profile: {e}",
                 file=sys.stderr,
             )
             return 1
-        skill = project / tree / resolve.EPIC_CLOSE_SKILL / "SKILL.md"
-        if tree and not skill.is_file():
+        skill = project / epic_scope.tree / resolve.EPIC_CLOSE_SKILL / "SKILL.md"
+        if epic_scope.tree and (
+            skill_locate.locate(project, epic_scope, resolve.EPIC_CLOSE_SKILL) is None
+        ):
             print(
                 f"cannot resolve {run_id}: the dev adapter's skill tree has no "
                 f"{skill.as_posix()} — close epic {slug} by hand and commit it, then: "
@@ -8358,6 +8479,7 @@ def _resolve_epic_close(
                     prompt,
                     model=dev_cfg.model,
                     effort=dev_cfg.effort,
+                    skill_dir=skill_locate.prompt_skill_dir(project, epic_scope, prompt),
                 )
             except NotImplementedError:
                 print(

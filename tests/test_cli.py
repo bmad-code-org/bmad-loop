@@ -83,6 +83,11 @@ from bmad_loop.plugins.store import load_grants
 STORIES_SPEC_FOLDER = "_bmad-output/epic-1"
 
 
+def _gated_trees(project, pol, root, grants, **kwargs):
+    """The primary tree names of the scopes the preflight gates on."""
+    return [scope.tree for scope in cli._skill_scopes(project, pol, root, grants, **kwargs)]
+
+
 def _stories_entry(story_id, **over):
     d = {"id": story_id, "title": f"Story {story_id}", "description": "does a thing"}
     d.update(over)
@@ -470,7 +475,7 @@ def test_dry_run_banner_stays_silent_for_a_warning_only_finding(project, capsys)
         'id = "adversarial"\n'
         'instruction = "Invoke the `bmad-review` skill with only the `adversarial` lens."\n'
     )
-    for tree in cli._skill_trees(project.project, pol, project.project, GrantSet.empty()):
+    for tree in _gated_trees(project.project, pol, project.project, GrantSet.empty()):
         primitive = project.project / tree / install.DEV_PRIMITIVE_NEW
         (primitive / "customize.toml").write_text(layer, encoding="utf-8")
 
@@ -480,7 +485,7 @@ def test_dry_run_banner_stays_silent_for_a_warning_only_finding(project, capsys)
     (custom / f"{install.DEV_PRIMITIVE_NEW}.toml").write_text("not = [toml\n", encoding="utf-8")
 
     findings = install.missing_base_skills(
-        project.project, cli._skill_trees(project.project, pol, project.project, GrantSet.empty())
+        project.project, _gated_trees(project.project, pol, project.project, GrantSet.empty())
     )
     severities = {f.severity for f in findings}
     assert severities == {"warning"}, f"fixture no longer produces a warning-only set: {findings}"
@@ -23085,7 +23090,7 @@ REVIEW_DISABLED_POLICY = DUAL_CLIENT_POLICY + "[review]\nenabled = false\n"
 def test_require_base_skills_does_not_gate_a_triage_only_skill_tree(project):
     """A triage CLI on its own skill tree must not be able to refuse a run.
 
-    ``_skill_trees`` iterates :data:`install.DEV_PRIMITIVE_ROLES` (dev, review), not
+    ``_skill_scopes`` iterates :data:`install.DEV_PRIMITIVE_ROLES` (dev, review), not
     :data:`runsetup.ROLES` (dev, review, triage). Every skill this preflight asks
     about — the dev primitive and the review layers its step-04 invokes inline — is
     one only a dev or review session dispatches, and ``WorktreeFlow`` only ever
@@ -23096,7 +23101,7 @@ def test_require_base_skills_does_not_gate_a_triage_only_skill_tree(project):
     ``--force``. Triage's only prompt is ``/bmad-loop-sweep``, which ships in this
     wheel and is laid down by ``bmad-loop init``.
 
-    Ablation: point ``_skill_trees`` back at ``ROLES`` and the ``is True`` below goes
+    Ablation: point ``_skill_scopes`` back at ``ROLES`` and the ``is True`` below goes
     False — nothing installed ``.agents/skills/bmad-build-auto``, and nothing ever
     will."""
     from bmad_loop.install import DEV_PRIMITIVE_ROLES
@@ -23110,7 +23115,7 @@ def test_require_base_skills_does_not_gate_a_triage_only_skill_tree(project):
     # ...because triage's tree was never asked about. Asserting the whole list, not
     # `".agents/skills" not in`: the point is which trees ARE gated, and an empty
     # list would satisfy the negative form while gating nothing at all.
-    assert cli._skill_trees(project.project, pol, project.project, GrantSet.empty()) == [
+    assert _gated_trees(project.project, pol, project.project, GrantSet.empty()) == [
         ".claude/skills"
     ]
 
@@ -23179,7 +23184,7 @@ def _break_plugin_discovery(root: Path) -> None:
         "discovery-fault",
     ],
 )
-def test_skill_trees_drop_review_only_when_no_review_session_can_spawn(
+def test_skill_scopes_drop_review_only_when_no_review_session_can_spawn(
     project, extra_policy, arrange, expected
 ):
     """``review.enabled = false`` drops the review tree only when nothing can still
@@ -23202,7 +23207,7 @@ def test_skill_trees_drop_review_only_when_no_review_session_can_spawn(
     # Asserting the whole list, not `".agents/skills" not in`: an empty list would
     # satisfy the negative form while gating nothing at all.
     assert (
-        cli._skill_trees(project.project, pol, project.project, load_grants(project.project))
+        _gated_trees(project.project, pol, project.project, load_grants(project.project))
         == expected
     )
 
@@ -23213,7 +23218,7 @@ def test_require_base_skills_passes_review_off_without_the_review_tree(project):
     tree — the preflight passes. Enabling tea (three review-role workflows) gates
     ``.agents/skills`` again.
 
-    Ablation: with `_skill_trees` reverted to gate both `DEV_PRIMITIVE_ROLES` trees
+    Ablation: with `_skill_scopes` reverted to gate both `DEV_PRIMITIVE_ROLES` trees
     unconditionally (the `_review_tree_gated` check removed), the first
     ``is True`` goes False — nothing installed ``.agents/skills/bmad-build-auto``."""
     _write_policy(project.project, REVIEW_DISABLED_POLICY)
@@ -23366,7 +23371,7 @@ def test_launch_judges_review_plugins_under_the_code_root(
         assert agents_fails, err
 
 
-def test_skill_trees_with_review_on_never_read_plugins(project, monkeypatch):
+def test_skill_scopes_with_review_on_never_read_plugins(project, monkeypatch):
     """``review.enabled = true`` gates both trees without consulting plugins at all:
     a discovery walk that would raise is never reached."""
     from bmad_loop.plugins import registry as registry_mod
@@ -23378,7 +23383,7 @@ def test_skill_trees_with_review_on_never_read_plugins(project, monkeypatch):
     _write_policy(project.project, DUAL_CLIENT_POLICY)
     pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
     assert pol.review.enabled is True
-    assert cli._skill_trees(project.project, pol, project.project, GrantSet.empty()) == [
+    assert _gated_trees(project.project, pol, project.project, GrantSet.empty()) == [
         ".claude/skills",
         ".agents/skills",
     ]
@@ -23395,7 +23400,7 @@ def test_skill_trees_with_review_on_never_read_plugins(project, monkeypatch):
 def test_gated_trees_are_a_subset_of_provisioned_trees(project, policy_text, gated_trees):
     """Gated ⊆ provisioned, pinned from BOTH sides rather than asserted in a comment.
 
-    ``cli._skill_trees`` decides which trees can REFUSE a run;
+    ``cli._skill_scopes`` decides which trees can REFUSE a run;
     ``WorktreeFlow.worktree_profiles`` decides which profiles get carried INTO a
     worktree. A tree gated but not provisioned drops the session into the
     `Unknown command` stall the preflight exists to catch, so gating may never
@@ -23425,7 +23430,7 @@ def test_gated_trees_are_a_subset_of_provisioned_trees(project, policy_text, gat
         for role in ROLES
     }
 
-    gated = cli._skill_trees(project.project, pol, project.project, GrantSet.empty())
+    gated = _gated_trees(project.project, pol, project.project, GrantSet.empty())
     provisioned = {
         p.skill_tree
         for p in WorktreeFlow.worktree_profiles(SimpleNamespace(_adapters_get=lambda: adapters))
@@ -24019,7 +24024,7 @@ def test_validate_reports_an_orphaned_legacy_override_as_a_warning(project, caps
 def test_validate_does_not_gate_a_triage_only_skill_tree(project, capsys, monkeypatch):
     """validate's verdict and run's abort are now one decision, on the same trees.
 
-    ``cmd_validate`` builds its trees through the same ``_skill_trees`` the real
+    ``cmd_validate`` builds its trees through the same ``_skill_scopes`` the real
     preflight calls, so a triage CLI on its own tree can no more fail validate than
     it can abort a run. Before that, ``cmd_validate`` passed
     ``[p.skill_tree for p in profiles]`` — every loaded profile, triage included —
@@ -29133,3 +29138,211 @@ def test_sweep_store_source_judges_a_v7_sweep_as_a_tickets_run(project_v7):
     assert cli._sweep_store_source(v7, pol) == "tickets"
     v6 = dataclasses.replace(v7, era="v6", active_initiative="", initiative_folder=None)
     assert cli._sweep_store_source(v6, pol) == "sprint-status"
+
+
+# ---- [skills] user_roots: validate and preflight resolve user-root skills -------
+
+CODEX_USER_ROOTS_POLICY = '[adapter]\nname = "codex"\nmodel = "gpt-5"\n'
+USER_ROOTS_ON = "\n[skills]\nuser_roots = true\n"
+
+
+def _user_skill_home(monkeypatch, tmp_path, tree):
+    """A home whose ``tree`` (``.agents/skills``, ...) holds the dev primitive and
+    review skills, pinned as the locator's home."""
+    from bmad_loop import skill_locate
+
+    home = tmp_path / "home"
+    install_build_auto_skill(home, tree)
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    return home
+
+
+def _global_only_codex(project, monkeypatch, capsys, tmp_path):
+    """codex on every role, the build skill only in `~/.agents/skills`, every other
+    validate gate green."""
+    _user_skill_home(monkeypatch, tmp_path, ".agents/skills")
+    _make_validate_pass(
+        project, monkeypatch, capsys, policy=CODEX_USER_ROOTS_POLICY, skills=lambda root: None
+    )
+    monkeypatch.setattr(probe_mod, "binary_version_text", lambda *_a, **_kw: "codex-cli 9.0.0")
+
+
+def _set_user_roots(project, on):
+    text = CODEX_USER_ROOTS_POLICY + (USER_ROOTS_ON if on else "")
+    _write_policy(project.project, text)
+    return policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+
+def test_user_roots_switch_validate_and_preflight_agree(project, capsys, monkeypatch, tmp_path):
+    """A global-only install: switch on, validate passes with `skills.root` naming
+    `~/.agents/skills` and the preflight passes; switch off, both refuse, and the
+    finding offers the switch.
+
+    Ablation (performed): stop passing `pol.skills.user_roots` to `scope_for` in
+    `_scoped_profiles` and the switch-on leg reports base-missing and FAILS."""
+    _global_only_codex(project, monkeypatch, capsys, tmp_path)
+    grants = load_grants(project.project)
+
+    pol = _set_user_roots(project, True)
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys)
+    roots = [f for f in doc["findings"] if f["check"] == "skills.root"]
+    primitive = next(f for f in roots if f["detail"]["skill"] == "bmad-build-auto")
+    assert primitive["severity"] == "ok"
+    assert primitive["detail"] == {
+        "profile": "codex",
+        "tree": ".agents/skills",
+        "skill": "bmad-build-auto",
+        "root": "~/.agents/skills",
+        "origin": "user",
+    }
+    assert doc["counts"]["problem"] == 0
+    assert cli._require_base_skills(project.project, pol, project.project, grants) is True
+    assert "skills.root" not in capsys.readouterr().err  # never printed as a warning
+
+    pol = _set_user_roots(project, False)
+    assert cli._require_base_skills(project.project, pol, project.project, grants) is False
+    assert "`[skills] user_roots = true`" in capsys.readouterr().err
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+    missing = next(
+        f
+        for f in doc["findings"]
+        if f["check"] == "skills.base-missing" and f["detail"]["skill"] == "bmad-build-auto"
+    )
+    assert missing["detail"]["outside"] == "~/.agents/skills/bmad-build-auto"
+    assert "`[skills] user_roots = true`" in missing["message"]
+    assert not [f for f in doc["findings"] if f["check"] == "skills.root"]
+
+
+def test_user_roots_dry_run_notes_the_user_root(project, capsys, monkeypatch, tmp_path):
+    """The dry-run preview says which skill a run would load from a user root."""
+    _global_only_codex(project, monkeypatch, capsys, tmp_path)
+    _set_user_roots(project, True)
+    capsys.readouterr()
+
+    assert cli.main(["run", "--project", str(project.project), "--dry-run"]) == 0
+
+    err = capsys.readouterr().err
+    assert "note: bmad-build-auto resolves from ~/.agents/skills/bmad-build-auto (user root)" in err
+    assert "NOT runnable" not in err
+
+
+@pytest.mark.parametrize("on", [False, True], ids=["switch-off", "switch-on"])
+def test_user_roots_claude_shadow(project, capsys, monkeypatch, tmp_path, on):
+    """claude runs a personal `~/.claude/skills` copy over the project's: switch off
+    the preflight warns about the shadow; switch on it resolves the user copy and
+    has nothing to warn about."""
+    from bmad_loop import install
+
+    _user_skill_home(monkeypatch, tmp_path, ".claude/skills")
+    install_build_auto_skill(project.project, ".claude/skills")
+    _write_policy(project.project, CLAUDE_ONLY_POLICY + (USER_ROOTS_ON if on else ""))
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+
+    assert cli._require_base_skills(project.project, pol, project.project, GrantSet.empty()) is True
+    err = capsys.readouterr().err
+    scopes = cli._skill_scopes(project.project, pol, project.project, GrantSet.empty())
+    origins = {
+        f.detail["origin"]
+        for f in install.skill_root_findings(project.project, scopes)
+        if f.detail["skill"] == "bmad-build-auto"
+    }
+    if on:
+        assert "warning:" not in err
+        assert origins == {"user"}
+    else:
+        assert "warning:" in err and "~/.claude/skills/bmad-build-auto" in err
+        assert origins == {"project"}
+
+
+def _user_root_report(project, policy_text, home_tree, monkeypatch, tmp_path, versions):
+    from bmad_loop.checks import ValidationReport
+
+    _user_skill_home(monkeypatch, tmp_path, home_tree)
+    _write_policy(project.project, policy_text)
+    pol = policy_mod.load(project.project / ".bmad-loop" / "policy.toml")
+    report = ValidationReport()
+    profiles = cli._scoped_profiles(project.project, pol, project.project, GrantSet.empty())
+    cli._report_skill_roots(report, project.project, pol, profiles, versions)
+    return {f.check: f for f in report.findings}
+
+
+@pytest.mark.parametrize(
+    ("text", "warned"), [("1.19.0", True), ("opencode v2.0.27", False)], ids=["v1", "v2"]
+)
+def test_user_roots_opencode_v1_warns(project, monkeypatch, tmp_path, text, warned):
+    """opencode 1.x cannot load a user-root skill (its spawn refuses), so validate
+    warns; 2.x allows it. The version is the one `_check_opencode_version` parsed.
+
+    Ablation (performed): drop the `version[0] < 2` branch and the v1 row FAILS."""
+    from bmad_loop.checks import ValidationReport
+
+    monkeypatch.setattr(probe_mod, "binary_version_text", lambda *_a, **_kw: text)
+    version = cli._check_opencode_version(ValidationReport(), "opencode", "/usr/bin/opencode")
+    findings = _user_root_report(
+        project,
+        OPENCODE_QUALIFIED_POLICY + USER_ROOTS_ON,
+        ".config/opencode/skills",
+        monkeypatch,
+        tmp_path,
+        {"opencode": version},
+    )
+    if warned:
+        detail = findings["skills.user-root-unsupported"].detail
+        assert (detail["profile"], detail["version"]) == ("opencode", "1.19.0")
+        assert "bmad-build-auto" in detail["skills"]
+    else:
+        assert "skills.user-root-unsupported" not in findings
+    assert findings["skills.root"].detail["origin"] == "user"
+
+
+@pytest.mark.parametrize("mode", ["sandboxed", "bypass"])
+def test_user_roots_sandboxed_warns(project, monkeypatch, tmp_path, mode):
+    """A sandboxed role loading a user-root skill is warned about; bypass is not."""
+    findings = _user_root_report(
+        project,
+        f'[adapter]\nname = "claude"\npermission_mode = "{mode}"\n' + USER_ROOTS_ON,
+        ".claude/skills",
+        monkeypatch,
+        tmp_path,
+        {},
+    )
+    if mode == "sandboxed":
+        finding = findings["skills.user-root-sandboxed"]
+        assert finding.severity == "warning"
+        assert finding.detail["profile"] == "claude"
+        assert "bmad-build-auto" in finding.detail["skills"]
+    else:
+        assert "skills.user-root-sandboxed" not in findings
+
+
+def test_resolve_epic_close_finds_the_skill_in_a_user_root(project, capsys, monkeypatch, tmp_path):
+    """bmad-agent-po only in `~/.claude/skills`: with `[skills] user_roots` on the
+    epic-close session launches, told where the skill is; off, it is refused."""
+    from bmad_loop import skill_locate
+
+    home = tmp_path / "home"
+    skill = home / ".claude" / "skills" / "bmad-agent-po" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bmad-agent-po\n---\n", encoding="utf-8")
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    _run_dir, resumed = _epic_close_run(project, monkeypatch, capsys)
+    _fake_epic_tree(monkeypatch, project, "done")
+    dirs: list[str | None] = []
+    _prompts, _claims = _epic_close_session(project, monkeypatch, lambda _prompt: 0, skill=False)
+    from bmad_loop import resolve
+
+    stub = resolve.run_epic_close_session
+
+    def capture(*a, skill_dir=None, **kw):
+        dirs.append(skill_dir)
+        return stub(*a, **kw)
+
+    monkeypatch.setattr(resolve, "run_epic_close_session", capture)
+
+    assert _resolve_epic_interactive(project, "--resume") == 1  # switch off: refused
+    assert dirs == [] and "bmad-agent-po/SKILL.md" in capsys.readouterr().err
+
+    policy = project.project / ".bmad-loop" / "policy.toml"
+    policy.write_text(policy.read_text(encoding="utf-8") + USER_ROOTS_ON, encoding="utf-8")
+    _resolve_epic_interactive(project, "--resume")
+    assert dirs == [str(skill.parent)], capsys.readouterr().err
