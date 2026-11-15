@@ -165,8 +165,11 @@ reviewers that copy will actually invoke — which on current sources is none at
   `auto`) picks the set a run launches. `validate` reads every enabled lens in both
   sets, because `auto`, an invocation's `--set workflow.review=…` and bmad-loop's own
   `[tickets] thorough_review` can each select either one. The shipped lenses invoke no
-  skill, so a v7 tree requires no review skill. Any other `review` value is
-  `skills.review-selection-invalid`, because the primitive HALTs every run on it.
+  skill, so a v7 tree requires no review skill. Any other `review` value, a non-string
+  one included, is `skills.review-selection-invalid`, because the primitive HALTs
+  every run on it. An override v7 cannot load (invalid TOML, or a lens `id`/`code`
+  that is not a non-empty string) is a `skills.customize-unreadable` problem rather
+  than a warning: v7 refuses to render the dev skill with it.
   `validate` reports `skills.review-layers-empty` when the configured set has no
   enabled lens: the `quick` or `thorough` set itself, or both sets under `auto`. A
   `review = "none"` run launches no lens, so empty sets pass. A `review_layers`

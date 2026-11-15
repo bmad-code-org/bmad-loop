@@ -12864,26 +12864,41 @@ def test_v7_auto_selection_needs_one_enabled_set(tmp_path):
 
 
 @pytest.mark.parametrize("key", ["id", "code"])
-def test_v7_lens_override_with_unhashable_key_is_reported_not_raised(tmp_path, key):
-    """A list- or table-valued merge key cannot index the keyed merge; the preflight
-    reports the override as unreadable instead of crashing with TypeError, and the
-    file is left out whole. Ablation: drop the `_MalformedMergeKey` guard and this
-    raises TypeError out of missing_base_skills."""
+@pytest.mark.parametrize("value", ['["quick"]', "{ a = 1 }", "1", '""'])
+def test_v7_lens_override_with_malformed_key_is_reported_not_raised(tmp_path, key, value):
+    """v7's loader accepts only a non-empty string merge key and refuses to render
+    the skill otherwise; the preflight reports the override as a problem instead of
+    crashing with TypeError on an unhashable key, and leaves the file out whole.
+    Ablation: drop the `_MalformedMergeKey` guard and the array/table cases raise
+    TypeError out of missing_base_skills while the int/empty cases go clean."""
     tree = _lens_tree(tmp_path)
     shipped = LENS_CUSTOMIZE if key == "id" else LENS_CUSTOMIZE.replace("\nid = ", "\ncode = ")
     _lens_tree(tmp_path, shipped)
     _write_override(
         tmp_path,
-        f'[[workflow.quick_lenses]]\n{key} = ["quick"]\ninstruction = ""\n',
+        f'[[workflow.quick_lenses]]\n{key} = {value}\ninstruction = ""\n',
         skill=DEV_PRIMITIVE_NEW,
     )
 
     findings = missing_base_skills(tmp_path, [tree])
 
-    assert [(f.check, f.severity) for f in findings] == [("skills.customize-unreadable", "warning")]
+    assert [(f.check, f.severity) for f in findings] == [("skills.customize-unreadable", "problem")]
+    assert "fails to start" in findings[0].message
     resolved = resolve_review_layers(tmp_path, tree)
     assert resolved is not None
     assert "quick" in resolved.active_sets
+
+
+def test_v7_unparseable_override_is_a_problem(tmp_path):
+    """v7 renders the dev skill through a strict loader that raises on invalid TOML
+    in an override, so no dev run starts; the layer-era warning would let the run
+    preflight pass. Ablation: report it as a warning on every tree and this fails."""
+    tree = _lens_tree(tmp_path)
+    _write_override(tmp_path, "this is not = valid toml [[[", skill=DEV_PRIMITIVE_NEW)
+
+    findings = missing_base_skills(tmp_path, [tree])
+
+    assert [(f.check, f.severity) for f in findings] == [("skills.customize-unreadable", "problem")]
 
 
 def test_v7_all_lenses_disabled_with_review_none_is_clean(tmp_path):
@@ -12918,6 +12933,22 @@ def test_v7_invalid_review_selection_is_a_problem(tmp_path):
     override.write_text('[workflow]\nreview = "deep"\n', encoding="utf-8")
     problems = missing_base_skills(tmp_path, [tree])
     assert [p.check for p in problems] == ["skills.review-selection-invalid"]
+
+
+@pytest.mark.parametrize(
+    ("literal", "shown"), [("false", "false"), ("1", "1"), ('["quick"]', '["quick"]')]
+)
+def test_v7_non_string_review_selection_is_a_problem(tmp_path, literal, shown):
+    """A non-string `review` is not "unset": the override still replaces the shipped
+    value and the template HALTs on it. Ablation: drop non-string values in
+    `_review_selection_of` and the shipped `quick` wins, reporting nothing."""
+    tree = _lens_tree(tmp_path)
+    _write_override(tmp_path, f"[workflow]\nreview = {literal}\n", skill=DEV_PRIMITIVE_NEW)
+
+    problems = missing_base_skills(tmp_path, [tree])
+
+    assert [p.check for p in problems] == ["skills.review-selection-invalid"]
+    assert problems[0].detail["selection"] == shown
 
 
 def test_review_layers_shape_still_wins_over_lenses(tmp_path):

@@ -498,10 +498,20 @@ def _lens_sets_of(data: Any) -> dict[str, list[Any]]:
 
 
 def _review_selection_of(data: Any) -> str | None:
-    """``workflow.review`` when it is a string, else None."""
+    """``workflow.review`` as text, or None only when the key is absent.
+
+    A present non-string value (``review = false``) is not dropped: v7's template
+    HALTs on it like on any unknown word, so it comes back as its TOML literal
+    (``false``, ``1``, ``["quick"]``). That text never equals a valid selection —
+    those are bare words only a string can produce — so the caller reports it.
+    """
     workflow = data.get("workflow") if isinstance(data, dict) else None
-    selection = workflow.get("review") if isinstance(workflow, dict) else None
-    return selection if isinstance(selection, str) else None
+    if not isinstance(workflow, dict) or "review" not in workflow:
+        return None
+    selection = workflow["review"]
+    if isinstance(selection, str):
+        return selection
+    return json.dumps(selection, default=str)
 
 
 # BMAD's own merge keys for arrays of tables, in detection precedence order.
@@ -509,9 +519,9 @@ _KEYED_MERGE_FIELDS = ("code", "id")
 
 
 class _MalformedMergeKey(ValueError):
-    """An array of tables keys on a value that cannot identify an entry (a TOML
-    array or table, e.g. ``id = ["quick"]``) — BMAD v7's resolver rejects the whole
-    customization on it rather than merging."""
+    """An array of tables keys on a value that cannot identify an entry (anything but
+    a non-empty string, e.g. ``id = ["quick"]`` or ``id = 1``) — BMAD v7's resolver
+    rejects the whole customization on it rather than merging."""
 
 
 def _keyed_merge_field(items: list[Any]) -> str | None:
@@ -540,14 +550,15 @@ def _merge_layer_arrays(base: list[Any], override: list[Any]) -> list[Any]:
     opts into one (matching keys replace in place, new keys append), plain
     concatenation otherwise.
 
-    Raises :class:`_MalformedMergeKey` when the chosen key holds an array or table:
-    it cannot index the merge, and a bare ``TypeError`` would crash the preflight.
+    Raises :class:`_MalformedMergeKey` when the chosen key holds anything but a
+    non-empty string, as v7's ``_detect_keyed_merge_field`` raises ``ConfigError`` —
+    and an array or table key would otherwise crash the preflight with ``TypeError``.
     """
     key = _keyed_merge_field(base + override)
     if key is None:
         return base + override
     for item in base + override:
-        if isinstance(item[key], (list, dict)):
+        if not isinstance(item[key], str) or not item[key]:
             raise _MalformedMergeKey(f"`{key}` = {item[key]!r} is not a valid array-entry key")
     result: list[Any] = []
     index_by_key: dict[Any, int] = {}
@@ -596,13 +607,14 @@ def _merged_review_layers(project: Path, tree: str, skill: str) -> _MergedReview
     absent or unparseable — the one case that genuinely means "shape unknown", so
     the caller falls back to the static catalog.
 
-    An unparseable OVERRIDE is not that case: BMAD's resolver warns and treats it
-    as empty, still resolving every other layer. Matching that keeps the preflight
-    agreeing with the run; the broken file is reported separately as a warning.
+    An unparseable OVERRIDE is not that case: the layer-era resolver warns and
+    treats it as empty, still resolving every other layer, so the preflight leaves
+    it out the same way and reports it separately — a warning there, a problem on
+    a v7 tree, whose strict loader refuses to render the skill at all.
 
     The lens sets merge exactly as the layers do, each set on its own (BMAD's
     resolver deep-merges each array of tables by its key), and ``workflow.review``
-    is a scalar: the last string value wins.
+    is a scalar: the last value wins, string or not.
 
     The shape is decided by the SHIPPED file, not the merge: a v7 run reads only the
     lens sets, so a ``review_layers`` override left over from a v6 install is inert
@@ -2154,14 +2166,21 @@ def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> l
         return fallback
     findings: list[Finding] = []
     for rel in resolved.unreadable:
+        # v7 renders the primitive through `render_skill.py`, whose strict loader
+        # raises on this file, so no dev run starts; the layer-era resolver skipped it.
+        v7 = bool(resolved.lens_sets)
+        consequence = (
+            "BMAD v7 refuses to render the dev skill with it, so every dev run fails to start"
+            if v7
+            else "this project's review layers resolve without it"
+        )
         findings.append(
             Finding(
                 "skills.customize-unreadable",
-                "warning",
+                "problem" if v7 else "warning",
                 f"{rel} could not be read as a customize override (invalid TOML, or an "
-                f"array entry whose `id`/`code` is an array or table) — this project's "
-                f"review layers resolve without it here, and BMAD v7's resolver rejects "
-                f"it outright; fix the file or remove it",
+                f"array entry whose `id`/`code` is not a non-empty string) — "
+                f"{consequence}; fix the file or remove it",
                 {"tree": tree, "file": rel},
             )
         )
