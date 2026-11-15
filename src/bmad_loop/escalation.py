@@ -370,6 +370,16 @@ def no_work_pause_reason(role: str, result: SessionResult) -> str:
     )
 
 
+# The reason prefix of a silent-hook-channel pause (#752). One constant, because
+# the reason builder, `pause_title` and the CLI's resume/resolve gates
+# (``resolve --adopt-result`` admits only this pause, DW-642) all key on it.
+HOOK_CHANNEL_SILENT_PREFIX = "hook channel silent: "
+
+# The reason prefix of a refused ``resolve --adopt-result`` adoption (DW-642): the
+# sweep engine re-validated the confirmed triage artifact at resume and refused it.
+ADOPT_REJECTED_PREFIX = "adopt rejected: "
+
+
 def hook_channel_silent_pause_reason(role: str, result: SessionResult) -> str:
     """The pause reason for a non-completed session whose hook channel stayed
     silent (#752): ``hook channel silent: <role> session <status> (...)``.
@@ -384,7 +394,7 @@ def hook_channel_silent_pause_reason(role: str, result: SessionResult) -> str:
     init is the wrong fix. "Commit before resume" because a dirty migration
     resume resets the checkout and would revert an uncommitted hook-config fix."""
     return (
-        f"hook channel silent: {session_failure_reason(role, result)} (no hook event "
+        f"{HOOK_CHANNEL_SILENT_PREFIX}{session_failure_reason(role, result)} (no hook event "
         "of any kind arrived for this attempt — the CLI's hook relay may be "
         "unregistered, untrusted, or running without the window's BMAD_LOOP_* "
         "environment; run `bmad-loop validate`, commit any hook-config fix before "
@@ -392,9 +402,53 @@ def hook_channel_silent_pause_reason(role: str, result: SessionResult) -> str:
     )
 
 
+def noncompletion_verdict(result: SessionResult) -> tuple[str, str] | None:
+    """Why a non-completed session did not complete, for a site that does not
+    pause on it (DW-644): ``(verdict, note)``, or None when ``result`` completed
+    or carries no classified cause.
+
+    Diagnostic only. The auto-retro failure sites journal ``verdict`` on
+    ``retro-auto-failed`` (``noncompletion``) and lead their notice with
+    ``note``; routing is unchanged, nothing pauses, retries or charges on it.
+    The precedence mirrors the engine's pause arms — ``env-fault`` > ``parked``
+    > ``no-work`` > ``hook-channel-silent`` — and the evidence sources are
+    theirs, so the vocabulary matches the ``pause_title`` kinds. The pause
+    reasons themselves are not reused: they tell the operator to resume or
+    resolve and say the attempt is not charged, both false for a best-effort
+    session that never paused. A usage-limited result keeps its ``env-fault`` /
+    ``parked`` verdict, but its note names the usage limit, as
+    ``env_fault_pause_reason`` / ``parked_pause_reason`` do."""
+    if result.status == "completed":
+        return None
+    if result.env_fault or result.parked:
+        verdict = "env-fault" if result.env_fault else "parked"
+        if result.usage_limited:
+            resets = f"; resets {result.usage_limit_resets}" if result.usage_limit_resets else ""
+            return verdict, f"usage limit: {result.usage_limited}{resets}"
+        if result.env_fault:
+            return verdict, f"environment fault: {env_fault_detail(result)}"
+        evidence = result.parked_evidence or "parked-session signal"
+        return verdict, f"parked: {evidence}; the CLI was waiting on a human"
+    if not result.produced_work:
+        return (
+            "no-work",
+            "no work produced: no completed turn or qualifying activity was observed; "
+            "the CLI may be waiting on a human (a permission prompt, a login, a confirmation)",
+        )
+    if result.hook_channel_silent:
+        return (
+            "hook-channel-silent",
+            "hook channel silent: no hook event of any kind arrived; the CLI's hook relay "
+            "may be unregistered, untrusted, or running without the window's BMAD_LOOP_* "
+            "environment (run `bmad-loop validate`)",
+        )
+    return None
+
+
 def pause_title(reason: str, story_key: str, *, env_fault_site: str | None = None) -> str:
     """The notification title for an escalation pause, classified by the reason's
     prefix (#727): a parked, no-work, usage-limit, hook-channel-silent (#752),
+    adopt-rejected (DW-642: a confirmed triage adoption refused at resume),
     session-failed (#752: a session that never completed, capped) or
     environment-fault pause is a human-needed stop but not a CRITICAL
     contradiction, and titling it as one sends the operator hunting for a spec
@@ -410,8 +464,10 @@ def pause_title(reason: str, story_key: str, *, env_fault_site: str | None = Non
         kind = "no work"
     elif reason.startswith("usage limit: "):
         kind = "usage limit"
-    elif reason.startswith("hook channel silent: "):
+    elif reason.startswith(HOOK_CHANNEL_SILENT_PREFIX):
         kind = "hook channel silent"
+    elif reason.startswith(ADOPT_REJECTED_PREFIX):
+        kind = "adopt rejected"
     elif reason.startswith("session failed: "):
         kind = "session failed"
     elif reason.startswith("environment fault: ") or env_fault_site is not None:

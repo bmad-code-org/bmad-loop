@@ -107,6 +107,8 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - Every dev and review session ends as `timeout` after `[limits] session_timeout_min` (default 90).
   - A session that did no work, or is still parked on a prompt only a human should answer when it stalls or times out, pauses the run instead of being charged; a non-blocking workflow's is journaled and the run continues.
   - A session that times out or stalls before any hook event of any kind reached it, on a CLI that maps `SessionStart`, pauses uncharged with a `hook channel silent:` reason pointing at `bmad-loop validate`; the fault is the relay, not the work, and its `result.json` is never read as a completion. This covers dev, review, fix, blocking-workflow, sweep triage and migration sessions.
+  - With `[limits] session_start_exit = true` (default off), such a session ends at `[limits] session_start_grace_s` (default 120 s) instead of running to the timeout, and takes the same uncharged pauses: `hook channel silent:`, or `parked:` / `no work produced:` when its pane shows a parked prompt or never changed.
+  - `resolve --adopt-result` shows a silent sweep triage attempt's `result.json` and, only on an explicit `y`, has the resumed sweep use it as the triage plan instead of relaunching triage; a result that carries a CRITICAL escalation is never adopted; the sweep first re-checks its sha256 and validates it against the live ledger, and pauses `adopt rejected:` when it no longer fits.
   - A sweep triage or migration that reaches its attempt cap without its last session completing pauses as `session failed:`, not as a validation failure, and a non-completed attempt hands the next one no new `--feedback`.
   - `run`, `sweep` and `resume` warn on stderr, and journal `hook-relay-unregistered`, when a role's project hook config does not register the relay; the launch is never refused.
   - A session approved past its permission prompt that then goes silent gets the stall nudge, not a parked pause.
@@ -118,7 +120,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - A dev relaunch runs the `[environment]` probes first; a failing probe rolls a kept tree back as any retry does, then pauses the run at the `environment` stage with the relaunch still uncharged, and `resume` re-probes before relaunching. In place with `[scm] rollback_on_failure = false`, a kept tree with uncommitted work and no attempt commits pauses for manual rollback instead.
   - In relaunch mode the session ends at the limit instead of waiting for its reset, a Claude Code `rate_limit` error naming no known limit counts as one, and the relaunched session gets `BMAD_LOOP_USAGE_RELAUNCH=<n>` so a wrapper can switch accounts.
   - Before an attempt is reset, its commits go to an `attempt-preserve/<run>-<tip8>` branch and uncommitted work to a `refs/attempt-preserve-dirty/*` snapshot.
-- **Config:** `[limits] max_dev_attempts`, `[limits] max_review_cycles`, `[limits] session_timeout_min`, `[limits] dev_stall_grace_s`, `[limits] dev_stall_nudges`, `[limits] dev_stall_nudges_cap`, `[limits] quota_wait_max_min`, `[limits] usage_limit_action`, `[limits] max_usage_relaunches`, `[scm] preserve_keep`
+- **Config:** `[limits] max_dev_attempts`, `[limits] max_review_cycles`, `[limits] session_timeout_min`, `[limits] dev_stall_grace_s`, `[limits] dev_stall_nudges`, `[limits] dev_stall_nudges_cap`, `[limits] quota_wait_max_min`, `[limits] session_start_exit`, `[limits] usage_limit_action`, `[limits] max_usage_relaunches`, `[scm] preserve_keep`
 - **Tested by:** `tests/test_escalation.py`, `tests/test_engine.py`, `tests/test_generic_tmux.py`, `tests/test_panematch.py`, `tests/test_sweep.py`, `tests/test_verify.py`, `tests/test_recovery_flow.py`, `tests/test_stories_e2e.py`, `tests/test_cli.py`
 - **Docs:** [Preserved attempts](escalations-guide.md#preserved-attempts), [Usage-limit pauses](escalations-guide.md#usage-limit-pauses), [Silent hook channel pauses](escalations-guide.md#silent-hook-channel-pauses), [Account rotation](plugin-authoring-guide.md#account-rotation), [StopFailure signals](adapter-authoring-guide.md#stopfailure-signals), [[limits] reference](reference/configuration.md#limits), [[scm] reference](reference/configuration.md#scm)
 
@@ -139,10 +141,10 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 ### Typed escalations and resolve
 
 - **Stability:** stable
-- **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, or adopting a kept branch, and closes a tickets epic at an `epic-boundary` pause.
+- **Description:** Sessions report escalations as CRITICAL, which pauses the run for a human, or PREFERENCE, which is only journaled. `bmad-loop resolve` clears a CRITICAL pause by re-arming the story, re-verifying work that was kept, adopting a kept branch, or adopting a silent sweep triage attempt's result, and closes a tickets epic at an `epic-boundary` pause.
 - **Properties:**
   - A CRITICAL escalation marks the story `escalated`, sends a `CRITICAL escalation: <story>` notice and pauses the run at `escalation`.
-  - A pause that is not a CRITICAL contradiction is titled by its reason: `Paused (parked prompt): <story>`, `Paused (no work): <story>`, `Paused (usage limit): <story>`, `Paused (hook channel silent): <story>`, `Paused (session failed): <story>` or `Paused (environment fault): <story>`.
+  - A pause that is not a CRITICAL contradiction is titled by its reason: `Paused (parked prompt): <story>`, `Paused (no work): <story>`, `Paused (usage limit): <story>`, `Paused (hook channel silent): <story>`, `Paused (session failed): <story>`, `Paused (adopt rejected): <story>` or `Paused (environment fault): <story>`.
   - A PREFERENCE escalation is journaled as `preference-escalation` and the run continues.
   - A story still escalated after a resume cleared the pause can still be resolved; `resume`, `status` and the TUI header point at it.
   - A resume that fails before its engine starts puts back the pause it cleared.
@@ -151,7 +153,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `--reverify` re-runs `[verify]` on a deferred or environment-fault story's kept work without a dev session; on a finished run it replays a kept worktree unit in a new run.
   - In tickets mode the re-arm moves the ticket's plan through `tickets.py mark` and clears its `blocked_*` fields.
   - On a tickets `epic-boundary` pause, resolve opens bmad-agent-po on the epic and resumes only when the epic reads `done` or `dropped` with its folder committed; otherwise it exits 1 with the run still paused.
-- **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`, `--at-reset`, `--margin-min`
+- **Config:** `bmad-loop resolve --story`, `--no-interactive`, `--restore-patch`, `--adopt-branch`, `--adopt-result`, `--reverify`, `--resume` / `--no-resume`, `--force`, `--abandon`, `--at-reset`, `--margin-min`
 - **Tested by:** `tests/test_engine.py`, `tests/test_cli.py`, `tests/test_escalation.py`, `tests/test_resolve.py`, `tests/test_runs.py`, `tests/test_tui_app.py`, `tests/test_tickets_source.py`, `tests/test_tickets_e2e.py`
 - **Docs:** [Escalations](escalations-guide.md#escalations), [Resolving an escalation](escalations-guide.md#resolving-an-escalation), [Replay a finished run's kept unit](escalations-guide.md#resolve-reverify-finished), [Abandon a replay run](escalations-guide.md#abandon-a-replay-run), [Resolve in tickets mode](escalations-guide.md#resolve-in-tickets-mode), [Epic closure in tickets mode](escalations-guide.md#epic-closure-in-tickets-mode), [resolve CLI reference](reference/cli.md#resolve)
 
@@ -232,6 +234,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - `auto` runs `/bmad-retrospective -H <epic>` on the `[adapter.retro]` role (falling back to the base `[adapter]` when that is unset), before the per-epic auto-sweep.
   - An auto retro succeeds only if the session completed, result.json says done, the board reads done and a retro doc exists. It is then committed as `chore(retro): epic N retrospective`.
   - A failed or refused auto retro (unless already done) tells you to run it by hand and never fails the run. If it leaves uncommitted changes, the run pauses at the epic boundary.
+  - When a failed auto retro's session did not complete for a classified cause (hook channel silent, environment fault, parked or no work), the notice names it and `retro-auto-failed` records it as `noncompletion`. A plain crash or stall carries neither. This is diagnostic only: the run neither pauses nor retries on it.
   - The retro doc's verdict is reported in the done notice. A `rejected` verdict sends an extra attention notice, and the run continues.
   - In tickets mode `auto` runs `/bmad-retrospective -H <epic-slug>`, and whatever the `retrospective` value the run pauses at `epic-boundary` for you to close the epic with bmad-agent-po. A `rejected` verdict pauses again at every pick while the epic stays open.
 - **Config:** `[gates] retrospective`, `[adapter.retro] name` / `model` / `effort` / `extra_args`
@@ -341,7 +344,7 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
   - codex runs with `--no-daemon` (Codex ≥ 0.156), so tools and hooks see the session's `BMAD_LOOP_*` environment; `validate` reports an older Codex or a profile that drops the flag as `adapter.codex-version`.
   - `bmad-loop probe-adapter <cli>` does a zero-launch scan by default. `--probe` opts in to one live, content-free turn. Every report is sanitized before it is printed.
   - Antigravity (experimental) reports token usage from its transcript (checked against agy 1.4.9; 1.1.3 writes none), subagents included, but not the model. Under worktree isolation, it trusts each unit worktree only when the project root is already trusted.
-- **Config:** `[adapter] name`; `[limits] session_start_grace_s`; `bmad-loop probe-adapter <cli> --probe`; `bmad-loop probe-adapter <cli> --workspace <path>`; `bmad-loop adapters`
+- **Config:** `[adapter] name`; `[limits] session_start_grace_s`, `session_start_exit`; `bmad-loop probe-adapter <cli> --probe`; `bmad-loop probe-adapter <cli> --workspace <path>`; `bmad-loop adapters`
 - **Tested by:** `tests/test_profile.py`, `tests/test_probe.py`, `tests/test_adapter_registry.py`, `tests/test_workspace_trust.py`, `tests/test_codex_trust.py`, `tests/test_generic_tmux.py`, `tests/test_cli.py`
 - **Docs:** [Choosing which CLIs to drive](setup-guide.md#choosing-which-clis-to-drive), [Codex shared app-server daemon](setup-guide.md#codex-shared-app-server-daemon), [Adapter authoring guide: finalizing a profile](adapter-authoring-guide.md#walkthrough-finalizing-a-profile), [CLI reference: probe-adapter](reference/cli.md#probe-adapter), [CLI reference: adapters](reference/cli.md#adapters)
 

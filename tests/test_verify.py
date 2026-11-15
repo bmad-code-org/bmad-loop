@@ -178,6 +178,35 @@ def test_file_bytes_at_revision_distinguishes_blob_absence_tree_and_git_failure(
         verify.worktree_file_bytes_at_revision(repo, "not-a-revision", "oracle/spec.bin")
 
 
+def _commit_one(repo, rel: str, text: str | None, message: str) -> str:
+    """Write (or, for ``None``, delete) ``rel``, commit it, and return HEAD."""
+    path = repo / rel
+    if text is None:
+        git(repo, "rm", "-q", rel)
+    else:
+        path.write_text(text, encoding="utf-8")
+        git(repo, "add", rel)
+    git(repo, "commit", "-q", "-m", message)
+    return verify.rev_parse_head(repo)
+
+
+def test_path_entry_unchanged_between_compares_one_tree_entry(project):
+    """DW-646's HEAD probe: True only when the path's tree entry (or its absence)
+    is identical at both revisions; a git failure raises, never "unchanged"."""
+    repo = project.project
+    base = _commit_one(repo, "ledger.md", "one\n", "ledger")
+    unrelated = _commit_one(repo, "other.txt", "x\n", "unrelated")
+    changed = _commit_one(repo, "ledger.md", "two\n", "ledger edit")
+    removed = _commit_one(repo, "ledger.md", None, "ledger removed")
+
+    assert verify.path_entry_unchanged_between(repo, base, unrelated, "ledger.md")
+    assert not verify.path_entry_unchanged_between(repo, base, changed, "ledger.md")
+    assert not verify.path_entry_unchanged_between(repo, changed, removed, "ledger.md")
+    assert not verify.path_entry_unchanged_between(repo, base, unrelated, "other.txt")
+    with pytest.raises(verify.GitError):
+        verify.path_entry_unchanged_between(repo, base, "not-a-revision", "ledger.md")
+
+
 def test_worktree_file_bytes_at_revision_applies_checkout_eol_filters(project):
     """The live-baseline oracle materializes bytes as Git checkout would.
 

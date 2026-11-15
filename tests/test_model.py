@@ -737,6 +737,8 @@ def test_session_record_tokens_by_model_round_trip_and_default():
         ("migration_ledger_rival", True, False),
         # DW-436: the validation-retry rejection latch
         ("migration_rewrite_rejected", True, False),
+        # DW-646: the uncharged-pause rewrite digest
+        ("migration_uncharged_rewrite", "sha256:" + "a" * 64, None),
         ("followup_reviews_spent", 2, 0),
         ("resolved_redrive", True, False),
         ("plan_checkpoint_pending", True, False),
@@ -756,6 +758,7 @@ def test_session_record_tokens_by_model_round_trip_and_default():
         "migration_commit_escalated",
         "migration_ledger_rival",
         "migration_rewrite_rejected",
+        "migration_uncharged_rewrite",
         "followup_reviews_spent",
         "resolved_redrive",
         "plan_checkpoint_pending",

@@ -346,6 +346,31 @@ def test_list_window_ids_transport_failure_still_raises(monkeypatch):
         PsmuxMultiplexer().list_window_ids("s")
 
 
+@pytest.mark.parametrize("listed", ["", "\n", "  \r\n"])
+def test_an_exit_zero_empty_listing_raises_rather_than_reading_as_gone(monkeypatch, listed):
+    # psmux's client prints whatever it read and exits 0 when the reply drops
+    # (v3.4.0), and a live psmux session is never windowless. `[]` would tell
+    # the liveness probe the CLI crashed and the prune that its kills landed.
+    _window_fake(monkeypatch, listed=listed)
+    mux = PsmuxMultiplexer()
+    with pytest.raises(MultiplexerError, match="exited 0 with no rows"):
+        mux.list_window_ids("s")
+    with pytest.raises(MultiplexerError, match="exited 0 with no rows"):
+        mux.window_alive("s", "s:@1")
+
+
+def test_a_proved_gone_session_still_lists_empty(monkeypatch):
+    # The raise covers exit-0 silence only: a session psmux says is gone keeps
+    # its `[]`, so a prune can still report a real kill as removed.
+    def gone(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="psmux: no server running on session 's'"
+        )
+
+    monkeypatch.setattr(tmux_base.subprocess, "run", gone)
+    assert PsmuxMultiplexer().list_window_ids("s") == []
+
+
 # --------------------------------------------------------------- new_session
 
 

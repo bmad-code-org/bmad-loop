@@ -76,7 +76,7 @@ from .adapters.generic import PARKED_PROMPT_MATCH_TIMEOUT_S
 from .adapters.multiplexer import MultiplexerError, TerminalMultiplexer, get_multiplexer
 from .adapters.panematch import Hit, MatchTimeout, match_rows, screen_rows
 from .adapters.profile import CLIProfile
-from .install import gated_hook_events, merge_hooks, relay_registered
+from .install import gated_hook_events, merge_hooks, read_relay_registration
 from .process_host import ProcessHostError, get_process_host
 
 # cmd_probe catches `probe.LeakDetected` around the renderers, mirroring
@@ -534,19 +534,30 @@ def infer_token_schema(
 # --------------------------------------------------------------- hook config
 
 
-def _hooks_registered(project: Path, profile: CLIProfile) -> bool:
-    config_path = project / profile.hooks.config_path
-    if not config_path.is_file():
-        return False
-    import json
+def _hooks_registered(project: Path, profile: CLIProfile) -> tuple[bool, str | None]:
+    """``(registered, fault)`` for the bmad-loop relay over the profile's events.
 
+    It goes through :func:`install.read_relay_registration`, the same reader
+    ``validate``'s ``hooks.*`` checks and the launch relay warning use, so it reads
+    only ``project / profile.hooks.config_path``: project-only is the contract. A
+    relay registered in a user- or local-scope settings file (or a CLI's
+    managed-policy/plugin hooks) is not seen here, though the CLI may still merge
+    it; ``bmad-loop init --cli <profile>`` registers the relay in the project
+    config.
+
+    ``fault`` names a broken config — invalid JSON, a non-object top level,
+    malformed handlers for a declared event, or an unreadable file (named only by
+    exception type) — behind the project-relative config path, never an absolute
+    one (the report's egress check refuses home-rooted paths). A fault reads as
+    unregistered. A missing file is unregistered with no fault."""
+    rel_path = profile.hooks.config_path
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-    if not isinstance(config, dict):
-        return False
-    return relay_registered(config, profile.hooks.dialect, profile.hooks.events)
+        registration = read_relay_registration(project, profile)
+    except (OSError, ValueError) as error:
+        return False, f"{rel_path} could not be read ({type(error).__name__})"
+    if registration.fault_detail is not None:
+        return False, f"{rel_path} {registration.fault_detail}"
+    return registration.registered, None
 
 
 def _check_hook_trust(
@@ -666,12 +677,22 @@ def scan(
         )
 
     if profile is not None:
-        finding.registered = _hooks_registered(project, profile)
+        finding.registered, hook_fault = _hooks_registered(project, profile)
         _check_hook_trust(finding, project, profile, binary)
-        if not finding.registered:
+        if hook_fault is not None:
+            finding.warnings.append(f"project hook config {hook_fault}")
             finding.next_steps.append(
-                f"hooks not registered in {profile.hooks.config_path}; "
-                f"`bmad-loop init --cli {cli}` to validate the dialect end-to-end, "
+                f"fix the project hook config: {hook_fault}; then `bmad-loop init --cli "
+                f"{cli}` against this project registers the relay there, or re-run "
+                "with --probe"
+            )
+        elif not finding.registered:
+            finding.next_steps.append(
+                "hooks not registered in the project hook config "
+                f"{profile.hooks.config_path} (only this file is read: a relay in "
+                "user- or local-scope settings, managed policy or plugin hooks reads "
+                f"as unregistered); `bmad-loop init --cli {cli}` against this project "
+                "registers the relay there so a run validates the dialect end-to-end, "
                 "or re-run with --probe"
             )
 

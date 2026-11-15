@@ -122,10 +122,24 @@ breaking changes may land in a minor release.
   `read_only` voids a reusable verify pass, and the gate declines `plugin-hook`.
 - Warn on stderr at `run`, `sweep` and `resume`, and journal `hook-relay-unregistered`
   per role, when a role's project hook config does not register the bmad-loop relay;
-  never refuses the launch (#752).
+  never refuses the launch (#752). It reads only the project hook config and says so.
+- Add `resolve --adopt-result` for a sweep paused `hook channel silent:` on triage: show
+  the attempt's `result.json` and, on an explicit `y` (never skipped), have the resumed
+  sweep use it as the triage plan after re-checking its sha256 and validating it against
+  the live ledger; a result carrying a CRITICAL escalation is never adopted, and a
+  refused adoption pauses `adopt rejected:`.
+- Add opt-in `[limits] session_start_exit` (default off): a session whose CLI maps
+  SessionStart and that delivers no hook event of any kind by `session_start_grace_s`
+  ends there non-completed and takes the existing uncharged pauses
+  (`hook channel silent:`, or `parked:` / `no work produced:` when the pane shows a
+  parked prompt or never changed) instead of waiting out `session_timeout_min`.
 
 ### Changed
 
+- Name the project hook config in `validate`'s `hooks.registered` problem and
+  `probe-adapter`'s unregistered-hooks next step, and state the contract: only the
+  project config is read, where `bmad-loop init` registers the relay; a user- or
+  local-scope registration is not seen.
 - **Require Codex 0.156 or newer.** Codex sessions run with `--no-daemon`, so tools and
   hooks see the session's `BMAD_LOOP_*` environment instead of a shared app-server
   daemon's (`validate`: `adapter.codex-version`). A session whose CLI sends no
@@ -177,6 +191,10 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Stop reading an empty psmux window listing as a dead session. psmux can drop a live
+  server's reply and exit 0 with nothing, which the liveness probe took for a crashed CLI
+  and the control-window prune for a verified kill. That listing now counts as a failed
+  probe: the session runs on and the prune reports the kill as undetermined.
 - Open agent task windows detached, so a tmux config `run` or `run-shell` that fails or
   prints when bmad-loop starts the server lands in view-mode on the session's `shell`
   window instead of the agent's pane, where it refused every wake nudge and TUI answer
@@ -296,6 +314,18 @@ breaking changes may land in a minor release.
 - Stop blaming validation for a sweep session that never completed: its cap reads
   `session failed:`, and the next attempt gets no `--feedback` claiming its output
   failed validation (#752).
+- Name why a failed auto retrospective's session did not complete (hook channel silent,
+  environment fault, parked or no work) in its notice and on `retro-auto-failed`
+  (`noncompletion`), instead of a generic failure.
+- Put the pre-migration ledger back on `bmad-loop resume` after a sweep migration paused
+  uncharged (environment fault, parked, no work, hook channel silent) over a ledger its
+  session rewrote or deleted, and restart the migration, instead of refusing until the
+  ledger is restored by hand. A ledger edited or committed since the pause still refuses,
+  as does native Windows.
+- Report a broken project hook config in `probe-adapter`'s scan (invalid JSON, unreadable,
+  not a JSON object, or malformed handlers for a declared event) as a config fault with a
+  next step to fix it, instead of an unregistered relay blamed on user- or local-scope
+  settings. `validate` also reports a non-object config as `hooks.config-parse`.
 
 ### Security
 

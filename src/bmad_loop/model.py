@@ -610,6 +610,15 @@ class StoryTask:
     # for PENDING, re-stamped False on every migrate escalation; pre-upgrade
     # tasks default to no latch (today's fail-closed escalation).
     migration_rewrite_rejected: bool = False
+    # DW-646: digest of the ledger an UNCHARGED migration pause (env-fault,
+    # parked, no-work, hook-channel-silent) left behind — ``"absent"`` for a
+    # deleted ledger, else ``"sha256:<hex>"``. Those pauses fire before any
+    # restore, so the session's rewrite stays live; an ESCALATED resume whose
+    # live ledger still matches this digest (no commit since changed it) puts the
+    # pre-migration baseline back by compare-and-set instead of refusing.
+    # Set by the uncharged arms only, cleared on each redispatch and when the
+    # restart leaves ESCALATED; pre-upgrade tasks default to no latch.
+    migration_uncharged_rewrite: str | None = None
     # DW-317: stable identity of one migration completion, minted fresh in the
     # same save that records DONE (a re-migration mints a new one). Hooks see it
     # as ``ctx.delivery_id`` / ``BMAD_LOOP_DELIVERY_ID`` to deduplicate the
@@ -1052,6 +1061,7 @@ class StoryTask:
             "migration_commit_escalated": self.migration_commit_escalated,
             "migration_ledger_rival": self.migration_ledger_rival,
             "migration_rewrite_rejected": self.migration_rewrite_rejected,
+            "migration_uncharged_rewrite": self.migration_uncharged_rewrite,
             "migration_delivery_id": self.migration_delivery_id,
             "migration_delivery_pending": self.migration_delivery_pending,
             "migration_delivery_counts": (
@@ -1315,6 +1325,11 @@ class StoryTask:
             migration_commit_escalated=bool(d.get("migration_commit_escalated", False)),
             migration_ledger_rival=bool(d.get("migration_ledger_rival", False)),
             migration_rewrite_rejected=bool(d.get("migration_rewrite_rejected", False)),
+            migration_uncharged_rewrite=(
+                str(d["migration_uncharged_rewrite"])
+                if d.get("migration_uncharged_rewrite") is not None
+                else None
+            ),
             migration_delivery_id=(
                 str(d["migration_delivery_id"])
                 if d.get("migration_delivery_id") is not None

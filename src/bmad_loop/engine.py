@@ -53,6 +53,7 @@ from .escalation import (
     env_fault_pause_reason,
     hook_channel_silent_pause_reason,
     no_work_pause_reason,
+    noncompletion_verdict,
     parked_pause_reason,
     pause_title,
     preference_escalations,
@@ -12646,12 +12647,19 @@ class Engine:
                 self._notify_retro_rejected(epic, verdict_doc)
         else:
             extra = {} if raised is None else {"error": str(raised)}
+            # Why the session did not complete (DW-644), diagnostic only: a silent
+            # hook channel or an environment fault must not read as a generic failure.
+            nc = None if result is None else noncompletion_verdict(result)
+            lead = ""
+            if nc is not None:
+                extra["noncompletion"] = nc[0]
+                lead = f"{nc[1]}; "
             self.journal.append("retro-auto-failed", epic=epic, errors=errors, **extra)
             gates.notify(
                 self.policy,
                 self.run_dir,
                 "auto retrospective failed",
-                f"epic {epic}: {'; '.join(errors)} — run /bmad-retrospective for epic "
+                f"epic {epic}: {lead}{'; '.join(errors)} — run /bmad-retrospective for epic "
                 f"{epic} by hand",
             )
         self._settle_retro_tree(epic, ok, docs)

@@ -74,7 +74,7 @@ Rules that span methods:
 
 - `new_window(session, name, cwd, env, command)`: run `command` with `env` layered on; return the native window id.
 - `new_parked_window(session, name, cwd, argv, return_opt)`: run `argv`, print `PARKED_BANNER`, park on a key, then return any attached client via `return_opt`.
-- `list_window_ids(session)`: same id form as `new_window`. Answer `[]` only for an empty listing or a proved-gone session; otherwise raise.
+- `list_window_ids(session)`: same id form as `new_window`. Answer `[]` only for an empty listing or a proved-gone session; otherwise raise. A tmux-family leaf whose client can exit 0 with nothing for a live session sets `_EMPTY_LISTING_IS_AN_ANSWER = False`, so that empty listing raises too (psmux does).
 - `list_windows(session, fields)`: one tuple per window in field order; best-effort `[]` on failure.
 - `window_alive(session, window_id)`: `True` while the window is listed AND its pane is alive; a window the multiplexer keeps listed after its pane exited (`remain-on-exit on`) is not alive. Membership alone is `list_window_ids`. Raise when liveness cannot be known; never answer `False` for that.
 - `kill_window(target)`: tolerate the window already being gone; no-op on a transport failure.
@@ -146,8 +146,13 @@ Both modes emit the same sanitized finding: markdown on stdout, or a file with `
 
 Runs `<binary> --version` and `--help`, finds the newest existing session transcript by
 convention, reads the declared hook config, and infers the token schema from the
-transcript. Use it first for any CLI that already has a profile or that you have run by
-hand.
+transcript. The hook check reads only the project hook config (the profile's
+`config_path`), not user- or local-scope settings, managed policy or plugin hooks, so a
+relay registered only there reports as unregistered; `bmad-loop init --cli <profile>`
+registers it in the project config. A broken project config (invalid JSON, unreadable,
+not a JSON object, or malformed handlers for a declared event) is reported as a config
+fault, with a warning and its own next step to fix that file. Use it first for any CLI
+that already has a profile or that you have run by hand.
 
 #### PROBE (`--probe`, opt-in live capture)
 

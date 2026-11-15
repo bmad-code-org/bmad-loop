@@ -119,6 +119,7 @@ from .engine import (
     SpecWriteReason,
     _retro_auto_prompt,
 )
+from .escalation import noncompletion_verdict
 from .frontmatter import frontmatter_fault, is_frontmatter_only, parse_frontmatter, status_of
 from .model import (
     PAUSE_EPIC_BOUNDARY,
@@ -904,12 +905,18 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         else:
             verdict = RETRO_VERDICT_UNKNOWN
             extra = {} if raised is None else {"error": str(raised)}
+            # Why the session did not complete (DW-644), diagnostic only.
+            nc = None if result is None else noncompletion_verdict(result)
+            lead = ""
+            if nc is not None:
+                extra["noncompletion"] = nc[0]
+                lead = f"{nc[1]}; "
             self.journal.append("retro-auto-failed", epic=0, epic_ref=slug, errors=errors, **extra)
             gates.notify(
                 self.policy,
                 self.run_dir,
                 "auto retrospective failed",
-                f"{slug}: {'; '.join(errors)} — run /bmad-retrospective -H {slug} by hand",
+                f"{slug}: {lead}{'; '.join(errors)} — run /bmad-retrospective -H {slug} by hand",
             )
         self._settle_retro_tree(0, ok, docs, epic_ref=slug)
         return verdict

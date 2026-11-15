@@ -12,6 +12,7 @@ gates on the ones it delegates (verify.verify_review_bundle).
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, NoReturn, TypeVar, assert_never
 
 from . import deferredwork, gates, sprintstatus, ticketstore, verify
-from .adapters.generic import load_result_document
+from .adapters.generic import _result_path, load_result_document, parse_result_document
 from .bmadconfig import ProjectPaths
 from .codex_trust import DAEMON_ENV_HINT
 from .engine import (
@@ -37,6 +38,8 @@ from .engine import (
     _session_task_id,
 )
 from .escalation import (
+    ADOPT_REJECTED_PREFIX,
+    UsageLimitPause,
     critical_session_reason,
     display_critical_reason,
     env_fault_pause_reason,
@@ -100,6 +103,9 @@ class _MigrationRecordInvalid(Exception):
 
 
 TRIAGE_KEY = "sweep-triage"
+# Every cycle's triage task key: ``sweep-triage`` for cycle 1, ``sweep-triage-<n>``
+# after (`_ensure_triage`'s suffix).
+TRIAGE_KEY_RE = re.compile(r"^sweep-triage(?:-[1-9][0-9]*)?\Z")
 TRIAGE_WORKFLOW = "deferred-sweep-triage"
 MIGRATE_KEY = "sweep-migrate"
 MIGRATE_WORKFLOW = "deferred-sweep-migrate"
@@ -598,6 +604,70 @@ def _shown_value(value: Any) -> str:
     if value is None or isinstance(value, (str, int, float)):
         return repr(value)
     return f"a {type(value).__name__}"
+
+
+def adopt_marker_path(run_dir: Path, key: str) -> Path:
+    """Where ``resolve --adopt-result`` (DW-642) records the operator's confirmed
+    adoption of triage task ``key``'s result.json, for the resumed sweep engine to
+    consume. Named ``adopt-<key>.json`` so it never matches the ``triage*.json``
+    cache glob `decisions` reads."""
+    return run_dir / f"adopt-{key}.json"
+
+
+def triage_attempt_id(task: StoryTask) -> str:
+    """The session task id of ``task``'s current triage attempt — the id
+    `_run_session` minted for it, so its ``tasks/<id>/result.json`` is the
+    attempt's own artifact. Valid while the task still carries that attempt's
+    ``attempt``/``generation``, i.e. before the ESCALATED restart re-arms it."""
+    attempt_id = _session_task_id(task.story_key, "triage", task.attempt, task.generation)
+    return attempt_id
+
+
+def triage_artifact_path(run_dir: Path, task_id: str) -> Path:
+    """Where triage attempt ``task_id``'s ``result.json`` lives: the adapter's own
+    read-back location under ``<run_dir>/tasks``."""
+    return _result_path(run_dir / "tasks", task_id)
+
+
+@dataclass(frozen=True)
+class TriageArtifact:
+    """One read of a triage attempt's ``result.json`` (DW-642): the raw bytes'
+    sha256 and the stat taken on the same open file, plus the parsed document."""
+
+    path: Path
+    sha256: str
+    mtime_ns: int
+    size: int
+    doc: dict[str, Any]
+
+
+def read_triage_artifact(run_dir: Path, task_id: str) -> TriageArtifact | None:
+    """Read ``<run_dir>/tasks/<task_id>/result.json`` once, hashing and parsing the
+    same bytes: None when no regular file is there; ``OSError``, ``ValueError``
+    (undecodable, unparseable, a non-object top level) or ``RecursionError`` for a
+    present document the completion read-back would refuse
+    (`parse_result_document`). The parsed document is not validated."""
+    path = triage_artifact_path(run_dir, task_id)
+    # `stat()` + `S_ISREG` as `load_result_document` does (DW-224).
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not stat.S_ISREG(mode):
+        return None
+    with path.open("rb") as handle:
+        st = os.fstat(handle.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        raw = handle.read()
+    doc = parse_result_document(raw.decode("utf-8"))
+    return TriageArtifact(
+        path=path,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        mtime_ns=st.st_mtime_ns,
+        size=len(raw),
+        doc=doc,
+    )
 
 
 def validate_triage(
@@ -1399,6 +1469,15 @@ def _hook_verdict(kinds: set[str]) -> str:
     if "SessionStart" in kinds:
         return "session-start-without-stop"
     return "no-session-start-or-stop"
+
+
+def _ledger_digest(text: str | None) -> str:
+    """The DW-646 uncharged-pause latch value for one ledger read: ``"absent"``
+    for a deleted ledger (distinct from an emptied one), else ``"sha256:<hex>"``
+    of its UTF-8 bytes."""
+    if text is None:
+        return "absent"
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _diagnostic_suffix(diagnostic: dict[str, Any] | None) -> str:
@@ -3649,6 +3728,133 @@ class SweepEngine(Engine):
         task.migration_rewrite_rejected = False
         super()._escalate(task, reason)
 
+    def _pause_uncharged_migration(
+        self,
+        task: StoryTask,
+        reason: str,
+        rewrite: str | None,
+        usage_limit: UsageLimitPause | None,
+    ) -> NoReturn:
+        """Pause the migration uncharged, latching the ledger its session left (DW-646).
+
+        The env-fault, parked, no-work and hook-channel-silent arms pause BEFORE
+        the restore, so a session that rewrote the ledger leaves that rewrite
+        live. ``migration_uncharged_rewrite`` records its digest in the same
+        save that records ESCALATED, so :meth:`_hold_escalated_migration` can
+        tell "nothing changed since the pause" from a later edit and put the
+        pre-migration baseline back on a plain resume. ``usage_limit`` rides
+        out on the ``RunPaused`` as in ``Engine._escalate_session``.
+        """
+        task.migration_uncharged_rewrite = _ledger_digest(rewrite)
+        self._escalate_session(task, reason, usage_limit)
+        raise AssertionError("migration escalation returned")
+
+    def _ledger_untouched_since_baseline(self, task: StoryTask, head: str) -> bool:
+        """Whether the commits from the task baseline to ``head`` left the ledger's
+        tree entry alone (DW-646). The silent-channel remedy is "commit the fix,
+        resume", which moves HEAD without touching the ledger; a commit OF the
+        ledger (the session's rewrite included) must not be overwritten. A proven
+        external ledger is no revision's to change. A resolution or probe fault
+        answers False: uncertainty never authorizes the write. Each fault is
+        journaled as ``ledger-baseline-probe-failed``, as
+        ``Engine._ledger_baseline_text`` does, so the refusal is attributable."""
+        assert task.baseline_commit
+        rel, fault = self._ledger_rel()
+        if rel is None:
+            if fault is not None:
+                self.journal.append(
+                    "ledger-baseline-probe-failed", story_key=task.story_key, error=str(fault)
+                )
+                return False
+            return True
+        try:
+            return verify.path_entry_unchanged_between(
+                self.workspace.root, task.baseline_commit, head, rel
+            )
+        except (verify.GitError, OSError, RuntimeError) as exc:
+            self.journal.append(
+                "ledger-baseline-probe-failed", story_key=task.story_key, error=str(exc)
+            )
+            return False
+
+    def _restore_uncharged_migration_rewrite(self, task: StoryTask, live: str | None) -> None:
+        """Put the pre-migration ledger back over an uncharged pause's rewrite (DW-646).
+
+        Runs only for a latched ``migration_uncharged_rewrite`` whose live ledger
+        holds no legacy entries. Each gate refuses loudly and mutates nothing:
+        HEAD must still equal the task baseline, or the commits above it must
+        have left the ledger alone (legacy text written over a committed ledger
+        would overwrite operator work and leave the restart a dirty tree over an
+        advanced HEAD); the
+        live ledger must still match the latched digest, and the baseline must
+        come from validated records (a DW-315 fallback host refuses there).
+        The write is a compare-and-set under ``ledger_lock``, pure text under
+        the hold. On return the existing ESCALATED restart re-enters the
+        migration with a fresh budget, and clears the latch.
+        """
+        remedy = (
+            "restore the pre-migration ledger, delete the migrate-* records in "
+            f"{self.run_dir}, then resume to re-enter the migration — or resolve "
+            "the escalation explicitly"
+        )
+        if task.baseline_commit:
+            head = self._migration_head(task)
+            if head != task.baseline_commit and not self._ledger_untouched_since_baseline(
+                task, head
+            ):
+                self._migration_evidence_failure(
+                    task,
+                    f"HEAD moved from the migration baseline {task.baseline_commit} to "
+                    f"{head} after the uncharged pause and the commits above the "
+                    "baseline changed the ledger (or that could not be verified), so a "
+                    f"plain resume will not write the pre-migration ledger over them; "
+                    f"{remedy}",
+                    own_remedy=True,
+                )
+        latch = task.migration_uncharged_rewrite
+        if _ledger_digest(live) != latch:
+            self._migration_evidence_failure(
+                task,
+                "live ledger changed after the uncharged pause (it no longer matches "
+                "the text the paused migration session left), so a plain resume will "
+                f"not overwrite it; {remedy}",
+                own_remedy=True,
+            )
+        baseline, _manifest = self._migration_baseline_and_manifest(task)
+        ledger = self.workspace.paths.deferred_work
+        diverged = False
+        wrote = False
+        with deferredwork.ledger_lock(ledger):
+            # PURE TEXT ONLY under the hold.
+            try:
+                current = deferredwork.read_for_write(ledger)
+            except (deferredwork.LedgerReadError, OSError):
+                current = None
+                diverged = True
+            if diverged:
+                pass
+            elif current == baseline:
+                pass
+            elif _ledger_digest(current) == latch:
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(ledger, baseline)
+                wrote = True
+            else:
+                diverged = True
+        if diverged:
+            self._migration_evidence_failure(
+                task,
+                "live ledger changed underneath the uncharged pause's restore, so a "
+                f"plain resume will not overwrite it; {remedy}",
+                own_remedy=True,
+            )
+        if wrote:
+            self.journal.append(
+                "sweep-migration-paused-rewrite-restored",
+                story_key=MIGRATE_KEY,
+                ledger=str(ledger),
+            )
+
     def _resume_escalated_migration_commit(self, task: StoryTask) -> None:
         """Retry the idempotent commit tail of a migration ESCALATED from COMMITTING.
 
@@ -3705,9 +3911,14 @@ class SweepEngine(Engine):
         the task, and both exits bypass this arm: a restored ``has_legacy``
         ledger returns here so the existing restart path re-enters the
         migration, and ``bmad-loop resolve`` re-arms the task out of ESCALATED.
-        Anything else — non-legacy, absent or unreadable — re-pauses through
-        ``_escalate``'s already-ESCALATED arm. No record is re-validated and no
-        git, ledger or task state is touched.
+        One exception (DW-646): an uncharged pause latched
+        ``migration_uncharged_rewrite``, and
+        :meth:`_restore_uncharged_migration_rewrite` puts the pre-migration
+        ledger back when nothing changed since the pause, then returns to that
+        same restart path. Anything else — non-legacy, absent or unreadable —
+        re-pauses through ``_escalate``'s already-ESCALATED arm. Outside that
+        restore no record is re-validated and no git, ledger or task state is
+        touched.
         """
         remedy = (
             "restore the pre-migration ledger, delete the migrate-* records in "
@@ -3725,6 +3936,9 @@ class SweepEngine(Engine):
                 own_remedy=True,
             )
         if live is not None and deferredwork.has_legacy(live):
+            return
+        if task.migration_uncharged_rewrite is not None:
+            self._restore_uncharged_migration_rewrite(task, live)
             return
         self._migration_evidence_failure(
             task,
@@ -4751,6 +4965,7 @@ class SweepEngine(Engine):
                 task.baseline_untracked = None
             task.migration_ledger_rival = False  # leaving ESCALATED consumes the latch
             task.migration_rewrite_rejected = False  # and this attempt's rejection
+            task.migration_uncharged_rewrite = None  # and its uncharged pause (DW-646)
             task.phase = Phase.PENDING  # deliberate reset, not a normal transition
         # DW-437/DW-440: two pre-dispatch guards, AFTER the whole entry chain so
         # they cover every path that reaches dispatch (fresh, PENDING-with-marker,
@@ -4888,6 +5103,7 @@ class SweepEngine(Engine):
             task.attempt += 1
             advance(task, Phase.TRIAGE_RUNNING)
             task.migration_rewrite_rejected = False  # DW-436: a new attempt, no rejection
+            task.migration_uncharged_rewrite = None  # DW-646: nor its uncharged pause
             self._save()
             launch_floor_ns = time.time_ns()
             result = self._run_session(
@@ -4946,18 +5162,20 @@ class SweepEngine(Engine):
                 # task.attempt to 0 — fresh budget) instead of charging a migration
                 # attempt. Escalate BEFORE the _safe_reset/attempt-cap path; that
                 # resume also restores the ledger if the worktree is dirty.
-                self._escalate_session(
+                self._pause_uncharged_migration(
                     task,
                     env_fault_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                    rewrite,
                     usage_limit_pause(result),
                 )
             if result.status != "completed" and result.parked:
                 # Parked on a human prompt (DW-348/DW-350): the stall nudge was
                 # withheld, so no rewrite ran — pause (fresh budget on resume)
                 # rather than charge a migration attempt, like the env-fault arm.
-                self._escalate_session(
+                self._pause_uncharged_migration(
                     task,
                     parked_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                    rewrite,
                     usage_limit_pause(result),
                 )
             if result.status != "completed" and not result.produced_work:
@@ -4965,9 +5183,11 @@ class SweepEngine(Engine):
                 # gate, so a prompt-blocked session waits out the timeout with
                 # `parked` unset and this is its only route to a pause. Fresh budget
                 # on resume, as for env_fault and parked, which outrank it.
-                self._escalate(
+                self._pause_uncharged_migration(
                     task,
                     no_work_pause_reason("migration", result) + _diagnostic_suffix(diagnostic),
+                    rewrite,
+                    None,
                 )
             if result.status != "completed" and result.hook_channel_silent:
                 # No hook event of any kind reached this attempt (#752): the relay
@@ -4975,10 +5195,12 @@ class SweepEngine(Engine):
                 # was never observable. Pause uncharged (fresh budget on resume, as
                 # for the arms above) instead of spending the cap on a channel
                 # fault; the result.json is never read as a completion here.
-                self._escalate(
+                self._pause_uncharged_migration(
                     task,
                     hook_channel_silent_pause_reason("migration", result)
                     + _diagnostic_suffix(diagnostic),
+                    rewrite,
+                    None,
                 )
             if not errors:
                 # This record is the durable proof that validation accepted the
@@ -5167,7 +5389,7 @@ class SweepEngine(Engine):
         still reach its retry/escalation decision."""
         # The id `_run_session` just minted for this attempt: the sweep dispatches
         # both legs as role "triage" with no label.
-        task_id = _session_task_id(task.story_key, "triage", task.attempt, task.generation)
+        task_id = triage_attempt_id(task)
         diagnostic: dict[str, Any] = {"task_id": task_id}
         # The adapter's own read-back location, which it clears at launch, so a
         # document there was written during this attempt.
@@ -5306,6 +5528,13 @@ class SweepEngine(Engine):
                     return plan
                 self.journal.append("sweep-triage-reload-failed", errors=errors)
 
+        # DW-642: an operator-confirmed adoption of the escalated attempt's own
+        # result.json, consumed before the ESCALATED restart below re-arms the
+        # attempt/generation the marker names.
+        adopted = self._consume_triage_adoption(triage_key, triage_path, open_now)
+        if adopted is not None:
+            return adopted
+
         task = self.state.tasks.get(triage_key)
         if task is None:
             task = StoryTask(story_key=triage_key, epic=0)
@@ -5403,55 +5632,7 @@ class SweepEngine(Engine):
                     + _diagnostic_suffix(diagnostic),
                 )
             if plan is not None:
-                advance(task, Phase.DONE)
-                self._save()
-                # Cache write failure must not discard this validated plan (DW-247).
-                # Use a WRITE kind: `sweep-triage-reload-failed` means an existing
-                # cache could not be read, not that a healthy triage could not save.
-                # With no usable cache, resume re-triages this cycle;
-                # `_publish_stranded_close` cannot recover its close at the no-open
-                # exit, and `bmad-loop decisions` cannot reconstruct its decisions.
-                # Written ATOMICALLY (DW-263): a short or refused write leaves either
-                # no cache or a complete one, never torn JSON — and the older bytes
-                # a transient read fault left behind were already unlinked in the
-                # reload arm above, so a refused write-back cannot leave a stale
-                # plan for the next resume to replay, except where that unlink was
-                # itself refused (`sweep-triage-cache-unlink-failed`) or the cache
-                # faulted at the metadata probe, whose arm does not unlink: there the
-                # older plan survives a refused write-back. A directory also reaches this
-                # catch: `os.replace` onto it raises `IsADirectoryError` on POSIX or
-                # `PermissionError` on Windows. Confined to the project root (#593,
-                # DW-269): the plain writer resolved `.bmad-loop/`, `runs/` and the
-                # run dir by name, so a link planted at any of them aimed the temp
-                # and the published cache out of the project. The root is the
-                # PROJECT that owns the run dir (`_decisions_phase` says why not
-                # `self.workspace.root`), not `self.run_dir` — a file confined
-                # against its own parent walks no components and refuses nothing.
-                # A refused parent reaches this catch as `UnconfinedWriteError`,
-                # itself an `OSError`, so it costs the cycle its cache and nothing
-                # else. `OSError` alone: unlike `atomic_write_text`, the confined
-                # helper never `resolve()`s, so DW-247's `RuntimeError` arm has
-                # nothing to catch here.
-                try:
-                    atomic_write_text_confined(
-                        triage_path,
-                        json.dumps(result.result_json, indent=2),
-                        confine_root=_project_of_run_dir(self.run_dir),
-                    )
-                except OSError as exc:
-                    self.journal.append(
-                        "sweep-triage-cache-write-failed", errors=[f"unwritable: {exc}"]
-                    )
-                self.journal.append(
-                    "sweep-triage-result",
-                    bundles=len(plan.bundles),
-                    decisions=len(plan.decisions),
-                    already_resolved=len(plan.already_resolved),
-                    blocked=len(plan.blocked),
-                    skip=len(plan.skip),
-                )
-                self._emit("post_triage", task)
-                return plan
+                return self._accept_triage_plan(task, plan, result.result_json, triage_path)
             if task.attempt >= self.policy.sweep.max_triage_attempts:
                 self._escalate(task, _cap_reason("triage", result, errors, task, diagnostic))
             if result.status == "completed":
@@ -5461,6 +5642,232 @@ class SweepEngine(Engine):
                     "The triage result.json failed deterministic validation:\n- "
                     + "\n- ".join(errors),
                 )
+
+    def _accept_triage_plan(
+        self, task: StoryTask, plan: TriagePlan, doc: dict[str, Any] | None, triage_path: Path
+    ) -> TriagePlan:
+        """Act on a validated triage plan: ``task`` to DONE, ``doc`` cached at
+        ``triage_path``, the ``sweep-triage-result`` row and the ``post_triage``
+        hook. Shared by a completed triage session and an adopted result (DW-642)."""
+        advance(task, Phase.DONE)
+        self._save()
+        # Cache write failure must not discard this validated plan (DW-247).
+        # Use a WRITE kind: `sweep-triage-reload-failed` means an existing
+        # cache could not be read, not that a healthy triage could not save.
+        # With no usable cache, resume re-triages this cycle;
+        # `_publish_stranded_close` cannot recover its close at the no-open
+        # exit, and `bmad-loop decisions` cannot reconstruct its decisions.
+        # Written ATOMICALLY (DW-263): a short or refused write leaves either
+        # no cache or a complete one, never torn JSON — and the older bytes
+        # a transient read fault left behind were already unlinked in
+        # `_ensure_triage`'s reload arm, so a refused write-back cannot leave a stale
+        # plan for the next resume to replay, except where that unlink was
+        # itself refused (`sweep-triage-cache-unlink-failed`) or the cache
+        # faulted at the metadata probe, whose arm does not unlink: there the
+        # older plan survives a refused write-back. A directory also reaches this
+        # catch: `os.replace` onto it raises `IsADirectoryError` on POSIX or
+        # `PermissionError` on Windows. Confined to the project root (#593,
+        # DW-269): the plain writer resolved `.bmad-loop/`, `runs/` and the
+        # run dir by name, so a link planted at any of them aimed the temp
+        # and the published cache out of the project. The root is the
+        # PROJECT that owns the run dir (`_decisions_phase` says why not
+        # `self.workspace.root`), not `self.run_dir` — a file confined
+        # against its own parent walks no components and refuses nothing.
+        # A refused parent reaches this catch as `UnconfinedWriteError`,
+        # itself an `OSError`, so it costs the cycle its cache and nothing
+        # else. `OSError` alone: unlike `atomic_write_text`, the confined
+        # helper never `resolve()`s, so DW-247's `RuntimeError` arm has
+        # nothing to catch here.
+        try:
+            atomic_write_text_confined(
+                triage_path,
+                json.dumps(doc, indent=2),
+                confine_root=_project_of_run_dir(self.run_dir),
+            )
+        except OSError as exc:
+            self.journal.append("sweep-triage-cache-write-failed", errors=[f"unwritable: {exc}"])
+        self.journal.append(
+            "sweep-triage-result",
+            bundles=len(plan.bundles),
+            decisions=len(plan.decisions),
+            already_resolved=len(plan.already_resolved),
+            blocked=len(plan.blocked),
+            skip=len(plan.skip),
+        )
+        self._emit("post_triage", task)
+        return plan
+
+    def _consume_triage_adoption(
+        self, triage_key: str, triage_path: Path, open_now: set[str]
+    ) -> TriagePlan | None:
+        """Consume a ``resolve --adopt-result`` marker for ``triage_key`` (DW-642):
+        the plan to act on instead of launching triage, or None to carry on as if
+        no marker were there.
+
+        The CLI confirmed a sha256-bound artifact with the operator and validated
+        it structurally only; the open set exists only here (`_loop` applies the
+        selectors and the migration), so this is the authoritative check. The
+        marker is accepted only when it names this key and the escalated task's
+        current attempt id, the attempt's ``result.json`` still hashes to the
+        confirmed sha256, the document carries no CRITICAL escalation (the
+        session path's gate), and `validate_triage` passes against ``open_now``.
+        Accepting writes the cache and moves the task to DONE; the attempt's
+        session record and ``triage-decision`` row stay non-completed — the human
+        gesture substitutes the plan, it does not complete the session.
+
+        A rejected marker on an ESCALATED task pauses at the escalation with an
+        ``adopt rejected:`` reason (task stays ESCALATED, no session runs, the
+        ledger is untouched); a plain resume then relaunches triage. A marker with
+        no ESCALATED task to apply to is journaled and dropped. Either way the
+        marker is removed: it is consumed once."""
+        marker_path = adopt_marker_path(self.run_dir, triage_key)
+        errors: list[str] = []
+        marker: Any = None
+        try:
+            marker = _read_json(marker_path)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            errors.append(f"adoption marker unreadable: {_bounded(str(exc))}")
+        task = self.state.tasks.get(triage_key)
+        if task is None or task.phase != Phase.ESCALATED:
+            phase = "absent" if task is None else str(task.phase)
+            errors.append(f"{triage_key} is not escalated (phase: {phase})")
+            self._reject_triage_adoption(triage_key, None, marker_path, errors)
+            return None
+        task_id = triage_attempt_id(task)
+        expected_sha: Any = None
+        if not errors:
+            if not isinstance(marker, dict):
+                errors.append(f"adoption marker is not a JSON object: {type(marker).__name__}")
+            else:
+                if marker.get("story_key") != triage_key:
+                    errors.append(
+                        f"adoption marker names {_shown_value(marker.get('story_key'))}, "
+                        f"not {triage_key}"
+                    )
+                if marker.get("task_id") != task_id:
+                    errors.append(
+                        f"adoption marker names attempt {_shown_value(marker.get('task_id'))}, "
+                        f"not the escalated attempt {task_id}"
+                    )
+                expected_sha = marker.get("sha256")
+                if not isinstance(expected_sha, str) or not expected_sha:
+                    errors.append("adoption marker carries no sha256")
+        artifact: TriageArtifact | None = None
+        if not errors:
+            try:
+                artifact = read_triage_artifact(self.run_dir, task_id)
+            except (OSError, ValueError, RecursionError) as exc:
+                errors.append(f"result.json unreadable: {_bounded(f'{type(exc).__name__}: {exc}')}")
+            else:
+                if artifact is None:
+                    errors.append(f"result.json of {task_id} is gone")
+                elif artifact.sha256 != expected_sha:
+                    errors.append(
+                        f"result.json of {task_id} changed since the confirm "
+                        f"(sha256 {artifact.sha256}, confirmed {expected_sha})"
+                    )
+        plan: TriagePlan | None = None
+        repairs: tuple[_BundleNameRepair, ...] = ()
+        if not errors and artifact is not None:
+            # The session path's CRITICAL gate, which `validate_triage` does not
+            # apply: a session that asked for a human before its channel went
+            # silent is not overruled by adopting its plan.
+            critical_reason = critical_session_reason("triage", artifact.doc)
+            if critical_reason is not None:
+                errors.append(f"result.json of {task_id} carries a {critical_reason}")
+            else:
+                repairs = _normalize_bundle_names(artifact.doc)
+                plan, errors = validate_triage(artifact.doc, open_now)
+        if plan is None or artifact is None:
+            self._reject_triage_adoption(triage_key, task, marker_path, errors, task_id=task_id)
+            raise AssertionError("adoption rejection returned")
+        # Removed BEFORE the plan is acted on: a marker that outlived its
+        # acceptance could be consumed a second time.
+        try:
+            marker_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self._reject_triage_adoption(
+                triage_key,
+                task,
+                marker_path,
+                [
+                    f"adoption marker could not be removed ({_bounded(str(exc))}); "
+                    f"delete {marker_path} before resuming"
+                ],
+                task_id=task_id,
+                unlink=False,
+            )
+        for repair in repairs:
+            self.journal.append(
+                "sweep-bundle-name-normalized",
+                field=repair.field,
+                original=repair.original,
+                normalized=repair.normalized,
+            )
+        self.journal.append(
+            "sweep-triage-adopted",
+            story_key=triage_key,
+            task_id=task_id,
+            sha256=artifact.sha256,
+            bundles=len(plan.bundles),
+            decisions=len(plan.decisions),
+            already_resolved=len(plan.already_resolved),
+            blocked=len(plan.blocked),
+            skip=len(plan.skip),
+        )
+        # Deliberate reset, not a normal transition: ESCALATED has no DONE edge,
+        # and PENDING -> DONE is the legal path for a plan no session produced.
+        task.phase = Phase.PENDING
+        return self._accept_triage_plan(task, plan, artifact.doc, triage_path)
+
+    def _reject_triage_adoption(
+        self,
+        triage_key: str,
+        task: StoryTask | None,
+        marker_path: Path,
+        errors: list[str],
+        *,
+        task_id: str | None = None,
+        unlink: bool = True,
+    ) -> None:
+        """Journal a refused adoption marker and remove it (DW-642). With an
+        ESCALATED ``task`` the run pauses at the escalation with an ``adopt
+        rejected:`` reason, mirroring `Engine._escalate`'s tail without its
+        ``advance`` (ESCALATED -> ESCALATED is no transition); with no task it
+        returns and triage carries on as if no marker were there."""
+        if unlink:
+            try:
+                marker_path.unlink(missing_ok=True)
+            except OSError as exc:
+                errors = [
+                    *errors,
+                    f"adoption marker could not be removed ({_bounded(str(exc))}); "
+                    f"delete {marker_path} before resuming",
+                ]
+        self.journal.append(
+            "sweep-triage-adopt-rejected",
+            story_key=triage_key,
+            task_id=task_id,
+            errors=errors,
+        )
+        if task is None:
+            return
+        reason = (
+            f"{ADOPT_REJECTED_PREFIX}{_bounded('; '.join(errors) or 'invalid adoption')} "
+            "(the confirmed triage result was not used and no ledger entry was closed; "
+            f"`bmad-loop resume {self.state.run_id}` relaunches triage)"
+        )
+        self._save()
+        gates.notify(
+            self.policy,
+            self.run_dir,
+            pause_title(reason, triage_key),
+            f"{display_critical_reason(reason, task.spec_file)} — then "
+            f"`bmad-loop resume {self.state.run_id}`",
+        )
+        raise RunPaused(reason, PAUSE_ESCALATION, triage_key)
 
     def _extra_session_env(
         self, task: StoryTask, role: str, label: str | None = None

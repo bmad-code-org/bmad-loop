@@ -140,6 +140,7 @@ bmad-loop probe-adapter [--project PROJECT] [--probe] [--transcript TRANSCRIPT] 
 | `--out OUT`                 | Write the report (or JSON document) to this file instead of stdout.                                                                                                                                                                                      |
 | `--json`                    | Emit a JSON document instead of the Markdown report.                                                                                                                                                                                                     |
 
+- The hook-registration check (`hooks registered`; JSON `hooks_registered`) reads only the project hook config (the profile's `config_path`, where `bmad-loop init --cli <profile>` registers the relay), never user- or local-scope settings, managed policy or plugin hooks: the same file `validate`'s `hooks.registered` reads. A relay registered only there reads as unregistered, and the next step says so. A broken project config (invalid JSON, unreadable, not a JSON object, or malformed handlers for a declared event) also reads as unregistered, but is reported as a config fault: a warning and a next step to fix that file, in place of the scope explanation.
 - Exits 1 when the profile is unknown (without `--binary`), the leak self-check fires (nothing is written), or hook or workspace trust is not `trusted` (the report is still written).
 
 JSON: [`probe-adapter --json`](#probe-adapter---json).
@@ -168,7 +169,7 @@ bmad-loop run [--project PROJECT] [--spec FOLDER] [--epic EPIC] [--story STORY] 
 - On a parent initiative, `run` builds the children one run each: the first child `next <parent>` lists as ready, skipping one with no folder or nothing left to dispatch, then the next after each run that finishes. Before each pick, its first included (after the clean-worktree, skills and plugin-trust checks, and journaled in the first child's run), it marks every drained child's initiative `done` and prints `... closed <child> (drained)`, or `... leaves <child> open (<why>: ...)` while a run holds the child, its first pick still finds work, or its store is refused. It prints `initiative chain <parent>: <child> -> <next>` per switch, or `... ends (<why>)` with each waiting child's unmet prerequisites and their status, and stops at a run that does not finish, including each child's pause at `epic-boundary` after every epic it finishes; `resume` or `resolve` driving that run to finished continues the chain. `--epic` and `--story` exit 1 there; `--run-id` names the first child's run; `--max-stories` is one budget for the whole chain, and the chain ends `max-stories` once it is spent.
 - A launch check that refuses the next child's run of a parent initiative (a dirty worktree, the skills, plugin trust, the child's store) ends the chain `launch-refused`, and `run` exits with that check's exit code.
 - `--dry-run` in tickets mode reads the active initiative through its `tickets.py` and marks nothing. It prints the startable tickets in build order (initiative epic table, then entry order), each with its badges, its `ticket <ref>` dispatch (`thorough` when `[tickets] thorough_review` selects it, `Halt after planning.` on an unrefined plan-checkpoint ticket) and its env, then the first pause a run would reach (`predicted:`), the `next` group counts and the tree's problems. A `tickets.py` failure exits 1. On a parent initiative it lists the children in build order (status, closed and total tickets, unmet prerequisites, and a tag: `next`, `ready`, `ready, passed over (<why>)`, `waiting`, `no folder`, `drained (the run closes it first)`, `done` or `dropped`), prints the `next` child's block, and ends `predicted: chain starts with <child>; later children are chosen as each finishes`, or with the chain's end line when no child can start. It closes no drained child but picks as if the run had, and the predicted line names them. `--max-stories` caps the first child's block only, `--epic` and `--story` exit 1, and the banner warns when the preflight would refuse the parent.
-- Warns, never refuses, when a role's CLI hook config does not register the bmad-loop relay: one `warning: <roles> (<profile>): the bmad-loop hook relay may be unregistered — <problem>. …` line on stderr per hooked profile, and one `hook-relay-unregistered` journal row per role (`role`, `profile`, `problem`). `<problem>` names the config: missing, not valid JSON, malformed handlers, no relay, or unreadable. The check reads only the project hook config, so run `bmad-loop validate` to confirm. Under worktree isolation only the main-checkout roles (triage, retro) are checked. A dry run does not check.
+- Warns, never refuses, when a role's CLI hook config does not register the bmad-loop relay: one `warning: <roles> (<profile>): the bmad-loop hook relay may be unregistered — <problem>. …` line on stderr per hooked profile, and one `hook-relay-unregistered` journal row per role (`role`, `profile`, `problem`). `<problem>` names the config: missing, not valid JSON, not a JSON object, malformed handlers, no relay, or unreadable. The check reads only the project hook config (the profile's `config_path`, where `bmad-loop init --cli <profile>` registers the relay), never user- or local-scope settings, managed policy or plugin hooks, so a relay registered only there still warns. `bmad-loop validate` reads the same config for `hooks.registered`, so it fails there too. Under worktree isolation only the main-checkout roles (triage, retro) are checked. A dry run does not check.
 - Prints `run <id> starting (attach: bmad-loop attach)`, then the run summary; exits 0 once the engine has run.
 
 ### `sweep`
@@ -224,7 +225,8 @@ Resolves an escalated story, then re-arms it and resumes the run. Without a mode
 
 ```text
 bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
-                  [--restore-patch PATH | --adopt-branch | --reverify | --abandon] [--resume | --no-resume] [--force]
+                  [--restore-patch PATH | --adopt-branch | --adopt-result | --reverify | --abandon]
+                  [--resume | --no-resume] [--force]
                   [--at-reset [--margin-min N]] run_id
 ```
 
@@ -234,6 +236,7 @@ bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
 | `--no-interactive`         | Skip the resolve agent (the spec was fixed by hand), then re-arm and resume. With `--abandon`: skip the confirm prompt.                                   |
 | `--restore-patch PATH`     | Re-arm the spec to `in-review` and re-apply this saved patch, so review resumes on the attempted change.                                                  |
 | `--adopt-branch`           | Commit and merge the kept worktree branch as-is and mark the story done. Worktree isolation only; not for sweeps.                                         |
+| `--adopt-result`           | Sweeps only: show a silent-channel triage attempt's `result.json` and, on an explicit `y`, use it as the triage plan. The confirm is never skipped.       |
 | `--reverify`               | Keep a DEFERRED (or environment-fault ESCALATED) story's attempt, replay `[verify]`, then review and commit. No dev session; not for sweeps.              |
 | `--abandon`                | Close an escalated replay run unmerged: park dirty work on a preserve ref, remove the worktree, keep the branch.                                          |
 | `--resume` / `--no-resume` | Resume without prompting / only re-arm. Default: prompt, then resume. Not with `--abandon` (exit 2).                                                      |
@@ -241,9 +244,10 @@ bmad-loop resolve [--project PROJECT] [--story STORY] [--no-interactive]
 | `--at-reset`               | For a usage limit the coding CLI waits out: wait in the foreground until the recorded reset plus `--margin-min`, then act as `--no-interactive --resume`. |
 | `--margin-min N`           | With `--at-reset`: minutes to wait past the reset, an integer of 0 or more. Default: 2.                                                                   |
 
-- `--restore-patch`, `--adopt-branch`, `--reverify` and `--abandon` are mutually exclusive.
+- `--restore-patch`, `--adopt-branch`, `--adopt-result`, `--reverify` and `--abandon` are mutually exclusive.
+- `--adopt-result` acts only on a sweep paused at `escalation` with a `hook channel silent:` reason on a triage task. It prints the attempt's `result.json` path, mtime, size, sha256, plan summary and full document, then asks to adopt it. `--resume`, `--no-interactive` and `--force` never skip that confirm, and any answer but `y`/`yes`, or end of input, exits 0 with nothing written. After a `y` it re-checks the pause, liveness, task and sha256 under the run lock, writes `adopt-<triage-key>.json`, journals `sweep-triage-adopt-confirmed`, then resumes (`--no-resume`: prints the resume hint). Exits 1 with nothing written for any other run, task or pause reason, for a missing, unreadable or invalid `result.json` or one that carries a CRITICAL escalation, and for a file that changed after it was shown. The resumed sweep re-validates the file against the live ledger and pauses `adopt rejected:` when it no longer fits. See [Adopt a silent triage attempt's result](../escalations-guide.md#adopt-a-silent-triage-attempts-result).
 - Tickets mode: `--story` takes a ticket ref. The re-arm moves the plan through `tickets.py mark` to `ready-for-dev`, or `in-review` for a restore, and a refused move aborts it. Refused with exit 1 when the ticket store's layout changed since the run started. See the [tickets guide](../tickets-guide.md#parking-and-resolve).
-- `--at-reset` reads the pause's recorded `paused_limit_class` and `paused_reset_at`, never the reason text. It takes resolve's other refusals first, then refuses with exit 1, leaving the run unchanged, when the run is not paused on a usage limit, the limit is a blocking one (credit exhaustion, including every opencode quota pause: add credits, then resolve without `--at-reset`), the reset did not resolve to a time, or the reset is more than `[limits] quota_wait_max_min` minutes away (0 = no cap). With `--no-resume`, `--abandon`, `--restore-patch`, `--adopt-branch` or `--reverify`, or `--margin-min` without `--at-reset` or below 0, it exits 2.
+- `--at-reset` reads the pause's recorded `paused_limit_class` and `paused_reset_at`, never the reason text. It takes resolve's other refusals first, then refuses with exit 1, leaving the run unchanged, when the run is not paused on a usage limit, the limit is a blocking one (credit exhaustion, including every opencode quota pause: add credits, then resolve without `--at-reset`), the reset did not resolve to a time, or the reset is more than `[limits] quota_wait_max_min` minutes away (0 = no cap). With `--no-resume`, `--abandon`, `--restore-patch`, `--adopt-branch`, `--adopt-result` or `--reverify`, or `--margin-min` without `--at-reset` or below 0, it exits 2.
 - `--at-reset` prints the wake time and journals `at-reset-wait-start` / `at-reset-wait-end`. With the wake time already past it resolves at once. After the wait every check is taken again on the run as it then stands, and it exits 1 with nothing re-armed when the pause is no longer the one it waited on (another story, limit class or reset). Ctrl-C during the wait exits 130 and leaves the run paused, with nothing re-armed.
 - Tickets mode, `epic-boundary` pause, no mode flag: opens bmad-agent-po on its closure check of the paused epic (`--no-interactive`: no session), then verifies that the epic reads `done` or `dropped` and its epic folder has no uncommitted change (in the store repository for T3/T4; not checked for an unversioned store). The session's exit code is never trusted. A pass journals `epic-close-verified`, then confirms `resume run <id>?` and resumes; `--story` must name the paused epic. Exits 1, the run still paused, when the check fails (journals `epic-close-unverified`), when the pause names no epic or the epic's retrospective has not run or is not committed (the refusal names the step, then `resume`), when the dev CLI's skill tree has no bmad-agent-po or the dev CLI has no interactive mode, and when the run's store cannot be checked. The session journals `epic-close-session-start` / `epic-close-session-end`. A mode flag keeps the refusal below. See [epic closure](../escalations-guide.md#epic-closure-in-tickets-mode).
 - `--reverify --story KEY` on a finished sprint run creates a new replay run for a kept DEFERRED worktree unit; the finished run is not modified.
@@ -507,21 +511,21 @@ Each row: `name`, `origin`, `path` (POSIX path from the code root), `surface` (`
 
 ### `probe-adapter --json`
 
-| Field                           | Type           | Meaning                                                         |
-| ------------------------------- | -------------- | --------------------------------------------------------------- |
-| `cli`, `binary`                 | str            | probed CLI and binary                                           |
-| `mode`                          | str            | `scan` or `probe`                                               |
-| `known_profile`, `binary_found` | bool           | a packaged profile exists; the binary resolved                  |
-| `dialect`                       | str \| null    | hook dialect                                                    |
-| `usage_parser`                  | str            | usage parser (`none` without a known profile)                   |
-| `hooks_registered`              | bool \| null   | relay hooks are present                                         |
-| `hook_trust`, `workspace_trust` | str \| null    | `trusted`, `untrusted` or `unverifiable`                        |
-| `declared_events`               | object         | native event → canonical event, as the profile declares         |
-| `version`, `help`               | str \| null    | the CLI's own `--version` / `--help` output                     |
-| `captured_events`               | array          | `{native_event, canonical_event, payload_keys, payload_schema}` |
-| `transcript`                    | object \| null | location, format and size of the discovered transcript          |
-| `tokens`                        | object \| null | token-schema inference                                          |
-| `warnings`, `next_steps`        | list[str]      | advisory text                                                   |
+| Field                           | Type           | Meaning                                                                             |
+| ------------------------------- | -------------- | ----------------------------------------------------------------------------------- |
+| `cli`, `binary`                 | str            | probed CLI and binary                                                               |
+| `mode`                          | str            | `scan` or `probe`                                                                   |
+| `known_profile`, `binary_found` | bool           | a packaged profile exists; the binary resolved                                      |
+| `dialect`                       | str \| null    | hook dialect                                                                        |
+| `usage_parser`                  | str            | usage parser (`none` without a known profile)                                       |
+| `hooks_registered`              | bool \| null   | relay hooks are registered in the project hook config, which parsed without a fault |
+| `hook_trust`, `workspace_trust` | str \| null    | `trusted`, `untrusted` or `unverifiable`                                            |
+| `declared_events`               | object         | native event → canonical event, as the profile declares                             |
+| `version`, `help`               | str \| null    | the CLI's own `--version` / `--help` output                                         |
+| `captured_events`               | array          | `{native_event, canonical_event, payload_keys, payload_schema}`                     |
+| `transcript`                    | object \| null | location, format and size of the discovered transcript                              |
+| `tokens`                        | object \| null | token-schema inference                                                              |
+| `warnings`, `next_steps`        | list[str]      | advisory text                                                                       |
 
 ### `decisions --json`
 
@@ -654,8 +658,8 @@ Every finding's `check` is one of these ids. Severity is `ok`, `warning` or `pro
 | `adapter.kind`                         | ok / problem           | the profile's `adapter` kind is registered                                                                                                              |
 | `adapter.external`                     | warning                | a third-party adapter entry point failed to load                                                                                                        |
 | `adapter.external-profile`             | warning                | a third-party profile entry point failed to load                                                                                                        |
-| `hooks.config-parse`                   | problem                | the hook config file is not valid JSON or has malformed handlers                                                                                        |
-| `hooks.registered`                     | ok / problem           | relay hooks are registered for the profile's events                                                                                                     |
+| `hooks.config-parse`                   | problem                | the hook config file is not valid JSON, is not a JSON object, or has malformed handlers                                                                 |
+| `hooks.registered`                     | ok / problem           | relay hooks are registered for the profile's events in the project hook config, where `init` writes them; user- or local-scope settings are not read    |
 | `hooks.events-incomplete`              | ok / warning           | a mapped hook event besides Stop has no relay; the warning names `bmad-loop init --cli <profile>`, or the CLI version it needs                          |
 | `hooks.trust`                          | ok / problem           | Codex project hook trust is current                                                                                                                     |
 | `hooks.relay-path-unsafe`              | warning                | a registered relay path has shell metacharacters the host's quoting leaves unsafe                                                                       |

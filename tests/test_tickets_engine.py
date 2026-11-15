@@ -3615,6 +3615,44 @@ def test_ticket_retro_wrong_epic_fails_and_pauses_on_its_output(project_v7):
     assert dirty["epic_ref"] == "epic-cart"
 
 
+def test_ticket_retro_silent_hook_channel_is_named(project_v7, monkeypatch):
+    """DW-644, tickets mode: a retro session that timed out on a silent hook
+    channel, writing nothing, journals `noncompletion` on `retro-auto-failed`
+    and its notice names the relay fault and `bmad-loop validate`. Diagnostic
+    only: the clean tree goes on to the ordinary closure pause, recorded as
+    `unknown`. Ablation (performed): drop the `noncompletion` extras line in
+    `_ticket_epic_retro` and this FAILS."""
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        tickets_engine.gates, "notify", lambda _p, _r, title, msg, **_k: sent.append((title, msg))
+    )
+
+    def silent(spec: SessionSpec) -> SessionResult:
+        return SessionResult(status="timeout", hook_channel_silent=True)
+
+    tree = _epic_tree(project_v7)
+    plan = Path(tree.finds["1.1"].plan)
+    engine, _ = make_engine(
+        project_v7,
+        tree,
+        policy=_retro_policy(),
+        script=[_builds_finishing(project_v7, tree, plan), silent],
+    )
+
+    assert engine.run().paused
+
+    state = load_state(engine.run_dir)
+    assert (state.paused_stage, state.paused_story_key) == (PAUSE_EPIC_BOUNDARY, "epic-cart")
+    assert state.ticket_epic_closures == {"epic-cart": "unknown"}
+    [failed] = _kinds(engine, "retro-auto-failed")
+    assert failed["epic_ref"] == "epic-cart"
+    assert failed["noncompletion"] == "hook-channel-silent"
+    assert any("timeout" in e for e in failed["errors"])
+    [msg] = [m for title, m in sent if title == "auto retrospective failed"]
+    assert msg.startswith("epic-cart: hook channel silent: ")
+    assert "bmad-loop validate" in msg
+
+
 def test_ticket_retro_commits_a_valid_doc_a_failed_leg_left(project_v7):
     """A retro session that writes a valid document but does not report done
     fails verification and pauses on the uncommitted document. Resumed with it

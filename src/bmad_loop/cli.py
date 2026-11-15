@@ -88,15 +88,26 @@ from .documents import (
 )
 from .engine import Engine, _publication_refusal
 from .escalation import (
+    HOOK_CHANNEL_SILENT_PREFIX,
     cleared_pause_escalation_keys,
+    critical_session_reason,
+    display_critical_reason,
     display_pause_reason,
     resume_skipped_escalation_keys,
 )
 from .journal import Journal, load_state, save_state, state_lock
-from .model import PAUSE_EPIC_BOUNDARY, PauseSnapshot, Phase, RunState, StoryTask
+from .model import (
+    PAUSE_EPIC_BOUNDARY,
+    PAUSE_ESCALATION,
+    PauseSnapshot,
+    Phase,
+    RunState,
+    StoryTask,
+)
 from .platform_util import (
     MAX_SEGMENT,
     LockUnavailableError,
+    atomic_write_text_confined,
     resolve_or_lexical,
     walk_files_unlinked,
 )
@@ -119,11 +130,18 @@ from .sweep import (
     DW_ID_RE,
     SEVERITY_ORDER,
     SWEEP_OVERRIDE_KEYS,
+    TRIAGE_KEY_RE,
     SweepEngine,
+    TriageArtifact,
+    adopt_marker_path,
     decimal_digits_key,
     increment_decimal_digits,
+    read_triage_artifact,
     resolve_sweep_override,
     select_entries,
+    triage_artifact_path,
+    triage_attempt_id,
+    validate_triage,
 )
 from .tickets_engine import TicketsEngine
 
@@ -882,52 +900,6 @@ def _report_bmad_config(report: ValidationReport, paths: bmadconfig.ProjectPaths
         )
 
 
-@dataclass(frozen=True)
-class _RelayRegistration:
-    """One hooked profile's project hook config, read the way ``validate`` reads it.
-
-    ``parsed`` is the loaded JSON (``{}`` when the file is missing or not JSON).
-    ``registered`` is :func:`install.relay_registered` over it, forced False by a
-    malformed handler list. ``fault`` is validate's ``hooks.config-parse`` message,
-    or None when the file is absent or parsed cleanly."""
-
-    config_path: Path
-    parsed: object
-    registered: bool
-    fault: str | None
-
-
-def _read_relay_registration(project: Path, profile: CLIProfile) -> _RelayRegistration:
-    """The registration core ``validate``'s ``hooks.*`` checks and the launch
-    warning (:func:`_warn_hook_relay_unregistered`) share. It reads only
-    ``project / profile.hooks.config_path``: a relay registered in a user- or
-    local-scope settings file is invisible here. A read error other than invalid
-    JSON propagates, as it always has for validate."""
-    hook_config = project / profile.hooks.config_path
-    registered = False
-    fault: str | None = None
-    parsed: object = {}
-    if hook_config.is_file():
-        try:
-            parsed = json.loads(hook_config.read_text(encoding="utf-8"))
-            registered = isinstance(parsed, dict) and install.relay_registered(
-                parsed, profile.hooks.dialect, profile.hooks.events
-            )
-            if isinstance(parsed, dict):
-                container = install.hook_event_container(parsed, profile.hooks.dialect)
-                malformed = [
-                    event
-                    for event in profile.hooks.events
-                    if event in container and not isinstance(container[event], list)
-                ]
-                if malformed:
-                    registered = False
-                    fault = f"{hook_config} has malformed handlers for {', '.join(malformed)}"
-        except json.JSONDecodeError:
-            fault = f"{hook_config} is not valid JSON"
-    return _RelayRegistration(hook_config, parsed, registered, fault)
-
-
 def _relay_registration_problem(project: Path, profile: CLIProfile) -> str | None:
     """Why a hooked ``profile``'s relay looks unregistered in the project hook
     config, or None when it is registered. A hookless profile has no hook config;
@@ -936,7 +908,7 @@ def _relay_registration_problem(project: Path, profile: CLIProfile) -> str | Non
     Unlike validate, an unreadable config is a problem to report, not a crash: the
     launch warning that calls this must never abort a launch."""
     try:
-        registration = _read_relay_registration(project, profile)
+        registration = install.read_relay_registration(project, profile)
     except (OSError, ValueError) as error:
         return f"{project / profile.hooks.config_path} could not be read ({type(error).__name__})"
     if registration.registered:
@@ -1333,7 +1305,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 {"profile": profile.name},
             )
             continue
-        registration = _read_relay_registration(project, profile)
+        registration = install.read_relay_registration(project, profile)
         hook_config = registration.config_path
         hooks_ok = registration.registered
         parsed = registration.parsed
@@ -1365,8 +1337,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
         else:
             report.fail(
                 "hooks.registered",
-                f"bmad-loop hooks not registered for {profile.name} — "
-                f"run `bmad-loop init --cli {profile.name}`",
+                f"bmad-loop hooks not registered for {profile.name} in {hook_config} — "
+                f"run `bmad-loop init --cli {profile.name}` to register the relay there "
+                "(validate reads only the project hook config; a user- or local-scope "
+                "registration is not seen)",
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
 
@@ -2693,8 +2667,9 @@ def _warn_hook_relay_unregistered(
     event per affected role. It never refuses and never touches stdout or the rc.
 
     The wording hedges ("may be unregistered") because the check reads only the
-    project hook config (:func:`_read_relay_registration`), and the CLI may merge
-    hooks from user- or local-scope settings too.
+    project hook config (:func:`install.read_relay_registration`) — the documented
+    contract — while the CLI may merge hooks from user- or local-scope settings
+    too.
 
     Under ``scm.isolation = "worktree"`` the dev primitives
     (:data:`install.DEV_PRIMITIVE_ROLES`) run in provisioned worktrees that register
@@ -2724,8 +2699,8 @@ def _warn_hook_relay_unregistered(
             f"{', '.join(profile_roles)} ({name}): the bmad-loop hook relay may be "
             f"unregistered — {problem}. A session whose hook events never arrive runs "
             "to session_timeout_min instead of completing. This check reads only the project "
-            "hook config: run `bmad-loop validate`, or register the relay with "
-            f"`bmad-loop init --cli {name}`."
+            "hook config, not user- or local-scope settings: run `bmad-loop validate`, or "
+            f"register the relay in the project config with `bmad-loop init --cli {name}`."
         )
         if after_silent_pause:
             message += (
@@ -7087,7 +7062,7 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
             resumed_roles,
             profiles=profiles,
             journal=composed.journal,
-            after_silent_pause=(pause.paused_reason or "").startswith("hook channel silent: "),
+            after_silent_pause=(pause.paused_reason or "").startswith(HOOK_CHANNEL_SILENT_PREFIX),
         )
     except BaseException as e:
         # make_adapters raises SystemExit for every refusal; anything escaping
@@ -7619,6 +7594,7 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     if (
         args.restore_patch is None
         and not getattr(args, "adopt_branch", False)
+        and not getattr(args, "adopt_result", False)
         and not getattr(args, "reverify", False)
         and not getattr(args, "abandon", False)
         and not getattr(args, "at_reset", False)
@@ -7676,6 +7652,11 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     # interactive session, which adopting never runs.
     if getattr(args, "adopt_branch", False):
         return _resolve_adopt(args, project, run_dir, state, task, story_key)
+
+    # DW-642: adopt a silent-channel triage attempt's surviving result.json. Behind
+    # the same gates, and likewise ahead of the interactive session it never runs.
+    if getattr(args, "adopt_result", False):
+        return _resolve_adopt_result(args, project, run_dir, state, task, story_key)
 
     # DW-535: close an escalated replay run without merging its unit. Behind the same
     # gates, and likewise ahead of the interactive session it never runs.
@@ -8496,6 +8477,7 @@ def _at_reset_usage_error(args: argparse.Namespace) -> str | None:
         ("--abandon", getattr(args, "abandon", False)),
         ("--restore-patch", args.restore_patch is not None),
         ("--adopt-branch", getattr(args, "adopt_branch", False)),
+        ("--adopt-result", getattr(args, "adopt_result", False)),
         ("--reverify", getattr(args, "reverify", False)),
     ):
         if given:
@@ -8689,6 +8671,259 @@ def _resolve_adopt(
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(f"adopted {branch} for {story_key} — it commits and merges on resume")
+    if args.resume is False:
+        print(f"resume when ready: bmad-loop resume {args.run_id}")
+        return 0
+    from .tui import launch  # import-safe: launch.py has no textual imports
+
+    if launch.in_ctl_session():
+        print(
+            f"✓ resuming run {args.run_id} in the background — "
+            f"watch it in the TUI, or: bmad-loop attach {args.run_id}"
+        )
+        launch.detach_client()
+    return _resume_paused_run(project, run_dir)
+
+
+def _adopt_result_refusal(state: RunState, task: StoryTask, story_key: str) -> str | None:
+    """Why ``resolve --adopt-result`` (DW-642) cannot apply to this run, or None:
+    a sweep paused at the escalation on a triage task whose pause reason is a
+    silent hook channel. Read from the pause fields, which the engine wrote."""
+    if state.run_type != "sweep":
+        return f"--adopt-result applies only to sweep runs (run {state.run_id} is a {state.run_type} run)"
+    if not TRIAGE_KEY_RE.match(story_key):
+        return (
+            f"--adopt-result adopts a triage attempt's result.json; {story_key} is not a "
+            "triage task (migration and bundle tasks are not adoptable)"
+        )
+    if state.paused_stage != PAUSE_ESCALATION or state.paused_story_key != story_key:
+        return (
+            f"run {state.run_id} is not paused at the escalation of {story_key} "
+            f"(stage: {state.paused_stage or 'none'}, story: {state.paused_story_key or 'none'})"
+        )
+    if not (state.paused_reason or "").startswith(HOOK_CHANNEL_SILENT_PREFIX):
+        return (
+            f"run {state.run_id} is not paused on a silent hook channel — --adopt-result "
+            "applies only to a `hook channel silent:` pause"
+        )
+    if task.phase != Phase.ESCALATED:
+        return f"{story_key} is not escalated (phase: {task.phase})"
+    return None
+
+
+def _adopt_marker_document(
+    story_key: str, task: StoryTask, task_id: str, artifact: TriageArtifact
+) -> str:
+    """The ``adopt-<key>.json`` marker `SweepEngine._consume_triage_adoption` reads."""
+    return json.dumps(
+        {
+            "story_key": story_key,
+            "task_id": task_id,
+            "attempt": task.attempt,
+            "generation": task.generation,
+            "sha256": artifact.sha256,
+            "mtime_ns": artifact.mtime_ns,
+            "size": artifact.size,
+            "adopted_at": datetime.now(timezone.utc).isoformat(),
+        },
+        indent=2,
+    )
+
+
+def _resolve_adopt_result(
+    args: argparse.Namespace,
+    project: Path,
+    run_dir: Path,
+    state: RunState,
+    task: StoryTask,
+    story_key: str,
+) -> int:
+    """``resolve --adopt-result`` (DW-642): use the result.json a silent-channel
+    triage attempt left behind as the sweep's triage plan, on the operator's word.
+
+    `cmd_resolve` has already run the shared gates. This refuses anything but a
+    sweep paused ``hook channel silent:`` on a triage task, reads the attempt's
+    artifact once (hashing and parsing the same bytes), refuses one that carries a
+    CRITICAL escalation, validates it structurally on a copy, and shows it in full. Only an explicit ``y`` continues: no flag
+    skips the confirm, and EOF declines. Under the run lock it re-checks the
+    pause, the engine's liveness, the task's phase/attempt/generation and the
+    artifact's sha256, then writes ``adopt-<key>.json`` and journals
+    ``sweep-triage-adopt-confirmed``. The resumed engine re-validates the artifact
+    against the live ledger before using it. Nothing here completes the session or
+    touches the ledger."""
+    if (refusal := _adopt_result_refusal(state, task, story_key)) is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
+    task_id = triage_attempt_id(task)
+    relaunch = f"`bmad-loop resume {args.run_id}` relaunches triage instead"
+    try:
+        artifact = read_triage_artifact(run_dir, task_id)
+    except (OSError, ValueError, RecursionError) as e:
+        print(
+            f"error: cannot adopt the result.json of {task_id}: {type(e).__name__}: {e} "
+            f"— {relaunch}",
+            file=sys.stderr,
+        )
+        return 1
+    if artifact is None:
+        print(
+            f"error: triage attempt {task_id} left no result.json "
+            f"({triage_artifact_path(run_dir, task_id)}) — {relaunch}",
+            file=sys.stderr,
+        )
+        return 1
+    # The session path escalates on a CRITICAL before it validates a plan; a
+    # session that asked for a human is not overruled by adopting its document.
+    if (critical := critical_session_reason("triage", artifact.doc)) is not None:
+        print(
+            f"error: the result.json of {task_id} carries a {display_critical_reason(critical)}"
+            f" — adopting it would bypass that escalation; {relaunch}",
+            file=sys.stderr,
+        )
+        return 1
+    # `validate_triage` normalizes its argument in place; the operator is shown
+    # the document as written.
+    plan, errors = validate_triage(json.loads(json.dumps(artifact.doc)), None)
+    if plan is None:
+        print(
+            f"error: the result.json of {task_id} is not a valid triage plan: "
+            + "; ".join(errors)
+            + f" — {relaunch}",
+            file=sys.stderr,
+        )
+        return 1
+    mtime = datetime.fromtimestamp(artifact.mtime_ns / 1e9, tz=timezone.utc).astimezone()
+    print(f"triage attempt {task_id} of {story_key} left this result.json before its pause:")
+    print(f"  path:   {artifact.path}")
+    print(f"  mtime:  {mtime.isoformat()}")
+    print(f"  size:   {artifact.size} bytes")
+    print(f"  sha256: {artifact.sha256}")
+    print(
+        f"  plan:   {len(plan.bundles)} bundle(s), {len(plan.decisions)} decision(s), "
+        f"{len(plan.already_resolved)} already resolved, {len(plan.blocked)} blocked, "
+        f"{len(plan.skip)} skipped, over {len(plan.open_ids)} open entr(ies)"
+    )
+    # ASCII-escaped: the document is session-written, and every control or
+    # non-ASCII character reaches the terminal as a \u escape, never raw.
+    print("----- result.json -----")
+    print(json.dumps(artifact.doc, indent=2, ensure_ascii=True))
+    print("----- end result.json -----")
+    print(
+        f"warning: the triage session of {story_key} never completed (its hook channel "
+        "was silent), so nothing vouches for this document but you; adopting it uses it "
+        "as the sweep's triage plan without a new session. The resumed sweep re-checks "
+        "it against the live ledger and pauses if it no longer fits",
+        file=sys.stderr,
+    )
+    marker = adopt_marker_path(run_dir, story_key)
+    recorded = os.path.lexists(marker)
+    if recorded:
+        print(
+            f"an adoption is already recorded ({marker}): declining below withdraws it, "
+            "so a plain resume relaunches triage"
+        )
+    # Never skipped: not by --resume, --no-interactive or --force. The confirm is
+    # the human gesture that stands in for the session completion.
+    if not _confirm(f"adopt this result.json as the triage plan of run {args.run_id}?"):
+        # A marker an earlier confirm left would otherwise still be adopted by the
+        # next plain resume: the decline is the operator's latest word.
+        if recorded:
+            with state_lock(run_dir):
+                # Cleanup removes the run under this same hold: a run removed while
+                # the operator read the document has nothing left to withdraw, and
+                # the Journal below must not recreate its directory.
+                if not runs.is_run(run_dir):
+                    print(f"no such run: {run_dir.name}", file=sys.stderr)
+                    return 1
+                try:
+                    marker.unlink(missing_ok=True)
+                except OSError as e:
+                    print(
+                        f"error: cannot withdraw the recorded adoption {marker}: {e} — "
+                        "delete it before resuming",
+                        file=sys.stderr,
+                    )
+                    return 1
+                Journal(run_dir, pin=state).append(
+                    "sweep-triage-adopt-withdrawn", story_key=story_key, task_id=task_id
+                )
+            print(f"the earlier adoption of {task_id}'s result.json was withdrawn")
+        print("cancelled — run is still paused at the escalation")
+        return 0
+    with state_lock(run_dir):
+        # The checks above ran lock-free: repeat them against the last writer's
+        # state — first that cleanup has not removed the run during the confirm.
+        if not runs.is_run(run_dir):
+            print(f"no such run: {run_dir.name}", file=sys.stderr)
+            return 1
+        fresh_state = load_state(run_dir, pin=state)
+        if (
+            fresh_state.paused_stage,
+            fresh_state.paused_story_key,
+            fresh_state.paused_reason,
+        ) != (state.paused_stage, state.paused_story_key, state.paused_reason):
+            print(
+                f"the pause of run {args.run_id} changed while resolve was in progress "
+                "— not adopting",
+                file=sys.stderr,
+            )
+            return 1
+        fresh_live = runs.engine_liveness(run_dir)
+        if fresh_live == "alive":
+            print(f"run {args.run_id} is still live — stop it first", file=sys.stderr)
+            return 1
+        if fresh_live == "unknown" and not args.force:
+            print(
+                f"run {args.run_id}: engine may still be live (unverifiable pid) — "
+                "refusing to adopt. Confirm the engine process is gone, then re-run "
+                "with --force (`stop` cannot verify or clear an unverifiable pid).",
+                file=sys.stderr,
+            )
+            return 1
+        fresh_task = fresh_state.tasks.get(story_key)
+        if fresh_task is None or fresh_task.phase != Phase.ESCALATED:
+            print(f"no escalated story to resolve in run {args.run_id}", file=sys.stderr)
+            return 1
+        if (fresh_task.generation, fresh_task.attempt) != (task.generation, task.attempt):
+            print(
+                f"the escalation for {story_key} changed while resolve was in progress "
+                "— not adopting",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            current = read_triage_artifact(run_dir, task_id)
+        except (OSError, ValueError, RecursionError) as e:
+            current = None
+            changed = f"it can no longer be read ({type(e).__name__}: {e})"
+        else:
+            changed = "it is gone" if current is None else "its bytes changed"
+        if current is None or current.sha256 != artifact.sha256:
+            print(
+                f"error: the result.json of {task_id} changed after it was shown — "
+                f"{changed}; not adopting (re-run resolve to see it again)",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            atomic_write_text_confined(
+                marker,
+                _adopt_marker_document(story_key, fresh_task, task_id, current),
+                confine_root=runs._project_of_run_dir(run_dir),
+            )
+        except OSError as e:
+            print(f"error: cannot write the adoption marker {marker}: {e}", file=sys.stderr)
+            return 1
+        Journal(run_dir, pin=fresh_state).append(
+            "sweep-triage-adopt-confirmed",
+            story_key=story_key,
+            task_id=task_id,
+            sha256=current.sha256,
+        )
+    print(
+        f"adoption of {task_id}'s result.json recorded ({marker}) — the resumed sweep "
+        "re-validates it against the live ledger and uses it instead of launching triage"
+    )
     if args.resume is False:
         print(f"resume when ready: bmad-loop resume {args.run_id}")
         return 0
@@ -11624,6 +11859,17 @@ def main(argv: list[str] | None = None) -> int:
         "(worktree isolation only; not for sweep runs)",
     )
     resolve_mode.add_argument(
+        "--adopt-result",
+        action="store_true",
+        help="sweep runs only: for a sweep paused `hook channel silent:` on a triage "
+        "task, show the result.json that attempt left behind (path, mtime, size, "
+        "sha256, plan summary, full document) and, on an explicit `y`, use it as the "
+        "triage plan instead of relaunching triage. The confirm is mandatory: no flag "
+        "skips it, and EOF or any other answer declines. The resumed sweep re-checks the "
+        "document against the live ledger and pauses `adopt rejected:` if it changed or "
+        "no longer fits. No resolve agent runs",
+    )
+    resolve_mode.add_argument(
         "--reverify",
         action="store_true",
         help="keep a DEFERRED (or environment-fault escalated) story's attempt as it "
@@ -11674,7 +11920,7 @@ def main(argv: list[str] | None = None) -> int:
         "quota_wait_max_min minutes away (0 = no cap); resolve's other refusals are "
         "also taken before the wait. Ctrl-C during the wait leaves the run paused and "
         "exits 130. Not combinable with --no-resume, --abandon, --restore-patch, "
-        "--adopt-branch or --reverify (exit 2)",
+        "--adopt-branch, --adopt-result or --reverify (exit 2)",
     )
     resolve_p.add_argument(
         "--margin-min",

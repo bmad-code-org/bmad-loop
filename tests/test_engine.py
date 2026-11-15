@@ -25819,12 +25819,14 @@ def retro_effect(
     rj_status: str | None = "done",
     stray: str | None = None,
     doc_body: str | bytes = "# retro\n",
+    **result_kw,
 ):
     """Simulate a `bmad-retrospective -H` session: it writes the retro doc (body
     `doc_body`; the default carries no frontmatter, so no verdict), flips
     `epic-N-retrospective: done` on the board (the SKILL writes the board, never
     the engine), optionally touches a foreign file, and returns a result whose
-    result.json carries `rj_status`."""
+    result.json carries `rj_status`. `result_kw` passes through to the
+    `SessionResult` (e.g. `hook_channel_silent=True`)."""
 
     def effect(spec: SessionSpec) -> SessionResult:
         if doc:
@@ -25838,7 +25840,7 @@ def retro_effect(
         if stray is not None:
             (project.project / stray).write_text("stray retro write\n")
         rj = None if rj_status is None else {"workflow": "bmad-retrospective", "status": rj_status}
-        return SessionResult(status=status, result_json=rj)
+        return SessionResult(status=status, result_json=rj, **result_kw)
 
     return effect
 
@@ -26138,6 +26140,69 @@ def test_auto_retro_session_not_completed_fails_and_run_continues(project, monke
     )
 
 
+def _run_failed_retro(project, monkeypatch, **result_kw):
+    """Drive a two-epic run whose epic-1 retro session ends `timeout` having
+    written nothing; returns the engine, its summary and the notices sent."""
+    sent = _record_notify(monkeypatch)
+    _two_epic_sprint(project)
+    retro = MockAdapter(
+        [
+            retro_effect(
+                project, board=False, doc=False, status="timeout", rj_status=None, **result_kw
+            )
+        ]
+    )
+    engine, _ = make_engine(
+        project,
+        [
+            dev_effect(project, "1-1-a"),
+            review_effect(project, "1-1-a", clean=True),
+            dev_effect(project, "2-1-b"),
+            review_effect(project, "2-1-b", clean=True),
+        ],
+        policy=AUTO_RETRO,
+        retro_adapter=retro,
+    )
+    summary = engine.run()
+    assert len(retro.sessions) == 1
+    return engine, summary, sent
+
+
+def test_auto_retro_silent_hook_channel_is_named_and_run_continues(project, monkeypatch):
+    """DW-644: a retro that timed out on a silent hook channel names the relay
+    fault — `noncompletion` on `retro-auto-failed` and the note in the notice —
+    instead of reading as a generic failure. Diagnostic only: the run neither
+    pauses nor charges, and `errors` still names the timeout.
+
+    Ablation: drop the `noncompletion` extras line in `_maybe_auto_retro` and the
+    field assertion reddens."""
+    engine, summary, sent = _run_failed_retro(project, monkeypatch, hook_channel_silent=True)
+
+    assert summary.done == 2 and not summary.paused
+    row = _only(engine, "retro-auto-failed")
+    assert row["noncompletion"] == "hook-channel-silent"
+    assert any("timeout" in e for e in row["errors"])
+    failed = [msg for title, msg in sent if title == "auto retrospective failed"]
+    assert len(failed) == 1
+    assert "hook channel silent" in failed[0] and "bmad-loop validate" in failed[0]
+    assert "/bmad-retrospective" in failed[0]
+    assert "resume" not in failed[0] and "not charged" not in failed[0]
+
+
+def test_auto_retro_plain_noncompleted_session_has_no_noncompletion(project, monkeypatch):
+    """DW-644: a non-completed retro with no classified cause keeps the old
+    shape — no `noncompletion` key, no cause note in the notice."""
+    engine, summary, sent = _run_failed_retro(project, monkeypatch)
+
+    assert summary.done == 2 and not summary.paused
+    row = _only(engine, "retro-auto-failed")
+    assert "noncompletion" not in row
+    failed = [msg for title, msg in sent if title == "auto retrospective failed"]
+    assert len(failed) == 1
+    assert failed[0].startswith("epic 1: session status timeout")
+    assert "hook channel silent" not in failed[0]
+
+
 def test_auto_retro_incomplete_session_is_never_success_and_its_output_pauses(project):
     """A session that did everything — doc, board, even a `done` result.json — but
     did not COMPLETE is still a failed retro: nothing is committed, and the
@@ -26208,6 +26273,7 @@ def test_auto_retro_session_exception_is_a_failed_retro(project):
     row = _only(engine, "retro-auto-failed")
     assert row["errors"][0] == "session raised RuntimeError"
     assert "transport fell over" in row["error"]
+    assert "noncompletion" not in row  # no SessionResult, no verdict (DW-644)
 
 
 @pytest.mark.parametrize("exc_type", [RunStopped, KeyboardInterrupt])

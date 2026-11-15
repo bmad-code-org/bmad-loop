@@ -46,7 +46,7 @@ import pytest
 
 from bmad_loop import runs
 from bmad_loop.adapters import psmux_backend, tmux_base
-from bmad_loop.adapters.multiplexer import UNSET, parked_screen
+from bmad_loop.adapters.multiplexer import UNSET, MultiplexerError, parked_screen
 from bmad_loop.adapters.psmux_backend import PsmuxMultiplexer
 from bmad_loop.tui import launch
 
@@ -147,7 +147,7 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
         # with both other arms empty.
         assert launch.prune_ctl_windows(proj_a) == (["run-20260726-1"], [], [], [])
 
-        live = mux.list_window_ids(session)
+        live = _window_ids(mux, session)
         assert win_a not in live
         assert win_b in live
         assert win_c in live  # its command was still running
@@ -214,15 +214,32 @@ def _raw_new_session(mux: PsmuxMultiplexer, session: str, cwd: Path) -> None:
     ), "probe setup: probe session was not observable by plain name"
 
 
+def _window_ids(mux: PsmuxMultiplexer, session: str) -> set[str]:
+    """`list_window_ids`, re-asked while the listing cannot be taken.
+
+    psmux's client can drop a live session's reply and exit 0 with nothing
+    (v3.4.0), which the backend raises on rather than reading as "no windows".
+    A test's setup and before/after reads want the answer, not the fault, so a
+    raise is re-asked for up to 5s. A read that answers is never re-asked."""
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            return set(mux.list_window_ids(session))
+        except MultiplexerError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
 def _mint_probe_window(
     mux: PsmuxMultiplexer, session: str, name: str, cwd: Path, argv: list[str] = PARKED_ARGV
 ) -> str:
-    before = set(mux.list_window_ids(session))
+    before = _window_ids(mux, session)
     mux.new_parked_window(session, name, cwd, argv, "@r")
     deadline = time.monotonic() + 5
     created: set[str] = set()
     while time.monotonic() < deadline:
-        created = set(mux.list_window_ids(session)) - before
+        created = _window_ids(mux, session) - before
         if len(created) == 1:
             break
         time.sleep(0.1)
@@ -1203,12 +1220,12 @@ def test_a_parked_trailer_runs_the_pinned_psmux_off_the_pane_path(probe, tmp_pat
             "_source_prefix",
             lambda: prefix + f"$env:PATH = {psmux_backend._pwsh_quote(system32)}; ",
         )
-        before = set(mux.list_window_ids(session))
+        before = _window_ids(mux, session)
         pwsh = _REAL_PWSH_PATH(mux)
         mux.new_parked_window(
             session, "pinned-psmux", tmp_path, [pwsh, "-NoProfile", "-Command", "exit 0"], "@r"
         )
-        created = set(mux.list_window_ids(session)) - before
+        created = _window_ids(mux, session) - before
         assert len(created) == 1, f"probe setup: window mint not observable: {sorted(created)}"
         window = created.pop()
         mux.set_window_option(window, "@r", "detach")
@@ -1342,14 +1359,14 @@ def test_adopted_unresolvable_kill_target_exits_nonzero_and_spares_live_windows(
     # Both halves matter and neither implies the other: the non-zero exit is what
     # triggers kill_window's survivor probe, and sparing the live windows is what
     # makes the old destructive workaround unnecessary (psmux/psmux#545).
-    before = set(mux.list_window_ids(session))
+    before = _window_ids(mux, session)
     assert len(before) >= 2, f"probe setup: probe session should hold the parked windows: {before}"
     proc = mux._run(["kill-window", "-t", f"{session}:@9999"], check=False)
     assert proc.returncode != 0, (
         "psmux is back to exiting 0 for an unresolvable kill-window target — "
         "kill_window's survivor probe never triggers and a real failure stays silent"
     )
-    after = set(mux.list_window_ids(session))
+    after = _window_ids(mux, session)
     assert after == before, (
         "an unresolvable kill-window target destroyed a live window again "
         f"(psmux/psmux#545): {sorted(before)} -> {sorted(after)}"
@@ -1642,7 +1659,7 @@ def test_a_powershell_older_than_7_3_refuses_the_launch_before_any_window(probe,
     if shutil.which("powershell.exe") is None:
         pytest.skip("requires Windows PowerShell 5.1 (powershell.exe)")
     mux, session, _windows = probe
-    before = sorted(mux.list_window_ids(session))
+    before = sorted(_window_ids(mux, session))
     monkeypatch.setattr(mux, "_PWSH", "powershell.exe")
     # A parked engine's argv as the TUI composes it, carrying the root shape
     # 5.1 corrupts: the state root must never reach the engine damaged.
@@ -1651,7 +1668,7 @@ def test_a_powershell_older_than_7_3_refuses_the_launch_before_any_window(probe,
         mux.new_parked_window(session, "legacy-shell", Path.cwd(), engine, "@r")
     assert "upgrade pwsh to 7.3 or later" in str(refused.value)
     assert psmux_backend._PWSH_VERSIONS[mux._pwsh_path()].startswith("5.1.")
-    assert sorted(mux.list_window_ids(session)) == before, "a window was minted despite the refusal"
+    assert sorted(_window_ids(mux, session)) == before, "a window was minted despite the refusal"
 
 
 # Argument shapes a window's argv must deliver byte-for-byte to its target on a
