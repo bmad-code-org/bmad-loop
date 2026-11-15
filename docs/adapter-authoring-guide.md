@@ -340,8 +340,10 @@ a new `name` extends the set. The aliases `claude-code-tmux` and `opencode` reso
 | `binary`                           | ✅       | —                                                                              | Executable resolved on `PATH`. `validate` runs `--version` only on binary names a packaged profile declares (`adapter.binary-unrunnable`).                                                                                                                                                                 |
 | `[hooks]`                          | ✅       | —                                                                              | The [`HookSpec`](#hookspec-the-hooks-table) table.                                                                                                                                                                                                                                                         |
 | `adapter`                          |          | `generic` (`opencode-http` if `dialect=none`)                                  | Adapter kind, resolved against the live [registry](#shipping-a-new-adapter-class-out-of-tree) at run start and by `validate` (`adapter.kind`). `generic` with `dialect = "none"` is refused.                                                                                                               |
-| `skill_tree`                       |          | `.claude/skills`                                                               | Project-relative tree the CLI reads skills from; `init` installs the `bmad-loop-*` skills here. Must stay inside the project.                                                                                                                                                                              |
-| `prompt_template`                  |          | `{prompt}`                                                                     | Renders the canonical `/skill args` prompt. Placeholders: `{prompt}` (whole string), `{skill}` (command name, no `/`), `{args}` (the rest).                                                                                                                                                                |
+| `skill_tree`                       |          | `.claude/skills`                                                               | Project-relative tree the CLI reads skills from; `init` installs the `bmad-loop-*` skills here. Must stay inside the project; a leading `~` is refused (it is not expanded).                                                                                                                               |
+| `extra_skill_trees`                |          | `[]`                                                                           | Further project-relative trees the CLI also reads skills from (opencode-http: `[".agents/skills"]`). Each entry gets the `skill_tree` checks and must differ from it. Read by validate, the run and worktree seeding; `init` installs only into `skill_tree`.                                              |
+| `[user_skills]`                    |          | unset                                                                          | The user-level folders the CLI loads skills from on its own, used only under `[skills] user_roots = true`. See [User-level skill roots](#user-level-skill-roots). Unset: no user root is resolved, hinted or shadow-checked.                                                                               |
+| `prompt_template`                  |          | `{prompt}`                                                                     | Renders the canonical `/skill args` prompt. Placeholders: `{prompt}` (whole string), `{skill}` (command name, no `/`), `{args}` (the rest), `{skill_dir}` (the skill's folder: `<skill_tree>/<skill>`, or the absolute path when it resolved from a user root).                                            |
 | `launch_args`                      |          | `[]`                                                                           | Argv after `binary` (`["-i"]` keeps gemini/copilot interactive). Under `opencode-http` it precedes `serve`; `validate` warns on unservable shapes.                                                                                                                                                         |
 | `bypass_args`                      |          | `[]`                                                                           | Permission-bypass flags for unattended runs, launched under `permission_mode = "bypass"`. A policy `extra_args` replaces them; `validate` warns (`policy.bypass-dropped`) when one is dropped.                                                                                                             |
 | `model_flag`                       |          | `--model`                                                                      | Flag passed with the model name when one is configured.                                                                                                                                                                                                                                                    |
@@ -453,6 +455,33 @@ write fault escalates the unit. Entries are never removed on teardown. The shipp
 settings_path = "~/.gemini/antigravity-cli/settings.json"
 key = "trustedWorkspaces"
 ```
+
+### User-level skill roots
+
+The `[user_skills]` table declares the folders in the user's home that the CLI loads skills
+from by itself. bmad-loop resolves a skill from them only when the project sets
+`[skills] user_roots = true`; with the switch off they serve the `skills.base-missing` hint
+and the `skills.user-shadow` warning.
+
+```toml
+[user_skills]
+precedence = "project"
+roots = [
+  { path = "~/.copilot/skills", disabled_by = ["COPILOT_HOME"] },
+  "~/.agents/skills",
+]
+```
+
+| Key           | Default     | Meaning                                                                                                                                                                                                                                                           |
+| ------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `precedence`  | `"project"` | Which copy the CLI runs when the project and a user root both hold one: `project` (the project's), `user` (the user root's; validate and the run check that copy) or `unordered` (both load in no documented order; bmad-loop checks the project copy and warns). |
+| `roots`       | `[]`        | The user roots, in the order the CLI reads them. Each is a `"~/..."` string or a `{ path = "~/...", disabled_by = [...] }` table. A path must start with `~/` and stay inside the home folder; duplicate roots are refused.                                       |
+| `disabled_by` | `[]`        | Environment variables that make the CLI skip this root when set (even to an empty value), such as a variable that moves the CLI's config home. Read from bmad-loop's environment plus the profile's `[env]`.                                                      |
+
+Declare only folders the CLI loads natively, as its own docs describe them. `validate` passes
+a skill found in a declared root, so a root the CLI does not read gives a green `validate`
+and a session that cannot find its skill. Recheck the list when the CLI changes how it
+discovers skills.
 
 ### Environment-fault patterns
 

@@ -348,6 +348,22 @@ bmad-loop drives a BMAD sprint unattended: a deterministic Python loop launches 
 - **Tested by:** `tests/test_profile.py`, `tests/test_probe.py`, `tests/test_adapter_registry.py`, `tests/test_workspace_trust.py`, `tests/test_codex_trust.py`, `tests/test_generic_tmux.py`, `tests/test_cli.py`
 - **Docs:** [Choosing which CLIs to drive](setup-guide.md#choosing-which-clis-to-drive), [Codex shared app-server daemon](setup-guide.md#codex-shared-app-server-daemon), [Adapter authoring guide: finalizing a profile](adapter-authoring-guide.md#walkthrough-finalizing-a-profile), [CLI reference: probe-adapter](reference/cli.md#probe-adapter), [CLI reference: adapters](reference/cli.md#adapters)
 
+### User-level skill roots
+
+- **Stability:** experimental
+- **Description:** An opt-in that lets a run use BMAD skills installed in the user's home folder (`npx skills add -g`) instead of the project's skill trees. Each CLI's profile declares the user folders that CLI loads on its own and which copy it runs on a name clash, so `validate` checks the copy the session will load.
+- **Properties:**
+  - Off by default: skills resolve only from the project's skill trees, and a skill found only in a user root keeps the run refused with a hint naming that copy.
+  - On, `validate`, the run preflight, `run --dry-run`, session dispatch and worktree seeding resolve every skill through the same lookup, and `validate` reports where each driven skill was found (`skills.root`).
+  - Only the folders a profile's `[user_skills]` table declares are searched; a root disabled by a set environment variable or unreadable is skipped and reported.
+  - With the switch on, a claude user copy outranks the project's, as Claude Code itself does; a user copy that competes with a project copy is reported as `skills.user-shadow` with the switch on or off.
+  - Each session journals the skills it loads from a user root (`skill-user-root`); worktrees never copy from a user root.
+  - opencode-http 2.x allows only the BMAD module skills a session needs from a user root, never the operator's personal skills; on 1.x the session refuses to start and `validate` warns.
+  - A leading `~` in a profile's `skill_tree`, `extra_skill_trees`, `seed_files` or `hooks.config_path` is refused, and a skill tree linked outside the repository is refused at preflight under worktree isolation.
+- **Config:** `[skills] user_roots`; profile `[user_skills]`, `extra_skill_trees`
+- **Tested by:** `tests/test_skill_locate.py`, `tests/test_install.py`, `tests/test_profile.py`, `tests/test_cli.py`, `tests/test_engine.py`, `tests/test_engine_worktree.py`, `tests/test_opencode_protocol.py`, `tests/test_opencode_http.py`
+- **Docs:** [Project skills and user-level skill roots](setup-guide.md#project-skills-and-user-level-skill-roots), [Adapter authoring guide: user-level skill roots](adapter-authoring-guide.md#user-level-skill-roots), [Configuration reference: [skills]](reference/configuration.md#skills)
+
 ### Per-stage adapters
 
 - **Stability:** stable

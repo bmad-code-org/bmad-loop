@@ -148,12 +148,71 @@ implementation and the follow-up review), installed by the BMad Method (bmm)
 module. `bmad-loop validate` checks it — plus any review skills its layers
 invoke — are present before a run starts.
 
-bmad-loop resolves BMAD skills only from the project's own skill tree
-(`.claude/skills`, `.agents/skills`). A global install (`npx skills add -g`, into
-`~/.claude/skills` or `~/.agents/skills`) and a Claude Code plugin install are not used.
-When `validate` finds a missing skill installed globally it says so, and
-`detail.outside` names that copy, but the run still refuses: install the skill per
-project with `npx skills add` without `-g`.
+### Project skills and user-level skill roots
+
+By default bmad-loop resolves BMAD skills only from the project's own skill trees
+(`.claude/skills`, `.agents/skills`). A Claude Code plugin install is never used. A global
+install (`npx skills add -g`) is used only when you opt in:
+
+```toml
+# .bmad-loop/policy.toml
+[skills]
+user_roots = true
+```
+
+With the switch on, a skill missing from the project trees may resolve from a user-level
+folder, but only from the folders the coding CLI itself loads. Each CLI's profile declares
+those folders, which the CLI reads first when both hold a copy (its precedence), and the
+environment variables that make the CLI skip one:
+
+| CLI           | Precedence  | User roots, in the order the CLI reads them                                                                 |
+| ------------- | ----------- | ----------------------------------------------------------------------------------------------------------- |
+| claude        | `user`      | `~/.claude/skills` (skipped when `CLAUDE_CONFIG_DIR` is set)                                                |
+| codex         | `unordered` | `~/.agents/skills`; `~/.codex/skills` (skipped when `CODEX_HOME` is set)                                    |
+| gemini        | `project`   | `~/.agents/skills`; `~/.gemini/skills` (both skipped when `GEMINI_CLI_HOME` is set)                         |
+| copilot       | `project`   | `~/.copilot/skills`; `~/.agents/skills` (both skipped when `COPILOT_HOME` is set)                           |
+| antigravity   | `unordered` | `~/.gemini/config/skills`                                                                                   |
+| opencode-http | `project`   | `~/.config/opencode/skills` (skipped when `XDG_CONFIG_HOME` is set); `~/.agents/skills`; `~/.claude/skills` |
+
+- `project`: the project copy wins; a user copy fills in only for a skill the project lacks.
+- `user`: the CLI runs the user copy even when the project has one, so `validate` and the
+  run check that copy.
+- `unordered`: the CLI loads both copies in no documented order. bmad-loop checks the
+  project copy and warns.
+
+`validate` reports where every driven skill was found as a `skills.root` line, and the run
+journals each skill a session loads from a user root (`skill-user-root`). A user root that
+a variable disables or that cannot be read (or every root, when there is no home folder) is reported as
+`skills.user-root-unavailable`; a user root whose BMAD method module is a different version
+from the project's as `skills.user-root-version-skew`. With the switch off, a missing skill
+that one of the CLI's own user roots holds keeps the run refused, and the `skills.base-missing`
+message names that copy (`detail.outside`) and the switch.
+
+Whatever the switch, `validate` warns with `skills.user-shadow` when a copy in a user root
+competes with the project's: Claude Code runs `~/.claude/skills/<name>` instead of the
+project copy, and Codex and Antigravity load both. Remove the stale copy or bring the two to
+the same version.
+
+Worktrees never carry a user root: under worktree isolation a skill resolved from one is
+loaded from your home folder, and the worktree seeding gate skips it (journaled as
+`worktree-skills-user-root`). A skill tree linked to a folder outside the repository is a
+`skills.tree-outside` problem under worktree isolation, refused before the run starts,
+because the worktree cannot carry it; without isolation it is a warning.
+
+**Fresh clones and CI** have no user roots to fall back on. Either commit the project skill
+tree, or commit the `skills-lock.json` that `npx skills add` writes and run
+`npx skills install` after cloning (the skills CLI still labels that command
+experimental).
+
+Known limitations:
+
+- The variables that disable a user root are read from bmad-loop's own environment plus the
+  profile's `[env]`. A long-lived tmux or psmux server can hand sessions a different
+  environment.
+- When one skill id is in both of opencode's project trees, which copy opencode loads is not
+  pinned. The skills CLI normally links the two, so they are identical.
+- The CLIs' folder lists change over time. The profiles reflect the vendor docs at the time
+  of writing; recheck them when a CLI changes how it finds skills.
 
 **Minimum BMAD-METHOD: v6.10.0** for sprint mode. Beyond the primitive itself (with
 its `customize.toml`), `bmad-loop validate` holds you to no fixed list of review
@@ -459,13 +518,22 @@ What differs on 2.x:
 
 - **Instructions:** 2.x reads only `AGENTS.md` — there is no `CLAUDE.md` fallback, so put
   project instructions the agent must see in `AGENTS.md`.
-- **Skills:** 2.x has no switch to turn off the operator's personal skills
-  (`~/.claude/skills`, `~/.agents/skills`) and its built-in ones. The adapter keeps sessions
-  hermetic with permission rules instead: every skill is denied except the project's own,
-  so the model is offered only those. (`GET /api/skill` still lists every skill it found;
-  the rules govern what a session can load.) A project skill whose directory name contains
-  `*` or `?` stays denied, because 2.x reads those characters as rule wildcards; the spawn
-  records a `skill-ids-refused` event in the session lifecycle log.
+- **Skills:** the adapter reads the project's skills from both `.claude/skills` and
+  `.agents/skills` (where the skills CLI installs opencode's project skills). 2.x has no
+  switch to turn off the operator's personal skills (`~/.claude/skills`, `~/.agents/skills`)
+  and its built-in ones. The adapter keeps sessions hermetic with permission rules instead:
+  every skill is denied except the project's own, so the model is offered only those.
+  (`GET /api/skill` still lists every skill it found; the rules govern what a session can
+  load.) A project skill whose directory name contains `*` or `?` stays denied, because 2.x
+  reads those characters as rule wildcards; the spawn records a `skill-ids-refused` event
+  in the session lifecycle log.
+- **User-root skills:** with
+  [`[skills] user_roots`](#project-skills-and-user-level-skill-roots) on, 2.x also allows
+  the BMAD module skills the session needs from a user root (the dev skill, its review
+  skills, and the skills a user root's BMAD module records list) and records a
+  `skill-ids-user-allowed` lifecycle event; your personal skills stay denied. 1.x turns
+  external skills off entirely, so it cannot load them: `validate` warns
+  (`skills.user-root-unsupported`) and the session refuses to start.
 - **Logs:** a provider failure (rate limit, quota, refused connection) never reaches the
   server's stdout on 2.x, so the adapter records each one in
   `<task-id>.provider-errors.log`, which the environment-fault classifier scans beside
@@ -508,7 +576,9 @@ By default, Codex attaches to a shared background app-server daemon, which may h
 ### Skill location
 
 `claude` reads skills from `.claude/skills/`; `codex`, `gemini`, `copilot`, and `antigravity`
-read from `.agents/skills/`. `init` installs the bundled `bmad-loop-*` skills into the right tree
+read from `.agents/skills/`; opencode reads both. For skills installed in your home folder,
+see [Project skills and user-level skill roots](#project-skills-and-user-level-skill-roots).
+`init` installs the bundled `bmad-loop-*` skills into the right tree
 for each CLI you pass via `--cli`, so selecting any of the `.agents/skills/` CLIs populates it automatically. It skips skill
 dirs that already exist — pass `--force-skills` to overwrite a stale copy, or `--no-skills` to
 manage them yourself.

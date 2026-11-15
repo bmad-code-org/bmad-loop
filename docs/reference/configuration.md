@@ -289,3 +289,18 @@ Terminal-multiplexer backend (machine-specific — policy.toml is gitignored).
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: policy-reference -->
+
+## Skill resolution: `[skills] user_roots`
+
+Off (the default), every skill a run drives must be in one of the project's skill trees: each profile's `skill_tree`, plus its `extra_skill_trees` (opencode-http also reads `.agents/skills`).
+
+On, a skill the project trees lack, or one a CLI with `user` precedence (claude) runs from its personal folder instead, resolves from the user-level folders that CLI loads on its own, as its profile's `[user_skills]` table declares them. `validate`, the run preflight, `run --dry-run`, session dispatch and worktree seeding all use the same resolution, so `validate` checks the copy the session will load. A CLI with no `[user_skills]` table never resolves from a user root.
+
+What changes with the switch on:
+
+- `validate` lists where each driven skill was found (`skills.root`, `detail.origin` is `project` or `user`), and `run --dry-run` prints a `note:` line for each skill from a user root.
+- Each session journals one `skill-user-root` entry per skill it loads from a user root.
+- opencode-http 2.x allows those BMAD skills through its permission rules; 1.x cannot load them, so `validate` warns (`skills.user-root-unsupported`) and the session refuses to start.
+- A dev or review stage with `permission_mode = "sandboxed"` that loads a user-root skill gets a `skills.user-root-sandboxed` warning: the sandbox may not let the CLI read your home folder.
+
+The `skills.user-shadow` warning does not depend on the switch. Per-CLI roots, precedence and the fresh-clone guidance are in the [setup guide](../setup-guide.md#project-skills-and-user-level-skill-roots); the profile keys are in the [adapter authoring guide](../adapter-authoring-guide.md#user-level-skill-roots).

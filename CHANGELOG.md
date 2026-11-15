@@ -133,6 +133,23 @@ breaking changes may land in a minor release.
   ends there non-completed and takes the existing uncharged pauses
   (`hook channel silent:`, or `parked:` / `no work produced:` when the pane shows a
   parked prompt or never changed) instead of waiting out `session_timeout_min`.
+- Add opt-in `[skills] user_roots` (default off): resolve a BMAD skill the project
+  lacks from the user-level folders the coding CLI loads on its own (`npx skills add -g`).
+  Each packaged profile declares those folders, its disabling variables and its
+  clash precedence in a new `[user_skills]` table; validate, preflight, `run --dry-run`,
+  dispatch and worktree seeding share one lookup, so `validate` checks the copy the
+  session loads. `validate` reports each driven skill's location (`skills.root`) and
+  warns on `skills.user-root-unavailable`, `-version-skew`, `-unsupported` (opencode
+  1.x, whose sessions then refuse to start) and `-sandboxed`; sessions journal
+  `skill-user-root`. opencode 2.x allows only the BMAD module skills a session needs
+  from a user root. See ADR 0002 (#770).
+- Warn with `skills.user-shadow`, whatever `[skills] user_roots` says, when a
+  user-level copy of a driven skill outranks (claude) or competes with (codex,
+  antigravity) the project's.
+- Read opencode-http's project skills from `.agents/skills` as well as
+  `.claude/skills` (new profile field `extra_skill_trees`).
+- Add a `{skill_dir}` profile prompt placeholder (the located skill folder); copilot's
+  prompt uses it.
 
 ### Changed
 
@@ -176,6 +193,14 @@ breaking changes may land in a minor release.
 - With `[verify] reuse_unchanged` on, `post_review_verify` may carry the reused pass's
   `dev`/`fix` stage and sequence, flagged by the new `verification_reused` (#1002).
 - Name each BMAD-METHOD module folder in the module record's skill sources: `skills/core-tools` for `bmad`, `skills/method` for `bmad-build-auto`, `bmad-agent-po` and `bmad-retrospective`. BMAD-METHOD moved each module's skills into its own folder.
+- Refuse a leading `~` in a profile's `skill_tree`, `extra_skill_trees`, `seed_files`
+  and `hooks.config_path` at load: it is not expanded.
+- Report a skill tree, or a skill linked inside it, that resolves outside the project
+  or repository as `skills.tree-outside`; under worktree isolation a link outside the
+  repository is refused at preflight instead of escalating mid-run.
+- Change copilot's default prompt template to `{skill_dir}`: the text is unchanged
+  for project skills, but the config digest changes once, so the first resume of a
+  copilot run after upgrading journals `security_config_changed`.
 
 ### Removed
 
@@ -201,8 +226,8 @@ breaking changes may land in a minor release.
   refuses to load as a `skills.customize-unreadable` problem.
 - Report a missing dev primitive once, without stacking review-skill and dispatch
   failures under the legacy `bmad-dev-auto` name on top of it. Name core-tools as
-  the v7 home of `bmad-review`, and note when a missing skill is installed only
-  globally (`~/.claude/skills`, `~/.agents/skills`).
+  the v7 home of `bmad-review`, and note when a missing skill is installed only in
+  one of the CLI's own user-level folders, naming `[skills] user_roots`.
 - Stop reading an empty psmux window listing as a dead session. psmux can drop a live
   server's reply and exit 0 with nothing, which the liveness probe took for a crashed CLI
   and the control-window prune for a verified kill. That listing now counts as a failed
