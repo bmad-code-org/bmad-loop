@@ -13212,3 +13212,258 @@ def test_outside_copy_unresolvable_home_is_no_hint(monkeypatch):
 
     monkeypatch.setattr(install_mod, "_outside_home", no_home)
     assert install_mod._outside_copy(DEV_PRIMITIVE_NEW) is None
+
+
+# --- user-level skill roots through SkillScope ---------------------------------
+
+
+def _user_scope(profile, home, *, on, environ=None):
+    """``profile``'s scope over a pinned ``home`` and environment."""
+    from bmad_loop.skill_locate import scope_for
+
+    return scope_for(get_profile(profile), resolve_user=on, home=home, environ=environ or {})
+
+
+def test_scope_global_only_install_resolves_from_the_user_root(tmp_path):
+    """Switch on: a global-only primitive resolves (no base-missing) and the findings
+    about that copy name its root; a plain string still reports today's base-missing."""
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    # truncated primitive (no step-04) plus the merged reviewer, all in ~/.agents/skills
+    _install_skills(
+        home, ".agents/skills", {DEV_PRIMITIVE_NEW: ("customize.toml",), "bmad-review": ()}
+    )
+    scope = _user_scope("codex", home, on=True)
+
+    findings = missing_base_skills(project, [scope])
+
+    assert [f.check for f in findings] == ["skills.base-incomplete"]
+    assert findings[0].detail["root"] == "~/.agents/skills"
+    assert findings[0].detail["tree"] == ".agents/skills"
+    assert findings[0].message.startswith(f"~/.agents/skills/{DEV_PRIMITIVE_NEW} is incomplete")
+    assert resolve_dev_primitive(project, scope) == DEV_PRIMITIVE_NEW
+    # the plain string, and the switch off, never resolve from home
+    assert [f.check for f in missing_base_skills(project, [".agents/skills"])] == [
+        "skills.base-missing"
+    ]
+    assert resolve_dev_primitive(project, _user_scope("codex", home, on=False)) is None
+
+
+def test_scope_missing_primitive_names_searched_roots_and_the_home_hint(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+
+    [on] = missing_base_skills(project, [_user_scope("codex", home, on=True)])
+    assert on.check == "skills.base-missing"
+    assert on.detail["searched"] == [".agents/skills", "~/.agents/skills", "~/.codex/skills"]
+    assert "outside" not in on.detail
+
+    _install_skills(home, ".codex/skills", {DEV_PRIMITIVE_NEW: ()})
+    [off] = missing_base_skills(project, [_user_scope("codex", home, on=False)])
+    assert off.check == "skills.base-missing"
+    assert "searched" not in off.detail
+    assert off.detail["outside"] == f"~/.codex/skills/{DEV_PRIMITIVE_NEW}"
+    assert "which this CLI loads" in off.message
+    assert "`[skills] user_roots = true`" in off.message
+
+
+def _shadow_layout(tmp_path, tree, home_root):
+    home, project = tmp_path / "home", tmp_path / "project"
+    install_build_auto_skill(project, tree)
+    _install_skills(home, home_root, {DEV_PRIMITIVE_NEW: ()})
+    return home, project
+
+
+def _checks(findings, check):
+    return [f for f in findings if f.check == check]
+
+
+def test_user_shadow_claude_personal_copy_overrides_with_the_switch_off(tmp_path):
+    home, project = _shadow_layout(tmp_path, ".claude/skills", ".claude/skills")
+
+    off = missing_base_skills(project, [_user_scope("claude", home, on=False)])
+    [shadow] = _checks(off, "skills.user-shadow")
+    assert shadow.severity == "warning"
+    assert shadow.detail == {
+        "tree": ".claude/skills",
+        "skill": DEV_PRIMITIVE_NEW,
+        "checked": f".claude/skills/{DEV_PRIMITIVE_NEW}",
+        "other": f"~/.claude/skills/{DEV_PRIMITIVE_NEW}",
+        "precedence": "user",
+        "kind": "overrides",
+    }
+    # switch on: the checks read the personal copy itself, so nothing is shadowed
+    on = missing_base_skills(project, [_user_scope("claude", home, on=True)])
+    assert not _checks(on, "skills.user-shadow")
+    # a plain string never looks at home
+    assert not _checks(missing_base_skills(project, [".claude/skills"]), "skills.user-shadow")
+
+
+def test_user_shadow_codex_unordered_copies_compete(tmp_path):
+    home, project = _shadow_layout(tmp_path, ".agents/skills", ".agents/skills")
+
+    for on in (False, True):
+        findings = missing_base_skills(project, [_user_scope("codex", home, on=on)])
+        [shadow] = _checks(findings, "skills.user-shadow")
+        assert shadow.detail["kind"] == "competes"
+        assert shadow.detail["precedence"] == "unordered"
+
+
+def test_user_shadow_gemini_project_precedence_is_no_shadow(tmp_path):
+    """Negative: gemini's workspace copy wins, so a user copy shadows nothing.
+    Ablation: drop the precedence test in skill_locate.shadow and this fails."""
+    home, project = _shadow_layout(tmp_path, ".agents/skills", ".agents/skills")
+
+    for on in (False, True):
+        findings = missing_base_skills(project, [_user_scope("gemini", home, on=on)])
+        assert not _checks(findings, "skills.user-shadow")
+
+
+def test_user_root_unavailable_is_reported_only_with_the_switch_on(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    install_build_auto_skill(project, ".agents/skills")
+    environ = {"CODEX_HOME": str(tmp_path / "codex")}
+
+    off = missing_base_skills(project, [_user_scope("codex", home, on=False, environ=environ)])
+    assert not _checks(off, "skills.user-root-unavailable")
+
+    on = missing_base_skills(project, [_user_scope("codex", home, on=True, environ=environ)])
+    [finding] = _checks(on, "skills.user-root-unavailable")
+    assert finding.severity == "warning"
+    assert finding.detail == {
+        "tree": ".agents/skills",
+        "root": "~/.codex/skills",
+        "reason": "env:CODEX_HOME",
+    }
+    assert "CODEX_HOME is set" in finding.message
+
+
+def _bmod_method(root, tree, version):
+    d = root / tree / "bmod-method"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text("# bmod-method\n", encoding="utf-8")
+    (d / "bmod.toml").write_text(f'[bmod]\nversion = "{version}"\n', encoding="utf-8")
+
+
+def test_user_root_version_skew_warns_when_module_records_differ(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    install_build_auto_skill(project, ".agents/skills")
+    _bmod_method(project, ".agents/skills", "6.13.0")
+    _bmod_method(home, ".agents/skills", "6.13.0")
+    scope = _user_scope("codex", home, on=True)
+
+    assert not _checks(missing_base_skills(project, [scope]), "skills.user-root-version-skew")
+
+    _bmod_method(home, ".agents/skills", "6.12.0")
+    [skew] = _checks(missing_base_skills(project, [scope]), "skills.user-root-version-skew")
+    assert skew.severity == "warning"
+    assert skew.detail == {
+        "tree": ".agents/skills",
+        "root": "~/.agents/skills",
+        "user_version": "6.12.0",
+        "project_version": "6.13.0",
+    }
+    # the project record still answers the display-only version
+    assert install_mod.bmod_method_version(project, [scope]) == "6.13.0"
+
+
+def test_render_probe_stages_a_user_root_primitive(tmp_path):
+    project, marker, primitive = _probe_project(tmp_path, RENDER_PROBE_OK_BODY, ".agents/skills")
+    home = tmp_path / "home"
+    (home / ".agents/skills").mkdir(parents=True)
+    shutil.move(primitive, home / ".agents/skills" / DEV_PRIMITIVE_NEW)
+    scope = _user_scope("codex", home, on=True)
+
+    [finding] = dev_renderer_probe(project, [scope])
+
+    assert finding.severity == "ok", finding.message
+    assert finding.detail["root"] == "~/.agents/skills"
+    assert finding.message.startswith(f"~/.agents/skills/{DEV_PRIMITIVE_NEW} renders cleanly")
+    ran = json.loads(marker.read_text(encoding="utf-8"))
+    assert Path(ran["skill"]) == Path(ran["root"]) / ".agents/skills" / DEV_PRIMITIVE_NEW
+    assert ran["skill_md"] is True
+    # switch off: the project tree has no primitive, so there is nothing to render
+    [off] = dev_renderer_probe(project, [_user_scope("codex", home, on=False)])
+    assert off.detail == {"trees": [".agents/skills"]}
+
+
+def test_review_layers_read_the_user_copy_with_project_local_overrides(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    _install_dev_auto(home, ".agents/skills", skill=DEV_PRIMITIVE_NEW, customize=LAYER_CUSTOMIZE)
+    extra = (
+        '[[workflow.review_layers]]\nid = "extra"\n'
+        'instruction = "Invoke the `bmad-review-extra` skill on this diff"\n'
+    )
+    override = project / install_mod.CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_NEW}.toml"
+    override.parent.mkdir(parents=True)
+    override.write_text(extra, encoding="utf-8")
+    # an override beside the user copy is not the project's and is never read
+    stray = home / install_mod.CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_NEW}.toml"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(extra.replace("extra", "stray"), encoding="utf-8")
+    scope = _user_scope("codex", home, on=True)
+
+    resolved = resolve_review_layers(project, scope)
+
+    assert resolved is not None
+    assert set(resolved.required) == {"bmad-review", "bmad-review-extra"}
+    assert resolve_review_layers(project, _user_scope("codex", home, on=False)) is None
+
+
+def test_user_root_skill_ids_keep_only_bmad_module_skills(tmp_path):
+    """A personal skill in the same root stays out. Ablation: collect every folder of
+    the user root instead of the candidates + module records and this fails."""
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    _install_skills(
+        home,
+        ".agents/skills",
+        {DEV_PRIMITIVE_NEW: (), "bmad-agent-po": (), "my-notes": (), "bmad-loop-sweep": ()},
+    )
+    _bmod_method(home, ".agents/skills", "6.13.0")
+    record = home / ".agents/skills/bmod-method/bmod.toml"
+    record.write_text(
+        '[bmod]\nversion = "6.13.0"\nskills = ["bmad-agent-po", "../escape", "*"]\n',
+        encoding="utf-8",
+    )
+    # the project copy of the sweep skill wins under codex's project-first lookup
+    _install_skills(project, ".agents/skills", {"bmad-loop-sweep": ()})
+    scope = _user_scope("codex", home, on=True)
+
+    ids = install_mod.user_root_skill_ids(project, scope, "bmad-loop-sweep")
+
+    assert DEV_PRIMITIVE_NEW in ids and "bmad-agent-po" in ids
+    assert "my-notes" not in ids
+    assert "bmad-loop-sweep" not in ids
+    assert not any(".." in i or "*" in i for i in ids)
+    assert install_mod.user_root_skill_ids(project, _user_scope("codex", home, on=False)) == ()
+
+
+def test_skill_root_findings_name_the_resolving_root(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    _install_skills(home, ".agents/skills", {**_era_catalog(DEV_PRIMITIVE_NEW), "bmad-review": ()})
+    scope = _user_scope("codex", home, on=True)
+
+    lines = install_mod.skill_root_findings(project, [scope])
+
+    assert lines and all(f.check == "skills.root" and f.severity == "ok" for f in lines)
+    by_skill = {f.detail["skill"]: f.detail for f in lines}
+    assert by_skill[DEV_PRIMITIVE_NEW] == {
+        "tree": ".agents/skills",
+        "skill": DEV_PRIMITIVE_NEW,
+        "root": "~/.agents/skills",
+        "origin": "user",
+    }
+    # never part of the preflight's finding list
+    assert not _checks(missing_base_skills(project, [scope]), "skills.root")
+
+
+def test_skill_trees_outside_skips_user_root_skills(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    _install_skills(home, ".agents/skills", {**_era_catalog(DEV_PRIMITIVE_NEW), "bmad-review": ()})
+    scope = _user_scope("codex", home, on=True)
+
+    assert install_mod.skill_trees_outside(project, project, [scope], isolation="worktree") == []

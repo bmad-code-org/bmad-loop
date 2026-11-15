@@ -36,7 +36,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, NamedTuple
 
-from . import bmadconfig, childrun, ticketlayout, ticketmodel, ticketstore, tickettree
+from . import bmadconfig, childrun, skill_locate, ticketlayout, ticketmodel, ticketstore, tickettree
 from .adapters.profile import (
     ALIASES,
     CANONICAL_EVENTS,
@@ -49,6 +49,7 @@ from .checks import Finding
 from .platform_util import atomic_write_bytes, atomic_write_text, file_lock
 from .policy import POLICY_TEMPLATE
 from .process_host import ProcessHostError, get_process_host
+from .skill_locate import Located, SkillScope, as_scope
 from .verify import (
     GitError,
     git_below_floor,
@@ -283,7 +284,61 @@ def _customize_overrides(skill: str) -> tuple[Path, ...]:
     )
 
 
-def resolve_dev_primitive(project: Path, tree: str) -> str | None:
+# A skill question's tree argument: a plain tree string (a project-only scope over
+# that one tree, exactly as before user roots existed) or a :class:`SkillScope`
+# from :func:`skill_locate.scope_for`. Every question below resolves a skill
+# through :func:`skill_locate.locate`, so the copy a check reads is the copy the
+# session loads.
+SkillTree = str | SkillScope
+
+
+def _scope_items(trees: Iterable[SkillTree]) -> dict[SkillScope, SkillTree]:
+    """``trees`` deduplicated on their scope, each mapped to the first spelling
+    given — a plain string keeps the legacy out-of-project hint
+    (:func:`_missing_hint`), so the original is carried alongside its scope."""
+    items: dict[SkillScope, SkillTree] = {}
+    for tree in trees:
+        items.setdefault(as_scope(tree), tree)
+    return items
+
+
+def _skill_dir(project: Path, scope: SkillScope, name: str) -> Path:
+    """Where ``name``'s files are read: the located copy's folder, else the primary
+    tree's spelling of it (absent or SKILL.md-less), which is exactly the path a
+    plain string tree has always read."""
+    found = skill_locate.locate(project, scope, name)
+    return found.path if found is not None else project / scope.tree / name
+
+
+def _root_detail(found: Located | None) -> dict[str, str]:
+    """The additive ``root`` detail entry for a copy outside the primary tree."""
+    return {} if found is None or found.primary else {"root": found.root}
+
+
+def _searched_detail(scope: SkillScope) -> dict[str, list[str]]:
+    """The additive ``searched`` detail entry: every location a missing skill was
+    looked for, when that is more than the primary tree alone."""
+    searched = list(scope.project_trees())
+    if scope.resolve_user:
+        searched += [root.spelling for root in scope.user_roots if not root.unavailable]
+    return {"searched": searched} if len(searched) > 1 else {}
+
+
+def _primitive_copy(project: Path, tree: SkillTree) -> Located | None:
+    """The located dev primitive :func:`resolve_dev_primitive` names, or None."""
+    scope = as_scope(tree)
+    new = skill_locate.locate(project, scope, DEV_PRIMITIVE_NEW)
+    if new is not None:
+        return new
+    legacy = skill_locate.locate(project, scope, DEV_PRIMITIVE_LEGACY)
+    if legacy is not None and all(
+        _is_file(legacy.path / marker) for marker in DEV_PRIMITIVE_MARKERS
+    ):
+        return legacy
+    return None
+
+
+def resolve_dev_primitive(project: Path, tree: SkillTree) -> str | None:
     """The dev-primitive skill name to drive in ``tree``, or None when none is usable.
 
     Prefers :data:`DEV_PRIMITIVE_NEW`; falls back to :data:`DEV_PRIMITIVE_LEGACY`
@@ -295,25 +350,30 @@ def resolve_dev_primitive(project: Path, tree: str) -> str | None:
     :func:`missing_base_skills` against the resolved dir. Requiring markers here
     instead would make a truncated bmad-build-auto silently resolve to a legacy
     install (or to the shim's failure message), hiding the real problem.
+
+    Each name is located through ``tree``'s scope (:func:`skill_locate.locate`), so a
+    user-root copy resolves only when the scope says the CLI would load it.
     """
-    if _is_file(project / tree / DEV_PRIMITIVE_NEW / "SKILL.md"):
-        return DEV_PRIMITIVE_NEW
-    legacy = project / tree / DEV_PRIMITIVE_LEGACY
-    if _is_file(legacy / "SKILL.md") and all(
-        _is_file(legacy / marker) for marker in DEV_PRIMITIVE_MARKERS
-    ):
-        return DEV_PRIMITIVE_LEGACY
+    found = _primitive_copy(project, tree)
+    return found.name if found is not None else None
+
+
+def _shim_copy(project: Path, tree: SkillTree) -> Located | None:
+    """The located legacy-named skill when it is only a forwarding shim (SKILL.md
+    present, at least one marker absent), else None."""
+    legacy = skill_locate.locate(project, as_scope(tree), DEV_PRIMITIVE_LEGACY)
+    if legacy is None:
+        return None
+    if any(not (legacy.path / marker).is_file() for marker in DEV_PRIMITIVE_MARKERS):
+        return legacy
     return None
 
 
-def _is_dev_primitive_shim(project: Path, tree: str) -> bool:
+def _is_dev_primitive_shim(project: Path, tree: SkillTree) -> bool:
     """True when ``tree`` holds a legacy-named skill that is only a forwarding shim
     (SKILL.md present, at least one marker absent). Selects the failure *message* in
     :func:`missing_base_skills`; it is never a resolution input."""
-    legacy = project / tree / DEV_PRIMITIVE_LEGACY
-    if not (legacy / "SKILL.md").is_file():
-        return False
-    return any(not (legacy / marker).is_file() for marker in DEV_PRIMITIVE_MARKERS)
+    return _shim_copy(project, tree) is not None
 
 
 def _is_renderer_stub(skill_dir: Path) -> bool:
@@ -387,21 +447,21 @@ def _absent_renderer_sources(skill_dir: Path) -> list[str]:
     return sorted(set(absent))
 
 
-def renderer_stub_resolved(project: Path, trees: Sequence[str]) -> bool:
+def renderer_stub_resolved(project: Path, trees: Sequence[SkillTree]) -> bool:
     """Whether any active tree resolves to a renderer-backed dev primitive.
 
     Resolution is per tree and deduplicated exactly like :func:`missing_base_skills`.
     Public because the engine's seed-escalation decision reuses this exact preflight
     discriminator rather than re-deriving one (`worktree_flow`).
     """
-    for tree in dict.fromkeys(trees):
-        resolved = resolve_dev_primitive(project, tree)
-        if resolved is not None and _is_renderer_stub(project / tree / resolved):
+    for scope in _scope_items(trees):
+        found = _primitive_copy(project, scope)
+        if found is not None and _is_renderer_stub(found.path):
             return True
     return False
 
 
-def dev_primitive_or_default(project: Path, tree: str | None) -> str:
+def dev_primitive_or_default(project: Path, tree: SkillTree | None) -> str:
     """Total form of :func:`resolve_dev_primitive` for callers that need a name.
 
     A prompt string — and a path this module has to probe *somewhere* to report on —
@@ -597,7 +657,7 @@ class _MergedReview(NamedTuple):
     selection: str | None
 
 
-def _merged_review_layers(project: Path, tree: str, skill: str) -> _MergedReview | None:
+def _merged_review_layers(project: Path, tree: SkillTree, skill: str) -> _MergedReview | None:
     """The skill's shipped review layers with project overrides applied.
 
     ``skill`` is the resolved dev-primitive name — the shipped config and its
@@ -621,8 +681,12 @@ def _merged_review_layers(project: Path, tree: str, skill: str) -> _MergedReview
     there and must not pull the preflight onto the layer path — that would require
     skills the run never invokes. A shipped file carrying a review layer keeps the
     layer path whatever lens tables it also carries (the v6.10-6.12 contract).
+
+    The shipped ``customize.toml`` is read from the copy ``tree``'s scope locates
+    (a user-root copy when the session would load that one); the overrides are
+    always the project's own ``_bmad/custom/`` files, wherever the skill lives.
     """
-    data = _read_toml(project / tree / skill / "customize.toml")
+    data = _read_toml(_skill_dir(project, as_scope(tree), skill) / "customize.toml")
     if data is None:
         return None
     layers = _layers_of(data)
@@ -698,7 +762,7 @@ def _collect_layer_skills(
                     ids.append(layer_id)
 
 
-def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
+def resolve_review_layers(project: Path, tree: SkillTree) -> ReviewResolution | None:
     """Read the review skills this project will really invoke, or None if unknown.
 
     The primitive's installed NAME is resolved from disk here rather than taken as
@@ -771,7 +835,9 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
             tuple(active_sets),
         )
     try:
-        step04 = (project / tree / primitive / "step-04-review.md").read_text(encoding="utf-8")
+        step04 = (_skill_dir(project, as_scope(tree), primitive) / "step-04-review.md").read_text(
+            encoding="utf-8"
+        )
     except (OSError, UnicodeDecodeError):
         return None
     # step-04 is a whole prose document rather than a self-contained execution
@@ -796,8 +862,20 @@ STORIES_PROBE_FILE = "step-01-clarify-and-route.md"
 STORIES_PROBE_TEXT = "folder+id dispatch"
 
 
+def _primitive_probe(
+    project: Path, scope: SkillScope, found: Located | None, name: str
+) -> tuple[str, str, str, Path]:
+    """``(tree, skill, rel, path)`` of the dev primitive's file ``name``: the located
+    copy's, or — nothing resolved — :data:`DEV_PRIMITIVE_NEW`'s under the primary
+    tree, the name to install. ``rel`` is the skill folder as messages show it."""
+    if found is None:
+        rel = f"{scope.tree}/{DEV_PRIMITIVE_NEW}"
+        return scope.tree, DEV_PRIMITIVE_NEW, rel, project / rel / name
+    return scope.tree, found.name, found.display, found.path / name
+
+
 def missing_stories_support(
-    project: Path, trees: Sequence[str], *, skip_unresolved: bool = False
+    project: Path, trees: Sequence[SkillTree], *, skip_unresolved: bool = False
 ) -> list[Finding]:
     """Problems for stories mode's stricter dev-primitive requirement.
 
@@ -820,13 +898,12 @@ def missing_stories_support(
     runs :func:`missing_base_skills` over the same trees, which already reports it
     (``skills.base-missing``/``-shim``) and keeps the run refused."""
     problems: list[Finding] = []
-    for tree in dict.fromkeys(trees):
-        skill = resolve_dev_primitive(project, tree)
-        if skill is None and skip_unresolved:
+    for scope in _scope_items(trees):
+        found = _primitive_copy(project, scope)
+        if found is None and skip_unresolved:
             continue
-        skill = skill or DEV_PRIMITIVE_NEW
-        probe = project / tree / skill / STORIES_PROBE_FILE
-        detail = {"tree": tree, "skill": skill, "file": STORIES_PROBE_FILE}
+        tree, skill, rel, probe = _primitive_probe(project, scope, found, STORIES_PROBE_FILE)
+        detail = {"tree": tree, "skill": skill, "file": STORIES_PROBE_FILE, **_root_detail(found)}
         try:
             text = probe.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -838,7 +915,7 @@ def missing_stories_support(
                 Finding(
                     "skills.stories-dispatch-missing",
                     "problem",
-                    f"{tree}/{skill}/{STORIES_PROBE_FILE} not found — stories "
+                    f"{rel}/{STORIES_PROBE_FILE} not found — stories "
                     f"mode needs folder+id dispatch; update the BMad Method (bmm) module",
                     detail,
                 )
@@ -849,7 +926,7 @@ def missing_stories_support(
                 Finding(
                     "skills.stories-dispatch-stale",
                     "problem",
-                    f"{tree}/{skill} lacks folder+id dispatch (no "
+                    f"{rel} lacks folder+id dispatch (no "
                     f"{STORIES_PROBE_TEXT!r} in {STORIES_PROBE_FILE}) — stories mode needs a "
                     f"newer {skill}; update the bmm module",
                     {**detail, "marker": STORIES_PROBE_TEXT},
@@ -866,6 +943,7 @@ TICKETS_STORE_CONFIG_REL = f"{CUSTOMIZE_DIR.as_posix()}/ticketing-store-config.t
 # The method module's install record, relative to a skill tree: `[bmod] version`
 # names the installed BMAD-METHOD release. Display only.
 BMOD_METHOD_MANIFEST = "bmod-method/bmod.toml"
+BMOD_METHOD_SKILL = "bmod-method"
 # A dev primitive that dispatches `ticket <ref>` from the tree resolves it with
 # `uv run {project-root}/_bmad/method/scripts/tickets.py ... find <ref>` in its
 # step-01; an older one has no ticket route. The marker is that script path,
@@ -874,20 +952,27 @@ TICKETS_PROBE_FILE = STORIES_PROBE_FILE
 TICKETS_PROBE_TEXT = "method/scripts/tickets.py"
 
 
-def bmod_method_version(project: Path, trees: Sequence[str]) -> str | None:
+def _bmod_version(manifest: Path) -> str | None:
+    """``[bmod] version`` of one ``bmod.toml``, or None."""
+    data = _read_toml(manifest)
+    bmod = data.get("bmod") if data is not None else None
+    version = bmod.get("version") if isinstance(bmod, dict) else None
+    return version.strip() if isinstance(version, str) and version.strip() else None
+
+
+def bmod_method_version(project: Path, trees: Sequence[SkillTree]) -> str | None:
     """``[bmod] version`` of the first ``<tree>/bmod-method/bmod.toml`` that has
-    one, or None. Display only: nothing gates on it."""
-    for tree in dict.fromkeys(trees):
-        data = _read_toml(project / tree / BMOD_METHOD_MANIFEST)
-        bmod = data.get("bmod") if data is not None else None
-        version = bmod.get("version") if isinstance(bmod, dict) else None
-        if isinstance(version, str) and version.strip():
-            return version.strip()
+    one, or None. Display only: nothing gates on it. Each tree's manifest is read
+    from the ``bmod-method`` copy its scope locates."""
+    for scope in _scope_items(trees):
+        version = _bmod_version(_skill_dir(project, scope, BMOD_METHOD_SKILL) / "bmod.toml")
+        if version is not None:
+            return version
     return None
 
 
 def missing_tickets_support(
-    project: Path, trees: Sequence[str], *, skip_unresolved: bool = False
+    project: Path, trees: Sequence[SkillTree], *, skip_unresolved: bool = False
 ) -> list[Finding]:
     """Problems for tickets mode's dev-primitive requirement: the resolved
     primitive's ``step-01-clarify-and-route.md`` must route a ticket from the tree
@@ -899,13 +984,12 @@ def missing_tickets_support(
     unresolved primitive is named and ``skip_unresolved`` honoured, as in
     :func:`missing_stories_support`."""
     problems: list[Finding] = []
-    for tree in dict.fromkeys(trees):
-        skill = resolve_dev_primitive(project, tree)
-        if skill is None and skip_unresolved:
+    for scope in _scope_items(trees):
+        found = _primitive_copy(project, scope)
+        if found is None and skip_unresolved:
             continue
-        skill = skill or DEV_PRIMITIVE_NEW
-        probe = project / tree / skill / TICKETS_PROBE_FILE
-        detail = {"tree": tree, "skill": skill, "file": TICKETS_PROBE_FILE}
+        tree, skill, rel, probe = _primitive_probe(project, scope, found, TICKETS_PROBE_FILE)
+        detail = {"tree": tree, "skill": skill, "file": TICKETS_PROBE_FILE, **_root_detail(found)}
         try:
             text = probe.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -913,7 +997,7 @@ def missing_tickets_support(
                 Finding(
                     "skills.tickets-dispatch-missing",
                     "problem",
-                    f"{tree}/{skill}/{TICKETS_PROBE_FILE} not found — tickets mode "
+                    f"{rel}/{TICKETS_PROBE_FILE} not found — tickets mode "
                     f"needs a dev primitive that dispatches from the ticket tree; "
                     f"update the BMad Method module",
                     detail,
@@ -925,7 +1009,7 @@ def missing_tickets_support(
                 Finding(
                     "skills.tickets-dispatch-stale",
                     "problem",
-                    f"{tree}/{skill} cannot dispatch from the ticket tree (no "
+                    f"{rel} cannot dispatch from the ticket tree (no "
                     f"{TICKETS_PROBE_TEXT!r} in {TICKETS_PROBE_FILE}) — tickets mode needs "
                     f"a newer {skill}; update the BMad Method module",
                     {**detail, "marker": TICKETS_PROBE_TEXT},
@@ -1529,7 +1613,7 @@ def missing_sweep_skill(project: Path, trees: Sequence[str]) -> list[Finding]:
 
 
 def missing_base_skills(
-    project: Path, trees: Sequence[str], *, home: Path | None = None
+    project: Path, trees: Sequence[SkillTree], *, home: Path | None = None
 ) -> list[Finding]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.
 
@@ -1595,19 +1679,27 @@ def missing_base_skills(
     These are independent of the ordinary marker check: a damaged primitive may
     need both remediations. All are content-gated on the installed SKILL.md, so an
     inline pre-renderer install sees byte-stable behavior.
+
+    A ``trees`` entry may be a :class:`SkillScope`: every skill is then located
+    through it (:func:`skill_locate.locate`), a copy outside the primary tree adds
+    ``detail["root"]``, a missing skill searched in more than one place adds
+    ``detail["searched"]``, and the user-root warnings of
+    :func:`_user_root_findings` join the list. A plain string is a project-only
+    scope and reports exactly what it always has.
     """
     problems: list[Finding] = []
     resolved_stub = False
-    for tree in dict.fromkeys(trees):
-        resolved = resolve_dev_primitive(project, tree)
-        if resolved is None and _is_dev_primitive_shim(project, tree):
-            legacy_dir = project / tree / DEV_PRIMITIVE_LEGACY
-            absent = [m for m in DEV_PRIMITIVE_MARKERS if not (legacy_dir / m).is_file()]
+    for scope, item in _scope_items(trees).items():
+        tree = scope.tree
+        found = _primitive_copy(project, scope)
+        shim = _shim_copy(project, scope) if found is None else None
+        if shim is not None:
+            absent = [m for m in DEV_PRIMITIVE_MARKERS if not (shim.path / m).is_file()]
             problems.append(
                 Finding(
                     "skills.base-shim",
                     "problem",
-                    f"{tree}/{DEV_PRIMITIVE_LEGACY} is unusable (missing "
+                    f"{shim.display} is unusable (missing "
                     f"{', '.join(absent)}) and {DEV_PRIMITIVE_NEW} is not installed — "
                     f"most likely the forwarding shim the BMad Method's rename left "
                     f"behind, otherwise a truncated install; update the bmm module. The "
@@ -1618,11 +1710,12 @@ def missing_base_skills(
                         "skill": DEV_PRIMITIVE_LEGACY,
                         "expected": DEV_PRIMITIVE_NEW,
                         "missing_markers": absent,
+                        **_root_detail(shim),
                     },
                 )
             )
-        elif resolved is None:
-            hint, outside = _outside_hint(DEV_PRIMITIVE_NEW, tree, home)
+        elif found is None:
+            hint, outside = _missing_hint(item, DEV_PRIMITIVE_NEW, home)
             problems.append(
                 Finding(
                     "skills.base-missing",
@@ -1631,20 +1724,30 @@ def missing_base_skills(
                     f"upstream dev primitive directly; it ships with {BMAD_FLOOR_TEXT}; "
                     f"install or update bmm (on v7, method) in this project "
                     f"(older installs name it {DEV_PRIMITIVE_LEGACY}){hint}",
-                    {"tree": tree, "skill": DEV_PRIMITIVE_NEW, **outside},
+                    {
+                        "tree": tree,
+                        "skill": DEV_PRIMITIVE_NEW,
+                        **outside,
+                        **_searched_detail(scope),
+                    },
                 )
             )
         else:
-            skill_dir = project / tree / resolved
+            resolved, skill_dir, rel, root = (
+                found.name,
+                found.path,
+                found.display,
+                _root_detail(found),
+            )
             absent = [m for m in DEV_PRIMITIVE_MARKERS if not (skill_dir / m).is_file()]
             if absent:
                 problems.append(
                     Finding(
                         "skills.base-incomplete",
                         "problem",
-                        f"{tree}/{resolved} is incomplete (missing "
+                        f"{rel} is incomplete (missing "
                         f"{', '.join(absent)}) — reinstall it from the bmm module",
-                        {"tree": tree, "skill": resolved, "missing_markers": absent},
+                        {"tree": tree, "skill": resolved, "missing_markers": absent, **root},
                     )
                 )
             if _is_renderer_stub(skill_dir):
@@ -1659,7 +1762,7 @@ def missing_base_skills(
                         Finding(
                             "skills.dev-renderer",
                             "problem",
-                            f"{tree}/{resolved}/SKILL.md renders via "
+                            f"{rel}/SKILL.md renders via "
                             f"{RENDERER_SCRIPT_MARKER} but the renderer script unit is "
                             f"incomplete (missing {', '.join(absent_scripts)}) — the "
                             "session would HALT without writing a spec; reinstall the "
@@ -1668,6 +1771,7 @@ def missing_base_skills(
                                 "tree": tree,
                                 "skill": resolved,
                                 "missing_scripts": absent_scripts,
+                                **root,
                             },
                         )
                     )
@@ -1677,7 +1781,7 @@ def missing_base_skills(
                     Finding(
                         "skills.dev-renderer-sources",
                         "problem",
-                        f"{tree}/{resolved} renders via {RENDERER_SCRIPT_MARKER} but its "
+                        f"{rel} renders via {RENDERER_SCRIPT_MARKER} but its "
                         f"render sources are incomplete (unresolved: "
                         f"{', '.join(absent_sources)}) — the session would HALT without "
                         "writing a spec; reinstall the BMad Method (bmm) module",
@@ -1685,10 +1789,12 @@ def missing_base_skills(
                             "tree": tree,
                             "skill": resolved,
                             "missing_sources": absent_sources,
+                            **root,
                         },
                     )
                 )
-        problems.extend(_review_findings(project, tree, home=home))
+        problems.extend(_review_findings(project, item, home=home))
+        problems.extend(_user_root_findings(project, scope, found))
     if resolved_stub and not (project / CENTRAL_CONFIG_REL).is_file():
         problems.append(
             Finding(
@@ -1720,7 +1826,7 @@ _RENDER_HALT_PREFIX = "HALT: "
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
-def dev_renderer_probe(project: Path, trees: Sequence[str]) -> list[Finding]:
+def dev_renderer_probe(project: Path, trees: Sequence[SkillTree]) -> list[Finding]:
     """Execute each renderer stub's own render command in a throwaway copy.
 
     The ``skills.dev-renderer*`` checks in :func:`missing_base_skills` prove the
@@ -1764,14 +1870,19 @@ def dev_renderer_probe(project: Path, trees: Sequence[str]) -> list[Finding]:
     executes. Plain ``validate`` must stay non-executing for a fresh clone, as the
     provenance note on the ``adapter.binary`` probe in ``cmd_validate`` records.
     No coding CLI is launched and no prompt is sent.
+
+    The stub is the copy each tree's scope locates; a user-root copy is staged from
+    its own folder into the temp root's primary-tree position (``detail["root"]``
+    names where it came from).
     """
-    unique = list(dict.fromkeys(trees))
+    scopes = list(_scope_items(trees))
+    unique = list(dict.fromkeys(scope.tree for scope in scopes))
     findings: list[Finding] = []
-    for tree in unique:
-        resolved = resolve_dev_primitive(project, tree)
-        if resolved is None or not _is_renderer_stub(project / tree / resolved):
+    for scope in scopes:
+        found = _primitive_copy(project, scope)
+        if found is None or not _is_renderer_stub(found.path):
             continue
-        findings.append(_probe_render(project, tree, resolved))
+        findings.append(_probe_render(project, scope.tree, found.name, source=found))
     if not findings:
         findings.append(
             Finding(
@@ -1849,15 +1960,18 @@ def _last_line(text: str) -> str:
     return lines[-1] if lines else ""
 
 
-def _probe_render(project: Path, tree: str, skill: str) -> Finding:
-    """One tree's render verdict; see :func:`dev_renderer_probe` for the contract."""
-    rel = f"{tree}/{skill}"
-    detail: dict[str, Any] = {"tree": tree, "skill": skill}
+def _probe_render(
+    project: Path, tree: str, skill: str, *, source: Located | None = None
+) -> Finding:
+    """One tree's render verdict; see :func:`dev_renderer_probe` for the contract.
+    ``source`` is the located copy to probe (default: ``<tree>/<skill>``)."""
+    rel = source.display if source is not None else f"{tree}/{skill}"
+    detail: dict[str, Any] = {"tree": tree, "skill": skill, **_root_detail(source)}
 
     def problem(message: str) -> Finding:
         return _render_problem(detail, message)
 
-    skill_dir = project / tree / skill
+    skill_dir = source.path if source is not None else project / tree / skill
     unparsed = f"{rel}/SKILL.md: the render command could not be parsed"
     try:
         skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
@@ -1887,7 +2001,7 @@ def _probe_render(project: Path, tree: str, skill: str) -> Finding:
         with tempfile.TemporaryDirectory(
             prefix="bmad-loop-render-probe-", ignore_cleanup_errors=True
         ) as tmp:
-            return _render_in(project, Path(tmp), template, detail)
+            return _render_in(project, Path(tmp), template, detail, source=skill_dir, rel=rel)
     except OSError as exc:
         return problem(f"{rel}: could not create a throwaway render directory ({exc})")
 
@@ -1897,11 +2011,20 @@ def _render_problem(detail: Mapping[str, Any], message: str, **extra: Any) -> Fi
 
 
 def _render_in(
-    project: Path, root: Path, template: Sequence[str], detail: Mapping[str, Any]
+    project: Path,
+    root: Path,
+    template: Sequence[str],
+    detail: Mapping[str, Any],
+    *,
+    source: Path | None = None,
+    rel: str | None = None,
 ) -> Finding:
-    """Stage the copy under ``root``, run the substituted command there, classify it."""
+    """Stage the copy under ``root``, run the substituted command there, classify it.
+
+    ``source`` is the skill folder staged (default ``<project>/<tree>/<skill>``); it
+    always lands at ``<root>/<tree>/<skill>``, and ``rel`` is how messages name it."""
     tree, skill = str(detail["tree"]), str(detail["skill"])
-    rel = f"{tree}/{skill}"
+    rel = rel if rel is not None else f"{tree}/{skill}"
 
     def problem(message: str, **extra: Any) -> Finding:
         return _render_problem(detail, message, **extra)
@@ -1909,7 +2032,9 @@ def _render_in(
     unmap = _render_path_unmapper(root, project)
     tmp_skill = root / tree / skill
     try:
-        _stage_render_copy(project, project / tree / skill, root, tmp_skill)
+        _stage_render_copy(
+            project, source if source is not None else project / tree / skill, root, tmp_skill
+        )
     except OSError as exc:
         return problem(f"{rel}: could not stage the throwaway render copy ({unmap(str(exc))})")
     argv = [
@@ -1991,7 +2116,7 @@ def _render_in(
     )
 
 
-def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]:
+def dev_primitive_warnings(project: Path, trees: Sequence[SkillTree]) -> list[Finding]:
     """Advisory findings about a resolved dev primitive — validate-only, never a gate.
 
     One condition, and it is genuinely survivable — which is what keeps it out of
@@ -2023,9 +2148,15 @@ def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]
     Returns [] when nothing resolves — :func:`missing_base_skills` owns that story.
     """
     findings: list[Finding] = []
-    resolved = {tree: resolve_dev_primitive(project, tree) for tree in dict.fromkeys(trees)}
-    new_trees = [tree for tree, name in resolved.items() if name == DEV_PRIMITIVE_NEW]
-    legacy_trees = [tree for tree, name in resolved.items() if name == DEV_PRIMITIVE_LEGACY]
+    resolved = {scope: resolve_dev_primitive(project, scope) for scope in _scope_items(trees)}
+    new_trees = list(
+        dict.fromkeys(scope.tree for scope, name in resolved.items() if name == DEV_PRIMITIVE_NEW)
+    )
+    legacy_trees = list(
+        dict.fromkeys(
+            scope.tree for scope, name in resolved.items() if name == DEV_PRIMITIVE_LEGACY
+        )
+    )
     if new_trees:
         orphaned = [
             (CUSTOMIZE_DIR / f"{DEV_PRIMITIVE_LEGACY}{suffix}").as_posix()
@@ -2108,6 +2239,33 @@ def _outside_hint(name: str, tree: str, home: Path | None) -> tuple[str, dict[st
     )
 
 
+def _home_hint(scope: SkillScope, name: str) -> tuple[str, dict[str, str]]:
+    """The message suffix and ``outside`` detail entry for a skill the project lacks
+    but one of the scope's own user roots holds while ``[skills] user_roots`` is
+    off (:func:`skill_locate.home_copy`), or ``("", {})``. Only the roots the CLI
+    itself loads are probed, and with the switch on there is nothing to hint: a
+    user copy would have resolved."""
+    if scope.resolve_user:
+        return "", {}
+    found = skill_locate.home_copy(scope, name)
+    if found is None:
+        return "", {}
+    return (
+        f"; a copy exists at {found.display}, which this CLI loads — set "
+        f"`[skills] user_roots = true` in .bmad-loop/policy.toml to use it, or install "
+        f"it per project (`npx skills add` without -g)",
+        {"outside": found.display},
+    )
+
+
+def _missing_hint(tree: SkillTree, name: str, home: Path | None) -> tuple[str, dict[str, str]]:
+    """The hint for a missing skill: the legacy fixed-folder probe
+    (:func:`_outside_hint`) for a plain tree string, :func:`_home_hint` for a scope."""
+    if isinstance(tree, str):
+        return _outside_hint(name, tree, home)
+    return _home_hint(tree, name)
+
+
 def _where_clause(layer_ids: Sequence[str]) -> str:
     """How a finding's message names the layers that reach for a skill."""
     if len(layer_ids) > 1:
@@ -2117,7 +2275,7 @@ def _where_clause(layer_ids: Sequence[str]) -> str:
     return "review step invokes"
 
 
-def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> list[Finding]:
+def _review_findings(project: Path, tree: SkillTree, *, home: Path | None = None) -> list[Finding]:
     """Findings for the review skills this tree's dev primitive invokes.
 
     Problems block; warnings never do. A skill is only a problem when the
@@ -2137,30 +2295,39 @@ def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> l
     cause, and the static fallback would otherwise demand the long-deleted hunters on
     top of it. ``home`` overrides the home directory the out-of-project hint probes
     (:func:`_outside_copy`); tests inject it.
+
+    Every skill is located through ``tree``'s scope, as in :func:`missing_base_skills`.
     """
-    primitive = resolve_dev_primitive(project, tree)
-    if primitive is None:
+    scope = as_scope(tree)
+    found = _primitive_copy(project, scope)
+    if found is None:
         return []
-    resolved = resolve_review_layers(project, tree)
+    primitive, primitive_rel, root = found.name, found.display, _root_detail(found)
+    tree_name = scope.tree
+
+    def present(skill: str) -> bool:
+        return skill_locate.locate(project, scope, skill) is not None
+
+    resolved = resolve_review_layers(project, scope)
     if resolved is None:
         # Unknown shape: keep the long-standing static requirement, which both real
         # topologies satisfy — the two hunters, or the merged reviewer instead.
-        if (project / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
+        if present(MERGED_REVIEW_SKILL):
             return []
         fallback: list[Finding] = []
         for skill in sorted(_REVIEW_LAYER_SKILLS):
-            if (project / tree / skill / "SKILL.md").is_file():
+            if present(skill):
                 continue
-            hint, outside = _outside_hint(skill, tree, home)
+            hint, outside = _missing_hint(tree, skill, home)
             fallback.append(
                 Finding(
                     "skills.base-missing",
                     "problem",
-                    f"{tree}/{skill} not found — this review layer ships with "
+                    f"{tree_name}/{skill} not found — this review layer ships with "
                     f"{BMAD_FLOOR_TEXT}, as does the consolidated {MERGED_REVIEW_SKILL} "
                     f"skill that supersedes it in newer releases; install "
                     f"{REVIEW_FLOOR_TEXT} in this project{hint}",
-                    {"tree": tree, "skill": skill, **outside},
+                    {"tree": tree_name, "skill": skill, **outside, **_searched_detail(scope)},
                 )
             )
         return fallback
@@ -2181,7 +2348,7 @@ def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> l
                 f"{rel} could not be read as a customize override (invalid TOML, or an "
                 f"array entry whose `id`/`code` is not a non-empty string) — "
                 f"{consequence}; fix the file or remove it",
-                {"tree": tree, "file": rel},
+                {"tree": tree_name, "file": rel},
             )
         )
     override_rel = _customize_overrides(primitive)[0].as_posix()
@@ -2191,11 +2358,11 @@ def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> l
             Finding(
                 "skills.review-selection-invalid",
                 "problem",
-                f"{tree}/{primitive} resolves workflow.review = {selection!r} — its "
+                f"{primitive_rel} resolves workflow.review = {selection!r} — its "
                 f"workflow HALTs every dev run on any value but "
                 f"{', '.join(REVIEW_SELECTIONS)}; fix `review` in {override_rel} or in "
                 f"the skill's customize.toml",
-                {"tree": tree, "source": resolved.source, "selection": selection},
+                {"tree": tree_name, "source": resolved.source, "selection": selection, **root},
             )
         )
     if resolved.lens_sets:
@@ -2216,11 +2383,11 @@ def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> l
                 Finding(
                     "skills.review-layers-empty",
                     "problem",
-                    f"{tree}/{primitive} has no enabled review lens (every `instruction` "
+                    f"{primitive_rel} has no enabled review lens (every `instruction` "
                     f"in {tables} is empty or absent) while workflow.review is "
                     f"{selection!r} — every dev run would HALT with no lens to launch; "
                     f're-enable a lens in {override_rel}, or set review = "none" there',
-                    {"tree": tree, "source": resolved.source},
+                    {"tree": tree_name, "source": resolved.source, **root},
                 )
             )
     elif resolved.layer_driven and not resolved.active_layers:
@@ -2228,53 +2395,284 @@ def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> l
             Finding(
                 "skills.review-layers-empty",
                 "problem",
-                f"{tree}/{primitive} has no enabled review layer (every "
+                f"{primitive_rel} has no enabled review layer (every "
                 f"`instruction` is empty) — every dev run would HALT blocked with "
                 f"'no active review layers'; re-enable a layer in "
                 f"{override_rel}",
-                {"tree": tree, "source": resolved.source},
+                {"tree": tree_name, "source": resolved.source, **root},
             )
         )
     for skill, layer_ids in sorted(resolved.required.items()):
-        if (project / tree / skill / "SKILL.md").is_file():
+        if present(skill):
             continue
-        hint, outside = _outside_hint(skill, tree, home)
+        hint, outside = _missing_hint(tree, skill, home)
         findings.append(
             Finding(
                 "skills.review-layer-missing",
                 "problem",
-                f"{tree}/{skill} not found — {tree}/{primitive}'s "
+                f"{tree_name}/{skill} not found — {primitive_rel}'s "
                 f"{_where_clause(layer_ids)} it ({resolved.source}), so every dev run's "
                 f"review would fail; install {REVIEW_FLOOR_TEXT} so this project's "
                 f"review layers resolve{hint}",
                 {
-                    "tree": tree,
+                    "tree": tree_name,
                     "skill": skill,
                     "layers": list(layer_ids),
                     "source": resolved.source,
                     **outside,
+                    **_searched_detail(scope),
                 },
             )
         )
     for skill, layer_ids in sorted(resolved.advisory.items()):
-        if (project / tree / skill / "SKILL.md").is_file():
+        if present(skill):
             continue
         findings.append(
             Finding(
                 "skills.review-layer-unresolved",
                 "warning",
-                f"{tree}/{skill} not found — {tree}/{primitive}'s "
+                f"{tree_name}/{skill} not found — {primitive_rel}'s "
                 f"{_where_clause(layer_ids)} it conditionally, or names it in prose this "
                 f"check cannot confirm is a handoff ({resolved.source}); install it if "
                 f"that layer is meant to run",
                 {
-                    "tree": tree,
+                    "tree": tree_name,
                     "skill": skill,
                     "layers": list(layer_ids),
                     "source": resolved.source,
                 },
             )
         )
+    return findings
+
+
+def _review_skill_names(project: Path, scope: SkillScope) -> tuple[str, ...]:
+    """Every review skill ``scope``'s dev primitive may invoke: the read review
+    shape's skills, else the static merged-or-standalone fallback the preflight and
+    the worktree gate apply to a shape that cannot be read."""
+    review = resolve_review_layers(project, scope)
+    if review is not None:
+        return review.skills()
+    if skill_locate.locate(project, scope, MERGED_REVIEW_SKILL) is not None:
+        return (MERGED_REVIEW_SKILL,)
+    return tuple(sorted(_REVIEW_LAYER_SKILLS))
+
+
+USER_SHADOW_CHECK = "skills.user-shadow"
+USER_ROOT_UNAVAILABLE_CHECK = "skills.user-root-unavailable"
+USER_ROOT_VERSION_SKEW_CHECK = "skills.user-root-version-skew"
+SKILL_ROOT_CHECK = "skills.root"
+
+_UNAVAILABLE_REASONS = {
+    "no-home": "the home directory cannot be determined",
+    "unreadable": "it cannot be read",
+}
+
+
+def _unavailable_text(reason: str) -> str:
+    if reason.startswith("env:"):
+        return f"{reason[4:]} is set, so the CLI does not read it"
+    return _UNAVAILABLE_REASONS.get(reason, reason)
+
+
+def _user_root_findings(project: Path, scope: SkillScope, found: Located | None) -> list[Finding]:
+    """The user-root warnings for one scope; empty for a scope without user roots
+    (every plain tree string).
+
+    - ``skills.user-shadow`` (whatever the switch): a skill the run drives sits in
+      both a project tree and a user root and the CLI may run the user copy
+      instead of the one the checks read (:func:`skill_locate.shadow`).
+    - ``skills.user-root-unavailable`` (switch on only): a declared root that can
+      never resolve — a disabler variable is set, the home is unknown, or the
+      folder cannot be read.
+    - ``skills.user-root-version-skew``: a user root's and a project tree's
+      ``bmod-method/bmod.toml`` name different BMAD-METHOD versions, so skills
+      from two installs may mix in one session.
+    """
+    if not scope.user_roots:
+        return []
+    tree = scope.tree
+    findings: list[Finding] = []
+    names = (found.name, *_review_skill_names(project, scope)) if found is not None else ()
+    for name in dict.fromkeys(names):
+        clash = skill_locate.shadow(project, scope, name)
+        if clash is None:
+            continue
+        checked, other = clash.checked.display, clash.other.display
+        if clash.kind == "overrides":
+            message = (
+                f"{other} overrides {checked}: this CLI loads the personal copy over the "
+                f"project's, but the checks read the project copy — remove {other}, or set "
+                f"`[skills] user_roots = true` in .bmad-loop/policy.toml so the checks read "
+                f"the copy that runs"
+            )
+        else:
+            message = (
+                f"{checked} and {other} both load, in no order this CLI states — the checks "
+                f"read the project copy; remove one of them so a session cannot run the other"
+            )
+        findings.append(
+            Finding(
+                USER_SHADOW_CHECK,
+                "warning",
+                message,
+                {
+                    "tree": tree,
+                    "skill": name,
+                    "checked": checked,
+                    "other": other,
+                    "precedence": scope.precedence,
+                    "kind": clash.kind,
+                },
+            )
+        )
+    if scope.resolve_user:
+        for root in scope.user_roots:
+            if not root.unavailable:
+                continue
+            findings.append(
+                Finding(
+                    USER_ROOT_UNAVAILABLE_CHECK,
+                    "warning",
+                    f"user skill root {root.spelling} is unavailable "
+                    f"({_unavailable_text(root.unavailable)}) — skills installed there are "
+                    f"not used for {tree}",
+                    {"tree": tree, "root": root.spelling, "reason": root.unavailable},
+                )
+            )
+    project_version = next(
+        (
+            v
+            for t in scope.project_trees()
+            if (v := _bmod_version(project / t / BMOD_METHOD_MANIFEST)) is not None
+        ),
+        None,
+    )
+    user_found = next(
+        (
+            (root.spelling, v)
+            for root in scope.user_roots
+            if not root.unavailable
+            and root.path is not None
+            and (v := _bmod_version(root.path / BMOD_METHOD_MANIFEST)) is not None
+        ),
+        None,
+    )
+    if project_version is not None and user_found is not None and user_found[1] != project_version:
+        user_root, user_version = user_found
+        findings.append(
+            Finding(
+                USER_ROOT_VERSION_SKEW_CHECK,
+                "warning",
+                f"{user_root}/{BMOD_METHOD_SKILL} is BMAD-METHOD {user_version} but "
+                f"{tree}/{BMOD_METHOD_SKILL} is {project_version} — a session may mix skills "
+                f"from the two installs; update the older one",
+                {
+                    "tree": tree,
+                    "root": user_root,
+                    "user_version": user_version,
+                    "project_version": project_version,
+                },
+            )
+        )
+    return findings
+
+
+def session_skill_candidates(
+    project: Path, scope: SkillTree, prompt_skill: str = ""
+) -> tuple[str, ...]:
+    """Every skill a session of ``scope``'s CLI may load: ``prompt_skill`` (the
+    skill its prompt names, when it names one), the :data:`BASE_SKILLS` catalog and
+    the review skills the installed primitive invokes."""
+    review = resolve_review_layers(project, scope)
+    return tuple(
+        dict.fromkeys(
+            (
+                *((prompt_skill,) if prompt_skill else ()),
+                *BASE_SKILLS,
+                *(review.skills() if review is not None else ()),
+            )
+        )
+    )
+
+
+# A skill id read from a user root's module record names a folder under that root;
+# anything but a plain name (a separator, `..`, a glob) is not one.
+_SKILL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _module_skill_ids(root: Path) -> list[str]:
+    """Every id listed by ``[bmod] skills`` in ``root``'s ``bmod-*/bmod.toml``
+    module records, in folder order. An unreadable root or record lists nothing."""
+    try:
+        manifests = sorted(root.glob("bmod-*/bmod.toml"))
+    except OSError:
+        return []
+    ids: list[str] = []
+    for manifest in manifests:
+        data = _read_toml(manifest)
+        bmod = data.get("bmod") if data is not None else None
+        listed = bmod.get("skills") if isinstance(bmod, dict) else None
+        if isinstance(listed, list):
+            ids += [
+                skill
+                for skill in listed
+                if isinstance(skill, str) and _SKILL_ID_RE.fullmatch(skill) and ".." not in skill
+            ]
+    return ids
+
+
+def user_root_skill_ids(project: Path, scope: SkillTree, prompt_skill: str = "") -> tuple[str, ...]:
+    """The BMAD module skill ids a session of ``scope``'s CLI loads from a user root.
+
+    Candidates are :func:`session_skill_candidates` plus every id a user root's
+    ``bmod-*/bmod.toml`` lists under ``[bmod] skills``; one is kept only where
+    :func:`skill_locate.locate` returns a user-root copy — so nothing with the
+    switch off, and never a personal skill no BMAD module record names. Feeds the
+    opencode allow-list and the run's user-root journal."""
+    resolved = as_scope(scope)
+    ids = list(session_skill_candidates(project, resolved, prompt_skill))
+    for root in resolved.user_roots:
+        if not root.unavailable and root.path is not None:
+            ids += _module_skill_ids(root.path)
+    kept: list[str] = []
+    for skill in dict.fromkeys(ids):
+        found = skill_locate.locate(project, resolved, skill)
+        if found is not None and found.origin == "user":
+            kept.append(skill)
+    return tuple(kept)
+
+
+def skill_root_findings(project: Path, scopes: Iterable[SkillTree]) -> list[Finding]:
+    """``skills.root`` ok lines: where each skill the run drives (the dev primitive
+    and its review skills) resolved, per scope. Validate-only — never part of
+    :func:`missing_base_skills`, whose caller in the run preflight prints every
+    non-problem finding as a warning."""
+    findings: list[Finding] = []
+    for scope in _scope_items(scopes):
+        found = _primitive_copy(project, scope)
+        if found is None:
+            continue
+        located = [found]
+        for skill in _review_skill_names(project, scope):
+            copy = skill_locate.locate(project, scope, skill)
+            if copy is not None:
+                located.append(copy)
+        for copy in located:
+            where = "user root" if copy.origin == "user" else "project tree"
+            findings.append(
+                Finding(
+                    SKILL_ROOT_CHECK,
+                    "ok",
+                    f"{copy.name} resolves from {copy.display} ({where})",
+                    {
+                        "tree": scope.tree,
+                        "skill": copy.name,
+                        "root": copy.root,
+                        "origin": copy.origin,
+                    },
+                )
+            )
     return findings
 
 
@@ -2929,7 +3327,7 @@ def _resolved_text(path: Path) -> str:
 
 
 def skill_trees_outside(
-    project: Path, repo_root: Path, trees: Iterable[str], *, isolation: str
+    project: Path, repo_root: Path, trees: Iterable[SkillTree], *, isolation: str
 ) -> list[Finding]:
     """``skills.tree-outside``: a skill tree, or a skill the run needs from one,
     that a link carries out of where bmad-loop can follow it.
@@ -2955,10 +3353,16 @@ def skill_trees_outside(
     ``skills`` CLI's own layout) is fine on both counts. A skill that is absent or
     unresolved is :func:`missing_base_skills`' to report, not this check's.
     ``detail``: ``tree``, ``skill`` (skill-level only), ``target`` (the resolved
-    path) and ``isolation``."""
+    path) and ``isolation``.
+
+    For a :class:`SkillScope` the tree-level check covers its primary tree and the
+    skill-level check the copies its scope locates in a project tree. A skill
+    resolved from a user root is excluded: it is outside the repo by design, the
+    session loads it natively, and worktree seeding never copies it."""
     worktree = isolation == "worktree"
     findings: list[Finding] = []
-    for tree in dict.fromkeys(trees):
+    for scope in _scope_items(trees):
+        tree = scope.tree
         tree_dir = project / tree
         if not _confined_to(tree_dir, project):
             leaves_repo = not _confined_to(tree_dir, repo_root)
@@ -2986,31 +3390,35 @@ def skill_trees_outside(
                 continue
         if not worktree:
             continue
-        primitive = resolve_dev_primitive(project, tree)
-        review = resolve_review_layers(project, tree)
-        if review is not None:
-            review_skills = review.skills()
-        elif (tree_dir / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
-            # an unreadable review shape: the same merged-or-standalone fallback
-            # the worktree's required-skill gate applies
-            review_skills = (MERGED_REVIEW_SKILL,)
-        else:
-            review_skills = tuple(sorted(_REVIEW_LAYER_SKILLS))
+        primitive = resolve_dev_primitive(project, scope)
+        # an unreadable review shape takes the same merged-or-standalone fallback
+        # the worktree's required-skill gate applies
+        review_skills = _review_skill_names(project, scope)
         required = (*((primitive,) if primitive is not None else ()), *review_skills)
         for skill in dict.fromkeys(required):
-            skill_dir = tree_dir / skill
+            found = skill_locate.locate(project, scope, skill)
+            if found is not None and found.origin == "user":
+                continue
+            skill_dir = found.path if found is not None else tree_dir / skill
             if not skill_dir.is_dir() or _confined_to(skill_dir, repo_root):
                 continue
             target = _resolved_text(skill_dir)
+            rel = found.display if found is not None else f"{tree}/{skill}"
             findings.append(
                 Finding(
                     TREE_OUTSIDE_CHECK,
                     "problem",
-                    f"{tree}/{skill} resolves outside the repo ({target}) — worktree "
+                    f"{rel} resolves outside the repo ({target}) — worktree "
                     f"isolation cannot seed a skill from outside the repo, so the isolated "
                     f"session would stall on it; install it into the project (`npx skills "
                     f'add` without -g) or set [scm] isolation = "none"',
-                    {"tree": tree, "skill": skill, "target": target, "isolation": isolation},
+                    {
+                        "tree": tree,
+                        "skill": skill,
+                        "target": target,
+                        "isolation": isolation,
+                        **_root_detail(found),
+                    },
                 )
             )
     return findings
