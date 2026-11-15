@@ -138,6 +138,8 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.review-layer-missing",
         "skills.review-layer-unresolved",
         "skills.review-layers-empty",
+        # v7 `workflow.review` outside none/quick/thorough/auto HALTs every build-auto run
+        "skills.review-selection-invalid",
         "skills.customize-unreadable",
         "skills.stories-dispatch",
         "skills.stories-dispatch-missing",

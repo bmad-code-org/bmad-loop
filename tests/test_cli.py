@@ -16398,6 +16398,56 @@ def _make_tickets_validate_pass(project, monkeypatch, capsys):
     )
 
 
+def test_validate_tickets_unresolved_primitive_reports_root_cause_only(
+    project, capsys, monkeypatch
+):
+    """#768: with the dev primitive gone, validate reports `skills.base-missing` —
+    not a tickets-dispatch finding naming the legacy `bmad-dev-auto` step file, and
+    never a green `skills.tickets-dispatch` line from a probe that skipped the tree.
+    Ablation: drop the `_all_resolve` gate and the ok line comes back."""
+    import shutil as _shutil
+
+    from bmad_loop.install import DEV_PRIMITIVE_LEGACY, DEV_PRIMITIVE_NEW
+
+    _make_tickets_validate_pass(project, monkeypatch, capsys)
+    _shutil.rmtree(project.project / ".claude" / "skills" / DEV_PRIMITIVE_NEW)
+
+    doc = machine_json(["validate", "--project", str(project.project), "--json"], capsys, rc=1)
+
+    assert doc["ok"] is False
+    checks = [f["check"] for f in doc["findings"]]
+    assert "skills.base-missing" in checks
+    assert not any(c.startswith("skills.tickets-dispatch") for c in checks)
+    # base-missing names the old spelling as a hint; no finding sends anyone to its dir
+    assert not any(f"{DEV_PRIMITIVE_LEGACY}/" in f["message"] for f in doc["findings"])
+
+
+@pytest.mark.parametrize("mode", ["tickets", "stories"])
+def test_require_base_skills_unresolved_primitive_still_refuses(tmp_path, capsys, mode):
+    """The run-start preflight skips the dispatch probe on an unresolved tree (it
+    would only restate the root cause under the legacy name) yet still refuses."""
+    from bmad_loop.install import DEV_PRIMITIVE_LEGACY, DEV_PRIMITIVE_NEW
+
+    _write_policy(tmp_path)
+    pol = policy_mod.load(tmp_path / ".bmad-loop" / "policy.toml")
+
+    assert (
+        cli._require_base_skills(
+            tmp_path,
+            pol,
+            tmp_path,
+            GrantSet.empty(),
+            require_tickets=mode == "tickets",
+            require_stories=mode == "stories",
+        )
+        is False
+    )
+    err = capsys.readouterr().err
+    assert f"{DEV_PRIMITIVE_NEW} not found" in err
+    assert DEV_PRIMITIVE_LEGACY + "/" not in err
+    assert "dispatch" not in err
+
+
 def test_validate_json_tickets_mode_document(project, capsys, monkeypatch):
     """A tickets project bmad-loop can drive validates ok: `mode` is `tickets`, the
     document names the active initiative and the v7 era, and the tickets checks ran

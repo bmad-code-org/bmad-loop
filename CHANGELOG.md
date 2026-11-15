@@ -191,6 +191,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Read BMAD v7's `quick_lenses`/`thorough_lenses` review sets in `validate` and the
+  run preflight, so a v7 project is no longer required to install the deleted
+  `bmad-review-adversarial-general` and `bmad-review-edge-case-hunter`. A `workflow.review`
+  value the dev skill would HALT on is reported as `skills.review-selection-invalid`.
+- Report a missing dev primitive once, without stacking review-skill and dispatch
+  failures under the legacy `bmad-dev-auto` name on top of it. Name core-tools as
+  the v7 home of `bmad-review`, and note when a missing skill is installed only
+  globally (`~/.claude/skills`, `~/.agents/skills`).
 - Stop reading an empty psmux window listing as a dead session. psmux can drop a live
   server's reply and exit 0 with nothing, which the liveness probe took for a crashed CLI
   and the control-window prune for a verified kill. That listing now counts as a failed

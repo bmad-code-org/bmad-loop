@@ -89,6 +89,13 @@ MODULE_SKILLS = (
 BMAD_FLOOR_TEXT = (
     "the bmm module (BMAD-METHOD >= 6.10.0) or, on BMAD v7, the method module (bmod-method >= 6.13)"
 )
+# Which upstream install ships the REVIEW skills a review finding names. They differ
+# from the primitive's floor on v7: the merged `bmad-review` moved out of the method
+# module into core-tools (the bmod-core-tools record lists it).
+REVIEW_FLOOR_TEXT = (
+    "the bmm module (BMAD-METHOD >= 6.10.0) or, on BMAD v7, the core-tools module "
+    "(which ships bmad-review)"
+)
 
 # The inner dev primitive, in both upstream eras. BMAD-METHOD PR #2651 (shipped in
 # bmad-method 6.10.1-next.33) renamed `bmad-dev-auto` -> `bmad-build-auto` and left a
@@ -189,7 +196,11 @@ RENDER_DIR_REL = f"{BMAD_DIR}/{RENDER_DIR_NAME}"
 #     requirement, used when the installed skill's shape can't be read: normally the
 #     reviewers are derived per tree from the dev primitive itself
 #     (resolve_review_layers), because which skills the review step invokes is a
-#     property of that skill version, not of a catalog pinned in here (#260).
+#     property of that skill version, not of a catalog pinned in here (#260). Three
+#     shapes are read: step-04 prose (v6.10.0), [[workflow.review_layers]]
+#     (v6.10-6.12) and the v7 [[workflow.quick_lenses]]/[[workflow.thorough_lenses]]
+#     sets. Neither hunter exists upstream any more, so a v7 tree must never land on
+#     this fallback just because its shape went unread.
 # bmad-review-verification-gap is not in the fallback set: no tagged BMAD-METHOD
 # release ships it standalone (on current sources it is a thin forwarder to the
 # merged bmad-review), so demanding it of every project made `validate`
@@ -211,7 +222,8 @@ DEV_BASE_SKILLS = {
 # falls back to the static catalog only when the resolution is None (an unreadable
 # shape), never because it resolved to requiring nothing. Both topologies stay
 # supported; this constant is named here for the fallback path only, and the derived
-# path sees it named in the layers themselves.
+# path sees it named in the layers themselves. The v7 lens sets are the 6.11 shape
+# again: every shipped lens says "Do not invoke any skill", so they derive nothing.
 MERGED_REVIEW_SKILL = "bmad-review"
 # The DEV_BASE_SKILLS entries MERGED_REVIEW_SKILL subsumes. bmad-dev-auto (the dev
 # primitive) is NOT here — the merged reviewer never substitutes for it.
@@ -413,6 +425,12 @@ class ReviewResolution(NamedTuple):
     fail. ``active_layers`` names every layer with a non-empty ``instruction`` —
     all of them disabled is a run that HALTs. ``unreadable`` names override files
     that failed to parse.
+
+    ``lens_sets`` names the v7 lens sets read (``("quick", "thorough")``), and is
+    empty for every other shape; ``active_layers`` then spans both sets.
+    ``selection`` is the resolved ``workflow.review`` string of that shape, or None
+    when no string value is configured. Both trail with defaults so every positional
+    construction of the older shapes stays valid.
     """
 
     source: str
@@ -421,6 +439,8 @@ class ReviewResolution(NamedTuple):
     layer_driven: bool
     active_layers: tuple[str, ...]
     unreadable: tuple[str, ...]
+    lens_sets: tuple[str, ...] = ()
+    selection: str | None = None
 
     def skills(self) -> tuple[str, ...]:
         """Every skill this review step may invoke, required or advisory."""
@@ -446,6 +466,39 @@ def _layers_of(data: Any) -> list[Any]:
     workflow = data.get("workflow") if isinstance(data, dict) else None
     layers = workflow.get("review_layers") if isinstance(workflow, dict) else None
     return list(layers) if isinstance(layers, list) else []
+
+
+# The v7 lens sets (BMAD-METHOD #2861), keyed by the `workflow.review` value that
+# selects each: `[[workflow.quick_lenses]]` and `[[workflow.thorough_lenses]]`.
+LENS_SETS = {"quick": "quick_lenses", "thorough": "thorough_lenses"}
+# Every `workflow.review` value v7 bmad-build-auto accepts: its workflow.md HALTs
+# the run on any other ("workflow.review must be none, quick, thorough, or auto").
+REVIEW_SELECTIONS = ("none", "quick", "thorough", "auto")
+
+
+def _lens_sets_of(data: Any) -> dict[str, list[Any]]:
+    """The v7 lens arrays present in ``data``, as ``{"quick": [...], "thorough": [...]}``.
+
+    A set appears only when its key holds an array — presence is what tells the lens
+    shape apart from the others, so an absent set is left out rather than reported
+    as ``[]``. Every hop is type-guarded as in :func:`_layers_of`.
+    """
+    workflow = data.get("workflow") if isinstance(data, dict) else None
+    if not isinstance(workflow, dict):
+        return {}
+    found: dict[str, list[Any]] = {}
+    for name, key in LENS_SETS.items():
+        lenses = workflow.get(key)
+        if isinstance(lenses, list):
+            found[name] = list(lenses)
+    return found
+
+
+def _review_selection_of(data: Any) -> str | None:
+    """``workflow.review`` when it is a string, else None."""
+    workflow = data.get("workflow") if isinstance(data, dict) else None
+    selection = workflow.get("review") if isinstance(workflow, dict) else None
+    return selection if isinstance(selection, str) else None
 
 
 # BMAD's own merge keys for arrays of tables, in detection precedence order.
@@ -503,26 +556,52 @@ def _merge_layer_arrays(base: list[Any], override: list[Any]) -> list[Any]:
     return result
 
 
-def _merged_review_layers(
-    project: Path, tree: str, skill: str
-) -> tuple[list[Any], tuple[str, ...]] | None:
+class _MergedReview(NamedTuple):
+    """A primitive's review config with project overrides applied, in every shape.
+
+    ``layers`` is the merged ``review_layers`` array. ``lens_shape`` is True when the
+    SHIPPED config carries a lens set and no review layer — the v7 primitive, whose
+    run reads only ``lens_sets`` (each merged independently) and ``selection``.
+    """
+
+    layers: list[Any]
+    unreadable: tuple[str, ...]
+    lens_shape: bool
+    lens_sets: dict[str, list[Any]]
+    selection: str | None
+
+
+def _merged_review_layers(project: Path, tree: str, skill: str) -> _MergedReview | None:
     """The skill's shipped review layers with project overrides applied.
 
     ``skill`` is the resolved dev-primitive name — the shipped config and its
     overrides are read from the SAME era, because that is what the run does.
 
-    Returns ``(layers, unreadable_override_paths)``, or None when the skill's OWN
-    customize.toml is absent or unparseable — the one case that genuinely means
-    "shape unknown", so the caller falls back to the static catalog.
+    Returns a :class:`_MergedReview`, or None when the skill's OWN customize.toml is
+    absent or unparseable — the one case that genuinely means "shape unknown", so
+    the caller falls back to the static catalog.
 
     An unparseable OVERRIDE is not that case: BMAD's resolver warns and treats it
     as empty, still resolving every other layer. Matching that keeps the preflight
     agreeing with the run; the broken file is reported separately as a warning.
+
+    The lens sets merge exactly as the layers do, each set on its own (BMAD's
+    resolver deep-merges each array of tables by its key), and ``workflow.review``
+    is a scalar: the last string value wins.
+
+    The shape is decided by the SHIPPED file, not the merge: a v7 run reads only the
+    lens sets, so a ``review_layers`` override left over from a v6 install is inert
+    there and must not pull the preflight onto the layer path — that would require
+    skills the run never invokes. A shipped file carrying a review layer keeps the
+    layer path whatever lens tables it also carries (the v6.10-6.12 contract).
     """
     data = _read_toml(project / tree / skill / "customize.toml")
     if data is None:
         return None
     layers = _layers_of(data)
+    lens_sets = _lens_sets_of(data)
+    lens_shape = bool(lens_sets) and not layers
+    selection = _review_selection_of(data)
     unreadable: list[str] = []
     for rel in _customize_overrides(skill):
         override = project / rel
@@ -533,13 +612,54 @@ def _merged_review_layers(
             unreadable.append(rel.as_posix())
             continue
         layers = _merge_layer_arrays(layers, _layers_of(extra))
-    return layers, tuple(unreadable)
+        for name, lenses in _lens_sets_of(extra).items():
+            lens_sets[name] = _merge_layer_arrays(lens_sets.get(name, []), lenses)
+        override_selection = _review_selection_of(extra)
+        if override_selection is not None:
+            selection = override_selection
+    return _MergedReview(layers, tuple(unreadable), lens_shape, lens_sets, selection)
 
 
-def _layer_id(layer: dict[str, Any], index: int) -> str:
-    """A layer's id for reporting — positional when it declares none."""
+def _layer_id(layer: dict[str, Any], index: int, label: str = "") -> str:
+    """A layer's id for reporting — positional when it declares none, prefixed with
+    ``label`` (a lens set's name) so positions in two sets cannot collide."""
     lid = layer.get("id")
-    return lid if isinstance(lid, str) and lid else f"#{index + 1}"
+    return lid if isinstance(lid, str) and lid else f"{label}#{index + 1}"
+
+
+def _collect_layer_skills(
+    layers: list[Any],
+    required: dict[str, list[str]],
+    advisory: dict[str, list[str]],
+    active: list[str],
+    label: str = "",
+) -> None:
+    """Fold one array of review layers (or lenses) into the requirement buckets.
+
+    A non-gated layer's invocation phrasing is required; a ``when``-gated layer's
+    invocations, and any bmad-* token not tied to an invocation phrasing, are
+    advisory. Empty-``instruction`` layers are disabled and contribute nothing.
+    """
+    for index, layer in enumerate(layers):
+        if not isinstance(layer, dict):
+            continue
+        instruction = layer.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            continue
+        layer_id = _layer_id(layer, index, label)
+        active.append(layer_id)
+        when = layer.get("when")
+        gated = isinstance(when, str) and bool(when.strip())
+        invoked = _INVOKE_SKILL_RE.findall(instruction)
+        # A gated layer's invocations are advisory; so is any bmad-* token we
+        # can't tie to an invocation phrasing, in either kind of layer.
+        hard = [] if gated else invoked
+        soft = [s for s in _SKILL_REF_RE.findall(instruction) if gated or s not in invoked]
+        for bucket, skills in ((required, hard), (advisory, soft)):
+            for skill in skills:
+                ids = bucket.setdefault(skill, [])
+                if layer_id not in ids:
+                    ids.append(layer_id)
 
 
 def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
@@ -569,6 +689,16 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
     every layer whose condition does not hold, and that condition is evaluated by
     the model in run context — undecidable here, so hard-requiring its skill would
     be a false FAIL.
+
+    BMAD v7 replaced the layers with two lens sets, ``[[workflow.quick_lenses]]``
+    and ``[[workflow.thorough_lenses]]``, selected per run by ``workflow.review``.
+    Each lens is read with the same per-layer rule, over BOTH sets: the selection
+    that runs is not knowable from config (``auto`` follows the route the model
+    resolves, the invocation may ``--set workflow.review=...``, and bmad-loop's own
+    ``[tickets] thorough_review`` asks for ``thorough``), so any enabled lens may
+    run — the same rule that requires every enabled review layer. Shape precedence
+    is decided by :func:`_merged_review_layers`: a review-layer config keeps the
+    layer path, a v7 config takes the lens path, and anything else falls to step-04.
     """
     # `primitive`, not `skill`: the layer loop below binds `skill` to each INVOKED
     # review skill, and the step-04 fallback after it reads this name as a directory.
@@ -578,31 +708,16 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
     merged = _merged_review_layers(project, tree, primitive)
     if merged is None:
         return None
-    layers, unreadable = merged
-    if layers:
+    unreadable = merged.unreadable
+    if merged.lens_shape or merged.layers:
         required: dict[str, list[str]] = {}
         advisory: dict[str, list[str]] = {}
         active: list[str] = []
-        for index, layer in enumerate(layers):
-            if not isinstance(layer, dict):
-                continue
-            instruction = layer.get("instruction")
-            if not isinstance(instruction, str) or not instruction.strip():
-                continue
-            layer_id = _layer_id(layer, index)
-            active.append(layer_id)
-            when = layer.get("when")
-            gated = isinstance(when, str) and bool(when.strip())
-            invoked = _INVOKE_SKILL_RE.findall(instruction)
-            # A gated layer's invocations are advisory; so is any bmad-* token we
-            # can't tie to an invocation phrasing, in either kind of layer.
-            hard = [] if gated else invoked
-            soft = [s for s in _SKILL_REF_RE.findall(instruction) if gated or s not in invoked]
-            for bucket, skills in ((required, hard), (advisory, soft)):
-                for skill in skills:
-                    ids = bucket.setdefault(skill, [])
-                    if layer_id not in ids:
-                        ids.append(layer_id)
+        if merged.lens_shape:
+            for name, lenses in merged.lens_sets.items():
+                _collect_layer_skills(lenses, required, advisory, active, name)
+        else:
+            _collect_layer_skills(merged.layers, required, advisory, active)
         return ReviewResolution(
             "customize.toml",
             {s: tuple(i) for s, i in required.items()},
@@ -611,6 +726,8 @@ def resolve_review_layers(project: Path, tree: str) -> ReviewResolution | None:
             True,
             tuple(active),
             unreadable,
+            tuple(merged.lens_sets) if merged.lens_shape else (),
+            merged.selection if merged.lens_shape else None,
         )
     try:
         step04 = (project / tree / primitive / "step-04-review.md").read_text(encoding="utf-8")
@@ -638,7 +755,9 @@ STORIES_PROBE_FILE = "step-01-clarify-and-route.md"
 STORIES_PROBE_TEXT = "folder+id dispatch"
 
 
-def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding]:
+def missing_stories_support(
+    project: Path, trees: Sequence[str], *, skip_unresolved: bool = False
+) -> list[Finding]:
     """Problems for stories mode's stricter dev-primitive requirement.
 
     Sprint mode drives any dev primitive; stories mode needs the folder+id
@@ -652,10 +771,19 @@ def missing_stories_support(project: Path, trees: Sequence[str]) -> list[Finding
 
     The two failures are separate check ids because they are separate conditions
     with separate remediations: ``-missing`` is a half install (reinstall the
-    module), ``-stale`` is an install that is simply too old (update it)."""
+    module), ``-stale`` is an install that is simply too old (update it).
+
+    A tree whose primitive does not resolve is probed under
+    :data:`DEV_PRIMITIVE_NEW` — the name to install — and reported ``-missing``.
+    ``skip_unresolved`` drops such a tree instead: pass it only from a caller that
+    runs :func:`missing_base_skills` over the same trees, which already reports it
+    (``skills.base-missing``/``-shim``) and keeps the run refused."""
     problems: list[Finding] = []
     for tree in dict.fromkeys(trees):
-        skill = dev_primitive_or_default(project, tree)
+        skill = resolve_dev_primitive(project, tree)
+        if skill is None and skip_unresolved:
+            continue
+        skill = skill or DEV_PRIMITIVE_NEW
         probe = project / tree / skill / STORIES_PROBE_FILE
         detail = {"tree": tree, "skill": skill, "file": STORIES_PROBE_FILE}
         try:
@@ -717,18 +845,24 @@ def bmod_method_version(project: Path, trees: Sequence[str]) -> str | None:
     return None
 
 
-def missing_tickets_support(project: Path, trees: Sequence[str]) -> list[Finding]:
+def missing_tickets_support(
+    project: Path, trees: Sequence[str], *, skip_unresolved: bool = False
+) -> list[Finding]:
     """Problems for tickets mode's dev-primitive requirement: the resolved
     primitive's ``step-01-clarify-and-route.md`` must route a ticket from the tree
     (it carries :data:`TICKETS_PROBE_TEXT`). One problem :class:`Finding` per
     ``trees`` entry lacking it; callers gate this on tickets mode only.
 
     ``-missing`` (the step file is absent or unreadable: a half install) and
-    ``-stale`` (an install too old to know the ticket tree) are separate ids, as
-    in :func:`missing_stories_support`."""
+    ``-stale`` (an install too old to know the ticket tree) are separate ids, and an
+    unresolved primitive is named and ``skip_unresolved`` honoured, as in
+    :func:`missing_stories_support`."""
     problems: list[Finding] = []
     for tree in dict.fromkeys(trees):
-        skill = dev_primitive_or_default(project, tree)
+        skill = resolve_dev_primitive(project, tree)
+        if skill is None and skip_unresolved:
+            continue
+        skill = skill or DEV_PRIMITIVE_NEW
         probe = project / tree / skill / TICKETS_PROBE_FILE
         detail = {"tree": tree, "skill": skill, "file": TICKETS_PROBE_FILE}
         try:
@@ -1353,7 +1487,9 @@ def missing_sweep_skill(project: Path, trees: Sequence[str]) -> list[Finding]:
     return problems
 
 
-def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
+def missing_base_skills(
+    project: Path, trees: Sequence[str], *, home: Path | None = None
+) -> list[Finding]:
     """Problems for the upstream skills the orchestrator drives but doesn't bundle.
 
     The dev primitive (bmad-build-auto, or a complete pre-rename bmad-dev-auto) and
@@ -1394,6 +1530,11 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
     ``bmad-review`` satisfying the hunters. Everything is per tree, since a project
     can have a post-consolidation `.claude` tree and a pre-merge `.agents` one side
     by side — and, across the rename, a different primitive era in each.
+
+    A nothing-resolved ``skills.base-missing`` notes a global install of the
+    primitive (``~/.claude/skills`` or ``~/.agents/skills``) when one exists, with
+    its path in ``detail["outside"]``; ``home`` overrides the probed home directory
+    (tests inject it). That is a hint, never a resolution: the run still refuses.
 
     ``skills.base-incomplete`` carries ``missing_markers`` as a list — the message
     joins it with ", " for the human line, which a consumer would otherwise have to
@@ -1440,6 +1581,7 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                 )
             )
         elif resolved is None:
+            hint, outside = _outside_hint(DEV_PRIMITIVE_NEW, tree, home)
             problems.append(
                 Finding(
                     "skills.base-missing",
@@ -1447,8 +1589,8 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                     f"{tree}/{DEV_PRIMITIVE_NEW} not found — the orchestrator drives this "
                     f"upstream dev primitive directly; it ships with {BMAD_FLOOR_TEXT}; "
                     f"install or update bmm (on v7, method) in this project "
-                    f"(older installs name it {DEV_PRIMITIVE_LEGACY})",
-                    {"tree": tree, "skill": DEV_PRIMITIVE_NEW},
+                    f"(older installs name it {DEV_PRIMITIVE_LEGACY}){hint}",
+                    {"tree": tree, "skill": DEV_PRIMITIVE_NEW, **outside},
                 )
             )
         else:
@@ -1505,7 +1647,7 @@ def missing_base_skills(project: Path, trees: Sequence[str]) -> list[Finding]:
                         },
                     )
                 )
-        problems.extend(_review_findings(project, tree))
+        problems.extend(_review_findings(project, tree, home=home))
     if resolved_stub and not (project / CENTRAL_CONFIG_REL).is_file():
         problems.append(
             Finding(
@@ -1883,6 +2025,48 @@ def dev_primitive_warnings(project: Path, trees: Sequence[str]) -> list[Finding]
     return findings
 
 
+# Where `npx skills add -g` lays a skill down, relative to the home directory. Probed
+# read-only for a HINT only: bmad-loop drives skills from the project's own tree and
+# never resolves one from here (a session cwd'd in the project would not see it in
+# every CLI, and a worktree could not seed it). Claude Code's plugin cache is not
+# probed — BMAD no longer ships Claude plugins.
+_OUTSIDE_SKILL_ROOTS = (".claude/skills", ".agents/skills")
+
+
+def _outside_home() -> Path:
+    """The home directory :func:`_outside_copy` probes by default. A seam: the test
+    suite pins it (conftest) so an operator's real global skills never leak into a
+    finding a test asserts on."""
+    return Path.home()
+
+
+def _outside_copy(name: str, home: Path | None = None) -> str | None:
+    """``~/<root>/<name>`` for the first global install of skill ``name`` found under
+    :data:`_OUTSIDE_SKILL_ROOTS`, or None. An undeterminable or unreadable home is
+    None: this only decorates a finding, so it must never crash the preflight."""
+    try:
+        base = _outside_home() if home is None else home
+        for root in _OUTSIDE_SKILL_ROOTS:
+            if (base / root / name / "SKILL.md").is_file():
+                return f"~/{root}/{name}"
+    except (OSError, RuntimeError):
+        return None
+    return None
+
+
+def _outside_hint(name: str, tree: str, home: Path | None) -> tuple[str, dict[str, str]]:
+    """The message suffix and detail entry for a skill installed only outside the
+    project (:func:`_outside_copy`), or ``("", {})`` when there is none."""
+    outside = _outside_copy(name, home)
+    if outside is None:
+        return "", {}
+    return (
+        f"; a copy exists at {outside}, but bmad-loop only drives skills installed in "
+        f"this project's {tree} — install it per project (`npx skills add` without -g)",
+        {"outside": outside},
+    )
+
+
 def _where_clause(layer_ids: Sequence[str]) -> str:
     """How a finding's message names the layers that reach for a skill."""
     if len(layer_ids) > 1:
@@ -1892,7 +2076,7 @@ def _where_clause(layer_ids: Sequence[str]) -> str:
     return "review step invokes"
 
 
-def _review_findings(project: Path, tree: str) -> list[Finding]:
+def _review_findings(project: Path, tree: str, *, home: Path | None = None) -> list[Finding]:
     """Findings for the review skills this tree's dev primitive invokes.
 
     Problems block; warnings never do. A skill is only a problem when the
@@ -1906,27 +2090,39 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
     send them to a path that does not exist on a renamed project. The static-catalog
     fallback below has no :class:`ReviewResolution` to carry the name, so this
     resolves independently rather than widening that tuple.
+
+    A tree whose primitive does not resolve gets NO review finding: the reviewers
+    derive from the primitive, :func:`missing_base_skills` already reports that root
+    cause, and the static fallback would otherwise demand the long-deleted hunters on
+    top of it. ``home`` overrides the home directory the out-of-project hint probes
+    (:func:`_outside_copy`); tests inject it.
     """
-    primitive = dev_primitive_or_default(project, tree)
+    primitive = resolve_dev_primitive(project, tree)
+    if primitive is None:
+        return []
     resolved = resolve_review_layers(project, tree)
     if resolved is None:
         # Unknown shape: keep the long-standing static requirement, which both real
         # topologies satisfy — the two hunters, or the merged reviewer instead.
         if (project / tree / MERGED_REVIEW_SKILL / "SKILL.md").is_file():
             return []
-        return [
-            Finding(
-                "skills.base-missing",
-                "problem",
-                f"{tree}/{skill} not found — this review layer ships with "
-                f"{BMAD_FLOOR_TEXT}, as does the consolidated {MERGED_REVIEW_SKILL} "
-                f"skill that supersedes it in newer releases; install or update bmm "
-                f"(on v7, method) in this project",
-                {"tree": tree, "skill": skill},
+        fallback: list[Finding] = []
+        for skill in sorted(_REVIEW_LAYER_SKILLS):
+            if (project / tree / skill / "SKILL.md").is_file():
+                continue
+            hint, outside = _outside_hint(skill, tree, home)
+            fallback.append(
+                Finding(
+                    "skills.base-missing",
+                    "problem",
+                    f"{tree}/{skill} not found — this review layer ships with "
+                    f"{BMAD_FLOOR_TEXT}, as does the consolidated {MERGED_REVIEW_SKILL} "
+                    f"skill that supersedes it in newer releases; install "
+                    f"{REVIEW_FLOOR_TEXT} in this project{hint}",
+                    {"tree": tree, "skill": skill, **outside},
+                )
             )
-            for skill in sorted(_REVIEW_LAYER_SKILLS)
-            if not (project / tree / skill / "SKILL.md").is_file()
-        ]
+        return fallback
     findings: list[Finding] = []
     for rel in resolved.unreadable:
         findings.append(
@@ -1939,7 +2135,36 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
                 {"tree": tree, "file": rel},
             )
         )
-    if resolved.layer_driven and not resolved.active_layers:
+    override_rel = _customize_overrides(primitive)[0].as_posix()
+    selection = resolved.selection
+    if resolved.lens_sets and selection is not None and selection not in REVIEW_SELECTIONS:
+        findings.append(
+            Finding(
+                "skills.review-selection-invalid",
+                "problem",
+                f"{tree}/{primitive} resolves workflow.review = {selection!r} — its "
+                f"workflow HALTs every dev run on any value but "
+                f"{', '.join(REVIEW_SELECTIONS)}; fix `review` in {override_rel} or in "
+                f"the skill's customize.toml",
+                {"tree": tree, "source": resolved.source, "selection": selection},
+            )
+        )
+    if resolved.lens_sets:
+        # an unset selection is left to the run: whether it HALTs is undecidable here
+        if not resolved.active_layers and selection is not None and selection != "none":
+            tables = " / ".join(f"[[workflow.{LENS_SETS[n]}]]" for n in resolved.lens_sets)
+            findings.append(
+                Finding(
+                    "skills.review-layers-empty",
+                    "problem",
+                    f"{tree}/{primitive} has no enabled review lens (every `instruction` "
+                    f"in {tables} is empty) while workflow.review is "
+                    f"{selection!r} — every dev run would HALT with no lens to launch; "
+                    f're-enable a lens in {override_rel}, or set review = "none" there',
+                    {"tree": tree, "source": resolved.source},
+                )
+            )
+    elif resolved.layer_driven and not resolved.active_layers:
         findings.append(
             Finding(
                 "skills.review-layers-empty",
@@ -1947,26 +2172,28 @@ def _review_findings(project: Path, tree: str) -> list[Finding]:
                 f"{tree}/{primitive} has no enabled review layer (every "
                 f"`instruction` is empty) — every dev run would HALT blocked with "
                 f"'no active review layers'; re-enable a layer in "
-                f"{_customize_overrides(primitive)[0].as_posix()}",
+                f"{override_rel}",
                 {"tree": tree, "source": resolved.source},
             )
         )
     for skill, layer_ids in sorted(resolved.required.items()):
         if (project / tree / skill / "SKILL.md").is_file():
             continue
+        hint, outside = _outside_hint(skill, tree, home)
         findings.append(
             Finding(
                 "skills.review-layer-missing",
                 "problem",
                 f"{tree}/{skill} not found — {tree}/{primitive}'s "
                 f"{_where_clause(layer_ids)} it ({resolved.source}), so every dev run's "
-                f"review would fail; install or update the bmm module so this project's "
-                f"review layers resolve",
+                f"review would fail; install {REVIEW_FLOOR_TEXT} so this project's "
+                f"review layers resolve{hint}",
                 {
                     "tree": tree,
                     "skill": skill,
                     "layers": list(layer_ids),
                     "source": resolved.source,
+                    **outside,
                 },
             )
         )

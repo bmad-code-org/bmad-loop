@@ -148,11 +148,28 @@ implementation and the follow-up review), installed by the BMad Method (bmm)
 module. `bmad-loop validate` checks it — plus any review skills its layers
 invoke — are present before a run starts.
 
+bmad-loop resolves BMAD skills only from the project's own skill tree
+(`.claude/skills`, `.agents/skills`). A global install (`npx skills add -g`, into
+`~/.claude/skills` or `~/.agents/skills`) and a Claude Code plugin install are not used.
+When `validate` finds a missing skill installed globally it says so, and
+`detail.outside` names that copy, but the run still refuses: install the skill per
+project with `npx skills add` without `-g`.
+
 **Minimum BMAD-METHOD: v6.10.0** for sprint mode. Beyond the primitive itself (with
 its `customize.toml`), `bmad-loop validate` holds you to no fixed list of review
 skills: it reads the primitive you actually have installed and requires the
 reviewers that copy will actually invoke — which on current sources is none at all.
 
+- **Lens sets (BMAD v7)** — `customize.toml` defines `[[workflow.quick_lenses]]` and
+  `[[workflow.thorough_lenses]]`, and `review` (`none`, `quick`, `thorough` or
+  `auto`) picks the set a run launches. `validate` reads every enabled lens in both
+  sets, because `auto`, an invocation's `--set workflow.review=…` and bmad-loop's own
+  `[tickets] thorough_review` can each select either one. The shipped lenses invoke no
+  skill, so a v7 tree requires no review skill. Any other `review` value is
+  `skills.review-selection-invalid`, because the primitive HALTs every run on it. With
+  every lens disabled and `review` not set to `none`, `validate` reports
+  `skills.review-layers-empty`. A `review_layers` override left over from a v6
+  install is ignored, as the v7 run ignores it.
 - **Layer-driven (post-6.10.0)** — `customize.toml` defines
   `[[workflow.review_layers]]`, and a layer's `instruction` may name a skill to hand
   off to. Current (6.11) sources define four layers — `blind-hunter`,
@@ -169,8 +186,11 @@ reviewers that copy will actually invoke — which on current sources is none at
 
 A layer disabled with an empty `instruction`, or replaced in
 `_bmad/custom/bmad-build-auto.toml` by a recipe that runs something else, requires
-nothing. If the shape cannot be read at all, `validate` falls back to requiring the two
-v6.10.0 hunters — which a tree carrying `bmad-review` satisfies.
+nothing. Lenses follow the same rules. If the shape cannot be read at all, `validate`
+falls back to requiring the two v6.10.0 hunters, which a tree carrying `bmad-review`
+satisfies. On v7, `bmad-review` ships in the core-tools module. When the dev primitive
+itself is missing, `validate` reports only that: no reviewer is demanded without a
+primitive to derive it from.
 
 `bmad-review-verification-gap` is required only when your installed layers name it: no
 tagged release ships it as a standalone skill, and on current sources it is a thin

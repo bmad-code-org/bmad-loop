@@ -2833,8 +2833,16 @@ def _warn_preflight_would_abort(
     problems = [
         p.message
         for p in install.missing_base_skills(paths.project, trees)
-        + (install.missing_stories_support(paths.project, trees) if require_stories else [])
-        + (install.missing_tickets_support(paths.project, trees) if require_tickets else [])
+        + (
+            install.missing_stories_support(paths.project, trees, skip_unresolved=True)
+            if require_stories
+            else []
+        )
+        + (
+            install.missing_tickets_support(paths.project, trees, skip_unresolved=True)
+            if require_tickets
+            else []
+        )
         + (
             install.missing_sweep_skill(paths.project, _triage_trees(paths.project, pol))
             if require_sweep
@@ -2968,9 +2976,10 @@ def _require_base_skills(
     skill_trees = _skill_trees(project, pol, root, grants, review_owed=review_owed)
     findings = install.missing_base_skills(project, skill_trees)
     if require_stories:
-        findings += install.missing_stories_support(project, skill_trees)
+        # missing_base_skills above reports (and refuses) an unresolved primitive
+        findings += install.missing_stories_support(project, skill_trees, skip_unresolved=True)
     if require_tickets:
-        findings += install.missing_tickets_support(project, skill_trees)
+        findings += install.missing_tickets_support(project, skill_trees, skip_unresolved=True)
     # Severity decides. A review layer we can't statically resolve (a `when` gate,
     # an unrecognized handoff phrasing, an unparseable override) is reported and
     # then stepped over: aborting on it would be the false FAIL of #260, only now
@@ -3073,6 +3082,12 @@ def _validate_stories_folder(
     return None
 
 
+def _all_resolve(project: Path, trees: list[str]) -> bool:
+    """Every tree resolves a dev primitive — the precondition for a dispatch-probe ok
+    line, since the probes skip an unresolved tree rather than report it."""
+    return all(install.resolve_dev_primitive(project, tree) is not None for tree in trees)
+
+
 def _validate_stories_queue(
     project: Path,
     paths: bmadconfig.ProjectPaths,
@@ -3103,8 +3118,10 @@ def _validate_stories_queue(
                 f"stories mode: {e} (spec folder: {folder})",
                 {"spec_folder": str(folder)},
             )
-    stories_probs = install.missing_stories_support(project, skill_trees)
-    if skill_trees and not stories_probs:
+    # cmd_validate's skills.base check reports an unresolved primitive on these same
+    # trees; such a tree is skipped here, so it must also withhold the ok line.
+    stories_probs = install.missing_stories_support(project, skill_trees, skip_unresolved=True)
+    if skill_trees and not stories_probs and _all_resolve(project, skill_trees):
         # The total form, not `resolve_dev_primitive`: this ok line only renders when
         # the probe passed, and the probe ran against exactly this name — so an
         # unresolvable tree that somehow satisfied it is still reported as what was
@@ -3420,8 +3437,8 @@ def _validate_tickets_mode_queue(
             retrospective=pol.gates.retrospective if pol is not None else None,
         )
     )
-    tickets_probs = install.missing_tickets_support(project, dev_trees)
-    if dev_trees and not tickets_probs:
+    tickets_probs = install.missing_tickets_support(project, dev_trees, skip_unresolved=True)
+    if dev_trees and not tickets_probs and _all_resolve(project, dev_trees):
         probed = list(
             dict.fromkeys(
                 install.dev_primitive_or_default(project, tree) for tree in dict.fromkeys(dev_trees)
