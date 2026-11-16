@@ -5630,6 +5630,41 @@ class Engine:
             profile, resolve_user=self.policy.skills.user_roots, session_env=session_env
         )
 
+    def _refuse_hook_hidden_skill(
+        self, role: str, project: Path, scope: skill_locate.SkillScope, skill: str
+    ) -> None:
+        """Stop a launch whose prompt names a skill that the session's post-hook
+        env hides.
+
+        The prompt is built before the ``pre_session`` hooks run, against the
+        scope every session of the profile shares (:meth:`_dev_skill` picks the
+        primitive's name there). A hook that sets a user root's disabler (an
+        account rotation's ``CLAUDE_CONFIG_DIR``) can hide the only copy, and the
+        CLI would then halt on an unknown command. The prompt is not rebuilt,
+        because hooks may have rewritten it. Only a skill the shared scope
+        resolves counts: a skill that resolves nowhere is preflight's finding,
+        not this hook's doing."""
+        if not skill or skill_locate.locate(project, scope, skill) is not None:
+            return
+        shared = self._skill_scope(role)
+        found = None if shared is None else skill_locate.locate(project, shared, skill)
+        if found is None:
+            return
+        why = next(
+            (
+                r.unavailable.removeprefix("env:")
+                for r in scope.user_roots
+                if r.spelling == found.root and r.unavailable.startswith("env:")
+            ),
+            None,
+        )
+        cause = f"it sets {why}, which" if why else "its env"
+        raise RuntimeError(
+            f"the {role} session prompt names /{skill}, which resolves from {found.root}, "
+            f"but a pre-session hook hid that root: {cause} stops the CLI reading it. "
+            "Install the skill in the project tree, or stop the hook from setting it"
+        )
+
     def _operator_park_enabled(self) -> bool:
         """Whether a dev session may park a story at ``awaiting-operator`` (#335).
 
@@ -9596,6 +9631,7 @@ class Engine:
             skill_dir = skill_locate.prompt_skill_dir(project, scope, prompt)
             if scope.resolve_user:
                 prompt_skill, _ = skill_locate.prompt_skill(prompt)
+                self._refuse_hook_hidden_skill(role, project, scope, prompt_skill)
                 user_skill_ids = user_root_skill_ids(project, scope, prompt_skill)
                 for skill in user_skill_ids:
                     found = skill_locate.locate(project, scope, skill)

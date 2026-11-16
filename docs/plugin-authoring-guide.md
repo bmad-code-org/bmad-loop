@@ -797,6 +797,9 @@ Before relying on it:
   relay hooks are in the project's `.claude/settings.json` and work with any directory.
 - Never commit, ship or log credentials. Keep the config directories outside the project
   tree, and never echo their contents from a hook or wrapper.
+- Setting `CLAUDE_CONFIG_DIR` makes Claude Code skip `~/.claude/skills`. Under
+  `[skills] user_roots`, a session whose skill came only from there stops before launch
+  with an error naming the skill and the variable. Install the skill in the project tree.
 
 ### Sweep (deferred-work cycle — bundles inherit all per-story stages)
 
