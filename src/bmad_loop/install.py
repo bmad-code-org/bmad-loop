@@ -2392,15 +2392,29 @@ def _review_skill_names(project: Path, scope: SkillScope) -> tuple[str, ...]:
     review = resolve_review_layers(project, scope)
     if review is not None:
         return review.skills()
+    return _fallback_review_skill_names(project, scope)
+
+
+def _fallback_review_skill_names(project: Path, scope: SkillScope) -> tuple[str, ...]:
+    """The static review requirement for a review shape that cannot be read: the
+    merged reviewer when it resolves, else the standalone hunters."""
     if skill_locate.locate(project, scope, MERGED_REVIEW_SKILL) is not None:
         return (MERGED_REVIEW_SKILL,)
     return tuple(sorted(_REVIEW_LAYER_SKILLS))
 
 
-def review_skill_names(project: Path, tree: SkillTree) -> tuple[str, ...]:
-    """Every review skill ``tree``'s dev primitive may invoke — the set the run
-    preflight checks next to the primitive (:func:`_review_skill_names`)."""
-    return _review_skill_names(project, as_scope(tree))
+def required_review_skill_names(project: Path, tree: SkillTree) -> tuple[str, ...]:
+    """The review skills ``tree``'s dev primitive WILL invoke: the ones whose
+    absence fails the run preflight (the problem-severity rows of
+    :func:`_review_findings`). That is the read shape's ``required`` skills, else
+    the static fallback for a shape that cannot be read. ``advisory`` skills are
+    left out, because a gated layer may never run and preflight only warns about
+    them."""
+    scope = as_scope(tree)
+    review = resolve_review_layers(project, scope)
+    if review is not None:
+        return tuple(review.required)
+    return _fallback_review_skill_names(project, scope)
 
 
 USER_SHADOW_CHECK = "skills.user-shadow"

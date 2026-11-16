@@ -78,7 +78,7 @@ from .frontmatter import FrontmatterWriteError
 from .install import (
     dev_primitive_or_default,
     module_record_version,
-    review_skill_names,
+    required_review_skill_names,
     user_root_skill_ids,
 )
 from .journal import SELF_MINTED_FIELDS, Journal, save_state
@@ -5653,8 +5653,11 @@ class Engine:
         may have rewritten it.
 
         The skills compared are the prompt's skill and, for the dev primitive, the
-        review skills it may invoke. Only a skill the shared scope resolves
-        counts: one that resolves nowhere is preflight's finding, not the hook's."""
+        review skills it WILL invoke (:func:`required_review_skill_names`). An
+        advisory reviewer (a ``when``-gated layer, an unconfirmed reference) is left
+        out: its layer may never run, and preflight only warns when it is missing.
+        Only a skill the shared scope resolves counts: one that resolves nowhere is
+        preflight's finding, not the hook's."""
         if not skill:
             return
         shared = self._skill_scope(role)
@@ -5662,7 +5665,7 @@ class Engine:
             return
         names = [skill]
         if skill == self._dev_skill(role):
-            names += [n for n in review_skill_names(project, shared) if n != skill]
+            names += [n for n in required_review_skill_names(project, shared) if n != skill]
         for name in dict.fromkeys(names):
             before = skill_locate.locate(project, shared, name)
             if before is None:

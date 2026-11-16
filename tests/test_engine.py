@@ -25426,6 +25426,67 @@ def test_session_refuses_when_a_hook_hides_a_required_review_skill(
     assert spec.skill_dir is None
 
 
+@pytest.mark.parametrize("gated", [True, False], ids=["advisory-launches", "required-refused"])
+def test_session_hook_guard_skips_an_advisory_review_skill(project, monkeypatch, tmp_path, gated):
+    """The primitive and its `blind` reviewer sit in the project tree. A second
+    layer names `bmad-review-performance`, which resolves only from
+    `~/.codex/skills`. When that layer is `when`-gated, the reviewer is advisory:
+    it may never run and preflight only warns when it is missing, so a
+    `pre_session` hook that sets CODEX_HOME and hides it does not stop the launch.
+    Ungated, the same reviewer is required and the launch stops.
+
+    Ablation (performed): compare every reviewer (`ReviewResolution.skills()`,
+    advisory included) in `_refuse_hook_changed_skill` and the advisory row FAILS
+    (the launch is refused)."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import skill_locate
+    from bmad_loop.install import DEV_PRIMITIVE_NEW
+
+    home = tmp_path / "home"
+    project_tree = install_build_auto_skill(project.project, ".agents/skills")
+    when_line = 'when = "the diff touches hot paths"\n' if gated else ""
+    (project_tree / DEV_PRIMITIVE_NEW / "customize.toml").write_text(
+        "[workflow]\n"
+        '[[workflow.review_layers]]\nid = "blind"\n'
+        'instruction = "Invoke the `bmad-review` skill on this diff."\n'
+        f'[[workflow.review_layers]]\nid = "perf"\n{when_line}'
+        'instruction = "Invoke the `bmad-review-performance` skill on this diff."\n',
+        encoding="utf-8",
+    )
+    for name, root in (("bmad-review", project_tree), ("bmad-review-performance", None)):
+        folder = (root or home / ".codex/skills") / name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    engine, adapter = make_engine(
+        project, [SessionResult(status="completed")], policy=_user_root_policy(True)
+    )
+    attach_profile(adapter, "codex")
+    real_gate = engine._emit_session_gate
+
+    def gate(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        return prompt, {**env, "CODEX_HOME": str(tmp_path / "rotated")}, ctx
+
+    monkeypatch.setattr(engine, "_emit_session_gate", gate)
+
+    def run():
+        engine._run_session(_prompt_task(), role="dev", prompt="/bmad-build-auto 1-1-a", seq=1)
+
+    if not gated:
+        with pytest.raises(
+            RuntimeError, match=r"review step needs bmad-review-performance.*CODEX_HOME"
+        ):
+            run()
+        assert adapter.sessions == []
+        return
+
+    run()
+    (spec,) = adapter.sessions
+    assert spec.skill_dir is None
+
+
 def test_session_spec_has_no_user_root_skills_with_the_switch_off(project, monkeypatch, tmp_path):
     """Switch off: the same global-only install contributes nothing — no
     `skill_dir` (the project-tree miss keeps the renderer's relative default), no
