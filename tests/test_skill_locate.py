@@ -453,6 +453,34 @@ def test_same_copy_refuses_an_oversized_or_missing_folder(tmp_path, monkeypatch)
     assert not same_copy(a, gone)
 
 
+def test_same_copy_walks_linked_folders(tmp_path):
+    """Files behind a linked folder count: identical `SKILL.md` files whose
+    `steps` links point at different contents are not the same skill.
+
+    Ablation (performed): drop `followlinks=True` from `_skill_files` and the
+    differing-target assertion FAILS."""
+    targets = {}
+    for side, text in (("a", "do it\n"), ("b", "do it differently\n")):
+        targets[side] = tmp_path / f"{side}-steps"
+        _copy(targets[side], {"step-01.md": text})
+    a = _copy(tmp_path / "a" / SKILL, {"SKILL.md": _FILES["SKILL.md"]})
+    b = _copy(tmp_path / "b" / SKILL, {"SKILL.md": _FILES["SKILL.md"]})
+    _plant_directory_redirect(a.path / "steps", targets["a"])
+    _plant_directory_redirect(b.path / "steps", targets["b"])
+    assert not same_copy(a, b)
+    assert not same_copy(b, a)
+    plain = _copy(tmp_path / "plain" / SKILL, _FILES)
+    assert same_copy(a, plain)
+
+
+def test_same_copy_refuses_a_link_cycle(tmp_path):
+    a = _copy(tmp_path / "a" / SKILL, _FILES)
+    b = _copy(tmp_path / "b" / SKILL, _FILES)
+    _plant_directory_redirect(b.path / "steps" / "loop", b.path)
+    assert not same_copy(a, b)
+    assert not same_copy(b, a)
+
+
 @pytest.mark.parametrize(
     ("prompt", "expected"),
     [

@@ -310,11 +310,20 @@ SAME_COPY_MAX_FILES = 512
 
 
 def _skill_files(folder: Path) -> dict[str, Path] | None:
-    """Every regular file under ``folder`` keyed by its ``/``-joined relative
-    path, or ``None`` when the walk fails or passes :data:`SAME_COPY_MAX_FILES`."""
+    """Every file under ``folder`` keyed by its ``/``-joined relative path, or
+    ``None`` when the walk fails or passes :data:`SAME_COPY_MAX_FILES`.
+
+    Linked folders are walked like real ones, so their files count too. A
+    folder reached twice (a link cycle, or two links to one folder) also
+    yields ``None``, which keeps the walk finite."""
     files: dict[str, Path] = {}
     errors: list[OSError] = []
-    for dirpath, dirnames, filenames in os.walk(folder, onerror=errors.append):
+    seen: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(folder, onerror=errors.append, followlinks=True):
+        real = os.path.realpath(dirpath)
+        if real in seen:
+            return None
+        seen.add(real)
         dirnames.sort()
         base = Path(dirpath)
         for name in filenames:
@@ -327,8 +336,9 @@ def _skill_files(folder: Path) -> dict[str, Path] | None:
 
 def same_copy(a: Located, b: Located) -> bool:
     """Whether two copies of a skill are the same skill: one folder, or two
-    folders holding byte-identical files at the same relative paths. A folder
-    that cannot be walked or read, or that holds more than
+    folders holding byte-identical files at the same relative paths, linked
+    folders included. A folder that cannot be walked or read, that reaches one
+    folder twice through links, or that holds more than
     :data:`SAME_COPY_MAX_FILES` files, is never the same as another one."""
     try:
         if a.path.resolve() == b.path.resolve():
