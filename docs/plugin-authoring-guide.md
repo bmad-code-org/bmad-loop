@@ -797,9 +797,15 @@ Before relying on it:
   relay hooks are in the project's `.claude/settings.json` and work with any directory.
 - Never commit, ship or log credentials. Keep the config directories outside the project
   tree, and never echo their contents from a hook or wrapper.
-- Setting `CLAUDE_CONFIG_DIR` makes Claude Code skip `~/.claude/skills`. Under
-  `[skills] user_roots`, a session whose skill came only from there stops before launch
-  with an error naming the skill and the variable. Install the skill in the project tree.
+- Setting `CLAUDE_CONFIG_DIR` makes Claude Code skip `~/.claude/skills`, so install the
+  skills your sessions use in the project tree. Under `[skills] user_roots`, what bmad-loop
+  catches depends on where the variable is set:
+  - **A `pre_session` hook:** a session whose skill came only from `~/.claude/skills`
+    stops before launch, with an error naming the skill and the variable.
+  - **The parent environment or the profile `[env]`:** preflight reports
+    `~/.claude/skills` as `skills.user-root-unavailable`.
+  - **A wrapper `binary`:** the script sets the variable after bmad-loop has checked the
+    session, so nothing catches it, and the session launches without that skill.
 
 ### Sweep (deferred-work cycle — bundles inherit all per-story stages)
 
