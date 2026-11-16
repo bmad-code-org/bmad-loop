@@ -25293,6 +25293,74 @@ def test_session_user_roots_resolve_against_the_post_hook_env(
     assert {r["root"] for r in rows} == {expected_root}
 
 
+@pytest.mark.parametrize(
+    ("hook_disables", "project_reviewers"),
+    [(False, False), (True, False), (True, True)],
+    ids=["ambient", "hook-set-reviewer-hidden", "hook-set-reviewers-in-project"],
+)
+def test_session_refuses_when_a_hook_hides_a_required_review_skill(
+    project, monkeypatch, tmp_path, hook_disables, project_reviewers
+):
+    """The dev primitive is in the project tree, but the review skills it must
+    invoke resolve only from `~/.codex/skills`. Preflight passes them against the
+    shared scope; a `pre_session` hook that sets CODEX_HOME hides that root, so the
+    primitive would launch and fail its review step. The launch stops before
+    `session-start`, naming the reviewer and the variable. Reviewers that the
+    project tree also carries keep the launch going.
+
+    Ablation (performed): drop the review-skill loop from
+    `_refuse_hook_hidden_skill` and the reviewer-hidden row FAILS (the session
+    launches)."""
+    import shutil
+
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import skill_locate
+    from bmad_loop.install import DEV_PRIMITIVE_NEW
+
+    home = tmp_path / "home"
+    project_tree = install_build_auto_skill(project.project, ".agents/skills")
+    home_tree = install_build_auto_skill(home, ".codex/skills")
+    shutil.rmtree(home_tree / DEV_PRIMITIVE_NEW)
+    reviewers = sorted(p.name for p in home_tree.iterdir())
+    assert reviewers
+    if not project_reviewers:
+        for name in reviewers:
+            shutil.rmtree(project_tree / name)
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    engine, adapter = make_engine(
+        project, [SessionResult(status="completed")], policy=_user_root_policy(True)
+    )
+    attach_profile(adapter, "codex")
+    real_gate = engine._emit_session_gate
+
+    def gate(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        if hook_disables:
+            env = {**env, "CODEX_HOME": str(tmp_path / "rotated")}
+        return prompt, env, ctx
+
+    monkeypatch.setattr(engine, "_emit_session_gate", gate)
+
+    def run():
+        engine._run_session(_prompt_task(), role="dev", prompt="/bmad-build-auto 1-1-a", seq=1)
+
+    if hook_disables and not project_reviewers:
+        with pytest.raises(
+            RuntimeError,
+            match=rf"/bmad-build-auto, whose review step needs {reviewers[0]}.*"
+            r"~/\.codex/skills.*CODEX_HOME",
+        ):
+            run()
+        assert adapter.sessions == []
+        assert "session-start" not in [e["kind"] for e in engine.journal.entries()]
+        return
+
+    run()
+    (spec,) = adapter.sessions
+    assert spec.skill_dir is None
+
+
 def test_session_spec_has_no_user_root_skills_with_the_switch_off(project, monkeypatch, tmp_path):
     """Switch off: the same global-only install contributes nothing — no
     `skill_dir` (the project-tree miss keeps the renderer's relative default), no

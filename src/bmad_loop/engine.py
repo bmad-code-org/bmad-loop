@@ -75,7 +75,12 @@ from .escalation import (
     usage_relaunch,
 )
 from .frontmatter import FrontmatterWriteError
-from .install import dev_primitive_or_default, module_record_version, user_root_skill_ids
+from .install import (
+    dev_primitive_or_default,
+    missing_review_skills,
+    module_record_version,
+    user_root_skill_ids,
+)
 from .journal import SELF_MINTED_FIELDS, Journal, save_state
 from .model import (
     ENV_FAULT_SITE_DISPATCH_PREFIX,
@@ -5643,27 +5648,56 @@ class Engine:
         CLI would then halt on an unknown command. The prompt is not rebuilt,
         because hooks may have rewritten it. Only a skill the shared scope
         resolves counts: a skill that resolves nowhere is preflight's finding,
-        not this hook's doing."""
-        if not skill or skill_locate.locate(project, scope, skill) is not None:
+        not this hook's doing.
+
+        A prompt naming the dev primitive also needs the review skills the
+        primitive invokes, which preflight required against the shared scope: one
+        the post-hook scope loses stops the launch the same way, since the
+        primitive would fail its review step without it."""
+        if not skill:
             return
         shared = self._skill_scope(role)
-        found = None if shared is None else skill_locate.locate(project, shared, skill)
-        if found is None:
+        if shared is None:
             return
+        if skill_locate.locate(project, scope, skill) is None:
+            found = skill_locate.locate(project, shared, skill)
+            if found is not None:
+                raise RuntimeError(
+                    f"the {role} session prompt names /{skill}, which resolves from "
+                    f"{found.root}, but a pre-session hook hid that root: "
+                    f"{self._hook_hid_cause(scope, found.root)} stops the CLI reading it. "
+                    "Install the skill in the project tree, or stop the hook from setting it"
+                )
+            return
+        if skill != self._dev_skill(role):
+            return
+        lost = sorted(
+            missing_review_skills(project, scope) - missing_review_skills(project, shared)
+        )
+        for reviewer in lost:
+            found = skill_locate.locate(project, shared, reviewer)
+            if found is None:
+                continue
+            raise RuntimeError(
+                f"the {role} session prompt names /{skill}, whose review step needs "
+                f"{reviewer}, which resolves from {found.root}, but a pre-session hook hid "
+                f"that root: {self._hook_hid_cause(scope, found.root)} stops the CLI reading "
+                "it. Install the skill in the project tree, or stop the hook from setting it"
+            )
+
+    @staticmethod
+    def _hook_hid_cause(scope: skill_locate.SkillScope, root: str) -> str:
+        """The clause naming what hid ``root`` in the post-hook ``scope``: the
+        disabler the hook set, else the hook's env in general."""
         why = next(
             (
                 r.unavailable.removeprefix("env:")
                 for r in scope.user_roots
-                if r.spelling == found.root and r.unavailable.startswith("env:")
+                if r.spelling == root and r.unavailable.startswith("env:")
             ),
             None,
         )
-        cause = f"it sets {why}, which" if why else "its env"
-        raise RuntimeError(
-            f"the {role} session prompt names /{skill}, which resolves from {found.root}, "
-            f"but a pre-session hook hid that root: {cause} stops the CLI reading it. "
-            "Install the skill in the project tree, or stop the hook from setting it"
-        )
+        return f"it sets {why}, which" if why else "its env"
 
     def _operator_park_enabled(self) -> bool:
         """Whether a dev session may park a story at ``awaiting-operator`` (#335).

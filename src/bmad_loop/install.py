@@ -2400,6 +2400,21 @@ def _review_skill_names(project: Path, scope: SkillScope) -> tuple[str, ...]:
     return tuple(sorted(_REVIEW_LAYER_SKILLS))
 
 
+_REVIEW_MISSING_CHECKS = frozenset({"skills.review-layer-missing", "skills.base-missing"})
+
+
+def missing_review_skills(project: Path, tree: SkillTree) -> frozenset[str]:
+    """The review skills ``tree``'s dev primitive must invoke but cannot load: every
+    skill a problem-severity :func:`_review_findings` row names, so the set the run
+    preflight blocks on. Empty when the primitive does not resolve (that root cause
+    is :func:`missing_base_skills`' finding)."""
+    return frozenset(
+        str(f.detail["skill"])
+        for f in _review_findings(project, tree)
+        if f.severity == "problem" and f.check in _REVIEW_MISSING_CHECKS and f.detail
+    )
+
+
 USER_SHADOW_CHECK = "skills.user-shadow"
 USER_ROOT_UNAVAILABLE_CHECK = "skills.user-root-unavailable"
 USER_ROOT_VERSION_SKEW_CHECK = "skills.user-root-version-skew"

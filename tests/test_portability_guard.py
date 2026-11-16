@@ -347,7 +347,8 @@ REFUSAL_HELPER_DEFS = {
     ("cli.py", "_reject_under_floor_git"),
     ("engine.py", "_refuse_gated_story"),
     # #770: a prompt skill that a pre_session hook's env hid from the CLI; test_engine.py
-    # test_session_user_roots_resolve_against_the_post_hook_env[hook-set]
+    # test_session_user_roots_resolve_against_the_post_hook_env[hook-set], and a
+    # required review skill the hook hid: ...[hook-set-reviewer-hidden]
     ("engine.py", "_refuse_hook_hidden_skill"),
     ("platform_util.py", "_refuse_unwritable_target"),
     ("platform_util.py", "_refuse_unwritable_target_at"),
