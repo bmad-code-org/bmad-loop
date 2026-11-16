@@ -3318,10 +3318,13 @@ def skill_trees_outside(
       on and it also leaves ``repo_root``, where seeding cannot copy a single skill
       out of it and the finding is a ``problem``. Its skill-level links are then
       not reported again.
-    - A **required skill directory** — the resolved dev primitive plus every skill
-      its review step may invoke (:meth:`ReviewResolution.skills`; for a shape
-      that cannot be read, the merged-or-standalone fallback the worktree gate
-      uses) — resolving outside ``repo_root``. Only worktree isolation reads skills through a copy,
+    - A **required skill directory** — the resolved dev primitive plus the review
+      skills it will invoke (:func:`required_review_skill_names`: the shape's
+      ``required`` skills, or for a shape that cannot be read the
+      merged-or-standalone fallback the worktree gate uses) — resolving outside
+      ``repo_root``. An advisory (``when``-gated) reviewer is left out, as in
+      :func:`base_skills_seed_incomplete`: it may never run, so its absence from a
+      worktree cannot stall the session. Only worktree isolation reads skills through a copy,
       and its seeding skips a source outside the repo and then escalates the unit
       mid-run, so it is a ``problem`` there and no finding at all otherwise: in
       place, the session reads the link directly.
@@ -3368,9 +3371,10 @@ def skill_trees_outside(
         if not worktree:
             continue
         primitive = resolve_dev_primitive(project, scope)
-        # an unreadable review shape takes the same merged-or-standalone fallback
-        # the worktree's required-skill gate applies
-        review_skills = _review_skill_names(project, scope)
+        # only the reviewers the primitive will invoke, as the worktree's
+        # required-skill gate; an unreadable review shape takes its same
+        # merged-or-standalone fallback
+        review_skills = required_review_skill_names(project, scope)
         required = (*((primitive,) if primitive is not None else ()), *review_skills)
         for skill in dict.fromkeys(required):
             found = skill_locate.locate(project, scope, skill)

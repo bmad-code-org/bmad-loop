@@ -11619,6 +11619,39 @@ def test_skill_tree_outside_skill_link_only_under_worktree(tmp_path):
     ]
 
 
+def test_skill_tree_outside_skips_linked_advisory_reviewer(tmp_path):
+    """A `when`-gated reviewer linked to a shared install may never run, so the
+    worktree gate does not require it (`base_skills_seed_incomplete`) and neither
+    does this check — while a required reviewer linked the same way still is.
+
+    Ablation: check `_review_skill_names` instead of `required_review_skill_names`
+    in `skill_trees_outside` and the advisory link is reported too."""
+    repo, tree = tmp_path / "repo", ".claude/skills"
+    advisory = "bmad-review-performance"
+    _install_dev_auto(
+        repo,
+        tree,
+        skill=DEV_PRIMITIVE_NEW,
+        customize="[workflow]\n"
+        + _layer("blind", "bmad-review")
+        + _layer("perf", advisory, when="the diff touches hot paths"),
+    )
+    _install_skills(repo, tree, {"bmad-review": ()})
+    _install_skills(tmp_path / "shared", "skills", {advisory: ()})
+    _link_dir(repo / tree / advisory, tmp_path / "shared" / "skills" / advisory)
+
+    assert missing_base_skills(repo, [tree]) == []
+    assert install_mod.skill_trees_outside(repo, repo, [tree], isolation="worktree") == []
+
+    shutil.rmtree(repo / tree / "bmad-review")
+    _install_skills(tmp_path / "shared", "skills", {"bmad-review": ()})
+    _link_dir(repo / tree / "bmad-review", tmp_path / "shared" / "skills" / "bmad-review")
+    assert [
+        f.detail["skill"]
+        for f in install_mod.skill_trees_outside(repo, repo, [tree], isolation="worktree")
+    ] == ["bmad-review"]
+
+
 def test_skill_tree_outside_ignores_in_repo_link(tmp_path):
     """The `skills` CLI's own layout — `.claude/skills` linked to `.agents/skills` —
     stays inside the repo, so neither the tree nor its skills are reported, even

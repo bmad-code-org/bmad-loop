@@ -197,10 +197,10 @@ breaking changes may land in a minor release.
 - Name each BMAD-METHOD module folder in the module record's skill sources: `skills/core-tools` for `bmad`, `skills/method` for `bmad-build-auto`, `bmad-agent-po` and `bmad-retrospective`. BMAD-METHOD moved each module's skills into its own folder.
 - Refuse a leading `~` in a profile's `skill_tree`, `extra_skill_trees`, `seed_files`
   and `hooks.config_path` at load: it is not expanded.
-- Report a skill tree, or a skill linked inside it, that resolves outside the project
-  or repository as `skills.tree-outside`; under worktree isolation a link outside the
-  repository is refused at preflight (and named by the `run --dry-run` banner) instead
-  of escalating mid-run.
+- Report a skill tree, or a skill the run requires linked inside it, that resolves
+  outside the project or repository as `skills.tree-outside`; under worktree isolation
+  a link outside the repository is refused at preflight (and named by the
+  `run --dry-run` banner) instead of escalating mid-run.
 - Change copilot's default prompt template to `{skill_dir}`: the text is unchanged
   for project skills, but the config digest changes once, so the first resume of a
   copilot run after upgrading journals `security_config_changed`.
