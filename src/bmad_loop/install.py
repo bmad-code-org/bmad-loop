@@ -1051,8 +1051,7 @@ def _probe_unreadable(check: str, rel: str, fault: str) -> Finding:
     return Finding(
         check,
         "problem",
-        f"{rel} could not be checked ({fault}) — fix its permissions or the filesystem "
-        "and re-run",
+        f"{rel} could not be checked ({fault}) — fix its permissions or the filesystem and re-run",
         {"path": rel, "error": fault},
     )
 
@@ -1144,7 +1143,7 @@ def _tickets_store_findings(
             )
         if sandboxed_roles:
             causes.append(
-                f"{', '.join(sandboxed_roles)} run permission_mode = \"sandboxed\", whose "
+                f'{", ".join(sandboxed_roles)} run permission_mode = "sandboxed", whose '
                 'sandbox confines writes to the working directory (use "bypass" there)'
             )
         findings.append(
@@ -1973,8 +1972,7 @@ def _probe_render(
     line = _render_command_line(skill_md)
     if line is None:
         return problem(
-            f"{unparsed} (no fenced code line names {RENDERER_SCRIPT_MARKER}); "
-            "nothing was executed"
+            f"{unparsed} (no fenced code line names {RENDERER_SCRIPT_MARKER}); nothing was executed"
         )
     detail["command"] = line
     try:
@@ -2087,8 +2085,7 @@ def _render_in(
     if halt is not None:
         text = halt[len(_RENDER_HALT_PREFIX) :].strip()
         return problem(
-            f"{rel}: render HALTs: {text} — a dev session would stop here without "
-            "writing a spec",
+            f"{rel}: render HALTs: {text} — a dev session would stop here without writing a spec",
             rc=proc.returncode,
             halt=text,
         )
@@ -2400,19 +2397,10 @@ def _review_skill_names(project: Path, scope: SkillScope) -> tuple[str, ...]:
     return tuple(sorted(_REVIEW_LAYER_SKILLS))
 
 
-_REVIEW_MISSING_CHECKS = frozenset({"skills.review-layer-missing", "skills.base-missing"})
-
-
-def missing_review_skills(project: Path, tree: SkillTree) -> frozenset[str]:
-    """The review skills ``tree``'s dev primitive must invoke but cannot load: every
-    skill a problem-severity :func:`_review_findings` row names, so the set the run
-    preflight blocks on. Empty when the primitive does not resolve (that root cause
-    is :func:`missing_base_skills`' finding)."""
-    return frozenset(
-        str(f.detail["skill"])
-        for f in _review_findings(project, tree)
-        if f.severity == "problem" and f.check in _REVIEW_MISSING_CHECKS and f.detail
-    )
+def review_skill_names(project: Path, tree: SkillTree) -> tuple[str, ...]:
+    """Every review skill ``tree``'s dev primitive may invoke — the set the run
+    preflight checks next to the primitive (:func:`_review_skill_names`)."""
+    return _review_skill_names(project, as_scope(tree))
 
 
 USER_SHADOW_CHECK = "skills.user-shadow"

@@ -306,6 +306,41 @@ def home_copy(scope: SkillScope, name: str) -> Located | None:
     return found[0] if found else None
 
 
+SAME_COPY_MAX_FILES = 512
+
+
+def _skill_files(folder: Path) -> dict[str, Path] | None:
+    """Every regular file under ``folder`` keyed by its ``/``-joined relative
+    path, or ``None`` when the walk fails or passes :data:`SAME_COPY_MAX_FILES`."""
+    files: dict[str, Path] = {}
+    errors: list[OSError] = []
+    for dirpath, dirnames, filenames in os.walk(folder, onerror=errors.append):
+        dirnames.sort()
+        base = Path(dirpath)
+        for name in filenames:
+            path = base / name
+            files[path.relative_to(folder).as_posix()] = path
+            if len(files) > SAME_COPY_MAX_FILES:
+                return None
+    return None if errors else files
+
+
+def same_copy(a: Located, b: Located) -> bool:
+    """Whether two copies of a skill are the same skill: one folder, or two
+    folders holding byte-identical files at the same relative paths. A folder
+    that cannot be walked or read, or that holds more than
+    :data:`SAME_COPY_MAX_FILES` files, is never the same as another one."""
+    try:
+        if a.path.resolve() == b.path.resolve():
+            return True
+        left, right = _skill_files(a.path), _skill_files(b.path)
+        if left is None or right is None or left.keys() != right.keys():
+            return False
+        return all(left[rel].read_bytes() == right[rel].read_bytes() for rel in left)
+    except OSError:
+        return False
+
+
 def prompt_skill(prompt: str) -> tuple[str, str]:
     """Split a canonical ``"/skill args"`` prompt into ``(skill, args)``;
     a prompt without a leading slash is ``("", prompt)``."""

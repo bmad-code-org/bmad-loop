@@ -800,9 +800,10 @@ Before relying on it:
 - Setting `CLAUDE_CONFIG_DIR` makes Claude Code skip `~/.claude/skills`, so install the
   skills your sessions use in the project tree. Under `[skills] user_roots`, what bmad-loop
   catches depends on where the variable is set:
-  - **A `pre_session` hook:** a session whose skill came only from `~/.claude/skills`
-    stops before launch, with an error naming the skill and the variable. So does a dev
-    session whose primitive needs a review skill that came only from there.
+  - **A `pre_session` hook:** a session whose skill came from `~/.claude/skills` stops
+    before launch, with an error naming the skill and the variable, unless the project
+    tree holds a byte-identical copy. So does a dev session whose primitive needs a
+    review skill that came from there.
   - **The parent environment or the profile `[env]`:** preflight reports
     `~/.claude/skills` as `skills.user-root-unavailable`.
   - **A wrapper `binary`:** the script sets the variable after bmad-loop has checked the

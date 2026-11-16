@@ -346,10 +346,12 @@ REFUSAL_HELPER_DEFS = {
     ("cli.py", "_reject_plugin_trust"),
     ("cli.py", "_reject_under_floor_git"),
     ("engine.py", "_refuse_gated_story"),
-    # #770: a prompt skill that a pre_session hook's env hid from the CLI; test_engine.py
-    # test_session_user_roots_resolve_against_the_post_hook_env[hook-set], and a
-    # required review skill the hook hid: ...[hook-set-reviewer-hidden]
-    ("engine.py", "_refuse_hook_hidden_skill"),
+    # #770: a prompt skill that a pre_session hook's env hid from the CLI or swapped
+    # for another copy; test_engine.py
+    # test_session_user_roots_resolve_against_the_post_hook_env[hook-set],
+    # test_session_refuses_when_a_hook_swaps_the_primitive_for_another_copy, and
+    # test_session_refuses_when_a_hook_hides_a_required_review_skill
+    ("engine.py", "_refuse_hook_changed_skill"),
     ("platform_util.py", "_refuse_unwritable_target"),
     ("platform_util.py", "_refuse_unwritable_target_at"),
     # #810: a named or wrong-typed [engine] block; test_policy.py

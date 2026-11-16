@@ -25241,14 +25241,13 @@ def test_session_user_roots_resolve_against_the_post_hook_env(
     root from the launched CLI, so dispatch resolves against the post-hook env.
     When the hidden root held the only copy of the skill the prompt names, the
     launch stops before `session-start`: the prompt was spelled before the hook
-    ran, and the CLI would halt on an unknown command. When another root still
-    loads it, the session launches from that root. Without the hook the
-    `~/.codex/skills` install resolves.
+    ran, and the CLI would halt on an unknown command. When `~/.agents/skills`,
+    which codex ranks first, also holds it, the hook changes nothing and the
+    session launches from there. Without the hook the `~/.codex/skills` install
+    resolves.
 
     Ablation (performed): drop `env` from the `_skill_scope` call at the
-    `SessionSpec` construction and the hook-set row FAILS (the session launches);
-    drop the post-hook `locate` early return in `_refuse_hook_hidden_skill` and
-    the other-root row FAILS (the launch is refused)."""
+    `SessionSpec` construction and the hook-set row FAILS (the session launches)."""
     from conftest import attach_profile, install_build_auto_skill
 
     from bmad_loop import skill_locate
@@ -25294,6 +25293,72 @@ def test_session_user_roots_resolve_against_the_post_hook_env(
 
 
 @pytest.mark.parametrize(
+    ("hook_disables", "project_copy"),
+    [(False, "older"), (True, "same"), (True, "older")],
+    ids=["ambient", "hook-set-same-copy", "hook-set-older-copy"],
+)
+def test_session_refuses_when_a_hook_swaps_the_primitive_for_another_copy(
+    project, monkeypatch, tmp_path, hook_disables, project_copy
+):
+    """Claude ranks `~/.claude/skills` above the project tree, so the preflight
+    checks the user copy of the primitive. A `pre_session` hook that sets
+    CLAUDE_CONFIG_DIR hides that root and the CLI falls back to the project copy,
+    which no check read (an older primitive without ticket support, say). The
+    launch stops before `session-start`, naming both roots. A byte-identical
+    project copy keeps the launch going, as does an ambient launch that reads the
+    checked user copy.
+
+    Ablation (performed): drop the `same_copy` comparison in
+    `_refuse_hook_changed_skill` (accept any post-hook copy) and the older-copy
+    row FAILS (the session launches); refuse every changed path regardless of
+    content and the same-copy row FAILS."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import skill_locate
+    from bmad_loop.install import DEV_PRIMITIVE_NEW
+
+    home = tmp_path / "home"
+    install_build_auto_skill(home, ".claude/skills")
+    install_build_auto_skill(project.project, ".claude/skills")
+    if project_copy == "older":
+        skill_md = project.project / ".claude/skills" / DEV_PRIMITIVE_NEW / "SKILL.md"
+        skill_md.write_text(skill_md.read_text(encoding="utf-8") + "\nolder\n", encoding="utf-8")
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    engine, adapter = make_engine(
+        project, [SessionResult(status="completed")], policy=_user_root_policy(True)
+    )
+    attach_profile(adapter, "claude")
+    real_gate = engine._emit_session_gate
+
+    def gate(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        if hook_disables:
+            env = {**env, "CLAUDE_CONFIG_DIR": str(tmp_path / "rotated")}
+        return prompt, env, ctx
+
+    monkeypatch.setattr(engine, "_emit_session_gate", gate)
+
+    def run():
+        engine._run_session(_prompt_task(), role="dev", prompt=f"/{DEV_PRIMITIVE_NEW} 1-1-a", seq=1)
+
+    if hook_disables and project_copy == "older":
+        with pytest.raises(
+            RuntimeError,
+            match=rf"/{DEV_PRIMITIVE_NEW}, which resolves from ~/\.claude/skills.*"
+            r"CLAUDE_CONFIG_DIR.*the copy in \.claude/skills, which no check read",
+        ):
+            run()
+        assert adapter.sessions == []
+        assert "session-start" not in [e["kind"] for e in engine.journal.entries()]
+        return
+
+    run()
+    (spec,) = adapter.sessions
+    expected = str(home / ".claude/skills" / DEV_PRIMITIVE_NEW) if not hook_disables else None
+    assert spec.skill_dir == expected
+
+
+@pytest.mark.parametrize(
     ("hook_disables", "project_reviewers"),
     [(False, False), (True, False), (True, True)],
     ids=["ambient", "hook-set-reviewer-hidden", "hook-set-reviewers-in-project"],
@@ -25308,8 +25373,8 @@ def test_session_refuses_when_a_hook_hides_a_required_review_skill(
     `session-start`, naming the reviewer and the variable. Reviewers that the
     project tree also carries keep the launch going.
 
-    Ablation (performed): drop the review-skill loop from
-    `_refuse_hook_hidden_skill` and the reviewer-hidden row FAILS (the session
+    Ablation (performed): compare only the prompt's skill in
+    `_refuse_hook_changed_skill` and the reviewer-hidden row FAILS (the session
     launches)."""
     import shutil
 

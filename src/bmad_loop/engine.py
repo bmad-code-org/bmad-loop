@@ -77,8 +77,8 @@ from .escalation import (
 from .frontmatter import FrontmatterWriteError
 from .install import (
     dev_primitive_or_default,
-    missing_review_skills,
     module_record_version,
+    review_skill_names,
     user_root_skill_ids,
 )
 from .journal import SELF_MINTED_FIELDS, Journal, save_state
@@ -5635,54 +5635,59 @@ class Engine:
             profile, resolve_user=self.policy.skills.user_roots, session_env=session_env
         )
 
-    def _refuse_hook_hidden_skill(
+    def _refuse_hook_changed_skill(
         self, role: str, project: Path, scope: skill_locate.SkillScope, skill: str
     ) -> None:
-        """Stop a launch whose prompt names a skill that the session's post-hook
-        env hides.
+        """Stop a launch whose post-hook env changes a skill the run preflight
+        checked for it.
 
         The prompt is built before the ``pre_session`` hooks run, against the
         scope every session of the profile shares (:meth:`_dev_skill` picks the
-        primitive's name there). A hook that sets a user root's disabler (an
-        account rotation's ``CLAUDE_CONFIG_DIR``) can hide the only copy, and the
-        CLI would then halt on an unknown command. The prompt is not rebuilt,
-        because hooks may have rewritten it. Only a skill the shared scope
-        resolves counts: a skill that resolves nowhere is preflight's finding,
-        not this hook's doing.
+        primitive's name there), and the preflight checked the copies that scope
+        resolves. A hook that sets a user root's disabler (an account rotation's
+        ``CLAUDE_CONFIG_DIR``) changes what the CLI loads: it can hide the only
+        copy, so the CLI halts on an unknown command, or hand the session another
+        copy that no check read (an older primitive without ticket support, say).
+        Either stops the launch, unless the other copy holds the same files
+        (:func:`skill_locate.same_copy`). The prompt is not rebuilt, because hooks
+        may have rewritten it.
 
-        A prompt naming the dev primitive also needs the review skills the
-        primitive invokes, which preflight required against the shared scope: one
-        the post-hook scope loses stops the launch the same way, since the
-        primitive would fail its review step without it."""
+        The skills compared are the prompt's skill and, for the dev primitive, the
+        review skills it may invoke. Only a skill the shared scope resolves
+        counts: one that resolves nowhere is preflight's finding, not the hook's."""
         if not skill:
             return
         shared = self._skill_scope(role)
         if shared is None:
             return
-        if skill_locate.locate(project, scope, skill) is None:
-            found = skill_locate.locate(project, shared, skill)
-            if found is not None:
-                raise RuntimeError(
-                    f"the {role} session prompt names /{skill}, which resolves from "
-                    f"{found.root}, but a pre-session hook hid that root: "
-                    f"{self._hook_hid_cause(scope, found.root)} stops the CLI reading it. "
-                    "Install the skill in the project tree, or stop the hook from setting it"
-                )
-            return
-        if skill != self._dev_skill(role):
-            return
-        lost = sorted(
-            missing_review_skills(project, scope) - missing_review_skills(project, shared)
-        )
-        for reviewer in lost:
-            found = skill_locate.locate(project, shared, reviewer)
-            if found is None:
+        names = [skill]
+        if skill == self._dev_skill(role):
+            names += [n for n in review_skill_names(project, shared) if n != skill]
+        for name in dict.fromkeys(names):
+            before = skill_locate.locate(project, shared, name)
+            if before is None:
                 continue
+            after = skill_locate.locate(project, scope, name)
+            if after is not None and skill_locate.same_copy(before, after):
+                continue
+            needs = (
+                f"names /{skill}"
+                if name == skill
+                else f"names /{skill}, whose review step needs {name}"
+            )
+            if any(r.spelling == before.root and r.unavailable for r in scope.user_roots):
+                what = (
+                    "a pre-session hook hid that root: "
+                    f"{self._hook_hid_cause(scope, before.root)} stops the CLI reading it"
+                )
+            else:
+                what = "a pre-session hook's env changes which copy the CLI loads"
+            if after is not None:
+                what += f", so the session would load the copy in {after.root}, which no check read"
             raise RuntimeError(
-                f"the {role} session prompt names /{skill}, whose review step needs "
-                f"{reviewer}, which resolves from {found.root}, but a pre-session hook hid "
-                f"that root: {self._hook_hid_cause(scope, found.root)} stops the CLI reading "
-                "it. Install the skill in the project tree, or stop the hook from setting it"
+                f"the {role} session prompt {needs}, which resolves from {before.root}, "
+                f"but {what}. Install the "
+                "skill in the project tree (one copy only), or stop the hook from setting it"
             )
 
     @staticmethod
@@ -9665,7 +9670,7 @@ class Engine:
             skill_dir = skill_locate.prompt_skill_dir(project, scope, prompt)
             if scope.resolve_user:
                 prompt_skill, _ = skill_locate.prompt_skill(prompt)
-                self._refuse_hook_hidden_skill(role, project, scope, prompt_skill)
+                self._refuse_hook_changed_skill(role, project, scope, prompt_skill)
                 user_skill_ids = user_root_skill_ids(project, scope, prompt_skill)
                 for skill in user_skill_ids:
                     found = skill_locate.locate(project, scope, skill)
@@ -11066,7 +11071,7 @@ class Engine:
                     task,
                     site="defer",
                     message=(
-                        "chore(deferred-work): restore ledger after deferring " f"{task.story_key}"
+                        f"chore(deferred-work): restore ledger after deferring {task.story_key}"
                     ),
                 )
         self._record_defer(task, reason)

@@ -26,6 +26,7 @@ from bmad_loop.skill_locate import (
     locate,
     prompt_skill,
     prompt_skill_dir,
+    same_copy,
     scope_for,
     shadow,
 )
@@ -400,6 +401,56 @@ def test_home_copy_ignores_the_switch(layout):
     found = home_copy(_scope(home, resolve_user=False), SKILL)
     assert found is not None and found.display == f"~/.agents/skills/{SKILL}"
     assert home_copy(_scope(home, resolve_user=False), "absent") is None
+
+
+def _copy(folder: Path, files: dict[str, str]) -> Located:
+    for rel, text in files.items():
+        path = folder / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return Located(SKILL, folder, "user", "~/.agents/skills", False)
+
+
+_FILES = {"SKILL.md": "---\nname: x\n---\n", "steps/step-01.md": "do it\n"}
+
+
+@pytest.mark.parametrize(
+    ("other", "expected"),
+    [
+        (_FILES, True),
+        ({**_FILES, "steps/step-01.md": "do it differently\n"}, False),
+        ({**_FILES, "steps/step-02.md": "more\n"}, False),
+        ({"SKILL.md": _FILES["SKILL.md"]}, False),
+    ],
+    ids=["identical", "changed-bytes", "extra-file", "missing-file"],
+)
+def test_same_copy_compares_every_file(tmp_path, other, expected):
+    """Two copies are the same skill only with identical relative paths and bytes.
+
+    Ablation (performed): compare `SKILL.md` alone in `same_copy` and the
+    changed-bytes and extra-file rows FAIL."""
+    a = _copy(tmp_path / "a" / SKILL, _FILES)
+    b = _copy(tmp_path / "b" / SKILL, other)
+    assert same_copy(a, b) is expected
+    assert same_copy(b, a) is expected
+
+
+def test_same_copy_of_one_folder_and_of_a_redirect_to_it(tmp_path):
+    a = _copy(tmp_path / "a" / SKILL, _FILES)
+    link = tmp_path / "link"
+    _plant_directory_redirect(link, a.path)
+    assert same_copy(a, a)
+    assert same_copy(a, Located(SKILL, link, "user", "~/.claude/skills", False))
+
+
+def test_same_copy_refuses_an_oversized_or_missing_folder(tmp_path, monkeypatch):
+    a = _copy(tmp_path / "a" / SKILL, _FILES)
+    b = _copy(tmp_path / "b" / SKILL, _FILES)
+    monkeypatch.setattr(skill_locate, "SAME_COPY_MAX_FILES", 1)
+    assert not same_copy(a, b)
+    monkeypatch.setattr(skill_locate, "SAME_COPY_MAX_FILES", 512)
+    gone = Located(SKILL, tmp_path / "gone" / SKILL, "user", "~/.agents/skills", False)
+    assert not same_copy(a, gone)
 
 
 @pytest.mark.parametrize(
