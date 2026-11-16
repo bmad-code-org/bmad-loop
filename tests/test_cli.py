@@ -29273,29 +29273,33 @@ def _user_root_report(project, policy_text, home_tree, monkeypatch, tmp_path, ve
     return {f.check: f for f in report.findings}
 
 
+@pytest.mark.parametrize("name", ["opencode", "opencode-http"], ids=["alias", "canonical"])
 @pytest.mark.parametrize(
     ("text", "warned"), [("1.19.0", True), ("opencode v2.0.27", False)], ids=["v1", "v2"]
 )
-def test_user_roots_opencode_v1_warns(project, monkeypatch, tmp_path, text, warned):
+def test_user_roots_opencode_v1_warns(project, monkeypatch, tmp_path, text, warned, name):
     """opencode 1.x cannot load a user-root skill (its spawn refuses), so validate
-    warns; 2.x allows it. The version is the one `_check_opencode_version` parsed.
+    warns; 2.x allows it. The version is the one `_check_opencode_version` parsed,
+    keyed by the canonical profile name the way `cmd_validate` stores it — so a
+    policy spelling the `opencode` alias still finds it.
 
-    Ablation (performed): drop the `version[0] < 2` branch and the v1 row FAILS."""
+    Ablation (performed): drop the `version[0] < 2` branch and both v1 rows FAIL;
+    look the version up by the policy name and the alias v1 row FAILS."""
     from bmad_loop.checks import ValidationReport
 
     monkeypatch.setattr(probe_mod, "binary_version_text", lambda *_a, **_kw: text)
     version = cli._check_opencode_version(ValidationReport(), "opencode", "/usr/bin/opencode")
     findings = _user_root_report(
         project,
-        OPENCODE_QUALIFIED_POLICY + USER_ROOTS_ON,
+        OPENCODE_QUALIFIED_POLICY.replace('"opencode"', f'"{name}"') + USER_ROOTS_ON,
         ".config/opencode/skills",
         monkeypatch,
         tmp_path,
-        {"opencode": version},
+        {"opencode-http": version},
     )
     if warned:
         detail = findings["skills.user-root-unsupported"].detail
-        assert (detail["profile"], detail["version"]) == ("opencode", "1.19.0")
+        assert (detail["profile"], detail["version"]) == (name, "1.19.0")
         assert "bmad-build-auto" in detail["skills"]
     else:
         assert "skills.user-root-unsupported" not in findings

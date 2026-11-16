@@ -208,12 +208,16 @@ def scope_for(
     resolve_user: bool,
     home: Path | None | Literal[_Default.SEAM] = _SEAM,
     environ: Mapping[str, str] | None = None,
+    session_env: Mapping[str, str] | None = None,
 ) -> SkillScope:
     """The scope ``profile``'s sessions load skills from.
 
     The disabler environment is ``environ`` (default :func:`ambient_environ`)
     overlaid with the profile's own ``env``, which every session is launched
-    with."""
+    with, then ``session_env`` — one session's own env after its plugin hooks,
+    in the adapters' launch order. Without it the scope is the one every
+    session of the profile shares, which a ``pre_session`` hook setting a
+    disabler (an account-rotation ``CLAUDE_CONFIG_DIR``) can still narrow."""
     base = ambient_environ() if environ is None else environ
     return build_scope(
         profile.skill_tree,
@@ -221,7 +225,7 @@ def scope_for(
         user_skills=profile.user_skills,
         resolve_user=resolve_user,
         home=home,
-        environ={**base, **profile.env},
+        environ={**base, **profile.env, **(session_env or {})},
     )
 
 

@@ -472,11 +472,11 @@ roots = [
 ]
 ```
 
-| Key           | Default     | Meaning                                                                                                                                                                                                                                                           |
-| ------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `precedence`  | `"project"` | Which copy the CLI runs when the project and a user root both hold one: `project` (the project's), `user` (the user root's; validate and the run check that copy) or `unordered` (both load in no documented order; bmad-loop checks the project copy and warns). |
-| `roots`       | `[]`        | The user roots, in the order the CLI reads them. Each is a `"~/..."` string or a `{ path = "~/...", disabled_by = [...] }` table. A path must start with `~/` and stay inside the home folder; duplicate roots are refused.                                       |
-| `disabled_by` | `[]`        | Environment variables that make the CLI skip this root when set (even to an empty value), such as a variable that moves the CLI's config home. Read from bmad-loop's environment plus the profile's `[env]`.                                                      |
+| Key           | Default     | Meaning                                                                                                                                                                                                                                                                          |
+| ------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `precedence`  | `"project"` | Which copy the CLI runs when the project and a user root both hold one: `project` (the project's), `user` (the user root's; validate and the run check that copy) or `unordered` (both load in no documented order; bmad-loop checks the project copy and warns).                |
+| `roots`       | `[]`        | The user roots, in the order the CLI reads them. Each is a `"~/..."` string or a `{ path = "~/...", disabled_by = [...] }` table. A path must start with `~/` and stay inside the home folder; duplicate roots are refused.                                                      |
+| `disabled_by` | `[]`        | Environment variables that make the CLI skip this root when set (even to an empty value), such as a variable that moves the CLI's config home. Read from bmad-loop's environment plus the profile's `[env]`; at session dispatch, also the env a `pre_session` plugin hook sets. |
 
 Declare only folders the CLI loads natively, as its own docs describe them. `validate` passes
 a skill found in a declared root, so a root the CLI does not read gives a green `validate`

@@ -25228,6 +25228,53 @@ def test_session_spec_carries_the_user_root_skill_dir_and_journals_it(
     assert row["version"] == "7.2.0"
 
 
+@pytest.mark.parametrize("hook_disables", [False, True], ids=["ambient", "hook-set"])
+def test_session_user_roots_resolve_against_the_post_hook_env(
+    project, monkeypatch, tmp_path, hook_disables
+):
+    """A `pre_session` hook that sets a root's disabler (an account rotation's
+    CLAUDE_CONFIG_DIR; here codex's CODEX_HOME over `~/.codex/skills`) hides that
+    root from the launched CLI, so dispatch resolves against the post-hook env:
+    no `skill_dir`, no ids, no `skill-user-root` row. Without the hook the same
+    install resolves.
+
+    Ablation (performed): drop `env` from the `_skill_scope` call at the
+    `SessionSpec` construction and the hook-set row FAILS."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import skill_locate
+
+    home = tmp_path / "home"
+    folder = install_build_auto_skill(home, ".codex/skills") / "bmad-build-auto"
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    engine, adapter = make_engine(
+        project, [SessionResult(status="completed")], policy=_user_root_policy(True)
+    )
+    attach_profile(adapter, "codex")
+    real_gate = engine._emit_session_gate
+
+    def gate(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        if hook_disables:
+            env = {**env, "CODEX_HOME": str(tmp_path / "rotated")}
+        return prompt, env, ctx
+
+    monkeypatch.setattr(engine, "_emit_session_gate", gate)
+
+    engine._run_session(_prompt_task(), role="dev", prompt="/bmad-build-auto 1-1-a", seq=1)
+
+    (spec,) = adapter.sessions
+    rows = [e for e in engine.journal.entries() if e["kind"] == "skill-user-root"]
+    if hook_disables:
+        assert spec.skill_dir is None
+        assert spec.user_skill_ids == ()
+        assert rows == []
+    else:
+        assert spec.skill_dir == str(folder)
+        assert "bmad-build-auto" in spec.user_skill_ids
+        assert {r["root"] for r in rows} == {"~/.codex/skills"}
+
+
 def test_session_spec_has_no_user_root_skills_with_the_switch_off(project, monkeypatch, tmp_path):
     """Switch off: the same global-only install contributes nothing — no
     `skill_dir` (the project-tree miss keeps the renderer's relative default), no

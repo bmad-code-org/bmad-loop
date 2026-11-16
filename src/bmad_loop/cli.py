@@ -2368,11 +2368,17 @@ def _report_skill_roots(
             continue
         for name in names:
             try:
-                kind = get_profile(name, project).adapter
+                profile = get_profile(name, project)
             except ProfileError:
                 continue
-            version = opencode_versions.get(name)
-            if kind == adapter_registry.OPENCODE_HTTP and version is not None and version[0] < 2:
+            # Keyed by the loaded profile's canonical name: a policy alias
+            # (`opencode` → `opencode-http`) is what `names` carries.
+            version = opencode_versions.get(profile.name)
+            if (
+                profile.adapter == adapter_registry.OPENCODE_HTTP
+                and version is not None
+                and version[0] < 2
+            ):
                 shown = ".".join(str(part) for part in version)
                 report.warn(
                     "skills.user-root-unsupported",

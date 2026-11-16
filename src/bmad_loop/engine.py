@@ -23,7 +23,16 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from stat import S_ISREG
-from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NoReturn, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Literal,
+    Mapping,
+    NamedTuple,
+    NoReturn,
+    Protocol,
+    Sequence,
+)
 
 from . import (
     artifact_publication,
@@ -5605,15 +5614,21 @@ class Engine:
             self._dev_skill_cache[project, scope] = dev_primitive_or_default(project, scope)
         return self._dev_skill_cache[project, scope]
 
-    def _skill_scope(self, role: str) -> skill_locate.SkillScope | None:
+    def _skill_scope(
+        self, role: str, session_env: Mapping[str, str] | None = None
+    ) -> skill_locate.SkillScope | None:
         """The skill scope ``role``'s sessions load skills from: its profile's
         primary and extra trees, plus the profile's declared user roots — resolved
-        only under ``[skills] user_roots`` (#770). None for an adapter with no
-        ``profile`` (test fakes), which every caller reads as "nothing to locate"."""
+        only under ``[skills] user_roots`` (#770). ``session_env`` is one
+        session's post-hook env, whose user-root disablers count too. None for an
+        adapter with no ``profile`` (test fakes), which every caller reads as
+        "nothing to locate"."""
         profile = getattr(self.adapters.get(role), "profile", None)
         if profile is None:
             return None
-        return skill_locate.scope_for(profile, resolve_user=self.policy.skills.user_roots)
+        return skill_locate.scope_for(
+            profile, resolve_user=self.policy.skills.user_roots, session_env=session_env
+        )
 
     def _operator_park_enabled(self) -> bool:
         """Whether a dev session may park a story at ``awaiting-operator`` (#335).
@@ -9568,11 +9583,14 @@ class Engine:
         # the `{skill_dir}` a profile template spells, and — only under
         # `[skills] user_roots` — the module skill ids the CLI loads from a user
         # root, each journaled so the run records which skills came from outside
-        # the project.
+        # the project. Resolved against the post-hook `env` the session launches
+        # with: a `pre_session` plugin that sets a root's disabler (an account
+        # rotation's CLAUDE_CONFIG_DIR) hides that root from the CLI, so it is
+        # hidden here too.
         skill_dir: str | None = None
         user_skill_ids: tuple[str, ...] = ()
         user_skill_rows: list[tuple[str, str, str | None]] = []
-        scope = self._skill_scope(role)
+        scope = self._skill_scope(role, env)
         if scope is not None:
             project = self.workspace.paths.project
             skill_dir = skill_locate.prompt_skill_dir(project, scope, prompt)
