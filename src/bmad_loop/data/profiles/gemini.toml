@@ -24,3 +24,19 @@ GEMINI_CLI_TRUST_WORKSPACE = "true"
 dialect = "gemini-settings-json"
 config_path = ".gemini/settings.json"
 events = { SessionStart = "SessionStart", AfterAgent = "Stop", SessionEnd = "SessionEnd" }
+
+# The home-relative skill folders Gemini CLI loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). Workspace skills
+# beat user skills, and ~/.agents/skills beats ~/.gemini/skills; GEMINI_CLI_HOME
+# moves both away from the home directory.
+# Source: https://geminicli.com/docs/cli/skills/ (2026-11-15).
+[user_skills]
+precedence = "project"
+roots = [
+  { path = "~/.agents/skills", disabled_by = [
+    "GEMINI_CLI_HOME",
+  ] },
+  { path = "~/.gemini/skills", disabled_by = [
+    "GEMINI_CLI_HOME",
+  ] },
+]

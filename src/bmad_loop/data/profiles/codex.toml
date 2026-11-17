@@ -65,3 +65,17 @@ linked_worktree_args = [
   "-c",
   'default_permissions="bmad_loop_worktree"',
 ]
+
+# The home-relative skill folders Codex loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). ~/.agents/skills and
+# the deprecated $CODEX_HOME/skills both load, with no stated order on a name
+# clash; CODEX_HOME moves the second away from ~/.codex.
+# Source: https://learn.chatgpt.com/docs/build-skills (2026-11-15).
+[user_skills]
+precedence = "unordered"
+roots = [
+  "~/.agents/skills",
+  { path = "~/.codex/skills", disabled_by = [
+    "CODEX_HOME",
+  ] },
+]

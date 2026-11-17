@@ -130,6 +130,20 @@ VALIDATE_CHECKS: frozenset[str] = frozenset(
         "skills.base-missing",
         "skills.base-incomplete",
         "skills.base-shim",
+        # a skill tree (or a required skill in one) linked out of the project/repo
+        "skills.tree-outside",
+        # where each driven skill resolved: a project tree or a user root (validate only)
+        "skills.root",
+        # a project skill a user-root copy may override or compete with at run time
+        "skills.user-shadow",
+        # a declared user root that cannot resolve (disabler set, no home, unreadable)
+        "skills.user-root-unavailable",
+        # user-root and project bmod-method records name different BMAD-METHOD versions
+        "skills.user-root-version-skew",
+        # an opencode 1.x server while a needed skill resolves from a user root
+        "skills.user-root-unsupported",
+        # a sandboxed role whose skills resolve from a user root outside the project
+        "skills.user-root-sandboxed",
         "skills.customize-legacy",
         "skills.dev-renderer",
         "skills.dev-renderer-config",

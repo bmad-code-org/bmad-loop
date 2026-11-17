@@ -104,7 +104,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
-from . import deferredwork, gates, ticketlayout, ticketstore, verify
+from . import deferredwork, gates, skill_locate, ticketlayout, ticketstore, verify
 from .adapters.base import SessionResult, SpecSnapshot
 from .checkpoints import CheckpointFlags, CheckpointFlowMixin
 from .engine import (
@@ -866,9 +866,13 @@ class TicketsEngine(CheckpointFlowMixin, Engine):
         if not clean:
             self._skip_auto_retro(0, "dirty", epic_ref=slug)
             self._pause_retro_refused(slug, "the tree has uncommitted changes")
-        adapter = self.adapters["retro"]
-        tree = getattr(getattr(adapter, "profile", None), "skill_tree", None)
-        if tree and not (self.workspace.paths.project / tree / RETRO_SKILL / "SKILL.md").is_file():
+        # The copy the retro CLI loads (#770): a user-root install counts under
+        # `[skills] user_roots`; an adapter with no profile is not probed.
+        scope = self._skill_scope("retro")
+        if (
+            scope is not None
+            and skill_locate.locate(self.workspace.paths.project, scope, RETRO_SKILL) is None
+        ):
             self._skip_auto_retro(0, "skill-missing", epic_ref=slug)
             return RETRO_VERDICT_UNKNOWN
 

@@ -579,6 +579,16 @@ label = "review may park a done story"
 description = "escalate: a review pass is never offered the park, and one that finalizes a done story at awaiting-operator is not accepted (default) · park: the review may demote it — the board moves done -> awaiting-operator, the story commits and parks · sprint mode with parks enabled only"
 
 [[section]]
+name = "skills"
+description = "where skills are resolved from"
+[[section.field]]
+key = "user_roots"
+kind = "switch"
+default_ref = "SkillsPolicy.user_roots"
+label = "user-level skill folders"
+description = "ON: a skill missing from the project's skill trees may resolve from the user-level folders the coding CLI loads on its own (its profile's [user_skills] roots, e.g. ~/.agents/skills after `npx skills add -g`); when both hold a copy, the profile's precedence picks, so a precedence = \"user\" CLI (claude) runs the user copy over the project's · OFF (default): the project's skill trees only"
+
+[[section]]
 name = "mux"
 description = "terminal-multiplexer backend (machine-specific — policy.toml is gitignored)"
 # options are injected at build-registry time from detect_multiplexers() (plus any

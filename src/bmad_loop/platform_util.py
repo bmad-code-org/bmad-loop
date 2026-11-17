@@ -295,6 +295,20 @@ def names_win32_alias(value: str | Path) -> bool:
     )
 
 
+def names_home_ref(value: str | Path) -> bool:
+    """True if ``value``'s first component starts with ``~`` — ``~``, ``~/x``,
+    ``~\\x`` or ``~user/x``.
+
+    Nothing that resolves a profile path expands ``~``: ``<project>/~/x`` is a
+    literal directory named ``~`` inside the project, so a value spelled this way
+    passes every containment guard while meaning something the author did not
+    intend. Only the FIRST component counts, split on both separators like the
+    rest of the family — ``PROGRA~1/x`` (a Win32 short name) and ``a/~b`` are
+    ordinary names and stay allowed."""
+    parts = [part for part in str(value).replace("\\", "/").split("/") if part]
+    return bool(parts) and parts[0].startswith("~")
+
+
 def is_wsl_unc_path(value: str | Path) -> bool:
     """True if ``value`` addresses a WSL distro's filesystem through the Windows UNC
     bridge — ``\\\\wsl.localhost\\<distro>\\...`` or its legacy ``\\\\wsl$\\<distro>\\...``

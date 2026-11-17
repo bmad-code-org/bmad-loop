@@ -270,6 +270,14 @@ Stories that owe external, human-only actions.
 | `enabled` | boolean | `true` |  | let a session finish + commit a story whose acceptance criteria need a human action (buy a domain, publish a DNS record) and park it as awaiting-operator instead of forcing done or blocked · what is owed is recorded in the story spec's operator_actions: frontmatter, and `bmad-loop confirm <story-key>` completes the story once you have done it |
 | `on_review_demotion` | string | `"escalate"` | `escalate` / `park` | escalate: a review pass is never offered the park, and one that finalizes a done story at awaiting-operator is not accepted (default) · park: the review may demote it — the board moves done -&gt; awaiting-operator, the story commits and parks · sprint mode with parks enabled only |
 
+### `[skills]`
+
+Where skills are resolved from.
+
+| Key | Type | Default | Allowed | Description |
+| --- | --- | --- | --- | --- |
+| `user_roots` | boolean | `false` |  | ON: a skill missing from the project's skill trees may resolve from the user-level folders the coding CLI loads on its own (its profile's [user_skills] roots, e.g. ~/.agents/skills after `npx skills add -g`); when both hold a copy, the profile's precedence picks, so a precedence = "user" CLI (claude) runs the user copy over the project's · OFF (default): the project's skill trees only |
+
 ### `[mux]`
 
 Terminal-multiplexer backend (machine-specific — policy.toml is gitignored).
@@ -281,3 +289,18 @@ Terminal-multiplexer backend (machine-specific — policy.toml is gitignored).
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: policy-reference -->
+
+## Skill resolution: `[skills] user_roots`
+
+Off (the default), every skill a run drives must be in one of the project's skill trees: each profile's `skill_tree`, plus its `extra_skill_trees` (opencode-http also reads `.agents/skills`).
+
+On, a skill the project trees lack, or one a CLI with `user` precedence (claude) runs from its personal folder instead, resolves from the user-level folders that CLI loads on its own, as its profile's `[user_skills]` table declares them. `validate`, the run preflight, `run --dry-run`, session dispatch and worktree seeding all use the same resolution, so `validate` checks the copy the session will load. A CLI with no `[user_skills]` table never resolves from a user root.
+
+What changes with the switch on:
+
+- `validate` lists where each driven skill was found (`skills.root`, `detail.origin` is `project` or `user`), and `run --dry-run` prints a `note:` line for each skill from a user root.
+- Each session journals one `skill-user-root` entry per skill it loads from a user root.
+- opencode-http 2.x allows those BMAD skills through its permission rules; 1.x cannot load them, so `validate` warns (`skills.user-root-unsupported`) and the session refuses to start.
+- A dev or review stage with `permission_mode = "sandboxed"` that loads a user-root skill gets a `skills.user-root-sandboxed` warning: the sandbox may not let the CLI read your home folder.
+
+`skills.user-shadow` is reported with the switch off too: claude's user copy overriding the project's warns only with the switch off (on, it is the copy resolved), and a codex or antigravity clash warns either way. Per-CLI roots, precedence and the fresh-clone guidance are in the [setup guide](../setup-guide.md#project-skills-and-user-level-skill-roots); the profile keys are in the [adapter authoring guide](../adapter-authoring-guide.md#user-level-skill-roots).

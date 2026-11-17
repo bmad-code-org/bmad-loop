@@ -20,6 +20,7 @@ from bmad_loop.adapters.profile import (
     load_profiles,
     parse_cli_version,
 )
+from bmad_loop.skill_locate import UserSkillRoot, UserSkillsSpec
 
 MINIMAL_PROFILE = """
 name = "mycli"
@@ -1181,6 +1182,30 @@ def test_render_prompt_passthrough_and_template():
     assert claude.render_prompt("just do it") == "just do it"
 
 
+def test_render_prompt_skill_dir_default_is_the_pre_placeholder_text():
+    """copilot's `{skill_dir}` defaults to `<skill_tree>/<skill>`, so a spec with no
+    located folder renders byte-identically to the pre-placeholder template —
+    including the `.agents/skills//SKILL.md` spelling of a slashless prompt — and
+    a given `skill_dir` substitutes. Ablation: default `skill_dir` to `""` (or drop
+    the default) and the byte-identity rows FAIL."""
+    copilot = get_profile("copilot")
+    tail = (
+        ", read its entire contents and follow its directions exactly, using subagents as needed: "
+    )
+    assert copilot.render_prompt("/bmad-dev-auto 1-1-a") == (
+        f"LOAD the FULL .agents/skills/bmad-dev-auto/SKILL.md{tail}1-1-a"
+    )
+    assert copilot.render_prompt("just do it") == (
+        f"LOAD the FULL .agents/skills//SKILL.md{tail}just do it"
+    )
+    assert copilot.render_prompt("/bmad-dev-auto 1-1-a", skill_dir="/home/u/.agents/skills/x") == (
+        f"LOAD the FULL /home/u/.agents/skills/x/SKILL.md{tail}1-1-a"
+    )
+    # a template without the placeholder ignores it
+    claude = get_profile("claude")
+    assert claude.render_prompt("/bmad-dev-auto 1-1-a", skill_dir="/x") == "/bmad-dev-auto 1-1-a"
+
+
 _BYPASS = ("--permission-mode", "bypassPermissions")
 
 
@@ -1491,6 +1516,24 @@ def test_user_profile_overlay(tmp_path):
         (
             MINIMAL_PROFILE.replace("[hooks]", 'parked_prompt_patterns = "Enter"\n[hooks]'),
             "parked_prompt_patterns must be a list of strings",
+        ),
+        # a leading `~` is never expanded: each field resolves it to a literal
+        # `<project>/~/...` directory, so it is refused with its own message (#770)
+        (
+            MINIMAL_PROFILE.replace("[hooks]", 'skill_tree = "~/.agents/skills"\n[hooks]'),
+            "skill_tree must not start with '~': a leading '~' is not expanded",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                'config_path = ".mycli/settings.json"', 'config_path = "~/.mycli/settings.json"'
+            ),
+            "hooks.config_path must not start with '~': a leading '~' is not expanded",
+        ),
+        (
+            MINIMAL_PROFILE.replace(
+                "[hooks]", 'seed_files = [".mcp.json", "~/.mcp.json"]\n[hooks]'
+            ),
+            "seed_files entries must not start with '~': a leading '~' is not expanded",
         ),
     ],
 )
@@ -1906,6 +1949,13 @@ def test_profile_scan_failure_degrades(profile_scan):
         ({"seed_files": ("/etc/passwd",)}, "seed_files"),
         ({"seed_files": (".",)}, "seed_files"),
         ({"hooks": HookSpec("claude-settings-json", "..", {"Stop": "Stop"})}, "relative"),
+        # a leading `~` is not expanded (#770)
+        ({"skill_tree": "~/.agents/skills"}, "skill_tree must not start with '~'"),
+        ({"seed_files": ("~/.mcp.json",)}, "seed_files entries must not start with '~'"),
+        (
+            {"hooks": HookSpec("claude-settings-json", "~\\.m\\s.json", {"Stop": "Stop"})},
+            "hooks.config_path must not start with '~'",
+        ),
         # a real dialect with nothing to write to
         ({"hooks": HookSpec("claude-settings-json", "", {"Stop": "Stop"})}, "config_path"),
         # hookless carrying hook plumbing is a contradiction either way in
@@ -2148,3 +2198,325 @@ def test_workspace_trust_value_rejections_on_both_routes(tmp_path, settings_path
     )
     with pytest.raises(ProfileError, match="workspace_trust"):
         profile_mod._validate_profile(constructed, "entry point test")
+
+
+# ------------------------------------- [user_skills] + extra_skill_trees (#770)
+
+
+def _toml_str(value: str) -> str:
+    # a TOML basic string; json.dumps escapes exactly what TOML needs here
+    return json.dumps(value)
+
+
+def _user_skills_table(spec: UserSkillsSpec) -> str:
+    roots = ", ".join(
+        "{ path = %s, disabled_by = [%s] }"
+        % (_toml_str(r.path), ", ".join(_toml_str(v) for v in r.disabled_by))
+        for r in spec.roots
+    )
+    return f"\n[user_skills]\nprecedence = {_toml_str(spec.precedence)}\nroots = [{roots}]\n"
+
+
+def _write_mycli(tmp_path: Path, text: str) -> Path:
+    profiles_dir = tmp_path / ".bmad-loop" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / "mycli.toml").write_text(text, encoding="utf-8")
+    return tmp_path
+
+
+def _assert_entry_point_refused(profile_scan, match: str, **over) -> None:
+    profile_scan(_FakeEntryPoint("acme", lambda: [_plugin_profile(**over)]))
+    profiles = load_profiles()
+    assert "acme" not in profiles, "an invalid profile must never reach the map"
+    assert match in profile_mod.external_profile_errors()["acme"]
+
+
+def test_default_profile_declares_no_extra_trees_and_no_user_skills(tmp_path):
+    """Off by default on every route that does not opt in: a constructed profile
+    (entry point) and a TOML overlay that omits both keys."""
+    constructed = CLIProfile(name="x", binary="x", hooks=HookSpec("none", "", {}))
+    assert constructed.extra_skill_trees == ()
+    assert constructed.user_skills is None
+    overlay = load_profiles(_write_mycli(tmp_path, MINIMAL_PROFILE))["mycli"]
+    assert overlay.extra_skill_trees == ()
+    assert overlay.user_skills is None
+
+
+_PACKAGED_USER_SKILLS = {
+    "claude": UserSkillsSpec("user", (UserSkillRoot("~/.claude/skills", ("CLAUDE_CONFIG_DIR",)),)),
+    "codex": UserSkillsSpec(
+        "unordered",
+        (UserSkillRoot("~/.agents/skills"), UserSkillRoot("~/.codex/skills", ("CODEX_HOME",))),
+    ),
+    "gemini": UserSkillsSpec(
+        "project",
+        (
+            UserSkillRoot("~/.agents/skills", ("GEMINI_CLI_HOME",)),
+            UserSkillRoot("~/.gemini/skills", ("GEMINI_CLI_HOME",)),
+        ),
+    ),
+    "antigravity": UserSkillsSpec("unordered", (UserSkillRoot("~/.gemini/config/skills"),)),
+    "copilot": UserSkillsSpec(
+        "project",
+        (
+            UserSkillRoot("~/.copilot/skills", ("COPILOT_HOME",)),
+            UserSkillRoot("~/.agents/skills", ("COPILOT_HOME",)),
+        ),
+    ),
+    "opencode-http": UserSkillsSpec(
+        "project",
+        (
+            UserSkillRoot("~/.config/opencode/skills", ("XDG_CONFIG_HOME",)),
+            UserSkillRoot("~/.agents/skills"),
+            UserSkillRoot("~/.claude/skills"),
+        ),
+    ),
+}
+
+
+def test_packaged_profiles_declare_their_user_skill_roots():
+    """Every shipped profile parses to exactly its documented `[user_skills]`
+    spec — order matters (it is the CLI's read order) — and only opencode-http
+    declares an extra project skill tree (`.agents/skills`, where the skills
+    CLI installs opencode's project skills)."""
+    packaged = {
+        tomllib.loads(entry.read_text(encoding="utf-8"))["name"]
+        for entry in resources.files("bmad_loop.data").joinpath("profiles").iterdir()
+        if entry.name.endswith(".toml")
+    }
+    # the map covers every shipped profile, so a new one must state its roots here
+    assert packaged == set(_PACKAGED_USER_SKILLS)
+    profiles = load_profiles()
+    assert {name: profiles[name].user_skills for name in packaged} == _PACKAGED_USER_SKILLS
+    extra = {"opencode-http": (".agents/skills",)}
+    for name in packaged:
+        assert profiles[name].extra_skill_trees == extra.get(name, ()), name
+
+
+def test_user_skills_parses_string_and_table_roots(tmp_path):
+    table = (
+        "\n[user_skills]\n"
+        'precedence = "unordered"\n'
+        'roots = ["~/.mycli/skills", { path = "~/.agents/skills", disabled_by = ["MYCLI_HOME"] }]\n'
+    )
+    spec = load_profiles(_write_mycli(tmp_path, MINIMAL_PROFILE + table))["mycli"].user_skills
+    assert spec == UserSkillsSpec(
+        "unordered",
+        (UserSkillRoot("~/.mycli/skills"), UserSkillRoot("~/.agents/skills", ("MYCLI_HOME",))),
+    )
+
+
+def test_user_skills_empty_table_takes_the_defaults(tmp_path):
+    spec = load_profiles(_write_mycli(tmp_path, MINIMAL_PROFILE + "\n[user_skills]\n"))[
+        "mycli"
+    ].user_skills
+    assert spec == UserSkillsSpec(precedence="project", roots=())
+
+
+@pytest.mark.parametrize("precedence", sorted({"project", "user", "unordered"}))
+def test_user_skills_accepts_every_precedence_on_both_routes(tmp_path, profile_scan, precedence):
+    spec = UserSkillsSpec(precedence, (UserSkillRoot("~/.mycli/skills", ("MYCLI_HOME",)),))
+    project = _write_mycli(tmp_path, MINIMAL_PROFILE + _user_skills_table(spec))
+    assert load_profiles(project)["mycli"].user_skills == spec
+    profile_scan(_FakeEntryPoint("acme", lambda: [_plugin_profile(user_skills=spec)]))
+    assert load_profiles()["acme"].user_skills == spec
+    assert profile_mod.external_profile_errors() == {}
+
+
+@pytest.mark.parametrize(
+    ("table", "match"),
+    [
+        pytest.param('user_skills = "~/.x"\n', "user_skills must be a table", id="not-a-table"),
+        pytest.param(
+            '\n[user_skills]\norder = "user"\n',
+            "user_skills has unknown keys: ['order']",
+            id="unknown-key",
+        ),
+        pytest.param(
+            "\n[user_skills]\nprecedence = 1\n",
+            "user_skills.precedence must be a string",
+            id="precedence-not-str",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = "~/.x"\n',
+            "user_skills.roots must be a list",
+            id="roots-not-list",
+        ),
+        pytest.param(
+            "\n[user_skills]\nroots = [3]\n",
+            "user_skills.roots entries must be",
+            id="root-not-str-or-table",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [["~/.x"]]\n',
+            "user_skills.roots entries must be",
+            id="root-is-a-list",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [{ path = "~/.x", disable = ["A"] }]\n',
+            "user_skills.roots entry has unknown keys: ['disable']",
+            id="root-unknown-key",
+        ),
+        pytest.param(
+            "\n[user_skills]\nroots = [{ path = 3 }]\n",
+            "user_skills.roots entry path must be a string",
+            id="root-path-not-str",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [{ disabled_by = ["A"] }]\n',
+            "user_skills.roots entry path must be a string",
+            id="root-path-missing",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [{ path = "~/.x", disabled_by = "A" }]\n',
+            "user_skills.roots entry disabled_by must be a list of strings",
+            id="disabled-by-not-list",
+        ),
+        pytest.param(
+            '\n[user_skills]\nroots = [{ path = "~/.x", disabled_by = [1] }]\n',
+            "user_skills.roots entry disabled_by must be a list of strings",
+            id="disabled-by-entry-not-str",
+        ),
+    ],
+)
+def test_user_skills_shape_rejections(tmp_path, table, match):
+    """Shape is the TOML parser's job only — a constructed `UserSkillsSpec` has
+    no shape left to parse — so these rows have no entry-point twin."""
+    # a bare `user_skills = ...` must sit above [hooks] to be top-level
+    text = table + MINIMAL_PROFILE if not table.startswith("\n") else MINIMAL_PROFILE + table
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(_write_mycli(tmp_path, text))
+
+
+_PRECEDENCE_ERR = "user_skills.precedence must be one of"
+_ROOT_ERR = "user_skills root path must be a '~/'-prefixed path inside the home directory"
+_ROOT_ALIAS_ERR = "user_skills root path must not name a Windows device"
+_VAR_ERR = "user_skills root disabled_by entries must be environment variable names"
+_DUP_ERR = "user_skills has duplicate roots"
+
+
+@pytest.mark.parametrize(
+    ("precedence", "roots", "match"),
+    [
+        pytest.param("first", (), _PRECEDENCE_ERR, id="precedence-unknown"),
+        pytest.param("User", (), _PRECEDENCE_ERR, id="precedence-case"),
+        pytest.param("", (), _PRECEDENCE_ERR, id="precedence-empty"),
+        pytest.param("project", (UserSkillRoot(".claude/skills"),), _ROOT_ERR, id="not-home"),
+        pytest.param("project", (UserSkillRoot("/etc/skills"),), _ROOT_ERR, id="absolute"),
+        pytest.param("project", (UserSkillRoot("~skills"),), _ROOT_ERR, id="tilde-no-slash"),
+        pytest.param("project", (UserSkillRoot("~"),), _ROOT_ERR, id="tilde-alone"),
+        pytest.param("project", (UserSkillRoot("~/"),), _ROOT_ERR, id="home-itself"),
+        pytest.param("project", (UserSkillRoot("~/."),), _ROOT_ERR, id="home-dot"),
+        pytest.param("project", (UserSkillRoot("~//etc"),), _ROOT_ERR, id="smuggled-abs"),
+        pytest.param("project", (UserSkillRoot("~/C:/x"),), _ROOT_ERR, id="smuggled-drive"),
+        pytest.param("project", (UserSkillRoot("~/../x"),), _ROOT_ERR, id="parent-climb"),
+        pytest.param(
+            "project", (UserSkillRoot("~/.claude/../../x"),), _ROOT_ERR, id="nested-climb"
+        ),
+        pytest.param(
+            "project", (UserSkillRoot("~\\.claude\\skills"),), _ROOT_ERR, id="backslash-prefix"
+        ),
+        pytest.param(
+            "project", (UserSkillRoot("~/NUL/skills"),), _ROOT_ALIAS_ERR, id="win32-device"
+        ),
+        pytest.param(
+            "project", (UserSkillRoot("~/.claude/skills."),), _ROOT_ALIAS_ERR, id="win32-trim"
+        ),
+        pytest.param(
+            "project", (UserSkillRoot("~/.x", ("1X",)),), _VAR_ERR, id="var-leading-digit"
+        ),
+        pytest.param("project", (UserSkillRoot("~/.x", ("A-B",)),), _VAR_ERR, id="var-dash"),
+        pytest.param("project", (UserSkillRoot("~/.x", ("",)),), _VAR_ERR, id="var-empty"),
+        pytest.param("project", (UserSkillRoot("~/.x", ("$HOME",)),), _VAR_ERR, id="var-sigil"),
+        pytest.param(
+            "project", (UserSkillRoot("~/.x", ("OK", "A B")),), _VAR_ERR, id="var-space-second"
+        ),
+        pytest.param(
+            "project",
+            (UserSkillRoot("~/a/b"), UserSkillRoot("~/a/b")),
+            _DUP_ERR,
+            id="dup-exact",
+        ),
+        pytest.param(
+            "project",
+            (UserSkillRoot("~/a/b"), UserSkillRoot("~/a//b/")),
+            _DUP_ERR,
+            id="dup-spelling",
+        ),
+        pytest.param(
+            "project",
+            (UserSkillRoot("~/a/b", ("X",)), UserSkillRoot("~/./a/b", ("Y",))),
+            _DUP_ERR,
+            id="dup-other-disabler",
+        ),
+    ],
+)
+def test_user_skills_value_rejections_on_both_routes(
+    tmp_path, profile_scan, precedence, roots, match
+):
+    """Value rules live in `_validate_profile`, so the TOML route and the
+    entry-point (constructed dataclass) route refuse the same set.
+
+    ABLATION (run when written): deleting the precedence, the disabled_by name or
+    the duplicate-root guard in `_validate_profile` reddens every one of its rows
+    (the TOML half trips first; the entry-point half shares the same guard)."""
+    spec = UserSkillsSpec(precedence=precedence, roots=roots)
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(_write_mycli(tmp_path, MINIMAL_PROFILE + _user_skills_table(spec)))
+    _assert_entry_point_refused(profile_scan, match, user_skills=spec)
+
+
+def test_extra_skill_trees_parse_on_both_routes(tmp_path, profile_scan):
+    text = MINIMAL_PROFILE.replace("[hooks]", 'extra_skill_trees = [".agents/skills"]\n[hooks]')
+    assert load_profiles(_write_mycli(tmp_path, text))["mycli"].extra_skill_trees == (
+        ".agents/skills",
+    )
+    profile_scan(
+        _FakeEntryPoint("acme", lambda: [_plugin_profile(extra_skill_trees=(".agents/skills",))])
+    )
+    assert load_profiles()["acme"].extra_skill_trees == (".agents/skills",)
+    assert profile_mod.external_profile_errors() == {}
+
+
+def test_extra_skill_trees_must_be_a_list_of_strings(tmp_path):
+    for value in ('".agents/skills"', "[1]"):
+        text = MINIMAL_PROFILE.replace("[hooks]", f"extra_skill_trees = {value}\n[hooks]")
+        with pytest.raises(ProfileError, match="extra_skill_trees must be a list of strings"):
+            load_profiles(_write_mycli(tmp_path, text))
+
+
+_EXTRA_REL_ERR = "extra_skill_trees entries must be project-relative paths"
+_EXTRA_HOME_ERR = "extra_skill_trees entries must not start with '~': a leading '~' is not expanded"
+_EXTRA_ALIAS_ERR = "extra_skill_trees entries must not name a Windows device"
+_EXTRA_SAME_ERR = "extra_skill_trees entries must differ from skill_tree"
+_EXTRA_DASH_ERR = "extra_skill_trees entries must not start with '-'"
+_EXTRA_DUP_ERR = "extra_skill_trees has duplicate entries"
+
+
+@pytest.mark.parametrize(
+    ("entries", "match"),
+    [
+        pytest.param(("~/x",), _EXTRA_HOME_ERR, id="tilde-slash"),
+        pytest.param(("~",), _EXTRA_HOME_ERR, id="tilde-alone"),
+        pytest.param(("~user/skills",), _EXTRA_HOME_ERR, id="tilde-user"),
+        pytest.param(("/abs",), _EXTRA_REL_ERR, id="absolute"),
+        pytest.param(("C:/x",), _EXTRA_REL_ERR, id="drive"),
+        pytest.param(("../x",), _EXTRA_REL_ERR, id="parent"),
+        pytest.param(("",), _EXTRA_REL_ERR, id="empty"),
+        pytest.param((".",), _EXTRA_REL_ERR, id="dot"),
+        pytest.param(("CON",), _EXTRA_ALIAS_ERR, id="win32-device"),
+        pytest.param((".agents/skills.",), _EXTRA_ALIAS_ERR, id="win32-trim"),
+        pytest.param(("-cprint(1)#",), _EXTRA_DASH_ERR, id="leading-dash"),
+        # MINIMAL_PROFILE and _plugin_profile both keep the default skill_tree
+        pytest.param((".claude/skills",), _EXTRA_SAME_ERR, id="same-as-skill-tree"),
+        pytest.param(("./.claude//skills/",), _EXTRA_SAME_ERR, id="same-as-skill-tree-spelling"),
+        pytest.param((".agents/skills", ".agents/skills"), _EXTRA_DUP_ERR, id="dup-exact"),
+        pytest.param((".agents/skills", ".agents//skills/"), _EXTRA_DUP_ERR, id="dup-spelling"),
+    ],
+)
+def test_extra_skill_trees_value_rejections_on_both_routes(tmp_path, profile_scan, entries, match):
+    listed = ", ".join(_toml_str(e) for e in entries)
+    text = MINIMAL_PROFILE.replace("[hooks]", f"extra_skill_trees = [{listed}]\n[hooks]")
+    with pytest.raises(ProfileError, match=re.escape(match)):
+        load_profiles(_write_mycli(tmp_path, text))
+    _assert_entry_point_refused(profile_scan, match, extra_skill_trees=entries)

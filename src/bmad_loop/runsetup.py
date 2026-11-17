@@ -342,6 +342,15 @@ def config_digest(
 
       Skill-content integrity is a real question and not one a config hash can
       answer.
+
+      The same holds for the rest of the skill-location surface:
+      ``extra_skill_trees`` (more project trees planted beside ``skill_tree`` in
+      ``OPENCODE_CONFIG_CONTENT``), ``user_skills`` (which home folders a skill
+      may resolve from) and the ``[skills] user_roots`` switch (whether they
+      are read at all, which also widens opencode 2.x's skill allow-list to
+      the BMAD ids located there). Each moves only a pointer to instructions,
+      never a program, flag or variable, and a user root is writable without
+      any config change at all.
     * ``usage_parser`` — and with it the rest of the token-budget surface. It
       selects a read-only tally over a transcript the orchestrator opens anyway
       and decides no program, flag, or variable. Rewriting it to ``"none"`` DOES

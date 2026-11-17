@@ -106,6 +106,7 @@ from bmad_loop.policy import (
     Policy,
     ReviewPolicy,
     ScmPolicy,
+    SkillsPolicy,
     StageAdapterPolicy,
     SweepPolicy,
     VerifyPolicy,
@@ -20161,6 +20162,15 @@ def _prompt_task(**kw) -> StoryTask:
     return StoryTask(story_key="1-1-a", epic=1, **kw)
 
 
+def _dev_skill_memo(engine) -> dict:
+    """``Engine._dev_skill_cache`` with each ``SkillScope`` key read as its primary
+    tree (None stays None), so a memo assertion names trees, not scope objects."""
+    return {
+        (project, scope.tree if scope is not None else None): name
+        for (project, scope), name in engine._dev_skill_cache.items()
+    }
+
+
 def test_dev_prompts_spell_the_post_rename_primitive(project):
     """Every generic-dev leg (fresh, known spec, restore, repair) invokes the name
     resolved from the dev adapter's skill tree — here post-rename bmad-build-auto."""
@@ -20208,7 +20218,7 @@ def test_dev_prompt_falls_back_to_the_legacy_name_without_a_profile(project):
 
     assert engine._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-dev-auto 1-1-a")
     # the None tree IS the fallback path, not an unresolved tree that happened to miss
-    assert engine._dev_skill_cache == {(project.project, None): "bmad-dev-auto"}
+    assert _dev_skill_memo(engine) == {(project.project, None): "bmad-dev-auto"}
 
 
 def test_review_prompt_resolves_through_the_review_adapters_own_tree(project):
@@ -20231,7 +20241,7 @@ def test_review_prompt_resolves_through_the_review_adapters_own_tree(project):
     )
     # each tree resolved independently — one memo entry per (workspace, tree), not
     # one per run
-    assert engine._dev_skill_cache == {
+    assert _dev_skill_memo(engine) == {
         (project.project, ".claude/skills"): "bmad-build-auto",
         (project.project, ".agents/skills"): "bmad-dev-auto",
     }
@@ -25096,7 +25106,7 @@ def test_workflow_marker_is_named_for_the_workflows_own_role_tree(project):
     # disagreeing is what the assertions above are reading — not two names that
     # happen to coincide.
     assert engine._dev_skill() == "bmad-build-auto"
-    assert engine._dev_skill_cache == {
+    assert _dev_skill_memo(engine) == {
         (project.project, ".agents/skills"): "bmad-dev-auto",
         (project.project, ".claude/skills"): "bmad-build-auto",
     }
@@ -25134,10 +25144,391 @@ def test_dev_prompt_resolves_in_the_reopened_worktree_not_the_main_checkout(proj
 
     engine.workspace = default
     assert engine._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-build-auto 1-1-a")
-    assert engine._dev_skill_cache == {
+    assert _dev_skill_memo(engine) == {
         (worktree.resolve(), ".claude/skills"): "bmad-dev-auto",
         (project.project, ".claude/skills"): "bmad-build-auto",
     }
+
+
+# ------------------------------- user-level skill roots: dispatch (#770)
+# A codex dev adapter whose project tree is empty and whose user root
+# `~/.agents/skills` (the codex profile's first declared root) carries the
+# post-rename primitive: the `[skills] user_roots` switch decides whether the
+# engine resolves, spells and journals that global copy.
+
+
+def _user_root_policy(on: bool) -> Policy:
+    return Policy(
+        gates=GatesPolicy(mode="none"),
+        notify=QUIET,
+        scm=ScmPolicy(rollback_on_failure=True),
+        skills=SkillsPolicy(user_roots=on),
+    )
+
+
+def _global_codex_engine(project, monkeypatch, tmp_path, *, on: bool, script=(), global_only=True):
+    """An engine whose codex dev adapter sees ``bmad-build-auto`` only in the user
+    root ``~/.agents/skills`` (home pinned to ``tmp_path/home``), with a module
+    record there naming it. Returns ``(engine, adapter, skill_folder)``."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import skill_locate
+
+    home = tmp_path / "home"
+    root = install_build_auto_skill(home, ".agents/skills")
+    record = root / "bmod-method" / "bmod.toml"
+    record.parent.mkdir(parents=True)
+    record.write_text('[bmod]\nversion = "7.2.0"\nskills = ["bmad-build-auto"]\n', encoding="utf-8")
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    engine, adapter = make_engine(project, list(script), policy=_user_root_policy(on))
+    attach_profile(adapter, "codex")
+    if global_only:
+        assert not (project.project / ".agents/skills/bmad-build-auto").exists()
+    return engine, adapter, root / "bmad-build-auto"
+
+
+def test_dev_prompt_spells_a_user_root_primitive_only_with_the_switch_on(
+    project, monkeypatch, tmp_path
+):
+    """With `[skills] user_roots` on, a primitive installed only in a user root the
+    CLI loads resolves, so the prompt spells it; off, the project tree alone is
+    read and the unresolved primitive falls back to the legacy name.
+
+    Ablation: pass `resolve_user=False` in `Engine._skill_scope` and the switch-on
+    half reddens (it spells `/bmad-dev-auto`)."""
+    on, _, _ = _global_codex_engine(project, monkeypatch, tmp_path, on=True)
+    prompt = on._generic_dev_prompt(_prompt_task(), None)
+    assert prompt.startswith("/bmad-build-auto 1-1-a")
+    assert "bmad-dev-auto" not in prompt
+
+    off, _, _ = _global_codex_engine(project, monkeypatch, tmp_path / "off", on=False)
+    assert off._generic_dev_prompt(_prompt_task(), None).startswith("/bmad-dev-auto 1-1-a")
+
+
+def test_session_spec_carries_the_user_root_skill_dir_and_journals_it(
+    project, monkeypatch, tmp_path
+):
+    """At the one `SessionSpec` construction, a prompt naming a user-root skill
+    hands the adapter that skill's absolute folder as `skill_dir` and the user-root
+    ids as `user_skill_ids`, and journals one `skill-user-root` row per id."""
+    engine, adapter, folder = _global_codex_engine(
+        project, monkeypatch, tmp_path, on=True, script=[SessionResult(status="completed")]
+    )
+
+    engine._run_session(_prompt_task(), role="dev", prompt="/bmad-build-auto 1-1-a", seq=1)
+
+    (spec,) = adapter.sessions
+    assert spec.skill_dir == str(folder)
+    assert "bmad-build-auto" in spec.user_skill_ids
+    rows = [e for e in engine.journal.entries() if e["kind"] == "skill-user-root"]
+    assert {r["skill"] for r in rows} == set(spec.user_skill_ids)
+    (row,) = [r for r in rows if r["skill"] == "bmad-build-auto"]
+    assert row["role"] == "dev"
+    assert row["root"] == "~/.agents/skills"
+    assert row["version"] == "7.2.0"
+
+
+@pytest.mark.parametrize(
+    ("hook_disables", "second_root"),
+    [(False, False), (True, False), (True, True)],
+    ids=["ambient", "hook-set", "hook-set-other-root-loads"],
+)
+def test_session_user_roots_resolve_against_the_post_hook_env(
+    project, monkeypatch, tmp_path, hook_disables, second_root
+):
+    """A `pre_session` hook that sets a root's disabler (an account rotation's
+    CLAUDE_CONFIG_DIR; here codex's CODEX_HOME over `~/.codex/skills`) hides that
+    root from the launched CLI, so dispatch resolves against the post-hook env.
+    When the hidden root held the only copy of the skill the prompt names, the
+    launch stops before `session-start`: the prompt was spelled before the hook
+    ran, and the CLI would halt on an unknown command. When `~/.agents/skills`,
+    which codex ranks first, also holds it, the hook changes nothing and the
+    session launches from there. Without the hook the `~/.codex/skills` install
+    resolves.
+
+    Ablation (performed): drop `env` from the `_skill_scope` call at the
+    `SessionSpec` construction and the hook-set row FAILS (the session launches)."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import skill_locate
+
+    home = tmp_path / "home"
+    folder = install_build_auto_skill(home, ".codex/skills") / "bmad-build-auto"
+    if second_root:
+        folder = install_build_auto_skill(home, ".agents/skills") / "bmad-build-auto"
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    engine, adapter = make_engine(
+        project, [SessionResult(status="completed")], policy=_user_root_policy(True)
+    )
+    attach_profile(adapter, "codex")
+    real_gate = engine._emit_session_gate
+
+    def gate(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        if hook_disables:
+            env = {**env, "CODEX_HOME": str(tmp_path / "rotated")}
+        return prompt, env, ctx
+
+    monkeypatch.setattr(engine, "_emit_session_gate", gate)
+
+    def run():
+        engine._run_session(_prompt_task(), role="dev", prompt="/bmad-build-auto 1-1-a", seq=1)
+
+    if hook_disables and not second_root:
+        with pytest.raises(RuntimeError, match=r"/bmad-build-auto.*~/\.codex/skills.*CODEX_HOME"):
+            run()
+        kinds = [e["kind"] for e in engine.journal.entries()]
+        assert adapter.sessions == []
+        assert "session-start" not in kinds
+        assert "skill-user-root" not in kinds
+        return
+
+    run()
+    (spec,) = adapter.sessions
+    rows = [e for e in engine.journal.entries() if e["kind"] == "skill-user-root"]
+    expected_root = "~/.agents/skills" if second_root else "~/.codex/skills"
+    assert spec.skill_dir == str(folder)
+    assert "bmad-build-auto" in spec.user_skill_ids
+    assert {r["root"] for r in rows} == {expected_root}
+
+
+@pytest.mark.parametrize(
+    ("hook_disables", "project_copy"),
+    [(False, "older"), (True, "same"), (True, "older")],
+    ids=["ambient", "hook-set-same-copy", "hook-set-older-copy"],
+)
+def test_session_refuses_when_a_hook_swaps_the_primitive_for_another_copy(
+    project, monkeypatch, tmp_path, hook_disables, project_copy
+):
+    """Claude ranks `~/.claude/skills` above the project tree, so the preflight
+    checks the user copy of the primitive. A `pre_session` hook that sets
+    CLAUDE_CONFIG_DIR hides that root and the CLI falls back to the project copy,
+    which no check read (an older primitive without ticket support, say). The
+    launch stops before `session-start`, naming both roots. A byte-identical
+    project copy keeps the launch going, as does an ambient launch that reads the
+    checked user copy.
+
+    Ablation (performed): drop the `same_copy` comparison in
+    `_refuse_hook_changed_skill` (accept any post-hook copy) and the older-copy
+    row FAILS (the session launches); refuse every changed path regardless of
+    content and the same-copy row FAILS."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import skill_locate
+    from bmad_loop.install import DEV_PRIMITIVE_NEW
+
+    home = tmp_path / "home"
+    install_build_auto_skill(home, ".claude/skills")
+    install_build_auto_skill(project.project, ".claude/skills")
+    if project_copy == "older":
+        skill_md = project.project / ".claude/skills" / DEV_PRIMITIVE_NEW / "SKILL.md"
+        skill_md.write_text(skill_md.read_text(encoding="utf-8") + "\nolder\n", encoding="utf-8")
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    engine, adapter = make_engine(
+        project, [SessionResult(status="completed")], policy=_user_root_policy(True)
+    )
+    attach_profile(adapter, "claude")
+    real_gate = engine._emit_session_gate
+
+    def gate(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        if hook_disables:
+            env = {**env, "CLAUDE_CONFIG_DIR": str(tmp_path / "rotated")}
+        return prompt, env, ctx
+
+    monkeypatch.setattr(engine, "_emit_session_gate", gate)
+
+    def run():
+        engine._run_session(_prompt_task(), role="dev", prompt=f"/{DEV_PRIMITIVE_NEW} 1-1-a", seq=1)
+
+    if hook_disables and project_copy == "older":
+        with pytest.raises(
+            RuntimeError,
+            match=rf"/{DEV_PRIMITIVE_NEW}, which resolves from ~/\.claude/skills.*"
+            r"CLAUDE_CONFIG_DIR.*the copy in \.claude/skills, which no check read",
+        ):
+            run()
+        assert adapter.sessions == []
+        assert "session-start" not in [e["kind"] for e in engine.journal.entries()]
+        return
+
+    run()
+    (spec,) = adapter.sessions
+    expected = str(home / ".claude/skills" / DEV_PRIMITIVE_NEW) if not hook_disables else None
+    assert spec.skill_dir == expected
+
+
+@pytest.mark.parametrize(
+    ("hook_disables", "project_reviewers"),
+    [(False, False), (True, False), (True, True)],
+    ids=["ambient", "hook-set-reviewer-hidden", "hook-set-reviewers-in-project"],
+)
+def test_session_refuses_when_a_hook_hides_a_required_review_skill(
+    project, monkeypatch, tmp_path, hook_disables, project_reviewers
+):
+    """The dev primitive is in the project tree, but the review skills it must
+    invoke resolve only from `~/.codex/skills`. Preflight passes them against the
+    shared scope; a `pre_session` hook that sets CODEX_HOME hides that root, so the
+    primitive would launch and fail its review step. The launch stops before
+    `session-start`, naming the reviewer and the variable. Reviewers that the
+    project tree also carries keep the launch going.
+
+    Ablation (performed): compare only the prompt's skill in
+    `_refuse_hook_changed_skill` and the reviewer-hidden row FAILS (the session
+    launches)."""
+    import shutil
+
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import skill_locate
+    from bmad_loop.install import DEV_PRIMITIVE_NEW
+
+    home = tmp_path / "home"
+    project_tree = install_build_auto_skill(project.project, ".agents/skills")
+    home_tree = install_build_auto_skill(home, ".codex/skills")
+    shutil.rmtree(home_tree / DEV_PRIMITIVE_NEW)
+    reviewers = sorted(p.name for p in home_tree.iterdir())
+    assert reviewers
+    if not project_reviewers:
+        for name in reviewers:
+            shutil.rmtree(project_tree / name)
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    engine, adapter = make_engine(
+        project, [SessionResult(status="completed")], policy=_user_root_policy(True)
+    )
+    attach_profile(adapter, "codex")
+    real_gate = engine._emit_session_gate
+
+    def gate(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        if hook_disables:
+            env = {**env, "CODEX_HOME": str(tmp_path / "rotated")}
+        return prompt, env, ctx
+
+    monkeypatch.setattr(engine, "_emit_session_gate", gate)
+
+    def run():
+        engine._run_session(_prompt_task(), role="dev", prompt="/bmad-build-auto 1-1-a", seq=1)
+
+    if hook_disables and not project_reviewers:
+        with pytest.raises(
+            RuntimeError,
+            match=rf"/bmad-build-auto, whose review step needs {reviewers[0]}.*"
+            r"~/\.codex/skills.*CODEX_HOME",
+        ):
+            run()
+        assert adapter.sessions == []
+        assert "session-start" not in [e["kind"] for e in engine.journal.entries()]
+        return
+
+    run()
+    (spec,) = adapter.sessions
+    assert spec.skill_dir is None
+
+
+@pytest.mark.parametrize("gated", [True, False], ids=["advisory-launches", "required-refused"])
+def test_session_hook_guard_skips_an_advisory_review_skill(project, monkeypatch, tmp_path, gated):
+    """The primitive and its `blind` reviewer sit in the project tree. A second
+    layer names `bmad-review-performance`, which resolves only from
+    `~/.codex/skills`. When that layer is `when`-gated, the reviewer is advisory:
+    it may never run and preflight only warns when it is missing, so a
+    `pre_session` hook that sets CODEX_HOME and hides it does not stop the launch.
+    Ungated, the same reviewer is required and the launch stops.
+
+    Ablation (performed): compare every reviewer (`ReviewResolution.skills()`,
+    advisory included) in `_refuse_hook_changed_skill` and the advisory row FAILS
+    (the launch is refused)."""
+    from conftest import attach_profile, install_build_auto_skill
+
+    from bmad_loop import skill_locate
+    from bmad_loop.install import DEV_PRIMITIVE_NEW
+
+    home = tmp_path / "home"
+    project_tree = install_build_auto_skill(project.project, ".agents/skills")
+    when_line = 'when = "the diff touches hot paths"\n' if gated else ""
+    (project_tree / DEV_PRIMITIVE_NEW / "customize.toml").write_text(
+        "[workflow]\n"
+        '[[workflow.review_layers]]\nid = "blind"\n'
+        'instruction = "Invoke the `bmad-review` skill on this diff."\n'
+        f'[[workflow.review_layers]]\nid = "perf"\n{when_line}'
+        'instruction = "Invoke the `bmad-review-performance` skill on this diff."\n',
+        encoding="utf-8",
+    )
+    for name, root in (("bmad-review", project_tree), ("bmad-review-performance", None)):
+        folder = (root or home / ".codex/skills") / name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "SKILL.md").write_text(f"# {name}\n", encoding="utf-8")
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    engine, adapter = make_engine(
+        project, [SessionResult(status="completed")], policy=_user_root_policy(True)
+    )
+    attach_profile(adapter, "codex")
+    real_gate = engine._emit_session_gate
+
+    def gate(*args, **kwargs):
+        prompt, env, ctx = real_gate(*args, **kwargs)
+        return prompt, {**env, "CODEX_HOME": str(tmp_path / "rotated")}, ctx
+
+    monkeypatch.setattr(engine, "_emit_session_gate", gate)
+
+    def run():
+        engine._run_session(_prompt_task(), role="dev", prompt="/bmad-build-auto 1-1-a", seq=1)
+
+    if not gated:
+        with pytest.raises(
+            RuntimeError, match=r"review step needs bmad-review-performance.*CODEX_HOME"
+        ):
+            run()
+        assert adapter.sessions == []
+        return
+
+    run()
+    (spec,) = adapter.sessions
+    assert spec.skill_dir is None
+
+
+def test_session_spec_has_no_user_root_skills_with_the_switch_off(project, monkeypatch, tmp_path):
+    """Switch off: the same global-only install contributes nothing — no
+    `skill_dir` (the project-tree miss keeps the renderer's relative default), no
+    ids, no `skill-user-root` row.
+
+    Ablation (performed): force `resolve_user=True` in `Engine._skill_scope` and
+    every assertion here reddens. The `scope.resolve_user` guard at the
+    `SessionSpec` construction only skips work: `user_root_skill_ids` is already
+    switch-gated through `locate`."""
+    engine, adapter, _ = _global_codex_engine(
+        project, monkeypatch, tmp_path, on=False, script=[SessionResult(status="completed")]
+    )
+
+    engine._run_session(_prompt_task(), role="dev", prompt="/bmad-build-auto 1-1-a", seq=1)
+
+    (spec,) = adapter.sessions
+    assert spec.skill_dir is None
+    assert spec.user_skill_ids == ()
+    assert "skill-user-root" not in [e["kind"] for e in engine.journal.entries()]
+
+
+def test_session_spec_skill_dir_is_none_for_a_primary_tree_hit(project, monkeypatch, tmp_path):
+    """A project-tree copy wins under the codex profile's `unordered` precedence, so
+    the spec carries no `skill_dir` (the renderer spells `<skill_tree>/<skill>`)
+    and no user-root ids for that skill even with the switch on."""
+    from conftest import install_build_auto_skill
+
+    install_build_auto_skill(project.project, ".agents/skills")
+    engine, adapter, _ = _global_codex_engine(
+        project,
+        monkeypatch,
+        tmp_path,
+        on=True,
+        script=[SessionResult(status="completed")],
+        global_only=False,
+    )
+
+    engine._run_session(_prompt_task(), role="dev", prompt="/bmad-build-auto 1-1-a", seq=1)
+
+    (spec,) = adapter.sessions
+    assert spec.skill_dir is None
+    assert "bmad-build-auto" not in spec.user_skill_ids
 
 
 # --------------------- the park-record put-back, confined to the project (#593)
@@ -26093,6 +26484,45 @@ def test_auto_retro_skill_probe_passes_when_the_skill_is_installed(project):
 
     assert len(retro.sessions) == 1
     assert "retro-auto-finished" in _kinds(engine)
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_auto_retro_skill_probe_reads_user_roots_only_with_the_switch_on(
+    project, monkeypatch, tmp_path, on
+):
+    """A `bmad-retrospective` installed only in the retro CLI's user root
+    (`~/.claude/skills` for claude) passes the probe under `[skills] user_roots`;
+    off, the probe reads the project tree alone and skips as `skill-missing`.
+
+    Ablation: restore the project-tree-only probe and the switch-on row reddens."""
+    from conftest import attach_profile
+
+    from bmad_loop import skill_locate
+
+    home = tmp_path / "home"
+    skill = home / ".claude" / "skills" / "bmad-retrospective" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: bmad-retrospective\n---\n")
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    policy = Policy(
+        gates=GatesPolicy(mode="none", retrospective="auto"),
+        notify=QUIET,
+        skills=SkillsPolicy(user_roots=on),
+    )
+    _two_epic_sprint(project)
+    _commit_all(project)
+    retro = MockAdapter([retro_effect(project)])
+    engine, _ = make_engine(project, [], policy=policy, retro_adapter=retro)
+    attach_profile(retro, "claude", project.project)
+
+    engine._maybe_auto_retro(1)
+
+    if on:
+        assert len(retro.sessions) == 1
+        assert "retro-auto-finished" in _kinds(engine)
+    else:
+        assert retro.sessions == []
+        assert _only(engine, "retro-auto-skipped")["reason"] == "skill-missing"
 
 
 def test_auto_retro_unreadable_board_is_refused(project, monkeypatch):

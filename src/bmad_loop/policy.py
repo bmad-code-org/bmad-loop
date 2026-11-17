@@ -455,6 +455,14 @@ class MuxPolicy:
 
 
 @dataclass(frozen=True)
+class SkillsPolicy:
+    # Resolve skills from the user-level folders each coding CLI natively loads
+    # (its profile's `[user_skills]` roots, e.g. ~/.agents/skills) as well as the
+    # project's skill trees. Off = project trees only. See bmad_loop.skill_locate.
+    user_roots: bool = False
+
+
+@dataclass(frozen=True)
 class SweepPolicy:
     auto: str = "never"  # never | per-epic | run-end
     max_bundles: int = 5  # bundles executed per sweep; triage excess is truncated
@@ -801,6 +809,7 @@ class Policy:
     tui: TuiPolicy = field(default_factory=TuiPolicy)
     operator: OperatorPolicy = field(default_factory=OperatorPolicy)
     mux: MuxPolicy = field(default_factory=MuxPolicy)
+    skills: SkillsPolicy = field(default_factory=SkillsPolicy)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1032,6 +1041,7 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
     tui_d = _section(doc, "tui")
     operator_d = _section(doc, "operator")
     mux_d = _section(doc, "mux")
+    skills_d = _section(doc, "skills")
 
     gates = GatesPolicy(
         mode=_typed_str(gates_d, "gates", "mode", GatesPolicy.mode),
@@ -1568,6 +1578,9 @@ def loads(text: str, plugin_schemas: dict[str, Any] | None = None) -> Policy:
         tui=tui,
         operator=operator,
         mux=mux,
+        skills=SkillsPolicy(
+            user_roots=_typed_bool(skills_d, "skills", "user_roots", SkillsPolicy.user_roots),
+        ),
     )
 
 
@@ -1862,6 +1875,12 @@ enabled = true
 # Takes effect on the next bmad-loop invocation; a running TUI refuses launches
 # until restarted.
 # honor_ambient_psmux_data_dir = false
+
+[skills]
+# Also resolve skills from the user-level folders each coding CLI loads on its
+# own (for example ~/.agents/skills after `npx skills add -g`), as declared in
+# its profile's [user_skills] table. Off = only the project's skill trees.
+# user_roots = false
 """
 
 

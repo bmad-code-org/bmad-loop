@@ -653,6 +653,21 @@ def test_git_timeout_default_parse_and_template():
     assert doc["limits"]["git_timeout_s"] == 120
 
 
+def test_skills_user_roots_default_parse_and_template():
+    import tomllib
+
+    assert policy.loads("").skills == policy.SkillsPolicy()
+    assert policy.loads("").skills.user_roots is False
+    assert policy.loads("[skills]\nuser_roots = true\n").skills.user_roots is True
+    with pytest.raises(policy.PolicyError, match=r"skills\.user_roots must be a boolean"):
+        policy.loads('[skills]\nuser_roots = "yes"\n')
+    # the emitted template documents the knob, commented out at its default
+    assert "\n[skills]\n" in policy.POLICY_TEMPLATE
+    assert "\n# user_roots = false\n" in policy.POLICY_TEMPLATE
+    assert tomllib.loads(policy.POLICY_TEMPLATE)["skills"] == {}
+    assert policy.loads(policy.POLICY_TEMPLATE).skills == policy.SkillsPolicy()
+
+
 def test_artifact_publication_limits_parse_validate_and_render():
     import tomllib
 
@@ -977,6 +992,7 @@ _BOOLEAN_POLICY_FIELDS = [
     ("tui", "low_frame_rate"),
     ("operator", "enabled"),
     ("mux", "honor_ambient_psmux_data_dir"),
+    ("skills", "user_roots"),
 ]
 
 

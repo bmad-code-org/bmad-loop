@@ -43,7 +43,10 @@ in git history, commit b85d8ca / PR #167). This list wins over memory:
 - Hermetic skills need ``OPENCODE_DISABLE_EXTERNAL_SKILLS=1`` **plus**
   ``skills.paths=["<worktree>/.claude/skills"]`` inside the config content —
   by default every server also sees the operator's personal
-  ``~/.claude/skills`` and ``~/.agents/skills``.
+  ``~/.claude/skills`` and ``~/.agents/skills``. The adapter lists every
+  project skill tree (the profile's ``skill_tree`` then its
+  ``extra_skill_trees``); a 1.x server therefore cannot load a user-root
+  skill at all, and a session that needs one is refused at spawn.
 - ``opencode serve`` survives parent SIGKILL (reparents to init and keeps
   serving); SIGTERM exits it cleanly.
 - All ``time.*`` fields are epoch **milliseconds**; ``POST /session/:id/abort``
@@ -138,7 +141,11 @@ identical on every route below), zero tokens against a local mock provider
   skill per id, and the configured ``skills`` paths are applied after the
   ``~/.claude`` / ``~/.agents`` / ``~/.config/opencode`` roots (each scanned
   sequentially, sorted). A same-id personal copy in all three roots lost in
-  every start, with either side's scan slowed by 2000 extra skills.
+  every start, with either side's scan slowed by 2000 extra skills. That
+  same discovery is what serves ``[skills] user_roots``: the adapter adds no
+  user path to ``skills`` and re-allows, after the project ids, only the
+  BMAD module skill ids the engine located in a user root — every other
+  personal skill stays denied.
 - A ``question`` deny removes the ``question`` tool from what the model is
   offered, so an unattended session cannot park on a form. Reads are not
   gated: under the allow-all config a ``read`` of a path outside the project
@@ -288,6 +295,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -517,12 +525,25 @@ class OpencodeProtocol:
     # usage when the transcript read fails.
     usage_reads_transcript: bool = True
 
-    def config_content(self, spec: SessionSpec, skill_dir: Path) -> str:
+    def config_content(
+        self,
+        spec: SessionSpec,
+        skill_dir: Path,
+        *,
+        extra_skill_dirs: Sequence[Path] = (),
+        user_skill_ids: Sequence[str] = (),
+    ) -> str:
         raise NotImplementedError
 
-    def refused_skill_ids(self, skill_dir: Path) -> list[str]:
-        """Project skill ids :meth:`config_content` left out of this
-        session's hermetic skill set — the adapter crumbs them at spawn."""
+    def refused_skill_ids(
+        self,
+        skill_dir: Path,
+        *,
+        extra_skill_dirs: Sequence[Path] = (),
+        user_skill_ids: Sequence[str] = (),
+    ) -> list[str]:
+        """Skill ids :meth:`config_content` left out of this session's
+        hermetic skill set — the adapter crumbs them at spawn."""
         return []
 
     def extra_env(self) -> dict[str, str]:
@@ -642,16 +663,26 @@ class V1Protocol(OpencodeProtocol):
     trace_skip_types = frozenset({"message.part.delta"})
     event_path = "/event"
 
-    def config_content(self, spec: SessionSpec, skill_dir: Path) -> str:
+    def config_content(
+        self,
+        spec: SessionSpec,
+        skill_dir: Path,
+        *,
+        extra_skill_dirs: Sequence[Path] = (),
+        user_skill_ids: Sequence[str] = (),
+    ) -> str:
         """The OPENCODE_CONFIG_CONTENT JSON for this session:
         blanket permission allow (the bypass-flags analogue), the hermetic
-        skills path (project skills only, paired with
-        OPENCODE_DISABLE_EXTERNAL_SKILLS=1 in the env), and the model when the
-        policy sets one (config-file model is the "provider/model" string
-        form)."""
+        skills paths (every project skill tree, primary first, and nothing
+        else — paired with OPENCODE_DISABLE_EXTERNAL_SKILLS=1 in the env), and
+        the model when the policy sets one (config-file model is the
+        "provider/model" string form). ``user_skill_ids`` is accepted for the
+        shared signature and ignored: 1.x cannot load a user-root skill without
+        dropping the external-skills switch, so the adapter refuses such a
+        session at spawn instead."""
         config: dict[str, Any] = {
             "permission": "allow",
-            "skills": {"paths": [str(skill_dir)]},
+            "skills": {"paths": [str(d) for d in (skill_dir, *extra_skill_dirs)]},
         }
         if spec.model:
             config["model"] = spec.model
@@ -1010,15 +1041,31 @@ class V2Protocol(OpencodeProtocol):
     model_settle_s = 5.0
     model_poll_s = 0.25
 
-    def config_content(self, spec: SessionSpec, skill_dir: Path) -> str:
+    def config_content(
+        self,
+        spec: SessionSpec,
+        skill_dir: Path,
+        *,
+        extra_skill_dirs: Sequence[Path] = (),
+        user_skill_ids: Sequence[str] = (),
+    ) -> str:
         """The OPENCODE_CONFIG_CONTENT JSON for this session, in V2's native
         keys. ``permissions`` is an ordered rule list where the LAST match
         wins: allow everything (the bypass-flags analogue), deny ``question``
         (an unattended session must never park on a form), then the hermetic
-        skills recipe — deny every skill, and re-allow each project skill by
-        id. V2 has no ``OPENCODE_DISABLE_EXTERNAL_SKILLS``, so these rules are
-        the only thing hiding the operator's personal and the built-in skills.
-        ``skills`` points discovery at the project tree; ``model`` is the
+        skills recipe — deny every skill, re-allow each project skill by id
+        (from every project tree, primary first), then each
+        ``user_skill_ids`` entry: the BMAD module skills the engine located
+        in a user root, which V2 discovers on its own from ``~/.claude``,
+        ``~/.agents`` and ``~/.config/opencode``. V2 has no
+        ``OPENCODE_DISABLE_EXTERNAL_SKILLS``, so these rules are the only thing
+        hiding the operator's personal and the built-in skills. ``skills``
+        points discovery at the project trees (no user path: V2 scans those
+        roots anyway), primary LAST: V2 registers explicit ``skills`` entries
+        above every discovered root and in array order, the later source
+        supplying a duplicate id, so the primary tree's copy — the one
+        :func:`bmad_loop.skill_locate.locate` resolves and validate reads —
+        wins a clash with an extra tree. ``model`` is the
         ``"provider/model"`` string when the policy sets one. An id the rule
         matcher would read as a pattern is never re-allowed
         (:meth:`refused_skill_ids`)."""
@@ -1027,26 +1074,36 @@ class V2Protocol(OpencodeProtocol):
             {"action": "question", "resource": "*", "effect": "deny"},
             {"action": "skill", "resource": "*", "effect": "deny"},
         ]
-        refused = self.refused_skill_ids(skill_dir)
+        dirs = (skill_dir, *extra_skill_dirs)
         permissions.extend(
             {"action": "skill", "resource": skill_id, "effect": "allow"}
-            for skill_id in project_skill_ids(skill_dir)
-            if skill_id not in refused
+            for skill_id in _v2_skill_ids(dirs, user_skill_ids)
+            if _V2_RULE_WILDCARDS.isdisjoint(skill_id)
         )
-        config: dict[str, Any] = {"permissions": permissions, "skills": [str(skill_dir)]}
+        config: dict[str, Any] = {
+            "permissions": permissions,
+            "skills": [str(d) for d in reversed(dirs)],
+        }
         if spec.model:
             config["model"] = spec.model
         return json.dumps(config)
 
-    def refused_skill_ids(self, skill_dir: Path) -> list[str]:
-        """Project skill ids holding a rule-pattern metacharacter. V2 matches
-        a rule's ``resource`` as a wildcard (``*`` any run, ``?`` one char,
-        no escape — pinned in the 2.0.27 bundle), so an allow for a directory
-        named ``*`` would come last and re-allow every personal and built-in
-        skill. Such a skill stays denied, fail-closed."""
+    def refused_skill_ids(
+        self,
+        skill_dir: Path,
+        *,
+        extra_skill_dirs: Sequence[Path] = (),
+        user_skill_ids: Sequence[str] = (),
+    ) -> list[str]:
+        """Skill ids — project or user-root — holding a rule-pattern
+        metacharacter. V2 matches a rule's ``resource`` as a wildcard (``*``
+        any run, ``?`` one char, no escape — pinned in the 2.0.27 bundle), so
+        an allow for a directory named ``*`` would come last and re-allow
+        every personal and built-in skill. Such a skill stays denied,
+        fail-closed."""
         return [
             skill_id
-            for skill_id in project_skill_ids(skill_dir)
+            for skill_id in _v2_skill_ids((skill_dir, *extra_skill_dirs), user_skill_ids)
             if not _V2_RULE_WILDCARDS.isdisjoint(skill_id)
         ]
 
@@ -1645,6 +1702,18 @@ def _v2_by_model(
 
 # The characters V2's permission-rule matcher reads as wildcards.
 _V2_RULE_WILDCARDS = frozenset("*?")
+
+
+def _v2_skill_ids(dirs: Sequence[Path], user_skill_ids: Sequence[str]) -> list[str]:
+    """Every skill id a V2 session may re-allow, first-seen order: each
+    project tree's ids (:func:`project_skill_ids`, tree by tree), then the
+    user-root ids. An id in two places is listed once — V2 keeps one skill
+    per id, so a second allow adds nothing."""
+    ids: dict[str, None] = {}
+    for skill_dir in dirs:
+        ids.update(dict.fromkeys(project_skill_ids(skill_dir)))
+    ids.update(dict.fromkeys(user_skill_ids))
+    return list(ids)
 
 
 def project_skill_ids(skill_dir: Path) -> list[str]:

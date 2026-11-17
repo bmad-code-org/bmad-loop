@@ -33,6 +33,7 @@ from bmad_loop import (
     install,
     platform_util,
     runs,
+    skill_locate,
     ticketlayout,
     ticketmodel,
     win32_at,
@@ -1100,16 +1101,18 @@ def _stub_cli_version(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_outside_skill_home(monkeypatch, tmp_path_factory):
-    """Pin the home directory the out-of-project skill hint probes (#768).
+def _isolate_user_skill_roots(monkeypatch, tmp_path_factory):
+    """Pin the home directory and environment the skill locator reads.
 
-    `install.missing_base_skills` notes a global `~/.claude/skills` or
-    `~/.agents/skills` copy of a missing skill in the finding's message and detail.
-    Unpinned, every test asserting on such a finding would depend on what the host
-    has installed globally — a developer with `npx skills add -g` would see failures
-    CI never does. Tests of the hint pass `home=` explicitly instead."""
-    empty = tmp_path_factory.getbasetemp() / "no-outside-home"
-    monkeypatch.setattr(install, "_outside_home", lambda: empty)
+    `skill_locate.scope_for` resolves each profile's `[user_skills]` roots
+    against the user's home and checks their disabler variables (CLAUDE_CONFIG_DIR,
+    CODEX_HOME, ...) in bmad-loop's environment. Unpinned, a developer with
+    `npx skills add -g` or an exported CODEX_HOME would see results CI never does.
+    The home is an empty base-temp dir (never created per test). Tests of real
+    behaviour pass `home=` / `environ=` or monkeypatch these seams."""
+    empty = tmp_path_factory.getbasetemp() / "no-user-skill-home"
+    monkeypatch.setattr(skill_locate, "user_home", lambda: empty)
+    monkeypatch.setattr(skill_locate, "ambient_environ", lambda: {})
 
 
 @pytest.fixture(autouse=True)

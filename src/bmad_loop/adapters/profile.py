@@ -48,10 +48,12 @@ import regex
 from ..platform_util import (
     has_parent_ref,
     is_absolute_path,
+    names_home_ref,
     names_tree_root,
     names_win32_alias,
 )
 from ..policy import PERMISSION_MODES, PROFILE_ALIASES
+from ..skill_locate import PRECEDENCES, UserSkillRoot, UserSkillsSpec, prompt_skill
 from .entrypoints import record_load_error
 from .multiplexer import ALLOWED_KEYS
 
@@ -440,6 +442,15 @@ class CLIProfile:
     # None = off. APPENDED after linked_worktree_args for the same
     # positional-compatibility reason.
     subagent_spawn_marker: str | None = None
+    # More project-relative skill trees the CLI also reads, after `skill_tree`,
+    # in the order it reads them. APPENDED after subagent_spawn_marker for the
+    # same positional-compatibility reason.
+    extra_skill_trees: tuple[str, ...] = ()
+    # The home-relative skill folders the CLI natively loads (`[user_skills]`),
+    # resolved by `bmad_loop.skill_locate`. None = the CLI declares none: no
+    # user-root resolution, shadow check or hint — the safe default for overlay
+    # and entry-point profiles. APPENDED last for the same reason.
+    user_skills: UserSkillsSpec | None = None
 
     @property
     def hookless(self) -> bool:
@@ -456,17 +467,21 @@ class CLIProfile:
             return self.subagent_transcript_dir
         return SUBAGENT_TRANSCRIPT_DIR_DEFAULTS.get(self.usage_parser, "")
 
-    def render_prompt(self, prompt: str) -> str:
+    def render_prompt(self, prompt: str, *, skill_dir: str | None = None) -> str:
         """Render the engine's canonical "/skill args" prompt for this CLI.
 
         Placeholders: {prompt} = the canonical string, {skill} = the leading
-        slash-command name without "/", {args} = everything after it.
+        slash-command name without "/", {args} = everything after it, {skill_dir}
+        = the folder holding the skill's SKILL.md — ``skill_dir`` when the engine
+        located it outside the primary tree (an extra tree, or the absolute folder
+        in a user root), else ``<skill_tree>/<skill>``.
         """
-        skill, args = "", prompt
-        if prompt.startswith("/"):
-            head, _, rest = prompt[1:].partition(" ")
-            skill, args = head, rest.strip()
-        return self.prompt_template.format(prompt=prompt, skill=skill, args=args)
+        skill, args = prompt_skill(prompt)
+        if skill_dir is None:
+            skill_dir = f"{self.skill_tree}/{skill}"
+        return self.prompt_template.format(
+            prompt=prompt, skill=skill, args=args, skill_dir=skill_dir
+        )
 
     def for_permission_mode(self, mode: str, platform: str = sys.platform) -> CLIProfile:
         """This profile with ``bypass_args`` set to ``mode``'s launch args.
@@ -539,6 +554,35 @@ def _check_linked_worktree_args(
         raise fail(f"{where} must use at least one of {', '.join(LINKED_WORKTREE_PLACEHOLDERS)}")
 
 
+_ENV_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _home_relative_bad(path: str) -> bool:
+    """True unless ``path`` is ``~/<something inside home>``.
+
+    Home-anchored and nothing else: the target lives outside the project, so
+    the confinement is "under ~", and the remainder must name something inside
+    home — not home itself, not an absolute path smuggled after the prefix
+    (`~//etc/passwd` joins to `/etc/passwd`), not a `..` climb out."""
+    rest = path[2:]
+    return (
+        not path.startswith("~/")
+        or names_tree_root(rest)
+        or is_absolute_path(rest)
+        or has_parent_ref(rest)
+    )
+
+
+def _tree_key(path: str) -> str:
+    """A spelling-insensitive key for comparing two declared folders: separators
+    unified, empty and `.` components and a trailing slash dropped."""
+    return "/".join(p for p in path.replace("\\", "/").split("/") if p not in ("", "."))
+
+
+def _same_tree(a: str, b: str) -> bool:
+    return _tree_key(a) == _tree_key(b)
+
+
 def _validate_profile(profile: CLIProfile, source: str) -> None:
     """Enforce every value-level invariant a ``CLIProfile`` must satisfy, whatever
     built it.
@@ -592,6 +636,11 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
             # `names_tree_root("")` is True, so this arm also carries the
             # "a real dialect must name a config_path at all" case.
             raise fail("hooks.config_path must be a project-relative path")
+        if names_home_ref(hooks.config_path):
+            raise fail(
+                "hooks.config_path must not start with '~': a leading '~' is not expanded; "
+                "hook config paths must be project-relative"
+            )
         if names_win32_alias(hooks.config_path):
             raise fail(
                 "hooks.config_path must not name a Windows device or end a component "
@@ -818,6 +867,12 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     ):
         raise fail("skill_tree must be a project-relative path")
 
+    if names_home_ref(profile.skill_tree):
+        raise fail(
+            "skill_tree must not start with '~': a leading '~' is not expanded; "
+            f"skill trees must be project-relative: got {profile.skill_tree!r}"
+        )
+
     if names_win32_alias(profile.skill_tree):
         raise fail(
             "skill_tree must not name a Windows device or end a component in a period or space"
@@ -830,26 +885,77 @@ def _validate_profile(profile: CLIProfile, source: str) -> None:
     for seed in profile.seed_files:
         if names_tree_root(seed) or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
+        if names_home_ref(seed):
+            raise fail(
+                "seed_files entries must not start with '~': a leading '~' is not "
+                f"expanded; seed files must be project-relative: got {seed!r}"
+            )
         if names_win32_alias(seed):
             raise fail(
                 "seed_files entries must not name a Windows device or end a component "
                 f"in a period or space: got {seed!r}"
             )
 
+    for extra in profile.extra_skill_trees:
+        if names_tree_root(extra) or is_absolute_path(extra) or has_parent_ref(extra):
+            raise fail(f"extra_skill_trees entries must be project-relative paths: got {extra!r}")
+        if names_home_ref(extra):
+            raise fail(
+                "extra_skill_trees entries must not start with '~': a leading '~' is not "
+                f"expanded; skill trees must be project-relative: got {extra!r}"
+            )
+        if names_win32_alias(extra):
+            raise fail(
+                "extra_skill_trees entries must not name a Windows device or end a "
+                f"component in a period or space: got {extra!r}"
+            )
+        # An extra tree reaches the prompt as {skill_dir} ("<tree>/<skill>") and is
+        # outside the config digest, so it must never read as a command-line option.
+        if extra.startswith("-"):
+            raise fail(
+                "extra_skill_trees entries must not start with '-': the rendered "
+                f"{{skill_dir}} would read as a command-line option: got {extra!r}"
+            )
+        if _same_tree(extra, profile.skill_tree):
+            raise fail(f"extra_skill_trees entries must differ from skill_tree: got {extra!r}")
+    if len({_tree_key(t) for t in profile.extra_skill_trees}) != len(profile.extra_skill_trees):
+        raise fail(f"extra_skill_trees has duplicate entries: {list(profile.extra_skill_trees)}")
+
+    user_skills = profile.user_skills
+    if user_skills is not None:
+        if user_skills.precedence not in PRECEDENCES:
+            raise fail(
+                f"user_skills.precedence must be one of {sorted(PRECEDENCES)}: "
+                f"got {user_skills.precedence!r}"
+            )
+        seen: set[str] = set()
+        for root in user_skills.roots:
+            if _home_relative_bad(root.path):
+                raise fail(
+                    "user_skills root path must be a '~/'-prefixed path inside the home "
+                    f"directory: got {root.path!r}"
+                )
+            if names_win32_alias(root.path[2:]):
+                raise fail(
+                    "user_skills root path must not name a Windows device or end a "
+                    f"component in a period or space: got {root.path!r}"
+                )
+            for var in root.disabled_by:
+                if not _ENV_VAR_NAME_RE.fullmatch(var):
+                    raise fail(
+                        "user_skills root disabled_by entries must be environment variable "
+                        f"names ([A-Za-z_][A-Za-z0-9_]*): got {var!r} for {root.path!r}"
+                    )
+            key = _tree_key(root.path)
+            if key in seen:
+                raise fail(f"user_skills has duplicate roots: got {root.path!r} twice")
+            seen.add(key)
+
     trust = profile.workspace_trust
     if trust is not None:
         settings_path = trust.settings_path
         rest = settings_path[2:]
-        # Home-anchored and nothing else: the file lives outside the project, so
-        # the confinement is "under ~", and the remainder must name something
-        # inside home — not home itself, not an absolute path smuggled after the
-        # prefix (`~//etc/passwd` joins to `/etc/passwd`), not a `..` climb out.
-        if (
-            not settings_path.startswith("~/")
-            or names_tree_root(rest)
-            or is_absolute_path(rest)
-            or has_parent_ref(rest)
-        ):
+        if _home_relative_bad(settings_path):
             raise fail(
                 "workspace_trust.settings_path must be a '~/'-prefixed path inside the "
                 f"home directory: got {settings_path!r}"
@@ -1026,6 +1132,47 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
             raise fail("workspace_trust.settings_path and workspace_trust.key must be strings")
         workspace_trust = WorkspaceTrustSpec(settings_path=settings_path, key=key)
 
+    # `[user_skills]`: shape only, like workspace_trust. A root is a bare
+    # "~/..." string or a `{ path, disabled_by }` table; values (the `~/`
+    # confinement, variable names, precedence, duplicates) in `_validate_profile`.
+    user_d = doc.get("user_skills")
+    user_skills: UserSkillsSpec | None = None
+    if user_d is not None:
+        if not isinstance(user_d, dict):
+            raise fail("user_skills must be a table")
+        unknown = sorted(set(user_d) - {"precedence", "roots"})
+        if unknown:
+            raise fail(f"user_skills has unknown keys: {unknown}")
+        precedence = user_d.get("precedence", UserSkillsSpec.precedence)
+        if not isinstance(precedence, str):
+            raise fail(f"user_skills.precedence must be a string: got {type(precedence).__name__}")
+        raw_roots = user_d.get("roots", [])
+        if not isinstance(raw_roots, list):
+            raise fail("user_skills.roots must be a list")
+        roots: list[UserSkillRoot] = []
+        for raw_root in raw_roots:
+            if isinstance(raw_root, str):
+                roots.append(UserSkillRoot(path=raw_root))
+                continue
+            if not isinstance(raw_root, dict):
+                raise fail(
+                    'user_skills.roots entries must be "~/..." strings or '
+                    "{ path, disabled_by } tables"
+                )
+            unknown = sorted(set(raw_root) - {"path", "disabled_by"})
+            if unknown:
+                raise fail(f"user_skills.roots entry has unknown keys: {unknown}")
+            root_path = raw_root.get("path")
+            if not isinstance(root_path, str):
+                raise fail("user_skills.roots entry path must be a string")
+            disabled_by = raw_root.get("disabled_by", [])
+            if not isinstance(disabled_by, list) or not all(
+                isinstance(x, str) for x in disabled_by
+            ):
+                raise fail("user_skills.roots entry disabled_by must be a list of strings")
+            roots.append(UserSkillRoot(path=root_path, disabled_by=tuple(disabled_by)))
+        user_skills = UserSkillsSpec(precedence=precedence, roots=tuple(roots))
+
     # Same shape-only rule as workspace_trust: four string lists, values in
     # `_validate_profile`.
     answers_d = doc.get("parked_answers")
@@ -1135,6 +1282,8 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         parked_answers=parked_answers,
         permission_modes=permission_modes,
         subagent_spawn_marker=raw_spawn_marker,
+        extra_skill_trees=str_list("extra_skill_trees"),
+        user_skills=user_skills,
     )
     _validate_profile(profile, source)
     return profile

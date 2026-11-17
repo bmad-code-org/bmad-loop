@@ -757,10 +757,12 @@ def run_epic_close_session(
     *,
     model: str = "",
     effort: str = "",
+    skill_dir: str | None = None,
 ) -> int:
     """Launch the interactive epic-close agent for epic ``slug`` attached to the
     caller's terminal, with ``prompt`` (:func:`epic_close_prompt`) as its first
-    prompt.
+    prompt. ``skill_dir`` is the located skill's ``{skill_dir}`` spelling
+    (:func:`skill_locate.prompt_skill_dir`), None for the primary tree.
 
     Blocks until the session exits. The session ends on process exit, as the
     resolve agent's does, never on prose. The returncode is returned for the
@@ -783,6 +785,7 @@ def run_epic_close_session(
         },
         model=model,
         effort=effort,
+        skill_dir=skill_dir,
     )
     argv = adapter.interactive_argv(spec)
     env = {**os.environ, **adapter.interactive_env(spec)}

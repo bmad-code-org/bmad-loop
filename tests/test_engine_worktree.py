@@ -68,6 +68,7 @@ from bmad_loop.policy import (
     OperatorPolicy,
     Policy,
     ScmPolicy,
+    SkillsPolicy,
     TicketsPolicy,
     VerifyPolicy,
 )
@@ -1555,6 +1556,38 @@ def test_missing_upstream_skill_seed_escalates_before_dispatch_and_records_mount
         minted.st_dev,
         minted.st_ino,
     )
+
+
+def test_global_only_primitive_with_user_roots_on_does_not_escalate(project, tmp_path, monkeypatch):
+    """#770: under `[skills] user_roots` a dev primitive installed only in the
+    operator's home (`~/.claude/skills`, which claude loads) is not a seeding gap —
+    no worktree carries the home and seeding never copies from it — so the unit
+    dispatches instead of escalating, and the exemption is journaled.
+
+    Ablation: drop the user-root `continue` in `base_skills_seed_incomplete` and the
+    gate reports `~/.claude/skills/bmad-build-auto` missing from the mount and the
+    run pauses before any session."""
+    from bmad_loop import skill_locate
+
+    home = tmp_path / "home"
+    install_build_auto_skill(home, ".claude/skills")
+    monkeypatch.setattr(skill_locate, "user_home", lambda: home)
+    commit_sprint(project, {"1-1-a": "ready-for-dev"})
+    policy = replace(wt_policy(), skills=SkillsPolicy(user_roots=True))
+    engine, adapter = make_engine(
+        project,
+        [wt_dev_effect(project, "1-1-a"), wt_review_effect(project, "1-1-a", clean=True)],
+        policy=policy,
+    )
+    attach_profile(adapter)
+
+    summary = engine.run()
+
+    assert summary.done == 1 and not summary.paused, engine.state.paused_reason
+    assert "story-escalated" not in journal_kinds(engine)
+    rows = [e for e in engine.journal.entries() if e["kind"] == "worktree-skills-user-root"]
+    assert rows and rows[0]["story_key"] == "1-1-a"
+    assert f"~/.claude/skills/{DEV_PRIMITIVE_NEW}" in rows[0]["entries"]
 
 
 def _install_short_renderer_case(project, tmp_path, *, renderer_stub):

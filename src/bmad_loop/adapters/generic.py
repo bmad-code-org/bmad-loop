@@ -1415,7 +1415,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         argv = [
             binary,
             *self.profile.launch_args,
-            self.profile.render_prompt(spec.prompt),
+            self.profile.render_prompt(spec.prompt, skill_dir=spec.skill_dir),
             *extra,
         ]
         if spec.model:

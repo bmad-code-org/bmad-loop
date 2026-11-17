@@ -425,6 +425,19 @@ def test_codex_extra_args_keep_no_daemon(tmp_path):
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
 
 
+def test_interactive_argv_renders_the_specs_skill_dir(tmp_path):
+    """The engine's located skill folder (`SessionSpec.skill_dir`) reaches the
+    copilot prompt's `{skill_dir}`; without one the prompt keeps the relative
+    `.agents/skills/<skill>` spelling. Ablation: drop `skill_dir=spec.skill_dir`
+    at the generic `render_prompt` call and the first assertion FAILS."""
+    adapter = make_adapter(tmp_path, profile_name="copilot")
+    folder = str(tmp_path / "home" / ".agents" / "skills" / "bmad-dev-auto")
+    located = dataclasses.replace(make_spec(tmp_path), skill_dir=folder)
+    assert adapter.interactive_argv(located)[2].startswith(f"LOAD the FULL {folder}/SKILL.md,")
+    plain = adapter.interactive_argv(make_spec(tmp_path))
+    assert plain[2].startswith("LOAD the FULL .agents/skills/bmad-dev-auto/SKILL.md,")
+
+
 def test_build_command_gemini_uses_interactive_flag(tmp_path):
     adapter = make_adapter(tmp_path, profile_name="gemini")
     cmd = adapter.build_command(make_spec(tmp_path))

@@ -87,3 +87,11 @@ events = { Stop = "Stop" }
 [workspace_trust]
 settings_path = "~/.gemini/antigravity-cli/settings.json"
 key = "trustedWorkspaces"
+
+# The home-relative skill folder Antigravity loads on its own, read only with
+# `[skills] user_roots = true` (see bmad_loop.skill_locate). Which copy wins on a
+# name clash with the workspace is not documented.
+# Source: https://antigravity.google/docs/skills (2026-11-15).
+[user_skills]
+precedence = "unordered"
+roots = ["~/.gemini/config/skills"]
