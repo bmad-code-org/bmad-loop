@@ -358,6 +358,29 @@ def test_write_pid(tmp_path):
         assert float(tokens[1]) > 0
 
 
+@pytest.mark.parametrize(
+    "task_id, expected",
+    [
+        ("3-1-short-key-dev-1", "3-1-short-key-dev-1"),
+        ("x" * 50 + "-dev-1", ("x" * 50 + "-dev-1")[-40:]),
+        # The 40-char slice starts at a dash: psmux would read it as a flag (#1061).
+        (
+            "3-2-aaaaaa-a-bbbbbbbbb-c-dd-eeeeeee-ff-ggggggg-dev-1",
+            "bbbbbbbbb-c-dd-eeeeeee-ff-ggggggg-dev-1",
+        ),
+        (
+            "3-2-aaaaaa-a---bbbbbbb-c-dd-eeeeeee-ff-ggggggg-dev-1",
+            "bbbbbbb-c-dd-eeeeeee-ff-ggggggg-dev-1",
+        ),
+    ],
+)
+def test_task_window_name_never_starts_with_a_dash(task_id, expected):
+    name = runs.task_window_name(task_id)
+    assert name == expected
+    assert not name.startswith("-")
+    assert len(name) <= 40
+
+
 @pytest.mark.usefixtures("force_tmux_backend")  # attach_argv goes through the seam
 def test_attach_argv_outside_tmux(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
