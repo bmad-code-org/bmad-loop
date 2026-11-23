@@ -220,6 +220,9 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Strip leading dashes from task window names. A task id whose last 40 characters
+  start with `-` was passed to `new-window -n` as an option, so psmux created no window
+  and the session read as crashed with an empty log (#1061).
 - Read BMAD v7's `quick_lenses`/`thorough_lenses` review sets in `validate` and the
   run preflight, so a v7 project is no longer required to install the deleted
   `bmad-review-adversarial-general` and `bmad-review-edge-case-hunter`. A `workflow.review`

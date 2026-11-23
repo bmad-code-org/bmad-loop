@@ -439,9 +439,12 @@ def session_name(run_id: str) -> str:
 
 def task_window_name(task_id: str) -> str:
     """Name of the window a task's agent session runs in, inside the run's
-    :func:`session_name` session: the task id's last 40 characters. The adapter
-    names the window with it, and an attach finds the task window by it."""
-    return task_id[-40:]
+    :func:`session_name` session: the task id's last 40 characters, leading
+    dashes stripped. The adapter names the window with it, and an attach finds
+    the task window by it. A ``-``-leading name reads as an option to
+    ``new-window -n``: psmux then exits 0 with no window and no id, and the
+    session reads as crashed (#1061)."""
+    return task_id[-40:].lstrip("-") or task_id
 
 
 def attach_target_argv(target: str) -> list[str]:
