@@ -220,6 +220,8 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- Recognize TOML-based TEA setup and enforce blocking gates from the current story or ticket's scoped reports.
+
 - Read BMAD v7's `quick_lenses`/`thorough_lenses` review sets in `validate` and the
   run preflight, so a v7 project is no longer required to install the deleted
   `bmad-review-adversarial-general` and `bmad-review-edge-case-hunter`. A `workflow.review`

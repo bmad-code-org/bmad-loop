@@ -1,9 +1,9 @@
 # Bundled Test Architect Enterprise (TEA) plugin for bmad-loop.
 #
 # Wires the BMAD "Test Architect Enterprise" module (the "Murat" agent + its
-# `bmad-testarch-*` workflows) into every run and sweep as advisory-by-default
+# `bmad-tea-*` skills) into every run and sweep as advisory-by-default
 # quality steps. It assumes TEA is already installed in the project
-# (`npx bmad-method install` -> Test Architect), and orchestrates by injecting
+# (install its skills and run `bmad setup tea`), and orchestrates by injecting
 # natural-language sessions that invoke the relevant TEA workflow at two
 # stages that have a live worktree:
 #
@@ -46,7 +46,7 @@ author = "bmad-loop"
 # a fresh checkout, so prime them into an isolated per-worktree checkout. No-ops
 # under today's in-place (isolation = none) mode; needed once worktrees are used.
 seed_globs = [
-  "_bmad/**",               # TEA runtime: config.yaml + testarch workflows + knowledge base
+  "_bmad/**",               # TEA runtime: config, scripts, and knowledge base
   ".claude/skills/bmad-t*", # compiled TEA skills for claude-code (bmad-tea + bmad-testarch-*)
   ".agents/skills/bmad-t*", # codex/cursor compiled skill home
   ".gemini/skills/bmad-t*", # gemini compiled skill home
@@ -70,7 +70,7 @@ key = "require_tea"
 type = "bool"
 default = true
 label = "Require TEA installed"
-help = "Fail fast at startup if the project has no _bmad/tea/config.yaml (TEA not installed). false = run anyway."
+help = "Require [modules.tea] in BMAD's TOML config or a legacy _bmad/tea/config.yaml at startup."
 
 # Per-step enable flags (workflow-overlay convention: <name>_enabled). Every
 # step ships on; set one false to drop just that workflow.
@@ -79,42 +79,42 @@ key = "td_enabled"
 type = "bool"
 default = true
 label = "Enable test-design (TD)"
-help = "post_dev_phase: risk assessment + coverage strategy for the changes (bmad-testarch-test-design)."
+help = "post_dev_phase: risk assessment + coverage strategy for the changes (bmad-tea-test-design)."
 
 [[settings]]
 key = "atdd_enabled"
 type = "bool"
 default = true
 label = "Enable ATDD (AT)"
-help = "post_dev_phase: failing acceptance tests + implementation checklist (bmad-testarch-atdd)."
+help = "post_dev_phase: failing acceptance tests + implementation checklist (bmad-tea-automate)."
 
 [[settings]]
 key = "automate_enabled"
 type = "bool"
 default = true
 label = "Enable automate (TA)"
-help = "post_dev_phase: prioritized API/E2E tests, fixtures, DoD summary (bmad-testarch-automate)."
+help = "post_dev_phase: prioritized API/E2E tests, fixtures, DoD summary (bmad-tea-automate)."
 
 [[settings]]
 key = "trace_enabled"
 type = "bool"
 default = true
 label = "Enable trace (TR)"
-help = "pre_commit_gate: map requirements to tests + record the quality-gate decision (bmad-testarch-trace)."
+help = "pre_commit_gate: map requirements to tests + record the quality-gate decision (bmad-tea-trace)."
 
 [[settings]]
 key = "nfr_enabled"
 type = "bool"
 default = true
 label = "Enable NFR (NR)"
-help = "pre_commit_gate: assess non-functional requirements + record the gate decision (bmad-testarch-nfr)."
+help = "pre_commit_gate: assess non-functional requirements + record the gate decision (bmad-tea-nfr)."
 
 [[settings]]
 key = "review_enabled"
 type = "bool"
 default = true
 label = "Enable test-review (RV)"
-help = "pre_commit_gate: quality check against the written tests (bmad-testarch-test-review)."
+help = "pre_commit_gate: quality check against the written tests (bmad-tea-test-review)."
 
 # Per-gate blocking flags (workflow-overlay convention: <name>_blocking). The
 # gate steps ship advisory; flip one true so a FAIL/CONCERNS verdict escalates
@@ -150,35 +150,35 @@ help = "true = a failing test-review gate escalates the unit at commit instead o
 [workflows.td]
 stage = "post_dev_phase"
 role = "dev"
-prompt = "Run the TEA Test Design workflow (skill `bmad-testarch-test-design`) for `{story_key}`. Produce a risk assessment and a risk-based coverage strategy for the changes currently in the working tree, and write the artifacts under TEA's configured test_artifacts directory. Do not modify production code."
+prompt = "Run the TEA Test Design workflow (skill `bmad-tea-test-design`, or legacy `bmad-testarch-test-design` if installed) for `{story_key}`. Produce a risk assessment and a risk-based coverage strategy for the changes currently in the working tree, and write the artifacts under TEA's configured test_artifacts directory. Do not modify production code."
 blocking = false
 
 [workflows.atdd]
 stage = "post_dev_phase"
 role = "dev"
-prompt = "Run the TEA ATDD workflow (skill `bmad-testarch-atdd`) for `{story_key}`. Generate failing acceptance tests plus an implementation checklist covering the changes currently in the working tree, written under TEA's configured test_artifacts directory."
+prompt = "Run the TEA ATDD workflow (red mode in `bmad-tea-automate`, or legacy `bmad-testarch-atdd` if installed) for `{story_key}`. Generate failing acceptance tests plus an implementation checklist covering the changes currently in the working tree, written under TEA's configured test_artifacts directory."
 blocking = false
 
 [workflows.automate]
 stage = "post_dev_phase"
 role = "dev"
-prompt = "Run the TEA Test Automation workflow (skill `bmad-testarch-automate`) for `{story_key}`. Generate prioritized API/E2E tests and fixtures for the changes currently in the working tree, plus a Definition-of-Done summary, under TEA's configured test_artifacts directory."
+prompt = "Run the TEA Test Automation workflow (skill `bmad-tea-automate`, or legacy `bmad-testarch-automate` if installed) for `{story_key}`. Generate prioritized API/E2E tests and fixtures for the changes currently in the working tree, plus a Definition-of-Done summary, under TEA's configured test_artifacts directory."
 blocking = false
 
 [workflows.trace]
 stage = "pre_commit_gate"
 role = "review"
-prompt = "Run the TEA Trace Requirements workflow (skill `bmad-testarch-trace`) for `{story_key}`. Map the requirements to the tests covering the changes currently in the working tree and record the quality-gate decision under TEA's configured test_artifacts directory."
+prompt = "Run the TEA Trace Requirements workflow (skill `bmad-tea-trace`, or legacy `bmad-testarch-trace` if installed) for `{unit_ref}`. When this unit is a story or ticket, use it as the explicit story target. Map the requirements to the tests covering the changes currently in the working tree and record the quality-gate decision under TEA's configured test_artifacts directory."
 blocking = false
 
 [workflows.nfr]
 stage = "pre_commit_gate"
 role = "review"
-prompt = "Run the TEA Non-Functional Requirements workflow (skill `bmad-testarch-nfr`) for `{story_key}`. Assess the NFRs of the changes currently in the working tree and record the gate decision under TEA's configured test_artifacts directory."
+prompt = "Run the TEA Non-Functional Requirements workflow (skill `bmad-tea-nfr`, or legacy `bmad-testarch-nfr` if installed) for `{unit_ref}`. When this unit is a story or ticket, use it as the explicit story target. Assess the NFRs of the changes currently in the working tree and record the gate decision under TEA's configured test_artifacts directory."
 blocking = false
 
 [workflows.review]
 stage = "pre_commit_gate"
 role = "review"
-prompt = "Run the TEA Test Review workflow (skill `bmad-testarch-test-review`) for `{story_key}`. Perform a quality check against the tests covering the changes currently in the working tree, using TEA's knowledge base and best practices, and record findings under TEA's configured test_artifacts directory."
+prompt = "Run the TEA Test Review workflow (skill `bmad-tea-test-review`, or legacy `bmad-testarch-test-review` if installed) for `{unit_ref}`. When this unit is a story or ticket, use it as the explicit story target. Perform a quality check against the tests covering the changes currently in the working tree, using TEA's knowledge base and best practices, and record findings at TEA's default scoped report path under its configured test_artifacts directory."
 blocking = false

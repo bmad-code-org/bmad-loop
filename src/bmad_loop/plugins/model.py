@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .context import HookContext
     from .grants import Verdict
 
@@ -110,7 +112,8 @@ class WorkflowSpec:
     generic ``_run_session`` path at an allowlisted ``stage`` (see
     WORKFLOW_STAGES). ``role`` selects which adapter runs it (WORKFLOW_ROLES);
     ``prompt`` is the agent prompt template, expanding ``{story_key}``,
-    ``{run_id}`` and ``{scripts}`` (the plugin's script dir). A ``blocking``
+    ``{unit_ref}`` (ticket ref, story spec, or unit key), ``{run_id}``, and
+    ``{scripts}`` (the plugin's script dir). A ``blocking``
     workflow whose session does not complete defers the unit (it routes through
     the engine's existing defer primitive); a non-blocking one is advisory.
 
@@ -247,6 +250,10 @@ class Plugin:
         editor_mode↔scm.isolation coupling). This is a deliberate config
         rejection, not a plugin bug, so the registry lets it propagate and the
         run fails fast rather than being isolated out. The default is a no-op."""
+
+    def validate_project(self, policy: Any, project: Path) -> None:
+        """Validate with the selected BMAD project, even when launched from elsewhere."""
+        self.validate(policy)
 
     def hook(self, stage: str, ctx: "HookContext") -> None:
         """Route a stage to its ``on_<stage>`` handler, if defined. The bus wraps

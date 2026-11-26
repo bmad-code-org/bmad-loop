@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     # is no cycle today — `verify` reaches deferredwork/bmadconfig/frontmatter/
     # model/platform_util/policy/sprintstatus, none of which touch `plugins/` —
     # so this is layering, not a workaround.
+    from ..model import TicketBinding
     from ..verify import CommandResult
 
 # Veto actions, least to most conservative. `skip` drops the current unit and
@@ -86,6 +87,11 @@ class HookContext:
         branch: str | None = None,
         repo_root: str | None = None,
         run_dir: str | None = None,
+        project_dir: str | None = None,
+        spec_file: str | None = None,
+        ticket: TicketBinding | None = None,
+        initiative: str = "",
+        sweep_bundle: bool = False,
         agents: tuple[str, ...] = (),
         result_json: dict[str, Any] | None = None,
         session_status: str | None = None,
@@ -116,6 +122,11 @@ class HookContext:
         self._branch = branch
         self._repo_root = repo_root
         self._run_dir = run_dir
+        self._project_dir = project_dir
+        self._spec_file = spec_file
+        self._ticket = ticket
+        self._initiative = initiative
+        self._sweep_bundle = sweep_bundle
         # the agent ids of the CLIs that run in this unit's worktree (dev + review),
         # for a plugin that routes per-agent config (e.g. the engine's MCP routing).
         self._agents = tuple(agents)
@@ -211,6 +222,27 @@ class HookContext:
     @property
     def run_dir(self) -> str | None:
         return self._run_dir
+
+    @property
+    def project_dir(self) -> str | None:
+        """The BMAD project directory in the checkout used for this stage."""
+        return self._project_dir
+
+    @property
+    def spec_file(self) -> str | None:
+        return self._spec_file
+
+    @property
+    def ticket(self) -> TicketBinding | None:
+        return self._ticket
+
+    @property
+    def initiative(self) -> str:
+        return self._initiative
+
+    @property
+    def sweep_bundle(self) -> bool:
+        return self._sweep_bundle
 
     @property
     def agents(self) -> tuple[str, ...]:

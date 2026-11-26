@@ -29,9 +29,11 @@ confidently-parsed FAIL/CONCERNS on an operator-marked-blocking gate escalates.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from bmad_loop.bmadconfig import BmadConfigError, read_module_config
 from bmad_loop.plugins.model import Plugin, PluginError
 
 if TYPE_CHECKING:
@@ -45,6 +47,10 @@ GATE_STEPS = ("trace", "nfr", "review")
 # Verdicts that escalate a blocking gate. PASS / WAIVED (an explicit human
 # approval to proceed) / an unknown-or-not-evaluated verdict never block.
 BLOCKING_VERDICTS = frozenset({"FAIL", "CONCERNS"})
+NOT_EVALUATED = "NOT_EVALUATED"
+DEFAULT_ARTIFACTS = "{project-root}/_bmad-output/test-artifacts"
+LEGACY_CONFIG = Path("_bmad/tea/config.yaml")
+GATE_FOLDERS = {"trace": "trace", "nfr": "nfr", "review": "test-review"}
 
 # Where each gate writes its decision, in probe order (first parseable wins).
 #   * "json"     — a TEA machine-readable file; read ``gate_status`` / ``decision``
@@ -109,6 +115,65 @@ def _scan_markdown(text: str, labels: tuple[str, ...], normalize) -> str | None:
     return None
 
 
+def _run_key(ctx: HookContext) -> str | None:
+    """Map Loop's bound unit to TEA's story identity."""
+    if ctx.sweep_bundle:
+        return None
+    ticket = ctx.ticket
+    if ticket is None:
+        story_key = Path(ctx.spec_file).stem if ctx.spec_file else ctx.story_key
+        if not ctx.spec_file and story_key:
+            story_key = story_key.replace(".", "-")
+    elif ticket.epic_slug == "backlog":
+        story_key = f"backlog--{Path(ticket.ref).stem}"
+    elif ctx.initiative and ticket.id:
+        initiative = ctx.initiative.removeprefix("initiative-")
+        if ticket.epic_slug.startswith("epic-"):
+            epic = f"e{ticket.epic_id}" if ticket.epic_id else ticket.epic_slug
+            story_key = f"{initiative}--{epic}-s{ticket.id}"
+        else:
+            story_key = f"{initiative}--s{ticket.id}"
+    else:
+        return None
+    if not story_key or "/" in story_key or "\\" in story_key:
+        return None
+    return f"story-{story_key}"
+
+
+def _scoped_verdict(text: str) -> str | None:
+    """Read a current verdict at the start of its value, including no decision."""
+    match = re.match(r"(NOT_EVALUATED|CONCERNS|FAIL|WAIVED|PASS)\b", text.strip(" *`").upper())
+    return match[1] if match else None
+
+
+def _scoped_markdown(text: str, kind: str) -> str | None:
+    labels = {
+        "md_trace": ("gate decision",),
+        "md_nfr": ("gate status", "overall status"),
+        "md_review": ("recommendation",),
+    }
+    for label in labels[kind]:
+        pattern = rf"^\s*(?:#+\s+)?\**{label}\**\s*:\s*\**([^\n]+)"
+        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+            value = match[1].strip()
+            if value.startswith("{") or "|" in value:
+                continue
+            if kind == "md_review":
+                value = value.lower().strip(" *`")
+                for recommendation, verdict in (
+                    ("request changes", "CONCERNS"),
+                    ("approve", "PASS"),
+                    ("block", "FAIL"),
+                ):
+                    if re.match(rf"{recommendation}\b", value):
+                        return verdict
+            else:
+                verdict = _scoped_verdict(value)
+                if verdict is not None:
+                    return verdict
+    return None
+
+
 class TeaPlugin(Plugin):
     """Trust-gated in-process plugin (loads only when "tea" is in
     ``[plugins] enabled``). Owns the TEA readiness gate + blocking-gate
@@ -123,20 +188,26 @@ class TeaPlugin(Plugin):
     # ----------------------------------------------------------- validation
 
     def validate(self, policy: Any) -> None:
-        """Readiness gate: with ``require_tea`` on, refuse to start unless TEA is
-        installed in the project (``_bmad/tea/config.yaml`` present). Raising here
-        propagates through ``registry.validate`` so the run fails fast at startup
-        rather than launching six sessions that each invoke a missing workflow."""
+        self.validate_project(policy, Path.cwd())
+
+    def validate_project(self, policy: Any, project: Path) -> None:
+        """Accept current central TEA setup or a legacy module install."""
         if not self._require_tea():
             return
-        config = self._tea_config_path(self._project_root())
-        if not config.is_file():
+        try:
+            modern = read_module_config(project, "tea")
+            if modern is not None:
+                self._current_artifacts_dir(project, modern)
+                return
+        except BmadConfigError as error:
+            raise PluginError(f"plugin 'tea': {error}") from error
+        if not (project / LEGACY_CONFIG).is_file():
             raise PluginError(
                 "plugin 'tea': the Test Architect Enterprise (TEA) module is not "
-                f"installed in this project (missing {config}). Install it with "
-                "`npx bmad-method install` and choose 'Test Architect', or set "
-                "require_tea = false under [plugins.tea] in .bmad-loop/policy.toml "
-                "to run the TEA workflows advisory-only without it."
+                f"installed in this project (missing [modules.tea] in {project / '_bmad/config.toml'} "
+                f"and legacy {project / LEGACY_CONFIG}). Install the TEA skills and run "
+                "`bmad setup tea`, or set require_tea = false under [plugins.tea] "
+                "in .bmad-loop/policy.toml."
             )
 
     # --------------------------------------------------------- enforcement
@@ -152,23 +223,34 @@ class TeaPlugin(Plugin):
         blocking verdicts escalate. ``pre_commit`` honors only a ``pause`` veto
         (a COMMITTING task has no legal move to DEFERRED), which is the right
         "blocking gate failed" semantic — escalate-for-human."""
-        gates = [g for g in GATE_STEPS if bool(self.settings.get(f"{g}_blocking"))]
+        gates = [
+            gate
+            for gate in GATE_STEPS
+            if self.settings.get(f"{gate}_enabled", True) and self.settings.get(f"{gate}_blocking")
+        ]
         if not gates:
             return  # nothing flagged blocking -> advisory only, no artifact read
 
         # Resolve the tree TEA wrote into: the unit's worktree (where the
         # pre_commit_gate sessions just ran), falling back to the repo root.
         # Under isolation = none the two coincide.
-        root = ctx.worktree or ctx.repo_root
+        root = ctx.project_dir or ctx.worktree or ctx.repo_root
         if not root:
             return  # fail-open: no tree to inspect
-        artifacts_dir = self._artifacts_dir(Path(root))
+        project = Path(root)
+        modern = read_module_config(project, "tea")
+        artifacts_dir = (
+            self._current_artifacts_dir(project, modern)
+            if modern is not None
+            else self._legacy_artifacts_dir(project)
+        )
+        run_key = _run_key(ctx)
 
         verdicts: dict[str, str] = {}
         failed: list[tuple[str, str]] = []
         for gate in gates:
-            verdict = self._gate_verdict(gate, artifacts_dir)
-            if verdict is None:
+            verdict = self._gate_verdict(gate, artifacts_dir, run_key, legacy=modern is None)
+            if verdict is None or verdict == NOT_EVALUATED:
                 continue  # fail-open: missing / unparseable / not-evaluated
             verdicts[gate] = verdict
             if verdict in BLOCKING_VERDICTS:
@@ -191,59 +273,57 @@ class TeaPlugin(Plugin):
     def _require_tea(self) -> bool:
         return bool(self.settings.get("require_tea", True))
 
-    def _project_root(self) -> Path:
-        """The project root, resolved the way the engine resolves it: the run's
-        working directory (``bmad-loop``'s ``--project`` defaults to cwd, and the
-        process is not chdir'd into a worktree at construction time). validate()
-        has no ``HookContext`` to read ``repo_root`` from, so cwd is the available
-        signal; ``on_pre_commit`` uses ``ctx.worktree`` / ``ctx.repo_root`` for the
-        authoritative per-unit root."""
-        return Path.cwd()
+    def _current_artifacts_dir(self, root: Path, config: dict[str, object]) -> Path:
+        value = config.get("test_artifacts", DEFAULT_ARTIFACTS)
+        if not isinstance(value, str) or not value.strip() or "\0" in value:
+            raise BmadConfigError("`modules.tea.test_artifacts` must be a non-empty path")
+        return root / value.replace("{project-root}", str(root))
 
-    def _tea_config_path(self, root: Path) -> Path:
-        return root / "_bmad" / "tea" / "config.yaml"
-
-    def _artifacts_dir(self, root: Path) -> Path:
-        """TEA's configured ``test_artifacts`` directory, resolved against ``root``.
-
-        Reads the ``test_artifacts`` line from ``_bmad/tea/config.yaml`` (a light
-        line parse — no YAML dependency, and robust if the file is absent), expands
-        the ``{project-root}`` / ``{output_folder}`` tokens, and falls back to the
-        installer default. A relative value is joined onto ``root``."""
-        value = "{project-root}/_bmad-output/test-artifacts"
-        config = self._tea_config_path(root)
+    def _legacy_artifacts_dir(self, root: Path) -> Path:
+        """Preserve classic YAML path and token handling."""
+        value = DEFAULT_ARTIFACTS
         try:
-            for raw in config.read_text(encoding="utf-8").splitlines():
+            for raw in (root / LEGACY_CONFIG).read_text(encoding="utf-8").splitlines():
                 line = raw.strip()
                 if line.startswith("test_artifacts:"):
                     value = line.split(":", 1)[1].strip().strip("\"'")
                     break
         except OSError:
-            pass  # fail-open: use the default location
+            pass
         value = value.replace("{project-root}", str(root)).replace(
             "{output_folder}", str(root / "_bmad-output")
         )
-        path = Path(value)
-        return path if path.is_absolute() else root / value
+        return root / value
 
-    def _gate_verdict(self, gate: str, artifacts_dir: Path) -> str | None:
-        """The latest verdict for ``gate`` from its artifacts, or None. Probes each
-        candidate in order, returning the first that parses to a known verdict;
-        any read/parse error on a candidate is swallowed (fail-open) and the next
-        is tried."""
-        for kind, filename in GATE_ARTIFACTS.get(gate, ()):
-            path = artifacts_dir / filename
-            if not path.is_file():
-                continue
+    def _gate_verdict(
+        self, gate: str, artifacts_dir: Path, run_key: str | None, *, legacy: bool
+    ) -> str | None:
+        candidates = GATE_ARTIFACTS[gate]
+        if run_key is not None:
+            folder = artifacts_dir / GATE_FOLDERS[gate]
+            scoped = [
+                (kind, folder / f"{Path(name).stem}-{run_key}{Path(name).suffix}")
+                for kind, name in candidates
+            ]
+            present = [(kind, path) for kind, path in scoped if path.is_file()]
+            if present:
+                return self._first_verdict(present, scoped=True)
+        if legacy:
+            flat = [(kind, artifacts_dir / name) for kind, name in candidates]
+            return self._first_verdict(flat, scoped=False)
+        return None
+
+    def _first_verdict(self, candidates: list[tuple[str, Path]], *, scoped: bool) -> str | None:
+        for kind, path in candidates:
             try:
-                verdict = self._parse_artifact(kind, path)
-            except Exception:  # nosec B112 - fail-open: a parse error never blocks
+                verdict = self._parse_artifact(kind, path, scoped=scoped)
+            except (OSError, ValueError):
                 continue
             if verdict is not None:
                 return verdict
         return None
 
-    def _parse_artifact(self, kind: str, path: Path) -> str | None:
+    def _parse_artifact(self, kind: str, path: Path, *, scoped: bool) -> str | None:
         """Extract a gate verdict from one artifact, by kind."""
         text = path.read_text(encoding="utf-8")
         if kind == "json":
@@ -251,8 +331,10 @@ class TeaPlugin(Plugin):
             if isinstance(data, dict):
                 raw = data.get("gate_status") or data.get("decision")
                 if isinstance(raw, str):
-                    return _verdict_token(raw)
+                    return _scoped_verdict(raw) if scoped else _verdict_token(raw)
             return None
+        if scoped:
+            return _scoped_markdown(text, kind)
         if kind == "md_review":
             return _scan_markdown(text, ("recommendation",), _review_token)
         return _scan_markdown(text, _MD_LABELS[kind], lambda line: _verdict_token(line))
