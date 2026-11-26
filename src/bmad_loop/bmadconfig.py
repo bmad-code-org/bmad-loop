@@ -515,6 +515,21 @@ def read_core_value(project: Path, key: str) -> tuple[str, str] | None:
     return None if central is None else _core_value(central, key)
 
 
+def read_module_config(project: Path, module: str) -> dict[str, object] | None:
+    """Read a module's settings from the three current central config layers."""
+    central = _load_central(project, V7_CENTRAL_LAYERS_REL)
+    modules = central.get("modules") if central is not None else None
+    if not isinstance(modules, _Table):
+        return None
+    table = modules.get(module)
+    if table is None:
+        return None
+    if not isinstance(table, _Table):
+        assert isinstance(table, _Leaf)
+        raise BmadConfigError(f"`modules.{module}` in {table.layer} must be a table")
+    return {key: node.value if isinstance(node, _Leaf) else node for key, node in table.items()}
+
+
 def active_initiative(project: Path) -> str | None:
     """The project's live ``[core] active_initiative`` (stripped, as `tickets.py`
     strips it), or None when none is active. Read fresh on every call: the value is

@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+from pathlib import Path
 
 import pytest
 from conftest import (
@@ -37,7 +38,7 @@ from conftest import (
 from bmad_loop.adapters.mock import MockAdapter
 from bmad_loop.engine import Engine
 from bmad_loop.journal import Journal
-from bmad_loop.model import RunState, TokenUsage
+from bmad_loop.model import RunState, TicketBinding, TokenUsage
 from bmad_loop.plugins import PluginError, PluginRegistry, get_plugin, load_plugins
 from bmad_loop.plugins.model import PluginManifest
 from bmad_loop.policy import GatesPolicy, NotifyPolicy, PluginsPolicy, Policy
@@ -113,7 +114,7 @@ def write_gate_artifact(project, gate: str, verdict: str) -> None:
         raise ValueError(f"unknown gate {gate!r}")
 
 
-def pre_commit_ctx(project):
+def pre_commit_ctx(project, **fields):
     """A minimal pre_commit HookContext pointing at the project tree (isolation =
     none: worktree == repo root), for unit-testing ``on_pre_commit`` directly."""
     from bmad_loop.plugins.context import HookContext
@@ -124,6 +125,7 @@ def pre_commit_ctx(project):
         worktree=str(project.project),
         repo_root=str(project.project),
         shared={},
+        **fields,
     )
 
 
@@ -618,3 +620,155 @@ def test_advisory_default_commits_despite_failing_gate(project, monkeypatch):
     summary = engine.run()
 
     assert summary.done == 1 and not summary.paused
+
+
+def install_current_tea(project):
+    config = project.project / "_bmad" / "config.toml"
+    config.parent.mkdir(exist_ok=True)
+    config.write_text('[modules.tea]\ntest_artifacts = "default-reports"\n', encoding="utf-8")
+    custom = config.parent / "custom"
+    custom.mkdir(exist_ok=True)
+    (custom / "config.toml").write_text(
+        '[modules.tea]\ntest_artifacts = "team-reports"\n', encoding="utf-8"
+    )
+    (custom / "config.user.toml").write_text(
+        '[modules.tea]\ntest_artifacts = "{project-root}/current-reports"\n', encoding="utf-8"
+    )
+    return project.project / "current-reports"
+
+
+def write_report(artifacts, filename, content):
+    report = artifacts / filename
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(content, encoding="utf-8")
+
+
+def test_current_install_to_blocking_trace(project):
+    artifacts = install_current_tea(project)
+    write_sprint(project, {"epic-1": "backlog", "1-1-a": "ready-for-dev"})
+    policy = tea_policy(
+        td_enabled=False,
+        atdd_enabled=False,
+        automate_enabled=False,
+        nfr_enabled=False,
+        review_enabled=False,
+        trace_blocking=True,
+    )
+    reg = PluginRegistry.build(project.project, policy)
+
+    def trace_session(spec):
+        assert "bmad-tea-trace" in spec.prompt
+        assert "spec-1-1-a.md" in spec.prompt
+        write_report(
+            artifacts, "trace/gate-decision-story-spec-1-1-a.json", '{"gate_status":"FAIL"}'
+        )
+        return workflow_effect([])(spec)
+
+    script = [dev_effect(project, "1-1-a", followup_review=False), trace_session]
+    engine = make_engine(project, script, reg, policy)
+    summary = engine.run()
+
+    assert summary.paused and summary.escalated == 1
+    assert engine.state.plugin_shared["tea_gates"] == {"trace": "FAIL"}
+
+
+@pytest.mark.parametrize(
+    "gate,filename,content,verdict",
+    [
+        ("trace", "trace/e2e-trace-summary-story-1-1-a.json", '{"gate_status":"FAIL"}', "FAIL"),
+        ("trace", "trace/traceability-matrix-story-1-1-a.md", "## Gate Decision: FAIL", "FAIL"),
+        (
+            "nfr",
+            "nfr/nfr-assessment-story-1-1-a.md",
+            "**Overall Status:** PASS\n**Gate Status:** CONCERNS ⚠️",
+            "CONCERNS",
+        ),
+        ("review", "test-review/test-review-story-1-1-a.md", "**Recommendation**: Block", "FAIL"),
+    ],
+)
+def test_current_scoped_verdict_wins_over_flat_report(project, gate, filename, content, verdict):
+    install_tea(project)
+    artifacts = install_current_tea(project)
+    flat_name = Path(filename).name.replace("-story-1-1-a", "")
+    flat_pass = {
+        "trace": (
+            '{"gate_status":"PASS"}' if flat_name.endswith(".json") else "## Gate Decision: PASS"
+        ),
+        "nfr": "**Overall Status:** PASS",
+        "review": "**Recommendation**: Approve",
+    }[gate]
+    write_report(artifacts, flat_name, flat_pass)
+    write_report(artifacts, filename, content)
+    ctx = pre_commit_ctx(project)
+    _tea_instance(**{f"{gate}_blocking": True}).on_pre_commit(ctx)
+
+    assert ctx.resolved_veto().action == "pause"
+    assert ctx.shared["tea_gates"] == {gate: verdict}
+
+
+@pytest.mark.parametrize(
+    "current,verdict",
+    [
+        (None, None),
+        ('{"gate_status":"NOT_EVALUATED"}', None),
+        ('{"gate_status":"PASS"}', "PASS"),
+        ("broken JSON", None),
+    ],
+)
+def test_current_trace_ignores_stale_flat_and_other_scopes(project, current, verdict):
+    install_tea(project)
+    artifacts = install_current_tea(project)
+    fail = '{"gate_status":"FAIL"}'
+    write_gate_artifact(project, "trace", "FAIL")
+    write_report(artifacts, "gate-decision.json", fail)
+    write_report(artifacts, "trace/gate-decision-story-1-2-unrelated.json", fail)
+    write_report(artifacts, "trace/gate-decision-system.json", fail)
+    if current is not None:
+        write_report(artifacts, "trace/e2e-trace-summary-story-1-1-a.json", current)
+    ctx = pre_commit_ctx(project)
+    _tea_instance(trace_blocking=True).on_pre_commit(ctx)
+
+    assert not ctx.vetoed
+    assert ctx.shared.get("tea_gates", {}).get("trace") == verdict
+
+
+def test_disabled_gate_ignores_existing_report(project):
+    artifacts = install_current_tea(project)
+    write_report(artifacts, "trace/gate-decision-story-1-1-a.json", '{"gate_status":"FAIL"}')
+    ctx = pre_commit_ctx(project)
+    _tea_instance(trace_blocking=True, trace_enabled=False).on_pre_commit(ctx)
+
+    assert not ctx.vetoed
+    assert "tea_gates" not in ctx.shared
+
+
+@pytest.mark.parametrize(
+    "ref,entry,folder,epic_id,scope",
+    [
+        ("1.2", "2", "epic-checkout", "1", "shop--e1-s2"),
+        ("CC2", "CC2", "epic-loyalty", "", "shop--epic-loyalty-sCC2"),
+        ("6a", "6a", "initiative-shop", "", "shop--s6a"),
+        ("story-coupon.md", "", "backlog", "", "backlog--story-coupon"),
+    ],
+)
+def test_ticket_scope_uses_bound_container(project, ref, entry, folder, epic_id, scope):
+    artifacts = install_current_tea(project)
+    write_report(artifacts, f"trace/gate-decision-story-{scope}.json", '{"decision":"FAIL"}')
+    ticket = TicketBinding(
+        ref=ref,
+        id=entry,
+        epic_slug=folder,
+        epic_id=epic_id,
+        title="Ticket",
+        plan="",
+        risk="",
+        refined=False,
+        plan_checkpoint=False,
+        done_checkpoint=False,
+        hitl=False,
+    )
+    ctx = pre_commit_ctx(project, ticket=ticket, initiative="initiative-shop")
+    _tea_instance(trace_blocking=True).on_pre_commit(ctx)
+
+    assert ctx.shared["tea_gates"] == {"trace": "FAIL"}
+    assert ctx.resolved_veto().action == "pause"

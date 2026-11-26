@@ -1064,7 +1064,7 @@ class Engine:
         # let every in-process plugin reject an incompatible config at startup
         # (e.g. the Unity plugin's editor_mode↔scm.isolation coupling) so the run
         # fails fast rather than mid-unit.
-        self._registry.validate(policy)
+        self._registry.validate(policy, project=self.paths.project)
         # a hook from a plugin not declared `read_only` voids any reusable verify
         # pass before it runs (#1002 / DW-640); the callback only touches state.
         self._bus = HookBus(
@@ -3099,6 +3099,7 @@ class Engine:
         base: dict = {
             "run_id": self.state.run_id,
             "repo_root": str(self.paths.repo_root),
+            "project_dir": str(self.workspace.paths.project),
             "run_dir": str(self.run_dir),
             "shared": self.state.plugin_shared,
             # the dev + review CLI agent ids in this unit's worktree, for a plugin
@@ -3113,6 +3114,10 @@ class Engine:
                 attempt=task.attempt,
                 worktree=task.worktree_path or str(self.workspace.root),
                 branch=task.branch or None,
+                ticket=task.ticket,
+                initiative=self.paths.active_initiative,
+                spec_file=task.spec_file,
+                sweep_bundle=bool(task.dw_ids),
             )
         base.update(fields)
         return HookContext(stage, **base)
@@ -3218,11 +3223,17 @@ class Engine:
         other, so token budgets and the transcript trail account for it."""
         if stage not in self._workflow_stages:
             return False
+        unit_ref = task.story_key
+        if task.ticket is not None:
+            unit_ref = task.ticket.ref
+        elif task.spec_file and not task.dw_ids:
+            unit_ref = task.spec_file
         for lp, wf in self._registry.workflows_for(stage):
             prompt = (
                 lp.manifest.render(wf.prompt)
                 .replace("{story_key}", task.story_key)
                 .replace("{run_id}", self.state.run_id)
+                .replace("{unit_ref}", unit_ref)
             )
             self.journal.append(
                 "workflow-start",

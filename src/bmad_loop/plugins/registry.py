@@ -525,10 +525,14 @@ class PluginRegistry:
             dict.fromkeys(g for lp in self._active_for_seeds() for g in lp.manifest.seed_globs)
         )
 
-    def validate(self, policy) -> None:
+    def validate(self, policy, *, project: Path | None = None) -> None:
         """Let every constructed in-process plugin self-validate against the run
         policy (``Plugin.validate``). A plugin raises to reject an incompatible
         config; the registry lets it propagate so the run fails fast at startup."""
         for lp in self._loaded:
-            if lp.instance is not None:
+            if lp.instance is None:
+                continue
+            if project is None:
                 lp.instance.validate(policy)
+            else:
+                lp.instance.validate_project(policy, project)
